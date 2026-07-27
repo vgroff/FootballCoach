@@ -1,0 +1,41 @@
+{
+  "_comment": "Player attribute generation config. Attributes are sampled from a correlated multivariate Gaussian, then clipped to [0,1]. See generation/knowledge.md for full explanation.",
+
+  "attribute_order": [
+    "top_speed",
+    "acceleration",
+    "stamina",
+    "kick_precision",
+    "kick_power",
+    "dribbling",
+    "ball_control",
+    "tackling"
+  ],
+
+  "default": {
+    "mean": 0.5,
+    "sigma": 0.2
+  },
+
+  "correlations": {
+    "_comment": "Pairs not listed default to 0 (independent). Symmetric.",
+    "top_speed:acceleration": 0.6,
+    "acceleration:ball_control": 0.1,
+    "acceleration:dribbling": 0.1,
+    "kick_precision:ball_control": 0.3,
+    "dribbling:ball_control": 0.2,
+    "tackling:dribbling": -0.3,
+    "tackling:kick_power": 0.4,
+    "tackling:ball_control": 0.4
+  },
+
+  "tiers": {
+    "_comment": "Per-tier (mean, sigma) overrides applied uniformly to all attributes before correlation is applied, then clipped to [0,1]. Premier League lands ~0.6-0.85, League Three ~0.2-0.3, per user spec.",
+    "premier_league": { "mean": 0.72, "sigma": 0.08 },
+    "championship": { "mean": 0.55, "sigma": 0.09 },
+    "league_one": { "mean": 0.4, "sigma": 0.09 },
+    "league_two": { "mean": 0.32, "sigma": 0.08 },
+    "league_three": { "mean": 0.25, "sigma": 0.07 },
+    "generic": { "mean": 0.5, "sigma": 0.2 }
+  }
+}

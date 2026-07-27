@@ -1,0 +1,58 @@
+"""The ball entity: position, velocity, spin, and possession state."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from footballcoach.config import load_physics_config
+from footballcoach.mathutils import Vector3
+
+
+@dataclass
+class Ball:
+    position: Vector3 = None  # type: ignore[assignment]
+    velocity: Vector3 = None  # type: ignore[assignment]
+    spin: Vector3 = None  # type: ignore[assignment]
+    radius_m: float = 0.11
+    mass_kg: float = 0.43
+
+    # Player id currently in possession (ball "stuck" to them), or None if loose.
+    possessed_by: str | None = None
+
+    # Player id who most recently released the ball (kick/pass/tackle-loss),
+    # and a short remaining grace period (seconds) during which THAT SAME
+    # player cannot immediately re-pick it up. Without this, a slow pass/kick
+    # (a few m/s) doesn't travel far enough in a single physics tick to clear
+    # the passer's own pickup radius, so they'd instantly re-acquire their
+    # own pass - see engine/knowledge.md's "release grace period" note.
+    last_released_by: str | None = None
+    release_grace_s: float = 0.0
+
+    def __post_init__(self) -> None:
+        if self.position is None:
+            self.position = Vector3.zero()
+        if self.velocity is None:
+            self.velocity = Vector3.zero()
+        if self.spin is None:
+            self.spin = Vector3.zero()
+
+    @staticmethod
+    def at_rest(position: Vector3 | None = None) -> "Ball":
+        cfg = load_physics_config()["ball"]
+        return Ball(
+            position=position or Vector3.zero(),
+            velocity=Vector3.zero(),
+            spin=Vector3.zero(),
+            radius_m=cfg["radius_m"],
+            mass_kg=cfg["mass_kg"],
+        )
+
+    @property
+    def is_loose(self) -> bool:
+        return self.possessed_by is None
+
+    @property
+    def height_m(self) -> float:
+        return self.position.z
+
+    def is_grounded(self, epsilon: float = 1e-6) -> bool:
+        return self.position.z <= self.radius_m + epsilon

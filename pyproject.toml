@@ -1,0 +1,28 @@
+[project]
+name = "footballcoach"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Vincent Groff", email = "vincent@numbereight.me" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.5.1",
+    "pygame-ce>=2.5.7",
+]
+
+[project.scripts]
+footballcoach = "footballcoach:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=9.1.1",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
