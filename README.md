@@ -77,8 +77,11 @@ statistically by `tests/balance/`). In a match:
   dragging to loft/chip instead of driving it low. Only does something if
   that player currently has the ball.
 - Click an opposing player to attempt a tackle.
+- `P` then click a teammate or ground to issue a pass; `S` to send the
+  selected goalkeeper to make a save.
 - `Space` pauses/resumes the simulation; `Esc` returns to the menu (or quits
-  from the menu).
+  from the menu); `H` or the help button (top-right) shows a full control
+  reference in-game.
 
 See [src/footballcoach/ui/knowledge.md](src/footballcoach/ui/knowledge.md)
 for the full interaction scheme and rendering notes.

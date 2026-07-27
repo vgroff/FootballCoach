@@ -25,8 +25,9 @@ of the engine.
 
 `PlayerState` is a small state machine:
 - `ACTIVE` - normal play, follows orders, regenerates stamina.
-- `INACTIVE_TACKLED` - just been tackled; can't tackle again and has reduced
-  speed until `state_timer_s` runs out (see `engine/tackling.py`).
+- `INACTIVE_TACKLED` - just been tackled (or just missed a tackle attempt
+  themselves - see `engine/tackling.py`); can't tackle again and has reduced
+  speed until `state_timer_s` runs out.
 - `CONTROLLING_BALL` - mid first-touch control-time delay (see
   `engine/possession.py`); can't act until the timer completes, at which
   point `Match._complete_control` grants possession. The ball's velocity is
@@ -34,6 +35,13 @@ of the engine.
   `Match._update_loose_ball_pickup`) and stays frozen (no free-flight
   physics runs) for the whole delay - it does NOT keep flying at the speed
   it arrived at while "being controlled".
+
+`Player.is_inactive` (`True` iff `state == PlayerState.INACTIVE_TACKLED`) is
+used by `engine/collision.py` to exclude inactive players from
+player-player push-apart collision (you can run straight through a player
+who's just been tackled/mistimed a tackle) while still allowing their
+cylinder to block a loose ball crossing into it from outside - see
+`engine/knowledge.md`'s `collision.py` section.
 
 ## `Ball` (`ball.py`)
 

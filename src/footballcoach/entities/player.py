@@ -69,3 +69,15 @@ class Player:
 
     def is_available_to_tackle(self) -> bool:
         return self.state != PlayerState.INACTIVE_TACKLED
+
+    @property
+    def is_inactive(self) -> bool:
+        """True while the player is temporarily out of active play (just
+        tackled/dispossessed, or having just failed a tackle attempt - see
+        engine/tackling.py). Inactive players don't participate in
+        player-player collision (others can run straight through them, see
+        engine/collision.py's `resolve_player_overlap`), though they can
+        still block a shot struck from outside their cylinder that flies
+        through it (see `engine/collision.py`'s
+        `resolve_ball_block_by_inactive_players`)."""
+        return self.state == PlayerState.INACTIVE_TACKLED

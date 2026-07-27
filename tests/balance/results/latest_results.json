@@ -292,13 +292,13 @@
   "save_far_post_fast_vs_slow_gk": {
     "fast_gk": {
       "n_trials": 300,
-      "saved": 279,
-      "save_rate_pct": 93.0
+      "saved": 283,
+      "save_rate_pct": 94.33
     },
     "slow_gk": {
       "n_trials": 300,
-      "saved": 9,
-      "save_rate_pct": 3.0
+      "saved": 1,
+      "save_rate_pct": 0.33
     }
   },
   "save_centre_aim_easy_case": {
@@ -314,19 +314,19 @@
     }
   },
   "save_rate_grid_pct": {
-    "gk_speed=0.1_near_post": 90.0,
+    "gk_speed=0.1_near_post": 96.0,
     "gk_speed=0.1_centre": 100.0,
-    "gk_speed=0.1_far_post": 62.0,
-    "gk_speed=0.5_near_post": 88.7,
+    "gk_speed=0.1_far_post": 44.7,
+    "gk_speed=0.5_near_post": 96.0,
     "gk_speed=0.5_centre": 100.0,
-    "gk_speed=0.5_far_post": 80.7,
-    "gk_speed=0.9_near_post": 90.0,
+    "gk_speed=0.5_far_post": 92.0,
+    "gk_speed=0.9_near_post": 96.0,
     "gk_speed=0.9_centre": 100.0,
-    "gk_speed=0.9_far_post": 82.0
+    "gk_speed=0.9_far_post": 92.0
   },
   "save_random_scenarios_good_vs_bad": {
     "n_scenarios": 150,
-    "good_gk_save_rate_pct": 98.0,
-    "bad_gk_save_rate_pct": 93.3
+    "good_gk_save_rate_pct": 100.0,
+    "bad_gk_save_rate_pct": 85.3
   }
 }

@@ -52,6 +52,22 @@ height in metres"): `draw_ball` boosts the ball's radius by
 `1 + min(height, 5)*0.35` and renders a `"{height:.1f}m"` label next to it
 whenever height exceeds 0.15m.
 
+## Player visual indicators (`style.py` / `renderer.draw_player`)
+
+- **Goalkeepers** are drawn in `GOALKEEPER_COLOUR` (a distinct orange)
+  instead of their team colour, so the keeper is identifiable at a glance.
+- **Ball possession**: whichever player currently has the ball
+  (`has_ball`, passed in by `App._draw_match`) gets a white
+  `POSSESSION_OUTLINE` ring drawn around their circle.
+- **Inactive players** (`PlayerState.INACTIVE_TACKLED`) are drawn onto a
+  per-pixel-alpha `pygame.Surface` at `INACTIVE_ALPHA` transparency (rather
+  than a flat colour substitute), so a tackled/off-balance player visibly
+  fades rather than just changing colour.
+- **Top layer for ball carrier**: `App._draw_match` sorts the player list so
+  whichever player has the ball is drawn last, i.e. on top of every other
+  player - avoids the possession ring/player circle being partially
+  obscured by a nearby defender drawn afterwards.
+
 ## Interaction scheme (`input.py`)
 
 - **Click a player** -> select them. Click the same player again to
@@ -75,6 +91,15 @@ whenever height exceeds 0.15m.
   treated as a click, not a drag, even if it started on the selected player
   - this lets you re-click your own player to deselect without accidentally
   triggering a tiny, useless kick.
+- **`P` key** -> enters one-shot "Pass mode" (`MatchInputController.
+  enter_pass_mode()`, tracked via the `OrderMode` enum). The next click on a
+  same-team player or empty ground issues a `PassOrder` at that
+  player/position instead of the normal select/move click handling, then
+  automatically reverts to `OrderMode.MOVE`. `Esc` (or pressing `P` again)
+  cancels pass mode without issuing anything (`cancel_pass_mode()`).
+- **`S` key** -> issues a `SaveOrder` to the currently-selected player via
+  `MatchInputController.issue_save_order()`, but only if that player
+  `.is_goalkeeper` (a no-op otherwise).
 
 ## Training mode goal reset (`app.py`)
 
@@ -88,11 +113,21 @@ practice loop doesn't require the trainee to trek back from wherever they
 ended up after a shot. This is intentionally training-mode-specific logic
 living in the UI layer, not a general engine behaviour.
 
+## Help overlay (`app.py`)
+
+`H` (or clicking the help button in the top-right corner of the match
+screen, drawn by `_draw_help_button`) toggles `App.show_help`. While shown,
+`_draw_help_overlay` renders a full-screen semi-transparent panel listing
+every control (click/drag/tackle/pass/save/pause/menu) and what each visual
+indicator means (goalkeeper colour, possession outline, inactive
+translucency). Match input events are suppressed while the overlay is open
+(only the help button/`H`/`Esc` are handled) so you can't accidentally
+issue orders while reading it; `Esc` closes the overlay first before
+falling back to its normal pass-mode-cancel / return-to-menu behaviour.
+
 ## Known gaps / not yet implemented
 
 - No jog/sprint toggle for Move orders (always sprint).
-- No visual indicator for ball possession state beyond player/ball
-  proximity (no highlight ring showing "this player has the ball").
 - Balance scenarios always use `rng_reduction=0.3` and don't loop/repeat
   automatically - selecting one plays a single live trial; go back to the
   menu (Esc) and re-select to see another random outcome.

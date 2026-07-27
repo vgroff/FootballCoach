@@ -86,20 +86,48 @@ class Renderer:
             label = self.hud_font.render(f"{ball.height_m:.1f}m", True, style.HUD_TEXT)
             surface.blit(label, (pos[0] + radius_px + 2, pos[1] - label.get_height() // 2))
 
-    def draw_player(self, surface: pygame.Surface, player: Player, selected: bool) -> None:
+    def draw_player(
+        self, surface: pygame.Surface, player: Player, selected: bool, has_ball: bool = False
+    ) -> None:
+        """Draws one player. Per the design spec:
+        - goalkeepers are drawn in a distinct orange colour rather than
+          their team colour.
+        - the player currently in possession (`has_ball`) gets a white
+          outline. Callers are responsible for drawing the ball-carrier
+          *last* among players (see app.py's draw order) so they render on
+          top of everyone else, since a raw z-order isn't otherwise tracked.
+        - inactive players (`PlayerState.INACTIVE_TACKLED`, including a
+          tackler briefly off-balance after a failed tackle - see
+          engine/knowledge.md) are drawn translucent rather than solid,
+          instead of a flat grey tint, so their team/goalkeeper colour is
+          still faintly visible.
+        """
         cam = self.camera
         pos = cam.world_to_screen(player.position.x, player.position.y)
         radius_px = max(style.MIN_PLAYER_RADIUS_PX, cam.scale_length(player.radius_m))
 
-        colour = style.TEAM_LEFT_COLOUR if player.team == Team.LEFT else style.TEAM_RIGHT_COLOUR
-        if player.state == PlayerState.INACTIVE_TACKLED:
-            colour = style.INACTIVE_TINT
-
-        pygame.draw.circle(surface, colour, pos, radius_px)
         if player.is_goalkeeper:
-            pygame.draw.circle(surface, style.GOALKEEPER_STRIPE, pos, radius_px, 2)
+            colour = style.GOALKEEPER_COLOUR
+        else:
+            colour = style.TEAM_LEFT_COLOUR if player.team == Team.LEFT else style.TEAM_RIGHT_COLOUR
+
+        is_inactive = player.state == PlayerState.INACTIVE_TACKLED
+
+        if is_inactive:
+            # Draw on a small per-pixel-alpha surface so the player reads as
+            # translucent rather than a flat grey substitute colour.
+            diameter = radius_px * 2 + 4
+            player_surf = pygame.Surface((diameter, diameter), pygame.SRCALPHA)
+            centre = (diameter // 2, diameter // 2)
+            pygame.draw.circle(player_surf, (*colour, style.INACTIVE_ALPHA), centre, radius_px)
+            surface.blit(player_surf, (pos[0] - centre[0], pos[1] - centre[1]))
+        else:
+            pygame.draw.circle(surface, colour, pos, radius_px)
+
+        if has_ball:
+            pygame.draw.circle(surface, style.POSSESSION_OUTLINE, pos, radius_px + 2, 2)
         if selected:
-            pygame.draw.circle(surface, style.SELECTED_OUTLINE, pos, radius_px + 3, 2)
+            pygame.draw.circle(surface, style.SELECTED_OUTLINE, pos, radius_px + 5, 2)
 
         # Heading indicator - a short line showing facing direction.
         heading_len_px = radius_px + 8

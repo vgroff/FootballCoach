@@ -11,7 +11,7 @@ import pygame
 from footballcoach.engine.match import Match
 from footballcoach.ui import scenarios, style
 from footballcoach.ui.camera import Camera
-from footballcoach.ui.input import MatchInputController
+from footballcoach.ui.input import MatchInputController, OrderMode
 from footballcoach.ui.renderer import Renderer
 
 FPS = 60
@@ -39,6 +39,8 @@ class App:
         self.running = True
         self.is_training_mode = False
         self._last_goal_tally = (0, 0)
+        self.show_help = False
+        self.help_button_rect = pygame.Rect(0, 0, 90, 32)  # positioned per-screen in _draw_match
 
     @staticmethod
     def _temp_pitch():
@@ -66,19 +68,35 @@ class App:
                 self._handle_keydown(event.key)
             elif self.screen == Screen.MENU and event.type == pygame.MOUSEBUTTONDOWN:
                 self._handle_menu_click(event.pos)
-            elif self.screen == Screen.MATCH:
+            elif self.screen == Screen.MATCH and event.type == pygame.MOUSEBUTTONDOWN and self.help_button_rect.collidepoint(event.pos):
+                self.show_help = not self.show_help
+            elif self.screen == Screen.MATCH and not self.show_help:
                 self._handle_match_mouse_event(event)
 
     def _handle_keydown(self, key: int) -> None:
         if key == pygame.K_ESCAPE:
-            if self.screen == Screen.MATCH:
+            if self.show_help:
+                self.show_help = False
+            elif self.input_controller is not None and self.input_controller.order_mode == OrderMode.PASS:
+                self.input_controller.cancel_pass_mode()
+            elif self.screen == Screen.MATCH:
                 self.screen = Screen.MENU
                 self.match = None
                 self.input_controller = None
             else:
                 self.running = False
-        elif key == pygame.K_SPACE and self.match is not None:
+            return
+        if key == pygame.K_h:
+            self.show_help = not self.show_help
+            return
+        if self.show_help or self.match is None or self.input_controller is None:
+            return
+        if key == pygame.K_SPACE:
             self.match.paused = not self.match.paused
+        elif key == pygame.K_p:
+            self.input_controller.enter_pass_mode()
+        elif key == pygame.K_s:
+            self.input_controller.issue_save_order()
 
     def _handle_match_mouse_event(self, event: pygame.event.Event) -> None:
         if self.input_controller is None:
@@ -185,8 +203,15 @@ class App:
         self.renderer.draw_pitch(self.surface, self.match.pitch)
 
         selected_id = self.input_controller.selected_player_id
-        for player in self.match.players:
-            self.renderer.draw_player(self.surface, player, selected=player.player_id == selected_id)
+        carrier_id = self.match.ball.possessed_by
+        # Draw the ball carrier last so they always render on top of every
+        # other player, per the design spec.
+        ordered_players = sorted(self.match.players, key=lambda p: p.player_id == carrier_id)
+        for player in ordered_players:
+            self.renderer.draw_player(
+                self.surface, player, selected=player.player_id == selected_id,
+                has_ball=player.player_id == carrier_id,
+            )
         self.renderer.draw_ball(self.surface, self.match.ball)
 
         drag = self.input_controller.drag_indicator()
@@ -198,11 +223,68 @@ class App:
         hud_lines = [
             self.mode_label,
             f"Score: LEFT {left} - {right} RIGHT",
-            f"{'PAUSED' if self.match.paused else 'Playing'} (Space to pause/resume, Esc for menu)",
+            f"{'PAUSED' if self.match.paused else 'Playing'} (Space to pause/resume, Esc for menu, H for help)",
         ]
         if selected_id is not None:
-            hud_lines.append(f"Selected: {selected_id} (click ground=move, drag=kick, click opponent=tackle)")
+            if self.input_controller.order_mode == OrderMode.PASS:
+                hud_lines.append(f"Selected: {selected_id} - PASS mode: click a target to pass (Esc cancels)")
+            else:
+                hud_lines.append(
+                    f"Selected: {selected_id} (click ground=move, drag=kick, click opponent=tackle, "
+                    "P=pass mode, S=save order if goalkeeper)"
+                )
         self.renderer.draw_hud_text(self.surface, hud_lines)
+        self._draw_help_button()
+
+        if self.show_help:
+            self._draw_help_overlay()
+
+    def _draw_help_button(self) -> None:
+        self.help_button_rect = pygame.Rect(self.camera.screen_width - 100, 8, 90, 32)
+        mouse_pos = pygame.mouse.get_pos()
+        hovered = self.help_button_rect.collidepoint(mouse_pos)
+        pygame.draw.rect(self.surface, (50, 50, 65) if not hovered else (70, 70, 90), self.help_button_rect, border_radius=6)
+        label = self.renderer.hud_font.render("Help (H)", True, style.HUD_ACCENT)
+        self.surface.blit(
+            label,
+            (
+                self.help_button_rect.centerx - label.get_width() // 2,
+                self.help_button_rect.centery - label.get_height() // 2,
+            ),
+        )
+
+    def _draw_help_overlay(self) -> None:
+        overlay = pygame.Surface((self.camera.screen_width, self.camera.screen_height), pygame.SRCALPHA)
+        overlay.fill((10, 10, 15, 220))
+        self.surface.blit(overlay, (0, 0))
+
+        title = self.renderer.title_font.render("Controls", True, style.HUD_ACCENT)
+        self.surface.blit(title, (60, 40))
+
+        lines = [
+            "Click a player           - select them (click again to deselect)",
+            "Click a team-mate        - switch selection (or pass to them in Pass mode)",
+            "Click an opponent        - tackle (selected player runs in and attempts a tackle)",
+            "Click empty ground       - move there (sprinting)",
+            "Click-drag from selected - kick: drag direction=aim, length=power (only if they have the ball)",
+            "Hold Shift while dragging- loft/chip the kick instead of driving it low",
+            "P                        - pass mode: next click (ground or player) passes there",
+            "S                        - issue a Save order (goalkeeper only): tracks and blocks shots",
+            "Space                    - pause/resume the simulation",
+            "H or Help button         - toggle this help overlay",
+            "Esc                      - close this overlay, or return to the menu / quit",
+            "",
+            "Visual indicators:",
+            "White outline            - player currently in possession of the ball",
+            "Orange fill              - goalkeeper",
+            "Translucent              - player is temporarily inactive (just tackled, or",
+            "                           just missed a tackle attempt)",
+        ]
+        y = 100
+        for line in lines:
+            rendered = self.renderer.hud_font.render(line, True, style.HUD_TEXT)
+            self.surface.blit(rendered, (60, y))
+            y += rendered.get_height() + 6
 
 
 def run_app() -> None:

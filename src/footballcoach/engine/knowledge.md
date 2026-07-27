@@ -70,6 +70,22 @@ mind.
 
 ## `movement.py` - movement, stamina, turning
 
+- **Goalkeeper diving boost**: goalkeepers get a flat
+  `goalkeeper_accel_multiplier` (1.5 by default) applied to straight-line
+  acceleration (`effective_acceleration`), lateral/turning acceleration
+  (`lateral_accel_capability`), and thus turn rate (`max_turn_rate_rad_s`) -
+  simulating a keeper's explosive dive/reach that outfield players don't
+  have. **The multiplier must be applied to all three** (straight-line,
+  lateral, and turn-rate), not just straight-line acceleration: an earlier
+  version only boosted straight-line acceleration, which let a fast keeper
+  build up speed towards a save target faster than they could *correct*
+  direction as the ball's predicted crossing point shifted tick-to-tick,
+  causing overshoot/oscillation past the target - this actually made a fast
+  keeper save *less* than a slow one in
+  `tests/balance/test_save_balance.py` until fixed. See also `match.py`'s
+  `SaveOrder` handling below for a related arrival-tolerance bug this
+  surfaced.
+
 - **Top speed / acceleration**: linear in the attribute,
   `v_max = 5.0 + 4.5*top_speed` m/s (5.0-9.5 m/s), `a_max = 2.5 + 5.0*accel`
   m/s² (2.5-7.5 m/s²). 9.5 m/s is a very fast but real football sprint
@@ -307,6 +323,14 @@ reduced speed - the reduced-speed-while-inactive multiplier
 `movement.py`'s speed calculation; this is a known gap to close before this
 mechanic is fully complete (see "Known gaps" below).
 
+A **failed** tackle attempt also briefly incapacitates the *tackler* (not
+just a successful one dispossessing the victim): `player.state` is set to
+`INACTIVE_TACKLED` for `tackler_miss_inactive_duration_s` (shorter than the
+victim's `inactive_duration_s`, since a mistimed lunge leaves you
+momentarily off-balance but not as badly as actually being dispossessed).
+Applies identically in both the `TackleOrder` and `ChaseTackleOrder`
+branches of `Match._process_orders`.
+
 ### `ChaseTackleOrder` - the "Tackle" high-level action
 
 Distinct from the base `TackleOrder` (which only resolves a tackle attempt
@@ -354,6 +378,21 @@ Implements the goalkeeper-only "Save" behaviour from the design brief:
     `scoring.check_goal`) by the time contact registers. Targeting a plane
     slightly in front of the line gives the keeper a chance to make contact
     *before* the ball would have crossed.
+- **Bug fix - snap to target on arrival, don't just freeze velocity:**
+  `Match._process_orders`'s `SaveOrder` branch, once the keeper is within a
+  small dead-zone (0.15m) of `target_position`, sets
+  `player.position = target_position` (not just `player.velocity = zero`).
+  An earlier version only zeroed velocity, leaving the keeper's actual
+  position wherever they happened to be inside the dead-zone. This was
+  fine for a normal-speed keeper (who typically "arrives" right around when
+  the predicted crossing point stabilizes), but once goalkeepers got the
+  `goalkeeper_accel_multiplier` diving boost (see `movement.py` above), a
+  fast keeper would reach and freeze near the dead-zone well *before* the
+  target position finished shifting - leaving a residual gap that could
+  push the keeper's final resting spot just outside `pickup_radius_m`,
+  turning what should have been an easy save into a miss. Snapping position
+  (not just velocity) to the target on arrival closes that gap. See
+  `tests/balance/test_save_balance.py` for the regression this fixed.
 - `own_goal_x` mirrors the attacking-direction convention from
   `offside.py` (`Team.LEFT` attacks +x and defends the goal at -x, and vice
   versa) - keep these two modules' conventions in sync if either changes.
@@ -377,8 +416,12 @@ spirit" of offside rather than the full law:
   much simpler to compute and still captures the core "don't camp in behind
   the last man" intent.
 - A teammate is offside if they are simultaneously *beyond* that last
-  defender **and** *beyond* the ball carrier, in the attacking direction.
-  Per Idea.md: any attacker meeting both conditions is flagged "whether or
+  defender **and** *beyond* the ball carrier **and** *beyond the halfway
+  line*, in the attacking direction. The halfway-line condition means a
+  player can never be offside in their own half, matching the real law -
+  without it, a defender pushed high up their own half could be flagged
+  offside against a long ball, which isn't how the actual rule works. Per
+  Idea.md: any attacker meeting all three conditions is flagged "whether or
   not the ball was actually intended for them" - i.e. this function should
   be called for any attacking teammate near the ball's path, not just the
   pass's intended receiver.
@@ -406,6 +449,28 @@ used as a direct proxy for how much a player should be able to shove another
 masses. `resolve_all_overlaps` runs a few iterations over all pairs so
 chains of 3+ overlapping players settle towards a mutually-valid
 configuration.
+
+**Inactive players are excluded from push-apart collision entirely** -
+`resolve_all_overlaps` skips any pair where either player's
+`Player.is_inactive` (true while `PlayerState.INACTIVE_TACKLED`) is true, so
+active players can run straight through a just-tackled player lying/off-
+balance on the ground rather than bumping into them like a solid obstacle.
+
+- **`resolve_ball_block_by_inactive_players`**: inactive players can still
+  block a *loose ball* (e.g. a shot/pass) with their cylinder, even though
+  they don't block other players. Each tick, this checks whether the ball's
+  movement segment (from its position last tick to this tick) entered an
+  inactive player's cylinder from *outside* it - a ball already inside the
+  cylinder (e.g. one that was there when the player became inactive) does
+  NOT get blocked, only a ball crossing in from outside, per the explicit
+  design spec ("they can still block the ball... if it is shot from outside
+  their cylinder and crosses in (but not if it is shot from inside the
+  cylinder)"). Uses a ray-circle intersection test in the XY plane; on a
+  block, the ball is stopped at the entry point and its velocity is damped/
+  reflected using `block_restitution` (0.35 - a fairly dead deflection,
+  since an inactive player is an unintentional obstacle, not an active
+  block/save). Wired into `Match.step()` right after `step_ball()`, using
+  the ball's pre-flight position captured before that call.
 
 ## `scoring.py` - goals
 
@@ -448,6 +513,21 @@ there's no "single order resolution while otherwise paused" mode yet).
   what the design brief and balance-test suites ask for (movement, kicking,
   passing, tackling, saving, ball physics, offside *detection*, goal
   detection).
+
+## Running-while-kicking power modifier (`kicking.running_power_multiplier`)
+
+Both `kick_ball` and `pass_ball` accept optional `kicker_velocity` /
+`kicker_top_speed_mps` parameters (passed by `Match._process_orders` for
+`KickOrder`/`PassOrder`), used to scale launch speed via
+`running_power_multiplier`: a simple cosine projection of the kicker's
+velocity onto the aim direction, scaled by how close to top speed they're
+currently running. Running straight towards the aim direction at full pace
+adds up to `running_power_coefficient` (0.3, i.e. +30%) extra power;
+running square-on has no effect; running directly away from the aim
+direction reduces power by the same amount. Defaults to a 1.0 (no-op)
+multiplier if the kicker isn't moving or no velocity/top-speed context is
+supplied, so existing callers (e.g. balance tests using stationary kickers)
+are unaffected.
 
 ## `../actions.py` - high-level one-shot action helpers
 

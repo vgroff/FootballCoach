@@ -24,6 +24,7 @@ class BallPhysicsParams:
     bounce_spin_retention: float
     rolling_friction_coefficient: float
     spin_decay_per_s: float
+    block_restitution: float
 
     @staticmethod
     def from_config() -> "BallPhysicsParams":
@@ -42,6 +43,7 @@ class BallPhysicsParams:
             bounce_spin_retention=bp["bounce_spin_retention"],
             rolling_friction_coefficient=bp["rolling_friction_coefficient"],
             spin_decay_per_s=bp["spin_decay_per_s"],
+            block_restitution=bp["block_restitution"],
         )
 
 

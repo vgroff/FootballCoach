@@ -21,6 +21,7 @@ class KickingParams:
     power_base_mps: float
     power_scale_mps: float
     firsttime_precision_weight: float
+    running_power_coefficient: float
 
     @staticmethod
     def from_config() -> "KickingParams":
@@ -31,6 +32,7 @@ class KickingParams:
             power_base_mps=d["power_base_mps"],
             power_scale_mps=d["power_scale_mps"],
             firsttime_precision_weight=d["firsttime_precision_weight"],
+            running_power_coefficient=d["running_power_coefficient"],
         )
 
 
@@ -75,6 +77,34 @@ def pass_angle_error_sigma_rad(params: PassingParams, kick_precision: float) -> 
 
 def max_kick_speed_mps(params: KickingParams, kick_power_attr: float) -> float:
     return params.power_base_mps + params.power_scale_mps * kick_power_attr
+
+
+def running_power_multiplier(
+    running_power_coefficient: float,
+    kicker_velocity: Vector3,
+    aim_direction: Vector3,
+    kicker_top_speed_mps: float,
+) -> float:
+    """Multiplier applied to kick/pass launch speed to model "running onto
+    the ball": running towards the aim direction adds power (up to
+    `running_power_coefficient` extra at a full sprint dead in line with the
+    shot), running square-on has no effect, and running backwards away from
+    the aim direction *reduces* power correspondingly - a simple cosine
+    projection of the kicker's velocity onto the aim direction, scaled by how
+    close to top speed they're currently running.
+
+    Returns 1.0 (no effect) if the kicker isn't moving or has negligible top
+    speed (e.g. callers that don't pass movement context at all). Shared by
+    both `kick_ball` and `pass_ball` (each passes its own params' coefficient
+    - currently only `KickingParams.running_power_coefficient` is used by
+    default, but the function itself is params-agnostic).
+    """
+    run_speed = kicker_velocity.length_xy()
+    if run_speed < 1e-6 or kicker_top_speed_mps < 1e-6 or aim_direction.length_xy() < 1e-9:
+        return 1.0
+    cos_angle = kicker_velocity.xy().normalized().dot(aim_direction.xy().normalized())
+    run_speed_fraction = min(1.0, run_speed / kicker_top_speed_mps)
+    return 1.0 + running_power_coefficient * cos_angle * run_speed_fraction
 
 
 def pass_speed_mps(params: PassingParams, distance_m: float, gravity_mps2: float, rolling_friction_coefficient: float) -> float:
@@ -203,6 +233,8 @@ def kick_ball(
     params: KickingParams | None = None,
     difficulty_multiplier: float = 1.0,
     gravity_mps2: float = 9.81,
+    kicker_velocity: Vector3 = Vector3.zero(),
+    kicker_top_speed_mps: float = 0.0,
 ) -> None:
     """Applies a kick to `ball`, releasing it from possession and giving it
     a velocity/spin aimed at `aim_point` (an absolute world position), with
@@ -214,12 +246,19 @@ def kick_ball(
     `power_fraction` in [0, 1] scales the kicker's max kick speed.
     `difficulty_multiplier` >= 1.0 inflates the error further for off-balance
     / first-time kicks (see kicking.firsttime_difficulty_multiplier).
+    `kicker_velocity`/`kicker_top_speed_mps` (both optional, default to no
+    effect) let a caller model "running onto the ball" - see
+    `running_power_multiplier`: running towards the aim direction adds
+    power, running away from it reduces power correspondingly.
     """
     params = params or KickingParams.from_config()
     r = rng or random
 
     sigma = reduced_sigma(angle_error_sigma_rad(params, kick_precision), rng_reduction) * difficulty_multiplier
     speed = max_kick_speed_mps(params, kick_power_attr) * max(0.0, min(1.0, power_fraction))
+    speed *= running_power_multiplier(
+        params.running_power_coefficient, kicker_velocity, aim_point - kicker_position, kicker_top_speed_mps
+    )
 
     _launch_ball(ball, kicker_position, aim_point, speed, sigma, spin, r, gravity_mps2)
 
@@ -236,6 +275,9 @@ def pass_ball(
     rolling_friction_coefficient: float = 0.06,
     power_fraction: float | None = None,
     max_speed_for_power: float | None = None,
+    running_power_coefficient: float = 0.0,
+    kicker_velocity: Vector3 = Vector3.zero(),
+    kicker_top_speed_mps: float = 0.0,
 ) -> None:
     """Applies a grounded pass to `ball`, aimed at `target_position` (an
     absolute world position, height ignored - passes are aimed along the
@@ -247,6 +289,10 @@ def pass_ball(
 
     Uses the dedicated, more forgiving `PassingParams` error model rather
     than `KickingParams` - see engine/knowledge.md for the rationale.
+
+    `running_power_coefficient`/`kicker_velocity`/`kicker_top_speed_mps`
+    (all optional, default to no effect) apply the same "running onto the
+    ball" power modifier as `kick_ball` - see `running_power_multiplier`.
     """
     params = params or PassingParams.from_config()
     r = rng or random
@@ -259,6 +305,10 @@ def pass_ball(
     else:
         max_speed = max_speed_for_power if max_speed_for_power is not None else params.max_speed_mps
         speed = max_speed * max(0.0, min(1.0, power_fraction))
+
+    speed *= running_power_multiplier(
+        running_power_coefficient, kicker_velocity, aim_point - kicker_position, kicker_top_speed_mps
+    )
 
     sigma = reduced_sigma(pass_angle_error_sigma_rad(params, kick_precision), rng_reduction)
 

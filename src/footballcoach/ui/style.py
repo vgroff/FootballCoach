@@ -9,8 +9,9 @@ BALL_OUTLINE = (40, 40, 40)
 TEAM_LEFT_COLOUR = (60, 110, 220)
 TEAM_RIGHT_COLOUR = (220, 70, 70)
 SELECTED_OUTLINE = (255, 220, 40)
-INACTIVE_TINT = (140, 140, 140)
-GOALKEEPER_STRIPE = (240, 210, 40)
+GOALKEEPER_COLOUR = (235, 140, 30)  # orange fill, overrides team colour
+POSSESSION_OUTLINE = (255, 255, 255)  # white outline on the player in possession
+INACTIVE_ALPHA = 110  # 0-255; inactive players are drawn translucent
 
 HUD_BG = (15, 15, 20)
 HUD_TEXT = (235, 235, 235)

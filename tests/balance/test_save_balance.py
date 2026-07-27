@@ -79,7 +79,14 @@ def test_fast_goalkeeper_saves_far_post_shot_much_more_than_slow_one(balance_rec
     gk_start_y = -half_goal_w + 0.3
     aim_y = half_goal_w - 0.3
     aim_z = 0.3
-    shot_x = -11.0
+    # Shot distance was increased from the original 11m (penalty spot) to 16m
+    # after goalkeepers were given a 1.5x acceleration boost to simulate
+    # diving (see engine/knowledge.md) - at 11m even a slow keeper had enough
+    # time to shuffle across and get a touch, washing out the fast-vs-slow
+    # differentiation this test exists to check. 16m gives a slow keeper
+    # meaningfully less reaction time while still being a plausible shot
+    # distance.
+    shot_x = -16.0
     power = 0.9
     n = 300
 
@@ -137,6 +144,8 @@ def test_save_rate_table_across_gk_speed_and_shot_placement(balance_recorder):
     half_goal_w = pitch.goal_width_m / 2.0
     gk_start_y = -half_goal_w + 0.3  # pinned to near post
     table = {}
+    # See test_fast_goalkeeper_saves_far_post_shot_much_more_than_slow_one for
+    # why this is 16m rather than the original 11m (goalkeeper diving boost).
     for gk_speed in (0.1, 0.5, 0.9):
         for label, aim_y in (
             ("near_post", -half_goal_w + 0.4),
@@ -145,7 +154,7 @@ def test_save_rate_table_across_gk_speed_and_shot_placement(balance_recorder):
         ):
             n = 150
             outcomes = [
-                _run_save_trial(pitch, gk_speed, gk_speed, 0.5, gk_start_y, -11.0, aim_y, 0.3, 0.9, 0.9, seed)
+                _run_save_trial(pitch, gk_speed, gk_speed, 0.5, gk_start_y, -16.0, aim_y, 0.3, 0.9, 0.9, seed)
                 for seed in range(n)
             ]
             saved = outcomes.count("saved")
@@ -173,8 +182,12 @@ def test_random_scenario_batch_good_vs_bad_goalkeeper(balance_recorder):
     rng = random.Random(99)
     n = 150
     scenarios = []
+    # Shot distance range was pushed out from 9-16m to 16-24m after the
+    # goalkeeper diving acceleration boost was added (see
+    # engine/knowledge.md) - closer shots gave even a bad goalkeeper enough
+    # time to reach almost anything, washing out the good-vs-bad comparison.
     for _ in range(n):
-        shot_x = -rng.uniform(9.0, 16.0)
+        shot_x = -rng.uniform(16.0, 24.0)
         aim_side = rng.choice([-1.0, 1.0])
         aim_y = aim_side * rng.uniform(half_goal_w * 0.5, half_goal_w - 0.3)
         aim_z = rng.uniform(0.1, 0.6)

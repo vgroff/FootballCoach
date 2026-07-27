@@ -12,10 +12,19 @@ from dataclasses import dataclass, field
 
 from footballcoach.config import load_physics_config
 from footballcoach.engine.ball_physics import BallPhysicsParams, step_ball
-from footballcoach.engine.collision import are_touching, resolve_all_overlaps
+from footballcoach.engine.collision import (
+    are_touching,
+    resolve_all_overlaps,
+    resolve_ball_block_by_inactive_players,
+)
 from footballcoach.engine.goalkeeping import GoalkeepingParams, save_target_position
 from footballcoach.engine.kicking import KickingParams, PassingParams, kick_ball, pass_ball
-from footballcoach.engine.movement import MovementParams, regen_stamina, step_player_towards
+from footballcoach.engine.movement import (
+    MovementParams,
+    effective_top_speed,
+    regen_stamina,
+    step_player_towards,
+)
 from footballcoach.engine.possession import ControlTimeParams, control_time_s
 from footballcoach.engine.scoring import Scoreboard, check_goal
 from footballcoach.engine.tackling import TacklingParams, attempt_tackle
@@ -100,7 +109,11 @@ class Match:
         # goalkeeper who is technically "catching" it and still cross the
         # goal line before the control-time timer completes.
         if self.ball.possessed_by is None and not self._any_player_controlling_ball():
+            pre_flight_position = self.ball.position
             step_ball(self.ball, dt, self.ball_physics_params)
+            resolve_ball_block_by_inactive_players(
+                self.ball, self.players, pre_flight_position, self.ball_physics_params.block_restitution
+            )
 
         self._update_loose_ball_pickup(dt)
 
@@ -174,6 +187,11 @@ class Match:
                         self.rng_reduction,
                         self.rng,
                         self.kicking_params,
+                        kicker_velocity=player.velocity,
+                        kicker_top_speed_mps=effective_top_speed(
+                            self.movement_params, player.attributes.top_speed, player.stamina,
+                            has_ball=True, ball_control_attr=player.attributes.ball_control,
+                        ),
                     )
                     self._start_release_grace(player.player_id)
                 order.status = OrderStatus.COMPLETE
@@ -193,6 +211,13 @@ class Match:
                         self.ball.possessed_by = player.player_id
                     target.state = PlayerState.INACTIVE_TACKLED
                     target.state_timer_s = self.tackling_params.inactive_duration_s
+                    if not success:
+                        # A failed (lunging/sliding) tackle also leaves the
+                        # tackler briefly unable to react - shorter than the
+                        # dispossessed player's penalty, since they weren't
+                        # actually beaten on the ball, just off-balance.
+                        player.state = PlayerState.INACTIVE_TACKLED
+                        player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
                 order.status = OrderStatus.COMPLETE
                 player.current_order = None
 
@@ -209,6 +234,12 @@ class Match:
                         gravity_mps2=self.ball_physics_params.gravity_mps2,
                         rolling_friction_coefficient=self.ball_physics_params.rolling_friction_coefficient,
                         power_fraction=order.power_fraction,
+                        running_power_coefficient=self.kicking_params.running_power_coefficient,
+                        kicker_velocity=player.velocity,
+                        kicker_top_speed_mps=effective_top_speed(
+                            self.movement_params, player.attributes.top_speed, player.stamina,
+                            has_ball=True, ball_control_attr=player.attributes.ball_control,
+                        ),
                     )
                     self._start_release_grace(player.player_id)
                 order.status = OrderStatus.COMPLETE
@@ -230,6 +261,9 @@ class Match:
                             self.ball.possessed_by = player.player_id
                         target.state = PlayerState.INACTIVE_TACKLED
                         target.state_timer_s = self.tackling_params.inactive_duration_s
+                        if not success:
+                            player.state = PlayerState.INACTIVE_TACKLED
+                            player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
                     order.status = OrderStatus.COMPLETE
                     player.current_order = None
                 else:
@@ -256,6 +290,19 @@ class Match:
                     )
                     direction = target_position - player.position
                     if direction.length_xy() < 0.15:
+                        # Snap to the target (not just freeze velocity):
+                        # without this, a keeper "arriving" anywhere within
+                        # the 0.15m tolerance ring stays frozen at that
+                        # residual offset for the rest of the shot's
+                        # flight - usually harmless, but a keeper boosted by
+                        # goalkeeper_accel_multiplier reaches (and freezes
+                        # at) that ring well before the ball arrives, and
+                        # the leftover gap could be just enough to sit
+                        # outside pickup_radius_m, turning a correctly-read
+                        # save into a miss (see
+                        # tests/balance/test_save_balance.py's fast-vs-slow
+                        # regression).
+                        player.position = target_position.with_z(player.position.z)
                         player.velocity = Vector3.zero()
                     else:
                         step_player_towards(player, direction, True, dt, self.movement_params, has_ball)

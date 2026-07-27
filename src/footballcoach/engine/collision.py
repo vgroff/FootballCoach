@@ -1,4 +1,5 @@
-"""Player-player collision resolution ("soft-body" overlap push-apart).
+"""Player-player collision resolution ("soft-body" overlap push-apart), plus
+loose-ball blocking by inactive players' cylinders.
 
 Players are cylinders viewed from above as circles of radius `radius_m`.
 Per the design spec: the distance between the centres of any two players
@@ -6,9 +7,21 @@ must be >= r1 + r2. If violated, both players are pushed apart along the
 line connecting their centres, weighted by their velocity component along
 that line - this lets a faster-moving/harder-charging player "win" more of
 the push, approximating momentum without a full mass/impulse system.
+
+Inactive players (just tackled, or having just failed a tackle - see
+`Player.is_inactive`) are excluded from this push-apart logic entirely: per
+the design spec you can run straight through an inactive player rather than
+being blocked by them. They can, however, still physically block a loose
+ball that flies through their cylinder from outside it (see
+`resolve_ball_block_by_inactive_players`) - a player lying on the ground
+after a tackle can still deflect a stray shot, they just can't obstruct
+other *players*' movement.
 """
 from __future__ import annotations
 
+import math
+
+from footballcoach.entities.ball import Ball
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
 
@@ -58,10 +71,19 @@ def resolve_player_overlap(player_a: Player, player_b: Player) -> None:
 
 def resolve_all_overlaps(players: list[Player], iterations: int = 2) -> None:
     """Resolves overlaps across all player pairs. Multiple iterations help
-    settle chains of overlapping players (e.g. 3+ players bunched up)."""
+    settle chains of overlapping players (e.g. 3+ players bunched up).
+
+    Pairs where either player is currently `is_inactive` are skipped
+    entirely - per the design spec, you can run straight through an
+    inactive player (no push-apart), rather than merely reducing the
+    push."""
     for _ in range(iterations):
         for i in range(len(players)):
+            if players[i].is_inactive:
+                continue
             for j in range(i + 1, len(players)):
+                if players[j].is_inactive:
+                    continue
                 resolve_player_overlap(players[i], players[j])
 
 
@@ -70,3 +92,82 @@ def are_touching(player_a: Player, player_b: Player, tolerance_m: float = 0.05) 
     "touching" (e.g. for tackle eligibility)."""
     distance = player_a.position.xy().distance_to(player_b.position.xy())
     return distance <= player_a.radius_m + player_b.radius_m + tolerance_m
+
+
+def resolve_ball_block_by_inactive_players(
+    ball: Ball,
+    players: list[Player],
+    previous_ball_position: Vector3,
+    block_restitution: float = 0.35,
+) -> None:
+    """Blocks a loose, in-flight ball against any *inactive* player's
+    cylinder that it passed through this tick, per the design spec: "you
+    shouldn't be able to bump into inactive players... however they can
+    still block the ball from being shot if it is shot from outside their
+    cylinder and crosses in (but not if it is shot from inside the
+    cylinder)".
+
+    Checks the ball's ground-plane movement segment (`previous_ball_position`
+    -> `ball.position`) against each inactive player's circle. If the
+    segment starts outside the cylinder and ends inside/beyond it (i.e. it
+    was struck from outside and is crossing in), the ball is stopped at the
+    entry point and its velocity is reflected/damped (a simple deflection,
+    not a full rebound simulation) - it does NOT block a ball that started
+    the tick already inside the cylinder (e.g. the ball being dribbled past
+    them or just released at their feet), matching "not if it is shot from
+    inside the cylinder".
+
+    Only meaningful for a loose ball (this is a no-op if `ball.possessed_by`
+    is set, since a possessed ball doesn't undergo free-flight physics
+    anyway).
+    """
+    if ball.possessed_by is not None:
+        return
+
+    start = previous_ball_position.xy()
+    end = ball.position.xy()
+    segment = end - start
+    segment_len = segment.length()
+    if segment_len < 1e-9:
+        return
+    direction = segment / segment_len
+
+    for player in players:
+        if not player.is_inactive:
+            continue
+
+        centre = player.position.xy()
+        radius = player.radius_m
+
+        start_offset = start - centre
+        # Distance from segment start to the circle boundary along `direction`,
+        # via the standard ray-circle intersection quadratic.
+        b = start_offset.dot(direction)
+        c = start_offset.dot(start_offset) - radius * radius
+
+        if c <= 0.0:
+            # Ball started inside the cylinder this tick - per the spec,
+            # don't block in this case (e.g. it was already at their feet).
+            continue
+
+        discriminant = b * b - c
+        if discriminant < 0.0:
+            continue  # ray never reaches the circle
+
+        t_entry = -b - math.sqrt(discriminant)
+        if t_entry < 0.0 or t_entry > segment_len:
+            continue  # entry point isn't within this tick's travel segment
+
+        # Struck from outside and crossing in this tick: stop the ball at
+        # the entry point and deflect it (damped reflection off the
+        # cylinder's surface normal at the entry point).
+        entry_point_xy = start + direction * t_entry
+        normal = (entry_point_xy - centre)
+        normal_len = normal.length()
+        normal = normal / normal_len if normal_len > 1e-9 else direction * -1.0
+
+        velocity_xy = ball.velocity.xy()
+        reflected_xy = velocity_xy - normal * (2.0 * velocity_xy.dot(normal))
+        ball.velocity = (reflected_xy * block_restitution).with_z(ball.velocity.z * block_restitution)
+        ball.position = Vector3(entry_point_xy.x, entry_point_xy.y, ball.position.z)
+        return  # only block against the first inactive player hit this tick

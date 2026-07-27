@@ -17,6 +17,7 @@ class TacklingParams:
     tackler_boost: float
     inactive_duration_s: float
     inactive_speed_penalty: float
+    tackler_miss_inactive_duration_s: float
 
     @staticmethod
     def from_config() -> "TacklingParams":
@@ -25,6 +26,7 @@ class TacklingParams:
             tackler_boost=d["tackler_boost"],
             inactive_duration_s=d["inactive_duration_s"],
             inactive_speed_penalty=d["inactive_speed_penalty"],
+            tackler_miss_inactive_duration_s=d["tackler_miss_inactive_duration_s"],
         )
 
 

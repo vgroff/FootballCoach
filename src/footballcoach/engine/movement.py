@@ -32,6 +32,7 @@ class MovementParams:
     lateral_accel_scale_mps2: float
     lateral_accel_ball_penalty_max: float
     min_speed_for_turn_mps: float
+    goalkeeper_accel_multiplier: float
 
     @staticmethod
     def from_config() -> "MovementParams":
@@ -54,6 +55,7 @@ class MovementParams:
             lateral_accel_scale_mps2=d["lateral_accel_scale_mps2"],
             lateral_accel_ball_penalty_max=d["lateral_accel_ball_penalty_max"],
             min_speed_for_turn_mps=d["min_speed_for_turn_mps"],
+            goalkeeper_accel_multiplier=d["goalkeeper_accel_multiplier"],
         )
 
 
@@ -102,8 +104,17 @@ def effective_acceleration(
     params: MovementParams,
     acceleration_attr: float,
     stamina_fraction: float,
+    is_goalkeeper: bool = False,
 ) -> float:
-    return max_acceleration_mps2(params, acceleration_attr) * stamina_multiplier(params, stamina_fraction)
+    accel = max_acceleration_mps2(params, acceleration_attr) * stamina_multiplier(params, stamina_fraction)
+    if is_goalkeeper:
+        # Simulates diving reach: goalkeepers get a flat acceleration boost
+        # on top of their attribute-driven acceleration, per the design
+        # spec ("give goalkeeper like 1.5x acceleration to simulate
+        # diving"). Applies to all goalkeeper movement, not just Save
+        # orders, since a keeper's explosive first step matters generally.
+        accel *= params.goalkeeper_accel_multiplier
+    return accel
 
 
 def lateral_accel_capability(
@@ -111,16 +122,27 @@ def lateral_accel_capability(
     acceleration_attr: float,
     has_ball: bool,
     ball_control_attr: float = 0.0,
+    is_goalkeeper: bool = False,
 ) -> float:
     """Max lateral (turning) acceleration available, in m/s^2.
 
     This governs turn rate: omega_max = a_lat / max(speed, eps). Carrying the
     ball reduces this unless ball_control is high (at ball_control=1.0 there
     is no penalty, per the design spec).
+
+    Goalkeepers get the same `goalkeeper_accel_multiplier` boost applied
+    here as `effective_acceleration` - without it, a keeper with boosted
+    straight-line acceleration but unboosted turning would build up speed
+    towards a save target faster than they can *correct* direction as the
+    predicted crossing point shifts, causing them to overshoot/oscillate
+    past a moving target instead of diving effectively (see
+    tests/balance/test_save_balance.py's fast-vs-slow-keeper regression).
     """
     a_lat = params.lateral_accel_base_mps2 + params.lateral_accel_scale_mps2 * acceleration_attr
     if has_ball:
         a_lat *= 1.0 - params.lateral_accel_ball_penalty_max * (1.0 - ball_control_attr)
+    if is_goalkeeper:
+        a_lat *= params.goalkeeper_accel_multiplier
     return a_lat
 
 
@@ -130,11 +152,12 @@ def max_turn_rate_rad_s(
     speed_mps: float,
     has_ball: bool,
     ball_control_attr: float = 0.0,
+    is_goalkeeper: bool = False,
 ) -> float:
     """omega_max = a_lat / max(speed, min_speed) -- turning is "free" (fast) at
     low speed and increasingly constrained at high speed, matching real
     running biomechanics (tight turns cost more the faster you're moving)."""
-    a_lat = lateral_accel_capability(params, acceleration_attr, has_ball, ball_control_attr)
+    a_lat = lateral_accel_capability(params, acceleration_attr, has_ball, ball_control_attr, is_goalkeeper)
     denom = max(speed_mps, params.min_speed_for_turn_mps)
     return a_lat / denom
 
@@ -192,7 +215,7 @@ def step_player_towards(
     attrs = player.attributes
 
     v_top = effective_top_speed(params, attrs.top_speed, player.stamina, has_ball, attrs.ball_control)
-    a_max = effective_acceleration(params, attrs.acceleration, player.stamina)
+    a_max = effective_acceleration(params, attrs.acceleration, player.stamina, player.is_goalkeeper)
 
     current_speed = player.velocity.length_xy()
     desired_dir = target_direction.xy().normalized()
@@ -206,7 +229,9 @@ def step_player_towards(
     # Turn rate limits how fast heading can rotate towards the desired direction.
     current_heading = player.heading_rad
     desired_heading = desired_dir.angle_xy() if desired_dir.length() > 1e-9 else current_heading
-    omega_max = max_turn_rate_rad_s(params, attrs.acceleration, max(current_speed, 0.5), has_ball, attrs.ball_control)
+    omega_max = max_turn_rate_rad_s(
+        params, attrs.acceleration, max(current_speed, 0.5), has_ball, attrs.ball_control, player.is_goalkeeper
+    )
 
     heading_diff = _angle_diff(current_heading, desired_heading)
     max_turn_this_tick = omega_max * dt_s

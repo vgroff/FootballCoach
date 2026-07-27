@@ -7,6 +7,11 @@ player is immediately flagged offside - regardless of whether the ball was
 actually intended for them. "Last defender" here is the deepest opponent
 (including the goalkeeper), which is a deliberate simplification of the
 real second-last-defender rule.
+
+Per the real law (and an explicit design requirement), a player can never be
+offside while in their own half - `is_offside_position` only flags an
+attacker who is also beyond the halfway line (x=0), in the attacking
+direction.
 """
 from __future__ import annotations
 
@@ -42,10 +47,12 @@ def is_offside_position(
     defending_team: Team,
 ) -> bool:
     """Returns True if `attacker` is in an offside position: beyond the last
-    defender AND beyond the ball carrier, in the attacking direction.
+    defender AND beyond the ball carrier, in the attacking direction, AND
+    beyond the halfway line (a player can never be offside in their own
+    half, per the real law).
 
-    Per the simplified spec, a player level with or behind the ball or the
-    last defender is onside.
+    Per the simplified spec, a player level with or behind the ball, the
+    last defender, or the halfway line is onside.
     """
     if attacker.team != attacking_team:
         return False
@@ -57,11 +64,13 @@ def is_offside_position(
     if sign > 0:
         beyond_defenders = attacker.position.x > defender_line_x
         beyond_ball_carrier = attacker.position.x > ball_carrier_x
+        beyond_halfway = attacker.position.x > 0.0
     else:
         beyond_defenders = attacker.position.x < defender_line_x
         beyond_ball_carrier = attacker.position.x < ball_carrier_x
+        beyond_halfway = attacker.position.x < 0.0
 
-    return beyond_defenders and beyond_ball_carrier
+    return beyond_defenders and beyond_ball_carrier and beyond_halfway
 
 
 def check_offside_on_pass(

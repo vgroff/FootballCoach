@@ -1,6 +1,5 @@
 {
   "_comment": "All values in SI units (metres, seconds, kg, radians) unless noted. Edit freely to tune balance; see knowledge.md in each package for how each constant is used.",
-
   "pitch": {
     "length_m": 105.0,
     "width_m": 68.0,
@@ -13,29 +12,24 @@
     "penalty_spot_distance_m": 11.0,
     "centre_circle_radius_m": 9.15
   },
-
   "player": {
     "radius_m": 0.3,
     "height_m": 1.8,
     "knee_height_m": 0.49,
     "waist_height_m": 0.95
   },
-
   "ball": {
     "radius_m": 0.11,
     "mass_kg": 0.43
   },
-
   "world": {
     "gravity_mps2": 9.81,
     "air_density_kgpm3": 1.225,
     "dt_s": 0.03333333333333333
   },
-
   "rng": {
     "default_rng_reduction": 0.3
   },
-
   "movement": {
     "_comment": "v_max = base + scale*top_speed_attr ; a_max = base + scale*acceleration_attr",
     "top_speed_base_mps": 5.0,
@@ -54,16 +48,17 @@
     "lateral_accel_base_mps2": 4.0,
     "lateral_accel_scale_mps2": 4.0,
     "lateral_accel_ball_penalty_max": 0.6,
-    "min_speed_for_turn_mps": 0.1
+    "min_speed_for_turn_mps": 0.1,
+    "goalkeeper_accel_multiplier": 1.5
   },
-
   "kicking": {
-    "_comment": "sigma_angle in radians = base + scale*(1-precision). power in m/s = base + scale*attr",
+    "_comment": "sigma_angle in radians = base + scale*(1-precision). power in m/s = base + scale*attr. running_power_coefficient: kicking/passing while running scales speed by (1 + coefficient*cos(angle between run direction and aim direction)*run_speed_fraction) - shared by both Kick and Pass execution.",
     "angle_error_base_rad": 0.0107,
     "angle_error_scale_rad": 0.0893,
     "power_base_mps": 15.0,
     "power_scale_mps": 20.0,
-    "firsttime_precision_weight": 0.8
+    "firsttime_precision_weight": 0.8,
+    "running_power_coefficient": 0.3
   },
   "passing": {
     "_comment": "Dedicated, more forgiving error model for the 'Pass' action (ground pass to a point) - see engine/knowledge.md. sigma_angle in radians = base + scale*(1-precision). Auto-pace: v = overshoot_factor * sqrt(2*mu_roll*g*distance), clamped to [min,max].",
@@ -73,7 +68,6 @@
     "min_speed_mps": 2.0,
     "max_speed_mps": 25.0
   },
-
   "goalkeeping": {
     "_comment": "'Save' action: predicts where an incoming shot crosses the keeper's own goal line and moves the keeper there. See engine/knowledge.md for the crossing-point prediction and the ball-freeze-on-pickup rule that makes saves work with the generic possession model.",
     "goal_frame_margin_m": 0.2,
@@ -82,9 +76,9 @@
   "tackling": {
     "tackler_boost": 1.2,
     "inactive_duration_s": 0.6,
-    "inactive_speed_penalty": 0.5
+    "inactive_speed_penalty": 0.5,
+    "tackler_miss_inactive_duration_s": 0.4
   },
-
   "ball_physics": {
     "drag_coefficient": 0.25,
     "magnus_coefficient": 0.25,
@@ -92,9 +86,9 @@
     "bounce_restitution_horizontal": 0.8,
     "bounce_spin_retention": 0.5,
     "rolling_friction_coefficient": 0.06,
-    "spin_decay_per_s": 0.15
+    "spin_decay_per_s": 0.15,
+    "block_restitution": 0.35
   },
-
   "control_time": {
     "_comment": "Time (s) for a player to bring a ball under control on first touch. See knowledge.md in engine/ for full derivation.",
     "t_base_s": 0.1,
@@ -114,7 +108,6 @@
       "ball_control_alpha": 0.9
     }
   },
-
   "offside": {
     "enabled_by_default": true
   }
