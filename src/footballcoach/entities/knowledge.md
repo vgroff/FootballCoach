@@ -59,6 +59,16 @@ kicked/passed - see `engine/knowledge.md`'s tick-order notes ("ordering
 subtlety #2") for the full rationale. Don't set these fields directly
 outside of `Match`/tests; they're an engine-internal bookkeeping detail.
 
+`just_bounced_timer_s: float = 0.0` is a **display-only** countdown set by
+`engine/ball_physics.step_ball()` to `just_bounced_display_duration_s` (0.3 s,
+from `physics.json["ball_physics"]`) whenever the ball makes a real bounce
+(incoming vertical speed above `BOUNCE_THRESHOLD_MPS` and outgoing speed also
+above it, i.e. the ball actually bounces rather than settling). It decays by
+`dt` each tick and floors at 0. The renderer uses it to draw an amber ring
+around the ball briefly after each bounce. It has no effect on simulation
+logic — treat it as a visualisation hint only; the engine itself never reads
+it.
+
 ## `Pitch` (`pitch.py`)
 
 Static geometry only - dimensions, goal mouths, box boundaries - centred at

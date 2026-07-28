@@ -24,7 +24,9 @@ steppable `Match` with a fixed timestep. All constants come from
                              is made
 6. release-grace countdown - decrement ball.release_grace_s if active
 7. resolve_all_overlaps   - push apart any overlapping players
-8. _check_goal            - detect goals, update scoreboard, reset for kickoff
+8. goal_linger countdown / _check_goal - if a goal linger is active, count
+                             it down and call _reset_after_goal() when it
+                             expires; otherwise detect goals normally
 ```
 
 **Ordering subtlety #1 - kick-then-pickup:** step 4 (advance loose-ball
@@ -644,3 +646,52 @@ actual behaviour lives in the order types and `Match._process_orders`
 described above. `opponent_goal_centre` resolves "which goal is this team
 attacking" using the same `Team.LEFT` attacks +x / `Team.RIGHT` attacks -x
 convention as `offside.py` and `goalkeeping.py`.
+## Goal linger (`Match.goal_linger_s`, Phase G/H)
+
+`Match.goal_linger_s: float = 0.0` — how many sim-seconds the ball stays in
+the net after a goal before `_reset_after_goal()` is called. With the
+default of 0.0 (headless/test mode), the existing immediate-reset behaviour
+is fully preserved. The UI sets this from `physics.json["ui"]["goal_linger_s"]`
+(default 3.0 s) when constructing a match.
+
+When a goal is detected by `_check_goal`:
+1. `scoreboard.score_for(side)` is called immediately (score updates on the
+   detection tick, not when the linger expires).
+2. `Match._goal_linger_remaining_s` is set to `goal_linger_s`; `_reset_after_goal`
+   is **deferred**.
+3. On each subsequent `Match.step()`, `_goal_linger_remaining_s` decrements by
+   `dt`. `_check_goal` is skipped entirely during the countdown (no double-
+   goal detection while the ball is still sitting in the net). When the
+   countdown reaches 0, `_reset_after_goal` runs.
+
+Tests: `tests/unit/test_goal_linger.py` covers immediate-reset regression,
+linger duration, no double-goals during linger, and countdown-rate assertion.
+
+## Game log (`Match.log_callback`, Phase G)
+
+`Match.log_callback: Callable[[LogLevel, str], None] | None = None` is an
+optional hook the UI attaches to receive real-time narration of match events.
+Default is `None` (headless / test use = zero cost, since the helper methods
+`_log_info` / `_log_debug` check for `None` before importing `gamelog.py`).
+
+Call sites (all in `match.py`):
+- Tackle outcomes (every `attempt_tackle` call site): INFO one-liner + DEBUG
+  breakdown with `result.tackler_roll`, `result.dribbler_roll`, and any
+  modifiers (GK box penalty, control-time penalty, head-on tag).
+- GK-in-box auto-fail short-circuit: distinct INFO message (no roll values).
+- Kick/shoot execution: DEBUG for kicks, INFO for shots.
+- `_complete_control`: INFO when a player finishes their first-touch.
+- Goal: INFO with scorer side and updated scoreboard.
+
+`TackleResult` (in `tackling.py`) was extended with `tackler_roll: float`
+and `dribbler_roll: float` fields so the log can report the exact draws
+without re-deriving them from internal state.
+
+## `ball_physics.py` — `just_bounced_timer_s` (Phase G)
+
+`step_ball()` sets `ball.just_bounced_timer_s = params.just_bounced_display_duration_s`
+(0.3 s, config) on the tick of each **real bounce** (incoming vertical speed
+exceeds `BOUNCE_THRESHOLD_MPS` and the outgoing restituted speed also
+exceeds it). It decrements by `dt` each tick and floors at 0. The renderer
+uses it to draw an amber ring briefly after each bounce; the engine itself
+never reads it back.

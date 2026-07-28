@@ -18,11 +18,13 @@ given a Move order actually arrives", "a penalty kicked dead centre with
 zero error scores and the goal is recorded", "a tackle with a big skill gap
 wins deterministically".
 
-`test_scenario_loop.py` tests `ScenarioLoop` (the UI's multi-trial balance
-scenario runner) headlessly without pygame, driving `loop.step()` directly.
-It uses `rng_reduction=0.3` because the loop's trial-end detection doesn't
-depend on determinism.  It parametrises over all `SCENARIOS` so new
-scenarios are automatically covered.
+`test_scenario_loop.py` tests `ScenarioLoop` headlessly without pygame,
+driving `loop.step()` directly.  It parametrises over all `SCENARIOS` so new
+scenarios are automatically covered.  All parametrised tests pass
+`linger_s=0.0` so they don't have to budget for the 3-second UI linger;
+dedicated linger tests (`test_linger_delays_trial_end`, `test_oob_linger_is_half_of_full_linger`,
+etc.) use an explicit non-zero `linger_s` and assert the half-linger for OOB
+events and full linger for goals/saves.
 
 `test_save_order.py` tests the goalkeeper `SaveOrder` logic via specific
 edge-cases at `rng_reduction=1.0` (deterministic): no overshoot past the
@@ -87,6 +89,19 @@ travel/reaction requirements (GK pinned to one post, shot aimed at the
 other). If a comparison test is failing because both sides score
 suspiciously similarly, that's usually the scenario being too easy, not a
 balance bug.
+
+### Phase G unit test files
+
+- `test_ball_physics.py` — extended with four `just_bounced_timer_s` tests:
+  timer set on real bounce, not set on settling contact, decays to zero over
+  the expected number of ticks, and resets to the full duration on each
+  subsequent bounce.
+- `test_gamelog.py` — `GameLog` ring buffer (add, filter by level, deque
+  eviction, timestamps) and tackle-logging plumbing (win/loss INFO entries,
+  DEBUG roll breakdown, GK-box auto-fail distinct message, `log_callback=None`
+  no-error regression).
+- `test_goal_linger.py` — `Match.goal_linger_s`: immediate-reset regression,
+  linger delays reset, no double-goals during linger, countdown rate.
 
 ## `conftest.py`
 
