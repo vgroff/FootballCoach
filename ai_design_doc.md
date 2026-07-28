@@ -451,25 +451,1046 @@ built now**, even though these two MVP experiments only ever populate 1-2
 of those slots - see section 2.2's rationale (avoids reworking the
 observation/encoder architecture later when scaling to 3v3/5v5).
 
-## 6. Open items / not yet decided
+## 6. Repository / module layout for the AI code
+
+New top-level package, parallel to `src/footballcoach/engine/`,
+`src/footballcoach/ui/` etc. Nothing here touches the existing engine
+package structure - the AI code is purely a *consumer* of `Match`,
+`orders`, `actions`, `entities`, `config`, exactly like `ui/` is today.
+
+```
+src/footballcoach/
+  ai/
+    __init__.py
+    config/
+      ai_config.json          # network sizes, PPO hyperparams, decision
+                               # interval, reward coefficients - mirrors the
+                               # engine's physics.json/attributes.json pattern
+    obs/
+      __init__.py
+      schema.py                # dataclasses describing the observation
+                                # layout (self, other-players, ball, global)
+      encoder.py                # Match -> ObservationBatch (numpy/torch),
+                                # relative encoding, masking, padding to 21
+    action/
+      __init__.py
+      schema.py                 # dataclasses describing raw network output
+                                # (decision heads + execution heads)
+      distributions.py          # MaskedCategorical, IndependentBernoulli,
+                                # combined ActionDistribution
+      gating.py                 # select_action(): the non-differentiable
+                                # winner-take-all + threshold rule (2.6)
+      to_orders.py               # ActionOutput -> orders.py Order objects,
+                                # incl. illegal-action detection/penalty flags
+    models/
+      __init__.py
+      entity_encoder.py          # shared per-entity MLP + attention block
+      decision_network.py        # trunk + all decision heads
+      execution_network.py       # trunk + all execution heads
+      value_network.py           # critic (shared trunk optional, see 8.2)
+    ppo/
+      __init__.py
+      rollout_buffer.py           # storage + GAE(lambda) computation
+      ppo_trainer.py               # the training loop itself (see section 8)
+      schedules.py                 # LR / clip-range / rng_reduction schedules
+    env/
+      __init__.py
+      match_env.py                  # Gym-like wrapper around Match + a
+                                     # scenario definition; step()/reset()
+      scenario_env.py                # adapts ui/scenarios.py ScenarioDefinition
+                                     # + ScenarioLoop into a trainable env
+      reward.py                      # per-head reward shaping functions
+                                     # (section 9)
+    curriculum/
+      __init__.py
+      phases.py                     # curriculum phase definitions (section 4)
+      opponent_pool.py               # rules-based / frozen-checkpoint
+                                     # opponent sampling (self-play pool)
+    scripts/
+      train.py                       # CLI entry point: `uv run python -m
+                                     # footballcoach.ai.scripts.train --phase 1`
+      evaluate.py                    # run N trials headless, report stats
+                                     # (mirrors tests/balance/'s reporting style)
+tests/
+  ai_unit/                            # fast, deterministic tests for obs
+                                     # encoding, masking, distributions, GAE
+  ai_scenario/                        # short end-to-end smoke tests: a few
+                                     # PPO updates on a toy env don't crash
+                                     # and the loss actually changes
+```
+
+New dependency to add to `pyproject.toml`: `torch` (CPU is fine to start;
+GPU only matters once training volume gets large - this project's episodes
+are cheap/short single-player physics steps, not image renders, so CPU
+throughput should be adequate for the MVP experiments). Suggest adding it
+as a `dev`/optional group first (`[dependency-groups] ai = ["torch>=2.x"]`)
+so the base game install stays lightweight for anyone who just wants to
+play, and `uv sync --group ai` pulls in the training stack.
+
+## 7. Observation schema (concrete)
+
+### 7.1 Constants
+
+```python
+# ai/config: mirrors physics.json's approach - tunable, not hardcoded, but
+# shown here with concrete defaults for clarity.
+MAX_OTHER_PLAYERS = 21          # full 11v11 minus self
+SELF_FEATURE_DIM = ...          # see below, computed from the fields
+OTHER_PLAYER_FEATURE_DIM = ...  # per-entity feature vector length
+GLOBAL_FEATURE_DIM = ...
+DECISION_INTERVAL_S = 0.5        # networks run every 0.5s of sim time, not
+                                  # every 1/30s engine tick (~15 ticks/decision)
+```
+
+`DECISION_INTERVAL_S = 0.5` is the user's confirmed starting value for how
+often the decision+execution networks actually run (open item from section
+6.1 resolved). Between decisions, the player continues executing the
+*last* chosen order/action via the existing engine order state machine
+(e.g. a `MoveOrder` or `ShootOrder` set by `to_orders.py`) exactly the same
+way a human-issued UI order persists tick-to-tick today - no special engine
+change is needed for this, since `orders.py` was already designed for
+"assign an order, it persists until complete/replaced." The execution
+network's *very* low-level outputs (move direction this instant, kick
+this instant) are the exception - see 7.4/9 for how these interact with
+sub-decision-interval ticks.
+
+### 7.2 Per-player feature vector (used for both "self" and each "other" slot)
+
+```python
+@dataclass
+class PlayerFeatures:
+    # Relative to observing player, normalized by pitch half-length/width
+    # (see 7.3 for the exact normalization convention). For the *self* slot
+    # this is (0, 0) - not omitted, so the self/other feature vectors have
+    # identical shape and the entity encoder's shared MLP can (optionally)
+    # also be reused for the self embedding if desired.
+    rel_dx: float
+    rel_dy: float
+    distance_m: float            # redundant with rel_dx/rel_dy, aids learning
+
+    velocity_x: float            # world-frame, normalized by that player's
+    velocity_y: float             # own effective_top_speed (not a global
+                                  # constant) so the scale is meaningful
+                                  # regardless of attribute-driven top speed
+    speed_mps: float              # magnitude, redundant with vx/vy
+
+    heading_sin: float             # sin/cos of heading_rad - avoids the
+    heading_cos: float             # angle-wraparound discontinuity (2.2)
+
+    stamina: float                  # 0-1, already normalized
+
+    # Attributes (all already 0-1 in PlayerAttributes)
+    top_speed: float
+    acceleration: float
+    kick_power: float
+    kick_precision: float
+    dribbling: float
+    ball_control: float
+    tackling: float
+    stamina_attr: float             # the attribute, distinct from current stamina
+
+    # Flags (all 0/1 floats, not bools, for direct tensor packing)
+    is_own_team: float
+    is_self: float                    # 1.0 only for the observing player's own slot
+    has_possession: float
+    is_inactive_tackled: float
+    is_controlling_ball: float
+    is_goalkeeper: float
+    attacking_direction: float           # +1.0 if attacking +x, -1.0 if attacking -x
+                                        # (Team.LEFT / Team.RIGHT convention,
+                                        # engine/offside.py) - present on
+                                        # every player slot (each player's own
+                                        # attacking direction), not just self,
+                                        # since a marker needs to know their
+                                        # mark target's attacking direction too
+
+    exists: float                       # 1.0 for a real player in this slot,
+                                        # 0.0 for a padded/absent slot - see 7.5
+```
+
+### 7.3 Normalization convention
+
+- Positions: expressed relative to the *observing* player
+  (`rel_dx = other.x - self.x`, `rel_dy = other.y - self.y`), then divided
+  by `pitch.length_m / 2` and `pitch.width_m / 2` respectively, so values
+  are roughly in [-1, 1] even as pitch dimensions vary across randomised
+  training scenarios (section 4's pitch-size randomisation). `distance_m`
+  is normalized by `pitch half-diagonal` for the same reason.
+- Velocities: normalized per-player by that player's own
+  `effective_top_speed` (from `engine/movement.py`) rather than a single
+  global max speed constant, so "0.5" always means "roughly half that
+  player's personal top speed" regardless of their `top_speed` attribute -
+  this keeps the feature meaningful and roughly attribute-invariant, which
+  should help shared-weight training generalise across the full attribute
+  range (0.2-0.9ish per `generation/knowledge.md`'s tiers).
+- Ball spin: normalized by a configured max plausible spin (from
+  `physics.json`'s Magnus-effect constants) similarly.
+
+### 7.4 Ball feature vector
+
+```python
+@dataclass
+class BallFeatures:
+    rel_dx: float
+    rel_dy: float
+    distance_m: float
+    height_m: float              # NOT normalized the same way as x/y - use
+                                  # a fixed divisor (e.g. 3.0m) since height
+                                  # doesn't scale with pitch size
+    velocity_x: float
+    velocity_y: float
+    velocity_z: float
+    spin_x: float
+    spin_y: float
+    spin_z: float
+    is_possessed: float           # 0/1
+    is_loose: float                # 1 - is_possessed, redundant but explicit
+```
+
+### 7.5 Global / match-context feature vector
+
+```python
+@dataclass
+class GlobalFeatures:
+    score_diff: float             # (own_team_goals - opp_team_goals), NOT
+                                  # raw scores, so it's meaningful regardless
+                                  # of which team is "left"/"right" this match
+    time_remaining_s: float        # normalized by a fixed max (e.g. 7200s
+                                  # i.e. 120 min, matching curriculum phase 1's
+                                  # random time-remaining spec) - clipped/
+                                  # log-scaled optionally so the 1-20s
+                                  # "urgent" scenarios are still distinguishable
+                                  # after normalization (a plain linear /7200
+                                  # squashes them all to ~0 - recommend
+                                  # log1p or a separate "is_urgent" flag, see
+                                  # note below)
+    pitch_length_m: float          # raw, or normalized against the standard
+    pitch_width_m: float            # 105m/68m - both are informative: the
+                                  # network needs to know actual scale isn't
+                                  # always standard
+    goal_width_m: float
+    goal_height_m: float
+    box_length_m: float
+    box_width_m: float
+    ball_restitution_coefficient: float
+    rng_reduction: float             # the network should know how noisy the
+                                  # current game/training setting is
+    attack_defence_smoothed: float    # this player's own EMA-smoothed
+                                  # attack/defence value fed back in (2.7) -
+                                  # technically a per-player, not global,
+                                  # feature; placed in self features in the
+                                  # actual tensor packing (listed here for
+                                  # narrative completeness)
+```
+
+**Time-remaining normalization note:** a plain linear normalisation by a
+large max (7200s) makes the curriculum's explicit 10%-of-the-time
+"1-20 seconds left" scenarios nearly indistinguishable from "2 minutes
+left" once squashed to a [0,1] range (both ~0.003 vs ~0.017). Recommend
+either (a) `log1p(time_remaining_s) / log1p(max_time_s)`, which spreads out
+the low end, or (b) an explicit additional `is_final_20s` binary flag
+alongside the normalized continuous value. Flagging this now since it's an
+easy thing to get subtly wrong and only notice much later when the "urgent
+endgame" scenario type never actually trains differently from a normal one.
+
+### 7.6 Padding / masking for the other-players block (concrete)
+
+- Build a list of up to `MAX_OTHER_PLAYERS` (21) `PlayerFeatures` for
+  whichever real players other than self exist this tick (could be as few
+  as 1 in a 1v1 scenario).
+- **Randomised slot assignment (added per user note):** real players are
+  shuffled into a *randomly chosen* subset of the 21 slots each time an
+  observation is built (not always slots 0..k-1) - this is important so the
+  network learns genuine *permutation invariance / doesn't overfit to slot
+  index* (e.g. "slot 0 is usually the ball carrier" would be a spurious
+  correlation in a fixed-assignment scheme, especially harmful once scaling
+  from 1v1 - where slot assignment barely varies - up to 11v11). Concretely:
+  `slot_indices = random.sample(range(MAX_OTHER_PLAYERS), k=len(other_players))`,
+  assign real players to those slots, zero-fill + `exists=0.0` on the rest.
+- Remaining (21 - k) slots: every field zeroed, **except** `exists = 0.0`
+  explicitly set (all other flags naturally read as 0 too, so a padded
+  slot looks like "a same-team, non-GK, no-possession player standing
+  exactly on top of the observer with zero velocity" if `exists` weren't
+  there to disambiguate it - this is exactly why the mask bit is
+  necessary, not just a nice-to-have).
+- The **attention mask** applied inside the entity encoder (section 8) uses
+  this same `exists` bit: padded slots' attention scores are set to `-inf`
+  before the softmax over keys, identically to the pass/tackle/mark target
+  masking described in section 2.4 - it is, in fact, the same masking
+  *technique* applied in two different places (entity attention keys vs.
+  action-head softmax targets), worth recognising as one recurring pattern
+  rather than two separate mechanisms.
+
+## 8. Network architecture (concrete modules)
+
+### 8.1 Entity encoder + attention
+
+```python
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+class EntityEncoder(nn.Module):
+    """Shared per-entity MLP + multi-head attention pooling, used for the
+    up-to-21 other-player slots. Query = self embedding; keys/values = other
+    players' embeddings. Padded slots are masked out of the attention
+    softmax so they contribute exactly zero, regardless of their (zeroed)
+    feature values.
+    """
+
+    def __init__(self, entity_feature_dim: int, embed_dim: int = 64, num_heads: int = 4):
+        super().__init__()
+        self.per_entity_mlp = nn.Sequential(
+            nn.Linear(entity_feature_dim, embed_dim),
+            nn.ReLU(),
+            nn.Linear(embed_dim, embed_dim),
+            nn.ReLU(),
+        )
+        # Reused for the self-embedding too (same shared weights) - self is
+        # just another "entity" with rel_dx=rel_dy=0, is_self=1.
+        self.attention = nn.MultiheadAttention(embed_dim, num_heads, batch_first=True)
+
+    def forward(
+        self,
+        self_features: torch.Tensor,     # (batch, entity_feature_dim)
+        other_features: torch.Tensor,    # (batch, MAX_OTHER_PLAYERS, entity_feature_dim)
+        exists_mask: torch.Tensor,        # (batch, MAX_OTHER_PLAYERS), 1.0/0.0
+    ) -> torch.Tensor:                    # returns (batch, embed_dim) context vector
+        self_embed = self.per_entity_mlp(self_features).unsqueeze(1)   # (batch, 1, embed_dim)
+        other_embed = self.per_entity_mlp(other_features)               # (batch, 21, embed_dim)
+
+        # nn.MultiheadAttention expects a boolean "key_padding_mask" where
+        # True means "ignore this key" - i.e. the INVERSE of exists_mask.
+        key_padding_mask = exists_mask < 0.5   # (batch, 21), True = padded/absent
+
+        context, _attn_weights = self.attention(
+            query=self_embed, key=other_embed, value=other_embed,
+            key_padding_mask=key_padding_mask,
+        )
+        return context.squeeze(1)   # (batch, embed_dim)
+```
+
+Note: `nn.MultiheadAttention`'s `key_padding_mask` already implements
+exactly the "-inf before softmax" masking rule described conceptually in
+section 2.4/7.6 - this is the built-in PyTorch mechanism for it, no need to
+hand-roll the masked-softmax for this particular use (hand-rolling is,
+however, still needed for the pass/tackle/mark *action* target heads,
+since those aren't attention layers - see 8.3).
+
+**Edge case: zero other players.** Even a 1v1 scenario has exactly 1 other
+player (the opponent), so `other_embed`/`exists_mask` are never *entirely*
+masked in the current curriculum. If a future scenario ever had literally
+zero other players (e.g. a solo dribbling drill), `nn.MultiheadAttention`
+with an all-True `key_padding_mask` for one batch row can produce NaNs
+(softmax over an empty/all -inf set is undefined) - guard for this
+explicitly (e.g. skip attention and use a learned "no-opponents" embedding
+constant) if such a scenario is ever added.
+
+### 8.2 Shared trunk + decision heads
+
+```python
+class DecisionNetwork(nn.Module):
+    def __init__(self, self_dim, ball_dim, global_dim, entity_embed_dim=64,
+                 trunk_hidden=256, latent_dim=32):
+        super().__init__()
+        self.entity_encoder = EntityEncoder(entity_feature_dim=self_dim)  # same feature schema as self/other
+        self.self_mlp = nn.Sequential(nn.Linear(self_dim, 64), nn.ReLU())
+        self.ball_mlp = nn.Sequential(nn.Linear(ball_dim, 32), nn.ReLU())
+        self.global_mlp = nn.Sequential(nn.Linear(global_dim, 32), nn.ReLU())
+
+        trunk_input_dim = 64 + 64 + 32 + 32  # entity_context + self + ball + global
+        self.trunk = nn.Sequential(
+            nn.Linear(trunk_input_dim, trunk_hidden), nn.ReLU(),
+            nn.Linear(trunk_hidden, trunk_hidden), nn.ReLU(),
+        )
+
+        # --- Heads ---
+        # Independent Bernoulli action-probability heads (raw logits; apply
+        # sigmoid only where a probability is actually needed, e.g. for
+        # gating/logging - keep raw logits for the Bernoulli distribution's
+        # log_prob, which is numerically more stable from logits directly).
+        self.shoot_logit = nn.Linear(trunk_hidden, 1)
+        self.pass_logit = nn.Linear(trunk_hidden, 1)
+        self.move_logit = nn.Linear(trunk_hidden, 1)
+        self.tackle_logit = nn.Linear(trunk_hidden, 1)
+        self.get_possession_raw = nn.Linear(trunk_hidden, 1)   # see 8.2.1 re: constraint vs tackle
+        self.mark_logit = nn.Linear(trunk_hidden, 1)
+        self.hold_position_logit = nn.Linear(trunk_hidden, 1)
+
+        # Categorical (masked) target heads - one logit per possible slot.
+        self.pass_target_logits = nn.Linear(trunk_hidden, MAX_OTHER_PLAYERS)
+        self.tackle_target_logits = nn.Linear(trunk_hidden, MAX_OTHER_PLAYERS)
+        self.mark_target_logits = nn.Linear(trunk_hidden, MAX_OTHER_PLAYERS)
+
+        # Continuous heads - output raw values; squash/scale to physical
+        # ranges (metres, m/s) in the action-decoding step (to_orders.py),
+        # NOT inside the network, so the network's own numeric output stays
+        # well-conditioned (roughly unit-scale) for the Normal distribution.
+        self.move_region_center = nn.Linear(trunk_hidden, 2)     # (x, y), tanh-squashed later
+        self.move_region_size = nn.Linear(trunk_hidden, 1)        # scalar, sigmoid+scale to 1-4m
+        self.move_arrival_speed = nn.Linear(trunk_hidden, 1)       # sigmoid+scale to 0-top_speed
+        self.region_of_play_center = nn.Linear(trunk_hidden, 2)
+        self.region_of_play_size = nn.Linear(trunk_hidden, 1)       # sigmoid+scale to 15-40m
+        self.attack_defence_raw = nn.Linear(trunk_hidden, 1)         # sigmoid -> 0-1
+
+        self.latent_vector = nn.Linear(trunk_hidden, latent_dim)     # unbounded, passed to execution net
+
+        # Per PPO's usual actor-critic setup, decide whether the value
+        # function shares the trunk (faster, more sample-efficient at small
+        # scale, but couples actor/critic gradients through a shared body -
+        # see 9.4 for the trade-off and recommendation) or has its own
+        # separate trunk (safer/decoupled, more parameters).
+        self.value_head = nn.Linear(trunk_hidden, 1)   # shared-trunk variant
+
+    def forward(self, self_feat, other_feat, exists_mask, ball_feat, global_feat):
+        entity_ctx = self.entity_encoder(self_feat, other_feat, exists_mask)
+        h = torch.cat([
+            entity_ctx,
+            self.self_mlp(self_feat),
+            self.ball_mlp(ball_feat),
+            self.global_mlp(global_feat),
+        ], dim=-1)
+        h = self.trunk(h)
+        return DecisionHeadsRaw(
+            shoot_logit=self.shoot_logit(h),
+            pass_logit=self.pass_logit(h),
+            move_logit=self.move_logit(h),
+            tackle_logit=self.tackle_logit(h),
+            get_possession_raw=self.get_possession_raw(h),
+            mark_logit=self.mark_logit(h),
+            hold_position_logit=self.hold_position_logit(h),
+            pass_target_logits=self.pass_target_logits(h),
+            tackle_target_logits=self.tackle_target_logits(h),
+            mark_target_logits=self.mark_target_logits(h),
+            move_region_center=self.move_region_center(h),
+            move_region_size=self.move_region_size(h),
+            move_arrival_speed=self.move_arrival_speed(h),
+            region_of_play_center=self.region_of_play_center(h),
+            region_of_play_size=self.region_of_play_size(h),
+            attack_defence_raw=self.attack_defence_raw(h),
+            latent_vector=self.latent_vector(h),
+            value=self.value_head(h),
+        )
+```
+
+#### 8.2.1 Enforcing "get-possession >= tackle" constraint
+
+The spec requires `get_possession_probability >= tackle_probability` always
+(get-possession can exceed tackle, e.g. chasing a loose ball, but never be
+lower). Rather than outputting `get_possession_probability` directly as an
+independent sigmoid (which the network could easily violate), derive it
+compositionally so the constraint is structurally guaranteed:
+
+```python
+tackle_prob = torch.sigmoid(heads.tackle_logit)
+extra_prob = torch.sigmoid(heads.get_possession_raw)   # network's own "how much MORE"
+# get_possession is tackle_prob plus some fraction of the remaining headroom
+# up to 1.0 - guarantees get_possession_prob in [tackle_prob, 1.0] always.
+get_possession_prob = tackle_prob + extra_prob * (1.0 - tackle_prob)
+```
+
+This is a standard "residual/headroom" parameterization - it keeps the
+constraint exact (not just encouraged via a loss penalty) at zero extra
+engineering cost, and both `tackle_logit` and `get_possession_raw` remain
+ordinary independent parameters the network can freely learn, with
+`get_possession_raw=0 -> get_possession_prob == tackle_prob` (the "always
+at least as often as tackle" floor) and `get_possession_raw=1 ->
+get_possession_prob == 1.0` (always attempt to get the ball this tick,
+maximal). Log-prob for PPO purposes should be computed on `tackle_logit`
+and `get_possession_raw` as two independent Bernoulli parameters directly
+(their own raw sigmoids), *not* on the derived `get_possession_prob` value,
+since the latter isn't a simple Bernoulli parameter of an independent
+action - it's cleaner to think of the actual PPO action space as
+`(tackle_intent, get_possession_extra)` and only compose them into the
+"effective get-possession probability" at the gating/execution stage.
+
+### 8.3 Masked categorical distribution for target heads
+
+```python
+class MaskedCategorical:
+    """Categorical distribution over MAX_OTHER_PLAYERS slots, masking out
+    non-existent players via -inf before softmax (see 2.4/7.6)."""
+
+    def __init__(self, logits: torch.Tensor, exists_mask: torch.Tensor):
+        # exists_mask: (batch, MAX_OTHER_PLAYERS), 1.0 = real player.
+        masked_logits = logits.masked_fill(exists_mask < 0.5, float("-inf"))
+        self.dist = torch.distributions.Categorical(logits=masked_logits)
+
+    def sample(self) -> torch.Tensor:
+        return self.dist.sample()
+
+    def log_prob(self, action: torch.Tensor) -> torch.Tensor:
+        return self.dist.log_prob(action)
+
+    def entropy(self) -> torch.Tensor:
+        return self.dist.entropy()
+
+    def mode(self) -> torch.Tensor:
+        return self.dist.probs.argmax(dim=-1)
+```
+
+`torch.distributions.Categorical` already normalises `exp(-inf)` to exactly
+0 probability internally and its `log_prob`/`entropy` handle this
+correctly (no NaN) as long as *at least one* slot per row is unmasked -
+same "all slots masked" edge case caveat as section 8.1's attention note
+applies here too (a scenario with literally no valid pass/tackle targets at
+all should never call `.sample()`/`.log_prob()` on this distribution for
+that row - guard at the call site, e.g. skip the pass-target loss term
+entirely for players with zero teammates).
+
+### 8.4 Independent Bernoulli heads
+
+```python
+class IndependentBernoulli:
+    """Thin wrapper so all the ~7-9 sigmoid action-probability heads share
+    one consistent log_prob/entropy/sample interface, built directly from
+    logits (numerically stabler than sigmoid-then-Bernoulli-from-probs)."""
+
+    def __init__(self, logits: torch.Tensor):
+        self.dist = torch.distributions.Bernoulli(logits=logits)
+
+    def sample(self) -> torch.Tensor:
+        return self.dist.sample()
+
+    def log_prob(self, action: torch.Tensor) -> torch.Tensor:
+        return self.dist.log_prob(action)
+
+    def entropy(self) -> torch.Tensor:
+        return self.dist.entropy()
+
+    def prob(self) -> torch.Tensor:
+        return torch.sigmoid(self.dist.logits)
+```
+
+### 8.5 Continuous heads (move target, arrival speed, region, attack/defence)
+
+Two standard options for continuous PPO action heads - **recommend Option
+B (Normal with learned/state-dependent std)** for this project:
+
+**Option A - Beta distribution**, naturally bounded to [0,1], good when the
+output truly has hard physical bounds (e.g. `attack_defence` and
+`move_region_size` after sigmoid do have hard bounds) but is slightly more
+fiddly to parameterize stably (needs `alpha, beta > 0`, typically via
+`softplus(raw) + 1`) and has less precedent/tooling than Gaussian PPO heads.
+
+**Option B - Gaussian (Normal) with `tanh`/`sigmoid` squashing applied
+*after* sampling**, the standard approach used by most continuous-control
+PPO implementations (e.g. MuJoCo benchmarks): network outputs an unbounded
+mean and a (state-independent or state-dependent) log-std; sample from
+`Normal(mean, std)`; squash the *sample* through `tanh` (mapped to [-1,1])
+or `sigmoid` (mapped to [0,1]) before rescaling into the physical range
+(metres, m/s). This requires a log-prob correction for the squashing
+Jacobian if being fully rigorous (as in SAC's original paper), but PPO
+implementations very commonly skip this correction in practice (treating
+the *pre-squash* Gaussian sample as the "action" for log_prob purposes,
+and only squashing for the actual physical/engine-facing value) - simpler,
+and works fine in practice for this kind of application; flag as a known
+minor approximation rather than a bug if adopted.
+
+```python
+class SquashedNormalHead:
+    """mean/log_std parameterization; produces both an unconstrained action
+    for PPO log_prob purposes and the squashed physical-range value for
+    actually building an order."""
+
+    def __init__(self, mean: torch.Tensor, log_std: torch.Tensor,
+                 low: float, high: float):
+        self.low, self.high = low, high
+        std = torch.exp(log_std.clamp(-5, 2))   # clamp for numerical stability
+        self.dist = torch.distributions.Normal(mean, std)
+
+    def sample_raw(self) -> torch.Tensor:
+        return self.dist.sample()
+
+    def log_prob(self, raw_action: torch.Tensor) -> torch.Tensor:
+        return self.dist.log_prob(raw_action).sum(dim=-1)
+
+    def to_physical(self, raw_action: torch.Tensor) -> torch.Tensor:
+        squashed = torch.sigmoid(raw_action)   # or tanh, remapped, per head
+        return self.low + squashed * (self.high - self.low)
+
+    def mode_physical(self) -> torch.Tensor:
+        return self.to_physical(self.dist.mean)
+```
+
+Recommended (mean, low, high) per continuous head:
+- `move_region_center`: unconstrained mean, squashed via `tanh` to
+  `[-1, 1]` in normalized rel-position space, rescaled to actual
+  metres/pitch-relative offset in `to_orders.py`.
+- `move_region_size`: `sigmoid`-squashed to `[1.0, 4.0]` metres.
+- `move_arrival_speed`: `sigmoid`-squashed to `[0, effective_top_speed]`
+  (a per-player value, computed in `to_orders.py`, not inside the network).
+- `region_of_play_size`: `sigmoid`-squashed to `[15.0, 40.0]` metres.
+- `attack_defence_raw`: `sigmoid`-squashed to `[0, 1]` directly (this is
+  the *instantaneous* target fed into the EMA smoother of section 2.7, not
+  the smoothed value itself).
+
+**State-dependent vs. global log_std:** simplest starting point is a single
+global `nn.Parameter` per head (not computed from the trunk), which is the
+most common/stable starting configuration in PPO continuous-control
+literature (e.g. CleanRL's continuous PPO) - start there; only move to a
+state-dependent std (an extra linear layer per head) if entropy collapse or
+insufficient exploration is observed empirically.
+
+### 8.6 Execution network
+
+Structurally similar shape (entity encoder + trunk), but its input also
+concatenates the *entire* decision-network output (all heads, both the
+"selected" ones and the ones gated off this tick - per section 2.5's
+explicit requirement), and its outputs map directly onto the low-level
+motor action surface:
+
+```python
+class ExecutionNetwork(nn.Module):
+    def __init__(self, self_dim, ball_dim, global_dim, decision_output_dim,
+                 entity_embed_dim=64, trunk_hidden=256):
+        super().__init__()
+        self.entity_encoder = EntityEncoder(entity_feature_dim=self_dim)
+        self.self_mlp = nn.Sequential(nn.Linear(self_dim, 64), nn.ReLU())
+        self.ball_mlp = nn.Sequential(nn.Linear(ball_dim, 32), nn.ReLU())
+        self.global_mlp = nn.Sequential(nn.Linear(global_dim, 32), nn.ReLU())
+        self.decision_mlp = nn.Sequential(nn.Linear(decision_output_dim, 64), nn.ReLU())
+
+        trunk_input_dim = 64 + 64 + 32 + 32 + 64
+        self.trunk = nn.Sequential(
+            nn.Linear(trunk_input_dim, trunk_hidden), nn.ReLU(),
+            nn.Linear(trunk_hidden, trunk_hidden), nn.ReLU(),
+        )
+
+        self.move_direction = nn.Linear(trunk_hidden, 2)   # sin/cos-style unit vector, see below
+        self.sprint_logit = nn.Linear(trunk_hidden, 1)       # Bernoulli: sprint vs jog
+        self.kick_logit = nn.Linear(trunk_hidden, 1)          # Bernoulli: kick this instant?
+        self.kick_direction = nn.Linear(trunk_hidden, 2)
+        self.kick_power = nn.Linear(trunk_hidden, 1)           # sigmoid -> 0-1 power_fraction
+        self.kick_spin = nn.Linear(trunk_hidden, 3)
+        self.tackle_attempt_logit = nn.Linear(trunk_hidden, 1)  # Bernoulli
+```
+
+`move_direction`/`kick_direction`: output a raw 2-vector and
+**L2-normalize** it to a unit vector (`v / (||v|| + eps)`) rather than
+outputting an angle directly - avoids the same angle-wraparound
+discontinuity problem noted for observations (2.2/7.2), and is
+differentiable/well-behaved for backprop. For PPO log_prob purposes on
+these direction heads, treat the *pre-normalization* raw 2D vector as
+sampled from an isotropic 2D Gaussian (`Normal(mean, std)` per component,
+independent), i.e. the same `SquashedNormalHead`-style machinery from 8.5
+but without the sigmoid/tanh squash step - just raw-then-normalize instead
+of raw-then-squash-to-range.
+
+## 9. PPO training loop - detailed, with explicit options
+
+### 9.1 What "one trajectory step" means here
+
+Given `DECISION_INTERVAL_S = 0.5s` and the engine's `dt = 1/30s`, one
+"environment step" for PPO purposes = **one decision interval**, not one
+engine tick: `MatchEnv.step(action)` internally (a) converts the sampled
+action into orders via `to_orders.py`, (b) assigns those orders to the
+player(s) being trained, (c) calls `Match.step()` in a loop ~15 times
+(0.5s / (1/30s)) advancing the underlying simulation, (d) computes the
+reward accumulated over those 15 ticks (section 9's reward section, 10
+below), (e) builds the next observation. This means a PPO "episode" (e.g.
+one curriculum-phase-1 trial capped at 2 minutes) is ~240 decision steps
+long (120s / 0.5s) - short enough that rollout buffers stay small and
+GAE/return computation is cheap, which is convenient for fast iteration on
+the MVP experiments.
+
+Other players in the scenario not currently being trained (e.g. a
+rules-based opponent, or a frozen older-generation checkpoint per the
+curriculum's self-play pool) are simply driven by whatever those
+mechanisms already are - the `orders`/`actions` layer for rules-based ones,
+or a separate frozen policy's forward pass (no gradient) for older-AI
+opponents - `MatchEnv` just needs to re-issue their orders/actions each
+decision interval (or every tick, if that opponent AI already works
+per-tick, e.g. `SaveOrder`/`MarkOrder`'s persistent-duty design already
+means "issue once, it stays in effect" so it doesn't need re-issuing at
+all).
+
+### 9.2 Reusing the UI scenarios for training data (explicit note, per user request)
+
+**`src/footballcoach/ui/scenarios.py` already contains built, tested
+scenario constructors (`build_penalty_scenario`, `build_tackle_scenario`,
+the 1v1/1v2/2v2 builders, etc.) and `ScenarioLoop`, which already knows how
+to run a scenario to completion, detect the outcome (goal/dispossessed/
+timeout/ball-out), and rebuild a fresh randomised trial. This is valuable,
+already-correct training-data infrastructure and should be reused rather
+than reimplemented:**
+
+- `env/scenario_env.py` should **wrap `ScenarioDefinition` + `ScenarioLoop`
+  directly**, rather than building a parallel/duplicate scenario-generation
+  path. Concretely: `ScenarioEnv.__init__(scenario: ScenarioDefinition,
+  trainee_player_id: str, **scenario_kwargs)` holds a `ScenarioLoop`
+  internally; `ScenarioEnv.reset()` calls (or waits for) the loop's
+  automatic match-rebuild-on-trial-end and returns the first observation;
+  `ScenarioEnv.step(action)` assigns the action's orders to the trainee
+  player, calls `ScenarioLoop.step()` in the required sub-loop (per 9.1),
+  and translates the loop's outcome (goal / dispossessed / timeout /
+  ball-out - see `ui/scenarios.py`'s `ScenarioLoop` for the exact outcome
+  enum) into a terminal reward + `done` flag.
+- This reuse is exactly why `ScenarioDefinition.build` functions already
+  taking `rng_reduction` and scenario-specific kwargs (separation
+  distance, attribute ranges, etc.) matters for training: the *same*
+  randomisation knobs already exposed to the UI's scenario-picker screen
+  (`ScenarioParam` list) double as the curriculum's difficulty/domain-
+  randomisation knobs during training, with zero duplicate code - e.g.
+  phase 1's "vary separation, vary attributes" requirement is already
+  exactly what `build_tackle_scenario`'s `separation_min_m` /
+  `separation_max_m` / `tackler_tackling_min/max` /
+  `dribbler_dribbling_min/max` kwargs provide.
+- Where a curriculum phase needs a scenario shape that doesn't exist yet in
+  `ui/scenarios.py` (e.g. a dedicated "1 attacker + keeper, empty vs
+  static-defender vs moving-defender" progression for phase 2's shooting
+  curriculum), **add it to `ui/scenarios.py` as a new `ScenarioDefinition`
+  builder** (following the existing file's conventions/docstring style)
+  rather than creating a separate training-only scenario module - this
+  keeps a single source of truth for scenario construction that's usable
+  both from the UI (for a human to visually spot-check what the AI is
+  training against) and from the training loop, and keeps the balance-test
+  suite's existing pattern (`tests/scenario/test_scenario_loop.py` already
+  exercises every entry in `SCENARIOS` generically) automatically covering
+  any new scenario added this way too.
+- The rules-based `orders`/`actions` "AI logic" already embedded in these
+  scenario builders (e.g. `build_tackle_scenario`'s use of
+  `ChaseTackleOrder`/`GetPossessionOrder`, `SaveOrder` for keepers) is
+  precisely the source of the "positive examples / scripted adversary or
+  ally" the curriculum (section 4) repeatedly calls for - no separate
+  scripted-opponent implementation is needed for the MVP experiments; it
+  already exists and is already tested.
+
+### 9.3 Rollout buffer + GAE(lambda)
+
+```python
+@dataclass
+class RolloutBuffer:
+    observations: list   # ObservationBatch per step
+    actions: list         # ActionOutput per step (raw, pre-gating - the
+                          # thing log_prob was computed against)
+    log_probs: list        # summed log_prob across ALL heads for this step
+    values: list             # critic's value estimate at this step
+    rewards: list             # scalar reward this step (see 9.5)
+    dones: list                # 1.0 if this step ended the episode
+
+    def compute_gae(self, gamma: float, lam: float, last_value: float):
+        advantages = [0.0] * len(self.rewards)
+        last_gae = 0.0
+        for t in reversed(range(len(self.rewards))):
+            next_value = self.values[t + 1] if t + 1 < len(self.values) else last_value
+            next_non_terminal = 1.0 - self.dones[t]
+            delta = self.rewards[t] + gamma * next_value * next_non_terminal - self.values[t]
+            last_gae = delta + gamma * lam * next_non_terminal * last_gae
+            advantages[t] = last_gae
+        returns = [a + v for a, v in zip(advantages, self.values)]
+        return advantages, returns
+```
+
+Standard GAE(lambda), `gamma≈0.99`, `lam≈0.95` as sane starting defaults
+(these plus all other hyperparameters belong in `ai_config.json`, not
+hardcoded - per section 6's `ai_config.json`, and consistent with the
+open-items note that exact hyperparameters are not yet decided/tuned).
+**Common silent bug to watch for** (flagged per section 3.1's warning that
+GAE bugs are silent): off-by-one on `next_value`/`dones` alignment - the
+value used for `delta` at step `t` must be the value estimate *after*
+transitioning (i.e. for the state the episode is *in* at `t+1`, not `t`),
+and `next_non_terminal` must zero out bootstrapping across an episode
+boundary. Writing a small unit test with a toy 3-step deterministic reward
+sequence and hand-computed expected advantages (in `tests/ai_unit/`) before
+trusting this against the real environment is strongly recommended.
+
+### 9.4 Actor/critic sharing - explicit options
+
+**Option A - Shared trunk (single network, two heads: policy heads + one
+value head off the same trunk features)**, as sketched in section 8.2's
+`DecisionNetwork.value_head`. Pros: fewer total parameters, faster to
+train per environment step (one forward pass computes both), and at small
+network scale (this project's MVP) is usually stable. Cons: the value
+loss's gradient and the policy loss's gradient both flow through the same
+trunk, so a large-magnitude value loss early in training (value function
+starts essentially random) can destabilise the policy's shared features
+before the value function calibrates - usually mitigated with a `vf_coef`
+weight (e.g. 0.5) down-weighting the value loss relative to the policy
+loss in the combined objective (see 9.6), and/or a warmup period.
+
+**Option B - Fully separate networks** (separate trunk for policy vs.
+value, doubling parameter count and forward-pass cost, no gradient
+interference). Cleaner in theory, standard in some PPO implementations
+(e.g. many robotics continuous-control setups use separate networks), at
+the cost of more compute and more total parameters to tune.
+
+**Recommendation for this project: start with Option A (shared trunk)** -
+given the modest network sizes needed for the MVP experiments (1v1/1v2
+scenarios, not full 11v11 matches yet) and the value of fast iteration,
+shared-trunk is the more common default in PPO reference implementations
+for small-to-medium tasks (e.g. OpenAI's original PPO paper and most
+CleanRL PPO variants default to a shared trunk for discrete-action tasks,
+though CleanRL's continuous-control variant actually uses fully separate
+networks). If value loss appears to destabilise policy training empirically
+(watch for policy entropy collapsing or KL divergence spiking right when
+value loss is large), switch to Option B - this is a cheap architectural
+change to make later (the value head is already factored out as its own
+`nn.Linear` in the sketch above) and doesn't require redesigning the rest
+of the system.
+
+Note this decision applies **independently to each of the two networks**
+(decision network's own actor/critic split, execution network's own
+actor/critic split) - it would also be reasonable to have the execution
+network's value function estimate be a *different* value function from the
+decision network's (e.g. different reward horizons/weightings per section
+9.5's per-head rewards), or to share a single combined value estimate
+across both - this is an open design choice, default recommendation:
+**one shared value estimate for the whole per-player action this tick**
+(decision + execution combined), since ultimately both networks are being
+optimised toward the same overall episode return, just at different levels
+of abstraction; revisit if the two networks need genuinely different
+training paces (e.g. execution-network-only phases of the curriculum,
+section 4).
+
+### 9.5 Per-head log_prob combination
+
+For a single environment step, log_prob is a **sum across every head that
+was "active"/relevant this step** - not every head is included every step
+(e.g. `pass_target_logits`'s log_prob only makes sense/should only be
+included if `pass_logit`'s Bernoulli sample was 1 this step, or during
+early bootstrapped phases, if the rules-based target was actually a pass).
+Concretely:
+
+```python
+def combined_log_prob(heads: DecisionHeadsRaw, action: DecisionAction, exists_mask) -> torch.Tensor:
+    lp = 0.0
+    lp = lp + IndependentBernoulli(heads.shoot_logit).log_prob(action.shoot)
+    lp = lp + IndependentBernoulli(heads.pass_logit).log_prob(action.pass_)
+    lp = lp + IndependentBernoulli(heads.move_logit).log_prob(action.move)
+    lp = lp + IndependentBernoulli(heads.tackle_logit).log_prob(action.tackle)
+    lp = lp + IndependentBernoulli(heads.get_possession_raw).log_prob(action.get_possession_extra)
+    lp = lp + IndependentBernoulli(heads.mark_logit).log_prob(action.mark)
+    lp = lp + IndependentBernoulli(heads.hold_position_logit).log_prob(action.hold_position)
+
+    # Target heads: only meaningfully sampled/relevant if the corresponding
+    # intent action was 1 this step (masked contribution otherwise - use
+    # action.pass_ as a 0/1 multiplier so an irrelevant target doesn't
+    # contribute gradient/log_prob noise on steps where it wasn't used).
+    lp = lp + action.pass_ * MaskedCategorical(heads.pass_target_logits, exists_mask).log_prob(action.pass_target)
+    lp = lp + action.tackle * MaskedCategorical(heads.tackle_target_logits, exists_mask).log_prob(action.tackle_target)
+    lp = lp + action.mark * MaskedCategorical(heads.mark_target_logits, exists_mask).log_prob(action.mark_target)
+
+    # Continuous heads similarly gated by relevance where applicable
+    # (move_region/arrival_speed only meaningfully "used" if move or
+    # hold_position fired - but simplest starting point: just always
+    # include them un-gated, since they're cheap/always well-defined
+    # continuous outputs, unlike the categorical targets which need an
+    # actual target player to exist. Recommend starting ungated for
+    # continuous heads and revisiting if this causes gradient noise.)
+    ...
+    return lp
+```
+
+This per-head-sum approach treats the whole multi-head action as one
+factorized joint distribution (`log P(all heads) = sum(log P(each
+head))`), which is the standard, correct way to combine independent action
+components for PPO's ratio calculation - `π_new(a|s)/π_old(a|s)` becomes
+`exp(sum(new_log_probs) - sum(old_log_probs))`, exactly analogous to how
+`MultiDiscrete` action spaces are already handled in most RL libraries,
+just generalised to a mix of Bernoulli/Categorical/Normal components.
+
+### 9.6 Clipped surrogate objective + full loss
+
+```python
+def ppo_loss(new_log_probs, old_log_probs, advantages, values, returns,
+             entropy, clip_range=0.2, vf_coef=0.5, ent_coef=0.01):
+    ratio = torch.exp(new_log_probs - old_log_probs)
+    advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)  # normalize
+
+    surr1 = ratio * advantages
+    surr2 = torch.clamp(ratio, 1 - clip_range, 1 + clip_range) * advantages
+    policy_loss = -torch.min(surr1, surr2).mean()
+
+    value_loss = F.mse_loss(values, returns)   # consider PPO's optional value clipping too
+
+    entropy_loss = -entropy.mean()   # encourage exploration
+
+    total_loss = policy_loss + vf_coef * value_loss + ent_coef * entropy_loss
+    return total_loss, dict(policy_loss=policy_loss.item(), value_loss=value_loss.item(),
+                              entropy=entropy.mean().item(), approx_kl=(old_log_probs - new_log_probs).mean().item())
+```
+
+Standard multi-epoch PPO update: for each rollout collection (e.g. a batch
+of full episodes/trials), run `K` epochs (e.g. 4-10) over the buffer in
+shuffled minibatches, recomputing `new_log_probs`/`values`/`entropy` each
+epoch (since the policy has changed), while `old_log_probs`/`advantages`/
+`returns` are fixed from the original rollout. Track `approx_kl` and
+early-stop epochs for a batch if it exceeds a threshold (e.g. 0.02) -
+standard PPO safety valve against a batch of stale advantages pushing the
+policy too far in one update.
+
+### 9.7 Illegal-action handling (developer note: engine should guard, confirmed)
+
+Per the user's explicit confirmation, **the engine should guard against
+illegal actions being physically possible** (e.g. `KickOrder`/`ShootOrder`
+already appear to require possession implicitly via `kick_ball`'s
+mechanics reading `ball.possessed_by` - this needs auditing/confirming
+during implementation, not yet verified as of this document) - i.e. an
+illegal action attempt should be a safe no-op at the engine level, not
+something that could corrupt match state, **and** the AI should be
+separately punished for attempting it via the reward function (a negative
+reward term applied whenever `to_orders.py` detects the action-to-order
+translation was attempted against an illegal precondition, e.g. shooting
+without possession, tackling out of range) - both protections should exist
+simultaneously (engine safety net + reward-shaping deterrent), not one
+instead of the other.
+
+## 10. Reward shaping (concrete starting formulas - all coefficients tunable)
+
+These are **starting points for the MVP experiments only** (per section 5),
+to be tuned empirically exactly like the engine's balance constants -
+expressed here as concrete formulas so implementation has something
+concrete to start from, not just "reward getting the ball" prose.
+
+### 10.1 Experiment 1 (GetPossession/Move)
+
+Per-decision-step reward, accumulated over the ~15 engine ticks in that
+interval:
+
+```python
+def phase1_reward(prev_ball_dist, curr_ball_dist, has_possession_now,
+                   gained_possession_this_step, ball_progress_toward_goal_m,
+                   ball_went_out_after_touch, illegal_action_attempted,
+                   reached_opponent_box_with_possession, timed_out) -> float:
+    r = 0.0
+    r += 0.05 * (prev_ball_dist - curr_ball_dist)     # shaping: closing distance to ball
+    if gained_possession_this_step:
+        r += 1.0                                        # one-off bonus for winning the ball
+    if has_possession_now:
+        r += 0.1 * ball_progress_toward_goal_m           # progressing the ball upfield
+    if ball_went_out_after_touch:
+        r -= 1.0
+    if illegal_action_attempted:
+        r -= 0.2
+    if reached_opponent_box_with_possession:
+        r += 5.0   # terminal bonus, episode ends
+    # timed_out: no terminal bonus/penalty, just ends
+    return r
+```
+
+### 10.2 Experiment 2 (Shoot)
+
+```python
+def phase2_reward(shot_taken_this_step, ticks_since_episode_start,
+                   shot_on_target, goal_scored, illegal_action_attempted,
+                   possession_lost_to_keeper) -> float:
+    r = 0.0
+    if shot_taken_this_step:
+        # Faster shots rewarded more - decaying bonus the longer the player
+        # waited before shooting.
+        r += 1.0 * max(0.0, 1.0 - ticks_since_episode_start / MAX_EPISODE_TICKS)
+        if shot_on_target:
+            r += 2.0
+        if goal_scored:
+            r += 10.0   # terminal
+    if illegal_action_attempted:
+        r -= 0.2
+    if possession_lost_to_keeper:
+        r -= 0.5   # mild - not the end of the world, but shouldn't be the norm
+    return r
+```
+
+Additionally, per section 5, the **decision network's `shoot_logit` head
+specifically** needs an auxiliary loss/reward term encouraging
+`shoot_probability > 0.5` in scenarios where shooting was actually the
+correct behaviour-bootstrapping target (rules-based comparison, exactly
+like phase 1's Move/GetPossession bootstrapping) - i.e. during the initial
+bootstrap sub-phase, add a supervised cross-entropy term between
+`shoot_logit` and the rules-based "should have shot here" binary label,
+alongside (not instead of) the PPO reward-driven loss, then anneal the
+supervised term's weight to zero as training progresses into pure RL.
+
+## 11. Illegal-action / guardrail engine audit checklist (to action during implementation)
+
+Concrete checklist for auditing `engine/` before/while wiring up
+`to_orders.py`, since the user confirmed illegal actions must be guarded:
+
+- [ ] `KickOrder`/`ShootOrder` execution: confirm `Match._process_orders`
+      already no-ops (rather than erroring or producing a nonsensical kick)
+      if the ordering player does not currently have `ball.possessed_by ==
+      player.player_id`. If not, add the guard.
+- [ ] `TackleOrder`/`ChaseTackleOrder`/`GetPossessionOrder`: confirm
+      attempting a tackle while `player.state == INACTIVE_TACKLED` is
+      already prevented (per `is_available_to_tackle()` in
+      `entities/player.py`) at every call site, not just some.
+- [ ] `PassOrder`: same possession precondition as `KickOrder`.
+- [ ] `SaveOrder`: confirm a non-goalkeeper issuing this order is a safe
+      no-op rather than undefined behaviour (per docstring, "Goalkeeper-only" -
+      verify this is actually enforced somewhere, not just documented).
+- [ ] Whatever guard behaviour is found/added, `to_orders.py` must be able
+      to *detect* "this action would have been illegal" independently
+      (i.e. don't rely on silently-no-op engine behaviour alone - the
+      reward function needs an explicit boolean to penalise), e.g. by
+      checking the same precondition in Python before/alongside assigning
+      the order, or by having the engine expose a small result/status object
+      from `_process_orders` indicating whether each order was legal this
+      tick.
+
+## 12. Testing strategy for the AI code
+
+Mirroring the existing engine's unit/scenario/balance test-tier convention:
+
+- **`tests/ai_unit/`** (fast, deterministic, no torch training loop): 
+  - Observation encoder: given a hand-built `Match` state, assert the
+    produced tensors have correct shape, correct masking (`exists` bits,
+    padded slots zeroed), correct normalization (e.g. a player exactly at
+    the pitch boundary produces `rel_dx ≈ ±1.0`), and correct random slot
+    shuffling (assert two calls with different RNG seeds place the same
+    real player in different slots, but always produce identical *content*
+    modulo slot permutation).
+  - `MaskedCategorical`/`IndependentBernoulli`/`SquashedNormalHead`: verify
+    `log_prob`/`entropy`/`sample` don't NaN, masked slots truly get zero
+    probability, squashing stays within declared physical bounds.
+  - GAE: small hand-computed toy sequence (section 9.3's note).
+  - `select_action()` gating rule (section 2.6): given a hand-built set of
+    head probabilities, assert the correct single winner is selected above
+    50% threshold, and that below-50%-for-everything correctly selects
+    "no action" (or whichever the design's convention is for that case -
+    **open item, not yet decided: what should happen if EVERY head is below
+    50%?** e.g. hold-position by default, or the previous tick's action
+    persists, or a dedicated small "no-op movement" default - flag this
+    explicitly as needing a decision before `gating.py` can be finalized).
+- **`tests/ai_scenario/`**: short smoke tests that a handful of PPO update
+  steps on a tiny toy environment (not necessarily the full football env -
+  a synthetic environment with a known optimal policy, e.g. "reward is
+  higher the closer a single continuous action value is to a fixed target"
+  is a good sanity check independent of football-specific complexity) run
+  without crashing and visibly reduce loss / increase reward over a few
+  iterations - catches gross implementation bugs before spending compute
+  on the real football scenarios.
+- **`ai/scripts/evaluate.py`**: mirrors `tests/balance/`'s reporting
+  convention (full stats, not just pass/fail) - run N trials of a given
+  curriculum-phase scenario with the current policy checkpoint, report
+  win-rate/goal-rate/average-time-to-shoot/etc., written to a results file
+  the same way `tests/balance/results/latest_results.json` works today.
+
+## 13. Open items / not yet decided
 
 These are flagged so a future session doesn't assume they're settled:
 
-- Exact reward function coefficients/shaping for each head (only
-  qualitative direction has been agreed so far, e.g. "reward closing
-  distance to ball," not exact formulas).
+- Exact reward function coefficients/shaping for each head - section 10
+  now gives concrete starting formulas for the two MVP experiments, but
+  these are explicitly starting points to tune empirically, not final
+  values; reward shaping for the later curriculum phases (passing,
+  tackling, marking, region-of-play, attack/defence-weighted rewards) is
+  still only qualitative.
 - Exact network sizes/hyperparameters (layer widths, attention head count,
-  learning rate, clip range, GAE lambda/gamma, etc.) - to be chosen during
-  implementation and tuned empirically, likely exposed via config similar
-  to the engine's `physics.json`/`attributes.json` pattern.
-- Whether/how the existing engine already guardrails all illegal actions
-  the execution network could attempt (kicking without possession, etc.) -
-  needs an audit; extend `engine/` as needed and punish illegal attempts in
-  the reward function. - Developer note: yes, they engine should definitely guard illegal actions like kicking without possession
-- How often the networks run relative to the engine's fixed 1/30s tick -
-  user confirmed this should be a tunable parameter (networks need not run
-  every tick), but no specific default has been chosen yet.
-    - let's say every 0.5s for now
+  learning rate, clip range, GAE lambda/gamma, etc.) - section 8/9 gives
+  concrete starting defaults (e.g. `trunk_hidden=256`, `embed_dim=64`,
+  `gamma=0.99`, `lam=0.95`, `clip_range=0.2`), but these are all
+  first-guess values to be tuned empirically once training actually runs,
+  exposed via `ai/config/ai_config.json` matching the engine's
+  `physics.json`/`attributes.json` pattern.
+- **RESOLVED**: illegal-action guarding - confirmed by user, the engine
+  must guard illegal actions (e.g. kicking without possession) as a safe
+  no-op, *and* the reward function must separately penalise the attempt.
+  See section 9.7 and the concrete audit checklist in section 11 for what
+  still needs verifying/adding in `engine/`.
+- **RESOLVED**: decision interval - confirmed by user as `0.5s` to start
+  (section 7.1's `DECISION_INTERVAL_S`), i.e. the decision+execution
+  networks run roughly every 15 engine ticks, not every tick.
 - Whether stable-baselines3 (or another library) should be reconsidered
   later - see section 3.1's explicit note that the custom-loop choice is
   revisitable.
@@ -484,3 +1505,36 @@ These are flagged so a future session doesn't assume they're settled:
   output, initialised so "move toward the ball" is a good prior from the
   start) - raised as an idea by the user, not yet decided whether/how to
   implement.
+- **New, from section 12's test-design discussion**: what should the
+  `select_action()` gating rule (section 2.6) do when *every* action-
+  probability head is below 50% this decision tick? Candidate options not
+  yet chosen between: (a) default to Hold-Position, (b) let the previous
+  decision's action persist unchanged, (c) a dedicated small "no-op/idle"
+  behaviour distinct from Hold-Position's region-penalty semantics. Needs
+  a decision before `action/gating.py` can be finalized.
+- Actor/critic sharing (section 9.4): recommended default is a shared
+  trunk per network (decision network's own actor/critic, execution
+  network's own actor/critic, one combined value estimate per player per
+  decision step) - flagged as easy to change later, not fully locked in.
+- Squashed-Gaussian log_prob correction for continuous heads (section 8.5):
+  deliberately *not* applying the tanh/sigmoid-Jacobian correction some
+  algorithms (e.g. SAC) use, as is common practice for PPO - flagged as a
+  known, deliberate approximation rather than an oversight, revisit only if
+  continuous-head training behaves oddly.
+- Whether execution-network-only phases of the curriculum need a
+  *different* value function/reward horizon from the decision network -
+  section 9.4 flags this as an open question with a default recommendation
+  (share one value estimate) rather than a settled answer.
+
+## 14. Reuse of `ui/scenarios.py` for training (summary pointer)
+
+See section 9.2 for the full explanation - **short version for anyone
+skimming this document**: do not build a separate/duplicate scenario or
+scripted-opponent system for training. `src/footballcoach/ui/scenarios.py`
+(`ScenarioDefinition`, `ScenarioLoop`, and the various `build_*` functions
+like `build_tackle_scenario`) already provides tested, randomisable,
+outcome-detecting scenario construction with rules-based AI logic built in
+via the existing `orders`/`actions` layer - `ai/env/scenario_env.py` should
+wrap these directly, and any new scenario shape a curriculum phase needs
+should be added to `ui/scenarios.py` itself (as a new `ScenarioDefinition`),
+not to a parallel training-only module.
