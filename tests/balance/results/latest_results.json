@@ -1,18 +1,18 @@
 {
   "penalty_precision_0.5_centre_aim": {
     "n_trials": 2000,
-    "scored": 2000,
-    "score_rate_pct": 100.0
+    "scored": 1979,
+    "score_rate_pct": 98.95
   },
   "penalty_precision_0.5_corner_aim": {
     "n_trials": 2000,
-    "scored": 1585,
-    "score_rate_pct": 79.25
+    "scored": 1440,
+    "score_rate_pct": 72.0
   },
   "penalty_precision_0.8_corner_aim": {
     "n_trials": 2000,
-    "scored": 1898,
-    "score_rate_pct": 94.9
+    "scored": 1742,
+    "score_rate_pct": 87.1
   },
   "sprint_100m_top_attrs_no_ball_seconds": {
     "time_s": 11.57
@@ -35,46 +35,46 @@
   },
   "tackling_0.8_vs_dribbling_0.6": {
     "n_trials": 5000,
-    "wins": 4124,
-    "win_rate_pct": 82.48
+    "wins": 4220,
+    "win_rate_pct": 84.4
   },
   "tackling_win_rate_grid_pct": {
-    "tackling=0.2_vs_dribbling=0.2": 63.1,
-    "tackling=0.2_vs_dribbling=0.4": 15.4,
-    "tackling=0.2_vs_dribbling=0.5": 7.4,
-    "tackling=0.2_vs_dribbling=0.6": 2.2,
+    "tackling=0.2_vs_dribbling=0.2": 66.1,
+    "tackling=0.2_vs_dribbling=0.4": 16.6,
+    "tackling=0.2_vs_dribbling=0.5": 8.7,
+    "tackling=0.2_vs_dribbling=0.6": 3.3,
     "tackling=0.2_vs_dribbling=0.8": 0.0,
     "tackling=0.2_vs_dribbling=0.95": 0.0,
-    "tackling=0.4_vs_dribbling=0.2": 96.4,
-    "tackling=0.4_vs_dribbling=0.4": 63.1,
-    "tackling=0.4_vs_dribbling=0.5": 45.0,
-    "tackling=0.4_vs_dribbling=0.6": 30.0,
-    "tackling=0.4_vs_dribbling=0.8": 15.4,
-    "tackling=0.4_vs_dribbling=0.95": 8.8,
-    "tackling=0.5_vs_dribbling=0.2": 99.4,
-    "tackling=0.5_vs_dribbling=0.4": 77.2,
-    "tackling=0.5_vs_dribbling=0.5": 63.1,
-    "tackling=0.5_vs_dribbling=0.6": 47.7,
-    "tackling=0.5_vs_dribbling=0.8": 25.2,
-    "tackling=0.5_vs_dribbling=0.95": 17.7,
+    "tackling=0.4_vs_dribbling=0.2": 97.1,
+    "tackling=0.4_vs_dribbling=0.4": 66.1,
+    "tackling=0.4_vs_dribbling=0.5": 47.7,
+    "tackling=0.4_vs_dribbling=0.6": 33.1,
+    "tackling=0.4_vs_dribbling=0.8": 16.6,
+    "tackling=0.4_vs_dribbling=0.95": 9.7,
+    "tackling=0.5_vs_dribbling=0.2": 99.9,
+    "tackling=0.5_vs_dribbling=0.4": 79.7,
+    "tackling=0.5_vs_dribbling=0.5": 66.1,
+    "tackling=0.5_vs_dribbling=0.6": 51.0,
+    "tackling=0.5_vs_dribbling=0.8": 28.1,
+    "tackling=0.5_vs_dribbling=0.95": 19.4,
     "tackling=0.6_vs_dribbling=0.2": 100.0,
-    "tackling=0.6_vs_dribbling=0.4": 86.3,
-    "tackling=0.6_vs_dribbling=0.5": 75.1,
-    "tackling=0.6_vs_dribbling=0.6": 63.1,
-    "tackling=0.6_vs_dribbling=0.8": 38.8,
-    "tackling=0.6_vs_dribbling=0.95": 26.4,
+    "tackling=0.6_vs_dribbling=0.4": 87.5,
+    "tackling=0.6_vs_dribbling=0.5": 77.2,
+    "tackling=0.6_vs_dribbling=0.6": 66.1,
+    "tackling=0.6_vs_dribbling=0.8": 43.0,
+    "tackling=0.6_vs_dribbling=0.95": 29.2,
     "tackling=0.8_vs_dribbling=0.2": 100.0,
-    "tackling=0.8_vs_dribbling=0.4": 96.4,
-    "tackling=0.8_vs_dribbling=0.5": 88.1,
-    "tackling=0.8_vs_dribbling=0.6": 80.4,
-    "tackling=0.8_vs_dribbling=0.8": 63.1,
-    "tackling=0.8_vs_dribbling=0.95": 48.4,
+    "tackling=0.8_vs_dribbling=0.4": 97.1,
+    "tackling=0.8_vs_dribbling=0.5": 89.8,
+    "tackling=0.8_vs_dribbling=0.6": 82.7,
+    "tackling=0.8_vs_dribbling=0.8": 66.1,
+    "tackling=0.8_vs_dribbling=0.95": 52.0,
     "tackling=0.95_vs_dribbling=0.2": 100.0,
-    "tackling=0.95_vs_dribbling=0.4": 99.1,
-    "tackling=0.95_vs_dribbling=0.5": 94.3,
-    "tackling=0.95_vs_dribbling=0.6": 87.8,
-    "tackling=0.95_vs_dribbling=0.8": 74.5,
-    "tackling=0.95_vs_dribbling=0.95": 63.1
+    "tackling=0.95_vs_dribbling=0.4": 99.3,
+    "tackling=0.95_vs_dribbling=0.5": 96.1,
+    "tackling=0.95_vs_dribbling=0.6": 89.4,
+    "tackling=0.95_vs_dribbling=0.8": 76.6,
+    "tackling=0.95_vs_dribbling=0.95": 66.1
   },
   "turning_reversal_scenario_accel_0.5": {
     "reference_speed_mps": 7.56,
@@ -169,13 +169,13 @@
   },
   "shoot_low_attrs_random_in_box": {
     "n_trials": 500,
-    "scored": 474,
-    "score_rate_pct": 94.8
+    "scored": 479,
+    "score_rate_pct": 95.8
   },
   "shoot_mid_attrs_random_in_box": {
     "n_trials": 500,
-    "scored": 499,
-    "score_rate_pct": 99.8
+    "scored": 500,
+    "score_rate_pct": 100.0
   },
   "shoot_high_attrs_random_in_box": {
     "n_trials": 500,
@@ -184,12 +184,12 @@
   },
   "shoot_scoring_rate_grid_pct": {
     "precision=0.2_penalty_spot": 100.0,
-    "precision=0.2_edge_of_box_centre": 100.0,
-    "precision=0.2_edge_of_box_wide_angle": 94.5,
+    "precision=0.2_edge_of_box_centre": 97.5,
+    "precision=0.2_edge_of_box_wide_angle": 92.0,
     "precision=0.2_six_yard_box": 100.0,
     "precision=0.5_penalty_spot": 100.0,
     "precision=0.5_edge_of_box_centre": 100.0,
-    "precision=0.5_edge_of_box_wide_angle": 100.0,
+    "precision=0.5_edge_of_box_wide_angle": 97.5,
     "precision=0.5_six_yard_box": 100.0,
     "precision=0.8_penalty_spot": 100.0,
     "precision=0.8_edge_of_box_centre": 100.0,
@@ -197,71 +197,71 @@
     "precision=0.8_six_yard_box": 100.0
   },
   "pass_10m_precision_0.5": {
-    "n_trials": 500,
-    "succeeded": 500,
-    "success_rate_pct": 100.0
+    "n_trials": 200,
+    "succeeded": 195,
+    "success_rate_pct": 97.5
   },
   "pass_10m_precision_0.15": {
-    "n_trials": 500,
-    "succeeded": 497,
-    "success_rate_pct": 99.4
+    "n_trials": 200,
+    "succeeded": 169,
+    "success_rate_pct": 84.5
   },
   "pass_10m_precision_0.9": {
-    "n_trials": 500,
-    "succeeded": 500,
+    "n_trials": 200,
+    "succeeded": 200,
     "success_rate_pct": 100.0
   },
   "pass_30m_precision_0.5": {
     "n_trials": 500,
-    "succeeded": 377,
-    "success_rate_pct": 75.4
+    "succeeded": 117,
+    "success_rate_pct": 23.4
   },
   "pass_30m_precision_0.1": {
     "n_trials": 500,
-    "succeeded": 292,
-    "success_rate_pct": 58.4
+    "succeeded": 66,
+    "success_rate_pct": 13.2
   },
   "pass_30m_precision_0.9": {
     "n_trials": 500,
-    "succeeded": 465,
-    "success_rate_pct": 93.0
+    "succeeded": 341,
+    "success_rate_pct": 68.2
   },
   "pass_success_rate_grid_pct": {
-    "precision=0.1_distance=5.0m": 100.0,
-    "precision=0.1_distance=10.0m": 99.33,
-    "precision=0.1_distance=20.0m": 78.67,
-    "precision=0.1_distance=30.0m": 62.0,
-    "precision=0.1_distance=40.0m": 46.0,
+    "precision=0.1_distance=5.0m": 98.67,
+    "precision=0.1_distance=10.0m": 81.33,
+    "precision=0.1_distance=20.0m": 51.33,
+    "precision=0.1_distance=25.0m": 41.33,
+    "precision=0.1_distance=30.0m": 0.0,
     "precision=0.3_distance=5.0m": 100.0,
-    "precision=0.3_distance=10.0m": 98.67,
-    "precision=0.3_distance=20.0m": 84.67,
-    "precision=0.3_distance=30.0m": 64.0,
-    "precision=0.3_distance=40.0m": 52.67,
+    "precision=0.3_distance=10.0m": 90.0,
+    "precision=0.3_distance=20.0m": 58.0,
+    "precision=0.3_distance=25.0m": 48.0,
+    "precision=0.3_distance=30.0m": 0.0,
     "precision=0.5_distance=5.0m": 100.0,
-    "precision=0.5_distance=10.0m": 99.33,
-    "precision=0.5_distance=20.0m": 90.67,
-    "precision=0.5_distance=30.0m": 74.67,
-    "precision=0.5_distance=40.0m": 57.33,
+    "precision=0.5_distance=10.0m": 95.33,
+    "precision=0.5_distance=20.0m": 73.33,
+    "precision=0.5_distance=25.0m": 57.33,
+    "precision=0.5_distance=30.0m": 0.0,
     "precision=0.7_distance=5.0m": 100.0,
     "precision=0.7_distance=10.0m": 100.0,
-    "precision=0.7_distance=20.0m": 94.0,
-    "precision=0.7_distance=30.0m": 84.0,
-    "precision=0.7_distance=40.0m": 70.0,
+    "precision=0.7_distance=20.0m": 85.33,
+    "precision=0.7_distance=25.0m": 83.33,
+    "precision=0.7_distance=30.0m": 0.0,
     "precision=0.9_distance=5.0m": 100.0,
     "precision=0.9_distance=10.0m": 100.0,
     "precision=0.9_distance=20.0m": 98.67,
-    "precision=0.9_distance=30.0m": 92.0,
-    "precision=0.9_distance=40.0m": 79.33
+    "precision=0.9_distance=25.0m": 98.0,
+    "precision=0.9_distance=30.0m": 0.0
   },
   "pass_random_scenarios_good_vs_bad": {
     "n_scenarios": 150,
-    "bad_player_precision_0.15_success_pct": 76.0,
-    "good_player_precision_0.9_success_pct": 98.0
+    "bad_player_precision_0.15_success_pct": 43.3,
+    "good_player_precision_0.9_success_pct": 73.3
   },
   "tackle_action_0.8_vs_0.6_dist5m": {
     "n_trials": 500,
-    "wins": 402,
-    "win_rate_pct": 80.4
+    "wins": 62,
+    "win_rate_pct": 12.4
   },
   "tackle_action_weak_vs_strong": {
     "n_trials": 300,
@@ -274,59 +274,156 @@
     "win_rate_pct": 100.0
   },
   "tackle_action_win_rate_grid_pct": {
-    "tackling=0.2_vs_dribbling=0.2": 62.7,
-    "tackling=0.2_vs_dribbling=0.5": 8.7,
+    "tackling=0.2_vs_dribbling=0.2": 2.7,
+    "tackling=0.2_vs_dribbling=0.5": 0.0,
     "tackling=0.2_vs_dribbling=0.8": 0.0,
-    "tackling=0.5_vs_dribbling=0.2": 100.0,
-    "tackling=0.5_vs_dribbling=0.5": 62.7,
-    "tackling=0.5_vs_dribbling=0.8": 26.0,
-    "tackling=0.8_vs_dribbling=0.2": 100.0,
-    "tackling=0.8_vs_dribbling=0.5": 89.3,
-    "tackling=0.8_vs_dribbling=0.8": 62.7
+    "tackling=0.5_vs_dribbling=0.2": 48.7,
+    "tackling=0.5_vs_dribbling=0.5": 2.7,
+    "tackling=0.5_vs_dribbling=0.8": 0.0,
+    "tackling=0.8_vs_dribbling=0.2": 83.3,
+    "tackling=0.8_vs_dribbling=0.5": 20.7,
+    "tackling=0.8_vs_dribbling=0.8": 2.7
   },
   "tackle_action_random_scenarios": {
     "n_scenarios": 200,
-    "defender_favoured_win_pct": 97.0,
-    "attacker_favoured_tackler_win_pct": 10.0
+    "defender_favoured_win_pct": 99.5,
+    "attacker_favoured_tackler_win_pct": 17.5
   },
   "save_far_post_fast_vs_slow_gk": {
     "fast_gk": {
       "n_trials": 300,
-      "saved": 283,
-      "save_rate_pct": 94.33
+      "saved": 253,
+      "save_rate_pct": 84.33
     },
     "slow_gk": {
       "n_trials": 300,
-      "saved": 1,
-      "save_rate_pct": 0.33
+      "saved": 0,
+      "save_rate_pct": 0.0
     }
   },
   "save_centre_aim_easy_case": {
     "good_gk": {
       "n_trials": 200,
-      "saved": 196,
-      "save_rate_pct": 98.0
+      "saved": 200,
+      "save_rate_pct": 100.0
     },
     "bad_gk": {
       "n_trials": 200,
-      "saved": 196,
-      "save_rate_pct": 98.0
+      "saved": 200,
+      "save_rate_pct": 100.0
     }
   },
   "save_rate_grid_pct": {
-    "gk_speed=0.1_near_post": 96.0,
+    "gk_speed=0.1_near_post": 80.0,
     "gk_speed=0.1_centre": 100.0,
-    "gk_speed=0.1_far_post": 44.7,
-    "gk_speed=0.5_near_post": 96.0,
+    "gk_speed=0.1_far_post": 6.7,
+    "gk_speed=0.5_near_post": 80.0,
     "gk_speed=0.5_centre": 100.0,
-    "gk_speed=0.5_far_post": 92.0,
-    "gk_speed=0.9_near_post": 96.0,
+    "gk_speed=0.5_far_post": 74.0,
+    "gk_speed=0.9_near_post": 80.0,
     "gk_speed=0.9_centre": 100.0,
-    "gk_speed=0.9_far_post": 92.0
+    "gk_speed=0.9_far_post": 74.0
   },
   "save_random_scenarios_good_vs_bad": {
     "n_scenarios": 150,
-    "good_gk_save_rate_pct": 100.0,
-    "bad_gk_save_rate_pct": 85.3
+    "good_gk_save_rate_pct": 75.3,
+    "bad_gk_save_rate_pct": 23.3
+  },
+  "dribble_speed_penalty_avg": {
+    "n_dribbler_wins": 980,
+    "avg_speed_multiplier": 0.7556,
+    "min_speed_multiplier": 0.2008,
+    "max_speed_multiplier": 1.0
+  },
+  "dribble_penalty_large_margin": {
+    "n_dribbler_wins": 3000,
+    "avg_speed_multiplier": 1.0
+  },
+  "dribble_penalty_narrow_margin": {
+    "n_dribbler_wins": 1212,
+    "avg_speed_multiplier": 0.7701
+  },
+  "dribble_penalty_near_zero_margin": {
+    "speed_multiplier": 0.2205920205920201
+  },
+  "goalkeeper_tackle_boost": {
+    "n": 2000,
+    "gk_win_rate_pct": 66.9,
+    "outfield_win_rate_pct": 30.2
+  },
+  "tackle_angle_win_rates_equal_attrs": {
+    "n": 2000,
+    "frontal_win_pct": 72.5,
+    "side_win_pct": 63.6,
+    "behind_win_pct": 16.8
+  },
+  "tackle_angle_behind_equal_attrs": {
+    "n": 2000,
+    "behind_win_pct": 16.8
+  },
+  "tackle_angle_frontal_equal_attrs": {
+    "n": 2000,
+    "frontal_win_pct": 72.5
+  },
+  "tackle_action_0.8_vs_0.6_dist5m_frontal": {
+    "n_trials": 500,
+    "wins": 432,
+    "win_rate_pct": 86.4
+  },
+  "tackle_action_0.8_vs_0.6_frontal_vs_behind": {
+    "n": 500,
+    "frontal_win_pct": 86.4,
+    "behind_win_pct": 33.4
+  },
+  "tackle_action_win_rate_grid_pct_frontal": {
+    "tackling=0.2_vs_dribbling=0.2": 72.7,
+    "tackling=0.2_vs_dribbling=0.5": 13.3,
+    "tackling=0.2_vs_dribbling=0.8": 1.3,
+    "tackling=0.5_vs_dribbling=0.2": 100.0,
+    "tackling=0.5_vs_dribbling=0.5": 72.7,
+    "tackling=0.5_vs_dribbling=0.8": 36.0,
+    "tackling=0.8_vs_dribbling=0.2": 100.0,
+    "tackling=0.8_vs_dribbling=0.5": 94.7,
+    "tackling=0.8_vs_dribbling=0.8": 72.7
+  },
+  "pass_25m_precision_0.5": {
+    "n_trials": 200,
+    "succeeded": 119,
+    "success_rate_pct": 59.5
+  },
+  "pass_25m_precision_0.1": {
+    "n_trials": 200,
+    "succeeded": 72,
+    "success_rate_pct": 36.0
+  },
+  "pass_25m_precision_0.9": {
+    "n_trials": 200,
+    "succeeded": 190,
+    "success_rate_pct": 95.0
+  },
+  "pass_40m_precision_0.5": {
+    "n_trials": 200,
+    "succeeded": 47,
+    "success_rate_pct": 23.5
+  },
+  "pass_40m_precision_0.9": {
+    "n_trials": 200,
+    "succeeded": 136,
+    "success_rate_pct": 68.0
+  },
+  "pass_60m_precision_0.9": {
+    "n_trials": 200,
+    "succeeded": 83,
+    "success_rate_pct": 41.5
+  },
+  "pass_75m_precision_0.9": {
+    "n_trials": 200,
+    "succeeded": 0,
+    "success_rate_pct": 0.0
+  },
+  "pass_70m_precision_0.9": {
+    "n_trials": 200,
+    "succeeded": 52,
+    "success_rate_pct": 26.0
   }
 }

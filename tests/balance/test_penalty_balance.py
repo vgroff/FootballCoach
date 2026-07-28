@@ -6,13 +6,17 @@ number of trials. These directly encode the user's explicit design targets:
 - precision 0.5, aim bottom corner: 50-80% scored
 - precision 0.8, aim bottom corner: 85-95% scored
 
-Every test reports full statistics via `balance_recorder`, not just pass/fail.
+Penalty setup: the kicker runs in at full sprinting speed (velocity set to
+their ball-carry effective top speed in the +x direction before the kick),
+shoots at power_fraction=0.8. The running boost adds power AND inaccuracy
+via the unified power-error coupling.
 """
 from __future__ import annotations
 
 import random
 
 from footballcoach.engine.match import Match
+from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import KickOrder
@@ -20,26 +24,37 @@ from tests.conftest import make_player
 
 N_TRIALS = 2000
 RNG_REDUCTION = 0.3
+PENALTY_POWER = 0.8
 
 
 def _run_penalty_trials(precision: float, aim_offset_y: float, aim_offset_z: float, n_trials: int) -> dict:
     pitch = Pitch.standard()
     penalty_spot = pitch.penalty_spot(left=False)
     goal_centre = pitch.right_goal_centre
+    mvmt = MovementParams.from_config()
 
     scored = 0
     for seed in range(n_trials):
         kicker = make_player(
             "p1", team=Team.LEFT, position=penalty_spot,
-            kick_precision=precision, kick_power=0.7,
+            kick_precision=precision, kick_power=0.7, top_speed=0.7, acceleration=0.7,
         )
+        # Run-up: kicker arrives at full sprint (ball-carry top speed in +x direction).
+        # Using ball-carry top speed ensures run_speed_fraction=1.0 in the running
+        # power multiplier computed inside kick_ball.
+        v_run = effective_top_speed(
+            mvmt, kicker.attributes.top_speed, kicker.stamina,
+            has_ball=True, ball_control_attr=kicker.attributes.ball_control,
+        )
+        kicker.velocity = Vector3(v_run, 0.0, 0.0)
+
         ball = Ball.at_rest(penalty_spot)
         ball.possessed_by = "p1"
         rng = random.Random(seed)
         match = Match(pitch=pitch, players=[kicker], ball=ball, rng_reduction=RNG_REDUCTION, rng=rng)
 
         aim_point = goal_centre + Vector3(0, aim_offset_y, aim_offset_z)
-        kicker.current_order = KickOrder(aim_point=aim_point, power_fraction=0.65, spin=Vector3.zero())
+        kicker.current_order = KickOrder(aim_point=aim_point, power_fraction=PENALTY_POWER, spin=Vector3.zero())
 
         for _ in range(150):
             match.step()

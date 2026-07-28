@@ -32,7 +32,7 @@ from enum import Enum, auto
 from footballcoach.engine.match import Match
 from footballcoach.entities.player import Player, Team
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import KickOrder, MoveOrder, PassOrder, SaveOrder, TackleOrder
+from footballcoach.orders import GetPossessionOrder, KickOrder, MoveOrder, PassOrder, SaveOrder, StopOrder, TackleOrder
 from footballcoach.ui.camera import Camera
 
 CLICK_DRAG_THRESHOLD_PX = 6
@@ -137,8 +137,8 @@ class MatchInputController:
                 else:
                     self.selected_player_id = clicked_player.player_id  # switch selection
                 return
-            # Opposing player - issue a tackle order.
-            selected.current_order = TackleOrder(target_player_id=clicked_player.player_id)
+            # Opposing player - chase and get possession.
+            selected.current_order = GetPossessionOrder()
             return
 
         # Empty ground - issue a move or pass order to the selected player.
@@ -166,6 +166,12 @@ class MatchInputController:
         selected = self.selected_player()
         if selected is not None and selected.is_goalkeeper:
             selected.current_order = SaveOrder()
+
+    def issue_stop_order(self) -> None:
+        """Decelerates the selected player to a standstill."""
+        selected = self.selected_player()
+        if selected is not None:
+            selected.current_order = StopOrder()
 
     def _finish_kick_drag(self, release_screen: tuple[int, int]) -> None:
         player = self.selected_player()

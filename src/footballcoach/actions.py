@@ -27,7 +27,8 @@ from __future__ import annotations
 from footballcoach.entities.pitch import Pitch
 from footballcoach.entities.player import Player, Team
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import ChaseTackleOrder, KickOrder, MoveOrder, PassOrder, SaveOrder
+from footballcoach.entities.player import Player as _Player  # forward ref alias
+from footballcoach.orders import ChaseTackleOrder, GetPossessionOrder, KickOrder, MoveOrder, PassOrder, SaveOrder, StopOrder
 
 DEFAULT_SHOOT_HEIGHT_M = 1.1
 DEFAULT_SHOOT_POWER_FRACTION = 0.85
@@ -59,18 +60,40 @@ def shoot(
     player.current_order = KickOrder(aim_point=aim_point, power_fraction=power_fraction, spin=Vector3.zero())
 
 
-def pass_to(player: Player, target_position: Vector3, power_fraction: float | None = None) -> None:
-    """Passes along the ground to `target_position`. Pace is auto-computed
+def pass_to(player: Player, target: "Player | Vector3", power_fraction: float | None = None) -> None:
+    """Passes along the ground to a teammate or position. Pace is auto-computed
     from distance unless `power_fraction` is given. Only has an effect if
-    `player` currently has the ball."""
-    player.current_order = PassOrder(target_position=target_position, power_fraction=power_fraction)
+    `player` currently has the ball.
+
+    If `target` is a ``Player``, the pass is led: the engine estimates where
+    the teammate will be when the ball arrives (based on their current velocity)
+    and aims at the predicted intercept position instead of their current one.
+    If `target` is a ``Vector3``, a plain (non-led) pass to that spot is issued.
+    """
+    if isinstance(target, Player):
+        player.current_order = PassOrder(
+            target_position=target.position,
+            power_fraction=power_fraction,
+            target_player_id=target.player_id,
+        )
+    else:
+        player.current_order = PassOrder(target_position=target, power_fraction=power_fraction)
 
 
-def tackle(player: Player, target: Player) -> None:
-    """Runs `player` straight at `target` and attempts a tackle once in
-    range. Persists across ticks until contact is made and one tackle
-    attempt is resolved (see orders.ChaseTackleOrder)."""
-    player.current_order = ChaseTackleOrder(target_player_id=target.player_id)
+def tackle(player: Player, target: Player | None = None) -> None:
+    """Runs `player` towards the ball and wins possession.
+
+    If the ball is loose the player sprints to it directly. If someone else
+    has it, the player chases that carrier and attempts a tackle on contact.
+    ``target`` is accepted for backward-compatibility but is ignored - the
+    order always tracks whoever currently holds the ball each tick.
+    """
+    player.current_order = GetPossessionOrder()
+
+
+def stop(player: Player) -> None:
+    """Decelerates `player` to a standstill using their normal braking."""
+    player.current_order = StopOrder()
 
 
 def save(goalkeeper: Player) -> None:

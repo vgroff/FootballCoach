@@ -11,13 +11,16 @@ from dataclasses import dataclass
 from footballcoach.config import load_physics_config
 from footballcoach.entities.ball import Ball
 from footballcoach.mathutils import Vector3
-from footballcoach.mathutils.rng import reduced_sigma
+
 
 
 @dataclass(frozen=True)
 class KickingParams:
     angle_error_base_rad: float
     angle_error_scale_rad: float
+    power_error_scale: float
+    power_error_exponent: float
+    precision_exponent: float
     power_base_mps: float
     power_scale_mps: float
     firsttime_precision_weight: float
@@ -29,6 +32,9 @@ class KickingParams:
         return KickingParams(
             angle_error_base_rad=d["angle_error_base_rad"],
             angle_error_scale_rad=d["angle_error_scale_rad"],
+            power_error_scale=d["power_error_scale"],
+            power_error_exponent=d["power_error_exponent"],
+            precision_exponent=d["precision_exponent"],
             power_base_mps=d["power_base_mps"],
             power_scale_mps=d["power_scale_mps"],
             firsttime_precision_weight=d["firsttime_precision_weight"],
@@ -38,41 +44,64 @@ class KickingParams:
 
 @dataclass(frozen=True)
 class PassingParams:
-    """Constants for the dedicated "Pass" action (see `pass_ball`) - a
-    grounded pass to a target point is a different technical skill to
-    curling a shot into a corner, so it gets its own (more forgiving)
-    angular error model and an auto-computed pace, rather than reusing
-    `KickingParams` directly. See engine/knowledge.md for the derivation.
+    """Auto-pace constants for ground passes (see `pass_ball`). The error model
+    is now unified with `KickingParams` - all kicks use the same sigma formula
+    regardless of whether they're shots, passes, or anything else. Passes tend
+    to be lower power than shots, so they inherit naturally lower inaccuracy
+    from the power-error coupling (see `kick_sigma_rad`).
     """
-    angle_error_base_rad: float
-    angle_error_scale_rad: float
     power_overshoot_factor: float
+    overshoot_drag_factor: float    # coefficient: total = base + drag_factor * distance^drag_exponent
+    overshoot_drag_exponent: float  # exponent on distance; 1.0=linear, >1=superlinear boost at long range
     min_speed_mps: float
     max_speed_mps: float
+    pass_aim_height_m: float  # height to aim at (and thus launch angle); 0.11=flat, higher=lofted
 
     @staticmethod
     def from_config() -> "PassingParams":
         d = load_physics_config()["passing"]
         return PassingParams(
-            angle_error_base_rad=d["angle_error_base_rad"],
-            angle_error_scale_rad=d["angle_error_scale_rad"],
             power_overshoot_factor=d["power_overshoot_factor"],
+            overshoot_drag_factor=d.get("overshoot_drag_factor", 0.0),
+            overshoot_drag_exponent=d.get("overshoot_drag_exponent", 1.0),
             min_speed_mps=d["min_speed_mps"],
             max_speed_mps=d["max_speed_mps"],
+            pass_aim_height_m=d["pass_aim_height_m"],
         )
 
 
 def angle_error_sigma_rad(params: KickingParams, kick_precision: float) -> float:
-    """Angular error std-dev (radians), applied independently to yaw and
-    pitch. Never zero even at precision=1.0, per the design spec that kicks
-    are never perfectly exact."""
-    return params.angle_error_base_rad + params.angle_error_scale_rad * (1.0 - kick_precision)
+    """Base angular error std-dev before power coupling and rng_reduction.
+    Never zero even at precision=1.0.
+    ``precision_exponent`` < 1.0 compresses the precision curve: using
+    ``1 - p^exponent`` reduces overall sensitivity to precision differences
+    (lower sigma across the board) relative to ``(1-p)^exponent``."""
+    return params.angle_error_base_rad + params.angle_error_scale_rad * (1.0 - kick_precision ** params.precision_exponent)
 
 
-def pass_angle_error_sigma_rad(params: PassingParams, kick_precision: float) -> float:
-    """Same shape as `angle_error_sigma_rad` but using the more forgiving
-    passing-specific constants."""
-    return params.angle_error_base_rad + params.angle_error_scale_rad * (1.0 - kick_precision)
+def kick_sigma_rad(
+    params: KickingParams,
+    kick_precision: float,
+    effective_power: float,
+    rng_reduction: float,
+) -> float:
+    """Unified angular error std-dev for all kicks (shots, passes, chips).
+
+    sigma = base_sigma(precision) * (1 + power_error_scale * effective_power^exponent) * (1 - rng_reduction)
+
+    ``effective_power`` is ``power_fraction * running_power_multiplier`` - it
+    can exceed 1.0 when the kicker is sprinting toward the target at full
+    pace (running_mult ≈ 1.3), producing proportionally more inaccuracy.
+
+    ``power_error_exponent`` (default 2.0, tunable 1.0–2.5) controls the shape
+    of the power-error curve. At exponent=2 the coupling is superlinear: a 25m
+    auto-pass at eff_power≈0.20 gets barely any extra error (multiplier ≈ 1.01),
+    while a running penalty at eff_power≈1.04 is nearly the same as linear
+    (since 1.04^2 ≈ 1.04). The exponent therefore primarily buys accuracy at
+    low-to-mid powers without touching the high-power penalty calibration.
+    """
+    base = angle_error_sigma_rad(params, kick_precision)
+    return base * (1.0 + params.power_error_scale * (effective_power ** params.power_error_exponent)) * (1.0 - rng_reduction)
 
 
 def max_kick_speed_mps(params: KickingParams, kick_power_attr: float) -> float:
@@ -114,14 +143,15 @@ def pass_speed_mps(params: PassingParams, distance_m: float, gravity_mps2: float
 
     Modelled as a rolling ball decelerating under (dominant) rolling
     friction from an initial speed: v = sqrt(2 * mu_roll * g * distance).
-    This ignores the smaller, speed-dependent aerodynamic drag contribution
-    that the full engine physics (see ball_physics.py) also applies, so a
-    tunable `power_overshoot_factor` compensates for the resulting
-    undershoot - see engine/knowledge.md for how this was calibrated against
-    the pass-accuracy balance tests.
+    Aerodynamic drag (ignored in the analytic model) removes more energy per
+    metre from faster long passes, so the effective overshoot factor grows
+    linearly with distance: overshoot = base + drag_factor * distance_m.
+    This keeps short passes barely overshooting while long passes get enough
+    extra pace to overcome drag - see engine/knowledge.md for calibration.
     """
     base_speed = math.sqrt(max(0.0, 2.0 * rolling_friction_coefficient * gravity_mps2 * distance_m))
-    speed = base_speed * params.power_overshoot_factor
+    overshoot = params.power_overshoot_factor + params.overshoot_drag_factor * (distance_m ** params.overshoot_drag_exponent)
+    speed = base_speed * overshoot
     return max(params.min_speed_mps, min(params.max_speed_mps, speed))
 
 
@@ -254,11 +284,12 @@ def kick_ball(
     params = params or KickingParams.from_config()
     r = rng or random
 
-    sigma = reduced_sigma(angle_error_sigma_rad(params, kick_precision), rng_reduction) * difficulty_multiplier
-    speed = max_kick_speed_mps(params, kick_power_attr) * max(0.0, min(1.0, power_fraction))
-    speed *= running_power_multiplier(
+    run_mult = running_power_multiplier(
         params.running_power_coefficient, kicker_velocity, aim_point - kicker_position, kicker_top_speed_mps
     )
+    effective_power = max(0.0, min(1.0, power_fraction)) * run_mult
+    sigma = kick_sigma_rad(params, kick_precision, effective_power, rng_reduction) * difficulty_multiplier
+    speed = max_kick_speed_mps(params, kick_power_attr) * max(0.0, min(1.0, power_fraction)) * run_mult
 
     _launch_ball(ball, kicker_position, aim_point, speed, sigma, spin, r, gravity_mps2)
 
@@ -274,42 +305,54 @@ def pass_ball(
     gravity_mps2: float = 9.81,
     rolling_friction_coefficient: float = 0.06,
     power_fraction: float | None = None,
-    max_speed_for_power: float | None = None,
     running_power_coefficient: float = 0.0,
     kicker_velocity: Vector3 = Vector3.zero(),
     kicker_top_speed_mps: float = 0.0,
+    kick_power_attr: float = 0.5,
+    kicking_params: "KickingParams | None" = None,
 ) -> None:
-    """Applies a grounded pass to `ball`, aimed at `target_position` (an
-    absolute world position, height ignored - passes are aimed along the
-    ground). Unlike `kick_ball`, the pace is auto-computed from distance
-    (see `pass_speed_mps`) unless an explicit `power_fraction` is supplied,
-    in which case it scales `max_speed_for_power` instead (letting a caller
-    override the auto-pace with a manual power slider if desired, mirroring
-    KickOrder's power_fraction).
+    """Applies a grounded pass to `ball`, aimed at `target_position`.
+    Height component of target_position is ignored - passes travel along
+    the ground.
 
-    Uses the dedicated, more forgiving `PassingParams` error model rather
-    than `KickingParams` - see engine/knowledge.md for the rationale.
+    The pace is auto-computed from distance (see `pass_speed_mps`) unless
+    ``power_fraction`` is supplied, in which case it scales
+    ``params.max_speed_mps``.
 
-    `running_power_coefficient`/`kicker_velocity`/`kicker_top_speed_mps`
-    (all optional, default to no effect) apply the same "running onto the
-    ball" power modifier as `kick_ball` - see `running_power_multiplier`.
+    Error model: uses the same unified ``kick_sigma_rad`` as ``kick_ball``
+    (see ``KickingParams``). The effective power for the sigma computation
+    is derived from the actual launch speed as a fraction of the kicker's
+    maximum kick speed, so a slow auto-pace short pass naturally yields a
+    lower-sigma (more accurate) kick than a full-power shot without needing
+    a separate error model.
     """
     params = params or PassingParams.from_config()
+    kp = kicking_params or KickingParams.from_config()
     r = rng or random
 
-    aim_point = target_position.with_z(0.0)
+    # Aim at pass_aim_height_m. At 0.11m (= ball radius) this gives pitch_angle=0
+    # and a flat rolling pass. Higher values produce a slight loft, which can help
+    # carries overcome friction on longer passes at the cost of a bounce on landing.
+    # Aiming at z=0 (old behaviour) caused a perpetual micro-bounce loop - see
+    # the comment in ball_physics.py's bounce threshold logic.
+    aim_point = target_position.with_z(params.pass_aim_height_m)
     distance = kicker_position.xy().distance_to(aim_point.xy())
 
     if power_fraction is None:
-        speed = pass_speed_mps(params, distance, gravity_mps2, rolling_friction_coefficient)
+        auto_speed = pass_speed_mps(params, distance, gravity_mps2, rolling_friction_coefficient)
+        max_kick = max_kick_speed_mps(kp, kick_power_attr)
+        base_power_fraction = auto_speed / max(max_kick, 1e-6)
     else:
-        max_speed = max_speed_for_power if max_speed_for_power is not None else params.max_speed_mps
-        speed = max_speed * max(0.0, min(1.0, power_fraction))
+        auto_speed = params.max_speed_mps * max(0.0, min(1.0, power_fraction))
+        base_power_fraction = max(0.0, min(1.0, power_fraction))
 
-    speed *= running_power_multiplier(
+    run_mult = running_power_multiplier(
         running_power_coefficient, kicker_velocity, aim_point - kicker_position, kicker_top_speed_mps
     )
 
-    sigma = reduced_sigma(pass_angle_error_sigma_rad(params, kick_precision), rng_reduction)
+    effective_power = base_power_fraction * run_mult
+    speed = auto_speed * run_mult
+
+    sigma = kick_sigma_rad(kp, kick_precision, effective_power, rng_reduction)
 
     _launch_ball(ball, kicker_position, aim_point, speed, sigma, Vector3.zero(), r, gravity_mps2)

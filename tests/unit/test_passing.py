@@ -2,23 +2,31 @@ from __future__ import annotations
 
 import random
 
-from footballcoach.engine.kicking import PassingParams, pass_angle_error_sigma_rad, pass_ball, pass_speed_mps
+from footballcoach.engine.kicking import KickingParams, PassingParams, kick_sigma_rad, pass_ball, pass_speed_mps
 from footballcoach.entities.ball import Ball
 from footballcoach.mathutils import Vector3
 
 
-def test_pass_angle_error_never_zero_at_max_precision():
-    params = PassingParams.from_config()
-    assert pass_angle_error_sigma_rad(params, 1.0) > 0.0
+def test_kick_sigma_never_zero_at_max_precision():
+    """Kicks are never perfectly accurate even at precision=1.0."""
+    kp = KickingParams.from_config()
+    assert kick_sigma_rad(kp, 1.0, effective_power=0.0, rng_reduction=0.0) > 0.0
 
 
-def test_pass_angle_error_more_forgiving_than_shot_error():
-    from footballcoach.engine.kicking import KickingParams, angle_error_sigma_rad
+def test_low_power_pass_less_sigma_than_high_power_shot():
+    """With the unified model, lower effective power → lower sigma."""
+    kp = KickingParams.from_config()
+    sigma_pass = kick_sigma_rad(kp, 0.5, effective_power=0.2, rng_reduction=0.0)
+    sigma_shot = kick_sigma_rad(kp, 0.5, effective_power=1.0, rng_reduction=0.0)
+    assert sigma_pass < sigma_shot
 
-    pass_params = PassingParams.from_config()
-    kick_params = KickingParams.from_config()
-    for precision in (0.2, 0.5, 0.8):
-        assert pass_angle_error_sigma_rad(pass_params, precision) < angle_error_sigma_rad(kick_params, precision)
+
+def test_higher_precision_always_lower_sigma():
+    kp = KickingParams.from_config()
+    for power in (0.0, 0.5, 1.0):
+        low_prec = kick_sigma_rad(kp, 0.2, power, rng_reduction=0.3)
+        high_prec = kick_sigma_rad(kp, 0.9, power, rng_reduction=0.3)
+        assert high_prec < low_prec
 
 
 def test_pass_speed_increases_with_distance():

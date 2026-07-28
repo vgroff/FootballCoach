@@ -46,16 +46,22 @@ class TackleOrder:
 
 @dataclass
 class PassOrder:
-    """A grounded pass to a target position. Distinct from KickOrder: the
-    engine computes an appropriate pace for the distance automatically (if
-    `power_fraction` is left as None) and applies a dedicated passing
-    accuracy model (see engine/kicking.py's `pass_ball`), which is more
-    forgiving than the general shot-error model KickOrder uses - passing
-    along the ground to a spot is a different technical skill than curling
-    a shot into a corner, even though both are driven by `kick_precision`.
+    """A grounded pass to a target position. The engine auto-computes pace
+    from distance (if `power_fraction` is left as None). Error model is the
+    same unified formula as KickOrder - lower power naturally produces a
+    more accurate kick.
+
+    If ``target_player_id`` is set, the pass is "led": the match engine
+    estimates where that player will be when the ball arrives (based on
+    their current velocity) and aims at the predicted position rather than
+    their current position. ``target_position`` must still be set to the
+    player's current position (used as a fallback and for distance
+    estimation); ``actions.pass_to`` handles this automatically when a
+    Player is passed instead of a Vector3.
     """
     target_position: Vector3
     power_fraction: float | None = None  # None = auto-computed from distance
+    target_player_id: str | None = None  # set for leading passes
     status: OrderStatus = OrderStatus.PENDING
 
 
@@ -85,4 +91,27 @@ class SaveOrder:
     status: OrderStatus = OrderStatus.PENDING
 
 
-Order = MoveOrder | KickOrder | TackleOrder | PassOrder | ChaseTackleOrder | SaveOrder
+@dataclass
+class StopOrder:
+    """Decelerates the player to a complete stop using their normal braking
+    capability, then completes. Useful for explicitly halting a player who is
+    mid-sprint without snapping their velocity to zero instantly."""
+    status: OrderStatus = OrderStatus.PENDING
+
+
+@dataclass
+class GetPossessionOrder:
+    """Runs straight at the ball and acquires it.
+
+    - If the ball is loose, the player sprints to it; pickup happens
+      automatically via the normal control-time model once they're close
+      enough.
+    - If another player has the ball, the player chases that carrier and
+      attempts one tackle on contact (exactly like the old ChaseTackleOrder),
+      then completes regardless of the tackle outcome.
+    - Completes immediately if this player already possesses the ball.
+    """
+    status: OrderStatus = OrderStatus.PENDING
+
+
+Order = MoveOrder | KickOrder | TackleOrder | PassOrder | ChaseTackleOrder | SaveOrder | StopOrder | GetPossessionOrder

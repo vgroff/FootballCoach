@@ -12,6 +12,7 @@ import random
 
 from footballcoach import actions
 from footballcoach.engine.match import Match
+from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import KickOrder
@@ -45,6 +46,12 @@ def _run_save_trial(
         "s", Team.RIGHT, position=Vector3(shot_x, 0, 0),
         kick_precision=precision, kick_power=power,
     )
+    # Shooter runs at full speed toward goal (negative x direction for Team.RIGHT
+    # shooting at the left goal), giving a realistic running-shot power boost.
+    mvmt = MovementParams.from_config()
+    run_speed = effective_top_speed(mvmt, shooter.attributes.top_speed, 1.0,
+                                    has_ball=True, ball_control_attr=shooter.attributes.ball_control)
+    shooter.velocity = Vector3(-run_speed, 0.0, 0.0)
     ball = Ball.at_rest(shooter.position)
     ball.possessed_by = "s"
     match = Match(pitch=pitch, players=[gk, shooter], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))
@@ -83,10 +90,10 @@ def test_fast_goalkeeper_saves_far_post_shot_much_more_than_slow_one(balance_rec
     # after goalkeepers were given a 1.5x acceleration boost to simulate
     # diving (see engine/knowledge.md) - at 11m even a slow keeper had enough
     # time to shuffle across and get a touch, washing out the fast-vs-slow
-    # differentiation this test exists to check. 16m gives a slow keeper
-    # meaningfully less reaction time while still being a plausible shot
-    # distance.
-    shot_x = -16.0
+    # differentiation this test exists to check. Further increased to 22m
+    # after kicking power was rescaled for running_power_coefficient=0.7
+    # (stationary shot speed dropped from ~30 to ~23 m/s).
+    shot_x = -22.0
     power = 0.9
     n = 300
 
@@ -183,11 +190,11 @@ def test_random_scenario_batch_good_vs_bad_goalkeeper(balance_recorder):
     n = 150
     scenarios = []
     # Shot distance range was pushed out from 9-16m to 16-24m after the
-    # goalkeeper diving acceleration boost was added (see
-    # engine/knowledge.md) - closer shots gave even a bad goalkeeper enough
-    # time to reach almost anything, washing out the good-vs-bad comparison.
+    # goalkeeper diving acceleration boost was added, then to 22-32m after
+    # kicking power was rescaled for running_power_coefficient=0.7
+    # (stationary shot speed dropped from ~30 to ~23 m/s).
     for _ in range(n):
-        shot_x = -rng.uniform(16.0, 24.0)
+        shot_x = -rng.uniform(22.0, 32.0)
         aim_side = rng.choice([-1.0, 1.0])
         aim_y = aim_side * rng.uniform(half_goal_w * 0.5, half_goal_w - 0.3)
         aim_z = rng.uniform(0.1, 0.6)

@@ -5,16 +5,22 @@ We have implemented what is in Idea.md. the following remainds:
 
 More functions:
 - Try and improve "pass" by estimating the other players movement and the time to contact and doing small/easy "through balls", maybe just with the other guy jogging and not too far away
-
+- fleshing out tackling - angle of the tackle should give bonuses and especially maluses when e.g. tackling from behind (i'm thinking add another modifier to the tackling roll, +10% for a fully frontal tackle, down to -5% for a 90 degree tackle, -65% for a fully 180 degree tackle)
+- when running at the ball during "get possession", try to run ahead of it (or the player) by estimating where it will be using the velocity and yours (do a rough approximation)
+- This is no pass action! Only kicks. I'd rather understand why kick isn't working well as a pass than fake something like that
 
 New NBs:
-- Are players able to stand still again once they've started jogging/sprinting? Especially in the UI is that doable?
-- dribbling passed a tackle should still slow you down, depending how well the skill check went (e.g. if your roll was (relative percentage) 35% or more higher, it doesn't slow you down), if you beat it by 0.1% it slows you down 80%. Add balance tests for this
-- I think if 2 players do the collision thing and one has the ball and they're going in opposite directions (I guess cosine similarity positive on velocities or something like that), a tackle is automatically triggered instead of the collision calculation. it's not realistic to have players charging each other frontally haha
-- goalkeeper tackling checks get +100% rather than the usual +20%
-- I want to change the tackle order: it should now be called "get possession" where player just runs straight at the ball, it falls back to what is now the tackle order if someone else has it but if they don't he just tries to get posession
+-     kicker = make_player(
+        "k", Team.LEFT, position=Vector3(x, y, 0),
+        kick_precision=precision, kick_power=power,
+    )
+    ball = Ball.at_rest(kicker.position)
+    ball.possessed_by = "k"
+- this is bad code, no? why wouldn't you do ball.possesed_by = kicker? What if two players have the same name? have a look in the codebase for other places where references are made with string literals instead of with objects. This is the only one I could find at least
 
 
 
 NB:
 - currently stamina regen is faster than sprint depeltion, do we want that?
+- Pretty sure you can currently kick at full power with having full in the kick_power stat, which begs the question of what it's purpose is. I think you should only have full power at 1.0 kick power, but maybe we up the max power a little bit too since it is very rare. I want the kicking/shooting to be realistic
+- In the move to order, avoid nearby players (a kind of repulsion mechanic with distance)

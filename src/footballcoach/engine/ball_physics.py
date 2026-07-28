@@ -111,12 +111,21 @@ def step_ball(ball: Ball, dt_s: float, params: BallPhysicsParams | None = None) 
     if new_position.z <= params.ball_radius_m:
         new_position = new_position.with_z(params.ball_radius_m)
         if new_velocity.z < -BOUNCE_THRESHOLD_MPS:
-            new_velocity = Vector3(
-                new_velocity.x * params.bounce_restitution_horizontal,
-                new_velocity.y * params.bounce_restitution_horizontal,
-                -new_velocity.z * params.bounce_restitution_vertical,
-            )
-            new_spin = new_spin * params.bounce_spin_retention
+            outgoing_vz = -new_velocity.z * params.bounce_restitution_vertical
+            if outgoing_vz < BOUNCE_THRESHOLD_MPS:
+                # The bounce would produce a smaller upward vz than the threshold.
+                # Continuing to bounce would create a perpetual micro-bounce loop
+                # (the ball never settles because restitution keeps it airborne by
+                # a tiny amount each tick). Treat as grounded instead: zero vz and
+                # let rolling friction take over.
+                new_velocity = new_velocity.with_z(0.0)
+            else:
+                new_velocity = Vector3(
+                    new_velocity.x * params.bounce_restitution_horizontal,
+                    new_velocity.y * params.bounce_restitution_horizontal,
+                    outgoing_vz,
+                )
+                new_spin = new_spin * params.bounce_spin_retention
         else:
             # Resting/rolling contact, not a real bounce: kill only the
             # (small, spurious) vertical velocity and leave horizontal

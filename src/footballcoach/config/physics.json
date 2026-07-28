@@ -52,21 +52,25 @@
     "goalkeeper_accel_multiplier": 1.5
   },
   "kicking": {
-    "_comment": "sigma_angle in radians = base + scale*(1-precision). power in m/s = base + scale*attr. running_power_coefficient: kicking/passing while running scales speed by (1 + coefficient*cos(angle between run direction and aim direction)*run_speed_fraction) - shared by both Kick and Pass execution.",
-    "angle_error_base_rad": 0.0107,
-    "angle_error_scale_rad": 0.0893,
-    "power_base_mps": 15.0,
-    "power_scale_mps": 20.0,
+    "_comment": "sigma_angle in radians = base + scale*(1 - precision^precision_exponent). power in m/s = base + scale*attr. running_power_coefficient: max run boost = coefficient (at full sprint in line with kick). power_base/scale rescaled from 15/20 so full-sprint run_mult=1.7 gives same peak speed as old coeff=0.3 (run_mult=1.3): factor=1.3/1.7=0.765.",
+    "angle_error_base_rad": 0.0055,
+    "angle_error_scale_rad": 0.04,
+    "power_base_mps": 12.0,
+    "power_scale_mps": 12.3,
     "firsttime_precision_weight": 0.8,
-    "running_power_coefficient": 0.3
+    "running_power_coefficient": 0.6,
+    "power_error_scale": 1.4,
+    "power_error_exponent": 2.0,
+    "precision_exponent": 0.87
   },
   "passing": {
-    "_comment": "Dedicated, more forgiving error model for the 'Pass' action (ground pass to a point) - see engine/knowledge.md. sigma_angle in radians = base + scale*(1-precision). Auto-pace: v = overshoot_factor * sqrt(2*mu_roll*g*distance), clamped to [min,max].",
-    "angle_error_base_rad": 0.009,
-    "angle_error_scale_rad": 0.014,
-    "power_overshoot_factor": 1.35,
+    "_comment": "Auto-pace for a grounded pass: v = overshoot_factor * sqrt(2*mu_roll*g*distance), clamped to [min,max]. Error model is now unified with kicking (KickingParams) - sigma scales with both precision and effective power.",
+    "power_overshoot_factor": 1.144,
+    "overshoot_drag_factor": 0.0026,
+    "overshoot_drag_exponent": 1.0,
     "min_speed_mps": 2.0,
-    "max_speed_mps": 25.0
+    "max_speed_mps": 25.0,
+    "pass_aim_height_m": 0.11
   },
   "goalkeeping": {
     "_comment": "'Save' action: predicts where an incoming shot crosses the keeper's own goal line and moves the keeper there. See engine/knowledge.md for the crossing-point prediction and the ball-freeze-on-pickup rule that makes saves work with the generic possession model.",
@@ -74,15 +78,23 @@
     "default_position_fraction_of_half_length": 0.02
   },
   "tackling": {
-    "tackler_boost": 1.2,
+    "tackler_boost": 1.25,
     "inactive_duration_s": 0.6,
     "inactive_speed_penalty": 0.5,
-    "tackler_miss_inactive_duration_s": 0.4
+    "tackler_miss_inactive_duration_s": 0.4,
+    "goalkeeper_tackle_boost": 2.0,
+    "dribble_beaten_speed_threshold": 0.35,
+    "dribble_beaten_max_penalty": 0.8,
+    "head_on_min_charge_speed_mps": 1.0,
+    "angle_modifier_frontal": 0.1,
+    "angle_modifier_side": -0.05,
+    "angle_modifier_behind": -0.5,
+    "_comment_angle": "Modifier added to tackling boost based on approach angle. angle=0 (frontal, tackler is directly in front of dribbler): +10%; angle=90 (side): -5%; angle=180 (from behind): -65%. Piecewise linear in cos(angle)."
   },
   "ball_physics": {
     "drag_coefficient": 0.25,
     "magnus_coefficient": 0.25,
-    "bounce_restitution_vertical": 0.6,
+    "bounce_restitution_vertical": 0.75,
     "bounce_restitution_horizontal": 0.8,
     "bounce_spin_retention": 0.5,
     "rolling_friction_coefficient": 0.06,

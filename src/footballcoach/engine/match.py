@@ -18,7 +18,7 @@ from footballcoach.engine.collision import (
     resolve_ball_block_by_inactive_players,
 )
 from footballcoach.engine.goalkeeping import GoalkeepingParams, save_target_position
-from footballcoach.engine.kicking import KickingParams, PassingParams, kick_ball, pass_ball
+from footballcoach.engine.kicking import KickingParams, PassingParams, kick_ball, pass_ball, pass_speed_mps
 from footballcoach.engine.movement import (
     MovementParams,
     effective_top_speed,
@@ -27,18 +27,20 @@ from footballcoach.engine.movement import (
 )
 from footballcoach.engine.possession import ControlTimeParams, control_time_s
 from footballcoach.engine.scoring import Scoreboard, check_goal
-from footballcoach.engine.tackling import TacklingParams, attempt_tackle
+from footballcoach.engine.tackling import TacklingParams, attempt_tackle, tackle_angle_modifier
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.pitch import Pitch
 from footballcoach.entities.player import Player, PlayerState
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import (
     ChaseTackleOrder,
+    GetPossessionOrder,
     KickOrder,
     MoveOrder,
     OrderStatus,
     PassOrder,
     SaveOrder,
+    StopOrder,
     TackleOrder,
 )
 
@@ -117,6 +119,7 @@ class Match:
 
         self._update_loose_ball_pickup(dt)
 
+        self._check_head_on_tackles()
         resolve_all_overlaps(self.players)
         self._check_goal()
 
@@ -200,18 +203,24 @@ class Match:
             elif isinstance(order, TackleOrder):
                 target = self.player_by_id(order.target_player_id)
                 if are_touching(player, target) and target.is_available_to_tackle():
-                    success = attempt_tackle(
+                    result = attempt_tackle(
                         player.attributes.tackling,
                         target.attributes.dribbling,
                         self.rng_reduction,
                         self.rng,
                         self.tackling_params,
+                        is_goalkeeper_tackle=player.is_goalkeeper,
+                        angle_modifier=tackle_angle_modifier(
+                            target.heading_rad, target.position, player.position, self.tackling_params
+                        ),
                     )
-                    if success and self.ball.possessed_by == target.player_id:
+                    if result.tackler_won and self.ball.possessed_by == target.player_id:
                         self.ball.possessed_by = player.player_id
+                    elif not result.tackler_won:
+                        target.velocity = target.velocity * result.dribble_speed_multiplier
                     target.state = PlayerState.INACTIVE_TACKLED
                     target.state_timer_s = self.tackling_params.inactive_duration_s
-                    if not success:
+                    if not result.tackler_won:
                         # A failed (lunging/sliding) tackle also leaves the
                         # tackler briefly unable to react - shorter than the
                         # dispossessed player's penalty, since they weren't
@@ -223,10 +232,11 @@ class Match:
 
             elif isinstance(order, PassOrder):
                 if has_ball:
+                    pass_target = self._leading_pass_target(player, order)
                     pass_ball(
                         self.ball,
                         player.position,
-                        order.target_position,
+                        pass_target,
                         player.attributes.kick_precision,
                         self.rng_reduction,
                         self.rng,
@@ -240,6 +250,8 @@ class Match:
                             self.movement_params, player.attributes.top_speed, player.stamina,
                             has_ball=True, ball_control_attr=player.attributes.ball_control,
                         ),
+                        kick_power_attr=player.attributes.kick_power,
+                        kicking_params=self.kicking_params,
                     )
                     self._start_release_grace(player.player_id)
                 order.status = OrderStatus.COMPLETE
@@ -250,18 +262,24 @@ class Match:
                 target = self.player_by_id(order.target_player_id)
                 if are_touching(player, target):
                     if target.is_available_to_tackle():
-                        success = attempt_tackle(
+                        result = attempt_tackle(
                             player.attributes.tackling,
                             target.attributes.dribbling,
                             self.rng_reduction,
                             self.rng,
                             self.tackling_params,
+                            is_goalkeeper_tackle=player.is_goalkeeper,
+                            angle_modifier=tackle_angle_modifier(
+                                target.heading_rad, target.position, player.position, self.tackling_params
+                            ),
                         )
-                        if success and self.ball.possessed_by == target.player_id:
+                        if result.tackler_won and self.ball.possessed_by == target.player_id:
                             self.ball.possessed_by = player.player_id
+                        elif not result.tackler_won:
+                            target.velocity = target.velocity * result.dribble_speed_multiplier
                         target.state = PlayerState.INACTIVE_TACKLED
                         target.state_timer_s = self.tackling_params.inactive_duration_s
-                        if not success:
+                        if not result.tackler_won:
                             player.state = PlayerState.INACTIVE_TACKLED
                             player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
                     order.status = OrderStatus.COMPLETE
@@ -270,6 +288,64 @@ class Match:
                     direction = target.position - player.position
                     step_player_towards(player, direction, True, dt, self.movement_params, has_ball)
                     player.stamina = _drain_if_sprinting(self.movement_params, player, True, dt)
+
+            elif isinstance(order, GetPossessionOrder):
+                order.status = OrderStatus.IN_PROGRESS
+                carrier = self.ball_carrier()
+                if self.ball.possessed_by == player.player_id:
+                    # Already have the ball.
+                    order.status = OrderStatus.COMPLETE
+                    player.current_order = None
+                elif carrier is not None and carrier.player_id != player.player_id:
+                    # Someone else has the ball - chase and tackle them.
+                    if are_touching(player, carrier):
+                        if carrier.is_available_to_tackle():
+                            result = attempt_tackle(
+                                player.attributes.tackling,
+                                carrier.attributes.dribbling,
+                                self.rng_reduction,
+                                self.rng,
+                                self.tackling_params,
+                                is_goalkeeper_tackle=player.is_goalkeeper,
+                                angle_modifier=tackle_angle_modifier(
+                                    carrier.heading_rad, carrier.position, player.position, self.tackling_params
+                                ),
+                            )
+                            if result.tackler_won:
+                                self.ball.possessed_by = player.player_id
+                            else:
+                                carrier.velocity = carrier.velocity * result.dribble_speed_multiplier
+                            carrier.state = PlayerState.INACTIVE_TACKLED
+                            carrier.state_timer_s = self.tackling_params.inactive_duration_s
+                            if not result.tackler_won:
+                                player.state = PlayerState.INACTIVE_TACKLED
+                                player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
+                        order.status = OrderStatus.COMPLETE
+                        player.current_order = None
+                    else:
+                        target = self._intercept_target(player, carrier.position, carrier.velocity)
+                        direction = target - player.position
+                        step_player_towards(player, direction, True, dt, self.movement_params, has_ball)
+                        player.stamina = _drain_if_sprinting(self.movement_params, player, True, dt)
+                else:
+                    # Ball is loose - sprint to intercept; pickup happens via _update_loose_ball_pickup.
+                    intercept = self._intercept_target(player, self.ball.position, self.ball.velocity)
+                    direction = intercept - player.position
+                    if direction.length_xy() <= self.pickup_radius_m:
+                        order.status = OrderStatus.COMPLETE
+                        player.current_order = None
+                    else:
+                        step_player_towards(player, direction, True, dt, self.movement_params, has_ball)
+                        player.stamina = _drain_if_sprinting(self.movement_params, player, True, dt)
+
+            elif isinstance(order, StopOrder):
+                order.status = OrderStatus.IN_PROGRESS
+                if player.speed_mps < 0.05:
+                    player.velocity = Vector3.zero()
+                    order.status = OrderStatus.COMPLETE
+                    player.current_order = None
+                else:
+                    step_player_towards(player, Vector3.zero(), False, dt, self.movement_params, has_ball)
 
             elif isinstance(order, SaveOrder):
                 order.status = OrderStatus.IN_PROGRESS
@@ -353,6 +429,121 @@ class Match:
 
     def _any_player_controlling_ball(self) -> bool:
         return any(p.state == PlayerState.CONTROLLING_BALL for p in self.players)
+
+    def _leading_pass_target(self, passer: Player, order: "PassOrder") -> Vector3:
+        """If the PassOrder has a ``target_player_id``, leads the pass to
+        where that player will be when the ball arrives.
+
+        The estimate: t_arrive ≈ distance / ball_speed (from auto-pace model),
+        capped at 2 s. If the target is standing still (speed < 0.3 m/s) or
+        doesn't exist, falls back to ``order.target_position``.
+        """
+        from footballcoach.orders import PassOrder  # local import to avoid circular
+        if order.target_player_id is None:
+            return order.target_position
+        try:
+            target = self.player_by_id(order.target_player_id)
+        except KeyError:
+            return order.target_position
+
+        if target.speed_mps < 0.3:
+            return order.target_position  # stationary - no lead needed
+
+        dist = passer.position.xy().distance_to(order.target_position.xy())
+        ball_speed = pass_speed_mps(
+            self.passing_params, dist,
+            self.ball_physics_params.gravity_mps2,
+            self.ball_physics_params.rolling_friction_coefficient,
+        )
+        t_arrive = min(dist / max(ball_speed, 1.0), 2.0)
+        predicted = order.target_position + target.velocity.xy() * t_arrive
+        return predicted.with_z(0.0)
+
+    def _intercept_target(self, player: Player, target_pos: Vector3, target_vel: Vector3) -> Vector3:
+        """Estimates where a moving target (ball or carrier) will be when
+        this player arrives at its current position, using the player's
+        current speed as a rough time estimate.
+
+        The prediction is intentionally simple - one linear step:
+            t_estimate = min(dist / max(my_speed, 1.0), 3.0)
+            intercept = target_pos + target_vel_xy * t_estimate
+
+        This is accurate enough for a sprint interception run and avoids
+        the player always running to where the ball/opponent currently is
+        (which causes them to perpetually chase from behind). Capping at
+        3 s prevents overshooting when the player is nearly stationary.
+        Only the xy component of target_vel is used (height is irrelevant
+        for ground-level interception runs).
+        """
+        dist = player.position.xy().distance_to(target_pos.xy())
+        my_speed = max(player.speed_mps, 1.0)
+        t_estimate = min(dist / my_speed, 3.0)
+        predicted_xy = target_pos + target_vel.xy() * t_estimate
+        return predicted_xy.with_z(target_pos.z)
+
+    def _check_head_on_tackles(self) -> None:
+        """Automatically triggers a tackle when two players from opposite teams
+        are overlapping, one has the ball, and both are charging directly
+        towards each other (head-on collision). This replaces the normal
+        push-apart resolution for such a pair, since two players sprinting
+        at each other frontally should not just bounce off - the player
+        without the ball is attempting to win it.
+
+        Only one such tackle is resolved per tick (the first qualifying pair
+        found). The resulting tackle uses the same skill-check, inactivity
+        penalties, and dribble-speed-penalty model as regular tackles.
+        """
+        carrier = self.ball_carrier()
+        if carrier is None or carrier.is_inactive:
+            return
+
+        min_charge = self.tackling_params.head_on_min_charge_speed_mps
+
+        for other in self.players:
+            if other.player_id == carrier.player_id:
+                continue
+            if other.is_inactive or other.team == carrier.team:
+                continue
+            if not are_touching(carrier, other):
+                continue
+
+            # Direction from carrier to other player.
+            delta = other.position.xy() - carrier.position.xy()
+            dist = delta.length()
+            if dist < 1e-9:
+                continue
+            direction = delta / dist  # unit vector carrier -> other
+
+            # Both must be charging towards each other along this axis.
+            carrier_speed_towards = carrier.velocity.xy().dot(direction)
+            other_speed_towards = -(other.velocity.xy().dot(direction))
+
+            if carrier_speed_towards < min_charge or other_speed_towards < min_charge:
+                continue
+
+            # Head-on: resolve as a tackle (other player is the tackler).
+            result = attempt_tackle(
+                other.attributes.tackling,
+                carrier.attributes.dribbling,
+                self.rng_reduction,
+                self.rng,
+                self.tackling_params,
+                is_goalkeeper_tackle=other.is_goalkeeper,
+                angle_modifier=tackle_angle_modifier(
+                    carrier.heading_rad, carrier.position, other.position, self.tackling_params
+                ),
+            )
+            if result.tackler_won:
+                self.ball.possessed_by = other.player_id
+            else:
+                carrier.velocity = carrier.velocity * result.dribble_speed_multiplier
+
+            carrier.state = PlayerState.INACTIVE_TACKLED
+            carrier.state_timer_s = self.tackling_params.inactive_duration_s
+            if not result.tackler_won:
+                other.state = PlayerState.INACTIVE_TACKLED
+                other.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
+            return  # only one head-on tackle per tick
 
     def _complete_control(self, player: Player) -> None:
         self.ball.possessed_by = player.player_id

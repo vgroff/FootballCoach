@@ -97,6 +97,8 @@ class App:
             self.input_controller.enter_pass_mode()
         elif key == pygame.K_s:
             self.input_controller.issue_save_order()
+        elif key == pygame.K_x:
+            self.input_controller.issue_stop_order()
 
     def _handle_match_mouse_event(self, event: pygame.event.Event) -> None:
         if self.input_controller is None:
@@ -264,12 +266,13 @@ class App:
         lines = [
             "Click a player           - select them (click again to deselect)",
             "Click a team-mate        - switch selection (or pass to them in Pass mode)",
-            "Click an opponent        - tackle (selected player runs in and attempts a tackle)",
+            "Click an opponent        - get possession: chase whoever has the ball and tackle them",
             "Click empty ground       - move there (sprinting)",
             "Click-drag from selected - kick: drag direction=aim, length=power (only if they have the ball)",
             "Hold Shift while dragging- loft/chip the kick instead of driving it low",
             "P                        - pass mode: next click (ground or player) passes there",
             "S                        - issue a Save order (goalkeeper only): tracks and blocks shots",
+            "X                        - stop: decelerate selected player to a standstill",
             "Space                    - pause/resume the simulation",
             "H or Help button         - toggle this help overlay",
             "Esc                      - close this overlay, or return to the menu / quit",
