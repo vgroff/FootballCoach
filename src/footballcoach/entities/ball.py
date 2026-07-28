@@ -27,6 +27,12 @@ class Ball:
     last_released_by: str | None = None
     release_grace_s: float = 0.0
 
+    # Countdown timer set to just_bounced_display_duration_s whenever the
+    # ball makes a genuine bounce (incoming vz exceeds BOUNCE_THRESHOLD_MPS).
+    # Decayed by dt each tick in ball_physics.step_ball. Used by the renderer
+    # to show a visual "just bounced" indicator. Zero when not recently bounced.
+    just_bounced_timer_s: float = 0.0
+
     def __post_init__(self) -> None:
         if self.position is None:
             self.position = Vector3.zero()

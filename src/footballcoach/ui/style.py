@@ -20,6 +20,15 @@ HUD_ACCENT = (120, 200, 255)
 DRAG_KICK_LINE = (255, 255, 255)
 DRAG_TACKLE_LINE = (255, 90, 90)
 
+# Phase G: player state outline rings (distinct from the possession/selection outlines)
+CONTROL_DELAY_OUTLINE = (80, 200, 255)   # cyan — player mid first-touch control
+INACTIVE_OUTLINE = (220, 60, 60)         # red — player tackled/inactive
+
+# Phase G: ball state outline rings
+BALL_STATE_FLYING_OUTLINE = (180, 230, 255)  # light blue — ball airborne
+BALL_STATE_ROLLING_OUTLINE = (180, 255, 180) # light green — ball rolling on ground
+BALL_STATE_BOUNCED_OUTLINE = (255, 210, 80)  # amber — ball just bounced
+
 HOTKEY_BAR_BG = (20, 20, 28)
 HOTKEY_ENABLED = (210, 210, 215)
 HOTKEY_DISABLED = (80, 80, 92)   # dim but still readable

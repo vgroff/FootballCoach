@@ -11,8 +11,10 @@ import pygame
 from footballcoach.engine.match import Match
 from footballcoach.ui import scenarios, style
 from footballcoach.ui.camera import Camera
+from footballcoach.ui.gamelog import GameLog, LogLevel
 from footballcoach.ui.input import MatchInputController, OrderMode
 from footballcoach.ui.renderer import Renderer
+from footballcoach.ui.scenarios import ScenarioParam
 
 FPS = 60
 
@@ -20,6 +22,7 @@ FPS = 60
 class Screen(Enum):
     MENU = auto()
     MATCH = auto()
+    SCENARIO_PARAMS = auto()
 
 
 class App:
@@ -41,7 +44,16 @@ class App:
         self._last_goal_tally = (0, 0)
         self._scenario_loop: scenarios.ScenarioLoop | None = None
         self.show_help = False
-        self.help_button_rect = pygame.Rect(0, 0, 90, 32)  # positioned per-screen in _draw_match
+        self.help_button_rect = pygame.Rect(0, 0, 90, 32)
+
+        # Game log
+        self.game_log = GameLog(max_entries=50)
+        self.log_min_level = LogLevel.INFO
+
+        # Pending scenario params (Screen.SCENARIO_PARAMS state)
+        self._pending_scenario_definition: scenarios.ScenarioDefinition | None = None
+        self._pending_scenario_params: dict[str, float] = {}
+        self._params_button_rects: dict[str, tuple[pygame.Rect, pygame.Rect]] = {}
 
     @staticmethod
     def _temp_pitch():
@@ -59,6 +71,10 @@ class App:
             pygame.display.flip()
         pygame.quit()
 
+    def _log(self, level: LogLevel, msg: str) -> None:
+        """Add a message to the game log (from UI layer, not engine)."""
+        self.game_log.add(level, msg)
+
     # -- event handling -----------------------------------------------------
 
     def _handle_events(self) -> None:
@@ -69,6 +85,8 @@ class App:
                 self._handle_keydown(event.key)
             elif self.screen == Screen.MENU and event.type == pygame.MOUSEBUTTONDOWN:
                 self._handle_menu_click(event.pos)
+            elif self.screen == Screen.SCENARIO_PARAMS and event.type == pygame.MOUSEBUTTONDOWN:
+                self._handle_params_click(event.pos)
             elif self.screen == Screen.MATCH and event.type == pygame.MOUSEBUTTONDOWN and self.help_button_rect.collidepoint(event.pos):
                 self.show_help = not self.show_help
             elif self.screen == Screen.MATCH and not self.show_help:
@@ -78,6 +96,8 @@ class App:
         if key == pygame.K_ESCAPE:
             if self.show_help:
                 self.show_help = False
+            elif self.screen == Screen.SCENARIO_PARAMS:
+                self.screen = Screen.MENU
             elif self.input_controller is not None and self.input_controller.order_mode != OrderMode.MOVE:
                 self.input_controller.cancel_order_mode()
             elif self.screen == Screen.MATCH:
@@ -89,6 +109,13 @@ class App:
             return
         if key == pygame.K_h:
             self.show_help = not self.show_help
+            return
+        if key == pygame.K_l and self.screen == Screen.MATCH:
+            # Cycle log min_level: INFO -> DEBUG -> INFO
+            if self.log_min_level == LogLevel.INFO:
+                self.log_min_level = LogLevel.DEBUG
+            else:
+                self.log_min_level = LogLevel.INFO
             return
         if self.show_help or self.match is None or self.input_controller is None:
             return
@@ -123,31 +150,77 @@ class App:
             self._start_match(scenarios.make_training_match(), "Training mode", is_training_mode=True)
         elif kind == "scenario":
             definition = next(s for s in scenarios.SCENARIOS if s.key == key)
-            self._start_scenario(definition)
+            if definition.params:
+                self._enter_params_screen(definition)
+            else:
+                self._start_scenario(definition)
+
+    def _enter_params_screen(self, definition: scenarios.ScenarioDefinition) -> None:
+        self._pending_scenario_definition = definition
+        self._pending_scenario_params = {p.name: p.default for p in definition.params}
+        self.screen = Screen.SCENARIO_PARAMS
+
+    def _handle_params_click(self, pos: tuple[int, int]) -> None:
+        if self._pending_scenario_definition is None:
+            return
+        for name, (minus_rect, plus_rect) in self._params_button_rects.items():
+            if name == "__start__":
+                if minus_rect.collidepoint(pos):
+                    self._start_scenario_with_params()
+                continue
+            if name == "__back__":
+                if minus_rect.collidepoint(pos):
+                    self.screen = Screen.MENU
+                continue
+            param = next((p for p in self._pending_scenario_definition.params if p.name == name), None)
+            if param is None:
+                continue
+            current = self._pending_scenario_params.get(name, param.default)
+            if minus_rect.collidepoint(pos):
+                self._pending_scenario_params[name] = max(param.min_value, current - param.step)
+            elif plus_rect.collidepoint(pos):
+                self._pending_scenario_params[name] = min(param.max_value, current + param.step)
+
+    def _start_scenario_with_params(self) -> None:
+        if self._pending_scenario_definition is None:
+            return
+        self._start_scenario(
+            self._pending_scenario_definition,
+            kwargs=dict(self._pending_scenario_params),
+        )
+        self._pending_scenario_definition = None
+        self._pending_scenario_params = {}
 
     def _start_match(self, match: Match, label: str, is_training_mode: bool = False) -> None:
         self.match = match
+        self._wire_match_log(match)
         self.input_controller = MatchInputController(match=match, camera=self.camera)
         self.mode_label = label
         self.screen = Screen.MATCH
         self.is_training_mode = is_training_mode
         self._scenario_loop = None
         self._last_goal_tally = (match.scoreboard.left_goals, match.scoreboard.right_goals)
-        # Training mode: auto-select the lone player so they're immediately
-        # controllable without requiring an extra click.
         if is_training_mode and match.players:
             self.input_controller.selected_player_id = match.players[0].player_id
 
-    def _start_scenario(self, definition: scenarios.ScenarioDefinition) -> None:
+    def _start_scenario(
+        self, definition: scenarios.ScenarioDefinition, kwargs: dict | None = None
+    ) -> None:
         """Builds a ScenarioLoop and begins the first trial."""
-        loop = scenarios.ScenarioLoop(definition=definition)
+        loop = scenarios.ScenarioLoop(definition=definition, kwargs=kwargs or {})
         self._scenario_loop = loop
         self.match = loop.match
+        self._wire_match_log(loop.match)
         self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
         self.mode_label = f"Balance scenario: {definition.label}"
         self.screen = Screen.MATCH
         self.is_training_mode = False
         self._last_goal_tally = (0, 0)
+
+    def _wire_match_log(self, match: Match) -> None:
+        """Attach the game log callback to a newly created Match."""
+        game_log = self.game_log
+        match.log_callback = lambda level, msg: game_log.add(level, msg, match.time_s)
 
     def _step_match(self) -> None:
         assert self.match is not None
@@ -157,17 +230,15 @@ class App:
             trial_ended = loop.step()
             self.match = loop.match
             if loop.complete:
-                # All trials done - return to menu.
                 self.screen = Screen.MENU
                 self.match = None
                 self.input_controller = None
                 self._scenario_loop = None
             elif trial_ended:
-                # New trial started - sync input controller to fresh match.
+                # New trial started — wire log to the fresh match and sync input.
+                self._wire_match_log(loop.match)
                 self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
             else:
-                # Mid-trial: keep input controller in sync (match reference may not change
-                # but the input controller holds a direct reference, so this is safe).
                 if self.input_controller is not None:
                     self.input_controller.match = loop.match
             return
@@ -175,15 +246,14 @@ class App:
         self.match.step()
         if self.is_training_mode:
             current_tally = (self.match.scoreboard.left_goals, self.match.scoreboard.right_goals)
-            if current_tally != self._last_goal_tally:
+            # Wait until the engine's goal linger is done (linger_remaining == 0)
+            # before repositioning the player — otherwise we'd reset mid-linger.
+            if current_tally != self._last_goal_tally and self.match._goal_linger_remaining_s <= 0.0:
                 self._reset_training_positions()
                 self._last_goal_tally = current_tally
 
     def _reset_training_positions(self) -> None:
-        """Training mode is single-player free play: per the design spec, a
-        goal resets both the ball (already done by Match) and the player
-        back to a neutral starting position, rather than leaving the player
-        wherever they happened to be standing."""
+        """Training mode: reposition the player to start after a goal."""
         from footballcoach.mathutils import Vector3
 
         assert self.match is not None
@@ -220,6 +290,8 @@ class App:
     def _draw(self) -> None:
         if self.screen == Screen.MENU:
             self._draw_menu()
+        elif self.screen == Screen.SCENARIO_PARAMS:
+            self._draw_params_screen()
         else:
             self._draw_match()
 
@@ -272,6 +344,8 @@ class App:
             total = sum(o.values())
             if total > 0:
                 tally = f"Goals: {o['goal']}  Saved: {o['saved']}  Miss: {o['miss']}"
+                if o.get("dispossessed", 0):
+                    tally += f"  Disp: {o['dispossessed']}"
                 if o["other"]:
                     tally += f"  Other: {o['other']}"
                 hud_lines.append(tally)
@@ -287,9 +361,22 @@ class App:
         self.renderer.draw_hud_text(self.surface, hud_lines)
         self._draw_help_button()
         self.renderer.draw_hotkey_bar(self.surface, self._hotkey_entries())
+        self.renderer.draw_game_log(self.surface, self.game_log, self.log_min_level)
 
         if self.show_help:
             self._draw_help_overlay()
+
+    def _draw_params_screen(self) -> None:
+        if self._pending_scenario_definition is None:
+            self.screen = Screen.MENU
+            return
+        defn = self._pending_scenario_definition
+        self._params_button_rects = self.renderer.draw_scenario_params(
+            self.surface,
+            defn.params,
+            self._pending_scenario_params,
+            title=f"Configure: {defn.label}",
+        )
 
     def _draw_help_button(self) -> None:
         self.help_button_rect = pygame.Rect(self.camera.screen_width - 100, 8, 90, 32)
@@ -326,13 +413,19 @@ class App:
             "X                        - stop: decelerate selected player to a standstill",
             "Space                    - pause/resume the simulation",
             "H or Help button         - toggle this help overlay",
+            "L                        - cycle game log level (INFO / DEBUG)",
             "Esc                      - close this overlay, or return to the menu / quit",
             "",
             "Visual indicators:",
             "White outline            - player currently in possession of the ball",
+            "Cyan ring                - player mid first-touch control delay",
+            "Red ring                 - player temporarily inactive (just tackled)",
             "Orange fill              - goalkeeper",
             "Translucent              - player is temporarily inactive (just tackled, or",
             "                           just missed a tackle attempt)",
+            "Blue ball ring           - ball airborne",
+            "Green ball ring          - ball rolling",
+            "Amber ball ring          - ball just bounced",
         ]
         y = 100
         for line in lines:

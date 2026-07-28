@@ -27,6 +27,12 @@ class MoveOrder:
     target_position: Vector3
     sprint: bool = True
     arrival_tolerance_m: float = 0.3
+    # Controls how fast the player is moving when the order completes.
+    # None  -> resolved to jog speed at execution time (smooth, natural stop).
+    # 0.0   -> full standstill (the order does not complete until speed < 0.05
+    #          m/s AND within the (slightly widened) distance tolerance).
+    # >0    -> any explicit speed target in m/s.
+    max_speed_on_arrival_mps: float | None = None
     status: OrderStatus = OrderStatus.PENDING
 
 
@@ -117,6 +123,23 @@ class GetPossessionOrder:
 
 
 @dataclass
+class MarkOrder:
+    """Mark a specific opposition player: continuously position the marker
+    between that player and the ball, and switch to GetPossession-style
+    chase / tackle logic when:
+
+    - The target gains ball possession (or is mid first-touch control), OR
+    - The ball comes within ``mark_intercept_radius_m`` of the marker.
+
+    Never auto-completes — holds indefinitely until replaced by another order
+    (same persistent-duty model as ``SaveOrder``). The standoff distance and
+    intercept radius are configured in ``physics.json["marking"]``.
+    """
+    target_player_id: str
+    status: OrderStatus = OrderStatus.PENDING
+
+
+@dataclass
 class ShootOrder:
     """Shoot at goal by aiming at a specific 3-D point (e.g. a corner of the
     goal frame).  The player must have possession; if they do not the order
@@ -138,4 +161,4 @@ class ShootOrder:
     status: OrderStatus = OrderStatus.PENDING
 
 
-Order = MoveOrder | KickOrder | ShootOrder | TackleOrder | PassOrder | ChaseTackleOrder | SaveOrder | StopOrder | GetPossessionOrder
+Order = MoveOrder | KickOrder | ShootOrder | TackleOrder | PassOrder | ChaseTackleOrder | SaveOrder | StopOrder | GetPossessionOrder | MarkOrder

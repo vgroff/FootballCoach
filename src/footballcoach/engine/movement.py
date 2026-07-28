@@ -8,12 +8,33 @@ from __future__ import annotations
 import logging
 import math
 from dataclasses import dataclass
+from enum import Enum, auto
 
 from footballcoach.config import load_physics_config
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
 
 log = logging.getLogger("footballcoach.movement")
+
+
+class SpeedMode(Enum):
+    """Three discrete target-speed modes for ``step_player_towards``.
+
+    The order/AI layer picks a mode; the engine then uses its full
+    kinematics (acceleration, turning, stamina) to reach that target.
+    No order or action is ever permitted to write ``player.velocity``
+    directly — ``SpeedMode`` is the sole control surface.  See
+    ``src/footballcoach/knowledge.md`` for the full engine/AI boundary rule.
+    """
+    SPRINT = auto()      # target = v_top (full sprint pace)
+    JOG = auto()         # target = v_top * 0.5 (half pace)
+    STANDSTILL = auto()  # target = 0 m/s — decelerate to a stop
+
+
+# Below this threshold in STANDSTILL mode, velocity is snapped to exactly zero
+# to prevent floating-point drift keeping an "idle" player creeping forever.
+# This is the *only* velocity snap in the codebase.
+_STOP_SNAP_THRESHOLD_MPS: float = 0.02
 
 
 @dataclass(frozen=True)
@@ -37,6 +58,7 @@ class MovementParams:
     min_speed_for_turn_mps: float
     goalkeeper_accel_multiplier: float
     goalkeeper_speed_multiplier: float
+    standstill_decel_multiplier: float  # accel boost when decelerating to STANDSTILL
 
     @staticmethod
     def from_config() -> "MovementParams":
@@ -61,6 +83,7 @@ class MovementParams:
             min_speed_for_turn_mps=d["min_speed_for_turn_mps"],
             goalkeeper_accel_multiplier=d["goalkeeper_accel_multiplier"],
             goalkeeper_speed_multiplier=d["goalkeeper_speed_multiplier"],
+            standstill_decel_multiplier=d.get("standstill_decel_multiplier", 1.5),
         )
 
 
@@ -210,7 +233,7 @@ def regen_stamina(
 def step_player_towards(
     player: Player,
     target_direction: Vector3,
-    sprinting: bool,
+    speed_mode: SpeedMode,
     dt_s: float,
     params: MovementParams | None = None,
     has_ball: bool = False,
@@ -218,6 +241,10 @@ def step_player_towards(
     """Advances `player`'s velocity/heading/position one physics tick towards
     `target_direction` (need not be normalized; zero vector means decelerate
     to a stop). Mutates `player` in place.
+
+    This is the *only* function permitted to write ``player.velocity`` —
+    all callers must use ``SpeedMode`` to express intent rather than
+    assigning velocity directly.  See ``src/footballcoach/knowledge.md``.
     """
     params = params or MovementParams.from_config()
     attrs = player.attributes
@@ -227,10 +254,19 @@ def step_player_towards(
 
     current_speed = player.velocity.length_xy()
     desired_dir = target_direction.xy().normalized()
-    desired_speed = v_top if sprinting else v_top * 0.5
+
+    if speed_mode is SpeedMode.SPRINT:
+        desired_speed = v_top
+    elif speed_mode is SpeedMode.JOG:
+        desired_speed = v_top * 0.5
+    else:  # STANDSTILL
+        desired_speed = 0.0
+        # Deceleration to standstill uses a boosted acceleration so stopping
+        # feels snappier than accelerating (1.5× by default, config-tunable).
+        a_max *= params.standstill_decel_multiplier
 
     if desired_dir.length() < 1e-9:
-        # Decelerate to a stop, keeping current heading.
+        # No target direction: decelerate to a stop, keeping current heading.
         desired_dir = player.velocity.xy().normalized()
         desired_speed = 0.0
 
@@ -262,6 +298,12 @@ def step_player_towards(
     else:
         new_speed = current_speed + math.copysign(max_delta, speed_diff)
     new_speed = max(0.0, new_speed)
+
+    # Physics-level snap: the *only* velocity snap in the codebase.
+    # Prevents floating-point drift keeping a player infinitely creeping
+    # when the engine has already driven them to (near-)zero.
+    if new_speed < _STOP_SNAP_THRESHOLD_MPS and desired_speed == 0.0:
+        new_speed = 0.0
 
     log.debug(
         "[movement] pid=%s  heading: %.2f->%.2f (diff=%.2f)  "

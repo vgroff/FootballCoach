@@ -100,9 +100,14 @@ class TackleResult:
     ``1 - dribble_beaten_max_penalty`` (≈0.20); above
     ``dribble_beaten_speed_threshold`` margin it reaches 1.0 (no slowdown).
     Always 1.0 when the tackler wins (irrelevant in that case).
+    ``tackler_roll`` / ``dribbler_roll``: the actual skill-roll values drawn
+    during the contest, exposed so callers (e.g. the game log) can show the
+    exact numbers without re-deriving them from ``skill_roll`` internals.
     """
     tackler_won: bool
     dribble_speed_multiplier: float
+    tackler_roll: float = 0.0
+    dribbler_roll: float = 0.0
 
 
 def attempt_tackle(
@@ -151,16 +156,16 @@ def attempt_tackle(
     if is_goalkeeper_tackle and gk_outside_box:
         boost *= (1.0 - params.goalkeeper_outside_box_tackle_penalty)
     effective_boost = boost * (1.0 + angle_modifier)
-    tackler_roll = skill_roll(tackling_attr * effective_boost, rng_reduction, r)
-    dribbler_roll = skill_roll(dribbling_attr, rng_reduction, r)
+    t_roll = skill_roll(tackling_attr * effective_boost, rng_reduction, r)
+    d_roll = skill_roll(dribbling_attr, rng_reduction, r)
 
-    if tackler_roll >= dribbler_roll:
-        return TackleResult(tackler_won=True, dribble_speed_multiplier=1.0)
+    if t_roll >= d_roll:
+        return TackleResult(tackler_won=True, dribble_speed_multiplier=1.0, tackler_roll=t_roll, dribbler_roll=d_roll)
 
     # Dribbler won - compute how much they're slowed by the near-miss.
-    relative_margin = (dribbler_roll - tackler_roll) / max(tackler_roll, 1e-9)
+    relative_margin = (d_roll - t_roll) / max(t_roll, 1e-9)
     threshold = params.dribble_beaten_speed_threshold
     max_penalty = params.dribble_beaten_max_penalty
     # Linear interpolation: 0 margin -> (1 - max_penalty), threshold -> 1.0
     speed_mult = (1.0 - max_penalty) + max_penalty * min(1.0, relative_margin / threshold)
-    return TackleResult(tackler_won=False, dribble_speed_multiplier=speed_mult)
+    return TackleResult(tackler_won=False, dribble_speed_multiplier=speed_mult, tackler_roll=t_roll, dribbler_roll=d_roll)

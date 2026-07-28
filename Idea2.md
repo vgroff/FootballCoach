@@ -1,9 +1,9 @@
 to the AI: Do not read this ever, they are just notes for me
 
-Read Idea.md, and all the READMe and knowledge files, except Idea2 and ai_pla.
-You may also have stuff in memory/storage for this repo. We now want to add some more features to the repo. the plan has already been made in current_plan, so read that. We have done phases A-E, now implement Phase F
+Read Idea.md, and all the READMe and knowledge files, except Idea2 and ai_plans.
+You may also have stuff in memory/storage for this repo. We now want to add some more features to the repo. the plan has already been made in current_plan, so read that. We have done phases A-F, now implement Phases G and H including the test
 
-Read Idea.md, and all the READMe and knowledge files, except Idea2 and ai_pla.
+Read Idea.md, and all the READMe and knowledge files, except Idea2 and ai_plans.
 You may also have stuff in memory/storage for this repo. We now want to add some more features to the repo. They are detailed below. Read the files you need, ask questions etc... Write me a high-level design document detailing what needs to be done, and which files are useful to read for each task and in general. It will be used by other agents. Also, detail the maths and numbers and say why you choose certain parameters or models, I'd like all that stuff and I like to understand those kinds of mechanics
 
 
@@ -25,10 +25,13 @@ You may also have stuff in memory/storage for this repo. We now want to add some
 - Add a game log - bottom corner somewhere, just some a scrolling window with messages evertime: a player takes possession, a kick happens (with params displayed), a goal is scored, or an order is given (with params). We probably we will want to add different levels of logging (behind a flag so that its skipped in tests, but always enabled for the UI) that we can switch between in the window so that we can see more detailed info if needed.
 - I'd be interested in trying rudimentary 2v2 scenarios in the UI - 2 attackers, 1 defender+1 GK, one has the ball and is in the box aligned with the left post, the other is slightly behind in x (to stay onside) and aligned with the right post but is running forwards. The player with the ball passes to the other, and the other either shoots immediately or controls it first, moves slightly forward and then shoots. Everything is carried out using the Pass/Move/Shoot orders for attackers, while the defender runs GetPosessions and the GK runs save.
 - I want to implement a Mark order - the player should basically stay close to a targeted opposition player and stand between him and the ball, and then try to intercept the ball if it gets close (use GetPossession code/logic for this). If his target has possession, he can also just fallback to using GetPossession code/logic to tackle him.
+- Let all scenarios run for an extra 2 seconds after theyre detected as completed
 
 NB Immediate:
-- Let all scenarios run for an extra 2 seconds after theyre detected as completed
-- Tests are very slow, are there places we cna cut timeouts or reduce the number of trials?
+- Goalkeeper snaps in save order - not sure its needed if we program things correctly
+- what's the point of actions.py? what does it do that orders don't do directly?
+- Have we implemented throw-ins, corners and goal kicks? How is the AI going to understand them? Maybe a separate "positioning" AI that positions the players of your team (legally) and then another one decides running direction/speed of the kicker, and the kicker kicks immediately basically
+
 
 NB:
 - currently stamina regen is faster than sprint depeltion, do we want that?
@@ -36,7 +39,5 @@ NB:
     - Ask the AI to explain the kick power calculations - maybe we need a non-linearity
 - implement goalie rebounds and "failed" saves of various kinds
     - also implement rebounds off players for failed ball controls
-- Use the goalkeeper clever positioning that we've implemented in the UI scenario for tuning gk values in the balance tests
-- Shooting backwards isn't as harsh of a penalty as you might think - might need to increase the effect of kick precision and/or the backwards shooting penalty in general
-- Show player attributed somewhere on select
-- Could grid search on the goalie intercept maneuver - really we should calculate distance/speed for both options, no?
+- Show player attributes ands stamina somewhere on select
+- Could do grid search on the goalie intercept maneuver and clever positioning - ask that AI how the intercepting is chosen, but really we should calculate distance/speed for both options, and make a weighted choice based on those, no? throw in some params and re-tune the goalie bonuses probably

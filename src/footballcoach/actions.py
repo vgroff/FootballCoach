@@ -28,7 +28,7 @@ from footballcoach.entities.pitch import Pitch
 from footballcoach.entities.player import Player, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.entities.player import Player as _Player  # forward ref alias
-from footballcoach.orders import ChaseTackleOrder, GetPossessionOrder, KickOrder, MoveOrder, PassOrder, SaveOrder, StopOrder
+from footballcoach.orders import ChaseTackleOrder, GetPossessionOrder, KickOrder, MarkOrder, MoveOrder, PassOrder, SaveOrder, StopOrder
 
 DEFAULT_SHOOT_HEIGHT_M = 1.1
 DEFAULT_SHOOT_POWER_FRACTION = 0.85
@@ -105,3 +105,11 @@ def save(goalkeeper: Player) -> None:
     incoming). Does not auto-complete - reissue only if replacing it with a
     different order."""
     goalkeeper.current_order = SaveOrder()
+
+
+def mark(player: Player, target: Player) -> None:
+    """Mark a specific opposition player: stand between them and the ball,
+    and switch to GetPossession-style chase/tackle if the target gains
+    possession or the ball comes within the configured intercept radius.
+    Does not auto-complete — holds until replaced by another order."""
+    player.current_order = MarkOrder(target_player_id=target.player_id)

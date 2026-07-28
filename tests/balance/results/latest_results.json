@@ -292,8 +292,8 @@
   "save_far_post_fast_vs_slow_gk": {
     "fast_gk": {
       "n_trials": 300,
-      "saved": 260,
-      "save_rate_pct": 86.67
+      "saved": 265,
+      "save_rate_pct": 88.33
     },
     "slow_gk": {
       "n_trials": 300,
@@ -315,19 +315,19 @@
   },
   "save_rate_grid_pct": {
     "gk_speed=0.1_near_post": 85.3,
-    "gk_speed=0.1_centre": 96.7,
+    "gk_speed=0.1_centre": 94.7,
     "gk_speed=0.1_far_post": 0.7,
     "gk_speed=0.5_near_post": 85.3,
     "gk_speed=0.5_centre": 96.7,
-    "gk_speed=0.5_far_post": 74.0,
+    "gk_speed=0.5_far_post": 60.7,
     "gk_speed=0.9_near_post": 85.3,
     "gk_speed=0.9_centre": 96.7,
-    "gk_speed=0.9_far_post": 80.0
+    "gk_speed=0.9_far_post": 80.7
   },
   "save_random_scenarios_good_vs_bad": {
     "n_scenarios": 150,
     "good_gk_save_rate_pct": 94.0,
-    "bad_gk_save_rate_pct": 91.3
+    "bad_gk_save_rate_pct": 92.0
   },
   "dribble_speed_penalty_avg": {
     "n_dribbler_wins": 980,
@@ -618,5 +618,22 @@
     "n_trials": 200,
     "succeeded": 74,
     "success_rate_pct": 37.0
+  },
+  "marking_vs_getpossession_time_on_ball": {
+    "n_trials": 200,
+    "get_possession_mean_ticks": 236.4,
+    "mark_mean_ticks": 110.59,
+    "diff_ticks_mark_minus_gp": -125.81
+  },
+  "marker_standoff_stability": {
+    "n_trials": 50,
+    "mean_steady_state_dist_m": 0.952,
+    "mean_max_steady_state_dist_m": 2.1
+  },
+  "mark_vs_getpossession_tackle_win_rate": {
+    "n_trials": 2000,
+    "mark_tackle_win_rate_pct": 87.9,
+    "get_possession_tackle_win_rate_pct": 87.9,
+    "diff_pct": 0.0
   }
 }

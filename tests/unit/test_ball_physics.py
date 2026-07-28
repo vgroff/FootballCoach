@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from footballcoach.engine.ball_physics import BallPhysicsParams, step_ball
 from footballcoach.entities.ball import Ball
 from footballcoach.mathutils import Vector3
@@ -97,6 +99,95 @@ def test_drag_reduces_horizontal_speed_in_flight():
     for _ in range(10):
         step_ball(ball, 1 / 30)
     assert ball.velocity.x < 20.0
+
+
+# ---------------------------------------------------------------------------
+# just_bounced_timer_s tests (Phase G)
+# ---------------------------------------------------------------------------
+
+def test_just_bounced_timer_set_on_real_bounce():
+    """A ball dropped from height and allowed to bounce must have
+    just_bounced_timer_s > 0 immediately after the real bounce tick."""
+    params = BallPhysicsParams.from_config()
+    ball = Ball.at_rest(Vector3(0, 0, 2.0))
+    assert ball.just_bounced_timer_s == 0.0
+
+    dt = 1 / 30
+    for _ in range(200):
+        step_ball(ball, dt, params)
+        if ball.just_bounced_timer_s > 0.0:
+            break
+    else:
+        raise AssertionError("just_bounced_timer_s was never set after 200 ticks")
+
+    assert ball.just_bounced_timer_s == pytest.approx(
+        params.just_bounced_display_duration_s, abs=1e-9
+    ), "timer must be reset to the full display duration on a real bounce"
+
+
+def test_just_bounced_timer_not_set_on_settling_contact():
+    """A ball placed at rest on the ground (no real bounce) must not trigger
+    the just_bounced indicator — the settling-contact branch leaves it 0."""
+    params = BallPhysicsParams.from_config()
+    # Start at ground level with only horizontal velocity (no vertical drop).
+    ball = Ball.at_rest(Vector3(0, 0, params.ball_radius_m))
+    ball.velocity = Vector3(3.0, 0.0, 0.0)
+
+    dt = 1 / 30
+    for _ in range(30):
+        step_ball(ball, dt, params)
+        assert ball.just_bounced_timer_s == 0.0, (
+            "just_bounced_timer_s should not be set for a rolling ball with no bounce"
+        )
+
+
+def test_just_bounced_timer_decays_to_zero():
+    """After a bounce sets just_bounced_timer_s, it must decay to 0 over
+    approximately just_bounced_display_duration_s seconds."""
+    params = BallPhysicsParams.from_config()
+    ball = Ball.at_rest(Vector3(0, 0, 2.0))
+    dt = 1 / 30
+
+    # Run until a bounce occurs.
+    for _ in range(200):
+        step_ball(ball, dt, params)
+        if ball.just_bounced_timer_s > 0.0:
+            break
+    else:
+        raise AssertionError("No bounce detected in 200 ticks")
+
+    # Now let it decay.
+    display_s = params.just_bounced_display_duration_s
+    expected_ticks = round(display_s / dt)
+    for i in range(expected_ticks + 5):
+        step_ball(ball, dt, params)
+        # Once the timer reaches 0 it must stay at 0 (no negative values).
+        assert ball.just_bounced_timer_s >= 0.0
+
+    assert ball.just_bounced_timer_s == pytest.approx(0.0, abs=dt + 1e-9), (
+        f"timer should have decayed to 0 after ~{expected_ticks} ticks; "
+        f"got {ball.just_bounced_timer_s:.4f}"
+    )
+
+
+def test_just_bounced_timer_reset_on_second_bounce():
+    """Each real bounce must reset the timer to the full display duration,
+    not accumulate."""
+    params = BallPhysicsParams.from_config()
+    ball = Ball.at_rest(Vector3(0, 0, 2.0))
+    dt = 1 / 30
+    bounce_count = 0
+
+    for _ in range(400):
+        prev_timer = ball.just_bounced_timer_s
+        step_ball(ball, dt, params)
+        if ball.just_bounced_timer_s == pytest.approx(params.just_bounced_display_duration_s, abs=1e-9) \
+                and prev_timer < params.just_bounced_display_duration_s:
+            bounce_count += 1
+            if bounce_count >= 2:
+                break
+
+    assert bounce_count >= 2, "Expected at least 2 bounces in 400 ticks"
 
 
 def test_magnus_effect_curves_spinning_ball():

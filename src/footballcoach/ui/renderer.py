@@ -4,6 +4,7 @@ rendering - no game logic or input handling lives here (see input.py / app.py).
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING
 
 import pygame
 
@@ -12,6 +13,10 @@ from footballcoach.entities.pitch import Pitch
 from footballcoach.entities.player import Player, PlayerState, Team
 from footballcoach.ui import style
 from footballcoach.ui.camera import Camera
+
+if TYPE_CHECKING:
+    from footballcoach.ui.gamelog import GameLog, LogLevel
+    from footballcoach.ui.scenarios import ScenarioParam
 
 
 class Renderer:
@@ -82,6 +87,15 @@ class Renderer:
         pygame.draw.circle(surface, style.BALL_COLOUR, pos, radius_px)
         pygame.draw.circle(surface, style.BALL_OUTLINE, pos, radius_px, 1)
 
+        # Ball state indicator rings (drawn on top of the ball circle).
+        # Priority: just_bounced > flying > rolling (mutually exclusive for display).
+        if ball.just_bounced_timer_s > 0.0:
+            pygame.draw.circle(surface, style.BALL_STATE_BOUNCED_OUTLINE, pos, radius_px + 3, 2)
+        elif ball.position.z > 0.05 and ball.possessed_by is None:
+            pygame.draw.circle(surface, style.BALL_STATE_FLYING_OUTLINE, pos, radius_px + 3, 2)
+        elif ball.velocity.length_xy() > 0.05 and ball.possessed_by is None:
+            pygame.draw.circle(surface, style.BALL_STATE_ROLLING_OUTLINE, pos, radius_px + 3, 2)
+
         if ball.height_m > 0.15:
             label = self.hud_font.render(f"{ball.height_m:.1f}m", True, style.HUD_TEXT)
             surface.blit(label, (pos[0] + radius_px + 2, pos[1] - label.get_height() // 2))
@@ -124,10 +138,18 @@ class Renderer:
         else:
             pygame.draw.circle(surface, colour, pos, radius_px)
 
+        # State outline rings: CONTROLLING_BALL (cyan) and INACTIVE_TACKLED (red).
+        # These are separate from the possession/selection outlines, and stack
+        # outward so they're each visible simultaneously.
+        if player.state == PlayerState.CONTROLLING_BALL:
+            pygame.draw.circle(surface, style.CONTROL_DELAY_OUTLINE, pos, radius_px + 4, 2)
+        elif is_inactive:
+            pygame.draw.circle(surface, style.INACTIVE_OUTLINE, pos, radius_px + 4, 2)
+
         if has_ball:
             pygame.draw.circle(surface, style.POSSESSION_OUTLINE, pos, radius_px + 2, 2)
         if selected:
-            pygame.draw.circle(surface, style.SELECTED_OUTLINE, pos, radius_px + 5, 2)
+            pygame.draw.circle(surface, style.SELECTED_OUTLINE, pos, radius_px + 7, 2)
 
         # Heading indicator - a short line showing facing direction.
         heading_len_px = radius_px + 8
@@ -187,3 +209,103 @@ class Renderer:
             rendered = self.hud_font.render(f"{key_text} {label}", True, colour)
             surface.blit(rendered, (x, bar_y + (bar_h - rendered.get_height()) // 2))
             x += rendered.get_width() + 20
+
+    def draw_game_log(
+        self,
+        surface: pygame.Surface,
+        game_log: "GameLog",
+        min_level: "LogLevel",
+        max_lines: int = 8,
+    ) -> None:
+        """Draws the most recent log entries as a scrolling text box in the
+        bottom-right corner of the screen.  Newest entries at the bottom.
+        No interactive scrollbar — intentionally simple for a playtesting tool.
+        """
+        from footballcoach.ui.gamelog import LogLevel
+        entries = game_log.entries_above(min_level)[-max_lines:]
+        if not entries:
+            return
+
+        line_h = self.hud_font.get_height() + 2
+        box_w = 480
+        box_h = len(entries) * line_h + 6
+        bar_h = 34  # hotkey bar height — sit just above it
+        box_x = surface.get_width() - box_w - 6
+        box_y = surface.get_height() - bar_h - box_h - 4
+
+        bg = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        bg.fill((10, 10, 18, 180))
+        surface.blit(bg, (box_x, box_y))
+
+        for i, entry in enumerate(entries):
+            colour = style.HUD_TEXT if entry.level == LogLevel.INFO else style.HOTKEY_DISABLED
+            text = self.hud_font.render(entry.message[:72], True, colour)
+            surface.blit(text, (box_x + 4, box_y + 3 + i * line_h))
+
+    def draw_scenario_params(
+        self,
+        surface: pygame.Surface,
+        params: list["ScenarioParam"],
+        values: dict[str, float],
+        title: str = "Scenario Parameters",
+    ) -> dict[str, tuple[pygame.Rect, pygame.Rect]]:
+        """Draws the scenario-parameter adjustment screen and returns a dict
+        mapping param name → (minus_rect, plus_rect) for click detection.
+
+        Layout: centred vertical list, one row per param.
+        """
+        surface.fill(style.HUD_BG)
+        sw, sh = surface.get_size()
+
+        title_surf = self.title_font.render(title, True, style.HUD_ACCENT)
+        surface.blit(title_surf, ((sw - title_surf.get_width()) // 2, 30))
+
+        row_h = 40
+        start_y = 100
+        col_label_x = sw // 2 - 220
+        col_val_x = sw // 2 + 20
+        col_minus_x = sw // 2 - 60
+        col_plus_x = sw // 2 + 100
+        btn_w, btn_h = 32, 28
+
+        button_rects: dict[str, tuple[pygame.Rect, pygame.Rect]] = {}
+
+        for i, param in enumerate(params):
+            y = start_y + i * row_h
+            label_surf = self.hud_font.render(param.label, True, style.HUD_TEXT)
+            surface.blit(label_surf, (col_label_x, y + (row_h - label_surf.get_height()) // 2))
+
+            val = values.get(param.name, param.default)
+            val_surf = self.hud_font.render(f"{val:.3g}", True, style.HUD_ACCENT)
+            surface.blit(val_surf, (col_val_x, y + (row_h - val_surf.get_height()) // 2))
+
+            minus_rect = pygame.Rect(col_minus_x, y + (row_h - btn_h) // 2, btn_w, btn_h)
+            plus_rect = pygame.Rect(col_plus_x, y + (row_h - btn_h) // 2, btn_w, btn_h)
+            mouse_pos = pygame.mouse.get_pos()
+            for rect, symbol in ((minus_rect, "-"), (plus_rect, "+")):
+                hovered = rect.collidepoint(mouse_pos)
+                bg_colour = (70, 70, 90) if hovered else (40, 40, 55)
+                pygame.draw.rect(surface, bg_colour, rect, border_radius=4)
+                sym_surf = self.hud_font.render(symbol, True, style.HUD_ACCENT)
+                surface.blit(sym_surf, (rect.x + (btn_w - sym_surf.get_width()) // 2,
+                                        rect.y + (btn_h - sym_surf.get_height()) // 2))
+            button_rects[param.name] = (minus_rect, plus_rect)
+
+        # Start / Back buttons near the bottom.
+        bottom_y = start_y + len(params) * row_h + 30
+        start_rect = pygame.Rect(sw // 2 - 110, bottom_y, 100, 38)
+        back_rect = pygame.Rect(sw // 2 + 20, bottom_y, 100, 38)
+        for rect, label, colour in (
+            (start_rect, "Start", style.HUD_ACCENT),
+            (back_rect, "Back", style.HUD_TEXT),
+        ):
+            hovered = rect.collidepoint(pygame.mouse.get_pos())
+            bg = (60, 90, 60) if (label == "Start" and hovered) else (60, 60, 80) if hovered else (35, 35, 50)
+            pygame.draw.rect(surface, bg, rect, border_radius=6)
+            txt = self.hud_font.render(label, True, colour)
+            surface.blit(txt, (rect.x + (rect.width - txt.get_width()) // 2,
+                                rect.y + (rect.height - txt.get_height()) // 2))
+        # Store Start/Back in the dict with special keys
+        button_rects["__start__"] = (start_rect, start_rect)
+        button_rects["__back__"] = (back_rect, back_rect)
+        return button_rects

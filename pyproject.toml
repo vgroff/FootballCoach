@@ -22,7 +22,11 @@ build-backend = "hatchling.build"
 [dependency-groups]
 dev = [
     "pytest>=9.1.1",
+    "pytest-xdist>=3.8.0",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+log_level = "WARNING"
+log_cli = false
+addopts = "-n auto"

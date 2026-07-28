@@ -4,6 +4,7 @@ import math
 
 from footballcoach.engine.movement import (
     MovementParams,
+    SpeedMode,
     ball_carry_speed_multiplier,
     drain_stamina,
     effective_acceleration,
@@ -88,7 +89,7 @@ def test_step_player_towards_moves_in_target_direction():
     player = make_player(position=Vector3(0, 0, 0))
     player.heading_rad = 0.0
     for _ in range(120):
-        step_player_towards(player, Vector3(1, 0, 0), sprinting=True, dt_s=1 / 30)
+        step_player_towards(player, Vector3(1, 0, 0), SpeedMode.SPRINT, dt_s=1 / 30)
     assert player.position.x > 5.0
     assert abs(player.position.y) < 1e-6
 
@@ -98,5 +99,36 @@ def test_step_player_towards_decelerates_on_zero_target():
     player.heading_rad = 0.0
     player.velocity = Vector3(5.0, 0.0, 0.0)
     for _ in range(60):
-        step_player_towards(player, Vector3.zero(), sprinting=False, dt_s=1 / 30)
+        step_player_towards(player, Vector3.zero(), SpeedMode.STANDSTILL, dt_s=1 / 30)
     assert player.velocity.length() < 0.5
+
+
+def test_standstill_decelerates_faster_than_jog():
+    """STANDSTILL should stop a moving player faster than JOG (standstill_decel_multiplier > 1)."""
+    params = MovementParams.from_config()
+
+    def ticks_to_stop(mode: SpeedMode) -> int:
+        player = make_player(position=Vector3(0, 0, 0), attr_value=0.5)
+        player.heading_rad = 0.0
+        player.velocity = Vector3(6.0, 0.0, 0.0)
+        for i in range(300):
+            step_player_towards(player, Vector3.zero(), mode, dt_s=1 / 30, params=params)
+            if player.speed_mps < 0.05:
+                return i
+        return 300
+
+    standstill_ticks = ticks_to_stop(SpeedMode.STANDSTILL)
+    jog_ticks = ticks_to_stop(SpeedMode.JOG)
+    assert standstill_ticks < jog_ticks, (
+        f"STANDSTILL should stop faster than JOG: {standstill_ticks} vs {jog_ticks} ticks"
+    )
+
+
+def test_standstill_snap_clears_drift():
+    """A player at near-zero speed in STANDSTILL mode should snap to exactly
+    zero (physics-level snap), preventing infinite creep."""
+    player = make_player(position=Vector3(0, 0, 0))
+    player.heading_rad = 0.0
+    player.velocity = Vector3(0.015, 0.0, 0.0)  # below _STOP_SNAP_THRESHOLD_MPS (0.02)
+    step_player_towards(player, Vector3.zero(), SpeedMode.STANDSTILL, dt_s=1 / 30)
+    assert player.speed_mps == 0.0, "velocity should be snapped to zero by physics-level guard"

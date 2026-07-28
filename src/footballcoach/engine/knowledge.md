@@ -70,6 +70,15 @@ mind.
 
 ## `movement.py` - movement, stamina, turning
 
+- **Velocity invariant**: `step_player_towards` is the **only** function
+  permitted to write `player.velocity`.  All callers pass a `SpeedMode` enum
+  value (`SPRINT`, `JOG`, or `STANDSTILL`); the function owns all kinematics.
+  A near-zero snap (`_STOP_SNAP_THRESHOLD_MPS = 0.02 m/s`, applied only in
+  `STANDSTILL` mode) clears floating-point drift when the target is 0 — this
+  is the only velocity snap in the engine.  `STANDSTILL` additionally uses
+  a `standstill_decel_multiplier` (1.5× by default, config-tunable) on top
+  of `a_max` so stopping is snappier than accelerating from rest.
+
 - **Goalkeeper movement boosts**: goalkeepers get two flat multipliers from
   `physics.json` applied on top of their attribute-driven movement:
   - `goalkeeper_accel_multiplier` (currently 3.1 in physics.json): applied
@@ -303,6 +312,13 @@ hard percentage targets.
   `ball_control_alpha = 0.9`. Outside the box, goalkeepers use the normal
   outfield-player formula (checked via `pitch.is_in_either_box()` in
   `Match._update_loose_ball_pickup`).
+- **Jump penalty (GK and outfield)**: above head height (1.8m), control
+  time increases faster than the base height-difficulty curve — modeled as
+  a continuous scaling of the height-factor term that ramps up toward each
+  player type's maximum reach height. GK max reach is higher than outfield
+  and the per-metre penalty is lower (GK advantage). Below head height,
+  outfield players are completely unaffected by this extension (regression
+  safe). Config keys in `physics.json["control_time"]`.
 - A small proportional Gaussian noise term (`noise_sigma_fraction = 0.1`,
   scaled by `rng_reduction`) is added on top of the deterministic
   `t_control` in `Match._update_loose_ball_pickup`, so touches aren't
@@ -449,6 +465,12 @@ Implements the goalkeeper-only "Save" behaviour from the design brief:
   is less likely to spill/fumble it once there. See
   `tests/balance/test_save_balance.py` for validation that save rate
   responds sensibly to both.
+- **Early intercept**: `early_intercept_target()` computes a candidate
+  intercept point along the ball's flight path and moves the GK there
+  instead of waiting for the goal-line crossing point, when the GK can
+  reach it faster. Falls back to the goal-line target if the ball is too
+  far or the intercept wouldn't save meaningful time. Config keys are in
+  `physics.json["goalkeeping"]`.
 
 ## `offside.py` - simplified offside rule
 
@@ -501,10 +523,15 @@ configuration.
 active players can run straight through a just-tackled player lying/off-
 balance on the ground rather than bumping into them like a solid obstacle.
 
-- **`resolve_ball_block_by_inactive_players`**: inactive players can still
-  block a *loose ball* (e.g. a shot/pass) with their cylinder, even though
-  they don't block other players. Each tick, this checks whether the ball's
-  movement segment (from its position last tick to this tick) entered an
+**Velocity damping on collision**: when two overlapping players have a
+  closing velocity above a minimum floor, the component of each player's
+  velocity directed toward the other is damped. The floor prevents
+  continuous damping of gentle jostling; the retention factor and floor are
+  tunable in `physics.json["collision"]`. Damping applies even to inactive
+  pairs (unlike position push-apart) so a just-tackled player coasting at
+  full speed still slows on contact. Because overlap can persist across
+  multiple ticks, the damping compounds — this is intentional but the floor
+  prevents it from driving velocity to zero.
   inactive player's cylinder from *outside* it - a ball already inside the
   cylinder (e.g. one that was there when the player became inactive) does
   NOT get blocked, only a ball crossing in from outside, per the explicit
@@ -559,30 +586,61 @@ there's no "single order resolution while otherwise paused" mode yet).
   passing, tackling, saving, ball physics, offside *detection*, goal
   detection).
 
-## Running-while-kicking power modifier (`kicking.running_power_multiplier`)
+## Running-while-kicking power and precision modifiers (`kicking.py`)
 
 Both `kick_ball` and `pass_ball` accept optional `kicker_velocity` /
-`kicker_top_speed_mps` parameters (passed by `Match._process_orders` for
-`KickOrder`/`PassOrder`), used to scale launch speed via
-`running_power_multiplier`: a simple cosine projection of the kicker's
-velocity onto the aim direction, scaled by how close to top speed they're
-currently running. Running straight towards the aim direction at full pace
-adds up to `running_power_coefficient` (0.3, i.e. +30%) extra power;
-running square-on has no effect; running directly away from the aim
-direction reduces power by the same amount. Defaults to a 1.0 (no-op)
-multiplier if the kicker isn't moving or no velocity/top-speed context is
-supplied, so existing callers (e.g. balance tests using stationary kickers)
-are unaffected.
+`kicker_top_speed_mps` parameters, used to apply two independent modifiers:
+
+**Power** (`running_power_multiplier`): cosine projection of the kicker's
+velocity onto the aim direction, scaled by fraction of top speed. Running
+fully toward the aim direction at top speed adds up to
+`running_power_coefficient` (+30%) extra power; running away reduces it
+by the same amount. No-ops at zero velocity.
+
+**Precision** (`running_direction_precision_multiplier`): reduces effective
+`kick_precision` when kicking against the run direction — no penalty within
+a forward cone (~70°), grading to a meaningful penalty at square-on, and a
+steeper penalty when kicking backward relative to momentum. Applied to all
+kicks (shots, passes, generic kicks) via the shared `_launch_ball` helper,
+not shots only. Config breakpoints and penalty magnitudes are in
+`physics.json["kicking"]`. Defaults to 1.0 (no penalty) when the kicker is
+nearly stationary.
+
+## `MarkOrder` and `GetPossessionOrder` (Phase F)
+
+**`GetPossessionOrder`**: instructs a player to acquire the ball, however
+necessary. Each tick: if a carrier exists (and isn't the player themselves),
+chase them and attempt a tackle on contact; if the ball is loose, sprint to
+the predicted intercept point. Completes once the player has possession.
+The chase/tackle logic is factored into `_run_get_possession_behaviour()`
+and shared with `MarkOrder`'s fallback.
+
+**`MarkOrder(target_player_id)`**: instructs a player to mark a specific
+opponent. Two modes per tick, selected automatically:
+- **Intercept/tackle mode**: when the target has ball possession (or is
+  `CONTROLLING_BALL`), or the ball is within `mark_intercept_radius_m`
+  (config, default 4.0m) of the marker — delegates to
+  `_run_get_possession_behaviour()`, identical to `GetPossessionOrder`.
+- **Standoff mode**: otherwise, moves to a point between the target and the
+  ball at `mark_standoff_m` (config, default 1.5m) offset from the target
+  toward the ball, decelerating to a standstill there. Uses
+  `_braking_speed_mode()` — no velocity snaps.
+
+`MarkOrder` **never auto-completes** (analogous to `SaveOrder`); it must be
+explicitly replaced with a different order. Config:
+`physics.json["marking"]`. Balance tests: `tests/balance/test_mark_balance.py`.
+
+**`StopOrder`**: decelerates the player to a standstill using
+`SpeedMode.STANDSTILL` and completes once `speed_mps == 0.0` (driven by
+the physics-level snap at `_STOP_SNAP_THRESHOLD_MPS`).
 
 ## `../actions.py` - high-level one-shot action helpers
 
 `src/footballcoach/actions.py` (one level up from `engine/`) provides the
 simple, literally-named functions requested for player control:
-`move_to`, `shoot`, `pass_to`, `tackle`, `save`. Each is a thin wrapper that
-just constructs and assigns the appropriate order (`MoveOrder`, `KickOrder`
-aimed at the opponent's goal centre, `PassOrder`, `ChaseTackleOrder`,
-`SaveOrder` respectively) - all the actual behaviour lives in the order
-types and `Match._process_orders` described above. `opponent_goal_centre`
-resolves "which goal is this team attacking" using the same
-`Team.LEFT` attacks +x / `Team.RIGHT` attacks -x convention as
-`offside.py` and `goalkeeping.py`.
+`move_to`, `shoot`, `pass_to`, `tackle`, `save`, `mark`. Each is a thin
+wrapper that just constructs and assigns the appropriate order — all the
+actual behaviour lives in the order types and `Match._process_orders`
+described above. `opponent_goal_centre` resolves "which goal is this team
+attacking" using the same `Team.LEFT` attacks +x / `Team.RIGHT` attacks -x
+convention as `offside.py` and `goalkeeping.py`.

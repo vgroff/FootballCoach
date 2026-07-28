@@ -25,6 +25,7 @@ class BallPhysicsParams:
     rolling_friction_coefficient: float
     spin_decay_per_s: float
     block_restitution: float
+    just_bounced_display_duration_s: float = 0.3
 
     @staticmethod
     def from_config() -> "BallPhysicsParams":
@@ -44,6 +45,7 @@ class BallPhysicsParams:
             rolling_friction_coefficient=bp["rolling_friction_coefficient"],
             spin_decay_per_s=bp["spin_decay_per_s"],
             block_restitution=bp["block_restitution"],
+            just_bounced_display_duration_s=bp.get("just_bounced_display_duration_s", 0.3),
         )
 
 
@@ -108,6 +110,7 @@ def step_ball(ball: Ball, dt_s: float, params: BallPhysicsParams | None = None) 
     # slow, grounded balls (e.g. a gentle pass) stop dead within a few
     # ticks.
     BOUNCE_THRESHOLD_MPS = 0.5
+    real_bounce_this_tick = False
     if new_position.z <= params.ball_radius_m:
         new_position = new_position.with_z(params.ball_radius_m)
         if new_velocity.z < -BOUNCE_THRESHOLD_MPS:
@@ -126,6 +129,7 @@ def step_ball(ball: Ball, dt_s: float, params: BallPhysicsParams | None = None) 
                     outgoing_vz,
                 )
                 new_spin = new_spin * params.bounce_spin_retention
+                real_bounce_this_tick = True
         else:
             # Resting/rolling contact, not a real bounce: kill only the
             # (small, spurious) vertical velocity and leave horizontal
@@ -144,3 +148,9 @@ def step_ball(ball: Ball, dt_s: float, params: BallPhysicsParams | None = None) 
     ball.position = new_position
     ball.velocity = new_velocity
     ball.spin = new_spin
+
+    # Update the visual "just bounced" timer: set on a real bounce, decay each tick.
+    if real_bounce_this_tick:
+        ball.just_bounced_timer_s = params.just_bounced_display_duration_s
+    elif ball.just_bounced_timer_s > 0.0:
+        ball.just_bounced_timer_s = max(0.0, ball.just_bounced_timer_s - dt_s)
