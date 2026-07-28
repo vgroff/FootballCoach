@@ -25,10 +25,10 @@ swappable/removable without touching the engine, per the project's
 - `scenarios.py` - builds `Match` instances for the two non-freeplay modes:
   `make_training_match()` (1 player + ball, full pitch, both goals live) and
   `SCENARIOS` (hand-picked recreations of the pytest balance scenarios -
-  penalty, save/goalkeeper dive, shoot from box, 20m pass, tackle challenge,
-  sprint race - for *watching* a single live trial, not for statistical
-  validation; the pytest suite in `tests/balance/` remains the source of
-  truth for balance numbers).
+  penalty, close-range shot vs keeper, far-post GK dive, shoot from box,
+  20m pass, tackle challenge, sprint race - for *watching* a live looping
+  series of trials, not for statistical validation; the pytest suite in
+  `tests/balance/` remains the source of truth for balance numbers).
 - `app.py` - `App` owns the pygame window, main loop, a simple two-screen
   state machine (`MENU` / `MATCH`), and wires input events to
   `MatchInputController` + `Match.step()` + `Renderer`.
@@ -149,29 +149,61 @@ states from the current selection/ball/mode.
 
 ## Balance scenario looping (`ScenarioLoop` in `scenarios.py`)
 
-`ScenarioLoop` wraps a `ScenarioDefinition` and replays it for
-`max_trials` (default 20) consecutive trials.  The UI calls
-`loop.step()` once per frame; each call advances the current trial's
-`Match` by one physics tick.  A trial ends when:
+`ScenarioLoop` wraps a `ScenarioDefinition` and replays it indefinitely
+(default `max_trials=0`, meaning run forever; any positive value stops after
+that many trials and returns to the menu).  The UI calls `loop.step()` once
+per frame; each call advances the current trial's `Match` by one physics
+tick.  A trial ends when:
 1. Ball crosses the touchline or goal line (out of bounds).
-2. All player orders have resolved *and* the ball is possessed or
-   stationary (≥ 30 ticks in, to let the initial kick/tackle execute).
-3. `timeout_ticks` failsafe (default 500, ≈ 16.7 s at 30 Hz).
+2. Scoreboard changed (goal scored).
+3. The initial ball carrier has released the ball AND the ball is since
+   possessed by someone else, gone dead, or a goal was recorded.
+   This correctly ends GK-save trials the instant the keeper controls the
+   ball, without waiting for `SaveOrder` to complete (it never does).
+4. All non-persistent orders resolved and ball stationary (covers orderless
+   scenarios like sprint).
+5. `timeout_ticks` failsafe (default 500, ≈ 16.7 s at 30 Hz).
 
-`loop.step()` returns `True` the tick a trial ends, at which point the
-loop has already built a fresh `Match` (via `definition.build()`) for
-the next trial, or set `loop.complete = True` if `max_trials` reached.
-`App._step_match` handles the three outcomes (mid-trial, new trial
-started, loop complete → return to menu).
+`ScenarioLoop.outcomes` accumulates `{'goal', 'saved', 'miss', 'other'}`
+counts across all completed trials.  The HUD shows these as
+`Goals: N  Saved: N  Miss: N` below the trial counter.
 
-The HUD shows `Trial N/max_trials` instead of the score during scenario
-mode.
+The HUD shows `Trial N  |  Playing` (no `/max`) when running indefinitely,
+or `Trial N/max_trials` when a finite count was specified.
 
 ## Training mode auto-select
 
 `App._start_match` now sets `input_controller.selected_player_id` to
 the lone trainee's ID immediately when `is_training_mode=True`, so the
 player is controllable from the first frame without an initial click.
+
+## Coordinate convention — critical pitfall
+
+All x-coordinates are measured from the **pitch centre** (origin), not from
+a goal line.  The left goal line is at `x = -pitch.half_length` (≈ -52.5m
+on a standard 105m pitch).  A value like `x = -22` places the player 22m
+from the *centre*, which is 30.5m from the left goal — **not** 22m from
+goal.  Use `-(pitch.half_length - distance_from_goal)` whenever you mean a
+specific distance from a goal line, e.g. `-(pitch.half_length - 25.0)` for
+25m out.  This mistake has bitten the save-balance tests and scenarios
+multiple times.
+
+## Close-range shot vs keeper scenario (`build_close_range_save_scenario`)
+
+Fully randomised each trial (decoupled from the balance tests):
+- **Distance**: 8–16m from the left goal line.
+- **Shooter attributes**: precision, power, speed all in 0.65–0.85 band;
+  power scales linearly with distance (closer → lower power) so the keeper
+  has a fighting chance even at 8m.
+- **GK attributes**: speed and ball_control both in 0.65–0.85 band.
+- **GK start position** (50/50 each trial):
+  - *Random*: anywhere across the goal width.
+  - *Smart*: shifted 30–60% of half-goal-width toward the shooter's y-side
+    (covering the near post angle a real keeper would), so the far side is
+    still exposed and the shot forces a realistic dive.
+- **Aim point**: always on the **opposite** y-side of the goal from
+  `gk_start_y`, at a random height (0.2–1.8m), so every trial requires a
+  cross-goal save.
 
 ## Known gaps / not yet implemented
 

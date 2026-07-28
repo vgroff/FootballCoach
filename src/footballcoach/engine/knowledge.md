@@ -72,26 +72,29 @@ mind.
 
 - **Goalkeeper movement boosts**: goalkeepers get two flat multipliers from
   `physics.json` applied on top of their attribute-driven movement:
-  - `goalkeeper_accel_multiplier` (2.8): applied to straight-line
-    acceleration (`effective_acceleration`), lateral/turning acceleration
-    (`lateral_accel_capability`), and thus turn rate (`max_turn_rate_rad_s`).
-    **Must be applied to all three** - an earlier version only boosted
-    straight-line acceleration, which let a fast keeper
-  - `goalkeeper_speed_multiplier` (1.5): applied to top speed in
-    `effective_top_speed` (via `step_player_towards`). Simulates a keeper's
-    explosive diving reach covering more of the goal than their raw speed
-    attribute alone would allow. Applied after stamina and ball-carry
-    penalties so it stacks multiplicatively with them.
-  Both multipliers are applied inside `step_player_towards` automatically
-  via `player.is_goalkeeper`, so no call-site changes are needed when
-  adding new order types. An earlier version only boosted straight-line acceleration, which let a fast keeper
-  build up speed towards a save target faster than they could *correct*
-  direction as the ball's predicted crossing point shifted tick-to-tick,
-  causing overshoot/oscillation past the target - this actually made a fast
-  keeper save *less* than a slow one in
-  `tests/balance/test_save_balance.py` until fixed. See also `match.py`'s
-  `SaveOrder` handling below for a related arrival-tolerance bug this
-  surfaced.
+  - `goalkeeper_accel_multiplier` (currently 3.1 in physics.json): applied
+    to straight-line acceleration (`effective_acceleration`), lateral/turning
+    acceleration (`lateral_accel_capability`), and thus turn rate
+    (`max_turn_rate_rad_s`). **Must be applied to all three** - an earlier
+    version only boosted straight-line acceleration, which caused overshoot
+    and oscillation as the keeper built speed faster than they could correct
+    direction when the predicted crossing point shifted each tick.
+  - `goalkeeper_speed_multiplier` (currently 1.45): applied to top speed
+    in `effective_top_speed`. Effective GK top speed is therefore
+    `(5.0 + 4.5*attr) * 1.45`, ranging from ~7.25 m/s (attr=0) to
+    ~13.8 m/s (attr=1.0). Simulates explosive diving reach. Applied after
+    stamina/ball-carry penalties so it stacks multiplicatively.
+  Both multipliers are applied automatically via `player.is_goalkeeper`
+  inside `step_player_towards`, so no call-site changes are needed for new
+  order types.
+- **SaveOrder snap threshold**: the arrival check uses
+  `max(0.15, gk_top_speed * dt)` rather than a fixed 0.15m.  Without the
+  per-tick term a fast GK (speed 13+ m/s at 30 Hz \u2248 0.46 m/tick) sails
+  through the fixed 0.15m window and overshoots the target every tick,
+  meaning a fast keeper saved *less* than a slow one.  The dynamic threshold
+  ensures the keeper snaps to the intercept point rather than oscillating
+  past it.  See `tests/scenario/test_save_order.py` for regression tests
+  covering overshoot, tunneling, and drift.
 
 - **Top speed / acceleration**: linear in the attribute,
   `v_max = 5.0 + 4.5*top_speed` m/s (5.0-9.5 m/s), `a_max = 2.5 + 5.0*accel`

@@ -18,10 +18,25 @@ given a Move order actually arrives", "a penalty kicked dead centre with
 zero error scores and the goal is recorded", "a tackle with a big skill gap
 wins deterministically".
 
-`test_scenario_loop.py` is an exception: it tests `ScenarioLoop`
-(the UI's multi-trial balance scenario runner) headlessly without pygame,
-driving `loop.step()` directly.  It uses the default `rng_reduction=0.3`
-because the loop's trial-end detection doesn't depend on determinism.
+`test_scenario_loop.py` tests `ScenarioLoop` (the UI's multi-trial balance
+scenario runner) headlessly without pygame, driving `loop.step()` directly.
+It uses `rng_reduction=0.3` because the loop's trial-end detection doesn't
+depend on determinism.  It parametrises over all `SCENARIOS` so new
+scenarios are automatically covered.
+
+`test_save_order.py` tests the goalkeeper `SaveOrder` logic via specific
+edge-cases at `rng_reduction=1.0` (deterministic): no overshoot past the
+far post, no tunneling on fast close-range shots, no drift when already
+on the crossing point, and confirmation that a slow keeper genuinely cannot
+cover 7m in time for an 8m shot (so "always saved" tests aren't vacuously
+true).  These complement `tests/balance/test_save_balance.py`'s statistical
+coverage.
+
+**Coordinate convention in tests**: x-coordinates are always from pitch
+centre (origin), not from a goal line.  Use `-(pitch.half_length - dist_m)`
+to place a shooter `dist_m` from the goal.  Hardcoding values like `-22.0`
+has repeatedly caused mismatched expectations about shot distance — always
+derive from `pitch.half_length`.
 
 ## `balance/`
 
