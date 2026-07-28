@@ -55,3 +55,54 @@ update it in all three places.
 
 Each reports full statistics (not just pass/fail) via the `balance_recorder`
 fixture - see `tests/knowledge.md`.
+## `steering.py` - player repulsion during Move orders
+
+A thin AI/order-layer module (sibling to `actions.py`, deliberately NOT
+under `engine/`) that computes a repulsion-adjusted movement direction and
+speed multiplier for `MoveOrder` handling in `Match._process_orders`. The
+engine modules (`movement.py`, `collision.py`) are completely unaware of it.
+
+**Design boundary**: `steering.py` decides *what direction and speed to
+request*; `engine/movement.py`'s `step_player_towards` then executes that
+request as pure kinematics. This mirrors the existing `actions.py` /
+`engine/` separation: "AI layer decides, engine executes".
+
+**Only `MoveOrder` uses repulsion.** ChaseTackleOrder, GetPossessionOrder,
+SaveOrder, etc. do not — confirmed out of scope.
+
+### `compute_repulsion(player, desired_dir, other_players, ball_carrier_id, params)`
+
+Returns `(adjusted_direction: Vector3, speed_multiplier: float)`.
+
+- For each other player within `params.radius_m` that is **not** the ball
+  carrier: add a repulsion vector away from them, with linear falloff
+  `strength(d) = strength_base * (1 - d/radius_m)`.
+- Ball carrier (if `player` has the ball) gets repulsion multiplied by
+  `ball_carrier_repulsion_mult` and a speed penalty
+  `min(ball_carrier_speed_penalty_max, |net_rep| * speed_penalty_scale)`.
+- **Orthogonal nudge**: if `rel_vel · net_repulsion < alignment_dot_threshold`
+  (player heading nearly straight into an obstacle), adds a perpendicular
+  component. Sign is chosen via 2D cross product of net_repulsion and
+  desired_dir to pick the side closest to the intended destination.
+- **Deflection cap** (`max_deflection_deg`): the final blended direction is
+  clamped so the steering angle relative to `desired_dir` never exceeds this
+  value. Prevents players from moving backwards. Currently 90°.
+
+### Config (`physics.json["repulsion"]`)
+
+| Key | Value | Notes |
+|-----|-------|-------|
+| `radius_m` | 3.8 | distance at which repulsion begins |
+| `strength_base` | 2.8 | peak directional weight at d=0 (m/s-equivalent) |
+| `ball_carrier_repulsion_mult` | 2.2 | extra multiplier when player has ball |
+| `ball_carrier_speed_penalty_max` | 0.4 | max fractional speed penalty (40%) |
+| `speed_penalty_scale` | 0.14 | converts \|net_rep\| to speed penalty |
+| `alignment_dot_threshold` | -0.7 | trigger orthogonal nudge threshold |
+| `min_orthogonal_adjust_mps` | 0.75 | sideways nudge magnitude |
+| `max_deflection_deg` | 90.0 | hard cap on steering angle change per tick |
+
+Values were tuned via `scripts/grid_search_repulsion_params.py` across 8
+scenarios (head-on collision, ball carrier vs jogger, cluster, corridor, etc.)
+with a multi-objective scorer (avoidance%, min_sep, avg_deflection, bc
+catchability, corridor clearance). See `scripts/repulsion_sandbox.py` for
+per-tick visualisation. Balance tests: `tests/balance/test_repulsion_balance.py`.

@@ -33,8 +33,10 @@ class MoveOrder:
 @dataclass
 class KickOrder:
     aim_point: Vector3  # absolute world position the kicker intends to hit
-    power_fraction: float  # in [0, 1]
+    power_fraction: float  # in [0, 1]; or >1 when compensate_for_run=False and caller wants old raw behaviour
     spin: Vector3
+    compensate_for_run: bool = True  # if True, match.py pre-divides by run_mult so the ball
+                                     # leaves at the intended speed regardless of run direction
     status: OrderStatus = OrderStatus.PENDING
 
 
@@ -131,7 +133,8 @@ class ShootOrder:
       engine fires at that point at the requested power.
     """
     aim_point: Vector3          # absolute world position to aim at
-    power_fraction: float       # in [0, 1]; 1.0 = full-power shot
+    power_fraction: float       # in [0, 1]; or >1 when compensate_for_run=False
+    compensate_for_run: bool = True  # same semantics as KickOrder.compensate_for_run
     status: OrderStatus = OrderStatus.PENDING
 
 

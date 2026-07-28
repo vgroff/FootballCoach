@@ -5,12 +5,15 @@ constants used here (they all live in config/physics.json).
 """
 from __future__ import annotations
 
+import logging
 import math
 from dataclasses import dataclass
 
 from footballcoach.config import load_physics_config
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
+
+log = logging.getLogger("footballcoach.movement")
 
 
 @dataclass(frozen=True)
@@ -259,6 +262,19 @@ def step_player_towards(
     else:
         new_speed = current_speed + math.copysign(max_delta, speed_diff)
     new_speed = max(0.0, new_speed)
+
+    log.debug(
+        "[movement] pid=%s  heading: %.2f->%.2f (diff=%.2f)  "
+        "speed: %.2f->%.2f (target=%.2f  a_max=%.2f)  "
+        "turn_frac=%.2f  v_top=%.2f  pos: (%.3f,%.3f)->(%.3f,%.3f)",
+        player.player_id,
+        current_heading, new_heading, heading_diff,
+        current_speed, new_speed, target_speed, a_max,
+        turn_fraction, v_top,
+        player.position.x, player.position.y,
+        player.position.x + Vector3.from_angle_xy(new_heading, new_speed).x * dt_s,
+        player.position.y + Vector3.from_angle_xy(new_heading, new_speed).y * dt_s,
+    )
 
     player.heading_rad = new_heading
     player.velocity = Vector3.from_angle_xy(new_heading, new_speed)

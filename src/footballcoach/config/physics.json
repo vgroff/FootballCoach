@@ -53,7 +53,7 @@
     "goalkeeper_speed_multiplier": 1.38
   },
   "kicking": {
-    "_comment": "sigma_angle in radians = base + scale*(1 - precision^precision_exponent). power in m/s = base + scale*attr. running_power_coefficient: max run boost = coefficient (at full sprint in line with kick). power_base/scale rescaled from 15/20 so full-sprint run_mult=1.7 gives same peak speed as old coeff=0.3 (run_mult=1.3): factor=1.3/1.7=0.765.",
+    "_comment": "sigma_angle in radians = base + scale*(1 - precision^precision_exponent). power in m/s = base + scale*attr. running_power_coefficient: max run boost = coefficient (at full sprint in line with kick). power_base/scale rescaled from 15/20 so full-sprint run_mult=1.7 gives same peak speed as old coeff=0.3 (run_mult=1.3): factor=1.3/1.7=0.765. running_direction_precision_*: reduce kick precision by up to 75% when kicking against the run direction (backwards). cos_high=0.35 (~70° forward cone), cos_low=-0.2 (~102°), penalty_mid=0.25 at cos_low, penalty_max=0.75 at cos=-1. See design doc for worked tables.",
     "angle_error_base_rad": 0.0055,
     "angle_error_scale_rad": 0.04,
     "power_base_mps": 12.0,
@@ -62,7 +62,12 @@
     "running_power_coefficient": 0.6,
     "power_error_scale": 1.4,
     "power_error_exponent": 2.0,
-    "precision_exponent": 0.87
+    "precision_exponent": 0.87,
+    "running_direction_precision_cos_high": 0.35,
+    "running_direction_precision_cos_low": -0.2,
+    "running_direction_precision_penalty_mid": 0.25,
+    "running_direction_precision_penalty_max": 0.75,
+    "running_direction_min_speed_mps": 1.0
   },
   "passing": {
     "_comment": "Auto-pace for a grounded pass: v = overshoot_factor * sqrt(2*mu_roll*g*distance), clamped to [min,max]. Error model is now unified with kicking (KickingParams) - sigma scales with both precision and effective power.",
@@ -74,9 +79,11 @@
     "pass_aim_height_m": 0.11
   },
   "goalkeeping": {
-    "_comment": "'Save' action: predicts where an incoming shot crosses the keeper's own goal line and moves the keeper there. See engine/knowledge.md for the crossing-point prediction and the ball-freeze-on-pickup rule that makes saves work with the generic possession model.",
+    "_comment": "'Save' action: predicts where an incoming shot crosses the keeper's own goal line and moves the keeper there. See engine/knowledge.md for the crossing-point prediction and the ball-freeze-on-pickup rule that makes saves work with the generic possession model. early_intercept_max_distance_m: GK only attempts early interception when ball is within this range. early_intercept_safety_margin: GK must be reachable at the intercept point in less than this fraction of the time to reach the goal line (guards false positives on fast/far shots).",
     "goal_frame_margin_m": 0.2,
-    "default_position_fraction_of_half_length": 0.02
+    "default_position_fraction_of_half_length": 0.02,
+    "early_intercept_max_distance_m": 10.0,
+    "early_intercept_safety_margin": 0.85
   },
   "tackling": {
     "tackler_boost": 1.25,
@@ -84,13 +91,17 @@
     "inactive_speed_penalty": 0.5,
     "tackler_miss_inactive_duration_s": 0.4,
     "goalkeeper_tackle_boost": 2.0,
+    "goalkeeper_outside_box_tackle_penalty": 0.4,
+    "control_time_penalty_reference_s": 0.3,
     "dribble_beaten_speed_threshold": 0.35,
     "dribble_beaten_max_penalty": 0.8,
     "head_on_min_charge_speed_mps": 1.0,
     "angle_modifier_frontal": 0.1,
     "angle_modifier_side": -0.05,
     "angle_modifier_behind": -0.5,
-    "_comment_angle": "Modifier added to tackling boost based on approach angle. angle=0 (frontal, tackler is directly in front of dribbler): +10%; angle=90 (side): -5%; angle=180 (from behind): -65%. Piecewise linear in cos(angle)."
+    "_comment_angle": "Modifier added to tackling boost based on approach angle. angle=0 (frontal, tackler is directly in front of dribbler): +10%; angle=90 (side): -5%; angle=180 (from behind): -65%. Piecewise linear in cos(angle).",
+    "_comment_gk_outside": "goalkeeper_outside_box_tackle_penalty: fractional reduction applied to effective_boost when a GK makes a tackle outside their own box. Reduces the 2.0 GK boost to ~1.2 — comparable to an outfield tackler, not better.",
+    "_comment_control_time": "control_time_penalty_reference_s: reference duration used to scale the dribbling penalty for CONTROLLING_BALL players. A player at/above this many seconds remaining gets up to 25% dribbling penalty; near 0s remaining gets no penalty."
   },
   "ball_physics": {
     "drag_coefficient": 0.25,
@@ -103,7 +114,7 @@
     "block_restitution": 0.35
   },
   "control_time": {
-    "_comment": "Time (s) for a player to bring a ball under control on first touch. See knowledge.md in engine/ for full derivation.",
+    "_comment": "Time (s) for a player to bring a ball under control on first touch. See knowledge.md in engine/ for full derivation. Jump zone (above player_height_m=1.8m): outfield_jump_scale_at_max_reach multiplies the (height_factor-1) term at outfield_max_reach_height_m; GK's height_factor_scale interpolates toward gk jump_scale_at_max_reach at gk_max_reach_height_m.",
     "t_base_s": 0.1,
     "t_scale_s": 0.3,
     "height_factor_knee": 1.0,
@@ -115,13 +126,33 @@
     "k2_own_velocity_s_per_mps": 0.05,
     "ball_control_alpha": 0.85,
     "noise_sigma_fraction": 0.1,
+    "outfield_jump_scale_at_max_reach": 2.0,
+    "outfield_max_reach_height_m": 2.0,
     "goalkeeper": {
       "t_base_s": 0.08,
       "height_factor_scale": 0.4,
-      "ball_control_alpha": 0.9
+      "ball_control_alpha": 0.9,
+      "jump_scale_at_max_reach": 1.2,
+      "max_reach_height_m": 2.2
     }
   },
   "offside": {
     "enabled_by_default": true
+  },
+  "collision": {
+    "_comment": "Player-player velocity damping on overlap. collision_velocity_retention: fraction of closing speed kept per tick (0.5 = 50% reduction). collision_damping_min_closing_speed_mps: closing speeds below this floor are left untouched, preventing unbounded compounding over many ticks of sustained overlap (see design doc for worked example).",
+    "collision_velocity_retention": 0.5,
+    "collision_damping_min_closing_speed_mps": 0.3
+  },
+  "repulsion": {
+    "_comment": "AI/order-layer steering — used ONLY in steering.py / MoveOrder handling. NOT engine physics. radius_m: distance at which repulsion begins. strength_base: peak directional weight at d=0 (m/s-equivalent, blended into heading not force). ball_carrier_repulsion_mult: extra boost when the moving player has the ball. ball_carrier_speed_penalty_max: max fractional speed penalty for ball carriers (0.4 = 40% reduction). speed_penalty_scale: converts |net_repulsion| to speed penalty fraction. alignment_dot_threshold: trigger orthogonal nudge when rel_vel . net_repulsion < this (i.e. heading nearly straight into obstacle). min_orthogonal_adjust_mps: sideways nudge magnitude (primary tuning knob — start at 1.5, tune via balance test).",
+    "radius_m": 3.8,
+    "strength_base": 2.8,
+    "ball_carrier_repulsion_mult": 2.2,
+    "ball_carrier_speed_penalty_max": 0.4,
+    "speed_penalty_scale": 0.14,
+    "alignment_dot_threshold": -0.7,
+    "min_orthogonal_adjust_mps": 0.75,
+    "max_deflection_deg": 90.0
   }
 }

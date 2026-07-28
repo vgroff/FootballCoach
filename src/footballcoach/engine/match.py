@@ -13,12 +13,13 @@ from dataclasses import dataclass, field
 from footballcoach.config import load_physics_config
 from footballcoach.engine.ball_physics import BallPhysicsParams, step_ball
 from footballcoach.engine.collision import (
+    CollisionParams,
     are_touching,
     resolve_all_overlaps,
     resolve_ball_block_by_inactive_players,
 )
-from footballcoach.engine.goalkeeping import GoalkeepingParams, save_target_position
-from footballcoach.engine.kicking import KickingParams, PassingParams, kick_ball, pass_ball, pass_speed_mps
+from footballcoach.engine.goalkeeping import GoalkeepingParams, early_intercept_target, save_target_position
+from footballcoach.engine.kicking import KickingParams, PassingParams, kick_ball, pass_ball, pass_speed_mps, compensate_power_for_run_mult, running_power_multiplier
 from footballcoach.engine.movement import (
     MovementParams,
     effective_top_speed,
@@ -30,7 +31,7 @@ from footballcoach.engine.scoring import Scoreboard, check_goal
 from footballcoach.engine.tackling import TacklingParams, attempt_tackle, tackle_angle_modifier
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.pitch import Pitch
-from footballcoach.entities.player import Player, PlayerState
+from footballcoach.entities.player import Player, PlayerState, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import (
     ChaseTackleOrder,
@@ -44,6 +45,10 @@ from footballcoach.orders import (
     StopOrder,
     TackleOrder,
 )
+from footballcoach.steering import RepulsionParams, compute_repulsion
+
+import logging
+log = logging.getLogger("footballcoach.match")
 
 
 @dataclass
@@ -64,6 +69,8 @@ class Match:
     control_time_params: ControlTimeParams = field(default_factory=ControlTimeParams.from_config)
     tackling_params: TacklingParams = field(default_factory=TacklingParams.from_config)
     goalkeeping_params: GoalkeepingParams = field(default_factory=GoalkeepingParams.from_config)
+    repulsion_params: RepulsionParams = field(default_factory=RepulsionParams.from_config)
+    collision_params: CollisionParams = field(default_factory=CollisionParams.from_config)
 
     paused: bool = False
     time_s: float = 0.0
@@ -121,7 +128,7 @@ class Match:
         self._update_loose_ball_pickup(dt)
 
         self._check_head_on_tackles()
-        resolve_all_overlaps(self.players)
+        resolve_all_overlaps(self.players, collision_params=self.collision_params)
         self._check_goal()
 
         if self.ball.release_grace_s > 0.0:
@@ -171,20 +178,49 @@ class Match:
                     order.status = OrderStatus.COMPLETE
                     player.current_order = None
                 else:
+                    # Apply repulsion steering: adjust direction and compute speed
+                    # multiplier. This is an AI/order-layer decision (steering.py);
+                    # step_player_towards itself stays a pure kinematics function.
+                    adj_dir, speed_mult = compute_repulsion(
+                        player, direction, self.players,
+                        self.ball.possessed_by, self.repulsion_params,
+                    )
+                    # Convert speed multiplier to sprint flag: if the repulsion
+                    # penalty is significant (< 0.75 of target speed), downgrade
+                    # a sprint to a jog. Non-ball-carriers always get mult=1.0.
+                    effective_sprint = order.sprint and speed_mult >= 0.75
+                    log.debug(
+                        "[move] t=%.3f  pid=%s  pos=(%.3f,%.3f)  "
+                        "raw_dir=(%.3f,%.3f)  adj_dir=(%.3f,%.3f)  "
+                        "speed_mult=%.3f  sprint=%s  has_ball=%s",
+                        self.time_s, player.player_id,
+                        player.position.x, player.position.y,
+                        direction.x, direction.y,
+                        adj_dir.x, adj_dir.y,
+                        speed_mult, effective_sprint, has_ball,
+                    )
                     step_player_towards(
-                        player, direction, order.sprint, dt, self.movement_params, has_ball
+                        player, adj_dir, effective_sprint, dt, self.movement_params, has_ball
                     )
                     player.stamina = _drain_if_sprinting(
-                        self.movement_params, player, order.sprint, dt
+                        self.movement_params, player, effective_sprint, dt
                     )
 
             elif isinstance(order, KickOrder):
                 if has_ball:
+                    _kick_top_speed = effective_top_speed(
+                        self.movement_params, player.attributes.top_speed, player.stamina,
+                        has_ball=True, ball_control_attr=player.attributes.ball_control,
+                    )
+                    _kick_run_mult = running_power_multiplier(
+                        self.kicking_params.running_power_coefficient, player.velocity,
+                        order.aim_point - player.position, _kick_top_speed,
+                    )
                     kick_ball(
                         self.ball,
                         player.position,
                         order.aim_point,
-                        order.power_fraction,
+                        compensate_power_for_run_mult(order.power_fraction, _kick_run_mult) if order.compensate_for_run else order.power_fraction,
                         player.attributes.kick_precision,
                         player.attributes.kick_power,
                         order.spin,
@@ -192,10 +228,7 @@ class Match:
                         self.rng,
                         self.kicking_params,
                         kicker_velocity=player.velocity,
-                        kicker_top_speed_mps=effective_top_speed(
-                            self.movement_params, player.attributes.top_speed, player.stamina,
-                            has_ball=True, ball_control_attr=player.attributes.ball_control,
-                        ),
+                        kicker_top_speed_mps=_kick_top_speed,
                     )
                     self._start_release_grace(player.player_id)
                 order.status = OrderStatus.COMPLETE
@@ -203,11 +236,19 @@ class Match:
 
             elif isinstance(order, ShootOrder):
                 if has_ball:
+                    _shoot_top_speed = effective_top_speed(
+                        self.movement_params, player.attributes.top_speed, player.stamina,
+                        has_ball=True, ball_control_attr=player.attributes.ball_control,
+                    )
+                    _shoot_run_mult = running_power_multiplier(
+                        self.kicking_params.running_power_coefficient, player.velocity,
+                        order.aim_point - player.position, _shoot_top_speed,
+                    )
                     kick_ball(
                         self.ball,
                         player.position,
                         order.aim_point,
-                        order.power_fraction,
+                        compensate_power_for_run_mult(order.power_fraction, _shoot_run_mult) if order.compensate_for_run else order.power_fraction,
                         player.attributes.kick_precision,
                         player.attributes.kick_power,
                         Vector3.zero(),
@@ -215,10 +256,7 @@ class Match:
                         self.rng,
                         self.kicking_params,
                         kicker_velocity=player.velocity,
-                        kicker_top_speed_mps=effective_top_speed(
-                            self.movement_params, player.attributes.top_speed, player.stamina,
-                            has_ball=True, ball_control_attr=player.attributes.ball_control,
-                        ),
+                        kicker_top_speed_mps=_shoot_top_speed,
                     )
                     self._start_release_grace(player.player_id)
                 order.status = OrderStatus.COMPLETE
@@ -227,36 +265,58 @@ class Match:
             elif isinstance(order, TackleOrder):
                 target = self.player_by_id(order.target_player_id)
                 if are_touching(player, target) and target.is_available_to_tackle():
-                    result = attempt_tackle(
-                        player.attributes.tackling,
-                        target.attributes.dribbling,
-                        self.rng_reduction,
-                        self.rng,
-                        self.tackling_params,
-                        is_goalkeeper_tackle=player.is_goalkeeper,
-                        angle_modifier=tackle_angle_modifier(
-                            target.heading_rad, target.position, player.position, self.tackling_params
-                        ),
-                    )
-                    if result.tackler_won and self.ball.possessed_by == target.player_id:
-                        self.ball.possessed_by = player.player_id
-                    elif not result.tackler_won:
-                        target.velocity = target.velocity * result.dribble_speed_multiplier
-                    target.state = PlayerState.INACTIVE_TACKLED
-                    target.state_timer_s = self.tackling_params.inactive_duration_s
-                    if not result.tackler_won:
-                        # A failed (lunging/sliding) tackle also leaves the
-                        # tackler briefly unable to react - shorter than the
-                        # dispossessed player's penalty, since they weren't
-                        # actually beaten on the ball, just off-balance.
+                    if self._gk_immune_from_tackle(target):
+                        # Phase B: GK in own box with ball is untackleable —
+                        # auto-fail, tackler penalised for the lunge, GK
+                        # state is completely unchanged.
                         player.state = PlayerState.INACTIVE_TACKLED
                         player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
+                    else:
+                        result = attempt_tackle(
+                            player.attributes.tackling,
+                            self._effective_dribbling(target),  # Phase B: CONTROLLING_BALL penalty
+                            self.rng_reduction,
+                            self.rng,
+                            self.tackling_params,
+                            is_goalkeeper_tackle=player.is_goalkeeper,
+                            angle_modifier=tackle_angle_modifier(
+                                target.heading_rad, target.position, player.position, self.tackling_params
+                            ),
+                            gk_outside_box=self._gk_outside_own_box(player),  # Phase B: GK penalty
+                        )
+                        if result.tackler_won and self._target_has_or_controls_ball(target):
+                            self.ball.possessed_by = player.player_id
+                        elif not result.tackler_won:
+                            target.velocity = target.velocity * result.dribble_speed_multiplier
+                        target.state = PlayerState.INACTIVE_TACKLED
+                        target.state_timer_s = self.tackling_params.inactive_duration_s
+                        if not result.tackler_won:
+                            # A failed (lunging/sliding) tackle also leaves the
+                            # tackler briefly unable to react - shorter than the
+                            # dispossessed player's penalty, since they weren't
+                            # actually beaten on the ball, just off-balance.
+                            player.state = PlayerState.INACTIVE_TACKLED
+                            player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
                 order.status = OrderStatus.COMPLETE
                 player.current_order = None
 
             elif isinstance(order, PassOrder):
                 if has_ball:
                     pass_target = self._leading_pass_target(player, order)
+                    _pass_top_speed = effective_top_speed(
+                        self.movement_params, player.attributes.top_speed, player.stamina,
+                        has_ball=True, ball_control_attr=player.attributes.ball_control,
+                    )
+                    _pass_run_mult = running_power_multiplier(
+                        self.kicking_params.running_power_coefficient, player.velocity,
+                        pass_target - player.position, _pass_top_speed,
+                    )
+                    # Compensate explicit power_fraction only; auto-pace (None) is
+                    # distance-based and already targets the right arrival speed.
+                    _compensated_pass_power = (
+                        compensate_power_for_run_mult(order.power_fraction, _pass_run_mult)
+                        if order.power_fraction is not None else None
+                    )
                     pass_ball(
                         self.ball,
                         player.position,
@@ -267,13 +327,10 @@ class Match:
                         self.passing_params,
                         gravity_mps2=self.ball_physics_params.gravity_mps2,
                         rolling_friction_coefficient=self.ball_physics_params.rolling_friction_coefficient,
-                        power_fraction=order.power_fraction,
+                        power_fraction=_compensated_pass_power,
                         running_power_coefficient=self.kicking_params.running_power_coefficient,
                         kicker_velocity=player.velocity,
-                        kicker_top_speed_mps=effective_top_speed(
-                            self.movement_params, player.attributes.top_speed, player.stamina,
-                            has_ball=True, ball_control_attr=player.attributes.ball_control,
-                        ),
+                        kicker_top_speed_mps=_pass_top_speed,
                         kick_power_attr=player.attributes.kick_power,
                         kicking_params=self.kicking_params,
                     )
@@ -286,26 +343,32 @@ class Match:
                 target = self.player_by_id(order.target_player_id)
                 if are_touching(player, target):
                     if target.is_available_to_tackle():
-                        result = attempt_tackle(
-                            player.attributes.tackling,
-                            target.attributes.dribbling,
-                            self.rng_reduction,
-                            self.rng,
-                            self.tackling_params,
-                            is_goalkeeper_tackle=player.is_goalkeeper,
-                            angle_modifier=tackle_angle_modifier(
-                                target.heading_rad, target.position, player.position, self.tackling_params
-                            ),
-                        )
-                        if result.tackler_won and self.ball.possessed_by == target.player_id:
-                            self.ball.possessed_by = player.player_id
-                        elif not result.tackler_won:
-                            target.velocity = target.velocity * result.dribble_speed_multiplier
-                        target.state = PlayerState.INACTIVE_TACKLED
-                        target.state_timer_s = self.tackling_params.inactive_duration_s
-                        if not result.tackler_won:
+                        if self._gk_immune_from_tackle(target):
+                            # Phase B: GK in own box with ball is untackleable.
                             player.state = PlayerState.INACTIVE_TACKLED
                             player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
+                        else:
+                            result = attempt_tackle(
+                                player.attributes.tackling,
+                                self._effective_dribbling(target),  # Phase B: CONTROLLING_BALL penalty
+                                self.rng_reduction,
+                                self.rng,
+                                self.tackling_params,
+                                is_goalkeeper_tackle=player.is_goalkeeper,
+                                angle_modifier=tackle_angle_modifier(
+                                    target.heading_rad, target.position, player.position, self.tackling_params
+                                ),
+                                gk_outside_box=self._gk_outside_own_box(player),  # Phase B: GK penalty
+                            )
+                            if result.tackler_won and self._target_has_or_controls_ball(target):
+                                self.ball.possessed_by = player.player_id
+                            elif not result.tackler_won:
+                                target.velocity = target.velocity * result.dribble_speed_multiplier
+                            target.state = PlayerState.INACTIVE_TACKLED
+                            target.state_timer_s = self.tackling_params.inactive_duration_s
+                            if not result.tackler_won:
+                                player.state = PlayerState.INACTIVE_TACKLED
+                                player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
                     order.status = OrderStatus.COMPLETE
                     player.current_order = None
                 else:
@@ -324,26 +387,32 @@ class Match:
                     # Someone else has the ball - chase and tackle them.
                     if are_touching(player, carrier):
                         if carrier.is_available_to_tackle():
-                            result = attempt_tackle(
-                                player.attributes.tackling,
-                                carrier.attributes.dribbling,
-                                self.rng_reduction,
-                                self.rng,
-                                self.tackling_params,
-                                is_goalkeeper_tackle=player.is_goalkeeper,
-                                angle_modifier=tackle_angle_modifier(
-                                    carrier.heading_rad, carrier.position, player.position, self.tackling_params
-                                ),
-                            )
-                            if result.tackler_won:
-                                self.ball.possessed_by = player.player_id
-                            else:
-                                carrier.velocity = carrier.velocity * result.dribble_speed_multiplier
-                            carrier.state = PlayerState.INACTIVE_TACKLED
-                            carrier.state_timer_s = self.tackling_params.inactive_duration_s
-                            if not result.tackler_won:
+                            if self._gk_immune_from_tackle(carrier):
+                                # Phase B: GK in own box with ball is untackleable.
                                 player.state = PlayerState.INACTIVE_TACKLED
                                 player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
+                            else:
+                                result = attempt_tackle(
+                                    player.attributes.tackling,
+                                    carrier.attributes.dribbling,
+                                    self.rng_reduction,
+                                    self.rng,
+                                    self.tackling_params,
+                                    is_goalkeeper_tackle=player.is_goalkeeper,
+                                    angle_modifier=tackle_angle_modifier(
+                                        carrier.heading_rad, carrier.position, player.position, self.tackling_params
+                                    ),
+                                    gk_outside_box=self._gk_outside_own_box(player),  # Phase B: GK penalty
+                                )
+                                if result.tackler_won:
+                                    self.ball.possessed_by = player.player_id
+                                else:
+                                    carrier.velocity = carrier.velocity * result.dribble_speed_multiplier
+                                carrier.state = PlayerState.INACTIVE_TACKLED
+                                carrier.state_timer_s = self.tackling_params.inactive_duration_s
+                                if not result.tackler_won:
+                                    player.state = PlayerState.INACTIVE_TACKLED
+                                    player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
                         order.status = OrderStatus.COMPLETE
                         player.current_order = None
                     else:
@@ -380,7 +449,21 @@ class Match:
                     order.status = OrderStatus.COMPLETE
                     player.current_order = None
                 else:
-                    target_position = save_target_position(
+                    gk_top_speed_early = effective_top_speed(
+                        self.movement_params, player.attributes.top_speed,
+                        player.stamina, has_ball=False, is_goalkeeper=True,
+                    )
+                    intercept = early_intercept_target(
+                        gk_position=player.position,
+                        gk_effective_top_speed_mps=gk_top_speed_early,
+                        ball_position=self.ball.position,
+                        ball_velocity=self.ball.velocity,
+                        pitch=self.pitch,
+                        team=player.team,
+                        gravity_mps2=self.ball_physics_params.gravity_mps2,
+                        params=self.goalkeeping_params,
+                    )
+                    target_position = intercept if intercept is not None else save_target_position(
                         self.pitch,
                         player.team,
                         self.ball.position,
@@ -396,11 +479,9 @@ class Match:
                     # goalkeeper_speed_multiplier boost) can travel further
                     # than the fixed threshold in a single tick and overshoot
                     # the target entirely, ending up on the wrong side.
-                    gk_top_speed = effective_top_speed(
-                        self.movement_params, player.attributes.top_speed,
-                        player.stamina, has_ball=False, is_goalkeeper=True,
-                    )
-                    snap_threshold = max(0.15, gk_top_speed * dt)
+                    # (gk_top_speed_early was already computed above for the
+                    # early-intercept distance gate — reuse it.)
+                    snap_threshold = max(0.15, gk_top_speed_early * dt)
                     if direction.length_xy() < snap_threshold:
                         player.position = target_position.with_z(player.position.z)
                         player.velocity = Vector3.zero()
@@ -546,6 +627,12 @@ class Match:
                 continue
 
             # Head-on: resolve as a tackle (other player is the tackler).
+            if self._gk_immune_from_tackle(carrier):
+                # Phase B: GK in own box with ball is untackleable —
+                # the onrushing player is penalised; carrier is untouched.
+                other.state = PlayerState.INACTIVE_TACKLED
+                other.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
+                return
             result = attempt_tackle(
                 other.attributes.tackling,
                 carrier.attributes.dribbling,
@@ -556,6 +643,7 @@ class Match:
                 angle_modifier=tackle_angle_modifier(
                     carrier.heading_rad, carrier.position, other.position, self.tackling_params
                 ),
+                gk_outside_box=self._gk_outside_own_box(other),  # Phase B: GK penalty
             )
             if result.tackler_won:
                 self.ball.possessed_by = other.player_id
@@ -572,6 +660,60 @@ class Match:
     def _complete_control(self, player: Player) -> None:
         self.ball.possessed_by = player.player_id
         self.ball.velocity = Vector3.zero()
+
+    # ── Phase B helpers ────────────────────────────────────────────────────
+
+    def _defends_left(self, player: Player) -> bool:
+        """True if this player's team defends the left goal (Team.LEFT)."""
+        return player.team == Team.LEFT
+
+    def _gk_immune_from_tackle(self, gk_candidate: Player) -> bool:
+        """True when a goalkeeper is in possession inside their own penalty
+        box — in that case all tackle attempts auto-fail (GK is legally
+        handling the ball in a protected area)."""
+        return (
+            gk_candidate.is_goalkeeper
+            and self.ball.possessed_by == gk_candidate.player_id
+            and self.pitch.is_in_box(
+                gk_candidate.position, left=self._defends_left(gk_candidate)
+            )
+        )
+
+    def _gk_outside_own_box(self, tackler: Player) -> bool:
+        """True when the tackler is a goalkeeper making a tackle from outside
+        their own penalty box (triggers the -40% tackle boost penalty)."""
+        return (
+            tackler.is_goalkeeper
+            and not self.pitch.is_in_box(
+                tackler.position, left=self._defends_left(tackler)
+            )
+        )
+
+    def _effective_dribbling(self, target: Player) -> float:
+        """Returns the target's dribbling attribute, with up to 25% penalty
+        if they are mid first-touch control (CONTROLLING_BALL state).
+
+        penalty_frac = min(1, state_timer_s / control_time_penalty_reference_s)
+        dribbling_eff = dribbling_attr * (1 - 0.25 * penalty_frac)
+
+        A player who just picked the ball up (near max timer) has the full
+        25% penalty; one about to finish control (near 0 s remaining) has
+        essentially no penalty.
+        """
+        if target.state != PlayerState.CONTROLLING_BALL:
+            return target.attributes.dribbling
+        ref_s = self.tackling_params.control_time_penalty_reference_s
+        penalty_frac = min(1.0, target.state_timer_s / ref_s)
+        return target.attributes.dribbling * (1.0 - 0.25 * penalty_frac)
+
+    def _target_has_or_controls_ball(self, target: Player) -> bool:
+        """True if the target has possession OR is mid first-touch control
+        (ball frozen at their feet). Used to decide ball transfer on a
+        tackle win against a CONTROLLING_BALL player."""
+        return (
+            self.ball.possessed_by == target.player_id
+            or target.state == PlayerState.CONTROLLING_BALL
+        )
 
     def _check_goal(self) -> None:
         side = check_goal(self.ball, self.pitch)

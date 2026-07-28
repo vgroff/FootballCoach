@@ -18,6 +18,8 @@ from footballcoach.mathutils.rng import skill_roll
 class TacklingParams:
     tackler_boost: float
     goalkeeper_tackle_boost: float
+    goalkeeper_outside_box_tackle_penalty: float
+    control_time_penalty_reference_s: float
     inactive_duration_s: float
     inactive_speed_penalty: float
     tackler_miss_inactive_duration_s: float
@@ -34,6 +36,8 @@ class TacklingParams:
         return TacklingParams(
             tackler_boost=d["tackler_boost"],
             goalkeeper_tackle_boost=d["goalkeeper_tackle_boost"],
+            goalkeeper_outside_box_tackle_penalty=d["goalkeeper_outside_box_tackle_penalty"],
+            control_time_penalty_reference_s=d["control_time_penalty_reference_s"],
             inactive_duration_s=d["inactive_duration_s"],
             inactive_speed_penalty=d["inactive_speed_penalty"],
             tackler_miss_inactive_duration_s=d["tackler_miss_inactive_duration_s"],
@@ -109,6 +113,7 @@ def attempt_tackle(
     params: TacklingParams | None = None,
     is_goalkeeper_tackle: bool = False,
     angle_modifier: float = 0.0,
+    gk_outside_box: bool = False,
 ) -> TackleResult:
     """Returns a TackleResult describing who won and how badly the dribbler
     was affected if they managed to keep the ball.
@@ -116,13 +121,21 @@ def attempt_tackle(
     tackler_roll = (rng_reduction + (1-rng_reduction)*U) * effective_boost * tackling_attr
     dribbler_roll = (rng_reduction + (1-rng_reduction)*U) * dribbling_attr
 
-    The base boost is ``tackler_boost`` (1.2, +20%) for outfield players, or
+    The base boost is ``tackler_boost`` (1.25, +25%) for outfield players, or
     ``goalkeeper_tackle_boost`` (2.0, +100%) for goalkeepers.
 
     ``angle_modifier`` is an additive modifier to the boost, computed by
     ``tackle_angle_modifier`` from the dribbler's heading and the approach
     direction. A frontal tackle (+0.10) makes the tackle slightly easier; a
     tackle from directly behind (-0.65) makes it much harder.
+
+    ``gk_outside_box`` — when ``True`` and ``is_goalkeeper_tackle`` is also
+    ``True``, the GK's ``effective_boost`` is multiplied by
+    ``(1 - goalkeeper_outside_box_tackle_penalty)`` (default −40%).  This
+    reduces a roaming keeper to roughly an outfield-tackler level, per the
+    design requirement that a GK leaving their box should not retain their
+    full inside-box advantage.  The caller (match.py) is responsible for
+    determining whether the GK is outside their own box and passing this flag.
 
     When the dribbler wins, the margin determines how much they're slowed:
     - Margin < ``dribble_beaten_speed_threshold`` (35%) relative to the
@@ -135,6 +148,8 @@ def attempt_tackle(
     r = rng or random
 
     boost = params.goalkeeper_tackle_boost if is_goalkeeper_tackle else params.tackler_boost
+    if is_goalkeeper_tackle and gk_outside_box:
+        boost *= (1.0 - params.goalkeeper_outside_box_tackle_penalty)
     effective_boost = boost * (1.0 + angle_modifier)
     tackler_roll = skill_roll(tackling_attr * effective_boost, rng_reduction, r)
     dribbler_roll = skill_roll(dribbling_attr, rng_reduction, r)

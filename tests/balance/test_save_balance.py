@@ -8,6 +8,7 @@ shot difficulty.
 """
 from __future__ import annotations
 
+import math
 import random
 
 from footballcoach import actions
@@ -52,13 +53,14 @@ def _run_save_trial(
     run_speed = effective_top_speed(mvmt, shooter.attributes.top_speed, 1.0,
                                     has_ball=True, ball_control_attr=shooter.attributes.ball_control)
     shooter.velocity = Vector3(-run_speed, 0.0, 0.0)
+    shooter.heading_rad = math.pi  # facing left, matches velocity
     ball = Ball.at_rest(shooter.position)
     ball.possessed_by = shooter.player_id
     match = Match(pitch=pitch, players=[gk, shooter], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))
 
     actions.save(gk)
     aim_point = pitch.left_goal_centre + Vector3(0, aim_y, aim_z)
-    shooter.current_order = KickOrder(aim_point=aim_point, power_fraction=power, spin=Vector3.zero())
+    shooter.current_order = KickOrder(aim_point=aim_point, power_fraction=power, spin=Vector3.zero(), compensate_for_run=False)
 
     for _ in range(MAX_TICKS):
         match.step()

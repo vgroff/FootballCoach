@@ -32,6 +32,13 @@ class ControlTimeParams:
     gk_t_base_s: float
     gk_height_factor_scale: float
     gk_ball_control_alpha: float
+    # Jump zone penalties (above player_height_m = 1.8m)
+    # GK: flatter penalty, higher ceiling (gloves + specialised technique)
+    gk_jump_scale_at_max_reach: float  # height_factor_scale at gk_max_reach_height_m
+    gk_max_reach_height_m: float       # max height GK can credibly intercept
+    # Outfield: steeper penalty, lower ceiling
+    outfield_jump_scale_at_max_reach: float  # applied as multiplier on (height_factor-1) at max reach
+    outfield_max_reach_height_m: float       # max height outfield can credibly jump to
 
     @staticmethod
     def from_config() -> "ControlTimeParams":
@@ -56,6 +63,10 @@ class ControlTimeParams:
             gk_t_base_s=gk["t_base_s"],
             gk_height_factor_scale=gk["height_factor_scale"],
             gk_ball_control_alpha=gk["ball_control_alpha"],
+            gk_jump_scale_at_max_reach=gk.get("jump_scale_at_max_reach", 1.2),
+            gk_max_reach_height_m=gk.get("max_reach_height_m", 2.2),
+            outfield_jump_scale_at_max_reach=d.get("outfield_jump_scale_at_max_reach", 2.0),
+            outfield_max_reach_height_m=d.get("outfield_max_reach_height_m", 2.0),
         )
 
 
@@ -121,7 +132,21 @@ def control_time_s(
     """
     if is_goalkeeper_in_box:
         height_factor = height_difficulty_factor(params, ball_height_m)
-        scaled_height_factor = 1.0 + (height_factor - 1.0) * params.gk_height_factor_scale
+        # Below head height: existing flat-scale (gk_height_factor_scale).
+        # Above head height (jump zone): interpolate the scale from
+        # gk_height_factor_scale toward gk_jump_scale_at_max_reach as the
+        # ball rises from player_height_m to gk_max_reach_height_m.
+        # Beyond gk_max_reach_height_m the scale stays at max (ball is
+        # unreachable — height_factor_max cap still applies).
+        if ball_height_m > params.player_height_m:
+            jump_range = max(params.gk_max_reach_height_m - params.player_height_m, 1e-6)
+            jump_frac = min(1.0, (ball_height_m - params.player_height_m) / jump_range)
+            effective_scale = params.gk_height_factor_scale + (
+                params.gk_jump_scale_at_max_reach - params.gk_height_factor_scale
+            ) * jump_frac
+        else:
+            effective_scale = params.gk_height_factor_scale
+        scaled_height_factor = 1.0 + (height_factor - 1.0) * effective_scale
         difficulty = (
             (scaled_height_factor - 1.0)
             + params.k1_relative_velocity_s_per_mps * relative_speed_mps
@@ -130,7 +155,23 @@ def control_time_s(
         alpha = params.gk_ball_control_alpha
         t_base = params.gk_t_base_s
     else:
-        difficulty = compute_difficulty(params, ball_height_m, relative_speed_mps, player_speed_mps)
+        # Below head height: existing difficulty curve, unmodified (pure regression safety).
+        # Above head height (outfield jump zone): apply extra difficulty scaling
+        # on the height_factor term, interpolating from 1.0 at player_height_m
+        # toward outfield_jump_scale_at_max_reach at outfield_max_reach_height_m.
+        if ball_height_m > params.player_height_m:
+            height_factor = height_difficulty_factor(params, ball_height_m)
+            jump_range = max(params.outfield_max_reach_height_m - params.player_height_m, 1e-6)
+            jump_frac = min(1.0, (ball_height_m - params.player_height_m) / jump_range)
+            effective_scale = 1.0 + (params.outfield_jump_scale_at_max_reach - 1.0) * jump_frac
+            scaled_height_term = (height_factor - 1.0) * effective_scale
+            difficulty = (
+                scaled_height_term
+                + params.k1_relative_velocity_s_per_mps * relative_speed_mps
+                + params.k2_own_velocity_s_per_mps * player_speed_mps
+            )
+        else:
+            difficulty = compute_difficulty(params, ball_height_m, relative_speed_mps, player_speed_mps)
         alpha = params.ball_control_alpha
         t_base = params.t_base_s
 

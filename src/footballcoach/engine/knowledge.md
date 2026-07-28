@@ -341,6 +341,41 @@ momentarily off-balance but not as badly as actually being dispossessed).
 Applies identically in both the `TackleOrder` and `ChaseTackleOrder`
 branches of `Match._process_orders`.
 
+### Phase B tackle modifiers (added after initial implementation)
+
+Two additional modifiers are applied at the `attempt_tackle()` call sites in
+`Match._process_orders` — not inside `attempt_tackle()` itself, keeping the
+function signature clean:
+
+**1. GK outside-box penalty** (`gk_outside_box: bool = False`):
+- If the tackler is a goalkeeper and is **outside** their own penalty box,
+  their effective `tackling_attr` is multiplied by
+  `(1 - goalkeeper_outside_box_tackle_penalty)` (currently `0.4` → 40%
+  penalty, i.e. GK tackles at 60% effectiveness outside the box).
+- Convention: `Team.LEFT` GK defends the box at the left end of the pitch
+  (x ≤ `pitch.left_box_max_x`); `Team.RIGHT` GK defends the right end.
+- Call sites check `player.is_goalkeeper and not pitch.is_in_own_box(player)`.
+- Config: `physics.json["tackling"]["goalkeeper_outside_box_tackle_penalty"]`.
+- Balance test: `tests/balance/test_gk_tackle_balance.py`.
+
+**2. GK in own box with ball — untackleable**:
+- If the *target* is a goalkeeper currently in their own box with possession,
+  the tackle attempt is skipped entirely (returns early at all four call
+  sites: `TackleOrder`, `ChaseTackleOrder`, `GetPossessionOrder`, and
+  `_check_head_on_tackles`). This models the goalkeeper's protected status
+  inside the box.
+
+**3. CONTROLLING_BALL dribble penalty**:
+- If the *target* is in `PlayerState.CONTROLLING_BALL` (mid first-touch),
+  their effective `dribbling_attr` is penalised based on how long they've
+  been in that state: `penalty_frac = min(1.0, state_timer_s /
+  control_time_penalty_reference_s)`, effective dribbling =
+  `dribbling_attr * (1 - 0.25 * penalty_frac)`.
+- Config: `physics.json["tackling"]["control_time_penalty_reference_s"]`
+  (currently `0.3s`).
+- If the tackler wins against a `CONTROLLING_BALL` target, the tackler is
+  given the ball (not just the target losing possession).
+
 ### `ChaseTackleOrder` - the "Tackle" high-level action
 
 Distinct from the base `TackleOrder` (which only resolves a tackle attempt

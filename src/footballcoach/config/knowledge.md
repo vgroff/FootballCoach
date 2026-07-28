@@ -6,9 +6,10 @@ cached loader.
 ## Files
 
 - `physics.json` - world/pitch/player/ball geometry, movement, kicking,
-  tackling, ball physics, and control-time constants. Organized into
-  sections matching the engine modules that consume them (e.g.
-  `physics.json["movement"]` is read by `engine/movement.py`).
+  tackling, ball physics, control-time, and repulsion constants. Organized
+  into sections matching the modules that consume them (e.g.
+  `physics.json["movement"]` → `engine/movement.py`,
+  `physics.json["repulsion"]` → `steering.py`).
 - `attributes.json` - player attribute generation: the base Gaussian
   distribution, inter-attribute correlations, and per-league "tier" presets
   (mean/sigma overrides) used by `generation/attributes.py`.

@@ -24,6 +24,9 @@ from tests.conftest import make_player
 
 N_TRIALS = 2000
 RNG_REDUCTION = 0.3
+# Pre-compensated power values: the kicker runs at full ball-carry top speed toward goal,
+# so the engine's compensate_power_for_run_mult() divides by run_mult (~1.576-1.60).
+# To keep effective_power identical to before that feature was added, we pre-multiply:
 PENALTY_POWER = 0.8
 
 
@@ -33,6 +36,7 @@ def _run_penalty_trials(
     aim_offset_z: float,
     n_trials: int,
     use_shoot_order: bool = False,
+    power_fraction: float = PENALTY_POWER,
 ) -> dict:
     pitch = Pitch.standard()
     penalty_spot = pitch.penalty_spot(left=False)
@@ -60,10 +64,13 @@ def _run_penalty_trials(
         match = Match(pitch=pitch, players=[kicker], ball=ball, rng_reduction=RNG_REDUCTION, rng=rng)
 
         aim_point = goal_centre + Vector3(0, aim_offset_y, aim_offset_z)
+        # compensate_for_run=False: this test was calibrated with the kicker's running
+        # velocity contributing raw to effective_power (including sigma inflation from
+        # the power-error coupling). That is the intended model for a penalty run-up.
         if use_shoot_order:
-            kicker.current_order = ShootOrder(aim_point=aim_point, power_fraction=PENALTY_POWER)
+            kicker.current_order = ShootOrder(aim_point=aim_point, power_fraction=power_fraction, compensate_for_run=False)
         else:
-            kicker.current_order = KickOrder(aim_point=aim_point, power_fraction=PENALTY_POWER, spin=Vector3.zero())
+            kicker.current_order = KickOrder(aim_point=aim_point, power_fraction=power_fraction, spin=Vector3.zero(), compensate_for_run=False)
 
         for _ in range(150):
             match.step()
@@ -117,7 +124,7 @@ def test_shoot_order_penalty_precision_05_centre_aim_scores_over_95_percent(bala
 
 
 def test_shoot_order_penalty_precision_05_corner_aim_scores_50_to_80_percent(balance_recorder):
-    pitch = Pitch.standard()
+    pitch = Pitch.standard()  # noqa: kept for readability
     corner_offset_y = pitch.goal_width_m / 2.0 - 0.475
     stats = _run_penalty_trials(precision=0.5, aim_offset_y=corner_offset_y, aim_offset_z=0.475, n_trials=N_TRIALS, use_shoot_order=True)
     balance_recorder.report("shoot_order_penalty_precision_0.5_corner_aim", stats)

@@ -4,6 +4,7 @@ and how it was validated against the penalty-scoring balance targets.
 """
 from __future__ import annotations
 
+import logging
 import math
 import random
 from dataclasses import dataclass
@@ -11,6 +12,8 @@ from dataclasses import dataclass
 from footballcoach.config import load_physics_config
 from footballcoach.entities.ball import Ball
 from footballcoach.mathutils import Vector3
+
+log = logging.getLogger("footballcoach.kicking")
 
 
 
@@ -25,6 +28,16 @@ class KickingParams:
     power_scale_mps: float
     firsttime_precision_weight: float
     running_power_coefficient: float
+    # Running-direction precision penalty breakpoints and magnitudes.
+    # A kick aimed mostly in the same direction as the kicker is running incurs
+    # no penalty; a kick aimed square-on or backward is penalised (up to -75%
+    # precision at full backwards run). Only applied when kicker ground speed
+    # exceeds running_direction_min_speed_mps.
+    running_direction_precision_cos_high: float  # >= this → no penalty (default 0.35, ≈70° cone)
+    running_direction_precision_cos_low: float   # < this → steep penalty zone (default -0.2, ≈102°)
+    running_direction_precision_penalty_mid: float   # penalty at cos_low boundary (default 0.25 = -25%)
+    running_direction_precision_penalty_max: float   # penalty at cos=-1 (default 0.75 = -75%)
+    running_direction_min_speed_mps: float           # min kicker speed to apply penalty (default 1.0)
 
     @staticmethod
     def from_config() -> "KickingParams":
@@ -39,6 +52,11 @@ class KickingParams:
             power_scale_mps=d["power_scale_mps"],
             firsttime_precision_weight=d["firsttime_precision_weight"],
             running_power_coefficient=d["running_power_coefficient"],
+            running_direction_precision_cos_high=d.get("running_direction_precision_cos_high", 0.35),
+            running_direction_precision_cos_low=d.get("running_direction_precision_cos_low", -0.2),
+            running_direction_precision_penalty_mid=d.get("running_direction_precision_penalty_mid", 0.25),
+            running_direction_precision_penalty_max=d.get("running_direction_precision_penalty_max", 0.75),
+            running_direction_min_speed_mps=d.get("running_direction_min_speed_mps", 1.0),
         )
 
 
@@ -134,6 +152,72 @@ def running_power_multiplier(
     cos_angle = kicker_velocity.xy().normalized().dot(aim_direction.xy().normalized())
     run_speed_fraction = min(1.0, run_speed / kicker_top_speed_mps)
     return 1.0 + running_power_coefficient * cos_angle * run_speed_fraction
+
+
+def running_direction_precision_multiplier(
+    kicker_velocity: Vector3,
+    aim_direction: Vector3,
+    params: KickingParams,
+) -> float:
+    """Precision multiplier (in [0.25, 1.0]) based on the angle between the
+    kicker's running direction and the kick aim direction.
+
+    Rationale: kicking in line with your momentum is biomechanically easiest
+    (full precision); kicking square-on or backwards against your own momentum
+    is significantly harder (reduced precision).
+
+    Piecewise-linear in cos(angle):
+      cos_sim >= cos_high (0.35)  → 1.0   (no penalty, ≈ 70° forward cone)
+      cos_low (-0.2) <= cos_sim < cos_high → linear 1.0 → (1 - penalty_mid)
+      cos_sim < cos_low           → linear (1 - penalty_mid) → (1 - penalty_max)
+
+    Returns 1.0 (no effect) if the kicker's ground speed is below
+    `running_direction_min_speed_mps`, or if either vector is degenerate.
+    """
+    run_speed = kicker_velocity.length_xy()
+    if run_speed < params.running_direction_min_speed_mps:
+        return 1.0
+
+    aim_len = aim_direction.length_xy()
+    if aim_len < 1e-9:
+        return 1.0
+
+    cos_sim = (kicker_velocity.xy() / run_speed).dot(aim_direction.xy() / aim_len)
+
+    cos_high = params.running_direction_precision_cos_high  # 0.35
+    cos_low = params.running_direction_precision_cos_low    # -0.2
+    penalty_mid = params.running_direction_precision_penalty_mid  # 0.25
+    penalty_max = params.running_direction_precision_penalty_max  # 0.75
+
+    if cos_sim >= cos_high:
+        return 1.0
+
+    if cos_sim >= cos_low:
+        # Linear from 1.0 at cos_high to (1-penalty_mid) at cos_low
+        t = (cos_high - cos_sim) / (cos_high - cos_low)
+        return 1.0 - penalty_mid * t
+
+    # Linear from (1-penalty_mid) at cos_low to (1-penalty_max) at cos_sim=-1
+    t = min(1.0, (cos_low - cos_sim) / (cos_low - (-1.0)))
+    return (1.0 - penalty_mid) - (penalty_max - penalty_mid) * t
+
+
+def compensate_power_for_run_mult(power_fraction: float, run_mult: float) -> float:
+    """Pre-compensates ``power_fraction`` so that ``adjusted * run_mult``
+    delivers the originally-intended ``power_fraction``, up to the cap of 1.0.
+
+    A player intending to kick at a given power naturally adjusts their effort
+    based on running momentum: they ease off when sprinting in line with the
+    kick (run_mult > 1) and try harder when running against it (run_mult < 1).
+    The cap at 1.0 means a very unfavourable run direction still costs some
+    pace, which is physically realistic.
+
+    Called at the order-processing layer (match.py) for ShootOrder, KickOrder
+    and PassOrder so all deliberate kicks deliver consistent intended power
+    regardless of run direction, while the raw running-power physics in
+    kick_ball/pass_ball remain unchanged.
+    """
+    return min(1.0, power_fraction / max(run_mult, 1e-6))
 
 
 def pass_speed_mps(params: PassingParams, distance_m: float, gravity_mps2: float, rolling_friction_coefficient: float) -> float:
@@ -284,12 +368,33 @@ def kick_ball(
     params = params or KickingParams.from_config()
     r = rng or random
 
+    aim_dir = aim_point - kicker_position
     run_mult = running_power_multiplier(
-        params.running_power_coefficient, kicker_velocity, aim_point - kicker_position, kicker_top_speed_mps
+        params.running_power_coefficient, kicker_velocity, aim_dir, kicker_top_speed_mps
     )
+    dir_precision_mult = running_direction_precision_multiplier(kicker_velocity, aim_dir, params)
+    effective_precision = kick_precision * dir_precision_mult
     effective_power = max(0.0, min(1.0, power_fraction)) * run_mult
-    sigma = kick_sigma_rad(params, kick_precision, effective_power, rng_reduction) * difficulty_multiplier
+    sigma = kick_sigma_rad(params, effective_precision, effective_power, rng_reduction) * difficulty_multiplier
     speed = max_kick_speed_mps(params, kick_power_attr) * max(0.0, min(1.0, power_fraction)) * run_mult
+
+    kicker_speed_xy = kicker_velocity.length_xy()
+    cos_sim = (
+        (kicker_velocity.xy() / kicker_speed_xy).dot(aim_dir.xy().normalized())
+        if kicker_speed_xy > 1e-6 and aim_dir.length_xy() > 1e-9
+        else float('nan')
+    )
+    log.debug(
+        "[kick_ball] kicker_vel=(%.2f,%.2f) kicker_speed=%.2f aim_dir=(%.2f,%.2f) "
+        "cos_sim=%.3f run_mult=%.3f dir_precision_mult=%.3f "
+        "kick_precision=%.3f -> effective_precision=%.3f "
+        "effective_power=%.3f sigma=%.5f speed=%.2f rng_reduction=%.2f",
+        kicker_velocity.x, kicker_velocity.y, kicker_speed_xy,
+        aim_dir.x, aim_dir.y,
+        cos_sim, run_mult, dir_precision_mult,
+        kick_precision, effective_precision,
+        effective_power, sigma, speed, rng_reduction,
+    )
 
     _launch_ball(ball, kicker_position, aim_point, speed, sigma, spin, r, gravity_mps2)
 
@@ -346,13 +451,34 @@ def pass_ball(
         auto_speed = params.max_speed_mps * max(0.0, min(1.0, power_fraction))
         base_power_fraction = max(0.0, min(1.0, power_fraction))
 
+    aim_dir = aim_point - kicker_position
     run_mult = running_power_multiplier(
-        running_power_coefficient, kicker_velocity, aim_point - kicker_position, kicker_top_speed_mps
+        running_power_coefficient, kicker_velocity, aim_dir, kicker_top_speed_mps
     )
+    dir_precision_mult = running_direction_precision_multiplier(kicker_velocity, aim_dir, kp)
+    effective_precision = kick_precision * dir_precision_mult
 
     effective_power = base_power_fraction * run_mult
     speed = auto_speed * run_mult
 
-    sigma = kick_sigma_rad(kp, kick_precision, effective_power, rng_reduction)
+    sigma = kick_sigma_rad(kp, effective_precision, effective_power, rng_reduction)
+
+    kicker_speed_xy = kicker_velocity.length_xy()
+    cos_sim = (
+        (kicker_velocity.xy() / kicker_speed_xy).dot(aim_dir.xy().normalized())
+        if kicker_speed_xy > 1e-6 and aim_dir.length_xy() > 1e-9
+        else float('nan')
+    )
+    log.debug(
+        "[pass_ball] kicker_vel=(%.2f,%.2f) kicker_speed=%.2f aim_dir=(%.2f,%.2f) "
+        "cos_sim=%.3f run_mult=%.3f dir_precision_mult=%.3f "
+        "kick_precision=%.3f -> effective_precision=%.3f "
+        "base_power_frac=%.3f effective_power=%.3f sigma=%.5f speed=%.2f rng_reduction=%.2f",
+        kicker_velocity.x, kicker_velocity.y, kicker_speed_xy,
+        aim_dir.x, aim_dir.y,
+        cos_sim, run_mult, dir_precision_mult,
+        kick_precision, effective_precision,
+        base_power_fraction, effective_power, sigma, speed, rng_reduction,
+    )
 
     _launch_ball(ball, kicker_position, aim_point, speed, sigma, Vector3.zero(), r, gravity_mps2)

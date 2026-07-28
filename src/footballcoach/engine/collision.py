@@ -16,14 +16,83 @@ ball that flies through their cylinder from outside it (see
 `resolve_ball_block_by_inactive_players`) - a player lying on the ground
 after a tackle can still deflect a stray shot, they just can't obstruct
 other *players*' movement.
+
+Velocity damping (applied after position push-apart) reduces the closing
+speed of colliding players, even for inactive pairs: without this, a
+just-tackled player would keep gliding at full speed into the opponent.
 """
 from __future__ import annotations
 
+import logging
 import math
+from dataclasses import dataclass
 
+from footballcoach.config import load_physics_config
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
+
+log = logging.getLogger("footballcoach.collision")
+
+
+@dataclass(frozen=True)
+class CollisionParams:
+    """Config-driven constants for player-player collision resolution."""
+    collision_velocity_retention: float   # fraction of closing speed retained per tick (0.5 = 50% reduction)
+    collision_damping_min_closing_speed_mps: float  # closing speeds below this are not damped
+
+    @staticmethod
+    def from_config() -> "CollisionParams":
+        d = load_physics_config().get("collision", {})
+        return CollisionParams(
+            collision_velocity_retention=d.get("collision_velocity_retention", 0.5),
+            collision_damping_min_closing_speed_mps=d.get("collision_damping_min_closing_speed_mps", 0.3),
+        )
+
+
+def _damp_overlap_velocity(
+    player_a: Player,
+    player_b: Player,
+    params: CollisionParams,
+) -> None:
+    """Damps the closing velocity components for a potentially overlapping
+    player pair. Only applies when the pair is actually overlapping AND the
+    closing component exceeds the floor threshold, so it self-limits to a
+    few ticks of sustained contact (see the worked example in the phase D
+    design doc for the compounding analysis).
+
+    Unlike the position push-apart, this runs for ALL pairs — including
+    those where one or both players are inactive — so a just-tackled player
+    does not keep gliding at full sprint speed into the opponent.
+
+    Note: position z is preserved; only xy closing components are damped.
+    """
+    delta = player_b.position.xy() - player_a.position.xy()
+    distance = delta.length()
+    min_distance = player_a.radius_m + player_b.radius_m
+
+    if distance >= min_distance:
+        return  # not overlapping, nothing to damp
+
+    if distance < 1e-9:
+        direction = Vector3(1.0, 0.0, 0.0)
+    else:
+        direction = delta / distance  # unit vector from a toward b (xy, z=0)
+
+    retention = params.collision_velocity_retention
+    floor_speed = params.collision_damping_min_closing_speed_mps
+
+    # Player A's closing component toward player B (positive = moving toward B)
+    closing_a = player_a.velocity.xy().dot(direction)
+    if closing_a > floor_speed:
+        reduction_a = closing_a * (1.0 - retention)
+        player_a.velocity = player_a.velocity - direction * reduction_a
+
+    # Player B's closing component toward player A (positive = moving toward A)
+    closing_b = -player_b.velocity.xy().dot(direction)
+    if closing_b > floor_speed:
+        reduction_b = closing_b * (1.0 - retention)
+        player_b.velocity = player_b.velocity + direction * reduction_b
 
 
 def resolve_player_overlap(player_a: Player, player_b: Player) -> None:
@@ -65,18 +134,37 @@ def resolve_player_overlap(player_a: Player, player_b: Player) -> None:
     push_a = direction * (-overlap * weight_a)
     push_b = direction * (overlap * weight_b)
 
+    log.debug(
+        "[collision] %s<->%s  dist=%.3f  min=%.3f  overlap=%.3f  "
+        "weight_a=%.3f  push_a=(%.3f,%.3f)  push_b=(%.3f,%.3f)",
+        player_a.player_id, player_b.player_id,
+        distance, min_distance, overlap, weight_a,
+        push_a.x, push_a.y, push_b.x, push_b.y,
+    )
+
     player_a.position = player_a.position + push_a
     player_b.position = player_b.position + push_b
 
 
-def resolve_all_overlaps(players: list[Player], iterations: int = 2) -> None:
+def resolve_all_overlaps(
+    players: list[Player],
+    iterations: int = 2,
+    collision_params: CollisionParams | None = None,
+) -> None:
     """Resolves overlaps across all player pairs. Multiple iterations help
     settle chains of overlapping players (e.g. 3+ players bunched up).
 
-    Pairs where either player is currently `is_inactive` are skipped
-    entirely - per the design spec, you can run straight through an
-    inactive player (no push-apart), rather than merely reducing the
-    push."""
+    Position push-apart: pairs where either player is currently `is_inactive`
+    are skipped entirely - per the design spec, you can run straight through
+    an inactive player, rather than merely reducing the push.
+
+    Velocity damping: applied once after all push-apart iterations, for ALL
+    pairs (including those involving inactive players). This prevents a
+    just-tackled player from continuing to glide at full sprint speed into
+    the opponent, while keeping the position push-apart rule unchanged.
+    """
+    params = collision_params or CollisionParams.from_config()
+
     for _ in range(iterations):
         for i in range(len(players)):
             if players[i].is_inactive:
@@ -85,6 +173,16 @@ def resolve_all_overlaps(players: list[Player], iterations: int = 2) -> None:
                 if players[j].is_inactive:
                     continue
                 resolve_player_overlap(players[i], players[j])
+
+    # Velocity damping — single pass over ALL pairs (active and inactive).
+    # This is intentionally separate from the position push-apart loop above:
+    # position push-apart is skipped for inactive pairs, but velocity damping
+    # is not (see module docstring for rationale). Compounding is self-limiting
+    # because the floor threshold stops damping once closing speed drops below
+    # collision_damping_min_closing_speed_mps.
+    for i in range(len(players)):
+        for j in range(i + 1, len(players)):
+            _damp_overlap_velocity(players[i], players[j], params)
 
 
 def are_touching(player_a: Player, player_b: Player, tolerance_m: float = 0.05) -> bool:

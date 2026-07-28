@@ -52,11 +52,14 @@ def shoot(
     pitch: Pitch,
     power_fraction: float = DEFAULT_SHOOT_POWER_FRACTION,
     aim_height_m: float = DEFAULT_SHOOT_HEIGHT_M,
+    aim_point: "Vector3 | None" = None,
 ) -> None:
-    """Shoots at goal, aimed at the dead centre of the opponent's goal.
-    Only has an effect if `player` currently has the ball (silently
-    no-ops otherwise, per KickOrder's existing behaviour in Match)."""
-    aim_point = opponent_goal_centre(pitch, player.team).with_z(aim_height_m)
+    """Shoots at goal. By default aims at the dead centre of the opponent's
+    goal at `aim_height_m`; pass an explicit `aim_point` to override (e.g.
+    to aim at a specific corner of the goal frame).
+    Only has an effect if `player` currently has the ball."""
+    if aim_point is None:
+        aim_point = opponent_goal_centre(pitch, player.team).with_z(aim_height_m)
     player.current_order = KickOrder(aim_point=aim_point, power_fraction=power_fraction, spin=Vector3.zero())
 
 

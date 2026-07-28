@@ -79,18 +79,18 @@
   "turning_reversal_scenario_accel_0.5": {
     "reference_speed_mps": 7.56,
     "time_to_start_reversing_s": 1.3,
-    "separation_after_10s_m": 127.74
+    "separation_after_10s_m": 126.02
   },
   "turning_reversal_accel_comparison": {
     "low_accel_attr_0.1": {
       "reference_speed_mps": 7.56,
       "time_to_start_reversing_s": 1.833,
-      "separation_after_10s_m": 119.59
+      "separation_after_10s_m": 117.88
     },
     "high_accel_attr_0.9": {
       "reference_speed_mps": 7.56,
-      "time_to_start_reversing_s": 1.0,
-      "separation_after_10s_m": 132.16
+      "time_to_start_reversing_s": 1.033,
+      "separation_after_10s_m": 130.01
     }
   },
   "stamina_drain_over_120s_sprint_attr_0.5": {
@@ -136,7 +136,7 @@
     "waist (0.95m)": 0.359,
     "chest (1.4m)": 0.455,
     "head (1.8m)": 0.704,
-    "above_head (2.2m)": 0.742
+    "above_head (2.2m)": 1.298
   },
   "control_time_vs_relative_velocity_seconds": {
     "relative_speed=0.0mps": 0.282,
@@ -227,30 +227,30 @@
     "success_rate_pct": 68.2
   },
   "pass_success_rate_grid_pct": {
-    "precision=0.1_distance=5.0m": 98.67,
-    "precision=0.1_distance=10.0m": 81.33,
-    "precision=0.1_distance=20.0m": 51.33,
-    "precision=0.1_distance=25.0m": 41.33,
+    "precision=0.1_distance=5.0m": 100.0,
+    "precision=0.1_distance=10.0m": 72.0,
+    "precision=0.1_distance=20.0m": 50.0,
+    "precision=0.1_distance=25.0m": 40.0,
     "precision=0.1_distance=30.0m": 0.0,
     "precision=0.3_distance=5.0m": 100.0,
-    "precision=0.3_distance=10.0m": 90.0,
-    "precision=0.3_distance=20.0m": 58.0,
-    "precision=0.3_distance=25.0m": 48.0,
+    "precision=0.3_distance=10.0m": 84.0,
+    "precision=0.3_distance=20.0m": 68.0,
+    "precision=0.3_distance=25.0m": 44.0,
     "precision=0.3_distance=30.0m": 0.0,
     "precision=0.5_distance=5.0m": 100.0,
-    "precision=0.5_distance=10.0m": 95.33,
-    "precision=0.5_distance=20.0m": 73.33,
-    "precision=0.5_distance=25.0m": 57.33,
+    "precision=0.5_distance=10.0m": 94.0,
+    "precision=0.5_distance=20.0m": 72.0,
+    "precision=0.5_distance=25.0m": 58.0,
     "precision=0.5_distance=30.0m": 0.0,
     "precision=0.7_distance=5.0m": 100.0,
     "precision=0.7_distance=10.0m": 100.0,
-    "precision=0.7_distance=20.0m": 85.33,
-    "precision=0.7_distance=25.0m": 83.33,
+    "precision=0.7_distance=20.0m": 88.0,
+    "precision=0.7_distance=25.0m": 82.0,
     "precision=0.7_distance=30.0m": 0.0,
     "precision=0.9_distance=5.0m": 100.0,
     "precision=0.9_distance=10.0m": 100.0,
-    "precision=0.9_distance=20.0m": 98.67,
-    "precision=0.9_distance=25.0m": 98.0,
+    "precision=0.9_distance=20.0m": 98.0,
+    "precision=0.9_distance=25.0m": 96.0,
     "precision=0.9_distance=30.0m": 0.0
   },
   "pass_random_scenarios_good_vs_bad": {
@@ -315,11 +315,11 @@
   },
   "save_rate_grid_pct": {
     "gk_speed=0.1_near_post": 85.3,
-    "gk_speed=0.1_centre": 89.3,
-    "gk_speed=0.1_far_post": 0.0,
+    "gk_speed=0.1_centre": 96.7,
+    "gk_speed=0.1_far_post": 0.7,
     "gk_speed=0.5_near_post": 85.3,
     "gk_speed=0.5_centre": 96.7,
-    "gk_speed=0.5_far_post": 32.7,
+    "gk_speed=0.5_far_post": 74.0,
     "gk_speed=0.9_near_post": 85.3,
     "gk_speed=0.9_centre": 96.7,
     "gk_speed=0.9_far_post": 80.0
@@ -327,7 +327,7 @@
   "save_random_scenarios_good_vs_bad": {
     "n_scenarios": 150,
     "good_gk_save_rate_pct": 94.0,
-    "bad_gk_save_rate_pct": 90.0
+    "bad_gk_save_rate_pct": 91.3
   },
   "dribble_speed_penalty_avg": {
     "n_dribbler_wins": 980,
@@ -423,8 +423,8 @@
   },
   "pass_70m_precision_0.9": {
     "n_trials": 200,
-    "succeeded": 52,
-    "success_rate_pct": 26.0
+    "succeeded": 0,
+    "success_rate_pct": 0.0
   },
   "shoot_order_penalty_precision_0.5_centre_aim": {
     "n_trials": 2000,
@@ -440,5 +440,183 @@
     "n_trials": 2000,
     "scored": 1742,
     "score_rate_pct": 87.1
+  },
+  "repulsion_baseline_no_neighbours": {
+    "adj_dir_x": 1.0,
+    "speed_mult": 1.0
+  },
+  "repulsion_off_collision_min_separation_m": {
+    "min_separation_m": 0.0103,
+    "sum_radii_m": 0.6,
+    "result": "overlap_occurred"
+  },
+  "repulsion_on_collision_avoidance": {
+    "min_separation_m": 0.6,
+    "sum_radii_m": 0.6,
+    "clearance_m": 0.0,
+    "p0_arrived_within_2s": true,
+    "p1_arrived_within_2s": false,
+    "direct_travel_ticks": 25
+  },
+  "repulsion_ball_carrier_avoidance": {
+    "min_sep_with_ball_m": 0.851,
+    "min_sep_without_ball_m": 0.7461,
+    "mean_close_approach_speed_with_ball_mps": 5.499,
+    "mean_close_approach_speed_without_ball_mps": 6.443,
+    "carrier_is_slower": true
+  },
+  "repulsion_no_repulsion_from_ball_carrier": {
+    "adj_dir_x": 1.0,
+    "adj_dir_y": 0.0,
+    "speed_mult": 1.0,
+    "deflected": false
+  },
+  "repulsion_three_neighbours": {
+    "initial_x": 0.0,
+    "final_x": 2.834,
+    "displacement_m": 2.834,
+    "made_forward_progress": true
+  },
+  "repulsion_oscillation_check": {
+    "total_flips": 0,
+    "min_gap_between_flips_ticks": 60,
+    "flip_ticks": [],
+    "oscillation_risk": "LOW"
+  },
+  "gk_tackle_inside_vs_outside_box": {
+    "n": 2000,
+    "gk_tackling": 0.7,
+    "dribbler_dribbling": 0.6,
+    "win_rate_inside_box_pct": 95.7,
+    "win_rate_outside_box_pct": 73.95,
+    "gap_pct": 21.75
+  },
+  "gk_in_box_untackleable_deterministic": {
+    "n": 20,
+    "tackler_wins": 0,
+    "gk_unchanged": true
+  },
+  "gk_in_box_untackleable_stochastic": {
+    "n": 100,
+    "tackler_wins": 0
+  },
+  "gk_boundary_outside_box_uses_penalty": {
+    "n": 500,
+    "rate_with_outside_penalty_pct": 73.2,
+    "rate_without_outside_penalty_pct": 94.8,
+    "gk_x_m": -35.5,
+    "box_length_m": 16.5
+  },
+  "controlling_ball_dribbling_penalty_unit": {
+    "timer=0.0s": {
+      "effective_dribbling": 0.8,
+      "expected": 0.8,
+      "match": true
+    },
+    "timer=0.075s": {
+      "effective_dribbling": 0.75,
+      "expected": 0.75,
+      "match": true
+    },
+    "timer=0.15s": {
+      "effective_dribbling": 0.7,
+      "expected": 0.7,
+      "match": true
+    },
+    "timer=0.3s": {
+      "effective_dribbling": 0.6,
+      "expected": 0.6,
+      "match": true
+    },
+    "timer=0.45s": {
+      "effective_dribbling": 0.6,
+      "expected": 0.6,
+      "match": true
+    }
+  },
+  "controlling_ball_penalty_balance": {
+    "n": 2000,
+    "tackling_attr": 0.6,
+    "dribbling_attr": 0.6,
+    "early_effective_dribbling": 0.45,
+    "late_effective_dribbling": 0.6,
+    "win_rate_early_control_pct": 83.75,
+    "win_rate_late_control_pct": 66.9,
+    "gap_pct": 16.85
+  },
+  "controlling_ball_regression_active_70_90_band": {
+    "n": 5000,
+    "win_rate_pct": 84.4
+  },
+  "shoot_run_forward_cos1.0": {
+    "n_trials": 300,
+    "scored": 225,
+    "score_rate_pct": 75.0,
+    "run_cos_sim": 1.0
+  },
+  "shoot_run_square_cos0.0": {
+    "n_trials": 300,
+    "scored": 214,
+    "score_rate_pct": 71.33,
+    "run_cos_sim": 0.0
+  },
+  "shoot_run_backward_cos-1.0": {
+    "n_trials": 300,
+    "scored": 182,
+    "score_rate_pct": 60.67,
+    "run_cos_sim": -1.0
+  },
+  "shoot_stationary_no_penalty": {
+    "n_trials": 300,
+    "scored": 300,
+    "score_rate_pct": 100.0
+  },
+  "pass_run_forward": {
+    "n_trials": 300,
+    "success_rate_pct": 94.0
+  },
+  "pass_run_backward": {
+    "n_trials": 300,
+    "success_rate_pct": 0.0
+  },
+  "gk_control_time_by_height": {
+    "gk_h=0.0m": 0.08,
+    "gk_h=0.5m": 0.08,
+    "gk_h=1.0m": 0.1247,
+    "gk_h=1.5m": 0.1616,
+    "gk_h=1.8m": 0.2132,
+    "gk_h=2.0m": 0.3563,
+    "gk_h=2.2m": 0.5092
+  },
+  "gk_vs_outfield_control_time_by_height": {
+    "gk": {
+      "h=0.0m": 0.08,
+      "h=0.5m": 0.08,
+      "h=1.0m": 0.1247,
+      "h=1.5m": 0.1616,
+      "h=1.8m": 0.2132,
+      "h=1.9m": 0.2835,
+      "h=2.0m": 0.3563
+    },
+    "outfield": {
+      "h=0.0m": 0.1,
+      "h=0.5m": 0.1001,
+      "h=1.0m": 0.2223,
+      "h=1.5m": 0.3232,
+      "h=1.8m": 0.4645,
+      "h=1.9m": 0.6569,
+      "h=2.0m": 0.856
+    }
+  },
+  "early_intercept_travel_distance": {
+    "n_trials": 200,
+    "n_with_early_intercept": 41,
+    "avg_intercept_target_dist_m": 0.868,
+    "avg_goal_line_dist_m": 1.347
+  },
+  "pass_65m_precision_0.9": {
+    "n_trials": 200,
+    "succeeded": 74,
+    "success_rate_pct": 37.0
   }
 }
