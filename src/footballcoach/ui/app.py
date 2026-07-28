@@ -39,6 +39,7 @@ class App:
         self.running = True
         self.is_training_mode = False
         self._last_goal_tally = (0, 0)
+        self._scenario_loop: scenarios.ScenarioLoop | None = None
         self.show_help = False
         self.help_button_rect = pygame.Rect(0, 0, 90, 32)  # positioned per-screen in _draw_match
 
@@ -77,8 +78,8 @@ class App:
         if key == pygame.K_ESCAPE:
             if self.show_help:
                 self.show_help = False
-            elif self.input_controller is not None and self.input_controller.order_mode == OrderMode.PASS:
-                self.input_controller.cancel_pass_mode()
+            elif self.input_controller is not None and self.input_controller.order_mode != OrderMode.MOVE:
+                self.input_controller.cancel_order_mode()
             elif self.screen == Screen.MATCH:
                 self.screen = Screen.MENU
                 self.match = None
@@ -95,6 +96,8 @@ class App:
             self.match.paused = not self.match.paused
         elif key == pygame.K_p:
             self.input_controller.enter_pass_mode()
+        elif key == pygame.K_k:
+            self.input_controller.enter_shoot_mode()
         elif key == pygame.K_s:
             self.input_controller.issue_save_order()
         elif key == pygame.K_x:
@@ -120,7 +123,7 @@ class App:
             self._start_match(scenarios.make_training_match(), "Training mode", is_training_mode=True)
         elif kind == "scenario":
             definition = next(s for s in scenarios.SCENARIOS if s.key == key)
-            self._start_match(definition.build(0.3), f"Balance scenario: {definition.label}", is_training_mode=False)
+            self._start_scenario(definition)
 
     def _start_match(self, match: Match, label: str, is_training_mode: bool = False) -> None:
         self.match = match
@@ -128,12 +131,48 @@ class App:
         self.mode_label = label
         self.screen = Screen.MATCH
         self.is_training_mode = is_training_mode
+        self._scenario_loop = None
         self._last_goal_tally = (match.scoreboard.left_goals, match.scoreboard.right_goals)
+        # Training mode: auto-select the lone player so they're immediately
+        # controllable without requiring an extra click.
+        if is_training_mode and match.players:
+            self.input_controller.selected_player_id = match.players[0].player_id
+
+    def _start_scenario(self, definition: scenarios.ScenarioDefinition) -> None:
+        """Builds a ScenarioLoop and begins the first trial."""
+        loop = scenarios.ScenarioLoop(definition=definition)
+        self._scenario_loop = loop
+        self.match = loop.match
+        self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
+        self.mode_label = f"Balance scenario: {definition.label}"
+        self.screen = Screen.MATCH
+        self.is_training_mode = False
+        self._last_goal_tally = (0, 0)
 
     def _step_match(self) -> None:
         assert self.match is not None
-        self.match.step()
 
+        if self._scenario_loop is not None:
+            loop = self._scenario_loop
+            trial_ended = loop.step()
+            self.match = loop.match
+            if loop.complete:
+                # All trials done - return to menu.
+                self.screen = Screen.MENU
+                self.match = None
+                self.input_controller = None
+                self._scenario_loop = None
+            elif trial_ended:
+                # New trial started - sync input controller to fresh match.
+                self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
+            else:
+                # Mid-trial: keep input controller in sync (match reference may not change
+                # but the input controller holds a direct reference, so this is safe).
+                if self.input_controller is not None:
+                    self.input_controller.match = loop.match
+            return
+
+        self.match.step()
         if self.is_training_mode:
             current_tally = (self.match.scoreboard.left_goals, self.match.scoreboard.right_goals)
             if current_tally != self._last_goal_tally:
@@ -221,22 +260,33 @@ class App:
             start_world, current_screen = drag
             self.renderer.draw_drag_indicator(self.surface, start_world, current_screen, style.DRAG_KICK_LINE)
 
-        left, right = self.match.scoreboard.left_goals, self.match.scoreboard.right_goals
-        hud_lines = [
-            self.mode_label,
-            f"Score: LEFT {left} - {right} RIGHT",
-            f"{'PAUSED' if self.match.paused else 'Playing'} (Space to pause/resume, Esc for menu, H for help)",
-        ]
-        if selected_id is not None:
-            if self.input_controller.order_mode == OrderMode.PASS:
-                hud_lines.append(f"Selected: {selected_id} - PASS mode: click a target to pass (Esc cancels)")
+        hud_lines = [self.mode_label]
+        paused_str = "PAUSED" if self.match.paused else "Playing"
+        if self._scenario_loop is not None:
+            loop = self._scenario_loop
+            if loop.max_trials > 0:
+                hud_lines.append(f"Trial {loop.trial_count + 1}/{loop.max_trials}  |  {paused_str}")
             else:
-                hud_lines.append(
-                    f"Selected: {selected_id} (click ground=move, drag=kick, click opponent=tackle, "
-                    "P=pass mode, S=save order if goalkeeper)"
-                )
+                hud_lines.append(f"Trial {loop.trial_count + 1}  |  {paused_str}")
+            o = loop.outcomes
+            total = sum(o.values())
+            if total > 0:
+                tally = f"Goals: {o['goal']}  Saved: {o['saved']}  Miss: {o['miss']}"
+                if o["other"]:
+                    tally += f"  Other: {o['other']}"
+                hud_lines.append(tally)
+        else:
+            left, right = self.match.scoreboard.left_goals, self.match.scoreboard.right_goals
+            hud_lines.append(f"Score: LEFT {left} - {right} RIGHT  |  {paused_str}")
+        if selected_id is not None:
+            mode = self.input_controller.order_mode
+            if mode != OrderMode.MOVE:
+                hud_lines.append(f"Selected: {selected_id}  [{mode.name} mode - Esc cancels]")
+            else:
+                hud_lines.append(f"Selected: {selected_id}")
         self.renderer.draw_hud_text(self.surface, hud_lines)
         self._draw_help_button()
+        self.renderer.draw_hotkey_bar(self.surface, self._hotkey_entries())
 
         if self.show_help:
             self._draw_help_overlay()
@@ -271,6 +321,7 @@ class App:
             "Click-drag from selected - kick: drag direction=aim, length=power (only if they have the ball)",
             "Hold Shift while dragging- loft/chip the kick instead of driving it low",
             "P                        - pass mode: next click (ground or player) passes there",
+            "K                        - shoot mode: next click sets the aim point for a full-power shot",
             "S                        - issue a Save order (goalkeeper only): tracks and blocks shots",
             "X                        - stop: decelerate selected player to a standstill",
             "Space                    - pause/resume the simulation",
@@ -288,6 +339,34 @@ class App:
             rendered = self.renderer.hud_font.render(line, True, style.HUD_TEXT)
             self.surface.blit(rendered, (60, y))
             y += rendered.get_height() + 6
+
+
+    def _hotkey_entries(self) -> list[tuple[str, str, bool, bool]]:
+        """Returns (key_label, action_label, enabled, active) for every hotkey.
+
+        *enabled* controls brightness: True = player can use this right now,
+        False = action not currently valid (no selection, no ball, etc.) and
+        rendered dim.  *active* highlights the key in accent colour when it
+        is the current transient mode (PASS / SHOOT).
+        """
+        ic = self.input_controller
+        match = self.match
+        if ic is None or match is None:
+            return []
+        selected = ic.selected_player()
+        has_ball = selected is not None and match.ball.possessed_by == selected.player_id
+        is_gk = selected is not None and selected.is_goalkeeper
+        is_selected = selected is not None
+        mode = ic.order_mode
+        return [
+            ("[Spc]", "Pause" if not match.paused else "Resume", True, False),
+            ("[P]",   "Pass",   has_ball,    mode == OrderMode.PASS),
+            ("[K]",   "Shoot",  has_ball,    mode == OrderMode.SHOOT),
+            ("[S]",   "Save",   is_gk,       False),
+            ("[X]",   "Stop",   is_selected, False),
+            ("[H]",   "Help",   True,        self.show_help),
+            ("[Esc]", "Menu",   True,        False),
+        ]
 
 
 def run_app() -> None:

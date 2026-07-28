@@ -292,8 +292,8 @@
   "save_far_post_fast_vs_slow_gk": {
     "fast_gk": {
       "n_trials": 300,
-      "saved": 253,
-      "save_rate_pct": 84.33
+      "saved": 260,
+      "save_rate_pct": 86.67
     },
     "slow_gk": {
       "n_trials": 300,
@@ -314,20 +314,20 @@
     }
   },
   "save_rate_grid_pct": {
-    "gk_speed=0.1_near_post": 80.0,
-    "gk_speed=0.1_centre": 100.0,
-    "gk_speed=0.1_far_post": 6.7,
-    "gk_speed=0.5_near_post": 80.0,
-    "gk_speed=0.5_centre": 100.0,
-    "gk_speed=0.5_far_post": 74.0,
-    "gk_speed=0.9_near_post": 80.0,
-    "gk_speed=0.9_centre": 100.0,
-    "gk_speed=0.9_far_post": 74.0
+    "gk_speed=0.1_near_post": 85.3,
+    "gk_speed=0.1_centre": 89.3,
+    "gk_speed=0.1_far_post": 0.0,
+    "gk_speed=0.5_near_post": 85.3,
+    "gk_speed=0.5_centre": 96.7,
+    "gk_speed=0.5_far_post": 32.7,
+    "gk_speed=0.9_near_post": 85.3,
+    "gk_speed=0.9_centre": 96.7,
+    "gk_speed=0.9_far_post": 80.0
   },
   "save_random_scenarios_good_vs_bad": {
     "n_scenarios": 150,
-    "good_gk_save_rate_pct": 75.3,
-    "bad_gk_save_rate_pct": 23.3
+    "good_gk_save_rate_pct": 94.0,
+    "bad_gk_save_rate_pct": 90.0
   },
   "dribble_speed_penalty_avg": {
     "n_dribbler_wins": 980,
@@ -425,5 +425,20 @@
     "n_trials": 200,
     "succeeded": 52,
     "success_rate_pct": 26.0
+  },
+  "shoot_order_penalty_precision_0.5_centre_aim": {
+    "n_trials": 2000,
+    "scored": 1979,
+    "score_rate_pct": 98.95
+  },
+  "shoot_order_penalty_precision_0.5_corner_aim": {
+    "n_trials": 2000,
+    "scored": 1440,
+    "score_rate_pct": 72.0
+  },
+  "shoot_order_penalty_precision_0.8_corner_aim": {
+    "n_trials": 2000,
+    "scored": 1742,
+    "score_rate_pct": 87.1
   }
 }

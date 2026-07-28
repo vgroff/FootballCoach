@@ -19,7 +19,7 @@ from footballcoach.engine.match import Match
 from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import KickOrder
+from footballcoach.orders import KickOrder, ShootOrder
 from tests.conftest import make_player
 
 N_TRIALS = 2000
@@ -27,7 +27,13 @@ RNG_REDUCTION = 0.3
 PENALTY_POWER = 0.8
 
 
-def _run_penalty_trials(precision: float, aim_offset_y: float, aim_offset_z: float, n_trials: int) -> dict:
+def _run_penalty_trials(
+    precision: float,
+    aim_offset_y: float,
+    aim_offset_z: float,
+    n_trials: int,
+    use_shoot_order: bool = False,
+) -> dict:
     pitch = Pitch.standard()
     penalty_spot = pitch.penalty_spot(left=False)
     goal_centre = pitch.right_goal_centre
@@ -49,12 +55,15 @@ def _run_penalty_trials(precision: float, aim_offset_y: float, aim_offset_z: flo
         kicker.velocity = Vector3(v_run, 0.0, 0.0)
 
         ball = Ball.at_rest(penalty_spot)
-        ball.possessed_by = "p1"
+        ball.possessed_by = kicker.player_id
         rng = random.Random(seed)
         match = Match(pitch=pitch, players=[kicker], ball=ball, rng_reduction=RNG_REDUCTION, rng=rng)
 
         aim_point = goal_centre + Vector3(0, aim_offset_y, aim_offset_z)
-        kicker.current_order = KickOrder(aim_point=aim_point, power_fraction=PENALTY_POWER, spin=Vector3.zero())
+        if use_shoot_order:
+            kicker.current_order = ShootOrder(aim_point=aim_point, power_fraction=PENALTY_POWER)
+        else:
+            kicker.current_order = KickOrder(aim_point=aim_point, power_fraction=PENALTY_POWER, spin=Vector3.zero())
 
         for _ in range(150):
             match.step()
@@ -92,4 +101,32 @@ def test_penalty_precision_08_corner_aim_scores_85_to_95_percent(balance_recorde
     corner_offset_y = pitch.goal_width_m / 2.0 - 0.475
     stats = _run_penalty_trials(precision=0.8, aim_offset_y=corner_offset_y, aim_offset_z=0.475, n_trials=N_TRIALS)
     balance_recorder.report("penalty_precision_0.8_corner_aim", stats)
+    assert 85.0 <= stats["score_rate_pct"] <= 95.0
+
+
+# ---------------------------------------------------------------------------
+# ShootOrder variants - mechanically identical to KickOrder; same balance
+# targets must hold (confirms ShootOrder routes through the same kick_ball
+# code path with the same error model).
+# ---------------------------------------------------------------------------
+
+def test_shoot_order_penalty_precision_05_centre_aim_scores_over_95_percent(balance_recorder):
+    stats = _run_penalty_trials(precision=0.5, aim_offset_y=0.0, aim_offset_z=1.1, n_trials=N_TRIALS, use_shoot_order=True)
+    balance_recorder.report("shoot_order_penalty_precision_0.5_centre_aim", stats)
+    assert stats["score_rate_pct"] > 95.0
+
+
+def test_shoot_order_penalty_precision_05_corner_aim_scores_50_to_80_percent(balance_recorder):
+    pitch = Pitch.standard()
+    corner_offset_y = pitch.goal_width_m / 2.0 - 0.475
+    stats = _run_penalty_trials(precision=0.5, aim_offset_y=corner_offset_y, aim_offset_z=0.475, n_trials=N_TRIALS, use_shoot_order=True)
+    balance_recorder.report("shoot_order_penalty_precision_0.5_corner_aim", stats)
+    assert 50.0 <= stats["score_rate_pct"] <= 80.0
+
+
+def test_shoot_order_penalty_precision_08_corner_aim_scores_85_to_95_percent(balance_recorder):
+    pitch = Pitch.standard()
+    corner_offset_y = pitch.goal_width_m / 2.0 - 0.475
+    stats = _run_penalty_trials(precision=0.8, aim_offset_y=corner_offset_y, aim_offset_z=0.475, n_trials=N_TRIALS, use_shoot_order=True)
+    balance_recorder.report("shoot_order_penalty_precision_0.8_corner_aim", stats)
     assert 85.0 <= stats["score_rate_pct"] <= 95.0

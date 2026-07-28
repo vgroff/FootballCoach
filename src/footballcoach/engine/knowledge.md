@@ -13,7 +13,7 @@ steppable `Match` with a fixed timestep. All constants come from
                              completing control (granting possession) when
                              a CONTROLLING_BALL timer expires
 2. _process_orders        - execute each player's current order (Move/Kick/
-                             Tackle/Pass/ChaseTackle/Save) for this tick
+                             Shoot/Tackle/Pass/ChaseTackle/Save) for this tick
 3. _sync_possessed_ball   - snap the ball to whoever currently has
                              possession (it's "stuck to them" per Idea.md)
 4. step_ball (if loose)   - advance free-flight physics for a loose ball,
@@ -70,14 +70,21 @@ mind.
 
 ## `movement.py` - movement, stamina, turning
 
-- **Goalkeeper diving boost**: goalkeepers get a flat
-  `goalkeeper_accel_multiplier` (1.5 by default) applied to straight-line
-  acceleration (`effective_acceleration`), lateral/turning acceleration
-  (`lateral_accel_capability`), and thus turn rate (`max_turn_rate_rad_s`) -
-  simulating a keeper's explosive dive/reach that outfield players don't
-  have. **The multiplier must be applied to all three** (straight-line,
-  lateral, and turn-rate), not just straight-line acceleration: an earlier
-  version only boosted straight-line acceleration, which let a fast keeper
+- **Goalkeeper movement boosts**: goalkeepers get two flat multipliers from
+  `physics.json` applied on top of their attribute-driven movement:
+  - `goalkeeper_accel_multiplier` (2.8): applied to straight-line
+    acceleration (`effective_acceleration`), lateral/turning acceleration
+    (`lateral_accel_capability`), and thus turn rate (`max_turn_rate_rad_s`).
+    **Must be applied to all three** - an earlier version only boosted
+    straight-line acceleration, which let a fast keeper
+  - `goalkeeper_speed_multiplier` (1.5): applied to top speed in
+    `effective_top_speed` (via `step_player_towards`). Simulates a keeper's
+    explosive diving reach covering more of the goal than their raw speed
+    attribute alone would allow. Applied after stamina and ball-carry
+    penalties so it stacks multiplicatively with them.
+  Both multipliers are applied inside `step_player_towards` automatically
+  via `player.is_goalkeeper`, so no call-site changes are needed when
+  adding new order types. An earlier version only boosted straight-line acceleration, which let a fast keeper
   build up speed towards a save target faster than they could *correct*
   direction as the ball's predicted crossing point shifted tick-to-tick,
   causing overshoot/oscillation past the target - this actually made a fast

@@ -35,7 +35,7 @@ def _run_shoot_trial(pitch, precision: float, power: float, x: float, y: float, 
         kick_precision=precision, kick_power=power,
     )
     ball = Ball.at_rest(kicker.position)
-    ball.possessed_by = "k"
+    ball.possessed_by = kicker.player_id
     match = Match(pitch=pitch, players=[kicker], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))
 
     actions.shoot(kicker, pitch)

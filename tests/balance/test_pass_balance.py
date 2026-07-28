@@ -29,14 +29,14 @@ def _run_pass_trial(pitch: Pitch, precision: float, target_position: Vector3, se
     passer = make_player("p", Team.LEFT, position=Vector3(0, 0, 0), kick_precision=precision)
     receiver = make_player("r", Team.LEFT, position=target_position)
     ball = Ball.at_rest(passer.position)
-    ball.possessed_by = "p"
+    ball.possessed_by = passer.player_id
     match = Match(pitch=pitch, players=[passer, receiver], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))
 
     actions.pass_to(passer, receiver.position)
 
     for _ in range(MAX_TICKS):
         match.step()
-        if ball.possessed_by == "r":
+        if ball.possessed_by == receiver.player_id:
             return True
         # Ball at rest, loose, and not mid-control by the receiver: it
         # missed and rolled dead somewhere (or was never close enough to
@@ -138,7 +138,7 @@ def _run_long_pass_trial(pitch: Pitch, precision: float, distance: float, seed: 
                                     has_ball=True, ball_control_attr=passer.attributes.ball_control)
     passer.velocity = Vector3(top_speed * 0.5, 0.0, 0.0)
     ball = Ball.at_rest(passer.position)
-    ball.possessed_by = "p"
+    ball.possessed_by = passer.player_id
     match = Match(pitch=pitch, players=[passer, receiver], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))
 
     actions.pass_to(passer, target)
@@ -146,7 +146,7 @@ def _run_long_pass_trial(pitch: Pitch, precision: float, distance: float, seed: 
     max_ticks = max(400, int(distance * 20))
     for _ in range(max_ticks):
         match.step()
-        if ball.possessed_by == "r":
+        if ball.possessed_by == receiver.player_id:
             return True
         if ball.velocity.length() < 0.05 and ball.possessed_by is None and receiver.state.name != "CONTROLLING_BALL":
             return False

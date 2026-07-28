@@ -114,4 +114,25 @@ class GetPossessionOrder:
     status: OrderStatus = OrderStatus.PENDING
 
 
-Order = MoveOrder | KickOrder | TackleOrder | PassOrder | ChaseTackleOrder | SaveOrder | StopOrder | GetPossessionOrder
+@dataclass
+class ShootOrder:
+    """Shoot at goal by aiming at a specific 3-D point (e.g. a corner of the
+    goal frame).  The player must have possession; if they do not the order
+    completes immediately as a no-op.
+
+    Mechanically identical to KickOrder - both call ``kick_ball`` with the
+    same error model.  The semantic distinction is:
+
+    - KickOrder: freeform kick; direction and power come from the UI drag
+      gesture or explicit scenario setup (used by balance-test fixtures,
+      penalty scenarios, etc.).
+    - ShootOrder: deliberate shot on goal; the player (or the user via the
+      ``K`` key in the UI) picks a target *inside the goal frame* and the
+      engine fires at that point at the requested power.
+    """
+    aim_point: Vector3          # absolute world position to aim at
+    power_fraction: float       # in [0, 1]; 1.0 = full-power shot
+    status: OrderStatus = OrderStatus.PENDING
+
+
+Order = MoveOrder | KickOrder | ShootOrder | TackleOrder | PassOrder | ChaseTackleOrder | SaveOrder | StopOrder | GetPossessionOrder

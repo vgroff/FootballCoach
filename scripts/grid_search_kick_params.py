@@ -157,7 +157,7 @@ def run_penalty_trial(kp: KickingParams, precision: float,
     kicker.velocity = Vector3(v_run, 0.0, 0.0)
 
     ball = Ball.at_rest(spot)
-    ball.possessed_by = "k"
+    ball.possessed_by = kicker.player_id
     match = Match(pitch=pitch, players=[kicker], ball=ball,
                   rng_reduction=RNG_REDUCTION, rng=random.Random(seed),
                   kicking_params=kp)
@@ -195,7 +195,7 @@ def run_pass_trial(kp: KickingParams, pp: PassingParams,
     passer.velocity = Vector3(top_speed * 0.5, 0.0, 0.0)
 
     ball = Ball.at_rest(passer.position)
-    ball.possessed_by = "p"
+    ball.possessed_by = passer.player_id
 
     match = Match(pitch=pitch, players=[passer, receiver], ball=ball,
                   rng_reduction=RNG_REDUCTION, rng=random.Random(seed),
@@ -208,7 +208,7 @@ def run_pass_trial(kp: KickingParams, pp: PassingParams,
     max_ticks = max(400, int(distance * 20))
     for _ in range(max_ticks):
         match.step()
-        if ball.possessed_by == "r":
+        if ball.possessed_by == receiver.player_id:
             return True
         if ball.velocity.length() < 0.05 and ball.possessed_by is None and receiver.state.name != "CONTROLLING_BALL":
             return False
@@ -279,7 +279,7 @@ def debug_pass_trial(kp: KickingParams, pp: PassingParams,
     receiver = _make_player("r", Team.LEFT, target)
 
     ball = Ball.at_rest(passer.position)
-    ball.possessed_by = "p"
+    ball.possessed_by = passer.player_id
 
     match = Match(pitch=pitch, players=[passer, receiver], ball=ball,
                   rng_reduction=RNG_REDUCTION, rng=random.Random(seed),
@@ -335,7 +335,7 @@ def debug_pass_trial(kp: KickingParams, pp: PassingParams,
         prev_vz = vz
         prev_vxy = vxy
 
-        if ball.possessed_by == "r":
+        if ball.possessed_by == receiver.player_id:
             print(f"  => RECEIVED at tick {tick}")
             return
         if ball.velocity.length() < 0.05 and ball.possessed_by is None and receiver.state.name != "CONTROLLING_BALL":
@@ -367,7 +367,7 @@ def run_pass_trial_with_velocity(kp, pp, precision, distance, velocity_fraction,
                                     has_ball=True, ball_control_attr=passer.attributes.ball_control)
     passer.velocity = Vector3(top_speed * velocity_fraction, 0.0, 0.0)
     ball = Ball.at_rest(passer.position)
-    ball.possessed_by = "p"
+    ball.possessed_by = passer.player_id
     match = Match(pitch=pitch, players=[passer, receiver], ball=ball,
                   rng_reduction=RNG_REDUCTION, rng=random.Random(seed),
                   kicking_params=kp, passing_params=pp)
@@ -376,7 +376,7 @@ def run_pass_trial_with_velocity(kp, pp, precision, distance, velocity_fraction,
     max_ticks = max(400, int(distance * 20))
     for _ in range(max_ticks):
         match.step()
-        if ball.possessed_by == "r":
+        if ball.possessed_by == receiver.player_id:
             return True
         if ball.velocity.length() < 0.05 and ball.possessed_by is None and receiver.state.name != "CONTROLLING_BALL":
             return False

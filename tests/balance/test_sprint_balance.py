@@ -33,7 +33,7 @@ def _time_to_run(top_speed_attr: float, acceleration_attr: float, has_ball: bool
     )
     if has_ball:
         ball = Ball.at_rest(player.position)
-        ball.possessed_by = "p1"
+        ball.possessed_by = player.player_id
     else:
         # Keep the ball well away from the player so it isn't auto-picked-up
         # mid-run (which would otherwise stall the "no ball" baseline with a

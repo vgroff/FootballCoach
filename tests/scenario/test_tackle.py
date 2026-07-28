@@ -18,12 +18,12 @@ def test_tackle_wins_ball_from_carrier():
     carrier = make_player("carrier", Team.RIGHT, position=Vector3(0.5, 0, 0), dribbling=0.1)
 
     ball = Ball.at_rest(Vector3(0.5, 0, 0))
-    ball.possessed_by = "carrier"
+    ball.possessed_by = carrier.player_id
 
     match = Match(pitch=pitch, players=[tackler, carrier], ball=ball, rng_reduction=1.0, rng=random.Random(0))
 
-    tackler.current_order = TackleOrder(target_player_id="carrier")
+    tackler.current_order = TackleOrder(target_player_id=carrier.player_id)
     match.step()
 
-    assert ball.possessed_by == "tackler"
+    assert ball.possessed_by == tackler.player_id
     assert carrier.state.name == "INACTIVE_TACKLED"

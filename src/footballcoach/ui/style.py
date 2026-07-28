@@ -20,6 +20,11 @@ HUD_ACCENT = (120, 200, 255)
 DRAG_KICK_LINE = (255, 255, 255)
 DRAG_TACKLE_LINE = (255, 90, 90)
 
+HOTKEY_BAR_BG = (20, 20, 28)
+HOTKEY_ENABLED = (210, 210, 215)
+HOTKEY_DISABLED = (80, 80, 92)   # dim but still readable
+HOTKEY_ACTIVE = (120, 200, 255)  # accent: current mode is active (same as HUD_ACCENT)
+
 FONT_NAME = None  # None = pygame default font
 HUD_FONT_SIZE = 18
 TITLE_FONT_SIZE = 32

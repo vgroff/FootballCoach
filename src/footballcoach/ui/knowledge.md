@@ -24,10 +24,11 @@ swappable/removable without touching the engine, per the project's
   to move, click opponent to tackle, drag from the ball-carrier to kick).
 - `scenarios.py` - builds `Match` instances for the two non-freeplay modes:
   `make_training_match()` (1 player + ball, full pitch, both goals live) and
-  `SCENARIOS` (a handful of hand-picked recreations of the pytest balance
-  scenarios - penalty, tackle, sprint - for *watching* a single live trial,
-  not for statistical validation; the pytest suite in `tests/balance/`
-  remains the source of truth for balance numbers).
+  `SCENARIOS` (hand-picked recreations of the pytest balance scenarios -
+  penalty, save/goalkeeper dive, shoot from box, 20m pass, tackle challenge,
+  sprint race - for *watching* a single live trial, not for statistical
+  validation; the pytest suite in `tests/balance/` remains the source of
+  truth for balance numbers).
 - `app.py` - `App` owns the pygame window, main loop, a simple two-screen
   state machine (`MENU` / `MATCH`), and wires input events to
   `MatchInputController` + `Match.step()` + `Renderer`.
@@ -95,8 +96,12 @@ whenever height exceeds 0.15m.
   enter_pass_mode()`, tracked via the `OrderMode` enum). The next click on a
   same-team player or empty ground issues a `PassOrder` at that
   player/position instead of the normal select/move click handling, then
-  automatically reverts to `OrderMode.MOVE`. `Esc` (or pressing `P` again)
-  cancels pass mode without issuing anything (`cancel_pass_mode()`).
+  automatically reverts to `OrderMode.MOVE`. `Esc` cancels any transient
+  mode (`cancel_order_mode()`).
+- **`K` key** -> enters one-shot "Shoot mode" (`enter_shoot_mode()`). The
+  next click on any pitch point issues a `ShootOrder` aimed at that point
+  (z=1.0m, full power), then automatically reverts to `OrderMode.MOVE`.
+  `Esc` also cancels shoot mode.
 - **`S` key** -> issues a `SaveOrder` to the currently-selected player via
   `MatchInputController.issue_save_order()`, but only if that player
   `.is_goalkeeper` (a no-op otherwise).
@@ -125,11 +130,53 @@ translucency). Match input events are suppressed while the overlay is open
 issue orders while reading it; `Esc` closes the overlay first before
 falling back to its normal pass-mode-cancel / return-to-menu behaviour.
 
+## Hotkey bar (`renderer.draw_hotkey_bar` / `App._hotkey_entries`)
+
+A permanent strip at the bottom of the screen shows every hotkey at all
+times.  Each entry is rendered in one of three states:
+- **Active** (accent colour): the key is the current transient mode, e.g.
+  `[P] Pass` while PASS mode is engaged.
+- **Enabled** (bright): the action is currently valid for the selected
+  player (e.g. `[K] Shoot` lights up only if the selected player has the
+  ball).
+- **Disabled** (dim but readable): action is not valid right now (no
+  selection, wrong player type, etc.).
+
+This replaces the old inline key-hint text in the HUD, which only appeared
+when a player was selected. `App._hotkey_entries()` computes the seven
+entries (`[Spc]`, `[P]`, `[K]`, `[S]`, `[X]`, `[H]`, `[Esc]`) and their
+states from the current selection/ball/mode.
+
+## Balance scenario looping (`ScenarioLoop` in `scenarios.py`)
+
+`ScenarioLoop` wraps a `ScenarioDefinition` and replays it for
+`max_trials` (default 20) consecutive trials.  The UI calls
+`loop.step()` once per frame; each call advances the current trial's
+`Match` by one physics tick.  A trial ends when:
+1. Ball crosses the touchline or goal line (out of bounds).
+2. All player orders have resolved *and* the ball is possessed or
+   stationary (≥ 30 ticks in, to let the initial kick/tackle execute).
+3. `timeout_ticks` failsafe (default 500, ≈ 16.7 s at 30 Hz).
+
+`loop.step()` returns `True` the tick a trial ends, at which point the
+loop has already built a fresh `Match` (via `definition.build()`) for
+the next trial, or set `loop.complete = True` if `max_trials` reached.
+`App._step_match` handles the three outcomes (mid-trial, new trial
+started, loop complete → return to menu).
+
+The HUD shows `Trial N/max_trials` instead of the score during scenario
+mode.
+
+## Training mode auto-select
+
+`App._start_match` now sets `input_controller.selected_player_id` to
+the lone trainee's ID immediately when `is_training_mode=True`, so the
+player is controllable from the first frame without an initial click.
+
 ## Known gaps / not yet implemented
 
 - No jog/sprint toggle for Move orders (always sprint).
-- Balance scenarios always use `rng_reduction=0.3` and don't loop/repeat
-  automatically - selecting one plays a single live trial; go back to the
-  menu (Esc) and re-select to see another random outcome.
+- Shoot mode (`K`) always fires at full power (`power_fraction=1.0`) with a
+  fixed aim height of 1.0m; no UI control for power or aim height yet.
 - No sound, no game clock/timer, no formations/kickoff - out of scope for
   this milestone (mirrors the engine's own documented gaps).

@@ -33,6 +33,7 @@ class MovementParams:
     lateral_accel_ball_penalty_max: float
     min_speed_for_turn_mps: float
     goalkeeper_accel_multiplier: float
+    goalkeeper_speed_multiplier: float
 
     @staticmethod
     def from_config() -> "MovementParams":
@@ -56,6 +57,7 @@ class MovementParams:
             lateral_accel_ball_penalty_max=d["lateral_accel_ball_penalty_max"],
             min_speed_for_turn_mps=d["min_speed_for_turn_mps"],
             goalkeeper_accel_multiplier=d["goalkeeper_accel_multiplier"],
+            goalkeeper_speed_multiplier=d["goalkeeper_speed_multiplier"],
         )
 
 
@@ -93,10 +95,13 @@ def effective_top_speed(
     stamina_fraction: float,
     has_ball: bool,
     ball_control_attr: float = 0.0,
+    is_goalkeeper: bool = False,
 ) -> float:
     speed = top_speed_mps(params, top_speed_attr) * stamina_multiplier(params, stamina_fraction)
     if has_ball:
         speed *= ball_carry_speed_multiplier(params, ball_control_attr)
+    if is_goalkeeper:
+        speed *= params.goalkeeper_speed_multiplier
     return speed
 
 
@@ -214,7 +219,7 @@ def step_player_towards(
     params = params or MovementParams.from_config()
     attrs = player.attributes
 
-    v_top = effective_top_speed(params, attrs.top_speed, player.stamina, has_ball, attrs.ball_control)
+    v_top = effective_top_speed(params, attrs.top_speed, player.stamina, has_ball, attrs.ball_control, player.is_goalkeeper)
     a_max = effective_acceleration(params, attrs.acceleration, player.stamina, player.is_goalkeeper)
 
     current_speed = player.velocity.length_xy()

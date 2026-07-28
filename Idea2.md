@@ -10,17 +10,14 @@ More functions:
 - This is no pass action! Only kicks. I'd rather understand why kick isn't working well as a pass than fake something like that
 
 New NBs:
--     kicker = make_player(
-        "k", Team.LEFT, position=Vector3(x, y, 0),
-        kick_precision=precision, kick_power=power,
-    )
-    ball = Ball.at_rest(kicker.position)
-    ball.possessed_by = "k"
-- this is bad code, no? why wouldn't you do ball.possesed_by = kicker? What if two players have the same name? have a look in the codebase for other places where references are made with string literals instead of with objects. This is the only one I could find at least
-
-
+- In the move to order, avoid nearby players (have a kind of repulsion mechanic with distance for players < 4m away or smth) - stronger repulsion if you have the ball that makes you slow down, no repulsion if the nearby player in question has the ball. Do a dot product between the relative velocity and the repulsion - if they're too aligned, add adjust move direction in the orthogonal direction to the repulsion by some minimum value. Then also add balance tests that confirm that a decent player will run straight into another player when the repulsion and mimimum direction adjustment are set to 0 and that they will run around correctly when it is set to the right value (and we have to find this value)
+- penalise goalkeeper tackles when they do it outside their box (by 35% for now to discourage them)
+- in the ui allow me to load in a generic shooting test similar to some of the existing ones but with full control over the boundaries of the random numbers like positions and kick precision, whichever ones are gonna be interesting, not necesarily every single random number
+- Goalkeeper save - shouldn't just try to do the save on the goal line - if ball is near and we think we can intercept it early then go for it - just write tests for this, we don't want false positives
+- Use the goalkeeper positioning we've implemented in the UI scenario for tuning gk values in the balance tests
 
 NB:
 - currently stamina regen is faster than sprint depeltion, do we want that?
-- Pretty sure you can currently kick at full power with having full in the kick_power stat, which begs the question of what it's purpose is. I think you should only have full power at 1.0 kick power, but maybe we up the max power a little bit too since it is very rare. I want the kicking/shooting to be realistic
-- In the move to order, avoid nearby players (a kind of repulsion mechanic with distance)
+- Pretty sure you can currently kick at full power with having full in the kick_power stat, which begs the question of what it's purpose is. I think you should only have full power at 1.0 kick power
+- implement goalie rebounds
+

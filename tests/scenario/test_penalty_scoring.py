@@ -20,7 +20,7 @@ def test_penalty_scores_and_goal_recorded():
     kicker = make_player("p1", team=Team.LEFT, position=penalty_spot, kick_precision=0.9, kick_power=0.9)
 
     ball = Ball.at_rest(penalty_spot)
-    ball.possessed_by = "p1"
+    ball.possessed_by = kicker.player_id
 
     match = Match(pitch=pitch, players=[kicker], ball=ball, rng_reduction=1.0, rng=random.Random(0))
 

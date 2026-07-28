@@ -18,6 +18,11 @@ given a Move order actually arrives", "a penalty kicked dead centre with
 zero error scores and the goal is recorded", "a tackle with a big skill gap
 wins deterministically".
 
+`test_scenario_loop.py` is an exception: it tests `ScenarioLoop`
+(the UI's multi-trial balance scenario runner) headlessly without pygame,
+driving `loop.step()` directly.  It uses the default `rng_reduction=0.3`
+because the loop's trial-end detection doesn't depend on determinism.
+
 ## `balance/`
 
 Statistical tests at the *default* game setting (`rng_reduction=0.3`), run
@@ -25,6 +30,12 @@ over many trials (typically 1000-5000) and asserting the *aggregate*
 outcome falls within a designer-specified band - e.g. "a 0.8 tackling player
 beats a 0.6 dribbling player 70-90% of the time". These exist to validate
 and tune game balance, not just correctness.
+
+Balance tests that validate a new order type (e.g. `ShootOrder`) must reach
+the same statistical targets as the equivalent `KickOrder` test, since both
+call the same `kick_ball` code path. The penalty tests do exactly this:
+`test_penalty_balance.py` runs each scenario with both `KickOrder` and
+`ShootOrder`, asserting identical score-rate bands for both.
 
 **Every balance test must report full statistics, not just pass/fail.** Use
 the `balance_recorder` fixture (defined in `tests/conftest.py`):

@@ -40,6 +40,7 @@ from footballcoach.orders import (
     OrderStatus,
     PassOrder,
     SaveOrder,
+    ShootOrder,
     StopOrder,
     TackleOrder,
 )
@@ -187,6 +188,29 @@ class Match:
                         player.attributes.kick_precision,
                         player.attributes.kick_power,
                         order.spin,
+                        self.rng_reduction,
+                        self.rng,
+                        self.kicking_params,
+                        kicker_velocity=player.velocity,
+                        kicker_top_speed_mps=effective_top_speed(
+                            self.movement_params, player.attributes.top_speed, player.stamina,
+                            has_ball=True, ball_control_attr=player.attributes.ball_control,
+                        ),
+                    )
+                    self._start_release_grace(player.player_id)
+                order.status = OrderStatus.COMPLETE
+                player.current_order = None
+
+            elif isinstance(order, ShootOrder):
+                if has_ball:
+                    kick_ball(
+                        self.ball,
+                        player.position,
+                        order.aim_point,
+                        order.power_fraction,
+                        player.attributes.kick_precision,
+                        player.attributes.kick_power,
+                        Vector3.zero(),
                         self.rng_reduction,
                         self.rng,
                         self.kicking_params,
@@ -365,19 +389,19 @@ class Match:
                         self.goalkeeping_params,
                     )
                     direction = target_position - player.position
-                    if direction.length_xy() < 0.15:
-                        # Snap to the target (not just freeze velocity):
-                        # without this, a keeper "arriving" anywhere within
-                        # the 0.15m tolerance ring stays frozen at that
-                        # residual offset for the rest of the shot's
-                        # flight - usually harmless, but a keeper boosted by
-                        # goalkeeper_accel_multiplier reaches (and freezes
-                        # at) that ring well before the ball arrives, and
-                        # the leftover gap could be just enough to sit
-                        # outside pickup_radius_m, turning a correctly-read
-                        # save into a miss (see
-                        # tests/balance/test_save_balance.py's fast-vs-slow
-                        # regression).
+                    # Snap threshold: the larger of 0.15m (minimum grab
+                    # radius) and the distance the keeper can cover in one
+                    # tick at their current effective top speed.  Without
+                    # the per-tick term, a fast keeper (especially with the
+                    # goalkeeper_speed_multiplier boost) can travel further
+                    # than the fixed threshold in a single tick and overshoot
+                    # the target entirely, ending up on the wrong side.
+                    gk_top_speed = effective_top_speed(
+                        self.movement_params, player.attributes.top_speed,
+                        player.stamina, has_ball=False, is_goalkeeper=True,
+                    )
+                    snap_threshold = max(0.15, gk_top_speed * dt)
+                    if direction.length_xy() < snap_threshold:
                         player.position = target_position.with_z(player.position.z)
                         player.velocity = Vector3.zero()
                     else:

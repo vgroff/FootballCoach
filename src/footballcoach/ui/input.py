@@ -32,7 +32,7 @@ from enum import Enum, auto
 from footballcoach.engine.match import Match
 from footballcoach.entities.player import Player, Team
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import GetPossessionOrder, KickOrder, MoveOrder, PassOrder, SaveOrder, StopOrder, TackleOrder
+from footballcoach.orders import GetPossessionOrder, KickOrder, MoveOrder, PassOrder, SaveOrder, ShootOrder, StopOrder, TackleOrder
 from footballcoach.ui.camera import Camera
 
 CLICK_DRAG_THRESHOLD_PX = 6
@@ -46,11 +46,11 @@ class OrderMode(Enum):
     """Which order a ground/player click issues to the selected player.
 
     MOVE is the persistent default (click ground=move, click opponent=
-    tackle). PASS is transient: it applies to exactly one click, then
-    automatically reverts to MOVE, so the user doesn't have to remember to
-    switch back after every pass."""
+    tackle). PASS and SHOOT are transient: each applies to exactly one
+    click then automatically reverts to MOVE."""
     MOVE = auto()
     PASS = auto()
+    SHOOT = auto()
 
 
 @dataclass
@@ -134,6 +134,10 @@ class MatchInputController:
                 if self.order_mode == OrderMode.PASS:
                     selected.current_order = PassOrder(target_position=clicked_player.position)
                     self.order_mode = OrderMode.MOVE  # PASS is a one-shot mode
+                elif self.order_mode == OrderMode.SHOOT:
+                    # Shoot at the clicked player's position (unusual but valid).
+                    selected.current_order = ShootOrder(aim_point=clicked_player.position, power_fraction=1.0)
+                    self.order_mode = OrderMode.MOVE
                 else:
                     self.selected_player_id = clicked_player.player_id  # switch selection
                 return
@@ -141,20 +145,34 @@ class MatchInputController:
             selected.current_order = GetPossessionOrder()
             return
 
-        # Empty ground - issue a move or pass order to the selected player.
+        # Empty ground - issue a move, pass, or shoot order to the selected player.
         if selected is not None:
             world_x, world_y = self.camera.screen_to_world(*screen_pos)
-            target = Vector3(world_x, world_y, 0.0)
             if self.order_mode == OrderMode.PASS:
+                target = Vector3(world_x, world_y, 0.0)
                 selected.current_order = PassOrder(target_position=target)
                 self.order_mode = OrderMode.MOVE  # PASS is a one-shot mode
+            elif self.order_mode == OrderMode.SHOOT:
+                # Aim at the clicked point at a mid-goal height (1.0m).
+                target = Vector3(world_x, world_y, 1.0)
+                selected.current_order = ShootOrder(aim_point=target, power_fraction=1.0)
+                self.order_mode = OrderMode.MOVE  # SHOOT is a one-shot mode
             else:
+                target = Vector3(world_x, world_y, 0.0)
                 selected.current_order = MoveOrder(target_position=target, sprint=True)
 
     def enter_pass_mode(self) -> None:
         """The next click (ground or player) issues a PassOrder instead of a
         MoveOrder/selection-switch, then reverts to OrderMode.MOVE."""
         self.order_mode = OrderMode.PASS
+
+    def enter_shoot_mode(self) -> None:
+        """The next click on the pitch issues a ShootOrder aimed at the
+        clicked point (at goal-frame height), then reverts to OrderMode.MOVE."""
+        self.order_mode = OrderMode.SHOOT
+
+    def cancel_order_mode(self) -> None:
+        self.order_mode = OrderMode.MOVE
 
     def cancel_pass_mode(self) -> None:
         self.order_mode = OrderMode.MOVE

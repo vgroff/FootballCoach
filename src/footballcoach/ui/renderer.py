@@ -157,3 +157,33 @@ class Renderer:
             rendered = self.hud_font.render(line, True, style.HUD_TEXT)
             surface.blit(rendered, (x, y))
             y += rendered.get_height() + 2
+
+    def draw_hotkey_bar(
+        self,
+        surface: pygame.Surface,
+        hotkeys: list[tuple[str, str, bool, bool]],
+    ) -> None:
+        """Draws a permanent hotkey reference strip at the bottom of the screen.
+
+        Each entry is ``(key_label, action_label, enabled, active)``.
+        - *active*: the key is the current mode (e.g. PASS/SHOOT) - rendered
+          in accent colour.
+        - *enabled*: the action is currently valid (player selected, has
+          ball, etc.) - rendered bright.
+        - *disabled*: action is not currently valid - rendered dim but
+          readable so the player can see the key exists.
+        """
+        bar_h = 34
+        bar_y = surface.get_height() - bar_h
+        pygame.draw.rect(surface, style.HOTKEY_BAR_BG, (0, bar_y, surface.get_width(), bar_h))
+        x = 10
+        for key_text, label, enabled, active in hotkeys:
+            if active:
+                colour = style.HOTKEY_ACTIVE
+            elif enabled:
+                colour = style.HOTKEY_ENABLED
+            else:
+                colour = style.HOTKEY_DISABLED
+            rendered = self.hud_font.render(f"{key_text} {label}", True, colour)
+            surface.blit(rendered, (x, bar_y + (bar_h - rendered.get_height()) // 2))
+            x += rendered.get_width() + 20

@@ -40,14 +40,14 @@ def _run_tackle_trial(pitch: Pitch, tackling: float, dribbling: float, distance:
     )
     attacker.heading_rad = math.pi  # faces toward the defender
     ball = Ball.at_rest(attacker.position)
-    ball.possessed_by = "a"
+    ball.possessed_by = attacker.player_id
     match = Match(pitch=pitch, players=[defender, attacker], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))
 
     actions.tackle(defender, attacker)
 
     for _ in range(MAX_TICKS):
         match.step()
-        if ball.possessed_by == "d":
+        if ball.possessed_by == defender.player_id:
             return True
         if defender.current_order is None:
             return False
@@ -66,14 +66,14 @@ def _run_tackle_trial_from_behind(pitch: Pitch, tackling: float, dribbling: floa
     )
     # heading_rad=0 is the default: attacker faces +x, away from the defender
     ball = Ball.at_rest(attacker.position)
-    ball.possessed_by = "a"
+    ball.possessed_by = attacker.player_id
     match = Match(pitch=pitch, players=[defender, attacker], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))
 
     actions.tackle(defender, attacker)
 
     for _ in range(MAX_TICKS):
         match.step()
-        if ball.possessed_by == "d":
+        if ball.possessed_by == defender.player_id:
             return True
         if defender.current_order is None:
             return False

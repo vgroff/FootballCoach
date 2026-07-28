@@ -35,7 +35,7 @@ def test_shoot_scores_from_close_range_no_keeper():
     position = Vector3(pitch.half_length - 5, 0, 0)
     kicker = make_player("k", Team.LEFT, position=position, kick_precision=0.9, kick_power=0.9)
     ball = Ball.at_rest(position)
-    ball.possessed_by = "k"
+    ball.possessed_by = kicker.player_id
     match = Match(pitch=pitch, players=[kicker], ball=ball, rng_reduction=1.0, rng=random.Random(0))
 
     actions.shoot(kicker, pitch)
@@ -54,7 +54,7 @@ def test_pass_to_reaches_teammate():
     passer = make_player("passer", Team.LEFT, position=Vector3(0, 0, 0), kick_precision=0.8)
     receiver = make_player("receiver", Team.LEFT, position=Vector3(15, 0, 0))
     ball = Ball.at_rest(passer.position)
-    ball.possessed_by = "passer"
+    ball.possessed_by = passer.player_id
     match = Match(pitch=pitch, players=[passer, receiver], ball=ball, rng_reduction=1.0, rng=random.Random(0))
 
     actions.pass_to(passer, receiver.position)
@@ -62,7 +62,7 @@ def test_pass_to_reaches_teammate():
     received = False
     for _ in range(300):
         match.step()
-        if ball.possessed_by == "receiver":
+        if ball.possessed_by == receiver.player_id:
             received = True
             break
     assert received
@@ -73,7 +73,7 @@ def test_tackle_chases_and_wins_ball():
     defender = make_player("d", Team.LEFT, position=Vector3(0, 0, 0), tackling=0.9, top_speed=0.8, acceleration=0.8)
     attacker = make_player("a", Team.RIGHT, position=Vector3(10, 0, 0), dribbling=0.1)
     ball = Ball.at_rest(attacker.position)
-    ball.possessed_by = "a"
+    ball.possessed_by = attacker.player_id
     match = Match(pitch=pitch, players=[defender, attacker], ball=ball, rng_reduction=1.0, rng=random.Random(0))
 
     actions.tackle(defender, attacker)
@@ -81,7 +81,7 @@ def test_tackle_chases_and_wins_ball():
     won_ball = False
     for _ in range(300):
         match.step()
-        if ball.possessed_by == "d":
+        if ball.possessed_by == defender.player_id:
             won_ball = True
             break
     assert won_ball
@@ -97,7 +97,7 @@ def test_save_intercepts_shot_on_target():
         "shooter", Team.RIGHT, position=Vector3(-25, 0, 0), kick_precision=0.9, kick_power=0.7,
     )
     ball = Ball.at_rest(shooter.position)
-    ball.possessed_by = "shooter"
+    ball.possessed_by = shooter.player_id
     match = Match(pitch=pitch, players=[gk, shooter], ball=ball, rng_reduction=1.0, rng=random.Random(0))
 
     actions.save(gk)
@@ -107,7 +107,7 @@ def test_save_intercepts_shot_on_target():
     scored = False
     for _ in range(300):
         match.step()
-        if ball.possessed_by == "gk":
+        if ball.possessed_by == gk.player_id:
             saved = True
             break
         if match.scoreboard.right_goals > 0:
