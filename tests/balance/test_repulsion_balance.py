@@ -64,6 +64,47 @@ def _run_match_steps(match: Match, n_steps: int) -> list[float]:
 # Test 1: Baseline regression — single player, no neighbours in range
 # ---------------------------------------------------------------------------
 
+def test_deflection_cap_guarantees_forward_component():
+    """compute_repulsion must never deflect the adjusted direction past
+    max_deflection_deg from the desired direction, even when repulsion is
+    strongest (obstacle directly in path at distance → 0).
+    At max_deflection_deg=85° the minimum forward dot product is cos(85°) > 0,
+    so the player always makes some progress toward the target."""
+    params = RepulsionParams.from_config()
+    assert params.max_deflection_deg <= 89.0, (
+        f"max_deflection_deg={params.max_deflection_deg} allows zero/negative "
+        "forward progress; must be < 90°"
+    )
+    min_cos = math.cos(math.radians(params.max_deflection_deg))
+    desired = Vector3(1.0, 0.0, 0.0)  # player wants to move +x
+
+    # Place an obstacle nearly on top of the player from various angles to
+    # maximise repulsion magnitude and direction variety.
+    player = make_player("p1", Team.LEFT, 0.5, position=Vector3(0.0, 0.0, 0.0))
+    player.velocity = Vector3(5.0, 0.0, 0.0)
+    player.heading_rad = 0.0
+
+    for angle_deg in range(0, 360, 15):
+        angle_rad = math.radians(angle_deg)
+        # Obstacle 0.5 m away (well inside radius_m) in direction of angle.
+        ox = math.cos(angle_rad) * 0.5
+        oy = math.sin(angle_rad) * 0.5
+        obstacle = make_player("obs", Team.RIGHT, 0.5, position=Vector3(ox, oy, 0.0))
+        obstacle.velocity = Vector3(0.0, 0.0, 0.0)
+
+        adj_dir, _ = compute_repulsion(player, desired, [player, obstacle], None, params)
+
+        # Normalise
+        length = math.hypot(adj_dir.x, adj_dir.y)
+        if length < 1e-9:
+            continue  # zero vector — no movement requested, skip
+        dot = (adj_dir.x / length) * desired.x + (adj_dir.y / length) * desired.y
+        assert dot >= min_cos - 1e-9, (
+            f"Obstacle at {angle_deg}°: deflection exceeded cap. "
+            f"dot={dot:.4f}, min_cos={min_cos:.4f} (max_deflection_deg={params.max_deflection_deg}°)"
+        )
+
+
 def test_baseline_single_player_no_repulsion_effect(balance_recorder):
     """Single player with no neighbours within radius_m — repulsion must be a
     no-op, returning the original (normalised) direction and speed_mult=1.0."""

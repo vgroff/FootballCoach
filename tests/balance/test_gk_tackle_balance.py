@@ -17,7 +17,7 @@ from footballcoach.engine.tackling import TacklingParams, attempt_tackle
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.entities.player import PlayerState
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import ChaseTackleOrder, TackleOrder
+from footballcoach.orders import ChaseTackleOrder
 from tests.conftest import make_player
 
 
@@ -105,7 +105,7 @@ def test_gk_in_box_untackleable_deterministic(balance_recorder):
     for seed in range(N):
         match, gk, tackler = _make_gk_in_box_match(rng_reduction=1.0)
         match.rng = random.Random(seed)
-        tackler.current_order = TackleOrder(target_player_id="gk")
+        tackler.current_order = ChaseTackleOrder(target_player_id="gk")
         match.step()
         # Ball should still belong to GK (not transferred)
         if match.ball.possessed_by == tackler.player_id:
@@ -129,7 +129,7 @@ def test_gk_in_box_untackleable_stochastic(balance_recorder):
     for seed in range(N):
         match, gk, tackler = _make_gk_in_box_match(rng_reduction=0.3)
         match.rng = random.Random(seed)
-        tackler.current_order = TackleOrder(target_player_id="gk")
+        tackler.current_order = ChaseTackleOrder(target_player_id="gk")
         match.step()
         if match.ball.possessed_by == tackler.player_id:
             wins += 1

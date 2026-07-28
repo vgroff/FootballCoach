@@ -323,7 +323,11 @@ def step_player_towards(
     player.position = player.position + player.velocity * dt_s
 
 
-def _angle_diff(a: float, b: float) -> float:
+def angle_diff(a: float, b: float) -> float:
     """Returns b - a wrapped to [-pi, pi]."""
     d = (b - a + math.pi) % (2 * math.pi) - math.pi
     return d
+
+
+# Keep the private alias so any existing internal callers still work.
+_angle_diff = angle_diff

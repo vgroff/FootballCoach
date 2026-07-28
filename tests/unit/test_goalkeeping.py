@@ -105,6 +105,7 @@ def test_save_target_plane_in_front_of_true_goal_line():
 def _make_gk_params(
     early_intercept_max_distance_m: float = 10.0,
     early_intercept_safety_margin: float = 0.85,
+    goal_line_save_weight: float = 1.0,
 ) -> GoalkeepingParams:
     base = GoalkeepingParams.from_config()
     # Reconstruct with custom values (frozen dataclass — must pass all fields).
@@ -113,21 +114,32 @@ def _make_gk_params(
         default_position_fraction_of_half_length=base.default_position_fraction_of_half_length,
         early_intercept_max_distance_m=early_intercept_max_distance_m,
         early_intercept_safety_margin=early_intercept_safety_margin,
+        goal_line_save_weight=goal_line_save_weight,
     )
 
 
 def test_early_intercept_close_slow_shot_returns_point_closer_than_goal_line():
-    """A slow close-range shot: GK should get an early intercept point that
-    is strictly closer to the GK than the default goal-line target."""
+    """A slow close-range shot: GK should prefer the early intercept (closer
+    to the GK) over the goal-line target.
+
+    Setup: GK is at the far post (y = +3m), ball is aimed at the near post
+    (y = -3m) and is close/slow.  The goal-line crossing is ~6m lateral
+    travel away; the intercept point is only ~2m away.  With
+    goal_line_save_weight=0.5 the intercept margin easily wins.
+    """
     pitch = Pitch.standard()
-    params = _make_gk_params()
-    # GK near the left goal, ball just inside the box heading slowly toward goal
-    gk_pos = Vector3(-pitch.half_length + 3.0, 0, 0)
-    ball_pos = Vector3(-pitch.half_length + 8.0, 1.0, 0.5)  # ~5m in front of GK
-    ball_vel = Vector3(-5.0, 0, 0)  # heading toward goal at moderate speed
+    params = _make_gk_params(goal_line_save_weight=0.5)
+    # Ball crossing laterally in front of goal (high y-velocity), GK on the
+    # opposite side.  The intercept point is partway along the ball's path
+    # (close to GK); the goal-line crossing is clamped to the far post (far
+    # from GK), so the intercept margin comfortably beats the weighted goal
+    # margin and the returned position is strictly closer.
+    gk_pos = Vector3(-pitch.half_length + 3.0, -3.0, 0)
+    ball_pos = Vector3(-pitch.half_length + 4.0, 3.5, 0.3)
+    ball_vel = Vector3(-1.0, -6.0, 0)
     gk_top_speed = 7.0
 
-    intercept = early_intercept_target(
+    result = early_intercept_target(
         gk_position=gk_pos,
         gk_effective_top_speed_mps=gk_top_speed,
         ball_position=ball_pos,
@@ -139,15 +151,17 @@ def test_early_intercept_close_slow_shot_returns_point_closer_than_goal_line():
     )
     goal_line_target = save_target_position(pitch, Team.LEFT, ball_pos, ball_vel, 9.81, params)
 
-    assert intercept is not None, "Expected early intercept for a close slow shot"
-    # Intercept should be closer to GK than the goal-line target
-    dist_intercept = gk_pos.xy().distance_to(intercept.xy())
+    assert result is not None, "Expected a target for a close slow shot"
+    # With low goal_line_save_weight, intercept margin wins → result should
+    # be closer to the GK than the goal-line target.
+    dist_result = gk_pos.xy().distance_to(result.xy())
     dist_goal_line = gk_pos.xy().distance_to(goal_line_target.xy())
-    assert dist_intercept < dist_goal_line
+    assert dist_result < dist_goal_line
 
 
-def test_early_intercept_ball_beyond_max_distance_returns_none():
-    """Ball further than early_intercept_max_distance_m → must return None."""
+def test_early_intercept_ball_beyond_max_distance_returns_goal_line_target():
+    """Ball further than early_intercept_max_distance_m → no intercept considered,
+    but a goal-line save is still returned (shot is heading toward goal)."""
     pitch = Pitch.standard()
     params = _make_gk_params(early_intercept_max_distance_m=10.0)
     gk_pos = Vector3(-pitch.half_length + 1.0, 0, 0)
@@ -165,7 +179,10 @@ def test_early_intercept_ball_beyond_max_distance_returns_none():
         gravity_mps2=9.81,
         params=params,
     )
-    assert result is None
+    goal_line_target = save_target_position(pitch, Team.LEFT, ball_pos, ball_vel, 9.81, params)
+    assert result is not None
+    assert abs(result.x - goal_line_target.x) < 0.01
+    assert abs(result.y - goal_line_target.y) < 0.01
 
 
 def test_early_intercept_no_shot_incoming_returns_none():
@@ -189,8 +206,9 @@ def test_early_intercept_no_shot_incoming_returns_none():
     assert result is None
 
 
-def test_early_intercept_boundary_exactly_at_max_distance():
-    """Ball exactly at max_distance_m: result should be None (boundary is exclusive on the outside)."""
+def test_early_intercept_boundary_exactly_at_max_distance_falls_back_to_goal_line():
+    """Ball exactly at max_distance_m: intercept not considered, but goal-line
+    save is returned since the shot is heading toward goal."""
     pitch = Pitch.standard()
     params = _make_gk_params(early_intercept_max_distance_m=10.0)
     gk_pos = Vector3(-pitch.half_length + 1.0, 0, 0)
@@ -208,13 +226,15 @@ def test_early_intercept_boundary_exactly_at_max_distance():
         gravity_mps2=9.81,
         params=params,
     )
-    # Exactly at the boundary or beyond → None
-    assert result is None
+    goal_line_target = save_target_position(pitch, Team.LEFT, ball_pos, ball_vel, 9.81, params)
+    assert result is not None
+    assert abs(result.x - goal_line_target.x) < 0.01
 
 
-def test_early_intercept_fast_far_shot_falls_back_to_none():
-    """A powerful shot from just inside the distance gate, but so fast the
-    GK cannot intercept it earlier than at the goal line → None."""
+def test_early_intercept_fast_far_shot_falls_back_to_goal_line():
+    """A powerful shot from just inside the distance gate: the ball arrives so
+    fast the GK cannot beat it to an intercept point, but can still get to
+    the goal-line save position → returns goal-line target."""
     pitch = Pitch.standard()
     params = _make_gk_params(early_intercept_max_distance_m=10.0, early_intercept_safety_margin=0.85)
     gk_pos = Vector3(-pitch.half_length + 1.0, 0, 0)
@@ -232,8 +252,10 @@ def test_early_intercept_fast_far_shot_falls_back_to_none():
         gravity_mps2=9.81,
         params=params,
     )
-    # Ball arrives so quickly the GK can't intercept earlier → None
-    assert result is None
+    goal_line_target = save_target_position(pitch, Team.LEFT, ball_pos, ball_vel, 9.81, params)
+    # Intercept margin is negative (ball too fast); goal-line margin wins.
+    assert result is not None
+    assert abs(result.x - goal_line_target.x) < 0.01
 
 
 # --------------------------------------------------------------------------

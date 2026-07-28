@@ -13,7 +13,7 @@ from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, PlayerAttributes, Team
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import TackleOrder
+from footballcoach.orders import ChaseTackleOrder
 from footballcoach.ui.gamelog import GameLog, LogLevel
 
 
@@ -109,7 +109,7 @@ def test_tackle_win_produces_log_entry():
     """A successful tackle (rng_reduction=1.0 → deterministic win for 0.9 vs 0.3)
     must produce exactly one INFO log entry containing both player ids."""
     match, defender, attacker, game_log = _make_tackle_match(rng_reduction=1.0)
-    defender.current_order = TackleOrder(target_player_id=attacker.player_id)
+    defender.current_order = ChaseTackleOrder(target_player_id=attacker.player_id)
     match.step()
     info_entries = game_log.entries_above(LogLevel.INFO)
     assert len(info_entries) >= 1, "Expected at least one INFO log entry after a tackle"
@@ -141,7 +141,7 @@ def test_tackle_loss_produces_log_entry():
     )
     game_log = GameLog()
     match.log_callback = lambda level, msg: game_log.add(level, msg, match.time_s)
-    defender.current_order = TackleOrder(target_player_id=attacker.player_id)
+    defender.current_order = ChaseTackleOrder(target_player_id=attacker.player_id)
     match.step()
     combined = " ".join(e.message for e in game_log.entries_above(LogLevel.INFO))
     assert "def2" in combined
@@ -151,7 +151,7 @@ def test_tackle_loss_produces_log_entry():
 def test_debug_entries_contain_roll_values():
     """The DEBUG-level tackle log entry must mention both rolled values."""
     match, defender, attacker, game_log = _make_tackle_match(rng_reduction=1.0)
-    defender.current_order = TackleOrder(target_player_id=attacker.player_id)
+    defender.current_order = ChaseTackleOrder(target_player_id=attacker.player_id)
     match.step()
     debug_entries = game_log.entries_above(LogLevel.DEBUG)
     # At least one DEBUG entry should contain "tackler_roll" and "dribbler_roll".
@@ -185,7 +185,7 @@ def test_gk_in_box_auto_fail_logs_distinctly():
     )
     game_log = GameLog()
     match.log_callback = lambda level, msg: game_log.add(level, msg, match.time_s)
-    outfielder.current_order = TackleOrder(target_player_id=gk.player_id)
+    outfielder.current_order = ChaseTackleOrder(target_player_id=gk.player_id)
     match.step()
     combined = " ".join(e.message for e in game_log.entries_above(LogLevel.INFO))
     # The auto-fail message should mention the GK immunity reason.
@@ -199,5 +199,5 @@ def test_log_callback_none_incurs_no_error():
     exceptions — the zero-cost headless path."""
     match, defender, attacker, _ = _make_tackle_match()
     match.log_callback = None  # explicit no-op
-    defender.current_order = TackleOrder(target_player_id=attacker.player_id)
+    defender.current_order = ChaseTackleOrder(target_player_id=attacker.player_id)
     match.step()  # must not raise

@@ -34,13 +34,13 @@ from footballcoach.entities.player import Player, PlayerState
 from footballcoach.generation import generate_attributes
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import (
+    ChaseTackleOrder,
     GetPossessionOrder,
     KickOrder,
     MoveOrder,
     PassOrder,
     SaveOrder,
     ShootOrder,
-    TackleOrder,
 )
 
 
@@ -156,7 +156,7 @@ def build_tackle_scenario(
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
     )
     attacker.current_order = MoveOrder(target_position=far_point, sprint=False)
-    defender.current_order = TackleOrder(target_player_id=attacker.player_id)
+    defender.current_order = ChaseTackleOrder(target_player_id=attacker.player_id)
     return match
 
 
@@ -249,7 +249,7 @@ def build_close_range_save_scenario(
     shooter_precision_min: float = 0.65,
     shooter_precision_max: float = 0.85,
     shooter_power_min: float = 0.70,
-    shooter_power_max: float = 0.90,
+    shooter_power_max: float = 0.95,
     gk_skill_min: float = 0.65,
     gk_skill_max: float = 0.85,
 ) -> Match:
@@ -321,7 +321,7 @@ def build_close_range_save_scenario(
     )
     gk.current_order = SaveOrder()
     shooter.current_order = KickOrder(aim_point=aim_point, power_fraction=shooter_power,
-                                      spin=Vector3.zero())
+                                      spin=Vector3.zero(), compensate_for_run=False)
     return match
 
 
@@ -389,11 +389,111 @@ def build_pass_scenario(
 
 
 # ---------------------------------------------------------------------------
+# Reusable on-tick AI primitives
+# ---------------------------------------------------------------------------
+
+class BallCarrierAttackerAI:
+    """Reusable on-tick AI for a player who holds the ball and must shoot.
+
+    Each tick, if the player has the ball:
+    - If their current order is a ``MoveOrder`` and the distance to the
+      move target is *increasing* (repulsion / obstruction is pushing them
+      away), immediately switches to a ``ShootOrder`` at the configured
+      aim point.
+    - If their current order is ``None`` (e.g. a prior ``MoveOrder``
+      completed), issues a ``ShootOrder``.
+    - No-ops when the player does not have the ball.
+
+    Compose with ``StagedGoalkeeperAI`` and others via ``CompositeAI``
+    when building scenario on_tick hooks.
+    """
+
+    def __init__(self, player_id: str, aim_point: Vector3, power_fraction: float = 0.9) -> None:
+        self.player_id = player_id
+        self.aim_point = aim_point
+        self.power_fraction = power_fraction
+        self._prev_dist_to_target: float | None = None
+
+    def __call__(self, match: Match, trial_tick: int) -> None:
+        try:
+            player = match.player_by_id(self.player_id)
+        except KeyError:
+            return
+        if match.ball.possessed_by != self.player_id:
+            self._prev_dist_to_target = None
+            return
+        order = player.current_order
+        if isinstance(order, MoveOrder):
+            dist = player.position.xy().distance_to(order.target_position.xy())
+            prev = self._prev_dist_to_target
+            self._prev_dist_to_target = dist
+            if prev is not None and dist > prev:
+                # Repulsion/obstruction is pushing us away — shoot now.
+                player.current_order = ShootOrder(
+                    aim_point=self.aim_point, power_fraction=self.power_fraction
+                )
+        elif order is None:
+            self._prev_dist_to_target = None
+            player.current_order = ShootOrder(
+                aim_point=self.aim_point, power_fraction=self.power_fraction
+            )
+
+
+class StagedGoalkeeperAI:
+    """Reusable on-tick AI for a goalkeeper that starts with a positioning
+    ``MoveOrder`` and transitions to ``SaveOrder`` once in place.
+
+    Assumes the GK's initial order is a ``MoveOrder`` (e.g. walk to goal
+    centre with ``max_speed_on_arrival_mps=0.0``).  As soon as that order
+    completes (``current_order`` becomes ``None``) and the GK does not have
+    the ball, this AI issues a ``SaveOrder`` so the engine handles shot
+    prediction from that point on.
+
+    Works correctly even when the GK starts exactly at the goal centre
+    (the MoveOrder completes in one or two ticks and the transition is
+    immediate).
+    """
+
+    def __init__(self, gk_id: str) -> None:
+        self.gk_id = gk_id
+
+    def __call__(self, match: Match, trial_tick: int) -> None:
+        try:
+            gk = match.player_by_id(self.gk_id)
+        except KeyError:
+            return
+        if gk.current_order is None and match.ball.possessed_by != self.gk_id:
+            gk.current_order = SaveOrder()
+
+
+class CompositeAI:
+    """Composes multiple on-tick AI callables into a single callable.
+
+    Each controller is called in insertion order every tick.  Useful for
+    combining ``BallCarrierAttackerAI``, ``StagedGoalkeeperAI``, and any
+    custom per-scenario logic into a single on_tick hook.
+    """
+
+    def __init__(self, *controllers: Callable[[Match, int], None]) -> None:
+        self._controllers = controllers
+
+    def __call__(self, match: Match, trial_tick: int) -> None:
+        for ctrl in self._controllers:
+            ctrl(match, trial_tick)
+
+
+# ---------------------------------------------------------------------------
 # 2v2 scenario
 # ---------------------------------------------------------------------------
 
 class TwoVTwoController:
-    """Drives the 2v2 scenario via the on_tick hook."""
+    """Drives the 2v2 scenario via the on_tick hook.
+
+    Handles the pass A→B hand-off: once B receives the ball, either shoots
+    immediately or runs 30 % toward the goal first.  Ongoing "if B has the
+    ball and no order, shoot" logic is delegated to ``BallCarrierAttackerAI``,
+    which also handles the repulsion-pushback-→-shoot shortcut.
+    """
 
     def __init__(self, attacker_a_id: str, attacker_b_id: str, goal_aim_point: Vector3,
                  shoot_immediately_probability: float = 0.5, rng: random.Random | None = None) -> None:
@@ -403,6 +503,7 @@ class TwoVTwoController:
         self._rng = rng or random.Random()
         self._b_received = False
         self._shoot_immediately = self._rng.random() < shoot_immediately_probability
+        self._b_ai = BallCarrierAttackerAI(attacker_b_id, goal_aim_point, power_fraction=0.85)
 
     def __call__(self, match: Match, trial_tick: int) -> None:
         try:
@@ -420,10 +521,8 @@ class TwoVTwoController:
                         b.position.y, 0.0,
                     )
                     b.current_order = MoveOrder(target_position=run_target, sprint=True)
-        else:
-            if (not self._shoot_immediately and match.ball.possessed_by == self.attacker_b_id
-                    and b.current_order is None):
-                b.current_order = ShootOrder(aim_point=self.goal_aim_point, power_fraction=0.85)
+        # Delegate ongoing attacker logic to the shared AI primitive.
+        self._b_ai(match, trial_tick)
 
 
 def build_2v2_scenario(
@@ -497,19 +596,28 @@ def build_2v2_scenario(
 # ---------------------------------------------------------------------------
 
 class OneVTwoController:
-    """Drives the 1v2 scenario: attacker moves then shoots once MoveOrder done."""
+    """Drives the 1v2 scenario.
 
-    def __init__(self, attacker_id: str, shoot_at: Vector3) -> None:
-        self.attacker_id = attacker_id
-        self.shoot_at = shoot_at
+    Composes two reusable AI primitives:
+
+    - ``BallCarrierAttackerAI``: attacker carries ball toward goal on a
+      ``MoveOrder``; switches to ``ShootOrder`` when the move completes or
+      repulsion starts pushing them away from the target.
+    - ``StagedGoalkeeperAI``: GK starts on a ``MoveOrder`` to the goal
+      centre; transitions to ``SaveOrder`` once in position.
+
+    The defender uses a ``GetPossessionOrder`` set at build time and needs
+    no on-tick logic.
+    """
+
+    def __init__(self, attacker_id: str, gk_id: str, shoot_at: Vector3) -> None:
+        self._ai = CompositeAI(
+            BallCarrierAttackerAI(attacker_id, shoot_at, power_fraction=0.9),
+            StagedGoalkeeperAI(gk_id),
+        )
 
     def __call__(self, match: Match, trial_tick: int) -> None:
-        try:
-            attacker = match.player_by_id(self.attacker_id)
-        except KeyError:
-            return
-        if (match.ball.possessed_by == self.attacker_id and attacker.current_order is None):
-            attacker.current_order = ShootOrder(aim_point=self.shoot_at, power_fraction=0.9)
+        self._ai(match, trial_tick)
 
 
 def build_1v2_scenario(
@@ -563,9 +671,11 @@ def build_1v2_scenario(
 
     gk_start = Vector3(pitch.right_goal_centre.x, rng.uniform(-gk_start_jitter_m, gk_start_jitter_m), 0)
 
-    attacker = Player.create("attacker", Team.RIGHT, PlayerAttributes.average(attacker_skill), position=attacker_start)
-    defender = Player.create("defender", Team.LEFT, PlayerAttributes.average(defender_skill), position=defender_start)
-    gk = Player.create("keeper", Team.LEFT, PlayerAttributes.average(gk_skill), position=gk_start, is_goalkeeper=True)
+    # Attacker runs toward the RIGHT goal (+x) so must be Team.LEFT (attacks +x).
+    # GK and defender are Team.RIGHT (defend the right goal).
+    attacker = Player.create("attacker", Team.LEFT, PlayerAttributes.average(attacker_skill), position=attacker_start)
+    defender = Player.create("defender", Team.RIGHT, PlayerAttributes.average(defender_skill), position=defender_start)
+    gk = Player.create("keeper", Team.RIGHT, PlayerAttributes.average(gk_skill), position=gk_start, is_goalkeeper=True)
 
     ball = Ball.at_rest(attacker_start)
     ball.possessed_by = attacker.player_id
@@ -592,9 +702,10 @@ def build_1v2_scenario(
 
     attacker.current_order = MoveOrder(target_position=move_target, sprint=True)
     defender.current_order = GetPossessionOrder()
-    gk.current_order = SaveOrder()
+    # GK starts by walking to goal centre (standstill), then on_tick upgrades to SaveOrder.
+    gk.current_order = MoveOrder(target_position=goal_centre, sprint=False, max_speed_on_arrival_mps=0.0)
 
-    controller = OneVTwoController(attacker.player_id, aim_point)
+    controller = OneVTwoController(attacker.player_id, gk.player_id, aim_point)
     match._1v2_controller = controller  # type: ignore[attr-defined]
     return match
 
@@ -602,6 +713,25 @@ def build_1v2_scenario(
 # ---------------------------------------------------------------------------
 # on_tick dispatch helpers for the SCENARIOS list
 # ---------------------------------------------------------------------------
+
+_PASS_SCENARIO_GET_POSSESSION_RADIUS_M = 6.0
+
+
+def _pass_on_tick(match: Match, trial_tick: int) -> None:
+    """Once the ball is within 4 m of the receiver, give them a GetPossessionOrder
+    so they actively move to collect it (rather than standing still)."""
+    try:
+        receiver = match.player_by_id("receiver")
+    except KeyError:
+        return
+    if match.ball.possessed_by is not None:
+        return
+    if isinstance(receiver.current_order, GetPossessionOrder):
+        return
+    dist = receiver.position.xy().distance_to(match.ball.position.xy())
+    if dist <= _PASS_SCENARIO_GET_POSSESSION_RADIUS_M:
+        receiver.current_order = GetPossessionOrder()
+
 
 def _sprint_on_tick(match: Match, trial_tick: int) -> None:
     ctrl = getattr(match, "_sprint_controller", None)
@@ -619,6 +749,49 @@ def _1v2_on_tick(match: Match, trial_tick: int) -> None:
     ctrl = getattr(match, "_1v2_controller", None)
     if ctrl is not None:
         ctrl(match, trial_tick)
+
+
+# ---------------------------------------------------------------------------
+# Repulsion obstacle scenario
+# ---------------------------------------------------------------------------
+
+def build_repulsion_obstacle_scenario(
+    rng_reduction: float = 0.3,
+    *,
+    obstacle_on_path: float = 1.0,
+    attacker_skill: float = 0.9,
+) -> Match:
+    """Ball carrier runs from x=-20 to x=+20 with a stationary obstacle at
+    x=0. obstacle_on_path=1.0 puts it dead on the line; 0.0 puts it 5 m
+    to the side. Watch for orbiting vs. clean passage."""
+    pitch = Pitch.standard()
+    rng = random.Random()
+
+    start = Vector3(-20.0, 0.0, 0.0)
+    target = Vector3(20.0, 0.0, 0.0)
+    obstacle_y = (1.0 - obstacle_on_path) * 5.0
+
+    obstacle = Player.create(
+        "obstacle", Team.RIGHT,
+        PlayerAttributes.average(0.5),
+        position=Vector3(0.0, obstacle_y, 0.0),
+    )
+    attacker = Player.create(
+        "attacker", Team.LEFT,
+        PlayerAttributes.average(attacker_skill),
+        position=start,
+    )
+    ball = Ball.at_rest(start)
+    ball.possessed_by = attacker.player_id
+
+    ui_cfg = load_physics_config().get("ui", {})
+    match = Match(
+        pitch=pitch, players=[attacker, obstacle], ball=ball,
+        rng_reduction=rng_reduction, rng=rng,
+        goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
+    )
+    attacker.current_order = MoveOrder(target_position=target, sprint=True)
+    return match
 
 
 # ---------------------------------------------------------------------------
@@ -646,6 +819,7 @@ SCENARIOS: list[ScenarioDefinition] = [
         label="Ground pass (randomised distance)",
         description="Two Premier-League-tier players, randomised distance/angle pass.",
         build=build_pass_scenario,
+        on_tick=_pass_on_tick,
         params=[
             ScenarioParam("max_distance_m", "Max pass distance (m)", 5.0, 60.0, 5.0, 30.0),
             ScenarioParam("attr_clamp_min", "Attr clamp min", 0.3, 1.0, 0.05, 0.70),
@@ -709,6 +883,16 @@ SCENARIOS: list[ScenarioDefinition] = [
             ScenarioParam("attacker_start_max_m", "Attacker start max dist (m)", 10.0, 50.0, 1.0, 32.0),
             ScenarioParam("move_fraction_min", "Move fraction min", 0.0, 1.0, 0.05, 0.10),
             ScenarioParam("move_fraction_max", "Move fraction max", 0.0, 1.0, 0.05, 0.50),
+        ],
+    ),
+    ScenarioDefinition(
+        key="repulsion_obstacle",
+        label="Repulsion: ball carrier past stationary obstacle",
+        description="Ball carrier runs x=-20 to x=+20 with a stationary player on the path. obstacle_on_path=1 is dead-centre, 0 is 5 m aside.",
+        build=build_repulsion_obstacle_scenario,
+        params=[
+            ScenarioParam("obstacle_on_path", "Obstacle on path (1=centre, 0=5m aside)", 0.0, 1.0, 0.1, 1.0),
+            ScenarioParam("attacker_skill", "Attacker skill", 0.3, 1.0, 0.05, 0.9),
         ],
     ),
 ]
@@ -811,6 +995,14 @@ class ScenarioLoop:
             self.definition.on_tick(self._match, self._trial_tick)
         self._match.step()
         self._trial_tick += 1
+        # Call on_tick again after the step so that controllers can reissue
+        # orders in the same tick they were cleared by match.step(). Without
+        # this, a MoveOrder completing inside match.step() leaves
+        # current_order=None for the rest of this tick, causing _trial_outcome
+        # to fire the "all orders None + ball still" early-termination check
+        # before the controller has had a chance to issue the next waypoint.
+        if self.definition.on_tick is not None:
+            self.definition.on_tick(self._match, self._trial_tick)
 
         if not self._ball_released and self._initial_carrier_id is not None:
             if self._match.ball.possessed_by != self._initial_carrier_id:
@@ -858,6 +1050,8 @@ class ScenarioLoop:
                         if self._initial_carrier_id else None
                     )
                     if initial_carrier is not None and repossessor.team != initial_carrier.team:
+                        if repossessor.is_goalkeeper:
+                            return "saved", self.linger_s
                         return "dispossessed", self.linger_s
                 except KeyError:
                     pass

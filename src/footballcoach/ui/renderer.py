@@ -162,6 +162,30 @@ class Renderer:
         label = self.hud_font.render(player.player_id, True, style.HUD_TEXT)
         surface.blit(label, (pos[0] - label.get_width() // 2, pos[1] + radius_px + 2))
 
+        # Stat bars: stamina (top) and speed (bottom), always visible.
+        bar_w = style.STAT_BAR_WIDTH_PX
+        bar_h = style.STAT_BAR_HEIGHT_PX
+        bar_x = pos[0] - bar_w // 2
+        label_h = label.get_height()
+        bar_y_stamina = pos[1] + radius_px + 2 + label_h + 2
+        bar_y_speed = bar_y_stamina + bar_h + style.STAT_BAR_GAP_PX
+
+        # Stamina bar
+        pygame.draw.rect(surface, style.STAT_BAR_BG, (bar_x, bar_y_stamina, bar_w, bar_h))
+        stamina_fill = max(0.0, min(1.0, player.stamina))
+        if stamina_fill > 0.6:
+            stamina_colour = style.STAMINA_BAR_HIGH
+        elif stamina_fill > 0.3:
+            stamina_colour = style.STAMINA_BAR_MID
+        else:
+            stamina_colour = style.STAMINA_BAR_LOW
+        pygame.draw.rect(surface, stamina_colour, (bar_x, bar_y_stamina, int(bar_w * stamina_fill), bar_h))
+
+        # Speed bar
+        pygame.draw.rect(surface, style.STAT_BAR_BG, (bar_x, bar_y_speed, bar_w, bar_h))
+        speed_fill = max(0.0, min(1.0, player.speed_mps / style.SPEED_BAR_MAX_MPS))
+        pygame.draw.rect(surface, style.SPEED_BAR_COLOUR, (bar_x, bar_y_speed, int(bar_w * speed_fill), bar_h))
+
     def draw_drag_indicator(
         self,
         surface: pygame.Surface,
@@ -241,6 +265,25 @@ class Renderer:
             colour = style.HUD_TEXT if entry.level == LogLevel.INFO else style.HOTKEY_DISABLED
             text = self.hud_font.render(entry.message[:72], True, colour)
             surface.blit(text, (box_x + 4, box_y + 3 + i * line_h))
+
+    def draw_pause_notification(self, surface: pygame.Surface, message: str) -> None:
+        """Draws a prominent centred banner when the game is auto-paused after
+        a human-issued order completes.  Rendered above the hotkey bar."""
+        sw, sh = surface.get_size()
+        bar_h = 34  # hotkey bar height
+
+        padding_x, padding_y = 28, 14
+        text_surf = self.title_font.render(message, True, style.HUD_ACCENT)
+        box_w = text_surf.get_width() + padding_x * 2
+        box_h = text_surf.get_height() + padding_y * 2
+        box_x = (sw - box_w) // 2
+        box_y = sh - bar_h - box_h - 12
+
+        bg = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        bg.fill((10, 10, 18, 220))
+        surface.blit(bg, (box_x, box_y))
+        pygame.draw.rect(surface, style.HUD_ACCENT, (box_x, box_y, box_w, box_h), 2, border_radius=6)
+        surface.blit(text_surf, (box_x + padding_x, box_y + padding_y))
 
     def draw_scenario_params(
         self,

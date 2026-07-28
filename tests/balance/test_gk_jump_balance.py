@@ -107,15 +107,17 @@ def test_early_intercept_reduces_travel_distance_on_close_shots(balance_recorder
         goal_line_tgt = save_target_position(pitch, Team.LEFT, ball_pos, ball_vel, 9.81, params)
 
         goal_line_dist = gk_pos.xy().distance_to(goal_line_tgt.xy())
-        goal_line_dists.append(goal_line_dist)
 
-        if intercept is not None:
-            intercept_dist = gk_pos.xy().distance_to(intercept.xy())
-            intercept_dists.append(intercept_dist)
+        # early_intercept_target now returns the CHOSEN target (intercept or
+        # goal-line).  It picked an early intercept only when the result
+        # differs from the plain goal-line target.
+        if intercept is not None and intercept != goal_line_tgt:
+            intercept_dists.append(gk_pos.xy().distance_to(intercept.xy()))
+            goal_line_dists.append(goal_line_dist)
 
     n_intercepted = len(intercept_dists)
     avg_intercept_dist = sum(intercept_dists) / max(n_intercepted, 1)
-    avg_goal_line_dist = sum(goal_line_dists[:n_intercepted]) / max(n_intercepted, 1)
+    avg_goal_line_dist = sum(goal_line_dists) / max(n_intercepted, 1)
 
     balance_recorder.report("early_intercept_travel_distance", {
         "n_trials": n,

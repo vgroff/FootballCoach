@@ -43,3 +43,14 @@ TITLE_FONT_SIZE = 32
 # affecting their (physically accurate) world position.
 MIN_PLAYER_RADIUS_PX = 8
 MIN_BALL_RADIUS_PX = 4
+
+# Player stat bars (stamina + speed), drawn below the player icon.
+STAMINA_BAR_HIGH = (80, 200, 100)   # green — high stamina
+STAMINA_BAR_MID = (220, 190, 40)    # yellow — medium stamina
+STAMINA_BAR_LOW = (220, 60, 60)     # red — low stamina
+SPEED_BAR_COLOUR = (120, 190, 255)  # light blue — current speed fraction
+STAT_BAR_BG = (40, 40, 48)         # dark background behind bars
+STAT_BAR_WIDTH_PX = 24             # fixed bar width in pixels
+STAT_BAR_HEIGHT_PX = 4             # height of each bar
+STAT_BAR_GAP_PX = 2                # vertical gap between the two bars
+SPEED_BAR_MAX_MPS = 10.0           # speed that fills the bar to 100%

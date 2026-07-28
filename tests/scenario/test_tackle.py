@@ -8,7 +8,7 @@ import random
 from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import TackleOrder
+from footballcoach.orders import ChaseTackleOrder
 from tests.conftest import make_player
 
 
@@ -22,7 +22,7 @@ def test_tackle_wins_ball_from_carrier():
 
     match = Match(pitch=pitch, players=[tackler, carrier], ball=ball, rng_reduction=1.0, rng=random.Random(0))
 
-    tackler.current_order = TackleOrder(target_player_id=carrier.player_id)
+    tackler.current_order = ChaseTackleOrder(target_player_id=carrier.player_id)
     match.step()
 
     assert ball.possessed_by == tackler.player_id

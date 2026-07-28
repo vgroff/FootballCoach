@@ -8,15 +8,14 @@ the engine's per-tick simulation.
 ## `orders.py` - the order data types
 
 Defines the order types a player can hold in `player.current_order`:
-`MoveOrder`, `KickOrder`, `ShootOrder`, `TackleOrder`, `PassOrder`,
+`MoveOrder`, `KickOrder`, `ShootOrder`, `PassOrder`,
 `ChaseTackleOrder`, `GetPossessionOrder`, `MarkOrder`, `SaveOrder`,
 `StopOrder`. These are plain dataclasses with an `OrderStatus`
 (PENDING/IN_PROGRESS/COMPLETE) — the actual per-tick execution logic for
 each lives in `engine/match.py`'s `Match._process_orders`, not here. See
-`engine/knowledge.md` for how each order type behaves tick-to-tick
-(especially the distinction between `TackleOrder`, which requires the two
-players to already be touching, and `ChaseTackleOrder`, which persists
-across ticks and closes the distance itself).
+`engine/knowledge.md` for how each order type behaves tick-to-tick.
+`TackleOrder` was removed — use `ChaseTackleOrder` for all tackle actions
+(it persists across ticks and closes the distance itself).
 
 `MoveOrder` has an optional `max_speed_on_arrival_mps` field (`None` =
 resolve to jog speed, `0.0` = full standstill). The engine uses

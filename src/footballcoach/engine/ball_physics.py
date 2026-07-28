@@ -10,6 +10,13 @@ from footballcoach.config import load_physics_config
 from footballcoach.entities.ball import Ball
 from footballcoach.mathutils import Vector3
 
+# Pitch imported lazily inside resolve_goal_boundary to avoid a circular
+# dependency at module load time (entities.pitch → config → nothing that
+# imports ball_physics, but keeping it lazy is defensive).
+from typing import TYPE_CHECKING
+if TYPE_CHECKING:
+    from footballcoach.entities.pitch import Pitch
+
 
 @dataclass(frozen=True)
 class BallPhysicsParams:
@@ -25,6 +32,7 @@ class BallPhysicsParams:
     rolling_friction_coefficient: float
     spin_decay_per_s: float
     block_restitution: float
+    goal_net_restitution: float = 0.15
     just_bounced_display_duration_s: float = 0.3
 
     @staticmethod
@@ -45,6 +53,7 @@ class BallPhysicsParams:
             rolling_friction_coefficient=bp["rolling_friction_coefficient"],
             spin_decay_per_s=bp["spin_decay_per_s"],
             block_restitution=bp["block_restitution"],
+            goal_net_restitution=bp.get("goal_net_restitution", 0.15),
             just_bounced_display_duration_s=bp.get("just_bounced_display_duration_s", 0.3),
         )
 
@@ -154,3 +163,53 @@ def step_ball(ball: Ball, dt_s: float, params: BallPhysicsParams | None = None) 
         ball.just_bounced_timer_s = params.just_bounced_display_duration_s
     elif ball.just_bounced_timer_s > 0.0:
         ball.just_bounced_timer_s = max(0.0, ball.just_bounced_timer_s - dt_s)
+
+def resolve_goal_boundary(ball: Ball, pitch: "Pitch", params: BallPhysicsParams) -> None:
+    """Bounces the ball off the interior surfaces of whichever goal it has
+    entered (back wall, side posts, crossbar).  Ground collisions inside the
+    goal are already handled by step_ball's normal ground-contact logic.
+
+    Call this after step_ball on every tick for loose balls.  Does nothing if
+    the ball is possessed or has not passed the goal line.
+    """
+    if ball.possessed_by is not None:
+        return
+
+    r = params.ball_radius_m
+    half_goal_w = pitch.goal_width_m / 2.0
+
+    in_left = ball.position.x < -pitch.half_length
+    in_right = ball.position.x > pitch.half_length
+    if not (in_left or in_right):
+        return
+
+    # Only apply to balls within the goal mouth (with a small margin for the
+    # ball radius).
+    if abs(ball.position.y) > half_goal_w + r or ball.position.z > pitch.goal_height_m + r:
+        return
+
+    net_e = params.goal_net_restitution
+
+    if in_left:
+        back_wall_x = -(pitch.half_length + pitch.goal_depth_m)
+        if ball.position.x <= back_wall_x + r and ball.velocity.x < 0.0:
+            ball.position = Vector3(back_wall_x + r, ball.position.y, ball.position.z)
+            ball.velocity = Vector3(-ball.velocity.x * net_e, ball.velocity.y * net_e, ball.velocity.z * net_e)
+    else:
+        back_wall_x = pitch.half_length + pitch.goal_depth_m
+        if ball.position.x >= back_wall_x - r and ball.velocity.x > 0.0:
+            ball.position = Vector3(back_wall_x - r, ball.position.y, ball.position.z)
+            ball.velocity = Vector3(-ball.velocity.x * net_e, ball.velocity.y * net_e, ball.velocity.z * net_e)
+
+    # Side posts (y): clamp and reflect.
+    if ball.position.y > half_goal_w - r and ball.velocity.y > 0.0:
+        ball.position = Vector3(ball.position.x, half_goal_w - r, ball.position.z)
+        ball.velocity = Vector3(ball.velocity.x * net_e, -ball.velocity.y * net_e, ball.velocity.z * net_e)
+    elif ball.position.y < -(half_goal_w - r) and ball.velocity.y < 0.0:
+        ball.position = Vector3(ball.position.x, -(half_goal_w - r), ball.position.z)
+        ball.velocity = Vector3(ball.velocity.x * net_e, -ball.velocity.y * net_e, ball.velocity.z * net_e)
+
+    # Crossbar (z): clamp and reflect.
+    if ball.position.z > pitch.goal_height_m - r and ball.velocity.z > 0.0:
+        ball.position = ball.position.with_z(pitch.goal_height_m - r)
+        ball.velocity = Vector3(ball.velocity.x * net_e, ball.velocity.y * net_e, -ball.velocity.z * net_e)

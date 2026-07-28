@@ -7,6 +7,7 @@ See engine/knowledge.md for the overall tick order and design rationale.
 """
 from __future__ import annotations
 
+import math
 import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Callable
@@ -15,7 +16,7 @@ if TYPE_CHECKING:
     from footballcoach.ui.gamelog import LogLevel
 
 from footballcoach.config import load_physics_config
-from footballcoach.engine.ball_physics import BallPhysicsParams, step_ball
+from footballcoach.engine.ball_physics import BallPhysicsParams, step_ball, resolve_goal_boundary
 from footballcoach.engine.collision import (
     CollisionParams,
     are_touching,
@@ -27,6 +28,7 @@ from footballcoach.engine.kicking import KickingParams, PassingParams, kick_ball
 from footballcoach.engine.movement import (
     MovementParams,
     SpeedMode,
+    angle_diff,
     effective_acceleration,
     effective_top_speed,
     regen_stamina,
@@ -50,12 +52,63 @@ from footballcoach.orders import (
     SaveOrder,
     ShootOrder,
     StopOrder,
-    TackleOrder,
 )
 from footballcoach.steering import RepulsionParams, compute_repulsion
 
 import logging
 log = logging.getLogger("footballcoach.match")
+
+# Brake-to-turn thresholds (order/AI layer only — no physics changes).
+# If a MoveOrder requires a heading change larger than this while the player
+# is moving above the minimum speed, downgrade to STANDSTILL for that tick so
+# the player decelerates quickly (standstill_decel_multiplier applies) and
+# pivot rate rises as speed drops (ω_max = a_lat / speed).
+_BRAKE_TO_TURN_THRESHOLD_RAD: float = 1.57   # ~90° — prevents orbiting around targets
+_BRAKE_TO_TURN_MIN_SPEED_MPS: float = 2.0    # don't bother below this; turn rate already high
+# When within this radius of the target and the velocity vector is not pointing
+# at it (cosine similarity < threshold), brake to a stop then jog in normally.
+# Catches lateral overshoots / orbiting without stopping on every normal approach.
+_CLOSE_PROXIMITY_BRAKE_M: float = 5.0
+_CLOSE_PROXIMITY_COS_THRESHOLD: float = 0.01
+
+# ShootOrder blocker detection: perpendicular-distance threshold from the shot
+# line within which an opposition player is considered to be blocking the shot.
+_SHOT_BLOCKER_THRESHOLD_M: float = 1.0
+# How far the shooter moves toward the goal when pausing due to a blocker.
+_SHOT_PAUSE_ADVANCE_M: float = 2.0
+
+
+def _has_blocker_on_shot_line(
+    shooter: "Player",
+    aim_point: "Vector3",
+    opposition: "list[Player]",
+    threshold_m: float = _SHOT_BLOCKER_THRESHOLD_M,
+) -> bool:
+    """Return ``True`` if any active opposition player lies within *threshold_m*
+    of the line segment from *shooter.position* to *aim_point* (XY plane only)
+    and is between the shooter and the aim point (not behind either end).
+
+    Inactive (tackled) players are excluded — they cannot intercept a shot.
+    """
+    sx, sy = shooter.position.x, shooter.position.y
+    ax, ay = aim_point.x, aim_point.y
+    dx, dy = ax - sx, ay - sy
+    line_len_sq = dx * dx + dy * dy
+    if line_len_sq < 1e-12:
+        return False
+    for opp in opposition:
+        if opp.state == PlayerState.INACTIVE_TACKLED:
+            continue
+        ox, oy = opp.position.x, opp.position.y
+        # Scalar projection onto the shot line (0 = shooter, 1 = aim point).
+        t = ((ox - sx) * dx + (oy - sy) * dy) / line_len_sq
+        if t <= 0.0 or t >= 1.0:
+            continue  # not between shooter and aim point
+        proj_x = sx + t * dx
+        proj_y = sy + t * dy
+        if math.hypot(ox - proj_x, oy - proj_y) < threshold_m:
+            return True
+    return False
 
 
 @dataclass(frozen=True)
@@ -158,6 +211,7 @@ class Match:
             resolve_ball_block_by_inactive_players(
                 self.ball, self.players, pre_flight_position, self.ball_physics_params.block_restitution
             )
+            resolve_goal_boundary(self.ball, self.pitch, self.ball_physics_params)
 
         self._update_loose_ball_pickup(dt)
 
@@ -192,6 +246,12 @@ class Match:
         if self.log_callback is not None:
             from footballcoach.ui.gamelog import LogLevel
             self.log_callback(LogLevel.DEBUG, msg)
+
+    def _complete_order(self, order) -> None:
+        """Transition *order* to COMPLETE and fire its on_complete callback if set."""
+        order.status = OrderStatus.COMPLETE
+        if order.on_complete is not None:
+            order.on_complete()
 
     # -------------------------------------------------------------------------
 
@@ -232,6 +292,10 @@ class Match:
                 direction = order.target_position - player.position
                 dist = direction.length_xy()
 
+                # Mark the first tick the player enters the target zone.
+                if dist <= order.arrival_tolerance_m:
+                    order.reached_target = True
+
                 # Resolve arrival speed: None means jog speed (natural coast-in).
                 jog_speed = effective_top_speed(
                     self.movement_params, player.attributes.top_speed, player.stamina,
@@ -257,8 +321,19 @@ class Match:
                     or player.speed_mps <= arrival_speed + 0.05
                 )
                 if dist <= effective_tolerance and speed_ok:
-                    order.status = OrderStatus.COMPLETE
+                    self._complete_order(order)
                     player.current_order = None
+                elif order.reached_target and dist > order.arrival_tolerance_m:
+                    # Overshoot: player was at the target but has drifted past.
+                    # Decelerate to a standstill and complete after the timeout.
+                    if order._overshoot_timer_s is None:
+                        order._overshoot_timer_s = order.overshoot_timeout_s
+                    order._overshoot_timer_s -= dt
+                    if order._overshoot_timer_s <= 0.0:
+                        self._complete_order(order)
+                        player.current_order = None
+                    else:
+                        step_player_towards(player, Vector3.zero(), SpeedMode.STANDSTILL, dt, self.movement_params, has_ball)
                 else:
                     a_max = effective_acceleration(
                         self.movement_params, player.attributes.acceleration,
@@ -279,6 +354,28 @@ class Match:
                     # STANDSTILL (braking takes priority over avoidance steering).
                     if speed_mode is SpeedMode.SPRINT and speed_mult < 0.75:
                         speed_mode = SpeedMode.JOG
+                    # Close-proximity brake: if within ~5m of the target but
+                    # velocity is not pointing at it (cos_sim < 0.01, i.e.
+                    # moving sideways or backwards), brake to a stop.  Once
+                    # stopped, normal jog-in logic resumes naturally.
+                    if dist <= _CLOSE_PROXIMITY_BRAKE_M and player.speed_mps > _BRAKE_TO_TURN_MIN_SPEED_MPS:
+                        vel_xy = player.velocity.xy()
+                        if vel_xy.length() > 1e-9 and adj_dir.length() > 1e-9:
+                            cos_sim = vel_xy.normalized().dot(adj_dir.normalized())
+                            if cos_sim < _CLOSE_PROXIMITY_COS_THRESHOLD:
+                                speed_mode = SpeedMode.STANDSTILL
+                    # Brake-to-turn: when the required heading change is very
+                    # large (>~90°) and the player is moving at meaningful speed,
+                    # decelerating first is faster than arcing at full pace.
+                    # ω_max = a_lat/speed, so braking → speed drops → turn rate
+                    # rises rapidly.  step_player_towards already handles
+                    # simultaneous braking + heading rotation under STANDSTILL;
+                    # this is purely an order-layer scheduling decision.
+                    if speed_mode is not SpeedMode.STANDSTILL and adj_dir.length() > 1e-9:
+                        desired_heading = adj_dir.angle_xy()
+                        heading_error = abs(angle_diff(player.heading_rad, desired_heading))
+                        if heading_error > _BRAKE_TO_TURN_THRESHOLD_RAD and player.speed_mps > _BRAKE_TO_TURN_MIN_SPEED_MPS:
+                            speed_mode = SpeedMode.STANDSTILL
                     log.debug(
                         "[move] t=%.3f  pid=%s  pos=(%.3f,%.3f)  "
                         "raw_dir=(%.3f,%.3f)  adj_dir=(%.3f,%.3f)  "
@@ -322,11 +419,35 @@ class Match:
                     )
                     self._start_release_grace(player.player_id)
                     self._log_debug(f"{player.player_id} kicked  power={order.power_fraction:.2f}")
-                order.status = OrderStatus.COMPLETE
+                self._complete_order(order)
                 player.current_order = None
 
             elif isinstance(order, ShootOrder):
                 if has_ball:
+                    # Blocker check: if an opposition player is on the shot
+                    # line and the random check succeeds, advance 2 m toward
+                    # the aim point instead of shooting (identical MoveOrder
+                    # code-path, including repulsion).
+                    opposition = [p for p in self.players if p.team != player.team]
+                    if (order.chance_of_pausing > 0.0
+                            and _has_blocker_on_shot_line(player, order.aim_point, opposition)
+                            and self.rng.random() < order.chance_of_pausing):
+                        aim_dir = (order.aim_point - player.position).xy()
+                        aim_len = aim_dir.length_xy()
+                        if aim_len > 1e-9:
+                            step_dir = aim_dir / aim_len
+                            raw_target = player.position.xy() + step_dir * _SHOT_PAUSE_ADVANCE_M
+                            clamped_target = Vector3(
+                                max(-self.pitch.half_length + 0.5, min(self.pitch.half_length - 0.5, raw_target.x)),
+                                max(-self.pitch.half_width + 0.5, min(self.pitch.half_width - 0.5, raw_target.y)),
+                                0.0,
+                            )
+                            player.current_order = MoveOrder(target_position=clamped_target, sprint=True)
+                            self._log_debug(
+                                f"{player.player_id} shoot paused (blocker) → advancing to "
+                                f"({clamped_target.x:.1f},{clamped_target.y:.1f})"
+                            )
+                            continue  # skip shoot; MoveOrder replaces ShootOrder
                     _shoot_top_speed = effective_top_speed(
                         self.movement_params, player.attributes.top_speed, player.stamina,
                         has_ball=True, ball_control_attr=player.attributes.ball_control,
@@ -351,47 +472,7 @@ class Match:
                     )
                     self._start_release_grace(player.player_id)
                     self._log_info(f"{player.player_id} shot at goal  power={order.power_fraction:.2f}")
-                order.status = OrderStatus.COMPLETE
-                player.current_order = None
-
-            elif isinstance(order, TackleOrder):
-                target = self.player_by_id(order.target_player_id)
-                if are_touching(player, target) and target.is_available_to_tackle():
-                    if self._gk_immune_from_tackle(target):
-                        # Phase B: GK in own box with ball is untackleable —
-                        # auto-fail, tackler penalised for the lunge, GK
-                        # state is completely unchanged.
-                        player.state = PlayerState.INACTIVE_TACKLED
-                        player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
-                        self._log_info(f"{player.player_id} tackle on {target.player_id} auto-failed [GK in own box]")
-                    else:
-                        result = attempt_tackle(
-                            player.attributes.tackling,
-                            self._effective_dribbling(target),  # Phase B: CONTROLLING_BALL penalty
-                            self.rng_reduction,
-                            self.rng,
-                            self.tackling_params,
-                            is_goalkeeper_tackle=player.is_goalkeeper,
-                            angle_modifier=tackle_angle_modifier(
-                                target.heading_rad, target.position, player.position, self.tackling_params
-                            ),
-                            gk_outside_box=self._gk_outside_own_box(player),  # Phase B: GK penalty
-                        )
-                        self._log_tackle_result(player.player_id, target.player_id, result)
-                        if result.tackler_won and self._target_has_or_controls_ball(target):
-                            self.ball.possessed_by = player.player_id
-                        elif not result.tackler_won:
-                            target.velocity = target.velocity * result.dribble_speed_multiplier
-                        target.state = PlayerState.INACTIVE_TACKLED
-                        target.state_timer_s = self.tackling_params.inactive_duration_s
-                        if not result.tackler_won:
-                            # A failed (lunging/sliding) tackle also leaves the
-                            # tackler briefly unable to react - shorter than the
-                            # dispossessed player's penalty, since they weren't
-                            # actually beaten on the ball, just off-balance.
-                            player.state = PlayerState.INACTIVE_TACKLED
-                            player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
-                order.status = OrderStatus.COMPLETE
+                self._complete_order(order)
                 player.current_order = None
 
             elif isinstance(order, PassOrder):
@@ -430,7 +511,7 @@ class Match:
                     )
                     self._start_release_grace(player.player_id)
                     self._log_debug(f"{player.player_id} passed to {pass_target}")
-                order.status = OrderStatus.COMPLETE
+                self._complete_order(order)
                 player.current_order = None
 
             elif isinstance(order, ChaseTackleOrder):
@@ -466,7 +547,7 @@ class Match:
                             if not result.tackler_won:
                                 player.state = PlayerState.INACTIVE_TACKLED
                                 player.state_timer_s = self.tackling_params.tackler_miss_inactive_duration_s
-                    order.status = OrderStatus.COMPLETE
+                    self._complete_order(order)
                     player.current_order = None
                 else:
                     direction = target.position - player.position
@@ -477,10 +558,10 @@ class Match:
                 order.status = OrderStatus.IN_PROGRESS
                 if self.ball.possessed_by == player.player_id:
                     # Already have the ball.
-                    order.status = OrderStatus.COMPLETE
+                    self._complete_order(order)
                     player.current_order = None
                 elif self._run_get_possession_behaviour(player, dt):
-                    order.status = OrderStatus.COMPLETE
+                    self._complete_order(order)
                     player.current_order = None
 
             elif isinstance(order, MarkOrder):
@@ -489,7 +570,7 @@ class Match:
                     mark_target = self.player_by_id(order.target_player_id)
                 except KeyError:
                     # Target no longer in the match.
-                    order.status = OrderStatus.COMPLETE
+                    self._complete_order(order)
                     player.current_order = None
                     continue
                 target_has_ball = (
@@ -536,7 +617,7 @@ class Match:
                 # _STOP_SNAP_THRESHOLD_MPS (0.02 m/s), new_speed is zeroed,
                 # so speed_mps == 0.0 exactly next tick.
                 if player.speed_mps == 0.0:
-                    order.status = OrderStatus.COMPLETE
+                    self._complete_order(order)
                     player.current_order = None
 
             elif isinstance(order, SaveOrder):
@@ -545,8 +626,23 @@ class Match:
                     # SaveOrder is goalkeeper-only; silently no-op for an
                     # outfield player rather than raising, since orders are
                     # not otherwise role-restricted.
-                    order.status = OrderStatus.COMPLETE
+                    self._complete_order(order)
                     player.current_order = None
+                elif self._goal_linger_remaining_s > 0.0:
+                    # A goal is being lingered: the ball is somewhere in or
+                    # beyond the net.  Cancel the SaveOrder so the GK stops
+                    # chasing it and doesn't run into their own goal.
+                    self._complete_order(order)
+                    player.current_order = None
+                elif has_ball:
+                    # GK has caught/gathered the ball - decelerate to a stop.
+                    # Do NOT run save_target_position here: that function uses
+                    # ball.velocity, which _sync_possessed_ball has already set
+                    # to the GK's own velocity.  If the GK was still running
+                    # toward their goal when they caught the ball, that velocity
+                    # points goalward, predict_goal_line_crossing finds a
+                    # crossing inside the net, and the GK chases it in - own goal.
+                    step_player_towards(player, Vector3.zero(), SpeedMode.STANDSTILL, dt, self.movement_params, has_ball)
                 else:
                     gk_top_speed_early = effective_top_speed(
                         self.movement_params, player.attributes.top_speed,
@@ -562,6 +658,11 @@ class Match:
                         gravity_mps2=self.ball_physics_params.gravity_mps2,
                         params=self.goalkeeping_params,
                     )
+                    # early_intercept_target now returns either the intercept
+                    # point or the goal-line target, whichever has the better
+                    # margin.  It returns None only when no shot is incoming at
+                    # all (ball moving away from goal), in which case fall back
+                    # to save_target_position's default positioning.
                     target_position = intercept if intercept is not None else save_target_position(
                         self.pitch,
                         player.team,
@@ -731,25 +832,73 @@ class Match:
         return predicted.with_z(0.0)
 
     def _intercept_target(self, player: Player, target_pos: Vector3, target_vel: Vector3) -> Vector3:
-        """Estimates where a moving target (ball or carrier) will be when
-        this player arrives at its current position, using the player's
-        current speed as a rough time estimate.
+        """Returns the world position this player should sprint toward in order
+        to intercept the target (ball or carrier) in the shortest possible time.
 
-        The prediction is intentionally simple - one linear step:
-            t_estimate = min(dist / max(my_speed, 1.0), 3.0)
-            intercept = target_pos + target_vel_xy * t_estimate
+        Solves the quadratic: find t >= 0 such that the player (sprinting at
+        their effective top speed v_p) can reach the point target_pos + v_b*t.
 
-        This is accurate enough for a sprint interception run and avoids
-        the player always running to where the ball/opponent currently is
-        (which causes them to perpetually chase from behind). Capping at
-        3 s prevents overshooting when the player is nearly stationary.
-        Only the xy component of target_vel is used (height is irrelevant
-        for ground-level interception runs).
+            |d + v_b*t|^2 = (v_p * t)^2   where d = target_pos - player_pos
+
+        Expanding:
+            (|v_b|^2 - v_p^2) * t^2 + 2*(d . v_b)*t + |d|^2 = 0
+
+        If the discriminant is negative the player cannot catch the target
+        at their current top speed (target escaping); fall back to the
+        current target position (run toward where it is now).
+
+        If ball speed is near-zero, the quadratic degenerates cleanly to
+        t = |d| / v_p (simple sprint time), which is exactly right.
+
+        Only xy components are used — height is irrelevant for interception runs.
         """
-        dist = player.position.xy().distance_to(target_pos.xy())
-        my_speed = max(player.speed_mps, 1.0)
-        t_estimate = min(dist / my_speed, 3.0)
-        predicted_xy = target_pos + target_vel.xy() * t_estimate
+        import math as _math
+        d = (target_pos - player.position).xy()
+        vb = target_vel.xy()
+
+        v_p = effective_top_speed(
+            self.movement_params,
+            player.attributes.top_speed,
+            player.stamina,
+            has_ball=False,
+            is_goalkeeper=player.is_goalkeeper,
+        )
+
+        vb_sq = vb.dot(vb)
+        vp_sq = v_p * v_p
+        d_dot_vb = d.dot(vb)
+        d_sq = d.dot(d)
+
+        a = vb_sq - vp_sq
+        b = 2.0 * d_dot_vb
+        c = d_sq
+
+        if abs(a) < 1e-6:
+            # Ball and player at same speed: linear solution t = -c/b
+            if abs(b) > 1e-6:
+                t = -c / b
+            else:
+                t = 0.0
+        else:
+            discriminant = b * b - 4.0 * a * c
+            if discriminant < 0.0:
+                # Player cannot catch the target — run to current position.
+                return target_pos.with_z(target_pos.z)
+            sqrt_disc = _math.sqrt(discriminant)
+            t1 = (-b - sqrt_disc) / (2.0 * a)
+            t2 = (-b + sqrt_disc) / (2.0 * a)
+            # Pick smallest non-negative root.
+            t = None
+            for candidate in (t1, t2):
+                if candidate >= 0.0:
+                    if t is None or candidate < t:
+                        t = candidate
+            if t is None:
+                # Both roots negative — target already past us; go to current pos.
+                return target_pos.with_z(target_pos.z)
+
+        t = max(0.0, t)
+        predicted_xy = target_pos + vb * t
         return predicted_xy.with_z(target_pos.z)
 
     def _check_head_on_tackles(self) -> None:

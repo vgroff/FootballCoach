@@ -5,7 +5,7 @@ Interaction scheme (per project design):
 - Click a player -> select them (click the same selected player again to
   deselect; click a same-team player to switch selection).
 - Click an opposing-team player while a player is selected -> issue a
-  TackleOrder from the selected player at the clicked player.
+  ChaseTackleOrder from the selected player at the clicked player.
 - Click empty ground while a player is selected -> issue a MoveOrder to that
   point (default `OrderMode.MOVE`).
 - Click-and-drag starting ON the selected player (only meaningful if they
@@ -28,11 +28,12 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from typing import Callable
 
 from footballcoach.engine.match import Match
 from footballcoach.entities.player import Player, Team
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import GetPossessionOrder, KickOrder, MoveOrder, PassOrder, SaveOrder, ShootOrder, StopOrder, TackleOrder
+from footballcoach.orders import ChaseTackleOrder, GetPossessionOrder, KickOrder, MoveOrder, PassOrder, SaveOrder, ShootOrder, StopOrder
 from footballcoach.ui.camera import Camera
 
 CLICK_DRAG_THRESHOLD_PX = 6
@@ -69,6 +70,9 @@ class MatchInputController:
     selected_player_id: str | None = None
     drag: DragState = field(default_factory=DragState)
     order_mode: OrderMode = OrderMode.MOVE
+    # Called when a human-issued order completes: (player_id, order_name).
+    # Set by App after construction to wire the auto-pause notification.
+    on_order_complete: Callable[[str, str], None] | None = field(default=None, repr=False, compare=False)
 
     def selected_player(self) -> Player | None:
         if self.selected_player_id is None:
@@ -77,6 +81,16 @@ class MatchInputController:
             if p.player_id == self.selected_player_id:
                 return p
         return None
+
+    def _issue_order(self, player: Player, order, order_name: str) -> None:
+        """Assign *order* to *player* and attach the on_complete callback so
+        the app can auto-pause and display a notification when it finishes."""
+        if self.on_order_complete is not None:
+            pid = player.player_id
+            cb = self.on_order_complete
+            name = order_name
+            order.on_complete = lambda: cb(pid, name)
+        player.current_order = order
 
     def _player_at_screen_pos(self, screen_pos: tuple[int, int]) -> Player | None:
         best: Player | None = None
@@ -132,17 +146,17 @@ class MatchInputController:
                 return
             if clicked_player.team == selected.team:
                 if self.order_mode == OrderMode.PASS:
-                    selected.current_order = PassOrder(target_position=clicked_player.position)
+                    self._issue_order(selected, PassOrder(target_position=clicked_player.position), "Pass")
                     self.order_mode = OrderMode.MOVE  # PASS is a one-shot mode
                 elif self.order_mode == OrderMode.SHOOT:
                     # Shoot at the clicked player's position (unusual but valid).
-                    selected.current_order = ShootOrder(aim_point=clicked_player.position, power_fraction=1.0)
+                    self._issue_order(selected, ShootOrder(aim_point=clicked_player.position, power_fraction=1.0), "Shoot")
                     self.order_mode = OrderMode.MOVE
                 else:
                     self.selected_player_id = clicked_player.player_id  # switch selection
                 return
             # Opposing player - chase and get possession.
-            selected.current_order = GetPossessionOrder()
+            self._issue_order(selected, GetPossessionOrder(), "Get Possession")
             return
 
         # Empty ground - issue a move, pass, or shoot order to the selected player.
@@ -150,16 +164,16 @@ class MatchInputController:
             world_x, world_y = self.camera.screen_to_world(*screen_pos)
             if self.order_mode == OrderMode.PASS:
                 target = Vector3(world_x, world_y, 0.0)
-                selected.current_order = PassOrder(target_position=target)
+                self._issue_order(selected, PassOrder(target_position=target), "Pass")
                 self.order_mode = OrderMode.MOVE  # PASS is a one-shot mode
             elif self.order_mode == OrderMode.SHOOT:
                 # Aim at the clicked point at a mid-goal height (1.0m).
                 target = Vector3(world_x, world_y, 1.0)
-                selected.current_order = ShootOrder(aim_point=target, power_fraction=1.0)
+                self._issue_order(selected, ShootOrder(aim_point=target, power_fraction=1.0), "Shoot")
                 self.order_mode = OrderMode.MOVE  # SHOOT is a one-shot mode
             else:
                 target = Vector3(world_x, world_y, 0.0)
-                selected.current_order = MoveOrder(target_position=target, sprint=True)
+                self._issue_order(selected, MoveOrder(target_position=target, sprint=True), "Move")
 
     def enter_pass_mode(self) -> None:
         """The next click (ground or player) issues a PassOrder instead of a
@@ -183,13 +197,14 @@ class MatchInputController:
         for non-goalkeepers in Match._process_orders)."""
         selected = self.selected_player()
         if selected is not None and selected.is_goalkeeper:
+            # SaveOrder is persistent (never auto-completes), so no pause callback.
             selected.current_order = SaveOrder()
 
     def issue_stop_order(self) -> None:
         """Decelerates the selected player to a standstill."""
         selected = self.selected_player()
         if selected is not None:
-            selected.current_order = StopOrder()
+            self._issue_order(selected, StopOrder(), "Stop")
 
     def _finish_kick_drag(self, release_screen: tuple[int, int]) -> None:
         player = self.selected_player()
@@ -220,7 +235,7 @@ class MatchInputController:
             aim_height,
         )
 
-        player.current_order = KickOrder(aim_point=aim_point, power_fraction=power_fraction, spin=Vector3.zero())
+        self._issue_order(player, KickOrder(aim_point=aim_point, power_fraction=power_fraction, spin=Vector3.zero()), "Kick")
 
     def drag_indicator(self) -> tuple[tuple[float, float], tuple[int, int]] | None:
         """Returns (player_world_xy, current_mouse_screen_pos) if a kick drag

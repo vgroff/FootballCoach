@@ -20,6 +20,7 @@ class Pitch:
     width_m: float
     goal_width_m: float
     goal_height_m: float
+    goal_depth_m: float
     box_length_m: float
     box_width_m: float
     six_yard_length_m: float
@@ -35,6 +36,7 @@ class Pitch:
             width_m=cfg.width_m,
             goal_width_m=cfg.goal_width_m,
             goal_height_m=cfg.goal_height_m,
+            goal_depth_m=cfg.goal_depth_m,
             box_length_m=cfg.box_length_m,
             box_width_m=cfg.box_width_m,
             six_yard_length_m=cfg.six_yard_length_m,

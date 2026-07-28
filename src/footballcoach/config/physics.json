@@ -5,6 +5,7 @@
     "width_m": 68.0,
     "goal_width_m": 7.32,
     "goal_height_m": 2.44,
+    "goal_depth_m": 2.45,
     "box_length_m": 16.5,
     "box_width_m": 40.32,
     "six_yard_length_m": 5.5,
@@ -49,8 +50,8 @@
     "lateral_accel_scale_mps2": 4.0,
     "lateral_accel_ball_penalty_max": 0.6,
     "min_speed_for_turn_mps": 0.1,
-    "goalkeeper_accel_multiplier": 4.0,
-    "goalkeeper_speed_multiplier": 1.38,
+    "goalkeeper_accel_multiplier": 5.0,
+    "goalkeeper_speed_multiplier": 1.5,
     "standstill_decel_multiplier": 1.5
   },
   "kicking": {
@@ -84,7 +85,8 @@
     "goal_frame_margin_m": 0.2,
     "default_position_fraction_of_half_length": 0.02,
     "early_intercept_max_distance_m": 10.0,
-    "early_intercept_safety_margin": 0.85
+    "early_intercept_safety_margin": 0.95,
+    "goal_line_save_weight": 1.1
   },
   "tackling": {
     "tackler_boost": 1.25,
@@ -113,7 +115,8 @@
     "rolling_friction_coefficient": 0.06,
     "spin_decay_per_s": 0.15,
     "block_restitution": 0.35,
-    "just_bounced_display_duration_s": 0.3
+    "just_bounced_display_duration_s": 0.3,
+    "goal_net_restitution": 0.1
   },
   "control_time": {
     "_comment": "Time (s) for a player to bring a ball under control on first touch. See knowledge.md in engine/ for full derivation. Jump zone (above player_height_m=1.8m): outfield_jump_scale_at_max_reach multiplies the (height_factor-1) term at outfield_max_reach_height_m; GK's height_factor_scale interpolates toward gk jump_scale_at_max_reach at gk_max_reach_height_m.",
@@ -148,14 +151,14 @@
   },
   "repulsion": {
     "_comment": "AI/order-layer steering — used ONLY in steering.py / MoveOrder handling. NOT engine physics. radius_m: distance at which repulsion begins. strength_base: peak directional weight at d=0 (m/s-equivalent, blended into heading not force). ball_carrier_repulsion_mult: extra boost when the moving player has the ball. ball_carrier_speed_penalty_max: max fractional speed penalty for ball carriers (0.4 = 40% reduction). speed_penalty_scale: converts |net_repulsion| to speed penalty fraction. alignment_dot_threshold: trigger orthogonal nudge when rel_vel . net_repulsion < this (i.e. heading nearly straight into obstacle). min_orthogonal_adjust_mps: sideways nudge magnitude (primary tuning knob — start at 1.5, tune via balance test).",
-    "radius_m": 3.8,
-    "strength_base": 2.8,
+    "radius_m": 8.0,
+    "strength_base": 0.3,
     "ball_carrier_repulsion_mult": 2.2,
     "ball_carrier_speed_penalty_max": 0.4,
     "speed_penalty_scale": 0.14,
     "alignment_dot_threshold": -0.7,
     "min_orthogonal_adjust_mps": 0.75,
-    "max_deflection_deg": 90.0
+    "max_deflection_deg": 80.0
   },
   "marking": {
     "_comment": "MarkOrder AI behaviour: marker stands between a target opposition player and the ball, and switches to GetPossession-style chase/tackle when the target has the ball or the ball comes within mark_intercept_radius_m. mark_standoff_m: distance from the target (toward the ball) the marker tries to hold.",
@@ -164,7 +167,7 @@
   },
   "ui": {
     "_comment": "UI-level timing constants. scenario_linger_s: how long (sim-seconds) a scenario trial keeps running after its outcome is determined before the next trial starts. goal_linger_s: how long (sim-seconds) the ball stays in place after a goal before the engine resets it to centre (giving players/GK time to react visually).",
-    "scenario_linger_s": 3.0,
-    "goal_linger_s": 3.0
+    "scenario_linger_s": 1.8,
+    "goal_linger_s": 1.8 
   }
 }

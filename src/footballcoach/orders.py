@@ -10,8 +10,9 @@ appropriate.
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum, auto
+from typing import Callable
 
 from footballcoach.mathutils import Vector3
 
@@ -33,7 +34,17 @@ class MoveOrder:
     #          m/s AND within the (slightly widened) distance tolerance).
     # >0    -> any explicit speed target in m/s.
     max_speed_on_arrival_mps: float | None = None
+    # If the player overshoots (crosses the target point), this countdown
+    # starts. When it reaches 0 the order completes (player brakes to stop).
+    # None = no overshoot detected yet.
+    overshoot_timeout_s: float = 0.5
+    # Set to True the first tick the player is within arrival_tolerance_m.
+    # Once True, if the player drifts back outside that radius the overshoot
+    # countdown starts.
+    reached_target: bool = False
+    _overshoot_timer_s: float | None = None
     status: OrderStatus = OrderStatus.PENDING
+    on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -44,12 +55,7 @@ class KickOrder:
     compensate_for_run: bool = True  # if True, match.py pre-divides by run_mult so the ball
                                      # leaves at the intended speed regardless of run direction
     status: OrderStatus = OrderStatus.PENDING
-
-
-@dataclass
-class TackleOrder:
-    target_player_id: str
-    status: OrderStatus = OrderStatus.PENDING
+    on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -71,6 +77,7 @@ class PassOrder:
     power_fraction: float | None = None  # None = auto-computed from distance
     target_player_id: str | None = None  # set for leading passes
     status: OrderStatus = OrderStatus.PENDING
+    on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -84,6 +91,7 @@ class ChaseTackleOrder:
     """
     target_player_id: str
     status: OrderStatus = OrderStatus.PENDING
+    on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -97,6 +105,7 @@ class SaveOrder:
     replaced by another order.
     """
     status: OrderStatus = OrderStatus.PENDING
+    on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -105,6 +114,7 @@ class StopOrder:
     capability, then completes. Useful for explicitly halting a player who is
     mid-sprint without snapping their velocity to zero instantly."""
     status: OrderStatus = OrderStatus.PENDING
+    on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -115,11 +125,12 @@ class GetPossessionOrder:
       automatically via the normal control-time model once they're close
       enough.
     - If another player has the ball, the player chases that carrier and
-      attempts one tackle on contact (exactly like the old ChaseTackleOrder),
+      attempts one tackle on contact (exactly like ChaseTackleOrder),
       then completes regardless of the tackle outcome.
     - Completes immediately if this player already possesses the ball.
     """
     status: OrderStatus = OrderStatus.PENDING
+    on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -137,6 +148,7 @@ class MarkOrder:
     """
     target_player_id: str
     status: OrderStatus = OrderStatus.PENDING
+    on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
 @dataclass
@@ -154,11 +166,20 @@ class ShootOrder:
     - ShootOrder: deliberate shot on goal; the player (or the user via the
       ``K`` key in the UI) picks a target *inside the goal frame* and the
       engine fires at that point at the requested power.
+
+    ``chance_of_pausing`` (default 0.8): if any opposition player lies on the
+    shooter's line to the aim point, the engine does a random check with this
+    probability. On success the shot is replaced by a 2 m MoveOrder in the
+    aim direction (processed identically to a normal MoveOrder, including
+    repulsion), giving the shooter a chance to clear the blocker before
+    shooting again on the next cycle.  Set to 0.0 to disable the check.
     """
     aim_point: Vector3          # absolute world position to aim at
     power_fraction: float       # in [0, 1]; or >1 when compensate_for_run=False
     compensate_for_run: bool = True  # same semantics as KickOrder.compensate_for_run
+    chance_of_pausing: float = 0.8  # probability of pausing when a blocker is detected
     status: OrderStatus = OrderStatus.PENDING
+    on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
 
-Order = MoveOrder | KickOrder | ShootOrder | TackleOrder | PassOrder | ChaseTackleOrder | SaveOrder | StopOrder | GetPossessionOrder | MarkOrder
+Order = MoveOrder | KickOrder | ShootOrder | PassOrder | ChaseTackleOrder | SaveOrder | StopOrder | GetPossessionOrder | MarkOrder

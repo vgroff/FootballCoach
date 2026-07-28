@@ -21,7 +21,8 @@ class GoalkeepingParams:
     goal_frame_margin_m: float
     default_position_fraction_of_half_length: float
     early_intercept_max_distance_m: float  # max GK-to-ball distance for early intercept to activate
-    early_intercept_safety_margin: float   # intercept must be reachable in < this fraction of goal-line time
+    early_intercept_safety_margin: float   # (legacy, unused in new logic) kept for config back-compat
+    goal_line_save_weight: float           # multiplier on goal-line margin; >1 prefers goal-line saves
 
     @staticmethod
     def from_config() -> "GoalkeepingParams":
@@ -31,6 +32,7 @@ class GoalkeepingParams:
             default_position_fraction_of_half_length=d["default_position_fraction_of_half_length"],
             early_intercept_max_distance_m=d.get("early_intercept_max_distance_m", 10.0),
             early_intercept_safety_margin=d.get("early_intercept_safety_margin", 0.85),
+            goal_line_save_weight=d.get("goal_line_save_weight", 1.0),
         )
 
 
@@ -83,69 +85,100 @@ def early_intercept_target(
     gravity_mps2: float,
     params: GoalkeepingParams | None = None,
 ) -> Vector3 | None:
-    """Computes an early intercept point for the goalkeeper: a candidate
-    position along the ball's flight path where the GK can reach the ball
-    BEFORE it crosses the goal line, if that is achievable within a
-    meaningful time margin.
+    """Chooses between an early intercept and a goal-line save by comparing
+    the time margin the GK has for each option, picking whichever gives the
+    larger safety buffer, weighted by ``goal_line_save_weight``.
 
-    Returns the intercept Vector3 if the following conditions all hold:
-      1. The ball is moving toward the defended goal (predict_goal_line_crossing
-         returns non-None for the goal-line target plane).
-      2. The GK is within `early_intercept_max_distance_m` of the ball.
-      3. The GK can reach the predicted ball position (at time
-         t_ball = distance_to_intercept / ball_speed_xy) in less time
-         than the goal-line crossing time multiplied by
-         `early_intercept_safety_margin`.
+    For each option the margin is defined as:
+        margin = t_ball_arrives - t_gk_arrives
 
-    Returns None otherwise (caller falls back to save_target_position).
+    A positive margin means the GK gets there before the ball.  Intercept
+    is only considered if the ball is within ``early_intercept_max_distance_m``
+    and both options are viable (positive margin). The goal-line margin is
+    multiplied by ``goal_line_save_weight`` before comparison — at the default
+    of 1.0 the choice is purely based on which margin is larger; values > 1.0
+    bias toward goal-line saves, values < 1.0 bias toward early intercepts.
 
-    The intercept point prediction mirrors `Match._intercept_target`:
-    a simple linear step using the GK's speed as a time estimate, which
-    prevents perpetually chasing the ball's current position.
+    Returns the chosen target Vector3, or None if no shot is incoming or
+    neither option is viable (caller falls back to save_target_position's
+    default positioning).
     """
     params = params or GoalkeepingParams.from_config()
     goal_x = own_goal_x(pitch, team)
     sign = 1.0 if team == Team.LEFT else -1.0
     target_plane_x = goal_x + sign * params.goal_frame_margin_m
+    gk_speed = max(gk_effective_top_speed_mps, 0.1)
+    half_goal_w = pitch.goal_width_m / 2.0
 
-    # Gate 1: is a shot incoming at all?
+    # --- Goal-line save option ---
     crossing = predict_goal_line_crossing(ball_position, ball_velocity, target_plane_x, gravity_mps2)
     if crossing is None:
-        return None
+        return None  # ball not heading toward goal at all
 
-    # Gate 2: is the ball close enough for early interception?
-    gk_to_ball = ball_position.xy().distance_to(gk_position.xy())
-    if gk_to_ball > params.early_intercept_max_distance_m:
-        return None
+    # Time for ball to reach goal-line plane.
+    dx_ball_to_goal = abs(target_plane_x - ball_position.x)
+    vx = abs(ball_velocity.x)
+    t_ball_to_goal_line = dx_ball_to_goal / max(vx, 0.1)
 
-    # Gate 3: can the GK reach an intercept point earlier than the goal-line crossing?
-    # Compute GK time to reach goal-line crossing (the existing target).
+    # Time for GK to reach goal-line crossing position.
     gk_to_goal_line = gk_position.xy().distance_to(crossing.xy())
-    t_to_goal_line = gk_to_goal_line / max(gk_effective_top_speed_mps, 0.1)
+    t_gk_to_goal_line = gk_to_goal_line / gk_speed
 
-    # Estimate intercept point: simple linear lead (1 step, capped at 2s).
-    gk_speed = max(gk_effective_top_speed_mps, 0.1)
-    t_estimate = min(gk_to_ball / gk_speed, 2.0)
-    ball_speed_xy = ball_velocity.length_xy()
-    # Candidate intercept = where the ball will be when the GK could arrive.
-    predicted_xy = ball_position + ball_velocity.xy() * t_estimate
-    # Clamp z to ground (ball may be in flight; intercept is at whatever height it reaches there).
-    t_ball_at_intercept = (predicted_xy.xy() - ball_position.xy()).length() / max(ball_speed_xy, 0.1) if ball_speed_xy > 0.1 else t_estimate
-    z_at_intercept = max(0.0, ball_position.z + ball_velocity.z * t_ball_at_intercept - 0.5 * gravity_mps2 * t_ball_at_intercept ** 2)
-    intercept_point = predicted_xy.with_z(z_at_intercept)
+    goal_line_margin = t_ball_to_goal_line - t_gk_to_goal_line
 
-    gk_to_intercept = gk_position.xy().distance_to(intercept_point.xy())
-    t_reach_intercept = gk_to_intercept / gk_speed
+    # --- Early intercept option ---
+    # Only evaluate if ball is within the activation radius.
+    gk_to_ball = ball_position.xy().distance_to(gk_position.xy())
+    intercept_target: Vector3 | None = None
+    intercept_margin = -math.inf
 
-    # Gate 3 check: must arrive at intercept clearly before the goal-line crossing.
-    if t_reach_intercept >= t_to_goal_line * params.early_intercept_safety_margin:
-        return None
+    if gk_to_ball <= params.early_intercept_max_distance_m:
+        ball_speed_xy = ball_velocity.length_xy()
+        # Estimate where the ball will be when the GK could reach it (one
+        # linear step capped at 2 s, same approach as Match._intercept_target).
+        t_estimate = min(gk_to_ball / gk_speed, 2.0)
+        predicted_xy = ball_position + ball_velocity.xy() * t_estimate
+        t_ball_at_intercept = (
+            (predicted_xy.xy() - ball_position.xy()).length() / max(ball_speed_xy, 0.1)
+            if ball_speed_xy > 0.1 else t_estimate
+        )
+        z_at_intercept = max(0.0,
+            ball_position.z + ball_velocity.z * t_ball_at_intercept
+            - 0.5 * gravity_mps2 * t_ball_at_intercept ** 2
+        )
+        candidate = predicted_xy.with_z(z_at_intercept)
 
-    # Clamp intercept to within goal frame (same clamping as save_target_position).
-    half_goal_w = pitch.goal_width_m / 2.0
-    clamped_y = max(-half_goal_w, min(half_goal_w, intercept_point.y))
-    clamped_z = max(0.0, min(pitch.goal_height_m, intercept_point.z))
-    return Vector3(intercept_point.x, clamped_y, clamped_z)
+        # Discard intercept candidates that are behind/on the goal line —
+        # the ball would already have scored before the GK could get there.
+        in_front_of_goal = (
+            candidate.x > target_plane_x if team == Team.LEFT
+            else candidate.x < target_plane_x
+        )
+        if in_front_of_goal:
+            gk_to_candidate = gk_position.xy().distance_to(candidate.xy())
+            t_gk_to_intercept = gk_to_candidate / gk_speed
+
+            intercept_margin = t_ball_at_intercept - t_gk_to_intercept
+
+            clamped_y = max(-half_goal_w, min(half_goal_w, candidate.y))
+            clamped_z = max(0.0, min(pitch.goal_height_m, candidate.z))
+            intercept_target = Vector3(candidate.x, clamped_y, clamped_z)
+
+    # --- Pick the better option ---
+    # Weight the goal-line margin so values > 1 bias toward staying on the line.
+    weighted_goal_line_margin = goal_line_margin * params.goal_line_save_weight
+
+    if intercept_margin > weighted_goal_line_margin and intercept_margin > 0.0:
+        return intercept_target
+
+    # Fall back to goal-line save if viable, else return None (caller uses
+    # save_target_position's default positioning).
+    if goal_line_margin > 0.0:
+        clamped_y = max(-half_goal_w, min(half_goal_w, crossing.y))
+        clamped_z = max(0.0, min(pitch.goal_height_m, crossing.z))
+        return Vector3(target_plane_x, clamped_y, clamped_z)
+
+    return None
 
 
 def save_target_position(

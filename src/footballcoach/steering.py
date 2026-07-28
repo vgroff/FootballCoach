@@ -92,6 +92,9 @@ def compute_repulsion(
     """
     has_ball = (ball_carrier_id is not None and ball_carrier_id == player.player_id)
 
+    # Distance to the move target (desired_dir is the unnormalised vector to it).
+    target_dist = (desired_dir.x * desired_dir.x + desired_dir.y * desired_dir.y) ** 0.5
+
     # ── Accumulate repulsion from nearby non-ball-carrier neighbours ──────
     net_rep_x: float = 0.0
     net_rep_y: float = 0.0
@@ -109,6 +112,11 @@ def compute_repulsion(
         dy = player.position.y - other.position.y
         dist = (dx * dx + dy * dy) ** 0.5
         if dist < 1e-9 or dist >= params.radius_m:
+            continue
+
+        # If already closer to the target than to this obstacle, it is no
+        # longer in the way — ignore its repulsion entirely.
+        if target_dist < dist:
             continue
 
         # Repulsion: away from other, linear falloff.

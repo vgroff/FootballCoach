@@ -1,8 +1,8 @@
-to the AI: Do not read this ever, they are just notes for me
-
+Read Idea.md, and all the READMe and knowledge files, except Idea2
+You may also have stuff in memory/storage for this repo. Here is my thoughts:
 
 AI Design:
-- Do ask questions and also criticise things
+- Do ask questions and do also criticise things
 - We're gonna do PPO with some neural networks - I think 2 per player, but they will be held in common and trained together (for now at least). At a high level, it'll go like this:
     - The input to each network will have at least the following:
         - ball position, velocity and spin
@@ -71,5 +71,5 @@ AI Design:
 I think the useful thing to do now is to think about high-level stuff, then get a detailed plan down that allow us to get some experiments done quickly. Some stuff:
 - I want to be training with all inputs and outputs there from the very beginning, including the decision network outputs (set manually to the order that the rules-based AI would follow in each scenario)
 - I'm very interested in using our Orders to get positive examples/as an adversary
-- I'm interested in doing the first two experimentes I detailed - teaching the GetPossession/Move orders, and teaching Shoot. Only to the shooter, GK remains rules-based AI
+- I'm particularly interested in doing the first two experimentes I detailed - teaching the GetPossession/Move orders, and teaching Shoot. Only to the shooter, GK remains rules-based AI
 - Is this feasible as an MVP, can we move fast and get something functional quickly?

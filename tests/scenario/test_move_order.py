@@ -157,3 +157,97 @@ def test_stop_order_no_snap():
 
     assert player.current_order is None, "StopOrder should complete"
     assert player.speed_mps == 0.0, "player should be exactly at rest after StopOrder"
+
+# ---------------------------------------------------------------------------
+# Brake-to-turn tests
+# ---------------------------------------------------------------------------
+
+def test_large_heading_change_triggers_deceleration():
+    """When a player at full sprint receives a MoveOrder requiring a heading
+    change of >120°, they should decelerate (brake) rather than maintain
+    speed while arcing.  Within the first ~0.5s the player's speed should
+    visibly drop below the speed they had when the new order was issued."""
+    pitch = Pitch.standard()
+    # attr_value=0.7 gives noticeable sprint speed (~8 m/s) without being extreme
+    player = make_player("p1", position=Vector3(0, 0, 0), attr_value=0.7)
+    ball = Ball.at_rest(Vector3(0, 30, 0))
+    match = Match(pitch=pitch, players=[player], ball=ball, rng_reduction=1.0, rng=random.Random(0))
+
+    # Accelerate to near top speed heading +x.
+    player.current_order = MoveOrder(target_position=Vector3(100, 0, 0), sprint=True)
+    for _ in range(90):  # 3 s
+        match.step()
+
+    sprint_speed = player.speed_mps
+    assert sprint_speed > 5.0, "player should be at meaningful speed before the test"
+
+    # Issue an order that requires a ~150° turn (target is behind-left).
+    player.current_order = MoveOrder(target_position=Vector3(-20, -5, 0), sprint=True)
+
+    min_speed_in_first_half_second = sprint_speed
+    for _ in range(15):  # 0.5 s at 30 Hz
+        match.step()
+        min_speed_in_first_half_second = min(min_speed_in_first_half_second, player.speed_mps)
+
+    assert min_speed_in_first_half_second < sprint_speed * 0.9, (
+        f"expected player to brake (speed < {sprint_speed * 0.9:.2f} m/s) during large "
+        f"heading change, but minimum speed was {min_speed_in_first_half_second:.2f} m/s"
+    )
+
+
+def test_large_heading_change_order_still_completes():
+    """A MoveOrder requiring a near-180° heading change while at speed must
+    still complete within a reasonable time (brake-to-turn should not stall
+    the player indefinitely)."""
+    pitch = Pitch.standard()
+    player = make_player("p1", position=Vector3(0, 0, 0), attr_value=0.5)
+    ball = Ball.at_rest(Vector3(0, 30, 0))
+    match = Match(pitch=pitch, players=[player], ball=ball, rng_reduction=1.0, rng=random.Random(0))
+
+    # Get to sprint speed heading +x.
+    player.current_order = MoveOrder(target_position=Vector3(100, 0, 0), sprint=True)
+    for _ in range(90):
+        match.step()
+
+    # Reset position and order a target directly behind (180° turn, 15 m away).
+    player.position = Vector3(0, 0, 0)
+    player.current_order = MoveOrder(target_position=Vector3(-15, 0, 0), sprint=True)
+
+    for _ in range(30 * 10):  # 10 s budget
+        match.step()
+        if player.current_order is None:
+            break
+
+    assert player.current_order is None, "order should complete within 10 s despite large heading change"
+    assert player.position.distance_to(Vector3(-15, 0, 0)) <= 0.5
+
+
+def test_small_heading_change_does_not_decelerate():
+    """A MoveOrder with a small heading change (<90°) should NOT trigger
+    brake-to-turn — the player should maintain roughly full sprint speed."""
+    pitch = Pitch.standard()
+    player = make_player("p1", position=Vector3(0, 0, 0), attr_value=0.7)
+    ball = Ball.at_rest(Vector3(0, 30, 0))
+    match = Match(pitch=pitch, players=[player], ball=ball, rng_reduction=1.0, rng=random.Random(0))
+
+    # Accelerate to near top speed heading +x.
+    player.current_order = MoveOrder(target_position=Vector3(100, 0, 0), sprint=True)
+    for _ in range(90):
+        match.step()
+
+    sprint_speed = player.speed_mps
+
+    # Issue an order ~45° off current heading — small enough that brake-to-turn
+    # should not trigger (threshold is ~90°).
+    player.current_order = MoveOrder(target_position=Vector3(20, 20, 0), sprint=True)
+
+    min_speed_in_first_half_second = sprint_speed
+    for _ in range(15):  # 0.5 s
+        match.step()
+        min_speed_in_first_half_second = min(min_speed_in_first_half_second, player.speed_mps)
+
+    # Speed should stay close to sprint speed (allow normal turn-arc penalty, but no braking).
+    assert min_speed_in_first_half_second >= sprint_speed * 0.6, (
+        f"player decelerated too much for a small heading change: "
+        f"min speed {min_speed_in_first_half_second:.2f} vs sprint {sprint_speed:.2f}"
+    )

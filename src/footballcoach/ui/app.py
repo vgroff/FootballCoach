@@ -50,6 +50,10 @@ class App:
         self.game_log = GameLog(max_entries=50)
         self.log_min_level = LogLevel.INFO
 
+        # Auto-pause notification: set when a human-issued order completes.
+        # Cleared the next time the player resumes (Space).
+        self._pause_notification: str | None = None
+
         # Pending scenario params (Screen.SCENARIO_PARAMS state)
         self._pending_scenario_definition: scenarios.ScenarioDefinition | None = None
         self._pending_scenario_params: dict[str, float] = {}
@@ -121,6 +125,8 @@ class App:
             return
         if key == pygame.K_SPACE:
             self.match.paused = not self.match.paused
+            if not self.match.paused:
+                self._pause_notification = None  # clear on resume
         elif key == pygame.K_p:
             self.input_controller.enter_pass_mode()
         elif key == pygame.K_k:
@@ -191,15 +197,23 @@ class App:
         self._pending_scenario_definition = None
         self._pending_scenario_params = {}
 
+    def _on_human_order_complete(self, player_id: str, order_name: str) -> None:
+        """Callback fired by input.py when a human-issued order finishes."""
+        if self.match is not None:
+            self.match.paused = True
+        self._pause_notification = f"{player_id}: {order_name} complete — Space to resume"
+
     def _start_match(self, match: Match, label: str, is_training_mode: bool = False) -> None:
         self.match = match
         self._wire_match_log(match)
         self.input_controller = MatchInputController(match=match, camera=self.camera)
+        self.input_controller.on_order_complete = self._on_human_order_complete
         self.mode_label = label
         self.screen = Screen.MATCH
         self.is_training_mode = is_training_mode
         self._scenario_loop = None
         self._last_goal_tally = (match.scoreboard.left_goals, match.scoreboard.right_goals)
+        self._pause_notification = None
         if is_training_mode and match.players:
             self.input_controller.selected_player_id = match.players[0].player_id
 
@@ -212,10 +226,12 @@ class App:
         self.match = loop.match
         self._wire_match_log(loop.match)
         self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
+        self.input_controller.on_order_complete = self._on_human_order_complete
         self.mode_label = f"Balance scenario: {definition.label}"
         self.screen = Screen.MATCH
         self.is_training_mode = False
         self._last_goal_tally = (0, 0)
+        self._pause_notification = None
 
     def _wire_match_log(self, match: Match) -> None:
         """Attach the game log callback to a newly created Match."""
@@ -238,6 +254,7 @@ class App:
                 # New trial started — wire log to the fresh match and sync input.
                 self._wire_match_log(loop.match)
                 self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
+                self.input_controller.on_order_complete = self._on_human_order_complete
             else:
                 if self.input_controller is not None:
                     self.input_controller.match = loop.match
@@ -362,6 +379,8 @@ class App:
         self._draw_help_button()
         self.renderer.draw_hotkey_bar(self.surface, self._hotkey_entries())
         self.renderer.draw_game_log(self.surface, self.game_log, self.log_min_level)
+        if self._pause_notification:
+            self.renderer.draw_pause_notification(self.surface, self._pause_notification)
 
         if self.show_help:
             self._draw_help_overlay()

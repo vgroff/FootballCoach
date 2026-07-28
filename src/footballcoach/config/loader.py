@@ -48,6 +48,7 @@ class PitchConfig:
     width_m: float
     goal_width_m: float
     goal_height_m: float
+    goal_depth_m: float
     box_length_m: float
     box_width_m: float
     six_yard_length_m: float
@@ -63,6 +64,7 @@ class PitchConfig:
             width_m=d["width_m"],
             goal_width_m=d["goal_width_m"],
             goal_height_m=d["goal_height_m"],
+            goal_depth_m=d.get("goal_depth_m", 2.45),
             box_length_m=d["box_length_m"],
             box_width_m=d["box_width_m"],
             six_yard_length_m=d["six_yard_length_m"],

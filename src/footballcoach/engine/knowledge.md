@@ -356,8 +356,7 @@ just a successful one dispossessing the victim): `player.state` is set to
 `INACTIVE_TACKLED` for `tackler_miss_inactive_duration_s` (shorter than the
 victim's `inactive_duration_s`, since a mistimed lunge leaves you
 momentarily off-balance but not as badly as actually being dispossessed).
-Applies identically in both the `TackleOrder` and `ChaseTackleOrder`
-branches of `Match._process_orders`.
+Applies in the `ChaseTackleOrder` branch of `Match._process_orders`.
 
 ### Phase B tackle modifiers (added after initial implementation)
 
@@ -379,7 +378,7 @@ function signature clean:
 **2. GK in own box with ball — untackleable**:
 - If the *target* is a goalkeeper currently in their own box with possession,
   the tackle attempt is skipped entirely (returns early at all four call
-  sites: `TackleOrder`, `ChaseTackleOrder`, `GetPossessionOrder`, and
+  sites: `ChaseTackleOrder`, `GetPossessionOrder`, and
   `_check_head_on_tackles`). This models the goalkeeper's protected status
   inside the box.
 
@@ -396,9 +395,7 @@ function signature clean:
 
 ### `ChaseTackleOrder` - the "Tackle" high-level action
 
-Distinct from the base `TackleOrder` (which only resolves a tackle attempt
-if the two players are *already* touching, and always completes - success
-or fail - in a single tick). `ChaseTackleOrder` persists across ticks: the
+`ChaseTackleOrder` persists across ticks: the
 tackler runs straight at the target's *current* position (re-aiming every
 tick, so a moving target is actually chased, not just run at their
 starting spot) until `are_touching()`, at which point exactly one tackle
