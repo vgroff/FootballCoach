@@ -281,6 +281,8 @@ class Match:
         for player in self.players:
             if player.state != PlayerState.ACTIVE:
                 continue
+            if player.ai is not None:
+                player.ai.act(player, self, 0)
             order = player.current_order
             if order is None:
                 continue
@@ -419,6 +421,8 @@ class Match:
                     )
                     self._start_release_grace(player.player_id)
                     self._log_debug(f"{player.player_id} kicked  power={order.power_fraction:.2f}")
+                    if player.on_kick is not None:
+                        player.on_kick(player)
                 self._complete_order(order)
                 player.current_order = None
 
@@ -472,6 +476,8 @@ class Match:
                     )
                     self._start_release_grace(player.player_id)
                     self._log_info(f"{player.player_id} shot at goal  power={order.power_fraction:.2f}")
+                    if player.on_kick is not None:
+                        player.on_kick(player)
                 self._complete_order(order)
                 player.current_order = None
 
@@ -511,6 +517,8 @@ class Match:
                     )
                     self._start_release_grace(player.player_id)
                     self._log_debug(f"{player.player_id} passed to {pass_target}")
+                    if player.on_kick is not None:
+                        player.on_kick(player)
                 self._complete_order(order)
                 player.current_order = None
 
@@ -519,6 +527,8 @@ class Match:
                 target = self.player_by_id(order.target_player_id)
                 if are_touching(player, target):
                     if target.is_available_to_tackle():
+                        if player.on_tackle is not None:
+                            player.on_tackle(player)
                         if self._gk_immune_from_tackle(target):
                             # Phase B: GK in own box with ball is untackleable.
                             player.state = PlayerState.INACTIVE_TACKLED
@@ -709,6 +719,10 @@ class Match:
         has_ball = self.ball.possessed_by == player.player_id
         carrier = self.ball_carrier()
 
+        order = player.current_order
+        sprint = getattr(order, 'sprint', True) if order is not None else True
+        speed_mode = SpeedMode.SPRINT if sprint else SpeedMode.JOG
+
         if carrier is not None and carrier.player_id != player.player_id:
             # Someone else has the ball — chase and tackle.
             if are_touching(player, carrier):
@@ -745,17 +759,17 @@ class Match:
             else:
                 intercept = self._intercept_target(player, carrier.position, carrier.velocity)
                 direction = intercept - player.position
-                step_player_towards(player, direction, SpeedMode.SPRINT, dt, self.movement_params, has_ball)
-                player.stamina = _drain_if_sprinting(self.movement_params, player, True, dt)
+                step_player_towards(player, direction, speed_mode, dt, self.movement_params, has_ball)
+                player.stamina = _drain_if_sprinting(self.movement_params, player, sprint, dt)
                 return False
         else:
-            # Ball is loose — sprint to intercept; pickup via _update_loose_ball_pickup.
+            # Ball is loose — run to intercept; pickup via _update_loose_ball_pickup.
             intercept = self._intercept_target(player, self.ball.position, self.ball.velocity)
             direction = intercept - player.position
             if direction.length_xy() <= self.pickup_radius_m:
                 return True  # at the ball — pickup will complete next tick
-            step_player_towards(player, direction, SpeedMode.SPRINT, dt, self.movement_params, has_ball)
-            player.stamina = _drain_if_sprinting(self.movement_params, player, True, dt)
+            step_player_towards(player, direction, speed_mode, dt, self.movement_params, has_ball)
+            player.stamina = _drain_if_sprinting(self.movement_params, player, sprint, dt)
             return False
 
     def _sync_possessed_ball(self) -> None:

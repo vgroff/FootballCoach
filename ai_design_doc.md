@@ -1067,16 +1067,23 @@ class ExecutionNetwork(nn.Module):
         self.tackle_attempt_logit = nn.Linear(trunk_hidden, 1)  # Bernoulli
 ```
 
-`move_direction`/`kick_direction`: output a raw 2-vector and
-**L2-normalize** it to a unit vector (`v / (||v|| + eps)`) rather than
-outputting an angle directly - avoids the same angle-wraparound
-discontinuity problem noted for observations (2.2/7.2), and is
-differentiable/well-behaved for backprop. For PPO log_prob purposes on
-these direction heads, treat the *pre-normalization* raw 2D vector as
-sampled from an isotropic 2D Gaussian (`Normal(mean, std)` per component,
-independent), i.e. the same `SquashedNormalHead`-style machinery from 8.5
-but without the sigmoid/tanh squash step - just raw-then-normalize instead
-of raw-then-squash-to-range.
+`move_direction`/`kick_direction`: the linear layer outputs a raw 2-vector
+which is **L2-normalized to a unit vector inside `forward()`** (`v / (||v||
++ eps)`) before being stored in `ExecutionHeadsRaw`. This is preferable to
+outputting an angle (avoids wraparound discontinuity, differentiable
+everywhere) and, crucially, **constrains the distribution mean to the unit
+circle**, bounding max mean-shift between any two policy versions to 2.
+Consequently the KL contribution of these heads is O(1) per step rather
+than the ~2000 that occurred when the raw vector could drift to magnitude
+25–50 — so direction heads are **included in the PPO log_prob ratio** like
+all other heads, with no special treatment needed.
+
+For PPO purposes: the unit-normalized mean is the parameter of an isotropic
+2D Gaussian (`Normal(mean, std)` per component, independent). The *noisy
+sample* drawn from this Gaussian is stored as `move_dir_raw`/`kick_dir_raw`
+in the rollout buffer and L2-normalized again to obtain the physical unit
+vector used by the engine. Log_prob is computed on the stored raw sample
+under the current mean, exactly as for `SquashedNormalHead` (section 8.5).
 
 ## 9. PPO training loop - detailed, with explicit options
 

@@ -300,7 +300,9 @@ class TestDirectionHead:
             phys = head.to_physical(sampled)
             norm = phys.norm(dim=-1)
             for n in norm:
-                assert float(n) == pytest.approx(1.0, abs=1e-5)
+                # to_physical uses eps=1e-6 guard; for small-norm samples the
+                # deviation from 1.0 is eps/norm, which can reach ~2e-5.
+                assert float(n) == pytest.approx(1.0, abs=1e-4)
 
     def test_mode_physical_is_unit_vector(self):
         for _ in range(10):
@@ -308,7 +310,7 @@ class TestDirectionHead:
             head = DirectionHead(raw, torch.zeros(2))
             phys = head.mode_physical()
             norm = float(phys.norm())
-            assert norm == pytest.approx(1.0, abs=1e-5)
+            assert norm == pytest.approx(1.0, abs=1e-4)
 
     def test_log_prob_finite(self):
         raw = torch.randn(4, 2)

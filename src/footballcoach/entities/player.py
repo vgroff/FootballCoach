@@ -4,10 +4,28 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from typing import TYPE_CHECKING
 
 from footballcoach.config import load_physics_config
 from footballcoach.entities.attributes import PlayerAttributes
 from footballcoach.mathutils import Vector3
+
+if TYPE_CHECKING:
+    from footballcoach.engine.match import Match
+
+
+class PlayerAI:
+    """Base class for all player AI controllers.
+
+    Subclass and override ``act(player, match, trial_tick)`` to implement
+    per-player decision logic.  ``Match.step()`` calls ``player.ai.act(...)``
+    once per physics tick for every player that has an AI assigned.
+
+    The default implementation is a no-op (stationary / order-driven player).
+    """
+
+    def act(self, player: "Player", match: "Match", trial_tick: int) -> None:  # noqa: ARG002
+        pass
 
 
 class Team(Enum):
@@ -41,6 +59,16 @@ class Player:
     # avoid a circular import - see orders.py for the concrete types).
     current_order: object | None = None
 
+    # Optional AI controller. If set, Match.step() calls ai.act(player, match, tick)
+    # once per physics tick before processing orders.  None = purely order-driven.
+    ai: PlayerAI | None = field(default=None, repr=False)
+
+    # Optional event callbacks — called by the engine at the exact moment the
+    # action executes (not when the order is set).  Signature: (player) -> None.
+    # Useful for recording, logging, UI effects, stats, etc.
+    on_kick: object | None = field(default=None, repr=False)     # fired when a kick/shoot/pass lands
+    on_tackle: object | None = field(default=None, repr=False)   # fired when a tackle attempt executes
+
     radius_m: float = 0.3
     height_m: float = 1.8
 
@@ -69,6 +97,77 @@ class Player:
 
     def is_available_to_tackle(self) -> bool:
         return self.state != PlayerState.INACTIVE_TACKLED
+
+    # ------------------------------------------------------------------
+    # Atomic action methods — the only correct way to assign Orders.
+    # PlayerAI subclasses, to_orders.py, and tests all call these.
+    # Never set player.current_order to an Order dataclass directly
+    # from outside this class.
+    # ------------------------------------------------------------------
+
+    def kick(self, aim_point: Vector3, power_fraction: float, spin: Vector3) -> None:
+        """Issue a KickOrder. Only effective if this player has the ball."""
+        from footballcoach.orders import KickOrder
+        self.current_order = KickOrder(aim_point=aim_point, power_fraction=power_fraction, spin=spin)
+
+    def pass_ball(
+        self,
+        target_position: Vector3,
+        target_player_id: str | None = None,
+        power_fraction: float | None = None,
+    ) -> None:
+        """Issue a PassOrder toward a position or a specific teammate."""
+        from footballcoach.orders import PassOrder
+        self.current_order = PassOrder(
+            target_position=target_position,
+            power_fraction=power_fraction,
+            target_player_id=target_player_id,
+        )
+
+    def get_possession(self) -> None:
+        """Chase the ball / dispossess the carrier."""
+        from footballcoach.orders import GetPossessionOrder
+        self.current_order = GetPossessionOrder()
+
+    def tackle_player(self, target_player_id: str) -> None:
+        """Chase and tackle a specific opposing player."""
+        from footballcoach.orders import ChaseTackleOrder
+        self.current_order = ChaseTackleOrder(target_player_id=target_player_id)
+
+    def mark_player(self, target_player_id: str) -> None:
+        """Mark a specific opposing player."""
+        from footballcoach.orders import MarkOrder
+        self.current_order = MarkOrder(target_player_id=target_player_id)
+
+    def stop(self) -> None:
+        """Decelerate to a standstill."""
+        from footballcoach.orders import StopOrder
+        self.current_order = StopOrder()
+
+    def save_goal(self) -> None:
+        """Goalkeeper only: track incoming shot and move to intercept."""
+        from footballcoach.orders import SaveOrder
+        self.current_order = SaveOrder()
+
+    def move_to(
+        self,
+        target_position: Vector3,
+        sprint: bool = True,
+        max_speed_on_arrival_mps: float | None = None,
+    ) -> None:
+        """Move toward a target position.
+
+        Used by the rules-based AI and BC label generation.
+        The neural execution network drives movement via move_direction
+        (a far-target MoveOrder constructed in to_orders.py), not by
+        calling this method with a strategic region centre.
+        """
+        from footballcoach.orders import MoveOrder
+        self.current_order = MoveOrder(
+            target_position=target_position,
+            sprint=sprint,
+            max_speed_on_arrival_mps=max_speed_on_arrival_mps,
+        )
 
     @property
     def is_inactive(self) -> bool:

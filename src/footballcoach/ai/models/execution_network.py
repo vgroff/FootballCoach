@@ -8,10 +8,10 @@ Structurally similar to the decision network (entity encoder + trunk), but:
   - Outputs the per-tick motor actions that drive the engine directly.
 
 Outputs:
-  move_direction   - raw 2D vector; normalized to unit vector in gating.py
+  move_direction   - unit vector (L2-normalized inside forward(); mean is always on unit circle)
   sprint_logit     - Bernoulli: sprint vs jog
   kick_logit       - Bernoulli: kick this tick?
-  kick_direction   - raw 2D vector; normalized to unit vector in gating.py
+  kick_direction   - unit vector (L2-normalized inside forward(); mean is always on unit circle)
   kick_power       - raw scalar; sigmoid -> [0, 1] power_fraction
   kick_spin        - raw 3D vector (physical units determined by to_orders.py)
   tackle_attempt_logit - Bernoulli
@@ -145,10 +145,10 @@ class ExecutionNetwork(nn.Module):
         )
 
         # Motor output heads
-        self.move_direction = nn.Linear(trunk_hidden, 2)    # raw; L2-norm in gating
+        self.move_direction = nn.Linear(trunk_hidden, 2)    # L2-normalized to unit vector in forward()
         self.sprint_logit = nn.Linear(trunk_hidden, 1)       # Bernoulli
         self.kick_logit = nn.Linear(trunk_hidden, 1)          # Bernoulli
-        self.kick_direction = nn.Linear(trunk_hidden, 2)       # raw; L2-norm in gating
+        self.kick_direction = nn.Linear(trunk_hidden, 2)       # L2-normalized to unit vector in forward()
         self.kick_power = nn.Linear(trunk_hidden, 1)            # raw; sigmoid -> [0,1]
         self.kick_spin = nn.Linear(trunk_hidden, 3)             # raw spin vector
         self.tackle_attempt_logit = nn.Linear(trunk_hidden, 1)  # Bernoulli
@@ -157,11 +157,13 @@ class ExecutionNetwork(nn.Module):
         self.value_head = nn.Linear(trunk_hidden, 1)
 
         # Fixed (non-learnable) log_std for direction heads.
-        # Direction heads are excluded from the PPO log_prob ratio (see ppo_trainer.py
-        # _compute_log_prob comment), so these don't need gradients. They only
+        # Direction heads are included in the PPO log_prob ratio. The mean is
+        # constrained to the unit circle (|mean|=1), so max mean-shift is 2 and
+        # KL contribution per step is bounded (~O(1) vs the previous ~2000 when
+        # the raw vector could drift to magnitude 25-50). These buffers only
         # control rollout sampling noise via DirectionHead.sample_raw().
-        self.register_buffer("move_dir_log_std", torch.zeros(2))
-        self.register_buffer("kick_dir_log_std", torch.zeros(2))
+        self.move_dir_log_std = nn.Parameter(torch.zeros(2))
+        self.kick_dir_log_std = nn.Parameter(torch.zeros(2))
         self.kick_power_log_std = nn.Parameter(torch.zeros(1))
         self.kick_spin_log_std = nn.Parameter(torch.zeros(3))
 
@@ -185,11 +187,15 @@ class ExecutionNetwork(nn.Module):
         ], dim=-1)
         h = self.trunk(h)
 
+        eps = 1e-6
+        raw_move = self.move_direction(h)
+        raw_kick = self.kick_direction(h)
+
         return ExecutionHeadsRaw(
-            move_direction=self.move_direction(h),
+            move_direction=raw_move / (raw_move.norm(dim=-1, keepdim=True) + eps),
             sprint_logit=self.sprint_logit(h),
             kick_logit=self.kick_logit(h),
-            kick_direction=self.kick_direction(h),
+            kick_direction=raw_kick / (raw_kick.norm(dim=-1, keepdim=True) + eps),
             kick_power=self.kick_power(h),
             kick_spin=self.kick_spin(h),
             tackle_attempt_logit=self.tackle_attempt_logit(h),

@@ -39,26 +39,83 @@ ai/
   env/
     reward.py          # phase1_reward(), phase2_reward(), EMAFilter (attack/defence)
     scenario_env.py    # ScenarioEnv: Gym-like wrapper over ScenarioDefinition + ScenarioLoop
+  bc/
+    __init__.py
+    dataset.py         # DemonstrationDataset: load .npz files, iterate_minibatches(), sample_batch()
   curriculum/
     phases.py          # CurriculumPhase dataclasses + PHASES_BY_ID dict
+    envs.py            # build_env(phase) + bc_label_fn_for_phase(id) — ONE source of truth,
+                       # imported by both train.py and record_demonstrations.py
     opponent_pool.py   # OpponentPool + apply_rules_based_opponent()
   scripts/
     train.py           # CLI: uv run python -m footballcoach.ai.scripts.train --phase 1
+                       #   --bc-dataset demonstrations/phase1/  (offline BC pre-training)
+                       #   --bc-pretrain-epochs N  --bc-pretrain-batch-size N
     evaluate.py        # CLI: ... evaluate --checkpoint path.pt --n-trials 100
+    record_demonstrations.py  # CLI: record rules-based episodes as .npz BC datasets
 ```
+
+## BC label vector (BC_LABEL_DIM = 15)
+
+`bc.py` stores 15 floats per step:
+
+| idx | field | source |
+|-----|-------|--------|
+| 0–6 | decision Bernoullis (shoot, pass, move, tackle, gp_extra, mark, hold) | rules AI decision |
+| 7–8 | move_dir_x/y | direction toward target |
+| 9 | sprint | rules AI order |
+| 10–11 | move_region_x/y (metres) | MoveOrder target position |
+| 12 | **kick_this_tick** | `player.on_kick` callback (fired by engine) |
+| 13 | **tackle_attempt** | `player.on_tackle` callback (fired by engine) |
+| 14 | valid | 1.0 = use this label |
+
+**Critical:** indices 12–13 come from **engine callbacks** (`Player.on_kick`,
+`Player.on_kick`), not from inspecting the current order type.  They reflect
+what the engine physically executed this tick.  Indices 0–11 come from asking
+the rules AI what it *decides* next — these are input to the decision network
+and movement-related execution heads.
+
+### Player event callbacks
+
+`Player` has two optional callbacks set on the instance:
+```python
+player.on_kick    = lambda player: ...   # fired when KickOrder/ShootOrder/PassOrder executes
+player.on_tackle  = lambda player: ...   # fired when ChaseTackleOrder makes contact
+```
+The engine fires these in `match.py` at the exact tick the action executes —
+not when the order is set.  Useful for: BC recording, UI effects, logging,
+statistics.  Both default to `None` (no-op).
+
+### Demonstration recording (`record_demonstrations.py`)
+
+Sampling strategy:
+- `env.step()` is called for each 0.5s decision interval — episodes terminate
+  correctly (box-possession terminal, timeout) because `ScenarioEnv.step()`
+  handles those checks.
+- Inside each `env.step()` call, the engine fires `player.on_kick` /
+  `player.on_tackle` callbacks at the exact physics tick the action executes.
+  These callbacks record an extra (obs, label) sample immediately.
+- Net result: one regular sample per 0.5s + one extra sample per kick/tackle
+  event. ~7k steps for 200 phase-1 episodes (~7s to record).
 
 ## Critical design rules
 
-### `_sample_action` returns 8 values
-`PPOTrainer._sample_action(obs_dict)` returns an 8-tuple:
+### Neural players use `NeuralPlayerAI` — `_sample_action` is called inside it
+`PPOTrainer.train()` sets `env.sample_action_fn = self._sample_action`.
+`ScenarioEnv.reset()` then assigns `NeuralPlayerAI(sample_action_fn, ...)`
+to the trainee (and secondary players).  `Match.step()` calls
+`player.ai.act()` each physics tick; every 15 ticks `NeuralPlayerAI` calls
+`_sample_action`, applies the action via `apply_action_to_player()`, and
+stores the result in `player.ai.last_transition`.  `env.step()` reads this
+into `env.last_trainee_transition` for the rollout buffer.
+
+`_sample_action(obs_dict)` still returns an 8-tuple internally:
 ```
 (action, log_prob, value, decision_probs, execution_physical,
  decision_physical, target_slots, raw_exec_samples)
 ```
-`raw_exec_samples` is a numpy dict of the raw execution samples that were
-used to compute `log_prob`.  It must be forwarded to
-`_action_to_numpy(action, raw_exec_samples)` so the rollout buffer holds
-the correct values for PPO's importance-ratio computation.
+`raw_exec_samples` must be forwarded to `_action_to_numpy(action, raw_exec_samples)`
+so the rollout buffer holds the correct values for the PPO importance ratio.
 
 ### Two concerns that must NEVER be conflated
 

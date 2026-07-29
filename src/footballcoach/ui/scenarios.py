@@ -10,20 +10,18 @@ These are UI conveniences for *watching* the mechanics that the balance
 tests already validate statistically - they are not a replacement for the
 pytest balance suite.
 
-Phase H additions:
-- ``ScenarioParam``: frozen dataclass describing one adjustable UI parameter.
-- ``ScenarioDefinition`` now carries a ``params`` list and an optional
-  ``on_tick`` hook (called each physics tick before ``match.step()``).
-- Removed from SCENARIOS: penalty, save, shoot (kept as private helpers).
-- Parameterized: save_close, pass, tackle, sprint.
-- New: 2v2, 1v2.
-- ``ScenarioLoop``: added ``dispossessed`` outcome, ``linger_s`` cooldown.
+AI wiring: each non-trainee player that needs per-tick logic gets a
+``PlayerAI`` subclass assigned to ``player.ai`` (from ``footballcoach.rules_ai``).
+``Match.step()`` calls ``player.ai.act(player, match, tick)`` automatically —
+no ``on_tick`` hook needed for per-player logic.  ``on_tick`` is only used for
+rare cross-player coordination (e.g. pass receiver pickup radius check).
 """
 from __future__ import annotations
 
 import math
 import random
 from dataclasses import dataclass, field, replace
+from pathlib import Path
 from typing import Callable
 
 from footballcoach.config import load_physics_config
@@ -161,26 +159,7 @@ def build_tackle_scenario(
     return match
 
 
-class SprintController:
-    """Issues sequential MoveOrder waypoints each time the previous completes."""
-
-    def __init__(self, player_id: str, waypoints: list[Vector3]) -> None:
-        self.player_id = player_id
-        self.waypoints = waypoints
-        self._next_idx = 0
-
-    def __call__(self, match: Match, trial_tick: int) -> None:
-        try:
-            player = match.player_by_id(self.player_id)
-        except KeyError:
-            return
-        if self._next_idx >= len(self.waypoints):
-            return
-        if player.current_order is None:
-            player.current_order = MoveOrder(
-                target_position=self.waypoints[self._next_idx], sprint=True
-            )
-            self._next_idx += 1
+# SprintController replaced by SprintWaypointAI (rules_ai.py) — a proper PlayerAI subclass.
 
 
 def _make_sprint_waypoints(
@@ -234,10 +213,8 @@ def build_sprint_scenario(
         rng_reduction=rng_reduction, rng=rng,
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
     )
-    controller = SprintController(player.player_id, waypoints)
     player.current_order = MoveOrder(target_position=waypoints[0], sprint=True)
-    controller._next_idx = 1
-    match._sprint_controller = controller  # type: ignore[attr-defined]
+    player.ai = SprintWaypointAI(waypoints, start_idx=1)
     return match
 
 
@@ -390,140 +367,16 @@ def build_pass_scenario(
 
 
 # ---------------------------------------------------------------------------
-# Reusable on-tick AI primitives
+# Reusable per-player AI primitives — live in footballcoach.rules_ai
 # ---------------------------------------------------------------------------
 
-class BallCarrierAttackerAI:
-    """Reusable on-tick AI for a player who holds the ball and must shoot.
-
-    Each tick, if the player has the ball:
-    - If their current order is a ``MoveOrder`` and the distance to the
-      move target is *increasing* (repulsion / obstruction is pushing them
-      away), immediately switches to a ``ShootOrder`` at the configured
-      aim point.
-    - If their current order is ``None`` (e.g. a prior ``MoveOrder``
-      completed), issues a ``ShootOrder``.
-    - No-ops when the player does not have the ball.
-
-    Compose with ``StagedGoalkeeperAI`` and others via ``CompositeAI``
-    when building scenario on_tick hooks.
-    """
-
-    def __init__(self, player_id: str, aim_point: Vector3, power_fraction: float = 0.9) -> None:
-        self.player_id = player_id
-        self.aim_point = aim_point
-        self.power_fraction = power_fraction
-        self._prev_dist_to_target: float | None = None
-
-    def __call__(self, match: Match, trial_tick: int) -> None:
-        try:
-            player = match.player_by_id(self.player_id)
-        except KeyError:
-            return
-        if match.ball.possessed_by != self.player_id:
-            self._prev_dist_to_target = None
-            return
-        order = player.current_order
-        if isinstance(order, MoveOrder):
-            dist = player.position.xy().distance_to(order.target_position.xy())
-            prev = self._prev_dist_to_target
-            self._prev_dist_to_target = dist
-            if prev is not None and dist > prev:
-                # Repulsion/obstruction is pushing us away — shoot now.
-                player.current_order = ShootOrder(
-                    aim_point=self.aim_point, power_fraction=self.power_fraction
-                )
-        elif order is None:
-            self._prev_dist_to_target = None
-            player.current_order = ShootOrder(
-                aim_point=self.aim_point, power_fraction=self.power_fraction
-            )
-
-
-class StagedGoalkeeperAI:
-    """Reusable on-tick AI for a goalkeeper that starts with a positioning
-    ``MoveOrder`` and transitions to ``SaveOrder`` once in place.
-
-    Assumes the GK's initial order is a ``MoveOrder`` (e.g. walk to goal
-    centre with ``max_speed_on_arrival_mps=0.0``).  As soon as that order
-    completes (``current_order`` becomes ``None``) and the GK does not have
-    the ball, this AI issues a ``SaveOrder`` so the engine handles shot
-    prediction from that point on.
-
-    Works correctly even when the GK starts exactly at the goal centre
-    (the MoveOrder completes in one or two ticks and the transition is
-    immediate).
-    """
-
-    def __init__(self, gk_id: str) -> None:
-        self.gk_id = gk_id
-
-    def __call__(self, match: Match, trial_tick: int) -> None:
-        try:
-            gk = match.player_by_id(self.gk_id)
-        except KeyError:
-            return
-        if gk.current_order is None and match.ball.possessed_by != self.gk_id:
-            gk.current_order = SaveOrder()
-
-
-class CompositeAI:
-    """Composes multiple on-tick AI callables into a single callable.
-
-    Each controller is called in insertion order every tick.  Useful for
-    combining ``BallCarrierAttackerAI``, ``StagedGoalkeeperAI``, and any
-    custom per-scenario logic into a single on_tick hook.
-    """
-
-    def __init__(self, *controllers: Callable[[Match, int], None]) -> None:
-        self._controllers = controllers
-
-    def __call__(self, match: Match, trial_tick: int) -> None:
-        for ctrl in self._controllers:
-            ctrl(match, trial_tick)
-
-
-# ---------------------------------------------------------------------------
-# 2v2 scenario
-# ---------------------------------------------------------------------------
-
-class TwoVTwoController:
-    """Drives the 2v2 scenario via the on_tick hook.
-
-    Handles the pass A→B hand-off: once B receives the ball, either shoots
-    immediately or runs 30 % toward the goal first.  Ongoing "if B has the
-    ball and no order, shoot" logic is delegated to ``BallCarrierAttackerAI``,
-    which also handles the repulsion-pushback-→-shoot shortcut.
-    """
-
-    def __init__(self, attacker_a_id: str, attacker_b_id: str, goal_aim_point: Vector3,
-                 shoot_immediately_probability: float = 0.5, rng: random.Random | None = None) -> None:
-        self.attacker_a_id = attacker_a_id
-        self.attacker_b_id = attacker_b_id
-        self.goal_aim_point = goal_aim_point
-        self._rng = rng or random.Random()
-        self._b_received = False
-        self._shoot_immediately = self._rng.random() < shoot_immediately_probability
-        self._b_ai = BallCarrierAttackerAI(attacker_b_id, goal_aim_point, power_fraction=0.85)
-
-    def __call__(self, match: Match, trial_tick: int) -> None:
-        try:
-            b = match.player_by_id(self.attacker_b_id)
-        except KeyError:
-            return
-        if not self._b_received:
-            if match.ball.possessed_by == self.attacker_b_id:
-                self._b_received = True
-                if self._shoot_immediately:
-                    b.current_order = ShootOrder(aim_point=self.goal_aim_point, power_fraction=0.85)
-                else:
-                    run_target = Vector3(
-                        b.position.x + (self.goal_aim_point.x - b.position.x) * 0.3,
-                        b.position.y, 0.0,
-                    )
-                    b.current_order = MoveOrder(target_position=run_target, sprint=True)
-        # Delegate ongoing attacker logic to the shared AI primitive.
-        self._b_ai(match, trial_tick)
+from footballcoach.rules_ai import (
+    BallCarrierAttackerAI,
+    BallReceiverThenShootAI,
+    StagedGoalkeeperAI,
+    Phase1RulesAI,
+    SprintWaypointAI,
+)
 
 
 def build_2v2_scenario(
@@ -576,50 +429,25 @@ def build_2v2_scenario(
     )
     attacker_a.current_order = PassOrder(target_position=attacker_b.position)
     defender.current_order = GetPossessionOrder()
-    gk.current_order = SaveOrder()
+    gk.current_order = MoveOrder(target_position=pitch.right_goal_centre, sprint=False,
+                                  max_speed_on_arrival_mps=0.0)
 
     aim_z = rng.uniform(0.2, 1.5)
     aim_point = pitch.right_goal_centre + Vector3(
         0, rng.uniform(-half_goal_w * 0.6, half_goal_w * 0.6), aim_z
     )
-    controller = TwoVTwoController(
-        attacker_a.player_id, attacker_b.player_id,
+    attacker_b.ai = BallReceiverThenShootAI(
         goal_aim_point=aim_point,
-        shoot_immediately_probability=shoot_immediately_probability,
-        rng=rng,
+        shoot_immediately=rng.random() < shoot_immediately_probability,
     )
-    match._2v2_controller = controller  # type: ignore[attr-defined]
+    defender.ai = Phase1RulesAI()
+    gk.ai = StagedGoalkeeperAI()
     return match
 
 
 # ---------------------------------------------------------------------------
 # 1v2 scenario
 # ---------------------------------------------------------------------------
-
-class OneVTwoController:
-    """Drives the 1v2 scenario.
-
-    Composes two reusable AI primitives:
-
-    - ``BallCarrierAttackerAI``: attacker carries ball toward goal on a
-      ``MoveOrder``; switches to ``ShootOrder`` when the move completes or
-      repulsion starts pushing them away from the target.
-    - ``StagedGoalkeeperAI``: GK starts on a ``MoveOrder`` to the goal
-      centre; transitions to ``SaveOrder`` once in position.
-
-    The defender uses a ``GetPossessionOrder`` set at build time and needs
-    no on-tick logic.
-    """
-
-    def __init__(self, attacker_id: str, gk_id: str, shoot_at: Vector3) -> None:
-        self._ai = CompositeAI(
-            BallCarrierAttackerAI(attacker_id, shoot_at, power_fraction=0.9),
-            StagedGoalkeeperAI(gk_id),
-        )
-
-    def __call__(self, match: Match, trial_tick: int) -> None:
-        self._ai(match, trial_tick)
-
 
 def build_1v2_scenario(
     rng_reduction: float = 0.3,
@@ -703,11 +531,11 @@ def build_1v2_scenario(
 
     attacker.current_order = MoveOrder(target_position=move_target, sprint=True)
     defender.current_order = GetPossessionOrder()
-    # GK starts by walking to goal centre (standstill), then on_tick upgrades to SaveOrder.
     gk.current_order = MoveOrder(target_position=goal_centre, sprint=False, max_speed_on_arrival_mps=0.0)
 
-    controller = OneVTwoController(attacker.player_id, gk.player_id, aim_point)
-    match._1v2_controller = controller  # type: ignore[attr-defined]
+    attacker.ai = BallCarrierAttackerAI(aim_point, power_fraction=0.9)
+    defender.ai = Phase1RulesAI()
+    gk.ai = StagedGoalkeeperAI()
     return match
 
 
@@ -735,21 +563,11 @@ def _pass_on_tick(match: Match, trial_tick: int) -> None:
 
 
 def _sprint_on_tick(match: Match, trial_tick: int) -> None:
-    ctrl = getattr(match, "_sprint_controller", None)
-    if ctrl is not None:
-        ctrl(match, trial_tick)
+    pass  # runner.ai = SprintWaypointAI assigned in build; Match.step() fires it.
 
 
-def _2v2_on_tick(match: Match, trial_tick: int) -> None:
-    ctrl = getattr(match, "_2v2_controller", None)
-    if ctrl is not None:
-        ctrl(match, trial_tick)
-
-
-def _1v2_on_tick(match: Match, trial_tick: int) -> None:
-    ctrl = getattr(match, "_1v2_controller", None)
-    if ctrl is not None:
-        ctrl(match, trial_tick)
+# _2v2_on_tick and _1v2_on_tick removed: players now carry their own AI
+# via player.ai — Match.step() calls it automatically.
 
 
 # ---------------------------------------------------------------------------
@@ -799,21 +617,201 @@ def build_repulsion_obstacle_scenario(
 # Phase 1 curriculum: 1v1 get-possession / move-toward-goal
 # ---------------------------------------------------------------------------
 
-def _1v1_on_tick(match: Match, trial_tick: int) -> None:
-    """UI fallback for the 1v1 training scenario: give the trainee a
-    ``GetPossessionOrder`` whenever it has no current order.
+# Phase 1 on_tick functions removed: both trainee and opponent now carry
+# player.ai assigned in build_1v1_scenario — Match.step() fires them automatically.
+# Kept as no-ops for backward compat with any external references.
 
-    In training the AI overrides the trainee's order each decision interval,
-    so this only fires between AI steps (or when no AI is driving the env).
-    In the UI scenario picker this makes the trainee chase the ball so the
-    scenario is watchable.
-    """
+def _1v1_on_tick(match: Match, trial_tick: int) -> None:
+    pass
+
+
+def phase1_training_on_tick(match: Match, trial_tick: int) -> None:
+    pass
+
+
+def _load_trainer(checkpoint_path: str):
+    """Load a PPOTrainer from a checkpoint file. Returns (trainer, error_str)."""
+    import os
+    if not checkpoint_path or not os.path.exists(checkpoint_path):
+        return None, f"No checkpoint found ({checkpoint_path})"
     try:
-        trainee = match.player_by_id("trainee")
+        from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+        trainer = PPOTrainer.from_config()
+        trainer.load_checkpoint(Path(checkpoint_path))
+        trainer.decision_net.eval()
+        trainer.execution_net.eval()
+        return trainer, None
+    except Exception as e:
+        return None, str(e)
+
+
+def _discover_checkpoints(checkpoint_dir: str) -> list[str]:
+    """Return sorted list of .pt checkpoint paths in checkpoint_dir."""
+    import glob
+    import os
+    if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
+        return []
+    paths = sorted(glob.glob(os.path.join(checkpoint_dir, "checkpoint_*.pt")))
+    return paths
+
+
+def _apply_neural_action(trainer, match: Match, player_id: str, trial_tick: int) -> None:
+    """Run one neural decision for player_id; falls back to GetPossessionOrder on error."""
+    import torch
+    from footballcoach.ai.obs.encoder import encode_observation, MAX_OTHER_PLAYERS
+    from footballcoach.ai.action.to_orders import apply_action_to_player, encode_slot_player_ids
+    from footballcoach.ai.action.gating import select_action
+
+    try:
+        player = match.player_by_id(player_id)
     except KeyError:
         return
-    if trainee.current_order is None:
-        trainee.current_order = GetPossessionOrder()
+    try:
+        time_remaining = max(0.0, 120.0 - trial_tick / 30.0)
+        obs = encode_observation(match=match, player_id=player_id, time_remaining_s=time_remaining)
+        obs_dict = {k: v.unsqueeze(0) for k, v in obs.to_torch_dict().items()}
+        with torch.no_grad():
+            result = trainer._sample_action(obs_dict)
+        (_action, _lp, _val, decision_probs, exec_phys, dec_phys, target_slots, _raw_exec) = result
+        slot_player_ids = encode_slot_player_ids(match, player_id, MAX_OTHER_PLAYERS)
+        gating = select_action(
+            decision_probs=decision_probs,
+            execution_physical=exec_phys,
+            target_slots=target_slots,
+        )
+        apply_action_to_player(
+            gating=gating,
+            player=player,
+            match=match,
+            slot_player_ids=slot_player_ids,
+            decision_physical=dec_phys,
+        )
+    except Exception:
+        if player.current_order is None:
+            player.current_order = GetPossessionOrder()
+
+
+def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run5"):
+    """Factory returning a (build_fn, on_tick_fn) pair for the Phase 1 UI scenario.
+
+    Exposes four params:
+      trainee_checkpoint_idx  — index into sorted .pt files (0 = rules-based)
+      opponent_checkpoint_idx — index into sorted .pt files (0 = rules-based)
+      ball_max_speed_mps
+      restitution_sigma
+
+    Trainers are cached per resolved path so switching checkpoints via the
+    slider only re-loads when the path actually changes.
+    """
+    import logging
+    log_ui = logging.getLogger("footballcoach.ui.scenarios")
+
+    DECISION_INTERVAL_TICKS = 15  # 0.5 s at 30 Hz
+
+    # Cache: path -> trainer (or None on load failure)
+    _trainer_cache: dict[str, object] = {}
+
+    def _get_trainer(checkpoint_path: str | None):
+        if not checkpoint_path:
+            return None
+        if checkpoint_path not in _trainer_cache:
+            trainer, err = _load_trainer(checkpoint_path)
+            if err:
+                log_ui.warning(f"Phase 1 UI: {err} — using rules-based AI")
+            _trainer_cache[checkpoint_path] = trainer
+        return _trainer_cache[checkpoint_path]
+
+    # Shared mutable state between build and on_tick
+    state: dict = {
+        "trainee_trainer": None,
+        "opponent_trainer": None,
+        "ticks_trainee": 0,
+        "ticks_opponent": 0,
+        "checkpoints": [],          # sorted list of .pt paths discovered at last build
+    }
+
+    def _resolve_trainer(idx: float, checkpoints: list[str]):
+        """idx=0 → rules-based (None), idx>=1 → checkpoints[round(idx)-1]."""
+        i = round(idx)
+        if i <= 0 or not checkpoints:
+            return None
+        return _get_trainer(checkpoints[min(i - 1, len(checkpoints) - 1)])
+
+    def build(
+        rng_reduction: float = 0.3,
+        *,
+        trainee_checkpoint_idx: float = 0.0,
+        opponent_checkpoint_idx: float = 0.0,
+        ball_max_speed_mps: float = 4.0,
+        restitution_sigma: float = 0.08,
+    ) -> Match:
+        checkpoints = _discover_checkpoints(checkpoint_dir)
+        state["checkpoints"] = checkpoints
+
+        trainee_trainer = _resolve_trainer(trainee_checkpoint_idx, checkpoints)
+        opponent_trainer = _resolve_trainer(opponent_checkpoint_idx, checkpoints)
+        state["trainee_trainer"] = trainee_trainer
+        state["opponent_trainer"] = opponent_trainer
+        state["ticks_trainee"] = 0
+        state["ticks_opponent"] = 0
+
+        match = build_1v1_scenario(
+            rng_reduction,
+            ball_max_speed_mps=ball_max_speed_mps,
+            restitution_sigma=restitution_sigma,
+            ball_max_dist_from_trainee_m=55.0,
+        )
+
+        # Override player.ai assignments made by build_1v1_scenario:
+        # trainee: rules-based if no trainer, else neural (on_tick drives it, ai=None)
+        try:
+            trainee = match.player_by_id("trainee")
+            trainee.ai = None if trainee_trainer is not None else Phase1RulesAI()
+        except KeyError:
+            pass
+
+        # opponent: rules-based if no trainer, else neural (on_tick drives it, ai=None)
+        # build_1v1_scenario already set opponent.ai to Phase1RulesAI or None randomly;
+        # override explicitly based on the user's choice.
+        try:
+            opponent = match.player_by_id("opponent")
+            opponent.ai = None if opponent_trainer is not None else Phase1RulesAI()
+        except KeyError:
+            pass
+
+        n = len(checkpoints)
+        log_ui.info(
+            f"Phase 1 UI: {n} checkpoint(s) in '{checkpoint_dir}'. "
+            f"trainee={'neural@'+checkpoints[round(trainee_checkpoint_idx)-1] if trainee_trainer else 'rules'}, "
+            f"opponent={'neural@'+checkpoints[round(opponent_checkpoint_idx)-1] if opponent_trainer else 'rules'}"
+            if n else f"Phase 1 UI: no checkpoints found in '{checkpoint_dir}', both players use rules-based AI."
+        )
+        return match
+
+    def on_tick(match: Match, trial_tick: int) -> None:
+        trainee_trainer = state["trainee_trainer"]
+        opponent_trainer = state["opponent_trainer"]
+
+        # --- Trainee ---
+        if trainee_trainer is not None:
+            state["ticks_trainee"] += 1
+            if state["ticks_trainee"] >= DECISION_INTERVAL_TICKS:
+                state["ticks_trainee"] = 0
+                _apply_neural_action(trainee_trainer, match, "trainee", trial_tick)
+        # else: trainee.ai = Phase1RulesAI() drives it via Match.step()
+
+        # --- Opponent ---
+        if opponent_trainer is not None:
+            state["ticks_opponent"] += 1
+            if state["ticks_opponent"] >= DECISION_INTERVAL_TICKS:
+                state["ticks_opponent"] = 0
+                _apply_neural_action(opponent_trainer, match, "opponent", trial_tick)
+        # else: opponent.ai = Phase1RulesAI() drives it via Match.step()
+
+    return build, on_tick
+
+
+_phase1_build, _phase1_on_tick = _make_phase1_scenario_pair()
 
 
 def build_1v1_scenario(
@@ -821,9 +819,10 @@ def build_1v1_scenario(
     *,
     trainee_tier: str = "generic",
     opponent_tier: str = "generic",
-    ball_max_speed_mps: float = 8.0,
+    ball_max_speed_mps: float = 10.0,
     restitution_sigma: float = 0.08,
-    ball_max_dist_from_trainee_m: float = 35.0,
+    ball_max_dist_from_trainee_m: float = 55.0,
+    trainee_team: "Team | None" = None,
 ) -> Match:
     """Phase 1 curriculum: 1v1 get-possession/move-toward-goal.
 
@@ -831,9 +830,11 @@ def build_1v1_scenario(
     randomised attributes, stamina, headings, and (for the ball) velocity,
     spin, and restitution coefficient.
 
-    Trainee (Team.LEFT, player_id='trainee') has no initial order so the AI
-    can drive it.  Opponent (Team.RIGHT, player_id='opponent') is immobile
-    (no order) - the first sub-phase of the phase-1 curriculum.
+    Trainee (random team each episode by default, player_id='trainee') has no
+    initial order so the AI can drive it.  Opponent gets the opposite team and
+    is immobile (no order) - the first sub-phase of the phase-1 curriculum.
+    Pass ``trainee_team`` to pin the side (used by tests / UI scenarios that
+    need a fixed attacking direction).
 
     Ball velocity is resampled (up to 20 times) until a linear extrapolation
     at the initial speed for 3 seconds stays in bounds (ignoring friction -
@@ -854,15 +855,20 @@ def build_1v1_scenario(
             0.0,
         )
 
-    # --- Trainee (Team.LEFT, attacks +x) ---
+    # --- Randomise which end the trainee attacks (unless pinned by caller) ---
+    if trainee_team is None:
+        trainee_team = rng.choice([Team.LEFT, Team.RIGHT])
+    opponent_team = Team.RIGHT if trainee_team == Team.LEFT else Team.LEFT
+
+    # --- Trainee (random team) ---
     trainee_attrs = generate_attributes(tier=trainee_tier, rng=rng)
-    trainee = Player.create("trainee", Team.LEFT, trainee_attrs, position=_rand_pos())
+    trainee = Player.create("trainee", trainee_team, trainee_attrs, position=_rand_pos())
     trainee.stamina = rng.uniform(0.3, 1.0)
     trainee.heading_rad = rng.uniform(-math.pi, math.pi)
 
-    # --- Opponent (Team.RIGHT, attacks -x) --- immobile, no order ---
+    # --- Opponent (opposite team) --- immobile, no order ---
     opponent_attrs = generate_attributes(tier=opponent_tier, rng=rng)
-    opponent = Player.create("opponent", Team.RIGHT, opponent_attrs, position=_rand_pos())
+    opponent = Player.create("opponent", opponent_team, opponent_attrs, position=_rand_pos())
     opponent.stamina = rng.uniform(0.3, 1.0)
     opponent.heading_rad = rng.uniform(-math.pi, math.pi)
 
@@ -905,7 +911,7 @@ def build_1v1_scenario(
     ball_params = replace(base_params, bounce_restitution_vertical=restitution)
 
     ui_cfg = load_physics_config().get("ui", {})
-    return Match(
+    match = Match(
         pitch=pitch,
         players=[trainee, opponent],
         ball=ball,
@@ -914,6 +920,12 @@ def build_1v1_scenario(
         ball_physics_params=ball_params,
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
     )
+    # 50% chance opponent uses rules-based AI; rest is immobile (neural training).
+    # player.ai is set so Match.step() drives it automatically.
+    use_rules = rng.random() < 0.5
+    opponent.ai = Phase1RulesAI() if use_rules else None
+    match._opponent_use_rules_ai = use_rules  # kept for ScenarioEnv secondary-player gating
+    return match
 
 
 # ---------------------------------------------------------------------------
@@ -980,7 +992,7 @@ SCENARIOS: list[ScenarioDefinition] = [
         label="2v2: pass and shoot vs defender+GK",
         description="Two attackers combine with a pass before shooting; one defender + GK.",
         build=build_2v2_scenario,
-        on_tick=_2v2_on_tick,
+        on_tick=None,
         params=[
             ScenarioParam("attacker_skill_min", "Attacker skill min", 0.3, 1.0, 0.05, 0.7),
             ScenarioParam("attacker_skill_max", "Attacker skill max", 0.3, 1.0, 0.05, 0.85),
@@ -996,7 +1008,7 @@ SCENARIOS: list[ScenarioDefinition] = [
         label="1v2: elite attacker vs. average defender+GK",
         description="Elite attacker (skill=0.9) runs at goal; average defender+GK defend.",
         build=build_1v2_scenario,
-        on_tick=_1v2_on_tick,
+        on_tick=None,
         params=[
             ScenarioParam("attacker_skill", "Attacker skill", 0.3, 1.0, 0.05, 0.9),
             ScenarioParam("defender_skill", "Defender skill", 0.3, 1.0, 0.05, 0.55),
@@ -1027,7 +1039,24 @@ SCENARIOS: list[ScenarioDefinition] = [
         build=build_1v1_scenario,
         on_tick=_1v1_on_tick,
         params=[
-            ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 15.0, 0.5, 8.0),
+            ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 15.0, 0.5, 10.0),
+            ScenarioParam("restitution_sigma", "Restitution randomness (sigma)", 0.0, 0.3, 0.01, 0.08),
+        ],
+    ),
+    ScenarioDefinition(
+        key="phase1_neural_ai",
+        label="Phase 1: Neural AI vs opponent (checkpoint picker)",
+        description=(
+            "1v1 Phase 1 scenario with selectable checkpoints for trainee and opponent. "
+            "Index 0 = rules-based AI. Index 1 = earliest checkpoint, higher = later checkpoints "
+            "from checkpoints/phase1_run5/ (sorted by step). Both players can be mixed freely."
+        ),
+        build=_phase1_build,
+        on_tick=_phase1_on_tick,
+        params=[
+            ScenarioParam("trainee_checkpoint_idx", "Trainee checkpoint (0=rules)", 0.0, 25.0, 1.0, 0.0),
+            ScenarioParam("opponent_checkpoint_idx", "Opponent checkpoint (0=rules)", 0.0, 25.0, 1.0, 0.0),
+            ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 8.0, 0.5, 4.0),
             ScenarioParam("restitution_sigma", "Restitution randomness (sigma)", 0.0, 0.3, 0.01, 0.08),
         ],
     ),

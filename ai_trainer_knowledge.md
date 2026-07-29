@@ -14,25 +14,43 @@ design document); this file is the actionable distillation of it.
 # One-time: install torch group
 uv sync --group ai
 
-# Train phase 1 with default BC settings (pre-train 2000 steps, aux loss annealed)
-uv run python -m footballcoach.ai.scripts.train --phase 1 --total-steps 500000
+# --- Demonstrations (do this first; used for offline BC pre-training) ---
 
-# Train without any BC (pure PPO from a random init)
-uv run python -m footballcoach.ai.scripts.train \
-    --phase 1 --total-steps 500000 --bc-pretrain-steps 0 --no-bc-aux
+# Record 200 phase-1 episodes of rules-based AI play (~7k steps, ~7s)
+# Sampling: env.step() every 0.5s + on_kick/on_tackle callbacks fire extra
+# samples at the exact tick kicks/tackles execute. Demos already in demonstrations/phase1/.
+uv run python -m footballcoach.ai.scripts.record_demonstrations \
+    --phase 1 --n-episodes 200 --episodes-per-file 8 \
+    --output demonstrations/phase1/
 
-# More BC pre-training, then PPO with aux loss
+# Inspect what's already recorded
+uv run python -m footballcoach.ai.scripts.record_demonstrations \
+    --phase 1 --n-episodes 0 --output demonstrations/phase1/ --info
+
+# --- Training ---
+
+# Train phase 1 using offline BC dataset (recommended — stable pre-training)
 uv run python -m footballcoach.ai.scripts.train \
-    --phase 1 --total-steps 500000 --bc-pretrain-steps 5000
+    --phase 1 --total-steps 200000 \
+    --bc-dataset demonstrations/phase1/ \
+    --bc-pretrain-epochs 3 --bc-pretrain-batch-size 256 \
+    --checkpoint-dir checkpoints/phase1_run4/
+
+# Train without any BC (pure PPO from random init)
+uv run python -m footballcoach.ai.scripts.train \
+    --phase 1 --total-steps 200000 --bc-pretrain-steps 0 --no-bc-aux
+
+# BC aux loss anneals to zero by 30% of training (aux_coeff_anneal_fraction=0.3 in config)
+# — after that the network is fully free to explore via PPO rewards.
 
 # Resume from a checkpoint (BC pre-training is skipped on resume)
 uv run python -m footballcoach.ai.scripts.train \
-    --phase 1 --total-steps 500000 \
-    --checkpoint checkpoints/checkpoint_00002048.pt
+    --phase 1 --total-steps 200000 \
+    --checkpoint checkpoints/phase1_run4/checkpoint_00100000.pt
 
 # Evaluate a saved checkpoint (100 trials, writes JSON)
 uv run python -m footballcoach.ai.scripts.evaluate \
-    --checkpoint checkpoints/checkpoint_00500000.pt \
+    --checkpoint checkpoints/phase1_run4/checkpoint_00200000.pt \
     --phase 1 --n-trials 100 --output results/eval_phase1.json
 
 # Run all tests (engine + AI unit + smoke)
@@ -56,8 +74,9 @@ Override the save directory with `--checkpoint-dir path/`.
 
 | File | Lines | Why it matters |
 |------|-------|----------------|
-| `ai_trainer_knowledge.md` (this file) | ~350 | Operational guide |
-| `src/footballcoach/ai/config/ai_config.json` | ~80 | All tunable hyperparameters incl. BC |
+| `ai_trainer_knowledge.md` (this file) | ~400 | Operational guide |
+| `src/footballcoach/ai/config/ai_config.json` | ~90 | All tunable hyperparameters incl. BC |
+| `src/footballcoach/rules_ai.py` | ~150 | **Source of truth for BC labels** — `Phase1RulesAI.act()` is what `phase1_labels()` calls; change behaviour here, not in `bc.py` |
 | `src/footballcoach/ai/scripts/train.py` | ~160 | CLI entry point; how envs and BC are built |
 | `src/footballcoach/ai/curriculum/phases.py` | ~100 | Which scenario each phase uses |
 | `src/footballcoach/ui/scenarios.py` | ~1100 | All scenario builders incl. `build_1v1_scenario`; **add new training scenarios here** |
@@ -153,17 +172,19 @@ Two completely separate concerns:
 ### 3.3 PPO loop flow
 
 ```
-env.reset() → ObservationBatch
+env.sample_action_fn = trainer._sample_action  # wires NeuralPlayerAI
+env.reset()  # assigns NeuralPlayerAI to trainee (+ secondary players)
 loop:
-    _sample_action(obs) → (action, log_prob, value, ...)
-    env.step(action) → (next_obs, reward, done, info)
-    buffer.add(obs, action, log_prob, value, reward, done)
+    env.step() → (next_obs, reward, done, info)
+    # NeuralPlayerAI sampled inside Match.step(); transition in env.last_trainee_transition
+    tr = env.last_trainee_transition
+    buffer.add(obs=tr["obs"], action=..., log_prob=tr["log_prob"], ...)
     if buffer full (2048 steps):
         compute_gae(gamma=0.99, lam=0.95, last_value)
         _ppo_update(batch) → 4 epochs, minibatches of 64
         _save_checkpoint(step)
         buffer.clear()
-    obs = next_obs if not done else env.reset()
+    if done: env.reset()
 ```
 
 One rollout = 2048 decision steps = ~1024 sim-seconds = ~8.5 min of sim time.
@@ -208,27 +229,76 @@ torch.save(ckpt["execution_net"], "models/execution_net_500k.pt")
 
 - Both players random placement, random attributes (`generic` tier), random
   stamina (0.3–1.0), random headings.
-- Ball: random placement, random velocity (≤8 m/s, resampled to stay in
+- **Trainee team is randomised each episode** (50% Team.LEFT attacks +x, 50%
+  Team.RIGHT attacks -x).  Pass `trainee_team=Team.LEFT/RIGHT` to pin it
+  (used in tests for direction-cosine assertions).
+- Ball: random placement, random velocity (≤**10 m/s**, resampled to stay in
   bounds 3s), random spin, random restitution (Gaussian σ=0.08 around default).
-- Opponent: **immobile** (no order) — the first sub-phase.
-- Episode ends: trainee reaches opponent box with ball (+5.0 terminal), or
-  120s timeout.
-- Reward:
+- **Opponent: 50/50 per episode** — either `opponent.ai = Phase1RulesAI()`
+  (chases ball / sprints to box; driven automatically by `Match.step()`) or
+  `opponent.ai = None` (standing still while the neural network controls it).
+  Flag `match._opponent_use_rules_ai` is set randomly in `build_1v1_scenario`.
+- **Episode ends** when **either player** reaches the other's box with
+  possession, **or** 120s timeout.
+  - Trainee reaches opponent box: +5.0 terminal reward (trainee wins)
+  - Opponent reaches trainee's box: episode ends, no terminal bonus (trainee
+    just loses; the standard step rewards already penalise this path)
+- Reward (same coefficients for both trainee and opponent when both are neural):
   ```
   +0.05 × (prev_ball_dist - curr_ball_dist)   # closing distance
   +1.0 if gained possession this step
-  +0.1 × ball_progress_m (toward opponent goal, only when in possession)
-  -1.0 if ball went out after trainee touched it
+  +0.1 × ball_progress_m (toward OWN attacking goal, only when in possession)
+  -1.0 if ball went out after this player touched it
   -0.2 if illegal action attempted
   +5.0 if reached opponent box with possession (terminal)
   ```
-- Progression (not yet automated): immobile opponent → rules-based opponent
-  (`GetPossessionOrder`/`MoveOrder`) → frozen older-generation checkpoint.
 
-**BC bootstrapping for Phase 1** (`bc.py::phase1_labels`):
-- Ball loose or opponent has it → `get_possession_extra=1`, `move_dir` = toward ball, `sprint=1`
-- Trainee has ball → `move=1`, `move_dir` = toward opponent goal (+x), `sprint=1`
-- Trains both decision network Bernoulli heads **and** execution network `move_direction` + `sprint`
+**Dual-player training (secondary_player_ids)**:
+- In non-rules-based episodes (50%), the opponent is also driven by the
+  **shared neural network** and its transitions are added to the same rollout
+  buffer as the trainee's.
+- `ScenarioEnv` accepts `secondary_player_ids=["opponent"]`.  The trainer
+  injects `env.sample_action_fn = self._sample_action` at the start of
+  `train()`.  After each `env.step()` the trainer drains
+  `env.last_secondary_results` and calls `buffer.add()` for each.
+- In rules-based episodes (50%), the opponent is driven by `player.ai`
+  (`Phase1RulesAI`) — no neural sampling is done for it (`ScenarioEnv` skips
+  secondary players when `match._opponent_use_rules_ai` is True).
+- Net effect: ~1.5× rollout fill rate vs. trainee-only; shared weights see
+  both the attacker and defender perspectives within the same training run.
+- **Episode type is tracked separately in the training log.**  `StepInfo.is_rules_episode`
+  is set from `match._opponent_use_rules_ai` and propagated to the trainer so
+  outcomes are split into `vs_rules(N): win%/opp%` and `vs_neural(N): win%/opp%`
+  in the rollout log line.  This lets you distinguish whether the trainee is
+  improving against the rules AI specifically or just beating the neural copy of
+  itself.
+
+**BC bootstrapping for Phase 1** (`bc.py::phase1_labels(env, player_id=None)`):
+- **Does NOT duplicate logic** — calls `Phase1RulesAI().act()` on a temporary
+  player state, reads back the `MoveOrder` or `GetPossessionOrder` it sets,
+  and translates that into a `BCLabel`.  If the rules AI behaviour changes,
+  the BC labels automatically follow.
+- `rules_ai.py::Phase1RulesAI` is the single source of truth for what the
+  rules-based player does.  Edit that, not `bc.py`.
+
+**Offline BC dataset** (`ai/bc/dataset.py`):
+- Pre-recorded .npz files of (obs, bc_label) pairs from rules-based play.
+- Recorded with: `uv run python -m footballcoach.ai.scripts.record_demonstrations`
+- Loaded with: `DemonstrationDataset.from_directory("demonstrations/phase1/")`
+- `BCPretrainer.pretrain(..., dataset=ds, n_epochs=3, batch_size=256)` uses
+  stable minibatch gradient descent instead of noisy single-sample online updates.
+- **Always use the offline dataset when it exists.** Online pre-training
+  (dataset=None) is noisy and oscillates on episode resets.
+
+**BC aux loss annealing** (`ai_config.json::bc.aux_coeff_anneal_fraction`):
+- `aux_coeff_start=0.35` → `aux_coeff_end=0.0`, reaching zero by
+  `aux_coeff_anneal_fraction × total_steps` (default 0.2 = 20% of training).
+- After that the network is purely RL-driven.  This is intentional — early
+  guidance, then full freedom to explore.
+
+**Direction cosine logged per BC epoch**: `pretrain_combined()` logs
+`dir_cos=X.XXX` alongside `bc_loss` at each offline epoch so you can track
+how quickly the `move_direction` head aligns with rules-based labels.
 
 ### Phase 2: Shooting
 
@@ -244,10 +314,10 @@ torch.save(ckpt["execution_net"], "models/execution_net_500k.pt")
 
 Phase 3 (`--phase 3`): passing. Phase 4 (`--phase 4`): tackling.
 Both defined in `curriculum/phases.py` with `scenario_key` pointing at
-existing UI scenarios, but `_build_env()` in `train.py` raises
-`NotImplementedError` for phases > 2.  Implement by adding cases to
-`train.py::_build_env()` and `train.py::_build_phase3_env()` etc.,
-following the same pattern as `_build_phase1_env()`.
+existing UI scenarios, but `build_env()` in `curriculum/envs.py` raises
+`NotImplementedError` for phases > 2.  Implement by adding `_build_phaseN_env()`
+to `curriculum/envs.py` — `train.py` and `record_demonstrations.py` both
+use `build_env()` automatically.
 
 ---
 
@@ -269,10 +339,22 @@ Never hardcode them.  Key sections:
     "target_kl": 0.02       // early-stop threshold per epoch
   },
   "bc": {
-    "pretrain_steps": 2000,     // supervised BC steps before PPO (0 = skip)
-    "pretrain_lr": 1e-3,        // learning rate for the BC pre-training phase
-    "aux_coeff_start": 0.2,     // BC aux loss weight at step 0 of PPO
-    "aux_coeff_end": 0.0        // BC aux loss weight at final step (linear anneal)
+    "pretrain_steps": 6000,               // online pre-training steps (fallback, no dataset)
+    "pretrain_lr": 6e-3,                  // learning rate for online BC pre-training
+    "pretrain_online_batch_size": 4,      // online BC gradient accumulation batch size
+    "direction_loss_weight": 3.0,         // weight on cosine direction loss vs BCE heads
+                                          // NOTE: high values corrupt the trunk at low step
+                                          // counts — keep ≤0.5 for online pre-training tests
+    "bc_pretrain_epochs": 50,            // offline BC epochs (used with --bc-dataset)
+    "bc_pretrain_batch_size": 256,        // offline BC minibatch size
+    "aux_coeff_start": 0.35,             // BC aux loss weight at PPO step 0
+    "aux_coeff_end": 0.0,                 // BC aux loss weight at end of annealing window
+    "aux_coeff_anneal_fraction": 0.2,     // fraction of total_steps over which coeff anneals
+    "value_pretrain_steps": 4096,         // rollout steps collected for value warm-up
+    "value_pretrain_epochs": 20,          // value-head epochs over that rollout
+    "value_pretrain_lr": 1e-2,           // value warm-up learning rate
+    "bc_repair_epochs": 10,              // joint BC+value repair epochs after value warm-up
+    "bc_repair_lr": 3e-3                 // learning rate for BC repair pass
   },
   "reward": {
     "phase1": {
@@ -306,27 +388,37 @@ rules-based AI does not have.  Instead, BC is a *separate, additive* loss.
 
 ### Two modes (both configurable, composable)
 
-**Mode 1 — Pre-training (before PPO):**
-`BCPretrainer.pretrain(env, n_steps, label_fn)` in `bc.py`.
-Rolls the *network* in the env but supervises it with BC labels from the
-rules-based logic each step.  Network weights update via pure BCE/cosine
-loss.  This gives the network a warm-start before PPO exploration begins,
-dramatically reducing the number of PPO steps to reach competent behaviour.
+**Mode 1 — Combined offline pre-training (recommended):**
+When `--bc-dataset` is provided, `PPOTrainer.pretrain_combined()` runs:
+  1. N BC epochs over the dataset (all params, stable minibatch SGD)
+  2. Collect one rollout with the now-BC-warmed policy (on-policy value targets)
+  3. M value-head epochs over that rollout (value heads only, trunk frozen)
 
-**Mode 2 — Auxiliary loss during PPO:**
+This is better than online pre-training because gradients are low-variance
+(minibatch over diverse dataset) and value targets are on-policy.
+
+**Mode 2 — Online pre-training (fallback, no dataset):**
+`BCPretrainer._pretrain_online()` steps the env, accumulates
+`pretrain_online_batch_size` (obs, label) pairs, then does one gradient step.
+Still noisy vs. offline mode, but much better than single-sample updates.
+`direction_loss_weight` must be kept low (≤0.5) for short online runs — high
+values cause the direction cosine loss to corrupt the shared trunk and invert the
+Bernoulli heads.  Use only when no dataset is available.
+
+**Mode 3 — Auxiliary loss during PPO:**
 At each PPO rollout step, `label_fn(env)` is called and a `BCLabel` is
 stored in the rollout buffer.  During `_ppo_update()`, a BC loss term is
 added: `total_loss += bc_coeff * bc_loss`.  `bc_coeff` anneals linearly
-from `aux_coeff_start` to `aux_coeff_end` (default 0.2 → 0.0) so BC
-influence fades as the RL signal takes over.
+from `aux_coeff_start` to `aux_coeff_end` over `aux_coeff_anneal_fraction`
+of total training steps (default 0.2 → 0.0 by 30%), then stays 0.0.
 
 ### What is supervised
 
 `bc_loss_from_tensor()` in `bc.py` supervises:
 - **Decision network**: all 7 Bernoulli heads (shoot, pass, move, tackle,
   get_possession_extra, mark, hold_position) via `binary_cross_entropy_with_logits`.
-- **Execution network**: `move_direction` (cosine loss on raw pre-normalised
-  2D vector output), `sprint` (BCE from logit).
+- **Execution network**: `move_direction` (cosine loss; `bc.py` normalizes
+  both prediction and label before computing the loss), `sprint` (BCE from logit).
 - Kick, tackle_attempt, and kick_direction are not supervised
   (rules-based AI doesn't kick in Phase 1; extend `BCLabel` if needed later).
 
@@ -347,7 +439,35 @@ influence fades as the RL signal takes over.
 
 ---
 
-## 7. Adding a new training scenario
+## 7. Reading the training log
+
+Each rollout (every 2048 steps) prints one line:
+
+```
+step=28,679 | rew=8.76 | pol=0.02 val=1.00 ent=0.25 kl=0.16  bc=2.84(x0.17) | 283sps  mv_ls=[0.01,0.00]  vs_rules(18): 65%/12%  vs_neural(16): 44%/25%
+```
+
+| Field | Meaning |
+|-------|---------|
+| `rew` | Mean episode return over last 20 episodes |
+| `val` | **Normalised MSE** of the value head: `MSE(predicted, GAE_return) / Var(returns)`.  ~1.0 = predicting the mean (no better than constant).  <0.5 = critic is useful.  0.85 after warmup is expected — it improves as returns stabilise |
+| `ent` | Policy entropy (higher = more exploration) |
+| `kl` | Approximate KL divergence from old policy.  >0.1 = large update (KL diagnostics printed separately). Repeated >1.0 = policy diverging |
+| `bc=X(xY)` | BC auxiliary loss value × current annealing coefficient.  Disappears once coeff reaches 0 |
+| `sps` | Decision steps per second |
+| `mv_ls` | `move_direction` log-std for both output dimensions (tracks direction head confidence) |
+| `vs_rules(N): W%/L%` | Trainee win% / opponent win% in the N **rules-based opponent** episodes this rollout |
+| `vs_neural(N): W%/L%` | Same for **neural opponent** episodes (shared-weight self-play).  Compare to `vs_rules` to see if improvement is vs the rules AI or just self-play |
+
+Offline BC epoch lines (during `pretrain_combined`):
+```
+  BC epoch 5/50: bc_loss=0.52  dir_cos=0.34
+```
+`dir_cos` is the mean cosine similarity between predicted and label `move_direction` for valid steps in that epoch.  Should rise toward 1.0 across epochs.
+
+---
+
+## 8. Adding a new training scenario
 
 All scenarios live in **`src/footballcoach/ui/scenarios.py`** — one source of
 truth for both the training loop and the UI scenario picker.
@@ -358,14 +478,15 @@ truth for both the training loop and the UI scenario picker.
    - Use `random.Random()` internally (not global `random`) so it's re-seedable.
    - Use `generate_attributes(tier=..., rng=rng)` for player attributes.
    - Set `player.stamina`, `player.heading_rad` manually as needed.
-   - Return a `Match` with orders pre-assigned to all non-trainee players.
-   - Trainee player id should be a stable string like `"trainee"`.
+   - Assign `player.ai = Phase1RulesAI()` (or another `PlayerAI` subclass from
+     `footballcoach.rules_ai`) to every non-trainee player that needs per-tick
+     logic.  `Match.step()` calls `ai.act(player, match, tick)` automatically.
+   - Return the `Match`; trainee player id should be a stable string like `"trainee"`.
 
-2. Optionally write an `_my_scenario_on_tick(match, trial_tick)` hook for
-   per-tick AI logic (only needed if rules-based players need updating each tick).
-
-3. Add a `ScenarioDefinition(key="my_key", ..., build=build_my_scenario,
-   on_tick=..., params=[...])` entry to the `SCENARIOS` list.
+2. Add a `ScenarioDefinition(key="my_key", ..., build=build_my_scenario,
+   on_tick=None, params=[...])` entry to the `SCENARIOS` list.
+   (`on_tick` is still available for rare cross-player coordination that can't
+   live on a single player's AI, but almost all scenarios should not need it.)
 
 4. Add a `CurriculumPhase(phase_id=N, scenario_key="my_key", ...)` to
    `curriculum/phases.py` and `ALL_PHASES` / `PHASES_BY_ID`.
@@ -378,19 +499,22 @@ truth for both the training loop and the UI scenario picker.
 
 ---
 
-## 8. Environment wrapper — ScenarioEnv
+## 9. Environment wrapper — ScenarioEnv
 
 ```
 src/footballcoach/ai/env/scenario_env.py
 ```
 
 Key behaviour:
-- `reset()` calls `ScenarioLoop._start_trial()` which calls `definition.build(rng_reduction)`.
-- `step(action)` applies gating + `apply_action_to_player()`, then runs
-  `ScenarioLoop.step()` in a sub-loop for `DECISION_INTERVAL_S / dt_s = 15` ticks.
+- `reset()` calls `ScenarioLoop._start_trial()`, then assigns `NeuralPlayerAI`
+  to the trainee (and secondary players) when `sample_action_fn` is set.
+- `step()` (no args) ticks the sim 15 times; all player AI fires inside
+  `Match.step()`.  After the tick loop, reads `player.ai.last_transition` to
+  populate `env.last_trainee_transition` and `env.last_secondary_results`.
 - Returns `(obs, reward, done, StepInfo)`.
-- `done` is `True` when `ScenarioLoop.step()` returns `True` (trial ended)
-  OR the episode tick limit is reached.
+- `done` is `True` when `ScenarioLoop.step()` returns `True` (trial ended),
+  OR the episode tick limit is reached, OR **any** player reaches the opponent
+  box with possession (phase 1).
 - The `timeout_ticks` passed to `ScenarioLoop` is `max_episode_s / dt_s`
   (not the ScenarioLoop default of 500); this ensures 120s episodes work.
 
@@ -398,9 +522,24 @@ Key behaviour:
 scenario's `build_*` function (e.g. `"trainee"` for phase 1,
 `"kicker"` for phase 2).
 
+**Secondary player training** (`secondary_player_ids`, `sample_action_fn`):
+- Pass `secondary_player_ids=["opponent", ...]` to also drive those players
+  with the shared neural network.
+- Set `env.sample_action_fn = trainer._sample_action` (done automatically by
+  `PPOTrainer.train()`).  `ScenarioEnv.reset()` then assigns `NeuralPlayerAI`
+  to the trainee and all secondary players.
+- After each `step()`, `env.last_trainee_transition` holds the PPO data for
+  the trainee; `env.last_secondary_results` holds the same for secondary
+  players (list of dicts `{obs, action, log_prob, value, raw_exec, reward, done}`).
+  Both are populated from `player.ai.last_transition` inside `step()`.
+- Secondary players are **skipped** (no neural sampling) when
+  `match._opponent_use_rules_ai` is True — their orders come from `player.ai`
+  instead.  Mixing neural + `player.ai` orders on the same player corrupts the
+  episode.
+
 ---
 
-## 8. Tests
+## 10. Tests
 
 ### AI unit tests (no training, fast)
 ```bash
@@ -426,7 +565,7 @@ uv run pytest tests/ -q   # all engine + AI + balance tests
 
 ---
 
-## 9. Common gotchas
+## 11. Common gotchas
 
 ### `trainee_player_id` must match the scenario
 If `ScenarioEnv` cannot find the player id in the `Match`, every call to
@@ -466,7 +605,8 @@ The PPO importance ratio `exp(new_lp - old_lp)` requires that `old_lp` and
 bugs caused `old_lp` to include terms that `new_lp` never matched:
 1. `sprint/kick/tackle_attempt` were stored as `0.0` (fixed: stored from samples)
 2. `move_dir_raw/kick_dir_raw` were not stored at all (fixed: stored + recomputed
-   via `DirectionHead` in `_recompute_log_prob`)
+   via `DirectionHead` in `_recompute_log_prob`; direction heads are now
+   included in the PPO ratio — see design doc 8.6)
 3. `bc_loss_val` was not detached before `.item()` (fixed: `.detach().item()`)
 
 Symptoms of a recurrence: `approx_kl` > 10 at step 1, `value_loss` doubling
@@ -477,6 +617,17 @@ every rollout.
 Do not cache slot-to-player mappings between steps.  Use `slot_player_ids`
 (returned by `_sample_action`) to convert a target slot index to a player id
 when building engine orders.
+
+### Direction heads are unit-normalized in `forward()` — included in PPO ratio
+`ExecutionNetwork.forward()` L2-normalizes `move_direction` and
+`kick_direction` to unit vectors before returning them in `ExecutionHeadsRaw`.
+This constrains the distribution mean to the unit circle (max mean-shift = 2),
+bounding the KL contribution to O(1) per step. Consequently **both direction
+heads are included in `_compute_log_prob` / `_recompute_log_prob`** like all
+other heads — the old exclusion and the `dir_l2` loss penalty are gone.
+The stored rollout values `move_dir_raw`/`kick_dir_raw` are still the noisy
+samples (drawn from Normal(unit_mean, std)) and are *not* on the unit circle —
+they're normalized separately when computing the physical direction for the engine.
 
 ### Categorical log_prob is gated by intent
 `pass_target` log_prob is only added when `pass_` (Bernoulli) fired (=1).
@@ -491,7 +642,7 @@ training stopped.  This is intentional.
 
 ---
 
-## 10. Current state and next steps
+## 12. Current state and next steps
 
 ### What is done
 - Full architecture implemented and tested: entity encoder + attention,
@@ -501,15 +652,25 @@ training stopped.  This is intentional.
   smoothing for attack/defence weighting.
 - Phase 1 scenario (`build_1v1_scenario`): random placement, attributes,
   stamina, heading; random ball velocity/spin/restitution.
+  - **Trainee team randomised** each episode (attacks either end).
+  - **Ball max speed increased to 10 m/s**.
+  - **Episode ends when either player reaches the opponent's box** with
+    possession (not just the trainee).
+  - **Opponent 50/50**: rules-based AI or neural network per episode.
 - End-to-end smoke test suite in `tests/ai_scenario/`.
 - Training loop confirmed to run: first PPO update at step=2048 produces
   finite losses and a positive mean episode reward from ball-chasing behaviour.
 - Checkpoint saving after every rollout and at end of run.
+- **Dual-player training**: `ScenarioEnv` accepts `secondary_player_ids` and
+  drives those players with the shared neural network (when not in rules-based
+  mode).  Their transitions are drained into the same rollout buffer by
+  `PPOTrainer.train()`.  Phase 1 training uses `secondary_player_ids=["opponent"]`.
 - **Behavioural cloning (BC) bootstrapping** (`src/footballcoach/ai/ppo/bc.py`):
   - Pre-training phase: pure supervised BCE on rules-based labels for N steps before PPO.
   - Auxiliary loss during PPO: BC cross-entropy added to PPO loss with linearly annealed coefficient.
   - Both modes train **decision network** (all 7 Bernoulli heads) AND **execution network** (`move_direction`, `sprint`).
-  - Phase 1 label fn: `bc.phase1_labels(env)` — toward ball when loose, toward goal when in possession.
+  - Phase 1 label fn: `bc.phase1_labels(env, player_id=None)` — team-aware,
+    works for any player; toward ball when loose, toward own attacking goal when in possession.
   - Configurable via `ai_config.json["bc"]` and CLI flags `--bc-pretrain-steps` / `--no-bc-aux`.
 
 ### Immediate next step: first real Phase 1 experiment
@@ -529,13 +690,13 @@ uv run python -m footballcoach.ai.scripts.evaluate \
     --phase 1 --n-trials 200 --output results/phase1_100k.json
 ```
 
-### Phase 1 opponent progression (not yet automated)
-The design calls for: immobile → sometimes rules-based → sometimes older
-frozen AI.  Currently the opponent is always immobile.  To add rules-based
-opponent: in `build_1v1_scenario`, assign `opponent.current_order =
-GetPossessionOrder()` when the opponent doesn't have the ball, and a `MoveOrder`
-toward the trainee's goal when it does.  This can be done via an `on_tick` hook
-on the `ScenarioDefinition` (see `_1v1_on_tick` as a template).
+### Phase 1 opponent progression
+Current state: **50% rules-based / 50% neural each episode** (automated).
+The `match._opponent_use_rules_ai` flag (set in `build_1v1_scenario`) controls
+which mode applies.  `Phase1RulesAI` (via `opponent.ai`) drives the opponent in
+rules-based episodes; `ScenarioEnv` drives it with the shared network in
+neural episodes.
+Next step: add frozen older-generation checkpoints as a third opponent mode.
 
 ### Phase 2 (shooting) — not yet run
 Ready to train.  Scenario is `build_penalty_scenario`.  Run with `--phase 2`.

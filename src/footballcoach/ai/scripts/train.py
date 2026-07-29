@@ -16,7 +16,7 @@ from pathlib import Path
 
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+    format="%(asctime)s %(levelname)s %(message)s",
 )
 log = logging.getLogger("footballcoach.ai.train")
 
@@ -26,7 +26,7 @@ def main() -> None:
     parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 3, 4],
                         help="Curriculum phase to train (default: 1)")
     parser.add_argument("--total-steps", type=int, default=500_000,
-                        help="Total training decision-steps (default: 500000)")
+                        help="PPO decision-steps to train for, excluding pre-training (default: 500000)")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to a checkpoint .pt file to resume from")
     parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/",
@@ -43,7 +43,22 @@ def main() -> None:
                         ))
     parser.add_argument("--no-bc-aux", action="store_true",
                         help="Disable BC auxiliary loss during PPO (ignores ai_config.json bc.aux_coeff).")
+    parser.add_argument("--bc-dataset", type=str, default=None,
+                        help=(
+                            "Path to a directory of .npz demonstration files for offline BC "
+                            "pre-training. When provided, pre-training uses the dataset instead "
+                            "of online env collection. Use record_demonstrations.py to create one."
+                        ))
+    parser.add_argument("--bc-pretrain-epochs", type=int, default=None,
+                        help="Epochs over dataset for offline BC pre-training (default: bc.bc_pretrain_epochs in ai_config.json).")
+    parser.add_argument("--bc-pretrain-batch-size", type=int, default=None,
+                        help="Minibatch size for offline BC pre-training (default: bc.bc_pretrain_batch_size in ai_config.json).")
+    parser.add_argument("--verbose", action="store_true",
+                        help="Enable debug-level logs (per-minibatch details, per-head diagnostics).")
     args = parser.parse_args()
+
+    if args.verbose:
+        logging.getLogger("footballcoach.ai").setLevel(logging.DEBUG)
 
     import torch
     torch.manual_seed(args.seed)
@@ -65,10 +80,11 @@ def main() -> None:
     log.info(f"Phase description: {phase.description}")
 
     # Build environment
-    env = _build_env(phase)
+    from footballcoach.ai.curriculum.envs import build_env, bc_label_fn_for_phase
+    env = build_env(phase)
 
     # BC label function (None = no BC)
-    label_fn = _bc_label_fn_for_phase(args.phase)
+    label_fn = bc_label_fn_for_phase(args.phase)
 
     # BC pre-training steps: CLI flag overrides config
     cfg = load_ai_config()
@@ -101,92 +117,67 @@ def main() -> None:
     if args.checkpoint:
         trainer.load_checkpoint(Path(args.checkpoint))
 
-    # BC pre-training phase (supervised, before PPO)
-    if pretrain_steps > 0 and label_fn is not None:
-        from footballcoach.ai.ppo.bc import BCPretrainer
-        pretrainer = BCPretrainer(
-            trainer.decision_net, trainer.execution_net, cfg, device
-        )
-        pretrainer.pretrain(env, n_steps=pretrain_steps, label_fn=label_fn)
-
-    # Value pre-training phase (fit value heads to actual returns before PPO)
+    # Pre-training phase: BC + value jointly when a dataset is available,
+    # otherwise fall back to online BC then separate value pre-training.
     value_pretrain_steps = int(bc_cfg.get("value_pretrain_steps", 0))
     value_pretrain_epochs = int(bc_cfg.get("value_pretrain_epochs", 20))
     value_pretrain_lr = float(bc_cfg.get("value_pretrain_lr", 1e-3))
-    if value_pretrain_steps > 0 and not args.checkpoint:
-        trainer.pretrain_value(
-            env,
-            n_steps=value_pretrain_steps,
-            n_epochs=value_pretrain_epochs,
-            lr=value_pretrain_lr,
+
+    if not args.checkpoint:
+        from footballcoach.ai.bc.dataset import DemonstrationDataset
+        dataset = None
+        if args.bc_dataset:
+            dataset = DemonstrationDataset.from_directory(args.bc_dataset)
+            log.info(f"Offline BC dataset: {len(dataset):,} steps from {args.bc_dataset}")
+
+        bc_pretrain_epochs = (
+            args.bc_pretrain_epochs
+            if args.bc_pretrain_epochs is not None
+            else int(bc_cfg.get("bc_pretrain_epochs", 30))
         )
+        bc_pretrain_batch_size = (
+            args.bc_pretrain_batch_size
+            if args.bc_pretrain_batch_size is not None
+            else int(bc_cfg.get("bc_pretrain_batch_size", 256))
+        )
+
+        if dataset is not None and label_fn is not None:
+            # Combined joint pre-training (BC + value in one pass)
+            trainer.pretrain_combined(
+                env=env,
+                dataset=dataset,
+                n_epochs=bc_pretrain_epochs,
+                batch_size=bc_pretrain_batch_size,
+                bc_lr=float(bc_cfg.get("pretrain_lr", 3e-4)),
+                value_lr=value_pretrain_lr,
+                repair_lr=float(bc_cfg.get("bc_repair_lr", bc_cfg.get("pretrain_lr", 3e-4))),
+                rollout_steps=max(value_pretrain_steps, trainer.rollout_steps),
+                value_epochs=value_pretrain_epochs,
+            )
+        else:
+            # Online BC pre-training (noisy but works without a dataset)
+            if pretrain_steps > 0 and label_fn is not None:
+                from footballcoach.ai.ppo.bc import BCPretrainer
+                pretrainer = BCPretrainer(
+                    trainer.decision_net, trainer.execution_net, cfg, device
+                )
+                pretrainer.pretrain(env, n_steps=pretrain_steps, label_fn=label_fn)
+
+            # Separate value pre-training
+            if value_pretrain_steps > 0:
+                trainer.pretrain_value(
+                    env,
+                    n_steps=value_pretrain_steps,
+                    n_epochs=value_pretrain_epochs,
+                    lr=value_pretrain_lr,
+                )
 
     # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0)
     aux_label_fn = None if (args.no_bc_aux or label_fn is None) else label_fn
     trainer.train(env, total_steps=args.total_steps, bc_label_fn=aux_label_fn)
 
 
-def _bc_label_fn_for_phase(phase_id: int):
-    """Return the BC label function for the given phase, or None if not defined."""
-    if phase_id == 1:
-        from footballcoach.ai.ppo.bc import phase1_labels
-        return phase1_labels
-    return None
-
-
-def _build_env(phase):
-    """Build a ScenarioEnv for the given curriculum phase."""
-    from footballcoach.ai.env.scenario_env import ScenarioEnv
-
-    # MVP: use the existing UI scenarios as training environments.
-    # Phase 1: a simple 1v1 GetPossession/Move scenario.
-    # Phase 2: the penalty scenario (attacker + optional GK).
-    if phase.phase_id == 1:
-        env = _build_phase1_env(phase)
-    elif phase.phase_id == 2:
-        env = _build_phase2_env(phase)
-    else:
-        raise NotImplementedError(f"Phase {phase.phase_id} not yet implemented")
-    return env
-
-
-def _build_phase1_env(phase):
-    """Phase 1: 1v1 get possession and bring ball toward goal."""
-    from footballcoach.ai.env.scenario_env import ScenarioEnv
-    from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
-
-    import functools
-    defn = ScenarioDefinition(
-        key="phase1_1v1",
-        label="Phase 1: 1v1 Get Possession",
-        description="1v1 scenario for curriculum phase 1",
-        build=functools.partial(build_1v1_scenario, ball_max_speed_mps=4.0),
-    )
-    return ScenarioEnv(
-        definition=defn,
-        trainee_player_id="trainee",
-        phase=1,
-        **phase.env_kwargs,
-    )
-
-
-def _build_phase2_env(phase):
-    """Phase 2: shooting (penalty + GK)."""
-    from footballcoach.ai.env.scenario_env import ScenarioEnv
-    from footballcoach.ui.scenarios import build_penalty_scenario, ScenarioDefinition
-
-    defn = ScenarioDefinition(
-        key="phase2_penalty",
-        label="Phase 2: Shoot",
-        description="Penalty scenario for curriculum phase 2",
-        build=build_penalty_scenario,
-    )
-    return ScenarioEnv(
-        definition=defn,
-        trainee_player_id="kicker",
-        phase=2,
-        **phase.env_kwargs,
-    )
+# env building and label functions live in curriculum.envs — no duplication here.
 
 
 if __name__ == "__main__":

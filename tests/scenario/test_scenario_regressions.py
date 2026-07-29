@@ -16,10 +16,10 @@ from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.entities.player import PlayerState
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import GetPossessionOrder, MoveOrder
+from footballcoach.rules_ai import SprintWaypointAI
 from footballcoach.ui.scenarios import (
     ScenarioDefinition,
     ScenarioLoop,
-    SprintController,
     _sprint_on_tick,
     _PASS_SCENARIO_GET_POSSESSION_RADIUS_M,
     _pass_on_tick,
@@ -98,10 +98,8 @@ def _build_multi_waypoint_sprint(rng_reduction: float = 1.0) -> Match:
               rng_reduction=rng_reduction, rng=random.Random(0),
               goal_linger_s=ui_cfg.get("goal_linger_s", 3.0))
     waypoints = [Vector3(0, 0, 0), Vector3(5, 0, 0), Vector3(10, 0, 0)]
-    ctrl = SprintController(player.player_id, waypoints)
     player.current_order = MoveOrder(target_position=waypoints[0], sprint=True)
-    ctrl._next_idx = 1
-    m._sprint_controller = ctrl  # type: ignore[attr-defined]
+    player.ai = SprintWaypointAI(waypoints, start_idx=1)
     return m
 
 

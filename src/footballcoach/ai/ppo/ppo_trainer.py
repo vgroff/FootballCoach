@@ -93,6 +93,9 @@ class PPOTrainer:
         self.target_kl = float(ppo_cfg.get("target_kl", 0.02))
         self.rollout_steps = int(ppo_cfg.get("rollout_steps", 2048))
         self.dir_l2_coef = float(ppo_cfg.get("dir_l2_coef", 0.01))
+        self.dir_log_std_min = float(ppo_cfg.get("dir_log_std_min", -5.0))
+        self.dir_log_std_max = float(ppo_cfg.get("dir_log_std_max", 2.0))
+        self._bc_cfg = bc_cfg
 
         lr = float(ppo_cfg.get("learning_rate", 3e-4))
         all_params = list(decision_net.parameters()) + list(execution_net.parameters())
@@ -123,11 +126,17 @@ class PPOTrainer:
                 network's move_direction and sprint are supervised.
         """
         from footballcoach.ai.ppo.bc import BCLabel
+        # Inject the sampling function so ScenarioEnv assigns NeuralPlayerAI to
+        # the trainee (and secondary players when not in rules-based mode).
+        env.sample_action_fn = self._sample_action
+
         obs = env.reset()
         buffer = RolloutBuffer()
         steps_this_rollout = 0
         episode_rewards: list[float] = []
         episode_reward_accum = 0.0
+        episode_outcomes_vs_rules: list[str] = []
+        episode_outcomes_vs_neural: list[str] = []
 
         log.info(f"PPO training started: total_steps={total_steps}")
 
@@ -137,34 +146,36 @@ class PPOTrainer:
             progress = self._total_steps / total_steps
 
             # --- Collect one decision step ---
-            obs_dict = {k: v for k, v in obs.to_torch_dict().items()}
-            action, log_prob, value, decision_probs, execution_physical, decision_physical, target_slots, raw_exec_samples = (
-                self._sample_action(obs_dict)
-            )
+            # NeuralPlayerAI fires inside env.step() — no pre-sampling needed here.
+            next_obs, reward, done, info = env.step()
 
-            # Build the action dict for the env
-            env_action = {
-                "decision_probs": decision_probs,
-                "execution_physical": execution_physical,
-                "decision_physical": decision_physical,
-                "target_slots": target_slots,
-                "slot_player_ids": getattr(env, "_last_slot_player_ids", [None] * 21),
-                "decision": action,
-                "execution": ExecutionAction(),  # placeholder; gating uses execution_physical
-            }
+            # Read transition data from the trainee's NeuralPlayerAI
+            tr = env.last_trainee_transition
+            if tr is None:
+                # No neural decision this step (e.g. rules-based episode where
+                # trainee is immobile); skip storing a transition.
+                if done:
+                    episode_rewards.append(episode_reward_accum)
+                    episode_reward_accum = 0.0
+                    obs = env.reset()
+                else:
+                    obs = next_obs
+                continue
 
-            next_obs, reward, done, info = env.step(env_action)
+            action = tr["action"]
+            log_prob = tr["log_prob"]
+            value = tr["value"]
+            raw_exec_samples = tr["raw_exec"]
 
-            # Collect BC label for this step (before resetting obs)
+            # Collect BC label for this step
             bc_label_arr = None
             if bc_label_fn is not None:
                 bc_label = bc_label_fn(env)
                 bc_label_arr = bc_label.to_array()
 
-            # Store transition (as numpy, not torch, for efficient storage)
-            obs_numpy = {k: v.numpy() for k, v in obs_dict.items()}
+            # Store trainee transition
             buffer.add(
-                obs=obs_numpy,
+                obs=tr["obs"],
                 action=_action_to_numpy(action, raw_exec_samples),
                 log_prob=float(log_prob),
                 value=float(value),
@@ -173,6 +184,20 @@ class PPOTrainer:
                 bc_label=bc_label_arr,
             )
 
+            # Store secondary player transitions (shared-weight training data)
+            for sec in getattr(env, "last_secondary_results", []):
+                buffer.add(
+                    obs=sec["obs"],  # already numpy dict from NeuralPlayerAI
+                    action=_action_to_numpy(sec["action"], sec["raw_exec"]),
+                    log_prob=sec["log_prob"],
+                    value=sec["value"],
+                    reward=sec["reward"],
+                    done=sec["done"],
+                    bc_label=None,
+                )
+                steps_this_rollout += 1
+                self._total_steps += 1
+
             episode_reward_accum += reward
             self._total_steps += 1
             steps_this_rollout += 1
@@ -180,6 +205,11 @@ class PPOTrainer:
             if done:
                 episode_rewards.append(episode_reward_accum)
                 episode_reward_accum = 0.0
+                if info is not None and info.trial_outcome is not None:
+                    if info.is_rules_episode:
+                        episode_outcomes_vs_rules.append(info.trial_outcome)
+                    else:
+                        episode_outcomes_vs_neural.append(info.trial_outcome)
                 obs = env.reset()
             else:
                 obs = next_obs
@@ -202,26 +232,42 @@ class PPOTrainer:
                 metrics = self._ppo_update(batch, progress)
                 update_time = time.perf_counter() - update_start
 
-                # Log
+                # Log one clean line per rollout
                 mean_ep_reward = (
                     float(np.mean(episode_rewards[-20:])) if episode_rewards else 0.0
                 )
                 bc_str = (
-                    f" | bc_loss={metrics['bc_loss']:.4f}"
-                    f" (coeff={metrics['bc_coeff']:.3f})"
+                    f"  bc={metrics['bc_loss']:.4f}(x{metrics['bc_coeff']:.2f})"
                     if metrics.get("bc_coeff", 0.0) > 0.0 else ""
                 )
+                # Phase-1 outcome win-rate over this rollout's episodes, split by opponent type
+                outcome_parts = []
+                if episode_outcomes_vs_rules:
+                    n = len(episode_outcomes_vs_rules)
+                    tw = episode_outcomes_vs_rules.count("box_possession")
+                    ow = episode_outcomes_vs_rules.count("opponent_box_possession")
+                    outcome_parts.append(f"vs_rules({n}): {tw/n*100:.0f}%/{ow/n*100:.0f}%")
+                    episode_outcomes_vs_rules.clear()
+                if episode_outcomes_vs_neural:
+                    n = len(episode_outcomes_vs_neural)
+                    tw = episode_outcomes_vs_neural.count("box_possession")
+                    ow = episode_outcomes_vs_neural.count("opponent_box_possession")
+                    outcome_parts.append(f"vs_neural({n}): {tw/n*100:.0f}%/{ow/n*100:.0f}%")
+                    episode_outcomes_vs_neural.clear()
+                outcome_str = ("  " + "  ".join(outcome_parts)) if outcome_parts else ""
+                mv_ls = metrics.get('move_log_std', [])
+                mv_ls_str = f"  mv_ls=[{','.join(f'{v:.2f}' for v in mv_ls)}]" if mv_ls else ""
                 log.info(
                     f"step={self._total_steps:,} | "
-                    f"ep_reward={mean_ep_reward:.2f} | "
-                    f"policy_loss={metrics['policy_loss']:.4f} | "
-                    f"value_loss={metrics['value_loss']:.4f} | "
-                    f"entropy={metrics['entropy']:.4f} | "
-                    f"approx_kl={metrics['approx_kl']:.4f}"
+                    f"rew={mean_ep_reward:.2f} | "
+                    f"pol={metrics['policy_loss']:.4f} "
+                    f"val={metrics['value_loss']:.4f} "
+                    f"ent={metrics['entropy']:.4f} "
+                    f"kl={metrics['approx_kl']:.4f}"
                     f"{bc_str} | "
-                    f"rollout={rollout_time:.1f}s | "
-                    f"update={update_time:.1f}s ({metrics['epoch_time_ms']:.0f}ms/epoch) | "
-                    f"{steps_per_sec:.0f} steps/s"
+                    f"{steps_per_sec:.0f}sps"
+                    f"{mv_ls_str}"
+                    f"{outcome_str}"
                 )
 
                 buffer.clear()
@@ -244,6 +290,274 @@ class PPOTrainer:
     # Value pre-training
     # -----------------------------------------------------------------------
 
+    def pretrain_combined(
+        self,
+        env,
+        dataset,
+        n_epochs: int,
+        batch_size: int,
+        bc_lr: float,
+        value_lr: float,
+        rollout_steps: int,
+        value_epochs: int = 5,
+        repair_lr: Optional[float] = None,
+    ) -> None:
+        """Joint BC + value pre-training in a single pass.
+
+        Collects one rollout to get GAE returns for the value loss, then for
+        each epoch iterates over the BC dataset in minibatches.  Each iteration
+        does two backward passes:
+
+          1. BC loss (all parameters) — teaches the policy trunk to imitate the
+             rules-based AI.
+          2. Value loss (value heads only, trunk detached) — warm-starts the
+             critic to predict actual returns, without corrupting the trunk.
+
+        This replaces the two separate ``BCPretrainer.pretrain`` +
+        ``pretrain_value`` calls and avoids the oscillation of online BC
+        pre-training.
+
+        Args:
+            env: ScenarioEnv
+            dataset: DemonstrationDataset
+            n_epochs: epochs over the BC dataset
+            batch_size: minibatch size for both losses
+            bc_lr: learning rate for BC (all params)
+            value_lr: learning rate for value heads only
+            rollout_steps: steps to collect for value targets (≥ rollout_steps in config)
+        """
+        from footballcoach.ai.ppo.bc import bc_loss_from_tensor
+        from footballcoach.ai.bc.dataset import DemonstrationDataset
+
+        log.info(
+            f"Combined BC + value pre-training: {n_epochs} epoch(s), "
+            f"batch_size={batch_size}, dataset={len(dataset):,} steps, "
+            f"rollout_steps={rollout_steps}"
+        )
+
+        bc_opt = torch.optim.Adam(
+            list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+            lr=bc_lr, eps=1e-5,
+        )
+        value_opt = torch.optim.Adam(
+            list(self.decision_net.value_head.parameters())
+            + list(self.execution_net.value_head.parameters()),
+            lr=value_lr, eps=1e-5,
+        )
+
+        # --- Phase 1: BC epochs over the dataset ---
+        # Do this first so the rollout is collected with the BC-warmed policy,
+        # giving on-policy value targets instead of random-init targets.
+        for epoch in range(n_epochs):
+            bc_losses = []
+            dir_cosines: list[float] = []
+            for obs_dict, bc_labels in dataset.iterate_minibatches(
+                batch_size=batch_size, shuffle=True, device=self.device, valid_only=True
+            ):
+                d_heads = self.decision_net(
+                    obs_dict["self_feat"], obs_dict["other_feat"],
+                    obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                )
+                e_heads = self.execution_net(
+                    obs_dict["self_feat"], obs_dict["other_feat"],
+                    obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                    d_heads,
+                )
+                bc_loss = bc_loss_from_tensor(bc_labels, d_heads, e_heads)
+                bc_opt.zero_grad()
+                bc_loss.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+                    self.max_grad_norm,
+                )
+                bc_opt.step()
+                bc_losses.append(bc_loss.item())
+
+                # Accumulate cosine similarity between predicted and label move directions
+                with torch.no_grad():
+                    valid_mask = bc_labels[:, -1] > 0.5
+                    has_dir = (bc_labels[:, 7].abs() + bc_labels[:, 8].abs()) > 1e-6
+                    sel = valid_mask & has_dir
+                    if sel.any():
+                        pred_dir = e_heads.move_direction[sel]
+                        tgt_dir = bc_labels[sel, 7:9]
+                        eps = 1e-6
+                        pred_n = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
+                        cos_vals = (pred_n * tgt_dir).sum(dim=-1)
+                        dir_cosines.append(cos_vals.mean().item())
+
+            mean_cos = float(np.mean(dir_cosines)) if dir_cosines else float('nan')
+            log.info(f"  BC epoch {epoch + 1}/{n_epochs}: bc_loss={np.mean(bc_losses):.4f}  dir_cos={mean_cos:.3f}")
+            dir_cosines.clear()
+        log.info(f"BC pre-training done ({n_epochs} epoch(s), final bc_loss={np.mean(bc_losses):.4f})")
+
+        # --- Phase 2: collect rollout with BC-warmed policy for value targets ---
+        env.sample_action_fn = self._sample_action
+        env.reset()
+        buffer = RolloutBuffer()
+        next_obs = None
+
+        for _ in range(rollout_steps):
+            next_obs, reward, done, _ = env.step()
+            tr = env.last_trainee_transition
+            if tr is not None:
+                buffer.add(
+                    obs=tr["obs"],
+                    action=_action_to_numpy(tr["action"], tr["raw_exec"]),
+                    log_prob=tr["log_prob"],
+                    value=tr["value"],
+                    reward=reward,
+                    done=1.0 if done else 0.0,
+                )
+            if done:
+                env.reset()
+
+        with torch.no_grad():
+            last_obs_dict = {k: v.unsqueeze(0).to(self.device)
+                             for k, v in (next_obs or env.reset()).to_torch_dict().items()}
+            last_value = self._get_value(last_obs_dict)
+
+        _, returns = buffer.compute_gae(self.gamma, self.lam, last_value)
+        rollout_batch = buffer.as_tensors(_, returns)
+        returns_t = rollout_batch["returns"].to(self.device)
+        ret_std = returns_t.std().clamp(min=1.0)
+        log.debug(f"  [combined pretrain] rollout returns: mean={returns_t.mean():.2f}  std={ret_std:.2f}")
+
+        # --- Phase 3: value head warm-up on on-policy returns ---
+        n_rollout = len(returns_t)
+        val_epochs = max(1, value_epochs)
+        for epoch in range(val_epochs):
+            val_losses = []
+            indices = torch.randperm(n_rollout)
+            for start in range(0, n_rollout, batch_size):
+                mb_idx = indices[start:start + batch_size]
+                mb_obs = {k.replace("obs/", ""): rollout_batch[k][mb_idx].to(self.device)
+                          for k in rollout_batch if k.startswith("obs/")}
+                mb_ret = returns_t[mb_idx]
+                d_v = self.decision_net(
+                    mb_obs["self_feat"], mb_obs["other_feat"],
+                    mb_obs["exists_mask"], mb_obs["ball_feat"], mb_obs["global_feat"],
+                )
+                e_v = self.execution_net(
+                    mb_obs["self_feat"], mb_obs["other_feat"],
+                    mb_obs["exists_mask"], mb_obs["ball_feat"], mb_obs["global_feat"],
+                    d_v,
+                )
+                pred_values = ((d_v.value + e_v.value) / 2.0).squeeze(-1)
+                value_loss = F.mse_loss(pred_values, mb_ret) / (ret_std ** 2)
+                value_opt.zero_grad()
+                value_loss.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.decision_net.value_head.parameters())
+                    + list(self.execution_net.value_head.parameters()),
+                    self.max_grad_norm,
+                )
+                value_opt.step()
+                val_losses.append(value_loss.item())
+            log.info(f"  Value epoch {epoch + 1}/{val_epochs}: val_loss={np.mean(val_losses):.4f}")
+        log.info(f"Value pre-training done ({val_epochs} epoch(s), final val_loss={np.mean(val_losses):.4f})")
+
+        # --- BC degradation check: re-evaluate BC loss over dataset after value warm-up ---
+        self.decision_net.eval()
+        self.execution_net.eval()
+        post_bc_losses = []
+        with torch.no_grad():
+            for obs_dict, bc_labels in dataset.iterate_minibatches(
+                batch_size=batch_size, shuffle=False, device=self.device, valid_only=True
+            ):
+                d_check = self.decision_net(
+                    obs_dict["self_feat"], obs_dict["other_feat"],
+                    obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                )
+                e_check = self.execution_net(
+                    obs_dict["self_feat"], obs_dict["other_feat"],
+                    obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                    d_check,
+                )
+                post_bc_losses.append(bc_loss_from_tensor(bc_labels, d_check, e_check).item())
+        self.decision_net.train()
+        self.execution_net.train()
+        post_bc_loss = float(np.mean(post_bc_losses))
+        bc_loss_before_value = float(np.mean(bc_losses))
+        delta = post_bc_loss - bc_loss_before_value
+        degraded = delta > 0.05
+        log.info(
+            f"BC check after value warm-up: bc_loss={post_bc_loss:.4f} "
+            f"(before={bc_loss_before_value:.4f}, delta={delta:+.4f})"
+            + ("  *** WARNING: significant BC degradation!" if degraded else "  OK")
+        )
+
+        # --- Phase 4: joint BC repair epoch (all params, bc_lr) ---
+        # Runs the BC dataset once more with all parameters trainable to restore
+        # any policy quality lost during value-only warm-up, while also keeping
+        # the freshly-warmed value head in the training graph.
+        repair_epochs = int(self._bc_cfg.get("bc_repair_epochs", 1))
+        if repair_epochs > 0:
+            _repair_lr = repair_lr if repair_lr is not None else bc_lr
+            repair_opt = torch.optim.Adam(
+                list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+                lr=_repair_lr, eps=1e-5,
+            )
+            for epoch in range(repair_epochs):
+                repair_losses = []
+                dir_cosines_r: list[float] = []
+                for obs_dict, bc_labels in dataset.iterate_minibatches(
+                    batch_size=batch_size, shuffle=True, device=self.device, valid_only=True
+                ):
+                    d_r = self.decision_net(
+                        obs_dict["self_feat"], obs_dict["other_feat"],
+                        obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                    )
+                    e_r = self.execution_net(
+                        obs_dict["self_feat"], obs_dict["other_feat"],
+                        obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                        d_r,
+                    )
+                    loss_r = bc_loss_from_tensor(bc_labels, d_r, e_r)
+                    repair_opt.zero_grad()
+                    loss_r.backward()
+                    nn.utils.clip_grad_norm_(
+                        list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+                        self.max_grad_norm,
+                    )
+                    repair_opt.step()
+                    repair_losses.append(loss_r.item())
+
+                    with torch.no_grad():
+                        valid_mask = bc_labels[:, -1] > 0.5
+                        has_dir = (bc_labels[:, 7].abs() + bc_labels[:, 8].abs()) > 1e-6
+                        sel = valid_mask & has_dir
+                        if sel.any():
+                            pred_dir = e_r.move_direction[sel]
+                            tgt_dir = bc_labels[sel, 7:9]
+                            eps = 1e-6
+                            pred_n = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
+                            dir_cosines_r.append((pred_n * tgt_dir).sum(dim=-1).mean().item())
+
+                mean_cos_r = float(np.mean(dir_cosines_r)) if dir_cosines_r else float('nan')
+                # Also measure value loss on the stored rollout returns (no gradient)
+                with torch.no_grad():
+                    val_losses_r = []
+                    for start_r in range(0, n_rollout, batch_size):
+                        mb_obs_r = {k.replace("obs/", ""): rollout_batch[k][start_r:start_r+batch_size].to(self.device)
+                                    for k in rollout_batch if k.startswith("obs/")}
+                        mb_ret_r = returns_t[start_r:start_r+batch_size]
+                        d_vr = self.decision_net(
+                            mb_obs_r["self_feat"], mb_obs_r["other_feat"],
+                            mb_obs_r["exists_mask"], mb_obs_r["ball_feat"], mb_obs_r["global_feat"],
+                        )
+                        e_vr = self.execution_net(
+                            mb_obs_r["self_feat"], mb_obs_r["other_feat"],
+                            mb_obs_r["exists_mask"], mb_obs_r["ball_feat"], mb_obs_r["global_feat"],
+                            d_vr,
+                        )
+                        pred_vr = ((d_vr.value + e_vr.value) / 2.0).squeeze(-1)
+                        val_losses_r.append(F.mse_loss(pred_vr, mb_ret_r).item() / (ret_std ** 2).item())
+                log.info(f"  BC repair epoch {epoch + 1}/{repair_epochs}: bc_loss={np.mean(repair_losses):.4f}  dir_cos={mean_cos_r:.3f}  val_loss={np.mean(val_losses_r):.4f}")
+            log.info(f"BC repair done ({repair_epochs} epoch(s), final bc_loss={np.mean(repair_losses):.4f}  dir_cos={mean_cos_r:.3f}  val_loss={np.mean(val_losses_r):.4f})")
+
+        log.info("Combined pre-training complete.")
+
     def pretrain_value(self, env, n_steps: int, n_epochs: int, lr: float) -> None:
         """Warm-start the value heads to predict actual returns before PPO starts.
 
@@ -259,51 +573,42 @@ class PPOTrainer:
             lr: Learning rate for value pre-training (higher than PPO lr, e.g. 1e-3)
         """
         log.info(f"Value pre-training: {n_steps} steps, {n_epochs} epochs, lr={lr}")
+        # Only train the value heads — not the shared trunk — so BC-learned
+        # policy weights are not corrupted.
         value_opt = torch.optim.Adam(
-            list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+            list(self.decision_net.value_head.parameters())
+            + list(self.execution_net.value_head.parameters()),
             lr=lr, eps=1e-5,
         )
 
-        obs = env.reset()
+        env.sample_action_fn = self._sample_action
+        env.reset()
         buffer = RolloutBuffer()
         episode_rewards: list[float] = []
         episode_accum = 0.0
+        next_obs = None
 
         for _ in range(n_steps):
-            obs_dict = {k: v for k, v in obs.to_torch_dict().items()}
-            result = self._sample_action(obs_dict)
-            action, log_prob, value, decision_probs, exec_phys, dec_phys, target_slots, raw_exec = result
-
-            env_action = {
-                "decision_probs": decision_probs,
-                "execution_physical": exec_phys,
-                "decision_physical": dec_phys,
-                "target_slots": target_slots,
-                "slot_player_ids": getattr(env, "_last_slot_player_ids", [None] * 21),
-                "decision": action,
-                "execution": ExecutionAction(),
-            }
-            next_obs, reward, done, _ = env.step(env_action)
-
-            buffer.add(
-                obs={k: v.numpy() for k, v in obs_dict.items()},
-                action=_action_to_numpy(action, raw_exec),
-                log_prob=float(log_prob),
-                value=float(value),
-                reward=reward,
-                done=1.0 if done else 0.0,
-            )
+            next_obs, reward, done, _ = env.step()
+            tr = env.last_trainee_transition
+            if tr is not None:
+                buffer.add(
+                    obs=tr["obs"],
+                    action=_action_to_numpy(tr["action"], tr["raw_exec"]),
+                    log_prob=tr["log_prob"],
+                    value=tr["value"],
+                    reward=reward,
+                    done=1.0 if done else 0.0,
+                )
             episode_accum += reward
             if done:
                 episode_rewards.append(episode_accum)
                 episode_accum = 0.0
-                obs = env.reset()
-            else:
-                obs = next_obs
+                env.reset()
 
         with torch.no_grad():
             last_obs_dict = {k: v.unsqueeze(0).to(self.device)
-                             for k, v in next_obs.to_torch_dict().items()}
+                             for k, v in (next_obs or env.reset()).to_torch_dict().items()}
             last_value = self._get_value(last_obs_dict)
 
         _, returns = buffer.compute_gae(self.gamma, self.lam, last_value)
@@ -313,8 +618,8 @@ class PPOTrainer:
         ret_mean = returns_t.mean()
         ret_std = returns_t.std().clamp(min=1.0)
 
-        print(f"  [value pretrain] returns: mean={ret_mean:.2f}  std={ret_std:.2f}"
-              f"  min={returns_t.min():.2f}  max={returns_t.max():.2f}")
+        log.debug(f"  [value pretrain] returns: mean={ret_mean:.2f}  std={ret_std:.2f}"
+                  f"  min={returns_t.min():.2f}  max={returns_t.max():.2f}")
 
         n = len(returns_t)
         for ep in range(n_epochs):
@@ -360,15 +665,20 @@ class PPOTrainer:
                                         spot_obs["exists_mask"], spot_obs["ball_feat"],
                                         spot_obs["global_feat"], d_s)
                 pred_vals = ((d_s.value + e_s.value) / 2.0).squeeze(-1)
-            print(f"  [value pretrain epoch {ep:2d}] loss={mean_loss:.4f}"
-                  f"  pred_val mean={pred_vals.mean():.2f}"
-                  f"  target mean={returns_t[:64].mean():.2f}")
+            log.debug(f"  [value pretrain epoch {ep:2d}] loss={mean_loss:.4f}"
+                      f"  pred_val mean={pred_vals.mean():.2f}  target mean={returns_t[:64].mean():.2f}")
 
         log.info("Value pre-training complete.")
 
     # -----------------------------------------------------------------------
     # Policy sampling
     # -----------------------------------------------------------------------
+
+    def _dir_head(self, raw_vec: torch.Tensor, log_std_param: torch.Tensor) -> "DirectionHead":
+        """Construct a DirectionHead with config-driven log_std clamp bounds."""
+        return DirectionHead(raw_vec, log_std_param,
+                             log_std_min=self.dir_log_std_min,
+                             log_std_max=self.dir_log_std_max)
 
     @torch.no_grad()
     def _sample_action(self, obs_dict: dict) -> tuple:
@@ -456,8 +766,8 @@ class PPOTrainer:
         eps = 1e-6
         log_std_move = self.execution_net.move_dir_log_std
         log_std_kick = self.execution_net.kick_dir_log_std
-        move_dir_raw = DirectionHead(e_heads.move_direction, log_std_move).sample_raw()  # (1, 2)
-        kick_dir_raw = DirectionHead(e_heads.kick_direction, log_std_kick).sample_raw()   # (1, 2)
+        move_dir_raw = self._dir_head(e_heads.move_direction, log_std_move).sample_raw()  # (1, 2)
+        kick_dir_raw = self._dir_head(e_heads.kick_direction, log_std_kick).sample_raw()   # (1, 2)
         move_dir_phys = (move_dir_raw / (move_dir_raw.norm(dim=-1, keepdim=True) + eps)).squeeze(0)
         kick_dir_phys = (kick_dir_raw / (kick_dir_raw.norm(dim=-1, keepdim=True) + eps)).squeeze(0)
 
@@ -567,13 +877,17 @@ class PPOTrainer:
             samples["tackle_attempt"]
         ).sum()
 
-        # Direction heads (move_direction, kick_direction) are intentionally
-        # excluded from the PPO log_prob ratio. The BC loss and policy gradient
-        # both move the direction head mean by large amounts each step, making
-        # the Gaussian log_prob of stored samples under the new distribution
-        # diverge catastrophically (mean_shift ~25-50 units with std~1 = KL ~2000).
-        # Direction is trained implicitly via policy/value gradient and explicitly
-        # via BC; it doesn't need to be in the ratio for correct PPO.
+        # Direction heads: now included in the PPO log_prob ratio.
+        # The network forward() normalizes the mean to a unit vector, bounding
+        # max mean-shift to 2 and keeping KL contribution O(1) per step.
+        log_std_move = self.execution_net.move_dir_log_std
+        log_std_kick = self.execution_net.kick_dir_log_std
+        lp += self._dir_head(e_heads.move_direction, log_std_move).log_prob(
+            samples["move_dir_raw"]
+        )
+        lp += self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+            samples["kick_dir_raw"]
+        )
 
         return lp
 
@@ -609,26 +923,28 @@ class PPOTrainer:
         all_entropy = []
         all_kl = []
         all_bc_loss = []
+        all_ratios: list[torch.Tensor] = []
         epoch_times = []
+        KL_DIAG_THRESHOLD = 0.1  # ~5× target_kl; log detailed diagnostics above this
 
-        # Print rollout-level stats once per update
-        print(f"\n{'='*70}")
-        print(f"[PPO UPDATE] step={self._total_steps:,}  n={n}  progress={progress:.3f}")
-        print(f"  old_log_prob: mean={old_log_probs.mean():.3f}  std={old_log_probs.std():.3f}"
-              f"  min={old_log_probs.min():.3f}  max={old_log_probs.max():.3f}")
-        print(f"  returns:      mean={returns.mean():.3f}  std={returns.std():.3f}"
-              f"  min={returns.min():.3f}  max={returns.max():.3f}")
-        raw_adv = batch["advantages"]
-        print(f"  advantages:   mean={raw_adv.mean():.3f}  std={raw_adv.std():.3f}"
-              f"  min={raw_adv.min():.3f}  max={raw_adv.max():.3f}")
-        raw_vals = batch["values"]
-        print(f"  values(old):  mean={raw_vals.mean():.3f}  std={raw_vals.std():.3f}"
-              f"  min={raw_vals.min():.3f}  max={raw_vals.max():.3f}")
-        raw_rews = batch["rewards"]
-        print(f"  rewards:      mean={raw_rews.mean():.4f}  std={raw_rews.std():.4f}"
-              f"  min={raw_rews.min():.4f}  max={raw_rews.max():.4f}"
-              f"  nonzero={int((raw_rews != 0).sum())}/{n}")
-        print(f"{'='*70}")
+        # Debug-level rollout stats (hidden by default)
+        if log.isEnabledFor(logging.DEBUG):
+            raw_adv = batch["advantages"]
+            raw_vals = batch["values"]
+            raw_rews = batch["rewards"]
+            log.debug(
+                f"[PPO UPDATE] step={self._total_steps:,}  n={n}  progress={progress:.3f}\n"
+                f"  old_log_prob: mean={old_log_probs.mean():.3f}  std={old_log_probs.std():.3f}"
+                f"  min={old_log_probs.min():.3f}  max={old_log_probs.max():.3f}\n"
+                f"  returns:      mean={returns.mean():.3f}  std={returns.std():.3f}"
+                f"  min={returns.min():.3f}  max={returns.max():.3f}\n"
+                f"  advantages:   mean={raw_adv.mean():.3f}  std={raw_adv.std():.3f}"
+                f"  min={raw_adv.min():.3f}  max={raw_adv.max():.3f}\n"
+                f"  values(old):  mean={raw_vals.mean():.3f}  std={raw_vals.std():.3f}"
+                f"  min={raw_vals.min():.3f}  max={raw_vals.max():.3f}\n"
+                f"  rewards:      mean={raw_rews.mean():.4f}  std={raw_rews.std():.4f}"
+                f"  nonzero={int((raw_rews != 0).sum())}/{n}"
+            )
 
         _diag_done = False  # print per-head breakdown only once
 
@@ -664,8 +980,8 @@ class PPOTrainer:
                               for k in batch if k.startswith("action/")}
                 new_log_probs = self._recompute_log_prob(d_heads, e_heads, mb_actions, em)
 
-                # Per-head log_prob breakdown (first minibatch of first epoch only)
-                if not _diag_done:
+                # Per-head log_prob breakdown (debug only, first mb of first epoch)
+                if not _diag_done and log.isEnabledFor(logging.DEBUG):
                     _diag_done = True
                     with torch.no_grad():
                         def _blp(logit, key):
@@ -682,27 +998,36 @@ class PPOTrainer:
                         lp_tackle_a = _blp(e_heads.tackle_attempt_logit, "tackle_attempt")
                         log_std_move = self.execution_net.move_dir_log_std.to(self.device)
                         log_std_kick = self.execution_net.kick_dir_log_std.to(self.device)
-                        lp_movedir  = DirectionHead(e_heads.move_direction, log_std_move).log_prob(mb_actions["move_dir_raw"]).mean().item()
-                        lp_kickdir  = DirectionHead(e_heads.kick_direction, log_std_kick).log_prob(mb_actions["kick_dir_raw"]).mean().item()
+                        lp_movedir  = self._dir_head(e_heads.move_direction, log_std_move).log_prob(mb_actions["move_dir_raw"]).mean().item()
+                        lp_kickdir  = self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(mb_actions["kick_dir_raw"]).mean().item()
                         lp_new_mb   = new_log_probs.mean().item()
                         lp_old_mb   = mb_old_lp.mean().item()
                         ratio_mb    = torch.exp(new_log_probs - mb_old_lp)
-                    print(f"  [DIAG epoch=0 mb=0]")
-                    print(f"    old_lp(mb)={lp_old_mb:.3f}  new_lp(mb)={lp_new_mb:.3f}  diff={lp_new_mb - lp_old_mb:.3f}")
-                    print(f"    ratio: mean={ratio_mb.mean():.4f}  std={ratio_mb.std():.4f}"
-                          f"  min={ratio_mb.min():.4f}  max={ratio_mb.max():.4f}")
-                    print(f"    new_values: mean={new_values.mean():.3f}  ret(mb): mean={mb_ret.mean():.3f}")
-                    print(f"    per-head new_log_prob contributions (mean over mb):")
-                    print(f"      shoot={lp_shoot:.3f}  pass={lp_pass:.3f}  move={lp_move:.3f}  tackle={lp_tackle:.3f}")
-                    print(f"      gp_extra={lp_gp:.3f}  mark={lp_mark:.3f}  hold={lp_hold:.3f}")
-                    print(f"      sprint={lp_sprint:.3f}  kick={lp_kick:.3f}  tackle_attempt={lp_tackle_a:.3f}")
-                    print(f"      move_dir={lp_movedir:.3f}  kick_dir={lp_kickdir:.3f}")
-                    print(f"      TOTAL={lp_shoot+lp_pass+lp_move+lp_tackle+lp_gp+lp_mark+lp_hold+lp_sprint+lp_kick+lp_tackle_a+lp_movedir:.3f}")
-                    print(f"    move_dir log_std={self.execution_net.move_dir_log_std.data.tolist()}"
-                          f"  kick_dir log_std={self.execution_net.kick_dir_log_std.data.tolist()}")
+                        stored_raw   = mb_actions["move_dir_raw"]
+                        stored_norm  = stored_raw.norm(dim=-1)
+                        current_norm = e_heads.move_direction.norm(dim=-1)
+                        mean_vec     = e_heads.move_direction.mean(dim=0)
+                        angle_deg    = math.degrees(math.atan2(float(mean_vec[1]), float(mean_vec[0])))
+                    log.debug(
+                        f"  [DIAG e0 mb0]\n"
+                        f"    old_lp={lp_old_mb:.3f}  new_lp={lp_new_mb:.3f}  diff={lp_new_mb - lp_old_mb:.3f}\n"
+                        f"    ratio: mean={ratio_mb.mean():.4f}  std={ratio_mb.std():.4f}"
+                        f"  min={ratio_mb.min():.4f}  max={ratio_mb.max():.4f}\n"
+                        f"    new_values={new_values.mean():.3f}  ret(mb)={mb_ret.mean():.3f}\n"
+                        f"    shoot={lp_shoot:.3f} pass={lp_pass:.3f} move={lp_move:.3f} tackle={lp_tackle:.3f}\n"
+                        f"    gp={lp_gp:.3f} mark={lp_mark:.3f} hold={lp_hold:.3f}\n"
+                        f"    sprint={lp_sprint:.3f} kick={lp_kick:.3f} t_attempt={lp_tackle_a:.3f}\n"
+                        f"    move_dir={lp_movedir:.3f} kick_dir={lp_kickdir:.3f}\n"
+                        f"    move_dir log_std={self.execution_net.move_dir_log_std.data.tolist()}\n"
+                        f"    [move_dir] cur_norm={current_norm.mean():.3f}  stored_norm={stored_norm.mean():.3f}"
+                        f"  angle={angle_deg:.1f}deg"
+                    )
+                else:
+                    _diag_done = True  # skip computation when not in DEBUG
 
                 # PPO clipped objective
                 ratio = torch.exp(new_log_probs - mb_old_lp)
+                all_ratios.append(ratio.detach().cpu())
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * mb_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
@@ -716,17 +1041,12 @@ class PPOTrainer:
                 # Entropy bonus
                 entropy = self._compute_entropy(d_heads, e_heads, em)
 
-                # L2 penalty on raw direction outputs — keeps them from drifting
-                # to large magnitudes, which causes huge mean-shifts between
-                # minibatches and training instability. The vectors are normalised
-                # to unit length before the engine anyway, so this doesn't harm output.
-                dir_l2 = (e_heads.move_direction.pow(2).mean()
-                          + e_heads.kick_direction.pow(2).mean())
+                # No dir_l2 penalty needed: direction means are unit-normalized in
+                # forward() so their magnitude is always 1 — penalizing it is a no-op.
 
                 total_loss = (policy_loss
                               + self.vf_coef * value_loss
-                              - self.ent_coef * entropy
-                              + self.dir_l2_coef * dir_l2)
+                              - self.ent_coef * entropy)
 
                 # BC auxiliary loss (decision + execution, annealed to 0)
                 bc_loss_val = torch.zeros(1, device=self.device)
@@ -757,20 +1077,28 @@ class PPOTrainer:
                     lp_after = self._recompute_log_prob(d_after, e_after, mb_actions, em)
                     movedir_mean_shift = (e_after.move_direction - e_heads.move_direction).norm(dim=-1).mean().item()
                     kickdir_mean_shift = (e_after.kick_direction - e_heads.kick_direction).norm(dim=-1).mean().item()
+                    # Actual KL contribution from move_direction (now included in ratio).
+                    _stored_raw_mb = mb_actions["move_dir_raw"]
+                    _log_std_move  = self.execution_net.move_dir_log_std.to(self.device)
+                    _lp_movedir_before = self._dir_head(e_heads.move_direction, _log_std_move).log_prob(_stored_raw_mb)
+                    _lp_movedir_after  = self._dir_head(e_after.move_direction, _log_std_move).log_prob(_stored_raw_mb)
+                    movedir_hyp_kl = (_lp_movedir_before - _lp_movedir_after).mean().item()
 
                 approx_kl = (mb_old_lp - new_log_probs).mean().item()
                 kl_after_step = (mb_old_lp - lp_after).mean().item()
 
                 mb_i = start // self.minibatch_size
-                print(f"  [e{epoch_i} mb{mb_i:02d}]"
-                      f"  grad_norm={raw_grad_norm:.1f}"
-                      f"  total={total_loss.item():.3f}"
-                      f"  policy={policy_loss.item():.3f}"
-                      f"  value={value_loss.item():.3f}"
-                      f"  dir_l2={dir_l2.item():.3f}"
-                      f"  kl_after={kl_after_step:.4f}"
-                      f"  move_shift={movedir_mean_shift:.3f}"
-                      f"  kick_shift={kickdir_mean_shift:.3f}")
+                log.debug(
+                    f"  [e{epoch_i} mb{mb_i:02d}]"
+                    f"  grad={raw_grad_norm:.1f}"
+                    f"  total={total_loss.item():.3f}"
+                    f"  pol={policy_loss.item():.3f}"
+                    f"  val={value_loss.item():.3f}"
+                    f"  kl={kl_after_step:.4f}"
+                    f"  mv_shift={movedir_mean_shift:.3f}"
+                    f"  mv_kl={movedir_hyp_kl:.4f}"
+                    f"  kk_shift={kickdir_mean_shift:.3f}"
+                )
 
                 all_policy_loss.append(policy_loss.item())
                 all_value_loss.append(value_loss.item())
@@ -779,12 +1107,83 @@ class PPOTrainer:
 
             epoch_times.append((time.perf_counter() - epoch_start) * 1000)
             mean_kl_epoch = float(np.mean(all_kl[-32:])) if all_kl else 0.0
-            print(f"  [epoch {epoch_i}] kl={mean_kl_epoch:.5f}  t={epoch_times[-1]:.0f}ms")
+            log.debug(f"  [epoch {epoch_i}] kl={mean_kl_epoch:.5f}  t={epoch_times[-1]:.0f}ms")
             # Early stop if KL too large
             if all_kl and np.mean(all_kl[-10:]) > self.target_kl:
-                print(f"  [early stop] KL={np.mean(all_kl):.5f} > target={self.target_kl}")
-                log.debug(f"Early stopping PPO epoch due to KL={np.mean(all_kl):.4f}")
+                log.debug(f"  [early stop] KL={np.mean(all_kl):.5f} > target={self.target_kl}")
                 break
+
+        # --- KL diagnostics (fires whenever rollout KL exceeds threshold) ---
+        mean_kl = float(np.mean(all_kl)) if all_kl else 0.0
+        move_log_std = self.execution_net.move_dir_log_std.data.tolist()
+        kick_log_std = self.execution_net.kick_dir_log_std.data.tolist()
+        if mean_kl > KL_DIAG_THRESHOLD and all_ratios:
+            ratios_t = torch.cat(all_ratios)
+            log.info(
+                f"  [KL={mean_kl:.4f} > {KL_DIAG_THRESHOLD}] ratio percentiles:"
+                f"  p5={ratios_t.quantile(0.05):.3f}"
+                f"  p25={ratios_t.quantile(0.25):.3f}"
+                f"  p50={ratios_t.quantile(0.50):.3f}"
+                f"  p75={ratios_t.quantile(0.75):.3f}"
+                f"  p95={ratios_t.quantile(0.95):.3f}"
+                f"  max={ratios_t.max():.3f}\n"
+                f"  move_dir_log_std={move_log_std}  kick_dir_log_std={kick_log_std}"
+            )
+            # Per-head new log_prob means on stored actions (first 256 transitions)
+            diag_n = min(256, n)
+            diag_obs = {k.replace("obs/", ""): batch[k][:diag_n].to(self.device)
+                        for k in batch if k.startswith("obs/")}
+            diag_act = {k.replace("action/", ""): batch[k][:diag_n].to(self.device)
+                        for k in batch if k.startswith("action/")}
+            diag_old_lp = old_log_probs[:diag_n].to(self.device)
+            with torch.no_grad():
+                d_d = self.decision_net(
+                    diag_obs["self_feat"], diag_obs["other_feat"],
+                    diag_obs["exists_mask"], diag_obs["ball_feat"], diag_obs["global_feat"],
+                )
+                e_d = self.execution_net(
+                    diag_obs["self_feat"], diag_obs["other_feat"],
+                    diag_obs["exists_mask"], diag_obs["ball_feat"], diag_obs["global_feat"], d_d,
+                )
+                def _blpv(logit, key):
+                    return IndependentBernoulli(logit).log_prob(diag_act[key]).squeeze(-1)
+                lp_shoot_d  = _blpv(d_d.shoot_logit, "shoot")
+                lp_pass_d   = _blpv(d_d.pass_logit, "pass_")
+                lp_move_d   = _blpv(d_d.move_logit, "move")
+                lp_tackle_d = _blpv(d_d.tackle_logit, "tackle")
+                lp_gp_d     = _blpv(d_d.get_possession_raw, "get_possession_extra")
+                lp_mark_d   = _blpv(d_d.mark_logit, "mark")
+                lp_hold_d   = _blpv(d_d.hold_position_logit, "hold_position")
+                lp_sprint_d = _blpv(e_d.sprint_logit, "sprint")
+                lp_kick_d   = _blpv(e_d.kick_logit, "kick")
+                lp_ta_d     = _blpv(e_d.tackle_attempt_logit, "tackle_attempt")
+                _lsm = self.execution_net.move_dir_log_std.to(self.device)
+                _lsk = self.execution_net.kick_dir_log_std.to(self.device)
+                lp_mvdir_d  = self._dir_head(e_d.move_direction, _lsm).log_prob(diag_act["move_dir_raw"])
+                lp_kkdir_d  = self._dir_head(e_d.kick_direction, _lsk).log_prob(diag_act["kick_dir_raw"])
+                diag_new_lp = (lp_shoot_d + lp_pass_d + lp_move_d + lp_tackle_d + lp_gp_d +
+                               lp_mark_d + lp_hold_d + lp_sprint_d + lp_kick_d + lp_ta_d +
+                               lp_mvdir_d + lp_kkdir_d)
+                diag_ratio  = torch.exp(diag_new_lp - diag_old_lp)
+                worst_i     = int(diag_ratio.argmax())
+                stored_mv   = diag_act["move_dir_raw"][worst_i]
+                new_mv_mean = e_d.move_direction[worst_i]
+                s_angle     = math.degrees(math.atan2(float(stored_mv[1]),   float(stored_mv[0])))
+                n_angle     = math.degrees(math.atan2(float(new_mv_mean[1]), float(new_mv_mean[0])))
+            log.info(
+                f"  [per-head new lp means, n={diag_n}]\n"
+                f"    shoot={lp_shoot_d.mean():.3f}  pass={lp_pass_d.mean():.3f}"
+                f"  move={lp_move_d.mean():.3f}  tackle={lp_tackle_d.mean():.3f}"
+                f"  gp={lp_gp_d.mean():.3f}  mark={lp_mark_d.mean():.3f}  hold={lp_hold_d.mean():.3f}\n"
+                f"    sprint={lp_sprint_d.mean():.3f}  kick={lp_kick_d.mean():.3f}"
+                f"  t_att={lp_ta_d.mean():.3f}\n"
+                f"    move_dir={lp_mvdir_d.mean():.3f} (min={lp_mvdir_d.min():.3f} max={lp_mvdir_d.max():.3f})"
+                f"  kick_dir={lp_kkdir_d.mean():.3f} (min={lp_kkdir_d.min():.3f} max={lp_kkdir_d.max():.3f})\n"
+                f"  [worst sample] idx={worst_i}  ratio={diag_ratio[worst_i]:.3f}"
+                f"  old_lp={diag_old_lp[worst_i]:.3f}  new_lp={diag_new_lp[worst_i]:.3f}\n"
+                f"    stored move_dir={s_angle:.1f}°  new_mean={n_angle:.1f}°"
+                f"  angular_diff={min(abs(s_angle-n_angle), 360-abs(s_angle-n_angle)):.1f}°"
+            )
 
         return {
             "policy_loss": float(np.mean(all_policy_loss)),
@@ -794,6 +1193,8 @@ class PPOTrainer:
             "bc_loss": float(np.mean(all_bc_loss)),
             "bc_coeff": bc_coeff,
             "epoch_time_ms": float(np.mean(epoch_times)) if epoch_times else 0.0,
+            "move_log_std": move_log_std,
+            "kick_log_std": kick_log_std,
         }
 
     def _recompute_log_prob(self, d_heads, e_heads, mb_actions: dict, exists_mask) -> torch.Tensor:
@@ -830,7 +1231,15 @@ class PPOTrainer:
                 )
                 lp[mask] += cat_lp[mask]
 
-        # Direction heads excluded — see comment in _compute_log_prob.
+        # Direction heads: included now that the mean is unit-normalized.
+        log_std_move = self.execution_net.move_dir_log_std.to(self.device)
+        log_std_kick = self.execution_net.kick_dir_log_std.to(self.device)
+        lp += self._dir_head(e_heads.move_direction, log_std_move).log_prob(
+            mb_actions["move_dir_raw"]
+        )
+        lp += self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+            mb_actions["kick_dir_raw"]
+        )
 
         return lp
 

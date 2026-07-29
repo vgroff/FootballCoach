@@ -169,13 +169,15 @@ class DirectionHead:
     See ai_design_doc.md section 8.6.
     """
 
-    def __init__(self, raw_vector: torch.Tensor, log_std: torch.Tensor):
+    def __init__(self, raw_vector: torch.Tensor, log_std: torch.Tensor,
+                 log_std_min: float = -5.0, log_std_max: float = 2.0):
         """
         Args:
             raw_vector: (..., 2) raw 2D vector from the network.
             log_std: (..., 2) or scalar log standard deviation.
+            log_std_min/max: clamp bounds (configurable; defaults match original hardcoded values).
         """
-        std = torch.exp(log_std.clamp(-5.0, 2.0))
+        std = torch.exp(log_std.clamp(log_std_min, log_std_max))
         self.dist = torch.distributions.Normal(raw_vector, std)
         self._raw = raw_vector
 

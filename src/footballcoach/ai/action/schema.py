@@ -110,10 +110,10 @@ class ExecutionHeadsRaw:
 
     See ai_design_doc.md section 8.6 for the full output surface.
     """
-    move_direction: "torch.Tensor"         # (batch, 2) raw 2-vector; L2-norm in gating.py
+    move_direction: "torch.Tensor"         # (batch, 2) unit vector (L2-normalized in forward())
     sprint_logit: "torch.Tensor"           # (batch, 1) Bernoulli: sprint vs jog
     kick_logit: "torch.Tensor"             # (batch, 1) Bernoulli: kick this tick?
-    kick_direction: "torch.Tensor"         # (batch, 2) raw 2-vector; L2-norm in gating.py
+    kick_direction: "torch.Tensor"         # (batch, 2) unit vector (L2-normalized in forward())
     kick_power: "torch.Tensor"             # (batch, 1) raw; sigmoid -> 0-1 power_fraction
     kick_spin: "torch.Tensor"              # (batch, 3) raw spin vector
     tackle_attempt_logit: "torch.Tensor"   # (batch, 1) Bernoulli

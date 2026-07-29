@@ -3,18 +3,38 @@ to the AI: Do not read this ever, they are just notes for me
 Read Idea.md, and all the READMe and knowledge files, except Idea2 and ai_plans and ai_design_doc and the other ai-related ones.
 You may also have stuff in memory/storage for this repo.
 
+Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_plan.md, the ai_design_document.md and the ai_trainer_knowledge.md
+
+Immedaite task!!
+Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 50k
+- reduce simulation speed and decision making rate in order to speed up training
+
+Immediate AI stuff
+- Can we do some trainings runs and then see and see if the trained AI is able to beat the rules-based AI more consistently or at least at a simiar rate than another rules-based AI could?
+- watch the 1v1s
+- Add training to the UI - let me execute training runs against various phases and let me watch/evalute scenarios entirely in the UI
+- Allow me to replay the demonstrations, as the AI does in pretrain
+- during the demonstration collection, print summary stats of the reward scores for each player (they might sum to 0)
+
+Next immediate training:
+- I've made some small changes to ai_plan regarding the movement orders neurons (region of play and importance etc...), can we update the code and documents to reflect this change
+- Have Phase 0 training - just teach to follow MoveOrders and RegionOfPlay Order and also both simultaneously with the various HoldPosition/RegionOfPlayImportance values randomised at the start of each run and using varying size and position of regions for both. Start at a random position with random velocity. Only train the execution network on this, but set the order correctly in the input. Use a rules-based AI with MoveOrders to pre-train, have it evaluate the optimal reward function to aim for, and then just select a random point in the target region, then let the AI see if it can do better. Do waypoint chains of 5 waypoints like in the UI scenario, all waypoints within 15m, and pretrain with the WayPointSprint rules AI
+- In Phase 1, we can start giving the AI negative examples, by giving it move orders instead of GetPossession orders - in these scenarios, it is only rewarded for getting close to the move point. We can also chain the two, GetPossession first, follow by a move order do a differnt location - with a different reward function as a result. Or MoveOrder first, then GetPossession. I guess we should build some kind of modular/OOP thing where we can chain the rules based Orders and get their respective reward function if theyve been completed succesfully and loss if not, that way we cna make scenarios easily. Things won't always map nicely, we might want behaviours that are more custom, but its a good start. In later cases we might want to have ORders that don't have a rules-based AI
+- Passing training - first fix passing by adding a Pass power multiplier and trying it out in the UI passing scenario
+
 AI stuff:
-- are the best models saved? In the UI scenario, have a checkbox for each player that allowed me to have them controlled by the best available AI instead of by the rules-based AI.
 - Speedup ideas - run the simulation at lower resolution, especially at the beginning, and lower the neutral network decision taking rate
-- Git ignore the checkpoints and shit
+- I feel like the AIs should a property of the players like player.ai = StagedGoalkeeper() or neural_net() rather than what we have. I don't understand why wiring in the player AI is so complicated, can it just be player.ai = AI(), then on player.tick(), AI.getAction() and then apply it, or AI.act(player)
 
 NB Immediate Immediate:
+- 2V2 scenario is completely broken, I think GK is on the wrong team, and probbaly other shit. Fix it. Also, the through ball pass is doing an awful job of predicting where the player will be, can we hit the pass harder? Maybe for the scenario, make the second attacker move slower, also, is he running GetPossession during the pass?
 - The goalkeeper clearly teleports after saving the ball sometimes, wtf is that about??
 - Goalkeeper in 1v2 is still going crazy often. The AI should be super simple. Go to goal centre, stop. Then do nothing, wait for a shot and then do save order. Then repeat once save order terminated. Explain the AI to me.
 - Tackles seem to behave a bit weird, I think the players often stop almost completely, and while I think speed should be reduced somewhat for both players, it's maybe too strong, also I think collisions should be turned off once a tackle has been engaged, I think that is supposed to happen with one of them going inactive but I just want to make sure the collision isn't being triggered on the same tick as the tackle either way.
-- We want a bit more visual excitment. Can we display some icons under/over/on top of a player for 1.2 seconds after he carries out an action like kick, tackle, or switching between moving stances/speeds - you can use the leg, wind, running game, idle (U+1F574) and soccer ball icons, or any you think are more appropriate, but please no more than 2 per icons per action.
+- We want a bit more visual excitment. Can we display some icons under/over/on top of a player for 1.2 seconds after he carries out an action like kick, tackle, taking control (do a differenet one for goalies) or switching between moving stances/speeds - you can use the leg, hand(GK), wind, running, idle (U+1F574) and soccer ball icons, or any you think are more appropriate, but please no more than 2 per icons per action.
 - Why is the ball.possessed_by still using a player_id?? Do we enforce unique player_ids?? It seems so much easier to use just use the possesed_by field be player type rather than string, ball.possessed_by = kicker, instead of kicker.player_id. Is there an issue with circular references or something? If so, can't it be solved gracefully by refactoring or something? If not, it's okay, it just seems ugly
 - Maybe slightly reduce the size of the player spheres?
+- Is the game log permanent and can I copy/paste from it?
 
 NB Immediate:
 - Goalkeeper snaps in save order - not sure its needed if we program things correctly
@@ -30,7 +50,8 @@ NB:
 - Pretty sure you can currently kick at full power with having full in the kick_power stat, which begs the question of what it's purpose is. I think you should only have full power at 1.0 kick power
     - Ask the AI to explain the kick power calculations - maybe we need a non-linearity
 - implement goalie rebounds and "failed" saves of various kinds
-    - also implement rebounds off players for failed ball controls
+    - also implement rebounds off players for failed ball controls and from succesful tackles
 - Show player attributes ands stamina somewhere on select
 - Could do grid search on the goalie intercept maneuver and clever positioning - ask that AI how the intercepting is chosen, but really we should calculate distance/speed for both options, and make a weighted choice based on those, no? throw in some params and re-tune the goalie bonuses probably
 - footballer heigh should vary - and therefore jump height
+- At some point ask an AI to read through everything and offer suggestions for refactors or cleanups, comments and criticisms on structure and easy wins, possible bugs and edge cases. Do this before extending the game too much beyond the pitch

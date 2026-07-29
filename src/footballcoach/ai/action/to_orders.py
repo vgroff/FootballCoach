@@ -17,7 +17,6 @@ encoder must produce and pass this mapping alongside the ObservationBatch.
 """
 from __future__ import annotations
 
-import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -27,16 +26,7 @@ from footballcoach.ai.action.gating import GatingResult, SelectedAction
 from footballcoach.engine.match import Match
 from footballcoach.entities.player import Player, PlayerState
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import (
-    ChaseTackleOrder,
-    GetPossessionOrder,
-    KickOrder,
-    MarkOrder,
-    MoveOrder,
-    PassOrder,
-    SaveOrder,
-    StopOrder,
-)
+# Player.move_to() / stop() / kick() etc. construct Orders via lazy imports internally.
 
 
 @dataclass
@@ -46,6 +36,47 @@ class OrderTranslationResult:
     illegal_reason: str = ""
 
 
+# Far-target distance used when setting movement direction via MoveOrder.
+# 50m is beyond any braking horizon within a 0.5s decision interval at
+# realistic top speeds (~8 m/s), so the player accelerates in the correct
+# direction for the full interval without the engine's braking logic firing.
+_FAR_TARGET_M: float = 50.0
+
+
+def apply_movement_to_player(player: Player, gating: GatingResult) -> None:
+    """Apply execution-network movement unconditionally every decision tick.
+
+    Sets a MoveOrder with a far-away target in ``gating.move_direction`` so
+    the engine's ``step_player_towards`` picks up the correct heading for all
+    ~15 ticks in the decision interval.  Uses the execution network's
+    ``sprint`` Bernoulli to choose SPRINT vs JOG speed mode.
+
+    When the decision network selects NONE (all heads < 0.5, including move),
+    the player decelerates to STANDSTILL instead.
+
+    This function is always called first by ``apply_action_to_player``.  If a
+    high-level order fires afterwards (shoot/pass/tackle/etc.), it overwrites
+    the MoveOrder — those orders encapsulate their own movement logic.
+    """
+    # NONE means all Bernoulli heads < 0.5, including move → STANDSTILL.
+    if gating.selected == SelectedAction.NONE:
+        player.stop()
+        return
+
+    d = gating.move_direction
+    if d is None or np.linalg.norm(d) < 1e-6:
+        player.stop()
+        return
+
+    target = Vector3(
+        player.position.x + float(d[0]) * _FAR_TARGET_M,
+        player.position.y + float(d[1]) * _FAR_TARGET_M,
+        0.0,
+    )
+    sprint = bool(gating.sprint) if gating.sprint is not None else False
+    player.move_to(target, sprint=sprint)
+
+
 def apply_action_to_player(
     gating: GatingResult,
     player: Player,
@@ -53,41 +84,38 @@ def apply_action_to_player(
     slot_player_ids: list[Optional[str]],
     decision_physical: dict,
 ) -> OrderTranslationResult:
-    """Translate a GatingResult into an engine order on ``player``.
+    """Translate a GatingResult into engine orders on ``player``.
+
+    Two-phase execution:
+      1. ``apply_movement_to_player`` — always sets a MoveOrder (or StopOrder)
+         based on the execution network's ``move_direction`` + ``sprint``.
+      2. High-level order dispatch — if a decision head fired, call the
+         corresponding player action method, which overwrites the MoveOrder.
 
     Args:
         gating: Output of ``select_action()``.
         player: The player receiving the order.
         match: Running match (needed for pitch geometry and other players).
         slot_player_ids: List of length MAX_OTHER_PLAYERS mapping slot index
-            -> player_id (None for padded slots).  Must match the shuffle
-            from the same obs encoding step.
-        decision_physical: Dict of decoded physical values from the decision
-            network (move_region_center_m, move_region_size_m,
-            move_arrival_speed_mps).  All in physical units after squashing.
+            -> player_id (None for padded slots).
+        decision_physical: Decoded physical values from the decision network
+            (move_region_center_m etc.). Used only for shoot aim; movement
+            is driven entirely by execution-network ``move_direction``.
 
     Returns:
         OrderTranslationResult with illegal_action flag.
     """
-    sel = gating.selected
-    pitch = match.pitch
+    # Phase 1: movement is unconditional.
+    apply_movement_to_player(player, gating)
 
-    # -----------------------------------------------------------------------
-    # Execution-network motor outputs: always applied regardless of what the
-    # decision network selected, UNLESS a specific high-level order already
-    # encapsulates movement (e.g. ChaseTackleOrder runs its own chase logic).
-    # For MOVE/HOLD_POSITION, the execution network's move_direction is used
-    # as the preferred direction within the requested region.
-    # -----------------------------------------------------------------------
+    # Phase 2: high-level order (overwrites movement order when it fires).
+    sel = gating.selected
 
     if sel == SelectedAction.SHOOT:
         return _apply_shoot(player, match, gating, decision_physical)
 
     elif sel == SelectedAction.PASS:
-        return _apply_pass(player, match, gating, slot_player_ids, decision_physical)
-
-    elif sel in (SelectedAction.MOVE, SelectedAction.HOLD_POSITION):
-        return _apply_move(player, gating, decision_physical, hold_position=(sel == SelectedAction.HOLD_POSITION))
+        return _apply_pass(player, match, gating, slot_player_ids)
 
     elif sel == SelectedAction.TACKLE:
         return _apply_tackle(player, match, gating, slot_player_ids)
@@ -98,8 +126,8 @@ def apply_action_to_player(
     elif sel == SelectedAction.MARK:
         return _apply_mark(player, match, gating, slot_player_ids)
 
-    else:  # SelectedAction.NONE
-        return _apply_none(player, gating)
+    # MOVE, HOLD_POSITION, NONE: movement already applied in phase 1.
+    return OrderTranslationResult()
 
 
 # ---------------------------------------------------------------------------
@@ -107,30 +135,21 @@ def apply_action_to_player(
 # ---------------------------------------------------------------------------
 
 def _apply_shoot(player: Player, match: Match, gating: GatingResult, decision_physical: dict) -> OrderTranslationResult:
-    """Issue a KickOrder toward goal (or the execution network's kick_direction)."""
-    # Precondition: player must have the ball
+    """Issue a KickOrder toward goal using the execution network's kick_direction."""
     if match.ball.possessed_by != player.player_id:
         return OrderTranslationResult(illegal_action=True, illegal_reason="shoot_without_possession")
 
-    # Use the execution network's kick_direction to determine aim_point.
-    # Project direction forward to a reasonable aim distance, then use
-    # actions.shoot's aim_point override for exact goal targeting.
     kick_dir = gating.kick_direction  # (2,) unit vector
     if kick_dir is None or np.linalg.norm(kick_dir) < 1e-6:
-        # Fallback: aim at opponent goal centre
         from footballcoach.actions import opponent_goal_centre
         aim_pt = opponent_goal_centre(match.pitch, player.team).with_z(1.1)
     else:
-        # Use kick_direction to pick the y-offset within the goal
         goal_half_w = match.pitch.goal_width_m / 2.0
-        if player.team.name == "LEFT":
-            goal_x = match.pitch.half_length
-        else:
-            goal_x = -match.pitch.half_length
+        goal_x = match.pitch.half_length if player.team.name == "LEFT" else -match.pitch.half_length
         aim_y = float(kick_dir[1]) * goal_half_w
         aim_pt = Vector3(goal_x, aim_y, 1.1)
 
-    player.current_order = KickOrder(
+    player.kick(
         aim_point=aim_pt,
         power_fraction=float(gating.kick_power_fraction) if gating.kick_power_fraction > 0 else 0.85,
         spin=Vector3(*gating.kick_spin) if gating.kick_spin is not None else Vector3.zero(),
@@ -143,7 +162,6 @@ def _apply_pass(
     match: Match,
     gating: GatingResult,
     slot_player_ids: list[Optional[str]],
-    decision_physical: dict,
 ) -> OrderTranslationResult:
     if match.ball.possessed_by != player.player_id:
         return OrderTranslationResult(illegal_action=True, illegal_reason="pass_without_possession")
@@ -152,34 +170,9 @@ def _apply_pass(
     if target_player is None:
         return OrderTranslationResult(illegal_action=True, illegal_reason="pass_no_valid_target")
 
-    player.current_order = PassOrder(
+    player.pass_ball(
         target_position=target_player.position,
         target_player_id=target_player.player_id,
-    )
-    return OrderTranslationResult()
-
-
-def _apply_move(
-    player: Player,
-    gating: GatingResult,
-    decision_physical: dict,
-    hold_position: bool,
-) -> OrderTranslationResult:
-    """Issue a MoveOrder toward the decision network's move_region_center."""
-    center = decision_physical.get("move_region_center_m")
-    if center is None:
-        # No region data; use player's current position (effectively hold)
-        target = player.position
-    else:
-        target = Vector3(float(center[0]), float(center[1]), 0.0)
-
-    arrival_speed = decision_physical.get("move_arrival_speed_mps")
-    sprint = gating.sprint if gating.sprint is not None else True
-
-    player.current_order = MoveOrder(
-        target_position=target,
-        sprint=sprint,
-        max_speed_on_arrival_mps=arrival_speed,
     )
     return OrderTranslationResult()
 
@@ -197,11 +190,10 @@ def _apply_tackle(
     if target_player is None:
         return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_no_valid_target")
 
-    # Don't tackle own teammates
     if target_player.team == player.team:
         return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_own_teammate")
 
-    player.current_order = ChaseTackleOrder(target_player_id=target_player.player_id)
+    player.tackle_player(target_player_id=target_player.player_id)
     return OrderTranslationResult()
 
 
@@ -209,7 +201,7 @@ def _apply_get_possession(player: Player, match: Match) -> OrderTranslationResul
     if player.state == PlayerState.INACTIVE_TACKLED:
         return OrderTranslationResult(illegal_action=True, illegal_reason="get_possession_while_inactive")
 
-    player.current_order = GetPossessionOrder()
+    player.get_possession()
     return OrderTranslationResult()
 
 
@@ -226,42 +218,7 @@ def _apply_mark(
     if target_player.team == player.team:
         return OrderTranslationResult(illegal_action=True, illegal_reason="mark_own_teammate")
 
-    player.current_order = MarkOrder(target_player_id=target_player.player_id)
-    return OrderTranslationResult()
-
-
-def _apply_none(player: Player, gating: GatingResult) -> OrderTranslationResult:
-    """All heads < 0.5: execution network drives movement only.
-
-    Issue a MoveOrder in the execution network's move_direction if the player
-    currently has no persistent order in progress; otherwise leave the
-    current order alone (it will continue executing per the engine's
-    tick-based order persistence).
-    """
-    from footballcoach.orders import OrderStatus
-    current = player.current_order
-
-    # If the player has an active in-progress order (not complete), leave it.
-    if current is not None:
-        status = getattr(current, "status", None)
-        if status is not None and status != OrderStatus.COMPLETE:
-            return OrderTranslationResult()
-
-    # No active order: move in execution network direction (keep player alive)
-    if gating.move_direction is not None:
-        d = gating.move_direction
-        # Take a step of 5m in the indicated direction as a provisional target
-        step = 5.0
-        target = Vector3(
-            player.position.x + float(d[0]) * step,
-            player.position.y + float(d[1]) * step,
-            0.0,
-        )
-        player.current_order = MoveOrder(
-            target_position=target,
-            sprint=bool(gating.sprint),
-        )
-
+    player.mark_player(target_player_id=target_player.player_id)
     return OrderTranslationResult()
 
 

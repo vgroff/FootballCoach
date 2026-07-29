@@ -56,10 +56,13 @@ class TrainingSchedules:
         self.clip_range = constant(float(ppo_cfg.get("clip_range", 0.2)))
         self.rng_reduction = rng_reduction_schedule(curriculum_cfg)
         bc = bc_cfg or {}
-        self.bc_aux_coeff = linear_anneal(
-            float(bc.get("aux_coeff_start", 0.0)),
-            float(bc.get("aux_coeff_end", 0.0)),
-        )
+        _bc_start = float(bc.get("aux_coeff_start", 0.0))
+        _bc_end = float(bc.get("aux_coeff_end", 0.0))
+        _bc_frac = float(bc.get("aux_coeff_anneal_fraction", 1.0))
+        _bc_inner = linear_anneal(_bc_start, _bc_end)
+        def _bc_schedule(progress: float) -> float:
+            return _bc_inner(min(progress / _bc_frac, 1.0)) if _bc_frac > 0.0 else _bc_end
+        self.bc_aux_coeff = _bc_schedule
 
     def lr(self, progress: float) -> float:
         return self.learning_rate(progress)

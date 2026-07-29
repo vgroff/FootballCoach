@@ -267,16 +267,22 @@ class TestMove:
         order = solo_match.player_by_id("p1").current_order
         assert isinstance(order, MoveOrder)
 
-    def test_move_target_matches_decision_physical(self, solo_match):
-        center = np.array([15.0, -3.0])
+    def test_move_target_uses_execution_direction(self, solo_match):
+        """Movement target is player.position + move_direction * 50m, not
+        the decision network's move_region_center."""
+        player = solo_match.player_by_id("p1")
+        player.position = Vector3(0.0, 0.0, 0.0)
+        move_dir = np.array([0.0, 1.0])  # pointing +y
         _apply(
-            _gating(SelectedAction.MOVE),
+            _gating(SelectedAction.MOVE, move_dir=move_dir),
             solo_match, "p1",
-            decision_physical={"move_region_center_m": center},
+            decision_physical={"move_region_center_m": np.array([15.0, -3.0])},
         )
         order = solo_match.player_by_id("p1").current_order
-        assert order.target_position.x == pytest.approx(15.0, abs=0.1)
-        assert order.target_position.y == pytest.approx(-3.0, abs=0.1)
+        assert isinstance(order, MoveOrder)
+        # Target should be ~50m in the +y direction, ignoring move_region_center
+        assert order.target_position.x == pytest.approx(0.0, abs=1.0)
+        assert order.target_position.y == pytest.approx(50.0, abs=1.0)
 
     def test_hold_position_assigns_move_order(self, solo_match):
         result = _apply(
@@ -293,20 +299,24 @@ class TestMove:
 # ---------------------------------------------------------------------------
 
 class TestNone:
-    def test_none_with_no_order_assigns_move(self, solo_match):
-        """When NONE and no active order, execution direction gives a MoveOrder."""
+    def test_none_always_sets_stop_order(self, solo_match):
+        """NONE (all heads < 0.5) always issues StopOrder (STANDSTILL).
+        move_logit < 0.5 means the player should decelerate, not keep drifting."""
+        from footballcoach.orders import StopOrder
         solo_match.player_by_id("p1").current_order = None
         result = _apply(
             _gating(SelectedAction.NONE, move_dir=np.array([1.0, 0.0])),
             solo_match, "p1",
         )
         assert not result.illegal_action
-        assert isinstance(solo_match.player_by_id("p1").current_order, MoveOrder)
+        assert isinstance(solo_match.player_by_id("p1").current_order, StopOrder)
 
-    def test_none_with_active_order_leaves_it(self, solo_match):
-        """When NONE and an in-progress order exists, it must not be overwritten."""
+    def test_none_overwrites_stale_in_progress_order(self, solo_match):
+        """NONE overwrites any existing order with StopOrder — the player
+        should decelerate regardless of what it was previously doing."""
+        from footballcoach.orders import StopOrder
         existing = MoveOrder(target_position=Vector3(20, 0, 0))
         existing.status = OrderStatus.IN_PROGRESS
         solo_match.player_by_id("p1").current_order = existing
         _apply(_gating(SelectedAction.NONE), solo_match, "p1")
-        assert solo_match.player_by_id("p1").current_order is existing
+        assert isinstance(solo_match.player_by_id("p1").current_order, StopOrder)

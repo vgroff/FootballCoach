@@ -303,13 +303,22 @@ class Renderer:
         title_surf = self.title_font.render(title, True, style.HUD_ACCENT)
         surface.blit(title_surf, ((sw - title_surf.get_width()) // 2, 30))
 
-        row_h = 40
+        row_h = 44
         start_y = 100
-        col_label_x = sw // 2 - 220
-        col_val_x = sw // 2 + 20
-        col_minus_x = sw // 2 - 60
-        col_plus_x = sw // 2 + 100
         btn_w, btn_h = 32, 28
+        gap = 16  # padding between label and minus button
+
+        # Measure the widest label so we can align buttons consistently.
+        max_label_w = max(
+            (self.hud_font.size(p.label)[0] for p in params),
+            default=0,
+        )
+        # Centre the whole block: label | gap | [-] gap [val] gap [+]
+        block_w = max_label_w + gap + btn_w + gap + 60 + gap + btn_w
+        col_label_x = (sw - block_w) // 2
+        col_minus_x = col_label_x + max_label_w + gap
+        col_val_x   = col_minus_x + btn_w + gap
+        col_plus_x  = col_val_x + 60 + gap
 
         button_rects: dict[str, tuple[pygame.Rect, pygame.Rect]] = {}
 

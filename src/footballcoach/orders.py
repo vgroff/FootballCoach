@@ -121,14 +121,15 @@ class StopOrder:
 class GetPossessionOrder:
     """Runs straight at the ball and acquires it.
 
-    - If the ball is loose, the player sprints to it; pickup happens
-      automatically via the normal control-time model once they're close
-      enough.
+    - If the ball is loose, the player chases it at the given speed (sprint
+      by default); pickup happens automatically via the normal control-time
+      model once they're close enough.
     - If another player has the ball, the player chases that carrier and
       attempts one tackle on contact (exactly like ChaseTackleOrder),
       then completes regardless of the tackle outcome.
     - Completes immediately if this player already possesses the ball.
     """
+    sprint: bool = True  # True = sprint to ball, False = jog
     status: OrderStatus = OrderStatus.PENDING
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 

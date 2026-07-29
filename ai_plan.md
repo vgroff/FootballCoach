@@ -1,5 +1,6 @@
 Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the a_plan.md and the ai_design_document.md
 
+
 AI Design:
 - Do ask questions and do also criticise things
 - We're gonna do PPO with some neural networks - I think 2 per player, but they will be held in common and trained together (for now at least). At a high level, it'll go like this:
@@ -23,9 +24,11 @@ AI Design:
         - Mark probability + mark target
             - Reward being close to mark target and being between him and the ball more aggresively, and reward interceptions
         - Hold position probability
-            - This is has the same behaviour as move and uses the move coordinates, but the network is penalised much more aggresively when it's enabled and the player is outside the designated region
+            - This is is a number between 0 and 1, the network is penalised much more aggresively when both iself and the move order are enabled and the player is outside the region designated by the move order, and the further they are the harsher the penalty
         - Region of play
             - A region that is at least 15m*15m and up to 40m*40m denoting the region of play - players are rewarded for staying in/nearer to this region, but not punished particularly harshly for straying outside of it
+        - Region of play importance
+            - Number between 0 - 1. If set high (>0.8) and hold position is low (<0.3), player will prefer being in region of play to move order
         - A value between 0 and 1 - defence/attack weighting - this changes the reward function during training - tackling and keeping posessionn is more rewarded with high defence but moving up the field, shooting and scoring is more heavily weighted with high attack. This value should not change dramatically (i.e. it should start at the output value and then if it changes, the change should happen over minutes when it's then presented to the execution network (or maybe this behaviour can be baked into the neural net, some kind of moving average? not sure, it has to be controllable and simple mainly)). When a goal happens this value is allow to change more aggresively. Otherwise, it should have this high latency to represent long term strategy
         - A latent vector
     - Then I have 2 options:

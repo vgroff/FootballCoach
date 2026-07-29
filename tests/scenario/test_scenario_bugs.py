@@ -75,15 +75,13 @@ def test_move_order_completion_with_no_order_does_not_immediately_end():
     """A player that just completed a MoveOrder (current_order=None, ball still)
     should not be considered 'done' on the very same tick — the next waypoint
     should be issueable on the following tick."""
-    from footballcoach.ui.scenarios import ScenarioLoop, ScenarioDefinition, SprintController, _sprint_on_tick
-    import math
+    from footballcoach.ui.scenarios import ScenarioLoop, ScenarioDefinition
+    from footballcoach.rules_ai import SprintWaypointAI
 
     pitch = Pitch.standard()
 
     def build_two_waypoint_sprint(rng_reduction=0.3):
         rng = random.Random(42)
-        from footballcoach.entities import PlayerAttributes
-        attrs = PlayerAttributes(0.8, 0.8, 0.8, 0.5, 0.5, 0.5, 0.5, 0.5)
         player = make_player("runner", Team.LEFT, attr_value=0.8,
                              position=Vector3(0, 0, 0))
         ball = Ball.at_rest(Vector3(0, 20, 0))
@@ -93,16 +91,14 @@ def test_move_order_completion_with_no_order_does_not_immediately_end():
                   rng_reduction=rng_reduction, rng=rng,
                   goal_linger_s=ui_cfg.get("goal_linger_s", 3.0))
         waypoints = [Vector3(3, 0, 0), Vector3(6, 0, 0)]
-        ctrl = SprintController(player.player_id, waypoints)
         player.current_order = MoveOrder(target_position=waypoints[0], sprint=True)
-        ctrl._next_idx = 1
-        m._sprint_controller = ctrl  # type: ignore[attr-defined]
+        player.ai = SprintWaypointAI(waypoints, start_idx=1)
         return m
 
     defn = ScenarioDefinition(
         key="test_sprint", label="test", description="",
         build=build_two_waypoint_sprint,
-        on_tick=_sprint_on_tick,
+        on_tick=None,
     )
     loop = ScenarioLoop(definition=defn, max_trials=0, timeout_ticks=300)
 
@@ -287,11 +283,10 @@ def test_1v2_move_order_completes_with_stationary_obstacle():
 
 
 def test_1v2_controller_issues_shoot_after_move():
-    """End-to-end test of the OneVTwoController: after the MoveOrder finishes,
-    the controller must issue a ShootOrder within a handful of ticks.
-    Defenders are present to reproduce the repulsion-driven circling bug."""
+    """After the attacker's MoveOrder finishes, BallCarrierAttackerAI (via
+    player.ai) must issue a ShootOrder within a handful of ticks."""
     from footballcoach.orders import GetPossessionOrder, ShootOrder
-    from footballcoach.ui.scenarios import OneVTwoController
+    from footballcoach.rules_ai import BallCarrierAttackerAI, Phase1RulesAI, StagedGoalkeeperAI
 
     pitch = Pitch.standard()
     goal_centre = pitch.right_goal_centre
@@ -317,19 +312,27 @@ def test_1v2_controller_issues_shoot_after_move():
 
     attacker.current_order = MoveOrder(target_position=move_target, sprint=True)
     defender.current_order = GetPossessionOrder()
-    controller = OneVTwoController(attacker.player_id, gk.player_id, shoot_at=aim_point)
+    attacker.ai = BallCarrierAttackerAI(aim_point, power_fraction=0.9)
+    defender.ai = Phase1RulesAI()
+    gk.ai = StagedGoalkeeperAI()
 
     MAX_TICKS = 400
     shoot_issued = False
     for tick in range(MAX_TICKS):
-        controller(match, tick)
-        # Check BEFORE step — match.step() executes the kick in the same tick,
-        # so by the time step() returns the order is already None.
-        if isinstance(attacker.current_order, ShootOrder):
-            shoot_issued = True
-            break
+        # ai.act() runs inside match.step() → ShootOrder issued → immediately
+        # consumed within the same step().  Capture via a flag on the order.
+        # Workaround: patch the AI's act to track firing.
+        _orig_act = attacker.ai.act
+        def _tracked_act(player, m, t, _orig=_orig_act):
+            _orig(player, m, t)
+            nonlocal shoot_issued
+            if isinstance(player.current_order, ShootOrder):
+                shoot_issued = True
+        attacker.ai.act = _tracked_act
+
         match.step()
-        # Stop if the attacker lost the ball (defender tackled them)
+        if shoot_issued:
+            break
         if match.ball.possessed_by != attacker.player_id:
             break
 

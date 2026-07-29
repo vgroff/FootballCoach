@@ -664,6 +664,23 @@ When a goal is detected by `_check_goal`:
 Tests: `tests/unit/test_goal_linger.py` covers immediate-reset regression,
 linger duration, no double-goals during linger, and countdown-rate assertion.
 
+## Player action callbacks (`Player.on_kick`, `Player.on_tackle`)
+
+Two optional per-player callbacks fire at the **exact engine tick** an action executes:
+
+```python
+player.on_kick    = lambda player: ...   # KickOrder, ShootOrder, PassOrder
+player.on_tackle  = lambda player: ...   # ChaseTackleOrder (when contact is made)
+```
+
+- `on_kick` fires inside `Match._process_orders()` immediately after `kick_ball()`
+  or `pass_ball()` is called and `_start_release_grace()` completes.
+- `on_tackle` fires when `are_touching(player, target)` is True and
+  `target.is_available_to_tackle()` — i.e. at the moment the tackle attempt
+  executes, before the tackle outcome is resolved.
+- Both default to `None` (no-op, zero cost).
+- Useful for: BC recording, UI action icons, statistics, logging.
+
 ## Game log (`Match.log_callback`, Phase G)
 
 `Match.log_callback: Callable[[LogLevel, str], None] | None = None` is an

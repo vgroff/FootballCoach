@@ -23,33 +23,56 @@ resolve to jog speed, `0.0` = full standstill). The engine uses
 to arrive at the requested speed — see the **Engine/AI boundary** section
 below. No order is permitted to assign `player.velocity` directly.
 
-## `actions.py` - simple, literally-named action helpers
+## Player action methods — the canonical way to issue Orders
 
-Per the project's requirement for straightforward functions rather than
-hand-built order objects: `move_to`, `shoot`, `pass_to`, `tackle`, `save`,
-`mark`. Each just assigns the corresponding order to `player.current_order`
-- none of them drive the match loop themselves, so a caller still needs to
-call `Match.step()` in a loop afterwards for anything to actually happen.
+`Player` has named action methods that are the **only** correct way to set
+`player.current_order`.  Never assign `player.current_order = SomeOrder(...)`
+from outside the `Player` class.
 
-- `move_to(player, target_position)` -> `MoveOrder`
-- `shoot(player, pitch)` -> `KickOrder` aimed at
-  `opponent_goal_centre(pitch, player.team)` (dead centre of the goal the
-  player's team is attacking, at `DEFAULT_SHOOT_HEIGHT_M` = 1.1m,
-  `DEFAULT_SHOOT_POWER_FRACTION` = 0.85). Only has an effect if the player
-  currently has the ball.
-- `pass_to(player, target_position)` -> `PassOrder` (auto-paced by
-  distance unless `power_fraction` is given explicitly).
-- `tackle(player, target)` -> `ChaseTackleOrder` (chase + one tackle
-  attempt on contact).
-- `save(goalkeeper)` -> `SaveOrder` (goalkeeper-only; continuously tracks
-  the incoming shot).
-- `mark(player, target)` -> `MarkOrder` (see below). Never auto-completes.
+| Method | Order issued | Notes |
+|--------|-------------|-------|
+| `player.kick(aim_point, power_fraction, spin)` | `KickOrder` | Only effective if player has ball |
+| `player.pass_ball(target_position, target_player_id, power_fraction)` | `PassOrder` | Led pass if `target_player_id` set |
+| `player.get_possession()` | `GetPossessionOrder` | Chase ball / dispossess carrier |
+| `player.tackle_player(target_player_id)` | `ChaseTackleOrder` | Chase + tackle on contact |
+| `player.mark_player(target_player_id)` | `MarkOrder` | Never auto-completes |
+| `player.stop()` | `StopOrder` | Decelerate to standstill |
+| `player.save_goal()` | `SaveOrder` | Goalkeeper only |
+| `player.move_to(target_position, sprint, max_speed_on_arrival_mps)` | `MoveOrder` | Rules-based AI and BC labels only — see neural boundary below |
 
-`opponent_goal_centre(pitch, team)` resolves which goal a team is attacking
-using the same convention as `engine/offside.py` and
-`engine/goalkeeping.py`: `Team.LEFT` attacks +x (the right goal),
-`Team.RIGHT` attacks -x (the left goal). If you ever flip this convention,
-update it in all three places.
+## Neural network / Orders boundary (IMPORTANT)
+
+`MoveOrder` and all Order types are used by:
+- The **rules-based AI** (assign `player.ai = Phase1RulesAI()` etc.; `Match.step()` calls `player.ai.act(player, match, tick)` automatically)
+- **BC label generation** (supervised teacher signal)
+- **High-level decision head fires** — when the neural network's shoot/pass/
+  tackle/get_possession/mark Bernoulli heads fire, `to_orders.py` calls the
+  corresponding player method, which sets the Order
+
+The **execution neural network drives movement** via `move_direction` (a unit
+vector) + `sprint` (Bernoulli), NOT via `move_region_center` from the decision
+network.  `to_orders.py::apply_movement_to_player` converts this to a far-target
+`MoveOrder` (50m in the direction vector) so the engine's `step_player_towards`
+picks up the correct heading for all ~15 ticks in the decision interval.
+
+- `move_logit < 0.5` (SelectedAction.NONE) → `player.stop()` → STANDSTILL
+- `move_logit >= 0.5` → `player.move_to(position + move_direction * 50m, sprint=sprint)`
+
+The decision network's `move_region_center` / `move_arrival_speed` are
+**strategic context** for reward shaping and BC label generation — they are
+NOT used as motor control inputs.
+
+## `actions.py` — thin shim (deprecated, kept for compatibility)
+
+`actions.py` functions (`move_to`, `shoot`, `pass_to`, `tackle`, `save`,
+`mark`) each delegate to the matching `Player` method in one line.  Existing
+call sites in the rules-based AI, UI, and tests are preserved.  **New code
+should call player methods directly.**
+
+`opponent_goal_centre(pitch, team)` in `actions.py` still resolves goal
+direction per the `Team.LEFT` attacks +x / `Team.RIGHT` attacks -x convention
+from `engine/offside.py` and `engine/goalkeeping.py`.  If you ever flip this
+convention update it in all three places.
 
 ## Where the balance tests for these live
 

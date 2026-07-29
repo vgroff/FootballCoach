@@ -21,7 +21,7 @@ Design rule: BC labels do NOT go through the PPO importance ratio / clipping.
 They are a separate, additive loss term. This means they can use actions taken
 by the rules-based AI (which has no π_old) without corrupting PPO's math.
 
-Flat tensor layout for stored BC labels (11 floats per step):
+Flat tensor layout for stored BC labels (15 floats per step):
   [0]  shoot
   [1]  pass_
   [2]  move
@@ -34,7 +34,9 @@ Flat tensor layout for stored BC labels (11 floats per step):
   [9]  sprint
   [10] move_region_x_m   (physical x of move target in metres; 0.0 if not applicable)
   [11] move_region_y_m   (physical y of move target in metres; 0.0 if not applicable)
-  [12] valid             (1.0 = use this label, 0.0 = skip BC loss for this step)
+  [12] kick_this_tick    (1.0 = player is kicking this step, 0.0 otherwise)
+  [13] tackle_attempt    (1.0 = player is tackling this step, 0.0 otherwise)
+  [14] valid             (1.0 = use this label, 0.0 = skip BC loss for this step)
 """
 from __future__ import annotations
 
@@ -49,22 +51,24 @@ import torch.nn.functional as F
 
 log = logging.getLogger("footballcoach.ai.bc")
 
-BC_LABEL_DIM = 13  # elements in the flat label vector (see module docstring)
+BC_LABEL_DIM = 15  # elements in the flat label vector (see module docstring)
 
 # Indices into the flat label vector
-_I_SHOOT     = 0
-_I_PASS      = 1
-_I_MOVE      = 2
-_I_TACKLE    = 3
-_I_GP_EXTRA  = 4
-_I_MARK      = 5
-_I_HOLD      = 6
-_I_DIR_X     = 7
-_I_DIR_Y     = 8
-_I_SPRINT    = 9
-_I_REGION_X  = 10
-_I_REGION_Y  = 11
-_I_VALID     = 12
+_I_SHOOT          = 0
+_I_PASS           = 1
+_I_MOVE           = 2
+_I_TACKLE         = 3
+_I_GP_EXTRA       = 4
+_I_MARK           = 5
+_I_HOLD           = 6
+_I_DIR_X          = 7
+_I_DIR_Y          = 8
+_I_SPRINT         = 9
+_I_REGION_X       = 10
+_I_REGION_Y       = 11
+_I_KICK_THIS_TICK = 12
+_I_TACKLE_ATTEMPT = 13
+_I_VALID          = 14
 
 # Standard pitch half-dimensions used to normalise move_region supervision.
 # Kept as constants here so bc_loss_from_tensor doesn't need a pitch object.
@@ -91,6 +95,8 @@ class BCLabel:
     move_direction: Optional[np.ndarray] = None  # shape (2,) unit vector
     sprint: float = 1.0
     move_region_center_m: Optional[np.ndarray] = None  # shape (2,) physical metres
+    kick_this_tick: float = 0.0   # execution: 1.0 if player is kicking this step
+    tackle_attempt: float = 0.0   # execution: 1.0 if player is attempting a tackle
     valid: bool = True
 
     def to_array(self) -> np.ndarray:
@@ -106,11 +112,13 @@ class BCLabel:
         if self.move_direction is not None:
             arr[_I_DIR_X] = float(self.move_direction[0])
             arr[_I_DIR_Y] = float(self.move_direction[1])
-        arr[_I_SPRINT]   = self.sprint
+        arr[_I_SPRINT]         = self.sprint
         if self.move_region_center_m is not None:
             arr[_I_REGION_X] = float(self.move_region_center_m[0])
             arr[_I_REGION_Y] = float(self.move_region_center_m[1])
-        arr[_I_VALID]    = 1.0 if self.valid else 0.0
+        arr[_I_KICK_THIS_TICK] = self.kick_this_tick
+        arr[_I_TACKLE_ATTEMPT] = self.tackle_attempt
+        arr[_I_VALID]          = 1.0 if self.valid else 0.0
         return arr
 
     @staticmethod
@@ -123,66 +131,77 @@ class BCLabel:
 # Rules-based label generators
 # ---------------------------------------------------------------------------
 
-def phase1_labels(env) -> BCLabel:
-    """Generate rules-based BC labels for the Phase 1 trainee from the
-    current match state.
+def phase1_labels(env, player_id: str = None) -> BCLabel:
+    """Derive BC labels for Phase 1 by asking Phase1RulesAI what it would do.
 
-    Rules:
-    - Ball loose or opponent has it:
-        get_possession=1 (gp_extra=1), move=0, tackle=0
-        move_direction = unit vector toward ball
-    - Trainee has ball:
-        move=1, get_possession=0
-        move_direction = unit vector toward opponent's goal (+x for Team.LEFT)
-    - Always: sprint=1, all other heads=0
+    Instantiates a temporary Phase1RulesAI, calls act() on the current match
+    state, and reads back the order it sets — so the labels are always exactly
+    in sync with the rules AI behaviour, with no duplicated logic here.
     """
+    from footballcoach.rules_ai import Phase1RulesAI
+    from footballcoach.orders import MoveOrder, GetPossessionOrder, ShootOrder, ChaseTackleOrder, KickOrder, PassOrder
+
     try:
         match = env.match
-        trainee_id = env.trainee_player_id
+        if player_id is None:
+            player_id = env.trainee_player_id
         if match is None:
             return BCLabel.invalid()
-        trainee = match.player_by_id(trainee_id)
-        ball = match.ball
+        player = match.player_by_id(player_id)
     except (KeyError, AttributeError):
         return BCLabel.invalid()
 
-    tx, ty = trainee.position.x, trainee.position.y
-    bx, by = ball.position.x, ball.position.y
+    # Execution heads (kick_this_tick, tackle_attempt, sprint) reflect what the
+    # rules AI is physically doing RIGHT NOW — i.e. the current order it's executing,
+    # before any new decision is made.
+    current_exec = player.current_order
+    kick_this_tick = 1.0 if isinstance(current_exec, (ShootOrder, KickOrder, PassOrder)) else 0.0
+    tackle_attempt = 1.0 if isinstance(current_exec, ChaseTackleOrder) else 0.0
 
-    if ball.possessed_by == trainee_id:
-        # Trainee has ball: move toward opponent's box entry (edge closest to trainee)
-        # Target: front edge of opponent's box at (+half_length - box_length, 0)
-        box_entry_x = match.pitch.half_length - match.pitch.box_length_m
-        goal_x = match.pitch.half_length
-        goal_y = 0.0
-        dx = goal_x - tx
-        dy = goal_y - ty
+    # Decision heads reflect what the rules AI DECIDES next.
+    # Temporarily clear current_order so the AI always produces a fresh decision.
+    player.current_order = None
+    try:
+        Phase1RulesAI().act(player, match, trial_tick=0)
+        order = player.current_order
+    finally:
+        player.current_order = current_exec  # always restore
+
+    if isinstance(order, MoveOrder):
+        tx, ty = player.position.x, player.position.y
+        tgt = order.target_position
+        dx, dy = tgt.x - tx, tgt.y - ty
         length = math.hypot(dx, dy)
         if length < 1e-6:
             return BCLabel.invalid()
         direction = np.array([dx / length, dy / length], dtype=np.float32)
         return BCLabel(
             move=1.0,
-            sprint=1.0,
+            sprint=1.0 if order.sprint else 0.0,
             move_direction=direction,
-            # MoveOrder target: aim for the opponent box entry, clamped inside pitch
-            move_region_center_m=np.array([box_entry_x, 0.0], dtype=np.float32),
+            move_region_center_m=np.array([tgt.x, tgt.y], dtype=np.float32),
+            kick_this_tick=kick_this_tick,
+            tackle_attempt=tackle_attempt,
         )
-    else:
-        # No possession or opponent has it: get possession, move toward ball
-        dx = bx - tx
-        dy = by - ty
+    elif isinstance(order, GetPossessionOrder):
+        ball = match.ball
+        bx, by = ball.position.x, ball.position.y
+        tx, ty = player.position.x, player.position.y
+        dx, dy = bx - tx, by - ty
         length = math.hypot(dx, dy)
         if length < 1e-6:
             return BCLabel.invalid()
         direction = np.array([dx / length, dy / length], dtype=np.float32)
         return BCLabel(
             get_possession_extra=1.0,
-            sprint=1.0,
+            sprint=1.0 if order.sprint else 0.0,
             move_direction=direction,
-            # MoveOrder target when chasing: go to ball position
             move_region_center_m=np.array([bx, by], dtype=np.float32),
+            kick_this_tick=kick_this_tick,
+            tackle_attempt=tackle_attempt,
         )
+    else:
+        return BCLabel.invalid()
 
 
 # ---------------------------------------------------------------------------
@@ -226,8 +245,10 @@ def bc_loss_from_tensor(
     loss += _bce(decision_heads.mark_logit,            _I_MARK)
     loss += _bce(decision_heads.hold_position_logit,   _I_HOLD)
 
-    # --- Execution: sprint Bernoulli ---
-    loss += _bce(exec_heads.sprint_logit, _I_SPRINT)
+    # --- Execution: sprint, kick_this_tick, tackle_attempt Bernoullis ---
+    loss += _bce(exec_heads.sprint_logit,          _I_SPRINT)
+    loss += _bce(exec_heads.kick_logit,            _I_KICK_THIS_TICK)
+    loss += _bce(exec_heads.tackle_attempt_logit,  _I_TACKLE_ATTEMPT)
 
     # Direction losses are upweighted relative to the 8 BCE terms (weight=3.0).
     # BCE heads converge quickly; direction needs more gradient pressure.
@@ -292,6 +313,7 @@ class BCPretrainer:
         self.device = device
         bc_cfg = cfg.get("bc", {})
         lr = float(bc_cfg.get("pretrain_lr", 1e-3))
+        self._online_batch_size = int(bc_cfg.get("pretrain_online_batch_size", 16))
         all_params = (
             list(decision_net.parameters()) + list(execution_net.parameters())
         )
@@ -302,57 +324,155 @@ class BCPretrainer:
         env,
         n_steps: int,
         label_fn: Callable,
+        dataset=None,
+        n_epochs: int = 1,
+        batch_size: int = 64,
     ) -> None:
-        """Run ``n_steps`` BC pre-training steps.
+        """Run BC pre-training.
+
+        Two modes:
+          - **Online** (default, ``dataset=None``): step the env with rules-based
+            AI, compute labels on-the-fly, one gradient step per env step.
+            Simple but noisy (single-sample updates, oscillates on episode reset).
+          - **Offline** (``dataset`` provided): sample minibatches from a pre-recorded
+            ``DemonstrationDataset`` for ``n_epochs`` epochs of ``n_steps`` steps.
+            Stable, low-variance gradients; decoupled from env randomness.
 
         Args:
-            env: ScenarioEnv — must already have been reset externally.
-            n_steps: Total gradient steps (= environment steps).
-            label_fn: Callable(env) -> BCLabel — produces supervision labels.
+            env: ScenarioEnv — used only in online mode.
+            n_steps: Online steps OR offline steps-per-epoch.
+            label_fn: Callable(env) -> BCLabel — online mode only.
+            dataset: Optional DemonstrationDataset for offline mode.
+            n_epochs: Offline mode only — number of passes over the dataset.
+            batch_size: Offline mode only — minibatch size.
         """
         if n_steps <= 0:
             return
 
-        log.info(f"BC pre-training: {n_steps} steps")
+        if dataset is not None:
+            self._pretrain_offline(dataset, n_steps, n_epochs, batch_size)
+        else:
+            self._pretrain_online(env, n_steps, label_fn)
+
+    def _pretrain_offline(self, dataset, n_steps: int, n_epochs: int, batch_size: int) -> None:
+        """Offline BC pre-training from a DemonstrationDataset."""
+        log.info(
+            f"BC pre-training (offline): {n_epochs} epoch(s), "
+            f"batch_size={batch_size}, dataset={len(dataset):,} steps"
+        )
+        import torch.nn as nn
+
+        total_steps_done = 0
+        for epoch in range(n_epochs):
+            epoch_loss = 0.0
+            epoch_batches = 0
+            for obs_dict, labels in dataset.iterate_minibatches(
+                batch_size=batch_size, shuffle=True, device=self.device, valid_only=True
+            ):
+                self.optimizer.zero_grad()
+                d_heads = self.decision_net(
+                    obs_dict["self_feat"], obs_dict["other_feat"],
+                    obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                )
+                e_heads = self.execution_net(
+                    obs_dict["self_feat"], obs_dict["other_feat"],
+                    obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                    d_heads,
+                )
+                loss = bc_loss_from_tensor(labels, d_heads, e_heads)
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+                    1.0,
+                )
+                self.optimizer.step()
+                epoch_loss += float(loss.item())
+                epoch_batches += 1
+                total_steps_done += 1
+
+            mean_loss = epoch_loss / max(1, epoch_batches)
+            log.info(
+                f"BC pre-train epoch {epoch + 1}/{n_epochs} | "
+                f"mean_bc_loss={mean_loss:.4f} ({epoch_batches} batches)"
+            )
+
+        log.info("BC pre-training (offline) complete.")
+
+    def _pretrain_online(self, env, n_steps: int, label_fn: Callable) -> None:
+        """Online BC pre-training: accumulate a mini-batch, then gradient step.
+
+        Collects ``pretrain_online_batch_size`` (obs, label) pairs before each
+        update.  This gives low-variance gradients at the cost of slightly
+        fewer updates per step, which is a much better trade-off than the
+        previous 1-sample-per-update scheme.
+        """
+        batch_size = max(1, self._online_batch_size)
+        log.info(f"BC pre-training (online): {n_steps} steps, batch_size={batch_size}")
+        import torch.nn as nn
+        from footballcoach.rules_ai import Phase1RulesAI
         obs = env.reset()
+        try:
+            env._loop.match.player_by_id(env.trainee_player_id).ai = Phase1RulesAI()
+        except (AttributeError, KeyError):
+            pass
         total_loss = 0.0
         valid_steps = 0
 
+        # Accumulators for the current mini-batch
+        batch_obs: list[dict] = []
+        batch_labels: list = []
+
         for step in range(n_steps):
             label = label_fn(env)
-            label_arr = torch.from_numpy(label.to_array()).unsqueeze(0).to(self.device)
-
-            obs_dict = {
-                k: v.unsqueeze(0).to(self.device)
-                for k, v in obs.to_torch_dict().items()
-            }
-
-            self.optimizer.zero_grad()
-            d_heads = self.decision_net(
-                obs_dict["self_feat"], obs_dict["other_feat"],
-                obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
-            )
-            e_heads = self.execution_net(
-                obs_dict["self_feat"], obs_dict["other_feat"],
-                obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
-                d_heads,
-            )
-            loss = bc_loss_from_tensor(label_arr, d_heads, e_heads)
-            loss.backward()
-            self.optimizer.step()
-
-            total_loss += float(loss.item())
+            obs_dict = {k: v.to(self.device) for k, v in obs.to_torch_dict().items()}
+            batch_obs.append(obs_dict)
+            batch_labels.append(torch.from_numpy(label.to_array()).to(self.device))
             if label.valid:
                 valid_steps += 1
 
-            # Step the env with a dummy action derived from the label so the
-            # state changes (trainee moves toward ball / goal).
-            env_action = _label_to_env_action(label, env)
-            next_obs, _reward, done, _info = env.step(env_action)
-            obs = env.reset() if done else next_obs
+            # Gradient step once the mini-batch is full (or at the last step)
+            if len(batch_obs) >= batch_size or step == n_steps - 1:
+                # Stack into batched tensors
+                stacked = {
+                    k: torch.stack([b[k] for b in batch_obs], dim=0)
+                    for k in batch_obs[0]
+                }
+                label_t = torch.stack(batch_labels, dim=0)
+
+                self.optimizer.zero_grad()
+                d_heads = self.decision_net(
+                    stacked["self_feat"], stacked["other_feat"],
+                    stacked["exists_mask"], stacked["ball_feat"], stacked["global_feat"],
+                )
+                e_heads = self.execution_net(
+                    stacked["self_feat"], stacked["other_feat"],
+                    stacked["exists_mask"], stacked["ball_feat"], stacked["global_feat"],
+                    d_heads,
+                )
+                loss = bc_loss_from_tensor(label_t, d_heads, e_heads)
+                loss.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+                    1.0,
+                )
+                self.optimizer.step()
+                total_loss += float(loss.item())
+                batch_obs.clear()
+                batch_labels.clear()
+
+            next_obs, _reward, done, _info = env.step()
+            if done:
+                obs = env.reset()
+                try:
+                    env._loop.match.player_by_id(env.trainee_player_id).ai = Phase1RulesAI()
+                except (AttributeError, KeyError):
+                    pass
+            else:
+                obs = next_obs
 
             if (step + 1) % 200 == 0:
-                mean_loss = total_loss / max(1, valid_steps)
+                updates = (step + 1) // batch_size
+                mean_loss = total_loss / max(1, updates)
                 log.info(
                     f"BC pre-train step {step + 1}/{n_steps} | "
                     f"mean_bc_loss={mean_loss:.4f} (over {valid_steps} valid steps)"

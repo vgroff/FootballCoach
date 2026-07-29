@@ -1,0 +1,249 @@
+"""Record rules-based AI demonstrations for offline BC pre-training.
+
+Runs N complete episodes of a given phase scenario with rules-based AI on
+all sides, collecting (observation, bc_label) pairs at each decision step.
+Saves the results as .npz files under a given output directory.
+
+Usage::
+
+    # Record 200 phase-1 episodes, 8 episodes per file (= 25 files)
+    uv run python -m footballcoach.ai.scripts.record_demonstrations \\
+        --phase 1 --n-episodes 200 --episodes-per-file 8 \\
+        --output demonstrations/phase1/
+
+    # Inspect what was recorded
+    uv run python -m footballcoach.ai.scripts.record_demonstrations \\
+        --phase 1 --n-episodes 0 --output demonstrations/phase1/ --info
+
+Output .npz files contain:
+    obs_self_feat, obs_other_feat, obs_exists_mask, obs_ball_feat,
+    obs_global_feat, bc_labels, meta_phase, meta_scenario
+
+Each file is self-contained and can be loaded individually or combined with
+DemonstrationDataset.from_directory().
+"""
+from __future__ import annotations
+
+import argparse
+import logging
+import os
+import time
+from pathlib import Path
+
+import numpy as np
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s %(name)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("footballcoach.ai.record")
+
+
+# ---------------------------------------------------------------------------
+# Per-phase env + label-fn factories (shared via curriculum.envs)
+# ---------------------------------------------------------------------------
+
+def _build_env_and_label_fn(phase_id: int):
+    """Return (env, label_fn, scenario_key) for the given phase."""
+    from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+    from footballcoach.ai.curriculum.envs import build_env, bc_label_fn_for_phase
+
+    phase = PHASES_BY_ID.get(phase_id)
+    if phase is None:
+        raise ValueError(f"Unknown phase: {phase_id}")
+    label_fn = bc_label_fn_for_phase(phase_id)
+    if label_fn is None:
+        raise NotImplementedError(f"No BC label function defined for phase {phase_id}")
+    env = build_env(phase)
+    return env, label_fn, phase.scenario_key
+
+
+# ---------------------------------------------------------------------------
+# Recording logic
+# ---------------------------------------------------------------------------
+
+def record_episodes(
+    env,
+    label_fn,
+    n_episodes: int,
+    scenario_key: str,
+    phase_id: int,
+) -> dict:
+    """Run *n_episodes* with rules-based AI driving the trainee and opponent.
+
+    Sampling strategy:
+      - on_kick / on_tackle player callbacks fire at the exact engine tick the
+        action executes (inside the 15-tick window of env.step()) → recorded
+        immediately via closure.
+      - Once per env.step() (0.5s) the current state is also sampled.
+      - env.step() handles all terminal conditions normally (box possession,
+        timeout) so episodes end correctly.
+
+    Returns a dict of numpy arrays ready to be saved as .npz.
+    """
+    from footballcoach.rules_ai import Phase1RulesAI
+
+    self_feats = []
+    other_feats = []
+    exists_masks = []
+    ball_feats = []
+    global_feats = []
+    bc_labels = []
+
+    steps_total = 0
+    steps_valid = 0
+
+    def _record_now():
+        obs = env._get_obs()
+        label = label_fn(env)
+        label_arr = label.to_array()
+        self_feats.append(obs.self_feat.copy())
+        other_feats.append(obs.other_feat.copy())
+        exists_masks.append(obs.exists_mask.copy())
+        ball_feats.append(obs.ball_feat.copy())
+        global_feats.append(obs.global_feat.copy())
+        bc_labels.append(label_arr)
+        nonlocal steps_total, steps_valid
+        steps_total += 1
+        if label.valid:
+            steps_valid += 1
+
+    for ep in range(n_episodes):
+        env.reset()
+
+        # Drive trainee with rules-based AI and attach action callbacks.
+        # Callbacks fire inside env.step()'s 15-tick loop, so episodes still
+        # terminate correctly via env.step()'s box-possession / timeout checks.
+        try:
+            player = env._loop.match.player_by_id(env.trainee_player_id)
+            player.ai = Phase1RulesAI()
+            player.on_kick = lambda p: _record_now()
+            player.on_tackle = lambda p: _record_now()
+        except (AttributeError, KeyError):
+            pass
+
+        done = False
+        while not done:
+            # Sample current state (0.5s cadence)
+            _record_now()
+            # Step 15 physics ticks; callbacks fire inside here for kicks/tackles
+            _obs, _reward, done, _info = env.step()
+
+        if (ep + 1) % 20 == 0 or ep == n_episodes - 1:
+            log.info(
+                f"Episode {ep + 1}/{n_episodes} | "
+                f"steps so far: {steps_total:,} ({steps_valid:,} valid)"
+            )
+
+    return {
+        "obs_self_feat":   np.stack(self_feats).astype(np.float32),
+        "obs_other_feat":  np.stack(other_feats).astype(np.float32),
+        "obs_exists_mask": np.stack(exists_masks).astype(np.float32),
+        "obs_ball_feat":   np.stack(ball_feats).astype(np.float32),
+        "obs_global_feat": np.stack(global_feats).astype(np.float32),
+        "bc_labels":       np.stack(bc_labels).astype(np.float32),
+        "meta_phase":      np.array(phase_id, dtype=np.int32),
+        "meta_scenario":   np.bytes_(scenario_key),
+    }
+
+
+# ---------------------------------------------------------------------------
+# CLI
+# ---------------------------------------------------------------------------
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Record rules-based AI demonstrations for BC pre-training"
+    )
+    parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 3, 4])
+    parser.add_argument("--n-episodes", type=int, default=200,
+                        help="Total episodes to record (default: 200)")
+    parser.add_argument("--episodes-per-file", type=int, default=8,
+                        help="Episodes per output .npz file (default: 8)")
+    parser.add_argument("--output", type=str, required=True,
+                        help="Output directory for .npz files")
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--info", action="store_true",
+                        help="Print info about existing files and exit")
+    args = parser.parse_args()
+
+    import random
+    np.random.seed(args.seed)
+    random.seed(args.seed)
+
+    output_dir = Path(args.output)
+
+    if args.info:
+        _print_info(output_dir)
+        return
+
+    if args.n_episodes <= 0:
+        log.info("n-episodes=0, nothing to record.")
+        return
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    env, label_fn, scenario_key = _build_env_and_label_fn(args.phase)
+
+    n_eps = args.n_episodes
+    eps_per_file = args.episodes_per_file
+    n_files = (n_eps + eps_per_file - 1) // eps_per_file
+
+    log.info(
+        f"Recording {n_eps} episodes of phase {args.phase} ({scenario_key}) "
+        f"→ {n_files} file(s) in {output_dir}"
+    )
+
+    total_steps = 0
+    file_idx = 0
+    remaining = n_eps
+
+    while remaining > 0:
+        batch = min(eps_per_file, remaining)
+        t0 = time.time()
+        data = record_episodes(
+            env=env,
+            label_fn=label_fn,
+            n_episodes=batch,
+            scenario_key=scenario_key,
+            phase_id=args.phase,
+        )
+        elapsed = time.time() - t0
+
+        n_steps = len(data["bc_labels"])
+        total_steps += n_steps
+
+        fname = output_dir / f"phase{args.phase}_{file_idx:04d}.npz"
+        np.savez_compressed(fname, **data)
+
+        log.info(
+            f"Saved {fname.name} | {batch} episodes, {n_steps} steps | {elapsed:.1f}s"
+        )
+
+        file_idx += 1
+        remaining -= batch
+
+    log.info(
+        f"Done. {file_idx} file(s), {total_steps:,} total steps → {output_dir}"
+    )
+
+
+def _print_info(directory: Path) -> None:
+    """Print summary of existing .npz files in directory."""
+    files = sorted(directory.glob("*.npz")) if directory.exists() else []
+    if not files:
+        print(f"No .npz files found in {directory}")
+        return
+    total_steps = 0
+    valid_steps = 0
+    for f in files:
+        data = np.load(f)
+        n = len(data["bc_labels"])
+        v = int((data["bc_labels"][:, -1] > 0.5).sum())
+        total_steps += n
+        valid_steps += v
+        print(f"  {f.name}: {n} steps ({v} valid)")
+    print(f"Total: {len(files)} files, {total_steps:,} steps ({valid_steps:,} valid)")
+
+
+if __name__ == "__main__":
+    main()
