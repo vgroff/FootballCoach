@@ -38,12 +38,19 @@ src/footballcoach/
                 order to a player
   ui/           pygame-ce renderer, mouse input handling, training mode, and
                 a picker for illustrative balance scenarios
+  ai/           Neural-network / PPO player AI (optional; requires torch).
+                Observation encoding, decision + execution networks, custom
+                PPO training loop. Install: uv sync --group ai
+                Train: uv run python -m footballcoach.ai.scripts.train --phase 1
 tests/
   unit/         Fast, deterministic unit tests per module
   scenario/     End-to-end scenarios at rng_reduction=1.0 (fully deterministic)
   balance/      Statistical balance tests at rng_reduction=0.3 (the default
                 game setting), run over many trials, reporting full stats
                 (not just pass/fail) so the numbers can be tuned
+  ai_unit/      Fast, deterministic AI unit tests (requires torch).
+                Covers obs encoding, GAE, distributions, gating, reward,
+                network shapes. Run: uv run pytest tests/ai_unit
 ```
 
 Each package under `src/footballcoach/` has its own `knowledge.md` explaining
@@ -56,7 +63,8 @@ This project uses [uv](https://github.com/astral-sh/uv) for dependency
 management.
 
 ```bash
-uv sync
+uv sync              # base game + tests (no torch)
+uv sync --group ai   # + torch, for AI training
 ```
 
 ## Running the game
@@ -100,6 +108,9 @@ uv run pytest tests/scenario
 
 # Statistical balance tests (prints full stats tables with -s)
 uv run pytest tests/balance -s
+
+# AI unit tests (requires uv sync --group ai first)
+uv run pytest tests/ai_unit
 ```
 
 Balance test results are also written to

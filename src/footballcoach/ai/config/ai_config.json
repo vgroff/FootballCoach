@@ -1,0 +1,72 @@
+{
+  "_comment": "AI neural network and PPO hyperparameters. All tunable constants live here, not hardcoded - mirrors physics.json/attributes.json pattern.",
+
+  "observation": {
+    "max_other_players": 21,
+    "decision_interval_s": 0.5,
+    "ball_spin_norm_max_rad_s": 30.0,
+    "time_remaining_norm_max_s": 7200.0,
+    "height_norm_m": 3.0,
+    "_comment_time": "Use log1p normalization for time_remaining to spread out the low end (see ai_design_doc.md section 7.5)"
+  },
+
+  "network": {
+    "entity_embed_dim": 64,
+    "num_attention_heads": 4,
+    "self_mlp_hidden": 64,
+    "ball_mlp_hidden": 32,
+    "global_mlp_hidden": 32,
+    "decision_mlp_hidden": 64,
+    "trunk_hidden": 256,
+    "latent_dim": 32,
+    "_comment": "Shared-trunk actor/critic (Option A from section 9.4). Switch to separate trunk if value loss destabilises policy."
+  },
+
+  "ppo": {
+    "gamma": 0.99,
+    "lam": 0.95,
+    "clip_range": 0.2,
+    "vf_coef": 0.5,
+    "ent_coef": 0.01,
+    "max_grad_norm": 0.5,
+    "learning_rate": 3e-4,
+    "n_epochs": 4,
+    "minibatch_size": 64,
+    "target_kl": 0.02,
+    "rollout_steps": 2048,
+    "_comment": "Standard PPO defaults from CleanRL-style reference implementations. Tune empirically."
+  },
+
+  "curriculum": {
+    "rng_reduction_start": 0.55,
+    "rng_reduction_end": 0.3,
+    "pitch_standard_fraction": 0.8,
+    "pitch_min_scale": 0.33,
+    "goal_min_scale": 0.5
+  },
+
+  "ema": {
+    "attack_defence_alpha_normal": 0.995,
+    "attack_defence_alpha_post_goal": 0.95,
+    "post_goal_window_s": 10.0,
+    "_comment": "EMA smoothing for attack/defence weighting (section 2.7). alpha close to 1 = slow change, further from 1 = fast change."
+  },
+
+  "reward": {
+    "phase1": {
+      "ball_distance_shaping": 0.05,
+      "gain_possession_bonus": 1.0,
+      "ball_progress_scale": 0.1,
+      "ball_out_penalty": -1.0,
+      "illegal_action_penalty": -0.2,
+      "box_possession_terminal": 5.0
+    },
+    "phase2": {
+      "shot_speed_bonus_max": 1.0,
+      "shot_on_target_bonus": 2.0,
+      "goal_terminal": 10.0,
+      "illegal_action_penalty": -0.2,
+      "possession_lost_to_keeper_penalty": -0.5
+    }
+  }
+}

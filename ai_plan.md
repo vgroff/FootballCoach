@@ -1,5 +1,3 @@
-Read Idea.md, and all the READMe and knowledge files, except Idea2
-You may also have stuff in memory/storage for this repo. Here is my thoughts:
 
 AI Design:
 - Do ask questions and do also criticise things

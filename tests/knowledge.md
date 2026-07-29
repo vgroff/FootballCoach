@@ -113,11 +113,50 @@ Shared fixtures:
   `PlayerAttributes` by hand in tests.
 - `BalanceResultRecorder` / `balance_recorder` fixture - see above.
 
+## `ai_unit/`
+
+Fast, deterministic tests for the AI package (`src/footballcoach/ai/`).
+These require `torch` installed (`uv sync --group ai`), but do NOT run any
+training - just forward passes with random inputs and arithmetic checks.
+
+**Key test files:**
+- `test_obs_schema.py` — dimension constants (PLAYER_FEATURE_DIM=25,
+  BALL_FEATURE_DIM=12, GLOBAL_FEATURE_DIM=11, MAX_OTHER_PLAYERS=21),
+  to_array shapes, dtypes, field ordering.
+- `test_obs_encoder.py` — position normalization, flag correctness,
+  slot shuffling permutation invariance, padded-slot all-zero invariant,
+  no-NaN guarantee, score-diff team perspective, log1p time normalization.
+- `test_gae.py` — GAE(lambda) hand-computed reference cases (three-step
+  episode with explicit expected values), Monte Carlo equivalence,
+  episode-boundary isolation (done=1 must zero cross-boundary carry),
+  last_value bootstrapping, RolloutBuffer housekeeping.
+- `test_distributions.py` — MaskedCategorical masked slots get EXACTLY zero
+  probability; unmasked probs sum to 1; SquashedNormalHead stays within
+  physical bounds; DirectionHead output is a unit vector; no NaN anywhere.
+- `test_gating.py` — winner-take-all rule, 0.5 does not fire (strictly >),
+  highest-prob head wins, target slot propagation, execution pass-through.
+- `test_to_orders.py` — correct order type assigned for each action, illegal
+  preconditions detected (shoot without possession, tackle while inactive,
+  tackle own teammate, no valid target), NONE with/without active order.
+- `test_reward.py` — per-component arithmetic for phase1_reward and
+  phase2_reward, EMAFilter slow/fast alpha, post-goal window expiry, reset.
+- `test_networks.py` — DecisionNetwork and ExecutionNetwork output shapes for
+  every head, no NaN/Inf, get_possession >= tackle constraint,
+  flatten_decision_heads dim consistency with execution_net.decision_mlp.
+
+**conftest.py** in `tests/ai_unit/` provides:
+- `solo_match` — single player, loose ball
+- `duel_match` — 1v1, p1 (LEFT) has ball, p2 (RIGHT) has none
+- `gk_match` — GK (LEFT) vs attacker (RIGHT) with ball
+- `standard_pitch` — standard Pitch fixture
+
 ## Running a subset
 
 ```bash
-uv run pytest tests/unit                 # fast
+uv run pytest tests/unit                 # fast engine unit tests
 uv run pytest tests/scenario             # deterministic end-to-end
 uv run pytest tests/balance -s           # statistical, prints tables
 uv run pytest tests/balance -s -k tackling  # just one balance area
+uv run pytest tests/ai_unit              # AI unit tests (requires torch)
+uv run pytest tests/ -q                  # everything
 ```

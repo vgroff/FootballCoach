@@ -24,6 +24,9 @@ dev = [
     "pytest>=9.1.1",
     "pytest-xdist>=3.8.0",
 ]
+ai = [
+    "torch>=2.0",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

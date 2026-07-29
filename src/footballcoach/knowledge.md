@@ -63,6 +63,21 @@ update it in all three places.
 
 Each reports full statistics (not just pass/fail) via the `balance_recorder`
 fixture - see `tests/knowledge.md`.
+## `ai/` - neural network / PPO player AI
+
+See [`ai/knowledge.md`](ai/knowledge.md) for the full operational notes.
+In brief: the `ai/` package is a pure consumer of the engine — it never
+modifies `engine/`, `entities/`, `orders.py`, or `actions.py`.  Install with
+`uv sync --group ai` (torch is a separate optional dependency group so the
+base game stays lightweight).
+
+The two MVP training experiments (phase 1: get-possession/move, phase 2:
+shoot) are driven via:
+```bash
+uv run python -m footballcoach.ai.scripts.train --phase 1
+uv run python -m footballcoach.ai.scripts.train --phase 2
+```
+
 ## `steering.py` - player repulsion during Move orders
 
 A thin AI/order-layer module (sibling to `actions.py`, deliberately NOT

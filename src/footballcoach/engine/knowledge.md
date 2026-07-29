@@ -692,3 +692,32 @@ exceeds `BOUNCE_THRESHOLD_MPS` and the outgoing restituted speed also
 exceeds it). It decrements by `dt` each tick and floors at 0. The renderer
 uses it to draw an amber ring briefly after each bounce; the engine itself
 never reads it back.
+
+## AI / engine boundary (relevant when wiring up the AI training loop)
+
+The AI package (`src/footballcoach/ai/`) drives the engine via the standard
+`orders.py` / `actions.py` interface — same as the UI.  `ai/action/to_orders.py`
+translates neural-network gating output into `MoveOrder`, `KickOrder`,
+`PassOrder`, `ChaseTackleOrder`, `GetPossessionOrder`, `MarkOrder` objects
+and assigns them to `player.current_order`, then `Match.step()` handles
+execution identically to any other caller.
+
+**Illegal-action guardrail audit** (ai_design_doc.md section 11 checklist;
+items confirmed vs engine behaviour as of the time the AI package was added):
+
+- `KickOrder`/`ShootOrder`: `Match._process_orders` requires `ball.possessed_by
+  == player.player_id` before calling `kick_ball`/`pass_ball`; an AI
+  attempting to shoot without possession is safely a no-op at the engine
+  level. `to_orders.py` detects this independently and sets `illegal_action=True`
+  for the reward function.
+- `ChaseTackleOrder`/`GetPossessionOrder`: `attempt_tackle()` call sites
+  already check `player.state != INACTIVE_TACKLED` via `player.is_available_to_tackle()`.
+  `to_orders.py` additionally refuses to assign these orders to inactive players.
+- `PassOrder`: same possession precondition as `KickOrder` (checked in
+  `to_orders.py`; engine-level guard is the same `kick_ball` path).
+- `SaveOrder`: documented as "goalkeeper-only" in orders.py; the engine
+  does not enforce this with a hard guard (it would just chase the ball as
+  an outfield player); `to_orders.py` does not currently guard non-GK save
+  attempts — add a guard if non-GK save orders prove to be a training issue.
+- AI must be punished for illegal attempts AND the engine must be a safe
+  no-op — both protections coexist (see design doc 9.7).
