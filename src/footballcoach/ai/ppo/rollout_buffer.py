@@ -14,7 +14,7 @@ IMPORTANT: GAE correctness depends on correct `dones` alignment:
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional  # noqa: F401 - used in add() signature
 
 import numpy as np
 import torch
@@ -53,6 +53,12 @@ class RolloutBuffer:
     # 1.0 if this step ended the episode, else 0.0
     dones: list[float] = field(default_factory=list)
 
+    # Optional BC supervision labels (flat float32 arrays of length BC_LABEL_DIM).
+    # Each entry is the output of BCLabel.to_array() for the corresponding step.
+    # An all-zeros array with valid=0 is used as a placeholder when no label fn
+    # is provided (bc_labels[t][_I_VALID] == 0.0 → skip BC loss for this step).
+    bc_labels: list[np.ndarray] = field(default_factory=list)
+
     def add(
         self,
         obs: dict[str, np.ndarray],
@@ -61,13 +67,19 @@ class RolloutBuffer:
         value: float,
         reward: float,
         done: float,
+        bc_label: Optional[np.ndarray] = None,
     ) -> None:
+        from footballcoach.ai.ppo.bc import BC_LABEL_DIM
         self.obs.append(obs)
         self.actions.append(action)
         self.log_probs.append(log_prob)
         self.values.append(value)
         self.rewards.append(reward)
         self.dones.append(done)
+        self.bc_labels.append(
+            bc_label if bc_label is not None
+            else np.zeros(BC_LABEL_DIM, dtype=np.float32)
+        )
 
     def __len__(self) -> int:
         return len(self.rewards)
@@ -152,6 +164,11 @@ class RolloutBuffer:
         result["advantages"] = torch.tensor(advantages, dtype=torch.float32)
         result["returns"] = torch.tensor(returns, dtype=torch.float32)
 
+        if self.bc_labels:
+            result["bc_labels"] = torch.from_numpy(
+                np.stack(self.bc_labels, axis=0).astype(np.float32)
+            )
+
         return result
 
     def clear(self) -> None:
@@ -161,3 +178,4 @@ class RolloutBuffer:
         self.values.clear()
         self.rewards.clear()
         self.dones.clear()
+        self.bc_labels.clear()

@@ -35,6 +35,14 @@ def main() -> None:
                         help="PyTorch device (default: cpu)")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
+    parser.add_argument("--bc-pretrain-steps", type=int, default=None,
+                        help=(
+                            "Supervised BC pre-training steps before PPO starts. "
+                            "Overrides bc.pretrain_steps in ai_config.json when set. "
+                            "Set to 0 to disable pre-training entirely."
+                        ))
+    parser.add_argument("--no-bc-aux", action="store_true",
+                        help="Disable BC auxiliary loss during PPO (ignores ai_config.json bc.aux_coeff).")
     args = parser.parse_args()
 
     import torch
@@ -46,7 +54,7 @@ def main() -> None:
 
     from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
     from footballcoach.ai.curriculum.phases import PHASES_BY_ID
-    from footballcoach.ai.env.scenario_env import ScenarioEnv
+    from footballcoach.ai.config import load_ai_config
 
     phase = PHASES_BY_ID.get(args.phase)
     if phase is None:
@@ -59,15 +67,59 @@ def main() -> None:
     # Build environment
     env = _build_env(phase)
 
-    # Build trainer
-    trainer = PPOTrainer.from_config(device=device, checkpoint_dir=checkpoint_dir)
+    # BC label function (None = no BC)
+    label_fn = _bc_label_fn_for_phase(args.phase)
+
+    # BC pre-training steps: CLI flag overrides config
+    cfg = load_ai_config()
+    bc_cfg = cfg.get("bc", {})
+    pretrain_steps = (
+        args.bc_pretrain_steps
+        if args.bc_pretrain_steps is not None
+        else int(bc_cfg.get("pretrain_steps", 0))
+    )
+
+    # Build trainer (--no-bc-aux zeros out the aux coeff in config)
+    if args.no_bc_aux:
+        import copy
+        cfg = copy.deepcopy(cfg)
+        cfg.setdefault("bc", {})["aux_coeff_start"] = 0.0
+        cfg["bc"]["aux_coeff_end"] = 0.0
+        trainer = PPOTrainer(
+            decision_net=__import__("footballcoach.ai.models.decision_network",
+                                    fromlist=["DecisionNetwork"]).DecisionNetwork.from_config(),
+            execution_net=__import__("footballcoach.ai.models.execution_network",
+                                     fromlist=["ExecutionNetwork"]).ExecutionNetwork.from_config(),
+            cfg=cfg,
+            device=device,
+            checkpoint_dir=checkpoint_dir,
+        )
+    else:
+        trainer = PPOTrainer.from_config(device=device, checkpoint_dir=checkpoint_dir)
 
     # Optionally resume from checkpoint
     if args.checkpoint:
         trainer.load_checkpoint(Path(args.checkpoint))
 
-    # Train
-    trainer.train(env, total_steps=args.total_steps)
+    # BC pre-training phase (supervised, before PPO)
+    if pretrain_steps > 0 and label_fn is not None:
+        from footballcoach.ai.ppo.bc import BCPretrainer
+        pretrainer = BCPretrainer(
+            trainer.decision_net, trainer.execution_net, cfg, device
+        )
+        pretrainer.pretrain(env, n_steps=pretrain_steps, label_fn=label_fn)
+
+    # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0)
+    aux_label_fn = None if (args.no_bc_aux or label_fn is None) else label_fn
+    trainer.train(env, total_steps=args.total_steps, bc_label_fn=aux_label_fn)
+
+
+def _bc_label_fn_for_phase(phase_id: int):
+    """Return the BC label function for the given phase, or None if not defined."""
+    if phase_id == 1:
+        from footballcoach.ai.ppo.bc import phase1_labels
+        return phase1_labels
+    return None
 
 
 def _build_env(phase):

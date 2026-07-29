@@ -4,7 +4,7 @@ Read Idea.md, and all the READMe and knowledge files, except Idea2 and ai_plans 
 You may also have stuff in memory/storage for this repo.
 
 AI stuff:
-- are the best models saved? Allow me to run the scenarios from the ui with every player controlled by the best AI instead of by the rules-based AI.
+- are the best models saved? In the UI scenario, have a checkbox for each player that allowed me to have it run ui with the best available AI instead of by the rules-based AI.
 
 NB Immediate Immediate:
 - The goalkeeper clearly teleports after saving the ball sometimes, wtf is that about??

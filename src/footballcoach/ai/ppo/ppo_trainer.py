@@ -78,7 +78,8 @@ class PPOTrainer:
 
         ppo_cfg = cfg["ppo"]
         curriculum_cfg = cfg.get("curriculum", {})
-        self.schedules = TrainingSchedules(ppo_cfg, curriculum_cfg)
+        bc_cfg = cfg.get("bc", {})
+        self.schedules = TrainingSchedules(ppo_cfg, curriculum_cfg, bc_cfg)
 
         self.gamma = float(ppo_cfg.get("gamma", 0.99))
         self.lam = float(ppo_cfg.get("lam", 0.95))
@@ -104,14 +105,22 @@ class PPOTrainer:
     # Main training entry point
     # -----------------------------------------------------------------------
 
-    def train(self, env, total_steps: int) -> None:
+    def train(self, env, total_steps: int, bc_label_fn=None) -> None:
         """Run PPO for ``total_steps`` decision-interval steps.
 
         Args:
             env: ScenarioEnv (or any env with reset()/step() returning
                  ObservationBatch, float, bool, info).
             total_steps: Total number of decision steps to train for.
+            bc_label_fn: Optional callable ``(env) -> BCLabel``.  When
+                provided, a BC supervision label is collected at each step
+                and stored in the rollout buffer so it can be used as an
+                auxiliary loss during the PPO update (weight controlled by
+                ``bc.aux_coeff_start/end`` in ai_config.json).  Both the
+                decision network's Bernoulli heads and the execution
+                network's move_direction and sprint are supervised.
         """
+        from footballcoach.ai.ppo.bc import BCLabel
         obs = env.reset()
         buffer = RolloutBuffer()
         steps_this_rollout = 0
@@ -142,6 +151,12 @@ class PPOTrainer:
 
             next_obs, reward, done, info = env.step(env_action)
 
+            # Collect BC label for this step (before resetting obs)
+            bc_label_arr = None
+            if bc_label_fn is not None:
+                bc_label = bc_label_fn(env)
+                bc_label_arr = bc_label.to_array()
+
             # Store transition (as numpy, not torch, for efficient storage)
             obs_numpy = {k: v.numpy() for k, v in obs_dict.items()}
             buffer.add(
@@ -151,6 +166,7 @@ class PPOTrainer:
                 value=float(value),
                 reward=reward,
                 done=1.0 if done else 0.0,
+                bc_label=bc_label_arr,
             )
 
             episode_reward_accum += reward
@@ -180,6 +196,11 @@ class PPOTrainer:
                 mean_ep_reward = (
                     float(np.mean(episode_rewards[-20:])) if episode_rewards else 0.0
                 )
+                bc_str = (
+                    f" | bc_loss={metrics['bc_loss']:.4f}"
+                    f" (coeff={metrics['bc_coeff']:.3f})"
+                    if metrics.get("bc_coeff", 0.0) > 0.0 else ""
+                )
                 log.info(
                     f"step={self._total_steps:,} | "
                     f"ep_reward={mean_ep_reward:.2f} | "
@@ -187,6 +208,7 @@ class PPOTrainer:
                     f"value_loss={metrics['value_loss']:.4f} | "
                     f"entropy={metrics['entropy']:.4f} | "
                     f"approx_kl={metrics['approx_kl']:.4f}"
+                    f"{bc_str}"
                 )
 
                 buffer.clear()
@@ -413,11 +435,16 @@ class PPOTrainer:
 
         Returns dict of mean loss metrics for logging.
         """
+        from footballcoach.ai.ppo.bc import bc_loss_from_tensor
+
         n = len(batch["log_probs"])
         clip = self.schedules.clip(progress)
         lr = self.schedules.lr(progress)
+        bc_coeff = self.schedules.bc(progress)
         for pg in self.optimizer.param_groups:
             pg["lr"] = lr
+
+        has_bc = "bc_labels" in batch and bc_coeff > 0.0
 
         # Normalize advantages
         adv = batch["advantages"]
@@ -430,6 +457,7 @@ class PPOTrainer:
         all_value_loss = []
         all_entropy = []
         all_kl = []
+        all_bc_loss = []
 
         for _ in range(self.n_epochs):
             indices = torch.randperm(n)
@@ -476,6 +504,14 @@ class PPOTrainer:
 
                 total_loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
 
+                # BC auxiliary loss (decision + execution, annealed to 0)
+                bc_loss_val = torch.zeros(1, device=self.device)
+                if has_bc:
+                    mb_bc = batch["bc_labels"][mb_idx].to(self.device)
+                    bc_loss_val = bc_loss_from_tensor(mb_bc, d_heads, e_heads)
+                    total_loss = total_loss + bc_coeff * bc_loss_val
+                all_bc_loss.append(float(bc_loss_val))
+
                 self.optimizer.zero_grad()
                 total_loss.backward()
                 nn.utils.clip_grad_norm_(
@@ -500,6 +536,8 @@ class PPOTrainer:
             "value_loss": float(np.mean(all_value_loss)),
             "entropy": float(np.mean(all_entropy)),
             "approx_kl": float(np.mean(all_kl)),
+            "bc_loss": float(np.mean(all_bc_loss)),
+            "bc_coeff": bc_coeff,
         }
 
     def _recompute_log_prob(self, d_heads, e_heads, mb_actions: dict, exists_mask) -> torch.Tensor:

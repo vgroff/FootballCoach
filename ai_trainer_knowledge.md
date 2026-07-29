@@ -14,10 +14,18 @@ design document); this file is the actionable distillation of it.
 # One-time: install torch group
 uv sync --group ai
 
-# Train phase 1 (get possession) for 500k steps, saving checkpoints
+# Train phase 1 with default BC settings (pre-train 2000 steps, aux loss annealed)
 uv run python -m footballcoach.ai.scripts.train --phase 1 --total-steps 500000
 
-# Resume from a checkpoint
+# Train without any BC (pure PPO from a random init)
+uv run python -m footballcoach.ai.scripts.train \
+    --phase 1 --total-steps 500000 --bc-pretrain-steps 0 --no-bc-aux
+
+# More BC pre-training, then PPO with aux loss
+uv run python -m footballcoach.ai.scripts.train \
+    --phase 1 --total-steps 500000 --bc-pretrain-steps 5000
+
+# Resume from a checkpoint (BC pre-training is skipped on resume)
 uv run python -m footballcoach.ai.scripts.train \
     --phase 1 --total-steps 500000 \
     --checkpoint checkpoints/checkpoint_00002048.pt
@@ -48,11 +56,12 @@ Override the save directory with `--checkpoint-dir path/`.
 
 | File | Lines | Why it matters |
 |------|-------|----------------|
-| `ai_trainer_knowledge.md` (this file) | ~300 | Operational guide |
-| `src/footballcoach/ai/config/ai_config.json` | ~70 | All tunable hyperparameters |
-| `src/footballcoach/ai/scripts/train.py` | ~140 | CLI entry point; how envs are built |
+| `ai_trainer_knowledge.md` (this file) | ~350 | Operational guide |
+| `src/footballcoach/ai/config/ai_config.json` | ~80 | All tunable hyperparameters incl. BC |
+| `src/footballcoach/ai/scripts/train.py` | ~160 | CLI entry point; how envs and BC are built |
 | `src/footballcoach/ai/curriculum/phases.py` | ~100 | Which scenario each phase uses |
 | `src/footballcoach/ui/scenarios.py` | ~1100 | All scenario builders incl. `build_1v1_scenario`; **add new training scenarios here** |
+| `src/footballcoach/ai/ppo/bc.py` | ~310 | BC label generation, pre-trainer, and aux loss — read when tuning BC |
 
 ### Tier 2: Read when modifying the training loop or reward
 
@@ -216,6 +225,11 @@ torch.save(ckpt["execution_net"], "models/execution_net_500k.pt")
 - Progression (not yet automated): immobile opponent → rules-based opponent
   (`GetPossessionOrder`/`MoveOrder`) → frozen older-generation checkpoint.
 
+**BC bootstrapping for Phase 1** (`bc.py::phase1_labels`):
+- Ball loose or opponent has it → `get_possession_extra=1`, `move_dir` = toward ball, `sprint=1`
+- Trainee has ball → `move=1`, `move_dir` = toward opponent goal (+x), `sprint=1`
+- Trains both decision network Bernoulli heads **and** execution network `move_direction` + `sprint`
+
 ### Phase 2: Shooting
 
 ```
@@ -254,6 +268,12 @@ Never hardcode them.  Key sections:
     "rollout_steps": 2048,  // steps before each update
     "target_kl": 0.02       // early-stop threshold per epoch
   },
+  "bc": {
+    "pretrain_steps": 2000,     // supervised BC steps before PPO (0 = skip)
+    "pretrain_lr": 1e-3,        // learning rate for the BC pre-training phase
+    "aux_coeff_start": 0.2,     // BC aux loss weight at step 0 of PPO
+    "aux_coeff_end": 0.0        // BC aux loss weight at final step (linear anneal)
+  },
   "reward": {
     "phase1": {
       "ball_distance_shaping": 0.05,
@@ -277,7 +297,57 @@ changes only require editing the JSON.
 
 ---
 
-## 6. Adding a new training scenario
+## 6. Behavioural cloning (BC) from rules-based AI
+
+BC lets the rules-based `orders` AI act as a teacher for the neural networks.
+**It does not and cannot use rules-based actions as PPO rollout data** — PPO
+requires `log π_old(a|s)` from the policy that took each action, which the
+rules-based AI does not have.  Instead, BC is a *separate, additive* loss.
+
+### Two modes (both configurable, composable)
+
+**Mode 1 — Pre-training (before PPO):**
+`BCPretrainer.pretrain(env, n_steps, label_fn)` in `bc.py`.
+Rolls the *network* in the env but supervises it with BC labels from the
+rules-based logic each step.  Network weights update via pure BCE/cosine
+loss.  This gives the network a warm-start before PPO exploration begins,
+dramatically reducing the number of PPO steps to reach competent behaviour.
+
+**Mode 2 — Auxiliary loss during PPO:**
+At each PPO rollout step, `label_fn(env)` is called and a `BCLabel` is
+stored in the rollout buffer.  During `_ppo_update()`, a BC loss term is
+added: `total_loss += bc_coeff * bc_loss`.  `bc_coeff` anneals linearly
+from `aux_coeff_start` to `aux_coeff_end` (default 0.2 → 0.0) so BC
+influence fades as the RL signal takes over.
+
+### What is supervised
+
+`bc_loss_from_tensor()` in `bc.py` supervises:
+- **Decision network**: all 7 Bernoulli heads (shoot, pass, move, tackle,
+  get_possession_extra, mark, hold_position) via `binary_cross_entropy_with_logits`.
+- **Execution network**: `move_direction` (cosine loss on raw pre-normalised
+  2D vector output), `sprint` (BCE from logit).
+- Kick, tackle_attempt, and kick_direction are not supervised
+  (rules-based AI doesn't kick in Phase 1; extend `BCLabel` if needed later).
+
+### Adding BC for a new phase
+
+1. Write `phase_N_labels(env) -> BCLabel` in `bc.py` following `phase1_labels`.
+2. Add it to `_bc_label_fn_for_phase(phase_id)` in `train.py`.
+3. Optionally tune `bc.pretrain_steps` / `bc.aux_coeff_start` in
+   `ai_config.json` (or override per run with `--bc-pretrain-steps`).
+
+### CLI flags
+
+| Flag | Effect |
+|------|--------|
+| `--bc-pretrain-steps N` | Override `bc.pretrain_steps` from config |
+| `--bc-pretrain-steps 0` | Skip pre-training entirely |
+| `--no-bc-aux` | Disable BC auxiliary loss during PPO |
+
+---
+
+## 7. Adding a new training scenario
 
 All scenarios live in **`src/footballcoach/ui/scenarios.py`** — one source of
 truth for both the training loop and the UI scenario picker.
@@ -308,7 +378,7 @@ truth for both the training loop and the UI scenario picker.
 
 ---
 
-## 7. Environment wrapper — ScenarioEnv
+## 8. Environment wrapper — ScenarioEnv
 
 ```
 src/footballcoach/ai/env/scenario_env.py
@@ -409,9 +479,14 @@ training stopped.  This is intentional.
   stamina, heading; random ball velocity/spin/restitution.
 - End-to-end smoke test suite in `tests/ai_scenario/`.
 - Training loop confirmed to run: first PPO update at step=2048 produces
-  finite losses (`policy=0.33, value=0.49, entropy=5.28`) and a positive
-  mean episode reward (1.31) from ball-chasing behaviour.
+  finite losses and a positive mean episode reward from ball-chasing behaviour.
 - Checkpoint saving after every rollout and at end of run.
+- **Behavioural cloning (BC) bootstrapping** (`src/footballcoach/ai/ppo/bc.py`):
+  - Pre-training phase: pure supervised BCE on rules-based labels for N steps before PPO.
+  - Auxiliary loss during PPO: BC cross-entropy added to PPO loss with linearly annealed coefficient.
+  - Both modes train **decision network** (all 7 Bernoulli heads) AND **execution network** (`move_direction`, `sprint`).
+  - Phase 1 label fn: `bc.phase1_labels(env)` — toward ball when loose, toward goal when in possession.
+  - Configurable via `ai_config.json["bc"]` and CLI flags `--bc-pretrain-steps` / `--no-bc-aux`.
 
 ### Immediate next step: first real Phase 1 experiment
 ```bash

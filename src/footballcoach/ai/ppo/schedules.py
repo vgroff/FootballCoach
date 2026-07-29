@@ -51,10 +51,15 @@ class TrainingSchedules:
         curriculum_cfg: The 'curriculum' section of ai_config.json.
     """
 
-    def __init__(self, ppo_cfg: dict, curriculum_cfg: dict):
+    def __init__(self, ppo_cfg: dict, curriculum_cfg: dict, bc_cfg: dict | None = None):
         self.learning_rate = constant(float(ppo_cfg.get("learning_rate", 3e-4)))
         self.clip_range = constant(float(ppo_cfg.get("clip_range", 0.2)))
         self.rng_reduction = rng_reduction_schedule(curriculum_cfg)
+        bc = bc_cfg or {}
+        self.bc_aux_coeff = linear_anneal(
+            float(bc.get("aux_coeff_start", 0.0)),
+            float(bc.get("aux_coeff_end", 0.0)),
+        )
 
     def lr(self, progress: float) -> float:
         return self.learning_rate(progress)
@@ -64,3 +69,7 @@ class TrainingSchedules:
 
     def rng(self, progress: float) -> float:
         return self.rng_reduction(progress)
+
+    def bc(self, progress: float) -> float:
+        """BC auxiliary loss coefficient — linearly anneals to 0.0."""
+        return self.bc_aux_coeff(progress)
