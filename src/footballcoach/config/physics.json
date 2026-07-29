@@ -50,7 +50,7 @@
     "lateral_accel_scale_mps2": 4.0,
     "lateral_accel_ball_penalty_max": 0.6,
     "min_speed_for_turn_mps": 0.1,
-    "goalkeeper_accel_multiplier": 3.5,
+    "goalkeeper_accel_multiplier": 4.0,
     "goalkeeper_speed_multiplier": 1.4,
     "standstill_decel_multiplier": 1.5
   },
@@ -90,7 +90,7 @@
   },
   "tackling": {
     "tackler_boost": 1.25,
-    "tackle_cooldown_s": 0.5,
+    "tackle_cooldown_s": 1.2,
     "tackle_attempt_tackler_speed_mult": 0.5,
     "tackle_attempt_tacklee_speed_mult": 0.8,
     "loser_speed_penalty_scale": 1.2,
