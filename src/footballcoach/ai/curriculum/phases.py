@@ -46,7 +46,7 @@ PHASE_1_GET_POSSESSION = CurriculumPhase(
     phase_id=1,
     scenario_key="1v1",
     env_kwargs={
-        "max_episode_s": 120.0,
+        "max_episode_s": 240.0,
     },
     # Freeze all decision heads except the latent vector in early training.
     # Gradually unfreeze as per the curriculum (this is done manually by the

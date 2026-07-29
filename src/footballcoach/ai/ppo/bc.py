@@ -29,10 +29,12 @@ Flat tensor layout for stored BC labels (11 floats per step):
   [4]  get_possession_extra
   [5]  mark
   [6]  hold_position
-  [7]  move_dir_x   (unit vector component; 0.0 if dir not applicable)
+  [7]  move_dir_x        (unit vector component; 0.0 if dir not applicable)
   [8]  move_dir_y
   [9]  sprint
-  [10] valid         (1.0 = use this label, 0.0 = skip BC loss for this step)
+  [10] move_region_x_m   (physical x of move target in metres; 0.0 if not applicable)
+  [11] move_region_y_m   (physical y of move target in metres; 0.0 if not applicable)
+  [12] valid             (1.0 = use this label, 0.0 = skip BC loss for this step)
 """
 from __future__ import annotations
 
@@ -47,7 +49,7 @@ import torch.nn.functional as F
 
 log = logging.getLogger("footballcoach.ai.bc")
 
-BC_LABEL_DIM = 11  # elements in the flat label vector (see module docstring)
+BC_LABEL_DIM = 13  # elements in the flat label vector (see module docstring)
 
 # Indices into the flat label vector
 _I_SHOOT     = 0
@@ -60,7 +62,14 @@ _I_HOLD      = 6
 _I_DIR_X     = 7
 _I_DIR_Y     = 8
 _I_SPRINT    = 9
-_I_VALID     = 10
+_I_REGION_X  = 10
+_I_REGION_Y  = 11
+_I_VALID     = 12
+
+# Standard pitch half-dimensions used to normalise move_region supervision.
+# Kept as constants here so bc_loss_from_tensor doesn't need a pitch object.
+_PITCH_HALF_LENGTH_M = 52.5
+_PITCH_HALF_WIDTH_M  = 34.0
 
 
 @dataclass
@@ -81,6 +90,7 @@ class BCLabel:
     hold_position: float = 0.0
     move_direction: Optional[np.ndarray] = None  # shape (2,) unit vector
     sprint: float = 1.0
+    move_region_center_m: Optional[np.ndarray] = None  # shape (2,) physical metres
     valid: bool = True
 
     def to_array(self) -> np.ndarray:
@@ -97,6 +107,9 @@ class BCLabel:
             arr[_I_DIR_X] = float(self.move_direction[0])
             arr[_I_DIR_Y] = float(self.move_direction[1])
         arr[_I_SPRINT]   = self.sprint
+        if self.move_region_center_m is not None:
+            arr[_I_REGION_X] = float(self.move_region_center_m[0])
+            arr[_I_REGION_Y] = float(self.move_region_center_m[1])
         arr[_I_VALID]    = 1.0 if self.valid else 0.0
         return arr
 
@@ -137,8 +150,9 @@ def phase1_labels(env) -> BCLabel:
     bx, by = ball.position.x, ball.position.y
 
     if ball.possessed_by == trainee_id:
-        # Trainee has ball: move toward +x (LEFT team attacks +x)
-        # Use opponent goal centre x which is at +half_length
+        # Trainee has ball: move toward opponent's box entry (edge closest to trainee)
+        # Target: front edge of opponent's box at (+half_length - box_length, 0)
+        box_entry_x = match.pitch.half_length - match.pitch.box_length_m
         goal_x = match.pitch.half_length
         goal_y = 0.0
         dx = goal_x - tx
@@ -151,6 +165,8 @@ def phase1_labels(env) -> BCLabel:
             move=1.0,
             sprint=1.0,
             move_direction=direction,
+            # MoveOrder target: aim for the opponent box entry, clamped inside pitch
+            move_region_center_m=np.array([box_entry_x, 0.0], dtype=np.float32),
         )
     else:
         # No possession or opponent has it: get possession, move toward ball
@@ -164,6 +180,8 @@ def phase1_labels(env) -> BCLabel:
             get_possession_extra=1.0,
             sprint=1.0,
             move_direction=direction,
+            # MoveOrder target when chasing: go to ball position
+            move_region_center_m=np.array([bx, by], dtype=np.float32),
         )
 
 
@@ -211,6 +229,10 @@ def bc_loss_from_tensor(
     # --- Execution: sprint Bernoulli ---
     loss += _bce(exec_heads.sprint_logit, _I_SPRINT)
 
+    # Direction losses are upweighted relative to the 8 BCE terms (weight=3.0).
+    # BCE heads converge quickly; direction needs more gradient pressure.
+    dir_w = 3.0
+
     # --- Execution: move_direction cosine loss ---
     # Only where we have a valid direction (both components nonzero)
     has_dir = (labels[:, _I_DIR_X].abs() + labels[:, _I_DIR_Y].abs()) > 1e-6
@@ -221,7 +243,23 @@ def bc_loss_from_tensor(
         pred_norm = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
         # 1 - cosine similarity → 0 when perfectly aligned, 2 when opposite
         cos_loss = 1.0 - (pred_norm * target_dir).sum(dim=-1)
-        loss += torch.where(has_dir, cos_loss, torch.zeros_like(cos_loss))
+        loss += dir_w * torch.where(has_dir, cos_loss, torch.zeros_like(cos_loss))
+
+    # --- Decision: move_region_center MSE (normalised by pitch dims) ---
+    # Supervise the continuous region-center output that becomes the MoveOrder target.
+    # Normalise to [-1,1] so the loss scale matches the other terms.
+    # The network outputs tanh(raw)*[half_length, half_width]; we compare in
+    # normalised space so both are in [-1, 1].
+    has_region = (labels[:, _I_REGION_X].abs() + labels[:, _I_REGION_Y].abs()) > 1e-6
+    if has_region.any():
+        pitch_scale = torch.tensor(
+            [[_PITCH_HALF_LENGTH_M, _PITCH_HALF_WIDTH_M]], device=labels.device
+        )
+        target_region = labels[:, _I_REGION_X:_I_REGION_Y + 1]  # (N, 2) physical m
+        target_norm = (target_region / pitch_scale).clamp(-1.0, 1.0)  # normalised
+        pred_norm_region = torch.tanh(decision_heads.move_region_center)  # (N, 2) in [-1,1]
+        region_loss = ((pred_norm_region - target_norm) ** 2).sum(dim=-1)  # per-sample MSE * 2
+        loss += dir_w * torch.where(has_region, region_loss, torch.zeros_like(region_loss))
 
     # Mask to valid steps only and mean
     valid_loss = loss[valid]
@@ -362,7 +400,11 @@ def _label_to_env_action(label: BCLabel, env) -> dict:
             "tackle_attempt":    False,
         },
         "decision_physical": {
-            "move_region_center_m":   np.zeros(2, dtype=np.float32),
+            "move_region_center_m":   (
+                label.move_region_center_m
+                if label.move_region_center_m is not None
+                else np.zeros(2, dtype=np.float32)
+            ),
             "move_region_size_m":     2.0,
             "move_arrival_speed_mps": 7.0,
         },

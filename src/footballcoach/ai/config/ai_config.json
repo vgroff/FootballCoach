@@ -27,6 +27,7 @@
     "lam": 0.95,
     "clip_range": 0.2,
     "vf_coef": 0.5,
+    "dir_l2_coef": 0.01,
     "ent_coef": 0.01,
     "max_grad_norm": 0.5,
     "learning_rate": 3e-4,
@@ -47,11 +48,16 @@
 
   "bc": {
     "_comment": "Behavioural cloning from rules-based AI. Set pretrain_steps=0 to skip pre-training. Set aux_coeff_start=0.0 to disable the PPO auxiliary BC loss.",
-    "pretrain_steps": 2000,
+    "pretrain_steps": 6000,
     "pretrain_lr": 1e-3,
+    "direction_loss_weight": 3.0,
     "aux_coeff_start": 0.2,
     "aux_coeff_end": 0.0,
-    "_comment_aux": "aux_coeff anneals linearly from start to end over the full training run. The BC loss is computed on decision Bernoulli heads and execution move_direction."
+    "_comment_aux": "aux_coeff anneals linearly from start to end over the full training run. The BC loss is computed on decision Bernoulli heads and execution move_direction.",
+    "value_pretrain_steps": 4096,
+    "value_pretrain_epochs": 20,
+    "value_pretrain_lr": 1e-3,
+    "_comment_value": "After BC pre-training, run value-only MSE warm-up so the critic is near the true return scale before PPO starts. Set value_pretrain_steps=0 to skip."
   },
 
   "ema": {

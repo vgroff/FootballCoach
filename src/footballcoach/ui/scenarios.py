@@ -823,6 +823,7 @@ def build_1v1_scenario(
     opponent_tier: str = "generic",
     ball_max_speed_mps: float = 8.0,
     restitution_sigma: float = 0.08,
+    ball_max_dist_from_trainee_m: float = 35.0,
 ) -> Match:
     """Phase 1 curriculum: 1v1 get-possession/move-toward-goal.
 
@@ -865,8 +866,16 @@ def build_1v1_scenario(
     opponent.stamina = rng.uniform(0.3, 1.0)
     opponent.heading_rad = rng.uniform(-math.pi, math.pi)
 
-    # --- Ball: random placement, velocity, spin ---
-    ball_pos = _rand_pos()
+    # --- Ball: random placement within ball_max_dist_from_trainee_m of trainee, in bounds ---
+    for _ball_attempt in range(50):
+        ball_pos = _rand_pos()
+        dist = math.hypot(
+            ball_pos.x - trainee.position.x,
+            ball_pos.y - trainee.position.y,
+        )
+        if dist <= ball_max_dist_from_trainee_m:
+            break
+    # _rand_pos already guarantees in-bounds; worst case we just use the last sample
     ball_vel = Vector3.zero()
     max_speed = ball_max_speed_mps
     for _attempt in range(20):

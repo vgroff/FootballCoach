@@ -156,10 +156,12 @@ class ExecutionNetwork(nn.Module):
         # Critic value head (shared trunk, Option A)
         self.value_head = nn.Linear(trunk_hidden, 1)
 
-        # Learnable global log_std parameters for continuous heads
-        # (one per component; state-independent starting point - see design doc 8.5)
-        self.move_dir_log_std = nn.Parameter(torch.zeros(2))
-        self.kick_dir_log_std = nn.Parameter(torch.zeros(2))
+        # Fixed (non-learnable) log_std for direction heads.
+        # Direction heads are excluded from the PPO log_prob ratio (see ppo_trainer.py
+        # _compute_log_prob comment), so these don't need gradients. They only
+        # control rollout sampling noise via DirectionHead.sample_raw().
+        self.register_buffer("move_dir_log_std", torch.zeros(2))
+        self.register_buffer("kick_dir_log_std", torch.zeros(2))
         self.kick_power_log_std = nn.Parameter(torch.zeros(1))
         self.kick_spin_log_std = nn.Parameter(torch.zeros(3))
 

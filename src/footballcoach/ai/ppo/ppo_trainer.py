@@ -26,6 +26,7 @@ from __future__ import annotations
 import logging
 import math
 import random
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Optional
@@ -91,6 +92,7 @@ class PPOTrainer:
         self.minibatch_size = int(ppo_cfg.get("minibatch_size", 64))
         self.target_kl = float(ppo_cfg.get("target_kl", 0.02))
         self.rollout_steps = int(ppo_cfg.get("rollout_steps", 2048))
+        self.dir_l2_coef = float(ppo_cfg.get("dir_l2_coef", 0.01))
 
         lr = float(ppo_cfg.get("learning_rate", 3e-4))
         all_params = list(decision_net.parameters()) + list(execution_net.parameters())
@@ -129,12 +131,14 @@ class PPOTrainer:
 
         log.info(f"PPO training started: total_steps={total_steps}")
 
+        rollout_start = time.perf_counter()
+
         while self._total_steps < total_steps:
             progress = self._total_steps / total_steps
 
             # --- Collect one decision step ---
             obs_dict = {k: v for k, v in obs.to_torch_dict().items()}
-            action, log_prob, value, decision_probs, execution_physical, decision_physical, target_slots = (
+            action, log_prob, value, decision_probs, execution_physical, decision_physical, target_slots, raw_exec_samples = (
                 self._sample_action(obs_dict)
             )
 
@@ -161,7 +165,7 @@ class PPOTrainer:
             obs_numpy = {k: v.numpy() for k, v in obs_dict.items()}
             buffer.add(
                 obs=obs_numpy,
-                action=_action_to_numpy(action),
+                action=_action_to_numpy(action, raw_exec_samples),
                 log_prob=float(log_prob),
                 value=float(value),
                 reward=reward,
@@ -182,6 +186,9 @@ class PPOTrainer:
 
             # --- PPO update when rollout buffer is full ---
             if steps_this_rollout >= self.rollout_steps:
+                rollout_time = time.perf_counter() - rollout_start
+                steps_per_sec = self.rollout_steps / max(rollout_time, 1e-6)
+
                 # Bootstrap value for last state
                 with torch.no_grad():
                     last_obs_dict = {k: v.unsqueeze(0).to(self.device)
@@ -190,7 +197,10 @@ class PPOTrainer:
 
                 advantages, returns = buffer.compute_gae(self.gamma, self.lam, last_value)
                 batch = buffer.as_tensors(advantages, returns)
+
+                update_start = time.perf_counter()
                 metrics = self._ppo_update(batch, progress)
+                update_time = time.perf_counter() - update_start
 
                 # Log
                 mean_ep_reward = (
@@ -208,11 +218,15 @@ class PPOTrainer:
                     f"value_loss={metrics['value_loss']:.4f} | "
                     f"entropy={metrics['entropy']:.4f} | "
                     f"approx_kl={metrics['approx_kl']:.4f}"
-                    f"{bc_str}"
+                    f"{bc_str} | "
+                    f"rollout={rollout_time:.1f}s | "
+                    f"update={update_time:.1f}s ({metrics['epoch_time_ms']:.0f}ms/epoch) | "
+                    f"{steps_per_sec:.0f} steps/s"
                 )
 
                 buffer.clear()
                 steps_this_rollout = 0
+                rollout_start = time.perf_counter()
 
                 # Save checkpoint
                 if self.checkpoint_dir is not None:
@@ -225,6 +239,132 @@ class PPOTrainer:
             log.info("Final checkpoint saved.")
 
         log.info("Training complete.")
+
+    # -----------------------------------------------------------------------
+    # Value pre-training
+    # -----------------------------------------------------------------------
+
+    def pretrain_value(self, env, n_steps: int, n_epochs: int, lr: float) -> None:
+        """Warm-start the value heads to predict actual returns before PPO starts.
+
+        Collects n_steps of experience using the current (BC-warm-started) policy,
+        computes Monte Carlo returns via GAE, then trains ONLY the value loss for
+        n_epochs at the given lr. This prevents the enormous value gradient from
+        destroying the policy on the very first PPO update.
+
+        Args:
+            env: ScenarioEnv
+            n_steps: Steps to collect (should be >= rollout_steps, e.g. 4096)
+            n_epochs: Epochs to fit the value network per collected rollout
+            lr: Learning rate for value pre-training (higher than PPO lr, e.g. 1e-3)
+        """
+        log.info(f"Value pre-training: {n_steps} steps, {n_epochs} epochs, lr={lr}")
+        value_opt = torch.optim.Adam(
+            list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+            lr=lr, eps=1e-5,
+        )
+
+        obs = env.reset()
+        buffer = RolloutBuffer()
+        episode_rewards: list[float] = []
+        episode_accum = 0.0
+
+        for _ in range(n_steps):
+            obs_dict = {k: v for k, v in obs.to_torch_dict().items()}
+            result = self._sample_action(obs_dict)
+            action, log_prob, value, decision_probs, exec_phys, dec_phys, target_slots, raw_exec = result
+
+            env_action = {
+                "decision_probs": decision_probs,
+                "execution_physical": exec_phys,
+                "decision_physical": dec_phys,
+                "target_slots": target_slots,
+                "slot_player_ids": getattr(env, "_last_slot_player_ids", [None] * 21),
+                "decision": action,
+                "execution": ExecutionAction(),
+            }
+            next_obs, reward, done, _ = env.step(env_action)
+
+            buffer.add(
+                obs={k: v.numpy() for k, v in obs_dict.items()},
+                action=_action_to_numpy(action, raw_exec),
+                log_prob=float(log_prob),
+                value=float(value),
+                reward=reward,
+                done=1.0 if done else 0.0,
+            )
+            episode_accum += reward
+            if done:
+                episode_rewards.append(episode_accum)
+                episode_accum = 0.0
+                obs = env.reset()
+            else:
+                obs = next_obs
+
+        with torch.no_grad():
+            last_obs_dict = {k: v.unsqueeze(0).to(self.device)
+                             for k, v in next_obs.to_torch_dict().items()}
+            last_value = self._get_value(last_obs_dict)
+
+        _, returns = buffer.compute_gae(self.gamma, self.lam, last_value)
+        batch = buffer.as_tensors(_, returns)
+
+        returns_t = batch["returns"].to(self.device)
+        ret_mean = returns_t.mean()
+        ret_std = returns_t.std().clamp(min=1.0)
+
+        print(f"  [value pretrain] returns: mean={ret_mean:.2f}  std={ret_std:.2f}"
+              f"  min={returns_t.min():.2f}  max={returns_t.max():.2f}")
+
+        n = len(returns_t)
+        for ep in range(n_epochs):
+            indices = torch.randperm(n)
+            ep_losses = []
+            for start in range(0, n, self.minibatch_size):
+                mb_idx = indices[start:start + self.minibatch_size]
+                mb_obs = {k.replace("obs/", ""): batch[k][mb_idx].to(self.device)
+                          for k in batch if k.startswith("obs/")}
+                mb_ret = returns_t[mb_idx]
+
+                sf = mb_obs["self_feat"]
+                of = mb_obs["other_feat"]
+                em = mb_obs["exists_mask"]
+                bf = mb_obs["ball_feat"]
+                gf = mb_obs["global_feat"]
+
+                d_heads = self.decision_net(sf, of, em, bf, gf)
+                e_heads = self.execution_net(sf, of, em, bf, gf, d_heads)
+                new_values = ((d_heads.value + e_heads.value) / 2.0).squeeze(-1)
+
+                # Normalised MSE so the loss is O(1) regardless of return scale
+                value_loss = F.mse_loss(new_values, mb_ret) / (ret_std ** 2)
+
+                value_opt.zero_grad()
+                value_loss.backward()
+                nn.utils.clip_grad_norm_(
+                    list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+                    self.max_grad_norm,
+                )
+                value_opt.step()
+                ep_losses.append(value_loss.item())
+
+            mean_loss = float(np.mean(ep_losses))
+            # Sample predicted value vs actual return for a spot-check
+            with torch.no_grad():
+                spot_obs = {k.replace("obs/", ""): batch[k][:64].to(self.device)
+                            for k in batch if k.startswith("obs/")}
+                d_s = self.decision_net(spot_obs["self_feat"], spot_obs["other_feat"],
+                                       spot_obs["exists_mask"], spot_obs["ball_feat"],
+                                       spot_obs["global_feat"])
+                e_s = self.execution_net(spot_obs["self_feat"], spot_obs["other_feat"],
+                                        spot_obs["exists_mask"], spot_obs["ball_feat"],
+                                        spot_obs["global_feat"], d_s)
+                pred_vals = ((d_s.value + e_s.value) / 2.0).squeeze(-1)
+            print(f"  [value pretrain epoch {ep:2d}] loss={mean_loss:.4f}"
+                  f"  pred_val mean={pred_vals.mean():.2f}"
+                  f"  target mean={returns_t[:64].mean():.2f}")
+
+        log.info("Value pre-training complete.")
 
     # -----------------------------------------------------------------------
     # Policy sampling
@@ -310,10 +450,14 @@ class PPOTrainer:
         kick = IndependentBernoulli(e_heads.kick_logit).sample()
         tackle_attempt = IndependentBernoulli(e_heads.tackle_attempt_logit).sample()
 
-        # Direction heads: L2-normalize for physical use
+        # Direction heads: sample from Normal(mean, std) per design doc 8.6.
+        # We store the noisy raw sample (not the mean) so that log_prob ratios
+        # during the PPO update are meaningful — new_mean vs stored sample.
         eps = 1e-6
-        move_dir_raw = e_heads.move_direction  # (1, 2)
-        kick_dir_raw = e_heads.kick_direction   # (1, 2)
+        log_std_move = self.execution_net.move_dir_log_std
+        log_std_kick = self.execution_net.kick_dir_log_std
+        move_dir_raw = DirectionHead(e_heads.move_direction, log_std_move).sample_raw()  # (1, 2)
+        kick_dir_raw = DirectionHead(e_heads.kick_direction, log_std_kick).sample_raw()   # (1, 2)
         move_dir_phys = (move_dir_raw / (move_dir_raw.norm(dim=-1, keepdim=True) + eps)).squeeze(0)
         kick_dir_phys = (kick_dir_raw / (kick_dir_raw.norm(dim=-1, keepdim=True) + eps)).squeeze(0)
 
@@ -359,6 +503,15 @@ class PPOTrainer:
             attack_defence_raw=float(ad_raw),
         )
 
+        # Raw execution samples needed to recompute log_prob during PPO update
+        raw_exec_samples = {
+            "sprint": np.array([float(sprint)], dtype=np.float32),
+            "kick": np.array([float(kick)], dtype=np.float32),
+            "tackle_attempt": np.array([float(tackle_attempt)], dtype=np.float32),
+            "move_dir_raw": move_dir_raw.squeeze(0).cpu().numpy().astype(np.float32),
+            "kick_dir_raw": kick_dir_raw.squeeze(0).cpu().numpy().astype(np.float32),
+        }
+
         return (
             action,
             float(log_prob),
@@ -367,6 +520,7 @@ class PPOTrainer:
             execution_physical,
             decision_physical,
             target_slots,
+            raw_exec_samples,
         )
 
     def _get_value(self, obs_dict: dict) -> float:
@@ -413,16 +567,13 @@ class PPOTrainer:
             samples["tackle_attempt"]
         ).sum()
 
-        # Direction heads (2D Normal, summed over components)
-        log_std_move = self.execution_net.move_dir_log_std.to(self.device)
-        log_std_kick = self.execution_net.kick_dir_log_std.to(self.device)
-        lp += DirectionHead(e_heads.move_direction, log_std_move).log_prob(
-            samples["move_dir_raw"]
-        )
-        if samples["kick"] > 0.5:
-            lp += DirectionHead(e_heads.kick_direction, log_std_kick).log_prob(
-                samples["kick_dir_raw"]
-            )
+        # Direction heads (move_direction, kick_direction) are intentionally
+        # excluded from the PPO log_prob ratio. The BC loss and policy gradient
+        # both move the direction head mean by large amounts each step, making
+        # the Gaussian log_prob of stored samples under the new distribution
+        # diverge catastrophically (mean_shift ~25-50 units with std~1 = KL ~2000).
+        # Direction is trained implicitly via policy/value gradient and explicitly
+        # via BC; it doesn't need to be in the ratio for correct PPO.
 
         return lp
 
@@ -458,8 +609,31 @@ class PPOTrainer:
         all_entropy = []
         all_kl = []
         all_bc_loss = []
+        epoch_times = []
 
-        for _ in range(self.n_epochs):
+        # Print rollout-level stats once per update
+        print(f"\n{'='*70}")
+        print(f"[PPO UPDATE] step={self._total_steps:,}  n={n}  progress={progress:.3f}")
+        print(f"  old_log_prob: mean={old_log_probs.mean():.3f}  std={old_log_probs.std():.3f}"
+              f"  min={old_log_probs.min():.3f}  max={old_log_probs.max():.3f}")
+        print(f"  returns:      mean={returns.mean():.3f}  std={returns.std():.3f}"
+              f"  min={returns.min():.3f}  max={returns.max():.3f}")
+        raw_adv = batch["advantages"]
+        print(f"  advantages:   mean={raw_adv.mean():.3f}  std={raw_adv.std():.3f}"
+              f"  min={raw_adv.min():.3f}  max={raw_adv.max():.3f}")
+        raw_vals = batch["values"]
+        print(f"  values(old):  mean={raw_vals.mean():.3f}  std={raw_vals.std():.3f}"
+              f"  min={raw_vals.min():.3f}  max={raw_vals.max():.3f}")
+        raw_rews = batch["rewards"]
+        print(f"  rewards:      mean={raw_rews.mean():.4f}  std={raw_rews.std():.4f}"
+              f"  min={raw_rews.min():.4f}  max={raw_rews.max():.4f}"
+              f"  nonzero={int((raw_rews != 0).sum())}/{n}")
+        print(f"{'='*70}")
+
+        _diag_done = False  # print per-head breakdown only once
+
+        for epoch_i in range(self.n_epochs):
+            epoch_start = time.perf_counter()
             indices = torch.randperm(n)
             for start in range(0, n, self.minibatch_size):
                 mb_idx = indices[start:start + self.minibatch_size]
@@ -490,19 +664,69 @@ class PPOTrainer:
                               for k in batch if k.startswith("action/")}
                 new_log_probs = self._recompute_log_prob(d_heads, e_heads, mb_actions, em)
 
+                # Per-head log_prob breakdown (first minibatch of first epoch only)
+                if not _diag_done:
+                    _diag_done = True
+                    with torch.no_grad():
+                        def _blp(logit, key):
+                            return IndependentBernoulli(logit).log_prob(mb_actions[key]).squeeze(-1).mean().item()
+                        lp_shoot    = _blp(d_heads.shoot_logit, "shoot")
+                        lp_pass     = _blp(d_heads.pass_logit, "pass_")
+                        lp_move     = _blp(d_heads.move_logit, "move")
+                        lp_tackle   = _blp(d_heads.tackle_logit, "tackle")
+                        lp_gp       = _blp(d_heads.get_possession_raw, "get_possession_extra")
+                        lp_mark     = _blp(d_heads.mark_logit, "mark")
+                        lp_hold     = _blp(d_heads.hold_position_logit, "hold_position")
+                        lp_sprint   = _blp(e_heads.sprint_logit, "sprint")
+                        lp_kick     = _blp(e_heads.kick_logit, "kick")
+                        lp_tackle_a = _blp(e_heads.tackle_attempt_logit, "tackle_attempt")
+                        log_std_move = self.execution_net.move_dir_log_std.to(self.device)
+                        log_std_kick = self.execution_net.kick_dir_log_std.to(self.device)
+                        lp_movedir  = DirectionHead(e_heads.move_direction, log_std_move).log_prob(mb_actions["move_dir_raw"]).mean().item()
+                        lp_kickdir  = DirectionHead(e_heads.kick_direction, log_std_kick).log_prob(mb_actions["kick_dir_raw"]).mean().item()
+                        lp_new_mb   = new_log_probs.mean().item()
+                        lp_old_mb   = mb_old_lp.mean().item()
+                        ratio_mb    = torch.exp(new_log_probs - mb_old_lp)
+                    print(f"  [DIAG epoch=0 mb=0]")
+                    print(f"    old_lp(mb)={lp_old_mb:.3f}  new_lp(mb)={lp_new_mb:.3f}  diff={lp_new_mb - lp_old_mb:.3f}")
+                    print(f"    ratio: mean={ratio_mb.mean():.4f}  std={ratio_mb.std():.4f}"
+                          f"  min={ratio_mb.min():.4f}  max={ratio_mb.max():.4f}")
+                    print(f"    new_values: mean={new_values.mean():.3f}  ret(mb): mean={mb_ret.mean():.3f}")
+                    print(f"    per-head new_log_prob contributions (mean over mb):")
+                    print(f"      shoot={lp_shoot:.3f}  pass={lp_pass:.3f}  move={lp_move:.3f}  tackle={lp_tackle:.3f}")
+                    print(f"      gp_extra={lp_gp:.3f}  mark={lp_mark:.3f}  hold={lp_hold:.3f}")
+                    print(f"      sprint={lp_sprint:.3f}  kick={lp_kick:.3f}  tackle_attempt={lp_tackle_a:.3f}")
+                    print(f"      move_dir={lp_movedir:.3f}  kick_dir={lp_kickdir:.3f}")
+                    print(f"      TOTAL={lp_shoot+lp_pass+lp_move+lp_tackle+lp_gp+lp_mark+lp_hold+lp_sprint+lp_kick+lp_tackle_a+lp_movedir:.3f}")
+                    print(f"    move_dir log_std={self.execution_net.move_dir_log_std.data.tolist()}"
+                          f"  kick_dir log_std={self.execution_net.kick_dir_log_std.data.tolist()}")
+
                 # PPO clipped objective
                 ratio = torch.exp(new_log_probs - mb_old_lp)
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * mb_adv
                 policy_loss = -torch.min(surr1, surr2).mean()
 
-                # Value loss
-                value_loss = F.mse_loss(new_values, mb_ret)
+                # Value loss — normalise by return variance so it stays ~O(1)
+                # regardless of how large/negative the returns are. This keeps
+                # the value gradient from overwhelming the policy gradient.
+                ret_var = returns.var().clamp(min=1.0)
+                value_loss = F.mse_loss(new_values, mb_ret) / ret_var
 
                 # Entropy bonus
                 entropy = self._compute_entropy(d_heads, e_heads, em)
 
-                total_loss = policy_loss + self.vf_coef * value_loss - self.ent_coef * entropy
+                # L2 penalty on raw direction outputs — keeps them from drifting
+                # to large magnitudes, which causes huge mean-shifts between
+                # minibatches and training instability. The vectors are normalised
+                # to unit length before the engine anyway, so this doesn't harm output.
+                dir_l2 = (e_heads.move_direction.pow(2).mean()
+                          + e_heads.kick_direction.pow(2).mean())
+
+                total_loss = (policy_loss
+                              + self.vf_coef * value_loss
+                              - self.ent_coef * entropy
+                              + self.dir_l2_coef * dir_l2)
 
                 # BC auxiliary loss (decision + execution, annealed to 0)
                 bc_loss_val = torch.zeros(1, device=self.device)
@@ -510,24 +734,55 @@ class PPOTrainer:
                     mb_bc = batch["bc_labels"][mb_idx].to(self.device)
                     bc_loss_val = bc_loss_from_tensor(mb_bc, d_heads, e_heads)
                     total_loss = total_loss + bc_coeff * bc_loss_val
-                all_bc_loss.append(float(bc_loss_val))
+                all_bc_loss.append(bc_loss_val.detach().item())
 
                 self.optimizer.zero_grad()
                 total_loss.backward()
+
+                # Grad norm BEFORE clipping
+                raw_grad_norm = torch.nn.utils.clip_grad_norm_(
+                    list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+                    float("inf"),  # don't clip yet, just measure
+                ).item()
                 nn.utils.clip_grad_norm_(
                     list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
                     self.max_grad_norm,
                 )
                 self.optimizer.step()
 
+                # After step: measure KL and direction mean shift
+                with torch.no_grad():
+                    d_after = self.decision_net(sf, of, em, bf, gf)
+                    e_after = self.execution_net(sf, of, em, bf, gf, d_after)
+                    lp_after = self._recompute_log_prob(d_after, e_after, mb_actions, em)
+                    movedir_mean_shift = (e_after.move_direction - e_heads.move_direction).norm(dim=-1).mean().item()
+                    kickdir_mean_shift = (e_after.kick_direction - e_heads.kick_direction).norm(dim=-1).mean().item()
+
                 approx_kl = (mb_old_lp - new_log_probs).mean().item()
+                kl_after_step = (mb_old_lp - lp_after).mean().item()
+
+                mb_i = start // self.minibatch_size
+                print(f"  [e{epoch_i} mb{mb_i:02d}]"
+                      f"  grad_norm={raw_grad_norm:.1f}"
+                      f"  total={total_loss.item():.3f}"
+                      f"  policy={policy_loss.item():.3f}"
+                      f"  value={value_loss.item():.3f}"
+                      f"  dir_l2={dir_l2.item():.3f}"
+                      f"  kl_after={kl_after_step:.4f}"
+                      f"  move_shift={movedir_mean_shift:.3f}"
+                      f"  kick_shift={kickdir_mean_shift:.3f}")
+
                 all_policy_loss.append(policy_loss.item())
                 all_value_loss.append(value_loss.item())
                 all_entropy.append(entropy.item())
-                all_kl.append(approx_kl)
+                all_kl.append(kl_after_step)
 
+            epoch_times.append((time.perf_counter() - epoch_start) * 1000)
+            mean_kl_epoch = float(np.mean(all_kl[-32:])) if all_kl else 0.0
+            print(f"  [epoch {epoch_i}] kl={mean_kl_epoch:.5f}  t={epoch_times[-1]:.0f}ms")
             # Early stop if KL too large
             if all_kl and np.mean(all_kl[-10:]) > self.target_kl:
+                print(f"  [early stop] KL={np.mean(all_kl):.5f} > target={self.target_kl}")
                 log.debug(f"Early stopping PPO epoch due to KL={np.mean(all_kl):.4f}")
                 break
 
@@ -538,6 +793,7 @@ class PPOTrainer:
             "approx_kl": float(np.mean(all_kl)),
             "bc_loss": float(np.mean(all_bc_loss)),
             "bc_coeff": bc_coeff,
+            "epoch_time_ms": float(np.mean(epoch_times)) if epoch_times else 0.0,
         }
 
     def _recompute_log_prob(self, d_heads, e_heads, mb_actions: dict, exists_mask) -> torch.Tensor:
@@ -573,6 +829,8 @@ class PPOTrainer:
                     mb_actions[key].long().squeeze(-1)
                 )
                 lp[mask] += cat_lp[mask]
+
+        # Direction heads excluded — see comment in _compute_log_prob.
 
         return lp
 
@@ -627,8 +885,8 @@ class PPOTrainer:
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _action_to_numpy(action: DecisionAction) -> dict[str, np.ndarray]:
-    """Flatten a DecisionAction to a numpy dict for the rollout buffer."""
+def _action_to_numpy(action: DecisionAction, exec_samples: dict) -> dict[str, np.ndarray]:
+    """Flatten a DecisionAction + raw execution samples to a numpy dict for the rollout buffer."""
     return {
         "shoot": np.array([action.shoot], dtype=np.float32),
         "pass_": np.array([action.pass_], dtype=np.float32),
@@ -640,9 +898,11 @@ def _action_to_numpy(action: DecisionAction) -> dict[str, np.ndarray]:
         "pass_target": np.array([action.pass_target], dtype=np.float32),
         "tackle_target": np.array([action.tackle_target], dtype=np.float32),
         "mark_target": np.array([action.mark_target], dtype=np.float32),
-        "sprint": np.array([0.0], dtype=np.float32),  # placeholder from execution action
-        "kick": np.array([0.0], dtype=np.float32),
-        "tackle_attempt": np.array([0.0], dtype=np.float32),
+        "sprint": exec_samples["sprint"],
+        "kick": exec_samples["kick"],
+        "tackle_attempt": exec_samples["tackle_attempt"],
+        "move_dir_raw": exec_samples["move_dir_raw"],
+        "kick_dir_raw": exec_samples["kick_dir_raw"],
         "move_region_center_raw": action.move_region_center_raw,
         "move_region_size_raw": np.array([action.move_region_size_raw], dtype=np.float32),
         "move_arrival_speed_raw": np.array([action.move_arrival_speed_raw], dtype=np.float32),

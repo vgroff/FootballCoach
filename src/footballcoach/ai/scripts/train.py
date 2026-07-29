@@ -109,6 +109,18 @@ def main() -> None:
         )
         pretrainer.pretrain(env, n_steps=pretrain_steps, label_fn=label_fn)
 
+    # Value pre-training phase (fit value heads to actual returns before PPO)
+    value_pretrain_steps = int(bc_cfg.get("value_pretrain_steps", 0))
+    value_pretrain_epochs = int(bc_cfg.get("value_pretrain_epochs", 20))
+    value_pretrain_lr = float(bc_cfg.get("value_pretrain_lr", 1e-3))
+    if value_pretrain_steps > 0 and not args.checkpoint:
+        trainer.pretrain_value(
+            env,
+            n_steps=value_pretrain_steps,
+            n_epochs=value_pretrain_epochs,
+            lr=value_pretrain_lr,
+        )
+
     # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0)
     aux_label_fn = None if (args.no_bc_aux or label_fn is None) else label_fn
     trainer.train(env, total_steps=args.total_steps, bc_label_fn=aux_label_fn)
@@ -143,11 +155,12 @@ def _build_phase1_env(phase):
     from footballcoach.ai.env.scenario_env import ScenarioEnv
     from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
 
+    import functools
     defn = ScenarioDefinition(
         key="phase1_1v1",
         label="Phase 1: 1v1 Get Possession",
         description="1v1 scenario for curriculum phase 1",
-        build=build_1v1_scenario,
+        build=functools.partial(build_1v1_scenario, ball_max_speed_mps=4.0),
     )
     return ScenarioEnv(
         definition=defn,

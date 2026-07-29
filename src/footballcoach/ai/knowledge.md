@@ -49,6 +49,17 @@ ai/
 
 ## Critical design rules
 
+### `_sample_action` returns 8 values
+`PPOTrainer._sample_action(obs_dict)` returns an 8-tuple:
+```
+(action, log_prob, value, decision_probs, execution_physical,
+ decision_physical, target_slots, raw_exec_samples)
+```
+`raw_exec_samples` is a numpy dict of the raw execution samples that were
+used to compute `log_prob`.  It must be forwarded to
+`_action_to_numpy(action, raw_exec_samples)` so the rollout buffer holds
+the correct values for PPO's importance-ratio computation.
+
 ### Two concerns that must NEVER be conflated
 
 1. **PPO log_prob / training** – computed from raw logits / raw sampled values,

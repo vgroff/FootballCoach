@@ -448,6 +448,30 @@ identical, `optimizer.step()` is not modifying weights (e.g. zero gradients).
 The PPO log_prob for get_possession is on `gp_raw` (raw Bernoulli), not on
 `gp_prob`.  Do not try to add `gp_prob` as an independent Bernoulli.
 
+### `_sample_action` returns an 8-tuple (not 7)
+As of the bug-fix commit (2026-07-29), `_sample_action` returns:
+```
+(action, log_prob, value, decision_probs, execution_physical,
+ decision_physical, target_slots, raw_exec_samples)
+```
+`raw_exec_samples` is a dict of numpy arrays (`sprint`, `kick`,
+`tackle_attempt`, `move_dir_raw`, `kick_dir_raw`) that must be passed to
+`_action_to_numpy(action, raw_exec_samples)` so the rollout buffer stores
+the real sampled values.  Any test or downstream code that unpacks the tuple
+must expect 8 elements.
+
+### Execution samples MUST be stored from `_sample_action`, not re-derived
+The PPO importance ratio `exp(new_lp - old_lp)` requires that `old_lp` and
+`new_lp` are computed over **identical** action components.  Three early
+bugs caused `old_lp` to include terms that `new_lp` never matched:
+1. `sprint/kick/tackle_attempt` were stored as `0.0` (fixed: stored from samples)
+2. `move_dir_raw/kick_dir_raw` were not stored at all (fixed: stored + recomputed
+   via `DirectionHead` in `_recompute_log_prob`)
+3. `bc_loss_val` was not detached before `.item()` (fixed: `.detach().item()`)
+
+Symptoms of a recurrence: `approx_kl` > 10 at step 1, `value_loss` doubling
+every rollout.
+
 ### Observation slot order is random — this is intentional
 `encode_observation()` shuffles real players into random slots each call.
 Do not cache slot-to-player mappings between steps.  Use `slot_player_ids`
