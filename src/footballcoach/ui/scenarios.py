@@ -23,10 +23,11 @@ from __future__ import annotations
 
 import math
 import random
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Callable
 
 from footballcoach.config import load_physics_config
+from footballcoach.engine.ball_physics import BallPhysicsParams
 from footballcoach.engine.match import Match
 from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.entities import Ball, Pitch, PlayerAttributes, Team
@@ -795,6 +796,118 @@ def build_repulsion_obstacle_scenario(
 
 
 # ---------------------------------------------------------------------------
+# Phase 1 curriculum: 1v1 get-possession / move-toward-goal
+# ---------------------------------------------------------------------------
+
+def _1v1_on_tick(match: Match, trial_tick: int) -> None:
+    """UI fallback for the 1v1 training scenario: give the trainee a
+    ``GetPossessionOrder`` whenever it has no current order.
+
+    In training the AI overrides the trainee's order each decision interval,
+    so this only fires between AI steps (or when no AI is driving the env).
+    In the UI scenario picker this makes the trainee chase the ball so the
+    scenario is watchable.
+    """
+    try:
+        trainee = match.player_by_id("trainee")
+    except KeyError:
+        return
+    if trainee.current_order is None:
+        trainee.current_order = GetPossessionOrder()
+
+
+def build_1v1_scenario(
+    rng_reduction: float = 0.3,
+    *,
+    trainee_tier: str = "generic",
+    opponent_tier: str = "generic",
+    ball_max_speed_mps: float = 8.0,
+    restitution_sigma: float = 0.08,
+) -> Match:
+    """Phase 1 curriculum: 1v1 get-possession/move-toward-goal.
+
+    Both players and the ball are placed randomly across the full pitch with
+    randomised attributes, stamina, headings, and (for the ball) velocity,
+    spin, and restitution coefficient.
+
+    Trainee (Team.LEFT, player_id='trainee') has no initial order so the AI
+    can drive it.  Opponent (Team.RIGHT, player_id='opponent') is immobile
+    (no order) - the first sub-phase of the phase-1 curriculum.
+
+    Ball velocity is resampled (up to 20 times) until a linear extrapolation
+    at the initial speed for 3 seconds stays in bounds (ignoring friction -
+    conservative).  If all attempts fail the ball starts at rest.
+
+    Restitution: sampled from Gaussian(base_restitution, sigma=0.08),
+    clamped to [0.2, 0.95].
+
+    See ai_design_doc.md sections 4 and 9.2 for the full design rationale.
+    """
+    rng = random.Random()
+    pitch = Pitch.standard()
+
+    def _rand_pos() -> Vector3:
+        return Vector3(
+            rng.uniform(-pitch.half_length + 1.5, pitch.half_length - 1.5),
+            rng.uniform(-pitch.half_width + 1.5, pitch.half_width - 1.5),
+            0.0,
+        )
+
+    # --- Trainee (Team.LEFT, attacks +x) ---
+    trainee_attrs = generate_attributes(tier=trainee_tier, rng=rng)
+    trainee = Player.create("trainee", Team.LEFT, trainee_attrs, position=_rand_pos())
+    trainee.stamina = rng.uniform(0.3, 1.0)
+    trainee.heading_rad = rng.uniform(-math.pi, math.pi)
+
+    # --- Opponent (Team.RIGHT, attacks -x) --- immobile, no order ---
+    opponent_attrs = generate_attributes(tier=opponent_tier, rng=rng)
+    opponent = Player.create("opponent", Team.RIGHT, opponent_attrs, position=_rand_pos())
+    opponent.stamina = rng.uniform(0.3, 1.0)
+    opponent.heading_rad = rng.uniform(-math.pi, math.pi)
+
+    # --- Ball: random placement, velocity, spin ---
+    ball_pos = _rand_pos()
+    ball_vel = Vector3.zero()
+    max_speed = ball_max_speed_mps
+    for _attempt in range(20):
+        speed = rng.uniform(0.0, max_speed)
+        direction = rng.uniform(-math.pi, math.pi)
+        vx = math.cos(direction) * speed
+        vy = math.sin(direction) * speed
+        # Conservative (no-friction) 3-second extrapolation check
+        if (abs(ball_pos.x + vx * 3.0) < pitch.half_length
+                and abs(ball_pos.y + vy * 3.0) < pitch.half_width):
+            ball_vel = Vector3(vx, vy, 0.0)
+            break
+        max_speed = max(1.0, max_speed * 0.7)
+
+    ball_spin = Vector3(
+        rng.gauss(0.0, 1.0),
+        rng.gauss(0.0, 1.0),
+        rng.gauss(0.0, 1.5),
+    )
+    ball = Ball.at_rest(ball_pos)
+    ball.velocity = ball_vel
+    ball.spin = ball_spin
+
+    # --- Randomised ball restitution ---
+    base_params = BallPhysicsParams.from_config()
+    restitution = max(0.2, min(0.95, rng.gauss(base_params.bounce_restitution_vertical, restitution_sigma)))
+    ball_params = replace(base_params, bounce_restitution_vertical=restitution)
+
+    ui_cfg = load_physics_config().get("ui", {})
+    return Match(
+        pitch=pitch,
+        players=[trainee, opponent],
+        ball=ball,
+        rng_reduction=rng_reduction,
+        rng=rng,
+        ball_physics_params=ball_params,
+        goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
+    )
+
+
+# ---------------------------------------------------------------------------
 # SCENARIOS list (Phase H: trimmed to 6, all parameterized)
 # ---------------------------------------------------------------------------
 
@@ -893,6 +1006,20 @@ SCENARIOS: list[ScenarioDefinition] = [
         params=[
             ScenarioParam("obstacle_on_path", "Obstacle on path (1=centre, 0=5m aside)", 0.0, 1.0, 0.1, 1.0),
             ScenarioParam("attacker_skill", "Attacker skill", 0.3, 1.0, 0.05, 0.9),
+        ],
+    ),
+    ScenarioDefinition(
+        key="1v1_phase1",
+        label="1v1: Phase 1 get possession (AI training)",
+        description=(
+            "Both players randomly placed, random ball, random attributes. "
+            "Phase 1 curriculum scenario. Trainee chases ball; opponent immobile."
+        ),
+        build=build_1v1_scenario,
+        on_tick=_1v1_on_tick,
+        params=[
+            ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 15.0, 0.5, 8.0),
+            ScenarioParam("restitution_sigma", "Restitution randomness (sigma)", 0.0, 0.3, 0.01, 0.08),
         ],
     ),
 ]

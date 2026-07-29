@@ -91,25 +91,15 @@ def _build_phase1_env(phase):
     from footballcoach.ai.env.scenario_env import ScenarioEnv
     from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
 
-    # Build a minimal ScenarioDefinition wrapping the 1v1 builder
-    # (if build_1v1_scenario exists; otherwise use tackle as a proxy)
-    try:
-        from footballcoach.ui.scenarios import build_1v1_scenario
-        build_fn = build_1v1_scenario
-    except ImportError:
-        # Fallback: use tackle scenario as a 1v1 proxy
-        from footballcoach.ui.scenarios import build_tackle_scenario
-        build_fn = build_tackle_scenario
-
     defn = ScenarioDefinition(
         key="phase1_1v1",
         label="Phase 1: 1v1 Get Possession",
         description="1v1 scenario for curriculum phase 1",
-        build=build_fn,
+        build=build_1v1_scenario,
     )
     return ScenarioEnv(
         definition=defn,
-        trainee_player_id="defender",  # will be overridden per scenario
+        trainee_player_id="trainee",
         phase=1,
         **phase.env_kwargs,
     )

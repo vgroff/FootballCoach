@@ -120,6 +120,7 @@ class ScenarioEnv:
             rng_reduction=self.rng_reduction,
             linger_s=self.linger_s,
             kwargs=self.scenario_kwargs,
+            timeout_ticks=int(self.max_episode_s / self._dt_s),
         )
         self._ema.reset()
         self._episode_ticks = 0

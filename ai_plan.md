@@ -1,3 +1,4 @@
+Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the a_plan.md and the ai_design_document.md
 
 AI Design:
 - Do ask questions and do also criticise things

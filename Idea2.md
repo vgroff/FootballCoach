@@ -1,12 +1,16 @@
 to the AI: Do not read this ever, they are just notes for me
 
-Read Idea.md, and all the READMe and knowledge files, except Idea2 and ai_plans and ai_design_doc.
+Read Idea.md, and all the READMe and knowledge files, except Idea2 and ai_plans and ai_design_doc and the other ai-related ones.
 You may also have stuff in memory/storage for this repo.
+
+AI stuff:
+- are the best models saved? Allow me to run the scenarios from the ui with every player controlled by the best AI instead of by the rules-based AI.
 
 NB Immediate Immediate:
 - The goalkeeper clearly teleports after saving the ball sometimes, wtf is that about??
-- Goalkeeper in 1v2 is still going crazy often. The AI should be super simple. Go to goal centre, stop. Then do nothing, wait for a shot and then do save order. Then repeat once save order terminated.
+- Goalkeeper in 1v2 is still going crazy often. The AI should be super simple. Go to goal centre, stop. Then do nothing, wait for a shot and then do save order. Then repeat once save order terminated. Explain the AI to me.
 - Tackles seem to behave a bit weird, I think the players often stop almost completely, and while I think speed should be reduced somewhat for both players, it's maybe too strong, also I think collisions should be turned off once a tackle has been engaged, I think that is supposed to happen with one of them going inactive but I just want to make sure the collision isn't being triggered on the same tick as the tackle either. - - We want a bit more visual excitment. Can we display some icons under/over a player for 1.2 seconds after he carries out an action like kick, tackle, or switching between moving stances/speeds - you can use the leg, wind, running game, idle (U+1F574) and soccer ball icons, or any you think are more appropriate, but please no more than 2 per icons per action.
+- Why is the ball.possessed_by still using a player_id?? Do we enforce unique player_ids?? It seems so much easier to use just use the possesed_by field be player type rather than string, ball.possessed_by = kicker, instead of kicker.player_id. Is there an issue with circular references or something? If so, can't it be solved gracefully by refactoring or something? If not, it's okay, it just seems ugly
 
 NB Immediate:
 - Goalkeeper snaps in save order - not sure its needed if we program things correctly
