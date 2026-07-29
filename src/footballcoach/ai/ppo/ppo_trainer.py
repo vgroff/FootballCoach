@@ -196,6 +196,12 @@ class PPOTrainer:
                 if self.checkpoint_dir is not None:
                     self._save_checkpoint(self._total_steps)
 
+        # Always save a final checkpoint so the result of the run is not lost
+        # even if total_steps is not an exact multiple of rollout_steps.
+        if self.checkpoint_dir is not None:
+            self._save_checkpoint(self._total_steps)
+            log.info("Final checkpoint saved.")
+
         log.info("Training complete.")
 
     # -----------------------------------------------------------------------
