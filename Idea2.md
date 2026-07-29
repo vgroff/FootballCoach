@@ -5,6 +5,7 @@ You may also have stuff in memory/storage for this repo.
 
 AI stuff:
 - are the best models saved? In the UI scenario, have a checkbox for each player that allowed me to have it run ui with the best available AI instead of by the rules-based AI.
+- Speedup ideas - run the simulation at lower resolution, especially at the beginning
 
 NB Immediate Immediate:
 - The goalkeeper clearly teleports after saving the ball sometimes, wtf is that about??
