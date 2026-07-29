@@ -14,7 +14,7 @@ from footballcoach.ui.camera import Camera
 from footballcoach.ui.gamelog import GameLog, LogLevel
 from footballcoach.ui.input import MatchInputController, OrderMode
 from footballcoach.ui.renderer import Renderer
-from footballcoach.ui.scenarios import ScenarioParam
+from footballcoach.ui.scenarios import ScenarioBoolParam, ScenarioChoiceParam, ScenarioParam
 
 FPS = 60
 
@@ -152,6 +152,8 @@ class App:
         if item is None:
             return
         kind, key = item
+        if kind == "header":
+            return
         if kind == "training":
             self._start_match(scenarios.make_training_match(), "Training mode", is_training_mode=True)
         elif kind == "scenario":
@@ -181,11 +183,25 @@ class App:
             param = next((p for p in self._pending_scenario_definition.params if p.name == name), None)
             if param is None:
                 continue
-            current = self._pending_scenario_params.get(name, param.default)
-            if minus_rect.collidepoint(pos):
-                self._pending_scenario_params[name] = max(param.min_value, current - param.step)
-            elif plus_rect.collidepoint(pos):
-                self._pending_scenario_params[name] = min(param.max_value, current + param.step)
+
+            if isinstance(param, ScenarioBoolParam):
+                if minus_rect.collidepoint(pos):  # same rect for both sides
+                    self._pending_scenario_params[name] = not bool(
+                        self._pending_scenario_params.get(name, param.default)
+                    )
+            elif isinstance(param, ScenarioChoiceParam):
+                current = self._pending_scenario_params.get(name, param.default)
+                idx = list(param.choices).index(current) if current in param.choices else 0
+                if minus_rect.collidepoint(pos):
+                    self._pending_scenario_params[name] = param.choices[(idx - 1) % len(param.choices)]
+                elif plus_rect.collidepoint(pos):
+                    self._pending_scenario_params[name] = param.choices[(idx + 1) % len(param.choices)]
+            else:
+                current = self._pending_scenario_params.get(name, param.default)
+                if minus_rect.collidepoint(pos):
+                    self._pending_scenario_params[name] = max(param.min_value, current - param.step)
+                elif plus_rect.collidepoint(pos):
+                    self._pending_scenario_params[name] = min(param.max_value, current + param.step)
 
     def _start_scenario_with_params(self) -> None:
         if self._pending_scenario_definition is None:
@@ -285,20 +301,46 @@ class App:
     # -- menu layout ---------------------------------------------------------
 
     def _menu_items(self) -> list[tuple[str, str, str, pygame.Rect]]:
-        """Returns (kind, key, label, screen_rect) for every clickable menu item."""
+        """Returns (kind, key, label, screen_rect) for every clickable menu item.
+
+        kind: 'training' | 'scenario' | 'header' (headers are non-clickable labels)
+        """
         items: list[tuple[str, str, str, pygame.Rect]] = []
-        x, y = 60, 140
-        row_h = 50
-        items.append(("training", "", "Training mode (1 player + ball, free play)", pygame.Rect(x, y, 500, row_h - 10)))
-        y += row_h + 20
+        x, y = 60, 110
+        row_h = 42
+        header_h = 28
+
+        # -- AI scenarios section --
+        items.append(("header", "", "── AI Scenarios ──", pygame.Rect(x, y, 500, header_h)))
+        y += header_h + 4
+        ai_keys = {"phase1_neural_ai", "1v1_phase1"}
         for definition in scenarios.SCENARIOS:
-            items.append(("scenario", definition.key, f"Balance scenario: {definition.label}", pygame.Rect(x, y, 500, row_h - 10)))
-            y += row_h
+            if definition.key in ai_keys:
+                items.append(("scenario", definition.key, definition.label, pygame.Rect(x + 16, y, 500, row_h - 6)))
+                y += row_h
+
+        # -- Training mode --
+        y += 8
+        items.append(("header", "", "── Freeplay ──", pygame.Rect(x, y, 500, header_h)))
+        y += header_h + 4
+        items.append(("training", "", "Training mode (1 player + ball, free play)", pygame.Rect(x + 16, y, 500, row_h - 6)))
+        y += row_h
+
+        # -- Balance scenarios --
+        y += 8
+        items.append(("header", "", "── Balance Scenarios ──", pygame.Rect(x, y, 500, header_h)))
+        y += header_h + 4
+        balance_keys = ai_keys  # skip these
+        for definition in scenarios.SCENARIOS:
+            if definition.key not in balance_keys:
+                items.append(("scenario", definition.key, definition.label, pygame.Rect(x + 16, y, 500, row_h - 6)))
+                y += row_h
+
         return items
 
     def _menu_item_at(self, pos: tuple[int, int]) -> tuple[str, str] | None:
         for kind, key, _label, rect in self._menu_items():
-            if rect.collidepoint(pos):
+            if kind != "header" and rect.collidepoint(pos):
                 return kind, key
         return None
 
@@ -318,12 +360,16 @@ class App:
         self.surface.blit(title, (60, 50))
 
         mouse_pos = pygame.mouse.get_pos()
-        for _kind, _key, label, rect in self._menu_items():
-            hovered = rect.collidepoint(mouse_pos)
-            colour = style.HUD_ACCENT if hovered else style.HUD_TEXT
-            pygame.draw.rect(self.surface, (40, 40, 50), rect, border_radius=6)
-            text = self.renderer.hud_font.render(label, True, colour)
-            self.surface.blit(text, (rect.x + 12, rect.y + (rect.height - text.get_height()) // 2))
+        for kind, _key, label, rect in self._menu_items():
+            if kind == "header":
+                text = self.renderer.hud_font.render(label, True, (120, 130, 160))
+                self.surface.blit(text, (rect.x, rect.y + (rect.height - text.get_height()) // 2))
+            else:
+                hovered = rect.collidepoint(mouse_pos)
+                colour = style.HUD_ACCENT if hovered else style.HUD_TEXT
+                pygame.draw.rect(self.surface, (50, 50, 65) if hovered else (38, 38, 52), rect, border_radius=6)
+                text = self.renderer.hud_font.render(label, True, colour)
+                self.surface.blit(text, (rect.x + 12, rect.y + (rect.height - text.get_height()) // 2))
 
         hint = self.renderer.hud_font.render("Esc to quit", True, style.HUD_TEXT)
         self.surface.blit(hint, (60, self.camera.screen_height - 40))

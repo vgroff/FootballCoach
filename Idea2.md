@@ -7,14 +7,17 @@ Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_
 
 Immedaite task!!
 Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 50k
-- reduce simulation speed and decision making rate in order to speed up training
+- are tests failing??
+- please give me MUCH larger bounds on all UI scenario parameters in the UI, keep the default values as they are, I just dont see why you would limit parameters like start distance or ball speed, or any other really, so unlimit anything thats reasonable (e.g. still no speed <0). I also want the AI checkpoint chooser to be a dropdown
 
 Immediate AI stuff
 - Can we do some trainings runs and then see and see if the trained AI is able to beat the rules-based AI more consistently or at least at a simiar rate than another rules-based AI could?
 - watch the 1v1s
 - Add training to the UI - let me execute training runs against various phases and let me watch/evalute scenarios entirely in the UI
-- Allow me to replay the demonstrations, as the AI does in pretrain
+    - let me also create my own scenarios and play them as training "demonstrations" entirely in the UI, using the actions/orders and having that recorded, and then it gets used for training. store the orders too for neural network training and replaying
+    - Allow me to replay the demonstrations in the UI - either through orders or through actions
 - during the demonstration collection, print summary stats of the reward scores for each player (they might sum to 0)
+- Think about how GetPossesion, Tackle and Move orders are going to interact - they could work together. The Orders would need to break down into AI suggestions maybe
 
 Next immediate training:
 - I've made some small changes to ai_plan regarding the movement orders neurons (region of play and importance etc...), can we update the code and documents to reflect this change
@@ -54,4 +57,4 @@ NB:
 - Show player attributes ands stamina somewhere on select
 - Could do grid search on the goalie intercept maneuver and clever positioning - ask that AI how the intercepting is chosen, but really we should calculate distance/speed for both options, and make a weighted choice based on those, no? throw in some params and re-tune the goalie bonuses probably
 - footballer heigh should vary - and therefore jump height
-- At some point ask an AI to read through everything and offer suggestions for refactors or cleanups, comments and criticisms on structure and easy wins, possible bugs and edge cases. Do this before extending the game too much beyond the pitch
+- At some point ask an AI to read through everything and offer suggestions for refactors or cleanups, duplicate code/logic, comments and criticisms on structure, easy wins, possible bugs and edge cases etc... Do this before extending the game too much beyond the pitch

@@ -183,7 +183,7 @@ def _apply_tackle(
     gating: GatingResult,
     slot_player_ids: list[Optional[str]],
 ) -> OrderTranslationResult:
-    if player.state == PlayerState.INACTIVE_TACKLED:
+    if not player.is_available_to_tackle():
         return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_while_inactive")
 
     target_player = _resolve_target_player(gating.target_slot, slot_player_ids, match)
@@ -198,7 +198,7 @@ def _apply_tackle(
 
 
 def _apply_get_possession(player: Player, match: Match) -> OrderTranslationResult:
-    if player.state == PlayerState.INACTIVE_TACKLED:
+    if not player.is_available_to_tackle():
         return OrderTranslationResult(illegal_action=True, illegal_reason="get_possession_while_inactive")
 
     player.get_possession()

@@ -16,7 +16,7 @@ from footballcoach.ui.camera import Camera
 
 if TYPE_CHECKING:
     from footballcoach.ui.gamelog import GameLog, LogLevel
-    from footballcoach.ui.scenarios import ScenarioParam
+    from footballcoach.ui.scenarios import AnyScenarioParam, ScenarioBoolParam, ScenarioChoiceParam, ScenarioParam
 
 
 class Renderer:
@@ -288,15 +288,18 @@ class Renderer:
     def draw_scenario_params(
         self,
         surface: pygame.Surface,
-        params: list["ScenarioParam"],
-        values: dict[str, float],
+        params: list["AnyScenarioParam"],
+        values: dict[str, object],
         title: str = "Scenario Parameters",
     ) -> dict[str, tuple[pygame.Rect, pygame.Rect]]:
         """Draws the scenario-parameter adjustment screen and returns a dict
-        mapping param name → (minus_rect, plus_rect) for click detection.
+        mapping param name → (left_rect, right_rect) for click detection.
 
-        Layout: centred vertical list, one row per param.
+        - ScenarioParam:       [-]  value  [+]
+        - ScenarioChoiceParam: [<]  choice [>]  (cycle through choices list)
+        - ScenarioBoolParam:   [checkbox]  label
         """
+        from footballcoach.ui.scenarios import ScenarioBoolParam, ScenarioChoiceParam
         surface.fill(style.HUD_BG)
         sw, sh = surface.get_size()
 
@@ -306,42 +309,79 @@ class Renderer:
         row_h = 44
         start_y = 100
         btn_w, btn_h = 32, 28
-        gap = 16  # padding between label and minus button
+        gap = 16
 
-        # Measure the widest label so we can align buttons consistently.
         max_label_w = max(
             (self.hud_font.size(p.label)[0] for p in params),
             default=0,
         )
-        # Centre the whole block: label | gap | [-] gap [val] gap [+]
-        block_w = max_label_w + gap + btn_w + gap + 60 + gap + btn_w
+        block_w = max_label_w + gap + btn_w + gap + 200 + gap + btn_w
         col_label_x = (sw - block_w) // 2
         col_minus_x = col_label_x + max_label_w + gap
         col_val_x   = col_minus_x + btn_w + gap
-        col_plus_x  = col_val_x + 60 + gap
+        col_plus_x  = col_val_x + 200 + gap
 
         button_rects: dict[str, tuple[pygame.Rect, pygame.Rect]] = {}
+        mouse_pos = pygame.mouse.get_pos()
 
         for i, param in enumerate(params):
             y = start_y + i * row_h
             label_surf = self.hud_font.render(param.label, True, style.HUD_TEXT)
             surface.blit(label_surf, (col_label_x, y + (row_h - label_surf.get_height()) // 2))
 
-            val = values.get(param.name, param.default)
-            val_surf = self.hud_font.render(f"{val:.3g}", True, style.HUD_ACCENT)
-            surface.blit(val_surf, (col_val_x, y + (row_h - val_surf.get_height()) // 2))
+            if isinstance(param, ScenarioBoolParam):
+                # Checkbox: single clickable box, no left/right buttons
+                checked = bool(values.get(param.name, param.default))
+                box_size = 22
+                box_x = col_minus_x
+                box_y = y + (row_h - box_size) // 2
+                box_rect = pygame.Rect(box_x, box_y, box_size, box_size)
+                hovered = box_rect.collidepoint(mouse_pos)
+                bg = (70, 100, 70) if checked else ((60, 60, 80) if hovered else (40, 40, 55))
+                pygame.draw.rect(surface, bg, box_rect, border_radius=4)
+                pygame.draw.rect(surface, style.HUD_ACCENT, box_rect, 1, border_radius=4)
+                if checked:
+                    tick = self.hud_font.render("✓", True, style.HUD_ACCENT)
+                    surface.blit(tick, (box_x + (box_size - tick.get_width()) // 2,
+                                        box_y + (box_size - tick.get_height()) // 2))
+                # Both rects point to the same box (toggle on either click)
+                button_rects[param.name] = (box_rect, box_rect)
 
-            minus_rect = pygame.Rect(col_minus_x, y + (row_h - btn_h) // 2, btn_w, btn_h)
-            plus_rect = pygame.Rect(col_plus_x, y + (row_h - btn_h) // 2, btn_w, btn_h)
-            mouse_pos = pygame.mouse.get_pos()
-            for rect, symbol in ((minus_rect, "-"), (plus_rect, "+")):
-                hovered = rect.collidepoint(mouse_pos)
-                bg_colour = (70, 70, 90) if hovered else (40, 40, 55)
-                pygame.draw.rect(surface, bg_colour, rect, border_radius=4)
-                sym_surf = self.hud_font.render(symbol, True, style.HUD_ACCENT)
-                surface.blit(sym_surf, (rect.x + (btn_w - sym_surf.get_width()) // 2,
-                                        rect.y + (btn_h - sym_surf.get_height()) // 2))
-            button_rects[param.name] = (minus_rect, plus_rect)
+            elif isinstance(param, ScenarioChoiceParam):
+                # Dropdown-style: [<] current_choice [>]
+                current = values.get(param.name, param.default)
+                minus_rect = pygame.Rect(col_minus_x, y + (row_h - btn_h) // 2, btn_w, btn_h)
+                plus_rect  = pygame.Rect(col_plus_x,  y + (row_h - btn_h) // 2, btn_w, btn_h)
+                for rect, symbol in ((minus_rect, "<"), (plus_rect, ">")):
+                    hovered = rect.collidepoint(mouse_pos)
+                    bg_colour = (70, 70, 90) if hovered else (40, 40, 55)
+                    pygame.draw.rect(surface, bg_colour, rect, border_radius=4)
+                    sym = self.hud_font.render(symbol, True, style.HUD_ACCENT)
+                    surface.blit(sym, (rect.x + (btn_w - sym.get_width()) // 2,
+                                       rect.y + (btn_h - sym.get_height()) // 2))
+                # Truncate long choice strings
+                choice_str = str(current)
+                if len(choice_str) > 28:
+                    choice_str = "…" + choice_str[-27:]
+                val_surf = self.hud_font.render(choice_str, True, style.HUD_ACCENT)
+                surface.blit(val_surf, (col_val_x, y + (row_h - val_surf.get_height()) // 2))
+                button_rects[param.name] = (minus_rect, plus_rect)
+
+            else:
+                # Standard numeric slider: [-] value [+]
+                val = values.get(param.name, param.default)
+                val_surf = self.hud_font.render(f"{val:.3g}", True, style.HUD_ACCENT)
+                surface.blit(val_surf, (col_val_x, y + (row_h - val_surf.get_height()) // 2))
+                minus_rect = pygame.Rect(col_minus_x, y + (row_h - btn_h) // 2, btn_w, btn_h)
+                plus_rect  = pygame.Rect(col_plus_x,  y + (row_h - btn_h) // 2, btn_w, btn_h)
+                for rect, symbol in ((minus_rect, "-"), (plus_rect, "+")):
+                    hovered = rect.collidepoint(mouse_pos)
+                    bg_colour = (70, 70, 90) if hovered else (40, 40, 55)
+                    pygame.draw.rect(surface, bg_colour, rect, border_radius=4)
+                    sym_surf = self.hud_font.render(symbol, True, style.HUD_ACCENT)
+                    surface.blit(sym_surf, (rect.x + (btn_w - sym_surf.get_width()) // 2,
+                                            rect.y + (btn_h - sym_surf.get_height()) // 2))
+                button_rects[param.name] = (minus_rect, plus_rect)
 
         # Start / Back buttons near the bottom.
         bottom_y = start_y + len(params) * row_h + 30
@@ -357,7 +397,6 @@ class Renderer:
             txt = self.hud_font.render(label, True, colour)
             surface.blit(txt, (rect.x + (rect.width - txt.get_width()) // 2,
                                 rect.y + (rect.height - txt.get_height()) // 2))
-        # Store Start/Back in the dict with special keys
         button_rects["__start__"] = (start_rect, start_rect)
         button_rects["__back__"] = (back_rect, back_rect)
         return button_rects

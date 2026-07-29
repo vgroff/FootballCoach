@@ -101,7 +101,7 @@ class ScenarioEnv:
         cfg = load_ai_config()
         self._obs_cfg = cfg["observation"]
         self._reward_cfg = cfg["reward"]
-        self._dt_s = 1.0 / 30.0  # engine tick rate
+        self._dt_s = float(self._obs_cfg.get("sim_dt_s", 1.0 / 30.0))
         self._decision_interval_s = float(self._obs_cfg["decision_interval_s"])
         self._ticks_per_decision = max(1, round(self._decision_interval_s / self._dt_s))
 
@@ -130,12 +130,15 @@ class ScenarioEnv:
     def reset(self) -> ObservationBatch:
         """Start a new trial and return the initial observation."""
         from footballcoach.rules_ai import NeuralPlayerAI
+        # Inject sim_dt_s so build functions can pass it to Match.
+        # This has no effect on builds that don't accept it (e.g. phase 2).
+        build_kwargs = {**self.scenario_kwargs, "sim_dt_s": self._dt_s}
         self._loop = ScenarioLoop(
             definition=self.definition,
             max_trials=0,
             rng_reduction=self.rng_reduction,
             linger_s=self.linger_s,
-            kwargs=self.scenario_kwargs,
+            kwargs=build_kwargs,
             timeout_ticks=int(self.max_episode_s / self._dt_s),
         )
         self._ema.reset()

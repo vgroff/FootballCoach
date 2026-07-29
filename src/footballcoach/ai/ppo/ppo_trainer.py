@@ -47,6 +47,7 @@ from footballcoach.ai.action.schema import DecisionAction, ExecutionAction
 from footballcoach.ai.config import load_ai_config
 from footballcoach.ai.models.decision_network import DecisionNetwork, derive_get_possession_prob
 from footballcoach.ai.models.execution_network import ExecutionNetwork, flatten_decision_heads
+from footballcoach.ai.obs.augment import augment_batch, augment_obs_bc
 from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
 from footballcoach.ai.ppo.schedules import TrainingSchedules
 
@@ -71,6 +72,7 @@ class PPOTrainer:
         cfg: dict,
         device: Optional[torch.device] = None,
         checkpoint_dir: Optional[Path] = None,
+        inference_only: bool = False,
     ):
         self.decision_net = decision_net
         self.execution_net = execution_net
@@ -95,11 +97,17 @@ class PPOTrainer:
         self.dir_l2_coef = float(ppo_cfg.get("dir_l2_coef", 0.01))
         self.dir_log_std_min = float(ppo_cfg.get("dir_log_std_min", -5.0))
         self.dir_log_std_max = float(ppo_cfg.get("dir_log_std_max", 2.0))
+        self.ent_dir_weight = float(ppo_cfg.get("ent_dir_weight", 1.0))
+        self.augment_n_slot_shuffles = int(ppo_cfg.get("augment_n_slot_shuffles", 0))
+        self._aug_rng = random.Random()
         self._bc_cfg = bc_cfg
 
         lr = float(ppo_cfg.get("learning_rate", 3e-4))
-        all_params = list(decision_net.parameters()) + list(execution_net.parameters())
-        self.optimizer = torch.optim.Adam(all_params, lr=lr, eps=1e-5)
+        if not inference_only:
+            all_params = list(decision_net.parameters()) + list(execution_net.parameters())
+            self.optimizer = torch.optim.Adam(all_params, lr=lr, eps=1e-5)
+        else:
+            self.optimizer = None  # type: ignore[assignment]  # not needed for inference
 
         self.decision_net.to(self.device)
         self.execution_net.to(self.device)
@@ -257,6 +265,13 @@ class PPOTrainer:
                 outcome_str = ("  " + "  ".join(outcome_parts)) if outcome_parts else ""
                 mv_ls = metrics.get('move_log_std', [])
                 mv_ls_str = f"  mv_ls=[{','.join(f'{v:.2f}' for v in mv_ls)}]" if mv_ls else ""
+                ha = metrics.get("head_act", {})
+                act_str = (
+                    f"  act: mv={ha.get('mv','?'):>3} gp={ha.get('gp','?'):>3}"
+                    f" spr={ha.get('spr','?'):>3} kck={ha.get('kck','?'):>3}"
+                    f" tk={ha.get('tk','?'):>3} sh={ha.get('sh','?'):>3}"
+                    f" hld={ha.get('hld','?'):>3}"
+                ) if ha else ""
                 log.info(
                     f"step={self._total_steps:,} | "
                     f"rew={mean_ep_reward:.2f} | "
@@ -267,6 +282,7 @@ class PPOTrainer:
                     f"{bc_str} | "
                     f"{steps_per_sec:.0f}sps"
                     f"{mv_ls_str}"
+                    f"{act_str}"
                     f"{outcome_str}"
                 )
 
@@ -354,6 +370,11 @@ class PPOTrainer:
             for obs_dict, bc_labels in dataset.iterate_minibatches(
                 batch_size=batch_size, shuffle=True, device=self.device, valid_only=True
             ):
+                # Augment with geometric flips + slot permutations (ALWAYS applied).
+                if self.augment_n_slot_shuffles > 0:
+                    obs_dict, bc_labels = augment_obs_bc(
+                        obs_dict, bc_labels, self.augment_n_slot_shuffles, self._aug_rng
+                    )
                 d_heads = self.decision_net(
                     obs_dict["self_feat"], obs_dict["other_feat"],
                     obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
@@ -424,6 +445,12 @@ class PPOTrainer:
         log.debug(f"  [combined pretrain] rollout returns: mean={returns_t.mean():.2f}  std={ret_std:.2f}")
 
         # --- Phase 3: value head warm-up on on-policy returns ---
+        # Augment rollout_batch with geometric flips + slot permutations (ALWAYS applied).
+        if self.augment_n_slot_shuffles > 0:
+            rollout_batch = augment_batch(rollout_batch, self.augment_n_slot_shuffles, self._aug_rng)
+        returns_t = rollout_batch["returns"].to(self.device)
+        ret_std = returns_t.std().clamp(min=1.0)  # recompute after expansion
+
         n_rollout = len(returns_t)
         val_epochs = max(1, value_epochs)
         for epoch in range(val_epochs):
@@ -504,6 +531,11 @@ class PPOTrainer:
                 for obs_dict, bc_labels in dataset.iterate_minibatches(
                     batch_size=batch_size, shuffle=True, device=self.device, valid_only=True
                 ):
+                    # Augment repair minibatch (ALWAYS applied).
+                    if self.augment_n_slot_shuffles > 0:
+                        obs_dict, bc_labels = augment_obs_bc(
+                            obs_dict, bc_labels, self.augment_n_slot_shuffles, self._aug_rng
+                        )
                     d_r = self.decision_net(
                         obs_dict["self_feat"], obs_dict["other_feat"],
                         obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
@@ -877,15 +909,14 @@ class PPOTrainer:
             samples["tackle_attempt"]
         ).sum()
 
-        # Direction heads: now included in the PPO log_prob ratio.
-        # The network forward() normalizes the mean to a unit vector, bounding
-        # max mean-shift to 2 and keeping KL contribution O(1) per step.
+        # Direction heads: weighted to prevent large continuous-head variance from
+        # dominating the ratio. ent_dir_weight < 1 damps their contribution.
         log_std_move = self.execution_net.move_dir_log_std
         log_std_kick = self.execution_net.kick_dir_log_std
-        lp += self._dir_head(e_heads.move_direction, log_std_move).log_prob(
+        lp += self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).log_prob(
             samples["move_dir_raw"]
         )
-        lp += self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+        lp += self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
             samples["kick_dir_raw"]
         )
 
@@ -901,6 +932,11 @@ class PPOTrainer:
         Returns dict of mean loss metrics for logging.
         """
         from footballcoach.ai.ppo.bc import bc_loss_from_tensor
+
+        # Augment batch with geometric flips + slot permutations before any
+        # gradient computation.  This expands the batch by 4 × n_slot_shuffles.
+        if self.augment_n_slot_shuffles > 0:
+            batch = augment_batch(batch, self.augment_n_slot_shuffles, self._aug_rng)
 
         n = len(batch["log_probs"])
         clip = self.schedules.clip(progress)
@@ -1185,6 +1221,22 @@ class PPOTrainer:
                 f"  angular_diff={min(abs(s_angle-n_angle), 360-abs(s_angle-n_angle)):.1f}°"
             )
 
+        # Per-head mean activation rates from the buffer (0–100%). Zero-cost: just
+        # averages the stored 0/1 action arrays — no extra forward pass needed.
+        def _act(key: str) -> int:
+            t = batch[f"action/{key}"]
+            return round(float(t.mean()) * 100)
+
+        head_act = {
+            "mv":  _act("move"),
+            "gp":  _act("get_possession_extra"),
+            "spr": _act("sprint"),
+            "kck": _act("kick"),
+            "tk":  _act("tackle_attempt"),
+            "sh":  _act("shoot"),
+            "hld": _act("hold_position"),
+        }
+
         return {
             "policy_loss": float(np.mean(all_policy_loss)),
             "value_loss": float(np.mean(all_value_loss)),
@@ -1195,6 +1247,7 @@ class PPOTrainer:
             "epoch_time_ms": float(np.mean(epoch_times)) if epoch_times else 0.0,
             "move_log_std": move_log_std,
             "kick_log_std": kick_log_std,
+            "head_act": head_act,
         }
 
     def _recompute_log_prob(self, d_heads, e_heads, mb_actions: dict, exists_mask) -> torch.Tensor:
@@ -1231,13 +1284,13 @@ class PPOTrainer:
                 )
                 lp[mask] += cat_lp[mask]
 
-        # Direction heads: included now that the mean is unit-normalized.
+        # Direction heads: weighted to match _compute_log_prob (must stay consistent).
         log_std_move = self.execution_net.move_dir_log_std.to(self.device)
         log_std_kick = self.execution_net.kick_dir_log_std.to(self.device)
-        lp += self._dir_head(e_heads.move_direction, log_std_move).log_prob(
+        lp += self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).log_prob(
             mb_actions["move_dir_raw"]
         )
-        lp += self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+        lp += self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
             mb_actions["kick_dir_raw"]
         )
 
@@ -1274,10 +1327,11 @@ class PPOTrainer:
         log.info(f"Saved checkpoint: {path}")
 
     def load_checkpoint(self, path: Path) -> int:
-        ckpt = torch.load(path, map_location=self.device)
+        ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.decision_net.load_state_dict(ckpt["decision_net"])
         self.execution_net.load_state_dict(ckpt["execution_net"])
-        self.optimizer.load_state_dict(ckpt["optimizer"])
+        if self.optimizer is not None and "optimizer" in ckpt:
+            self.optimizer.load_state_dict(ckpt["optimizer"])
         self._total_steps = ckpt["step"]
         log.info(f"Loaded checkpoint: {path} (step {self._total_steps})")
         return self._total_steps
@@ -1288,6 +1342,24 @@ class PPOTrainer:
         decision_net = DecisionNetwork.from_config()
         execution_net = ExecutionNetwork.from_config()
         return cls(decision_net=decision_net, execution_net=execution_net, cfg=cfg, **kwargs)
+
+    @classmethod
+    def load_for_inference(cls, path: "Path | str") -> "PPOTrainer":
+        """Load networks only — no optimizer created. Safe to call inside pygame/UI."""
+        path = Path(path)
+        cfg = load_ai_config()
+        decision_net = DecisionNetwork.from_config()
+        execution_net = ExecutionNetwork.from_config()
+        trainer = cls(
+            decision_net=decision_net,
+            execution_net=execution_net,
+            cfg=cfg,
+            inference_only=True,
+        )
+        trainer.load_checkpoint(path)
+        trainer.decision_net.eval()
+        trainer.execution_net.eval()
+        return trainer
 
 
 # ---------------------------------------------------------------------------

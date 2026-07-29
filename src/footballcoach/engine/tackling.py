@@ -10,6 +10,7 @@ import random
 from dataclasses import dataclass
 
 from footballcoach.config import load_physics_config
+from footballcoach.entities.player import Player, PlayerState
 from footballcoach.mathutils import Vector3
 from footballcoach.mathutils.rng import skill_roll
 
@@ -20,15 +21,17 @@ class TacklingParams:
     goalkeeper_tackle_boost: float
     goalkeeper_outside_box_tackle_penalty: float
     control_time_penalty_reference_s: float
-    inactive_duration_s: float
-    inactive_speed_penalty: float
-    tackler_miss_inactive_duration_s: float
-    dribble_beaten_speed_threshold: float
-    dribble_beaten_max_penalty: float
+    tackle_cooldown_s: float
+    tackle_attempt_tackler_speed_mult: float
+    tackle_attempt_tacklee_speed_mult: float
+    loser_speed_penalty_scale: float
+    loser_speed_penalty_max: float
     head_on_min_charge_speed_mps: float
     angle_modifier_frontal: float
     angle_modifier_side: float
     angle_modifier_behind: float
+    dribble_beaten_speed_threshold: float
+    dribble_beaten_max_penalty: float
 
     @staticmethod
     def from_config() -> "TacklingParams":
@@ -38,15 +41,17 @@ class TacklingParams:
             goalkeeper_tackle_boost=d["goalkeeper_tackle_boost"],
             goalkeeper_outside_box_tackle_penalty=d["goalkeeper_outside_box_tackle_penalty"],
             control_time_penalty_reference_s=d["control_time_penalty_reference_s"],
-            inactive_duration_s=d["inactive_duration_s"],
-            inactive_speed_penalty=d["inactive_speed_penalty"],
-            tackler_miss_inactive_duration_s=d["tackler_miss_inactive_duration_s"],
-            dribble_beaten_speed_threshold=d["dribble_beaten_speed_threshold"],
-            dribble_beaten_max_penalty=d["dribble_beaten_max_penalty"],
+            tackle_cooldown_s=d["tackle_cooldown_s"],
+            tackle_attempt_tackler_speed_mult=d["tackle_attempt_tackler_speed_mult"],
+            tackle_attempt_tacklee_speed_mult=d["tackle_attempt_tacklee_speed_mult"],
+            loser_speed_penalty_scale=d["loser_speed_penalty_scale"],
+            loser_speed_penalty_max=d["loser_speed_penalty_max"],
             head_on_min_charge_speed_mps=d["head_on_min_charge_speed_mps"],
             angle_modifier_frontal=d["angle_modifier_frontal"],
             angle_modifier_side=d["angle_modifier_side"],
             angle_modifier_behind=d["angle_modifier_behind"],
+            dribble_beaten_speed_threshold=d["dribble_beaten_speed_threshold"],
+            dribble_beaten_max_penalty=d["dribble_beaten_max_penalty"],
         )
 
 
@@ -95,19 +100,49 @@ class TackleResult:
     """Result of a tackle attempt.
 
     ``tackler_won`` is True when the tackler wins the ball.
-    ``dribble_speed_multiplier`` is applied to the dribbler's velocity when
-    the dribbler wins but was only narrowly beaten: at 0 margin it is
-    ``1 - dribble_beaten_max_penalty`` (≈0.20); above
-    ``dribble_beaten_speed_threshold`` margin it reaches 1.0 (no slowdown).
-    Always 1.0 when the tackler wins (irrelevant in that case).
+
+    Speed multipliers are always applied to both players:
+    - Base contact reductions (``tackle_attempt_tackler/tacklee_speed_mult``)
+      are applied to both regardless of outcome.
+    - The *loser* additionally gets a penalty scaled by the roll difference:
+      ``penalty = min(|t_roll - d_roll| * loser_speed_penalty_scale, loser_speed_penalty_max)``
+      Their final speed mult = base × (1 - penalty).
+
     ``tackler_roll`` / ``dribbler_roll``: the actual skill-roll values drawn
     during the contest, exposed so callers (e.g. the game log) can show the
     exact numbers without re-deriving them from ``skill_roll`` internals.
     """
     tackler_won: bool
-    dribble_speed_multiplier: float
+    tackler_speed_mult: float
+    tacklee_speed_mult: float
     tackler_roll: float = 0.0
     dribbler_roll: float = 0.0
+
+    @property
+    def dribble_speed_multiplier(self) -> float:
+        """Speed multiplier applied to the dribbler (tacklee).  Convenience alias for ``tacklee_speed_mult``."""
+        return self.tacklee_speed_mult
+
+
+def apply_tackle_result(
+    result: "TackleResult",
+    tackler: "Player",
+    tacklee: "Player",
+    params: TacklingParams,
+) -> None:
+    """Apply the physical consequences of a resolved tackle to both players.
+
+    This is the ONLY place velocity and state are written for tackle outcomes.
+    Possession transfer is NOT handled here — the caller must call
+    ``match._set_possession()`` separately so the possession callback fires.
+    """
+    from footballcoach.entities.player import Player, PlayerState  # local to avoid circular  # noqa: F401
+    tackler.velocity = tackler.velocity * result.tackler_speed_mult
+    tacklee.velocity = tacklee.velocity * result.tacklee_speed_mult
+    tackler.state = PlayerState.INACTIVE_TACKLED
+    tackler.state_timer_s = params.tackle_cooldown_s
+    tacklee.state = PlayerState.INACTIVE_TACKLED
+    tacklee.state_timer_s = params.tackle_cooldown_s
 
 
 def attempt_tackle(
@@ -159,13 +194,40 @@ def attempt_tackle(
     t_roll = skill_roll(tackling_attr * effective_boost, rng_reduction, r)
     d_roll = skill_roll(dribbling_attr, rng_reduction, r)
 
-    if t_roll >= d_roll:
-        return TackleResult(tackler_won=True, dribble_speed_multiplier=1.0, tackler_roll=t_roll, dribbler_roll=d_roll)
+    # Base contact speed reductions applied to both players always.
+    base_tackler = params.tackle_attempt_tackler_speed_mult
+    base_tacklee = params.tackle_attempt_tacklee_speed_mult
 
-    # Dribbler won - compute how much they're slowed by the near-miss.
-    relative_margin = (d_roll - t_roll) / max(t_roll, 1e-9)
-    threshold = params.dribble_beaten_speed_threshold
-    max_penalty = params.dribble_beaten_max_penalty
-    # Linear interpolation: 0 margin -> (1 - max_penalty), threshold -> 1.0
-    speed_mult = (1.0 - max_penalty) + max_penalty * min(1.0, relative_margin / threshold)
-    return TackleResult(tackler_won=False, dribble_speed_multiplier=speed_mult, tackler_roll=t_roll, dribbler_roll=d_roll)
+    # Loser's additional penalty, proportional to roll difference.
+    diff = abs(t_roll - d_roll)
+    loser_extra_penalty = min(diff * params.loser_speed_penalty_scale, params.loser_speed_penalty_max)
+    loser_extra_mult = 1.0 - loser_extra_penalty
+
+    if t_roll >= d_roll:
+        # Tackler wins: tacklee is the loser and gets extra slow-down.
+        return TackleResult(
+            tackler_won=True,
+            tackler_speed_mult=base_tackler,
+            tacklee_speed_mult=base_tacklee * loser_extra_mult,
+            tackler_roll=t_roll,
+            dribbler_roll=d_roll,
+        )
+    else:
+        # Dribbler wins: tackler is the loser; dribbler speed depends on
+        # how convincingly they won (relative margin vs tackler's roll).
+        # Large margin (>= threshold) → full speed retained (mult=1.0).
+        # Near-zero margin → slowed by up to dribble_beaten_max_penalty.
+        threshold = params.dribble_beaten_speed_threshold
+        max_penalty = params.dribble_beaten_max_penalty
+        relative_margin = (d_roll - t_roll) / t_roll if t_roll > 1e-9 else 1.0
+        if relative_margin >= threshold:
+            dribbler_mult = 1.0
+        else:
+            dribbler_mult = 1.0 - max_penalty * (1.0 - relative_margin / threshold)
+        return TackleResult(
+            tackler_won=False,
+            tackler_speed_mult=base_tackler * loser_extra_mult,
+            tacklee_speed_mult=dribbler_mult,
+            tackler_roll=t_roll,
+            dribbler_roll=d_roll,
+        )

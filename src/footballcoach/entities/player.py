@@ -68,6 +68,13 @@ class Player:
     # Useful for recording, logging, UI effects, stats, etc.
     on_kick: object | None = field(default=None, repr=False)     # fired when a kick/shoot/pass lands
     on_tackle: object | None = field(default=None, repr=False)   # fired when a tackle attempt executes
+    on_possession_gained: object | None = field(default=None, repr=False)  # fired by match._set_possession() when this player gains the ball
+
+    # Movement intent — set by execute() / AI each tick, consumed by match._apply_movement().
+    # Orders/AI MUST NOT call step_player_towards directly; they set these two fields and the
+    # engine applies them via step_player_towards.  desired_speed_mode=None means no movement.
+    desired_direction: Vector3 = field(default_factory=Vector3.zero, repr=False, compare=False)
+    desired_speed_mode: object | None = field(default=None, repr=False, compare=False)  # SpeedMode at runtime
 
     radius_m: float = 0.3
     height_m: float = 1.8

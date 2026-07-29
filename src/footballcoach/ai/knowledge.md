@@ -141,11 +141,20 @@ gp_prob = tackle_prob + sigmoid(gp_raw) * (1 - tackle_prob)
 Always in [tackle_prob, 1.0].  PPO log_prob is on the two raw logits
 separately as independent Bernoullis, NOT on the derived gp_prob.
 
-### Observation slot shuffling
+### Observation slot shuffling and geometric augmentation
 
 `encode_observation()` randomly shuffles which of the 21 other-player slots
 each real player lands in, every call.  This teaches the network permutation
-invariance.  Tests in `tests/ai_unit/test_obs_encoder.py` verify that (a)
+invariance.
+
+**Additional augmentation** (`obs/augment.py`) is applied inside `PPOTrainer._ppo_update()`
+**for ALL training phases in this repo**.  Each rollout batch is expanded by
+4 × `ppo.augment_n_slot_shuffles` (default 12×):
+- 4 geometric flips: identity, flip_x, flip_y, flip_xy (exact pitch symmetries)
+- n slot permutations per flip (exact for permutation-invariant attention)
+Field indices for each flip are derived from `fields(PlayerFeatures)` /
+`fields(BallFeatures)` at import time — see `obs/augment.py` for the full
+derivation including pseudovector (spin) transforms.  Tests in `tests/ai_unit/test_obs_encoder.py` verify that (a)
 features are identical across different shuffle seeds and (b) different seeds
 actually produce different slot assignments.
 

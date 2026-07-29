@@ -482,3 +482,37 @@ def pass_ball(
     )
 
     _launch_ball(ball, kicker_position, aim_point, speed, sigma, Vector3.zero(), r, gravity_mps2)
+
+def has_blocker_on_shot_line(
+    shooter_pos: Vector3,
+    aim_point: Vector3,
+    opposition: list,
+    threshold_m: float = 1.0,
+) -> bool:
+    """Return True if any active opposition player lies within *threshold_m*
+    of the line segment from *shooter_pos* to *aim_point* (XY plane only)
+    and is between the shooter and the aim point.
+
+    ``opposition`` is a list of Player objects; inactive (tackled) players
+    are excluded — they cannot intercept a shot.
+    """
+    import math as _math
+    from footballcoach.entities.player import PlayerState
+    sx, sy = shooter_pos.x, shooter_pos.y
+    ax, ay = aim_point.x, aim_point.y
+    dx, dy = ax - sx, ay - sy
+    line_len_sq = dx * dx + dy * dy
+    if line_len_sq < 1e-12:
+        return False
+    for opp in opposition:
+        if opp.state == PlayerState.INACTIVE_TACKLED:
+            continue
+        ox, oy = opp.position.x, opp.position.y
+        t = ((ox - sx) * dx + (oy - sy) * dy) / line_len_sq
+        if t <= 0.0 or t >= 1.0:
+            continue
+        proj_x = sx + t * dx
+        proj_y = sy + t * dy
+        if _math.hypot(ox - proj_x, oy - proj_y) < threshold_m:
+            return True
+    return False

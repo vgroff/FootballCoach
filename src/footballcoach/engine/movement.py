@@ -331,3 +331,54 @@ def angle_diff(a: float, b: float) -> float:
 
 # Keep the private alias so any existing internal callers still work.
 _angle_diff = angle_diff
+
+
+def braking_speed_mode(
+    dist: float,
+    current_speed: float,
+    arrival_speed: float,
+    a_max: float,
+    standstill_decel_mult: float,
+    jog_speed: float,
+    sprint_requested: bool,
+) -> SpeedMode:
+    """Picks the SpeedMode for this tick so the player arrives at
+    ``arrival_speed`` (m/s) within ``dist`` metres without overshooting.
+
+    Logic:
+    - If ``arrival_speed >= jog_speed``, no braking is needed: return
+      SPRINT or JOG per ``sprint_requested``.
+    - If ``arrival_speed ≈ 0`` (< 0.1):
+        * Always STANDSTILL within 0.5 m (close-range guard that prevents
+          re-acceleration oscillation when braking_dist ≈ 0 at low speed).
+        * Switch to STANDSTILL earlier when ``dist <= v²/(2·a_eff)``
+          (deceleration physics: the distance needed to reach 0 from the
+          current speed under the boosted standstill deceleration).
+    - Otherwise switch to JOG within the corresponding braking distance.
+    """
+    if arrival_speed >= jog_speed - 0.05:
+        return SpeedMode.SPRINT if sprint_requested else SpeedMode.JOG
+
+    if arrival_speed < 0.1:
+        if dist <= 0.5:
+            return SpeedMode.STANDSTILL
+        a_eff = a_max * standstill_decel_mult
+        braking_dist = (current_speed ** 2) / (2.0 * a_eff) if current_speed > 0.0 else 0.0
+        if dist <= braking_dist:
+            return SpeedMode.STANDSTILL
+    else:
+        v_sq_diff = max(0.0, current_speed ** 2 - arrival_speed ** 2)
+        braking_dist = v_sq_diff / (2.0 * a_max) if a_max > 0.0 else 0.0
+        if dist <= braking_dist:
+            return SpeedMode.JOG
+
+    return SpeedMode.SPRINT if sprint_requested else SpeedMode.JOG
+
+
+def drain_if_sprinting(params: MovementParams, player: Player, sprinting: bool, dt: float) -> float:
+    """Drain stamina only if the player is actually sprinting; otherwise
+    return current stamina unchanged.
+    """
+    if not sprinting:
+        return player.stamina
+    return drain_stamina(params, player.stamina, player.attributes.stamina, 1.0, dt)

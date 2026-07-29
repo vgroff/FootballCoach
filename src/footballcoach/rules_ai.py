@@ -29,19 +29,29 @@ from footballcoach.orders import (
 
 
 class Phase1RulesAI(PlayerAI):
-    """Chase ball; when possessed, sprint toward the front edge of the
-    opponent's box.  Team-aware via player.team."""
+    """Chase ball; when possessed, sprint toward a random point inside the
+    opponent's box (in the half of the box nearest to the player's current
+    y-position).  Team-aware via player.team."""
 
     def act(self, player: Player, match: Match, trial_tick: int) -> None:
         if match.ball.possessed_by == player.player_id:
             if not isinstance(player.current_order, MoveOrder):
-                goal_x = (
-                    match.pitch.half_length - match.pitch.box_length_m
-                    if player.team == Team.LEFT
-                    else -(match.pitch.half_length - match.pitch.box_length_m)
-                )
+                pitch = match.pitch
+                half_box_w = pitch.box_width_m / 2.0
+                # x: random within the full box depth (inner edge → goal line)
+                if player.team == Team.LEFT:
+                    box_inner_x = pitch.half_length - pitch.box_length_m
+                    target_x = random.uniform(box_inner_x, pitch.half_length)
+                else:
+                    box_inner_x = -(pitch.half_length - pitch.box_length_m)
+                    target_x = random.uniform(-pitch.half_length, box_inner_x)
+                # y: random in the nearest half of the box to the player
+                if player.position.y >= 0.0:
+                    target_y = random.uniform(0.0, half_box_w)
+                else:
+                    target_y = random.uniform(-half_box_w, 0.0)
                 player.current_order = MoveOrder(
-                    target_position=Vector3(goal_x, 0.0, 0.0),
+                    target_position=Vector3(target_x, target_y, 0.0),
                     sprint=True,
                 )
         else:

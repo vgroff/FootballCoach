@@ -439,7 +439,63 @@ of total training steps (default 0.2 → 0.0 by 30%), then stays 0.0.
 
 ---
 
-## 7. Reading the training log
+## 7. Data augmentation (geometric flips + slot permutations)
+
+**Source:** `src/footballcoach/ai/obs/augment.py`
+
+**Applies to ALL AI training phases in this repo** — wired into `_ppo_update()`
+in `PPOTrainer` so every phase automatically gets augmentation.
+
+### What it does
+
+Each real rollout batch is expanded by **4 × `augment_n_slot_shuffles`** before
+any gradient step.  Default `augment_n_slot_shuffles=3` → **12× augmentation**.
+
+**Geometric flips** (4 variants: identity, flip_x, flip_y, flip_xy):
+- flip_x: negate all x-direction quantities (positions, velocities, heading_cos,
+  attacking_direction, action vectors, BC label direction)
+- flip_y: negate all y-direction quantities (heading_sin, etc.)
+- Angular velocity (spin) is a pseudovector: under flip_x, spin_y and spin_z
+  negate; under flip_y, spin_x and spin_z negate.
+- These are **exact symmetries** of the football environment — reward and
+  terminal conditions are identical under pitch reflections.
+
+**Slot permutations** (`n_slot_shuffles` per geometric variant):
+- Randomly permute the opponent-player slot ordering in `other_feat`/`exists_mask`.
+- Exact for permutation-invariant attention networks.
+- Speeds up learning of permutation invariance.
+
+### Correctness of reusing old_log_probs
+
+PPO requires `π_old(a|s)`.  For augmented samples, we reuse the original
+log_prob.  This is:
+- **Exact** for slot permutations (attention is permutation-invariant)
+- **Approximate** for flips early in training; becomes exact as the network
+  learns equivariance; provides a gradient signal *toward* equivariance
+
+### Tuning
+
+| Config key | Default | Effect |
+|---|---|---|
+| `ppo.augment_n_slot_shuffles` | `3` | Slot permutations per flip. `0` = off, `1` = 4×, `3` = 12× |
+
+Note: 12× augmentation makes each PPO update ~12× more compute. Reduce
+`rollout_steps` if training wall-clock time is too long, since each step
+contributes 12 gradient-worthy samples.
+
+### Adding augmentation to a new phase/scenario
+
+No action needed.  `augment_batch()` operates on the encoded observation
+arrays, not the scenario.  New scenarios are automatically augmented as long
+as:
+1. Positions are encoded as relative offsets from the observing player
+2. Velocities are in world frame (both are true for all current scenarios)
+3. If the scenario has asymmetric structure (e.g. goal only on one side),
+   verify flip symmetry holds for your reward function before enabling flips.
+
+---
+
+## 8. Reading the training log
 
 Each rollout (every 2048 steps) prints one line:
 
@@ -458,6 +514,7 @@ step=28,679 | rew=8.76 | pol=0.02 val=1.00 ent=0.25 kl=0.16  bc=2.84(x0.17) | 28
 | `mv_ls` | `move_direction` log-std for both output dimensions (tracks direction head confidence) |
 | `vs_rules(N): W%/L%` | Trainee win% / opponent win% in the N **rules-based opponent** episodes this rollout |
 | `vs_neural(N): W%/L%` | Same for **neural opponent** episodes (shared-weight self-play).  Compare to `vs_rules` to see if improvement is vs the rules AI or just self-play |
+| `act: mv=XX gp=XX spr=XX ...` | Per-head mean activation rate (0–100%) from stored buffer actions. Values near 0 or 100 = saturated head (collapse warning). Zero extra compute — reads from buffer directly |
 
 Offline BC epoch lines (during `pretrain_combined`):
 ```
@@ -467,7 +524,7 @@ Offline BC epoch lines (during `pretrain_combined`):
 
 ---
 
-## 8. Adding a new training scenario
+## 9. Adding a new training scenario
 
 All scenarios live in **`src/footballcoach/ui/scenarios.py`** — one source of
 truth for both the training loop and the UI scenario picker.
@@ -499,7 +556,7 @@ truth for both the training loop and the UI scenario picker.
 
 ---
 
-## 9. Environment wrapper — ScenarioEnv
+## 10. Environment wrapper — ScenarioEnv
 
 ```
 src/footballcoach/ai/env/scenario_env.py

@@ -65,6 +65,30 @@ class ScenarioParam:
     default: float
 
 
+@dataclass(frozen=True)
+class ScenarioChoiceParam:
+    """A dropdown-style parameter: one of a fixed list of string options.
+
+    The build function receives the selected string as a kwarg.
+    ``default`` must be one of ``choices``.
+    """
+    name: str
+    label: str
+    choices: tuple[str, ...]
+    default: str
+
+
+@dataclass(frozen=True)
+class ScenarioBoolParam:
+    """A checkbox parameter (True/False).
+
+    The build function receives a bool kwarg.
+    """
+    name: str
+    label: str
+    default: bool
+
+
 def make_training_match(rng_reduction: float = 0.3, tier: str = "premier_league") -> Match:
     """One player + ball, full pitch, both goals live, no opponent."""
     pitch = Pitch.standard()
@@ -79,13 +103,16 @@ def make_training_match(rng_reduction: float = 0.3, tier: str = "premier_league"
     )
 
 
+AnyScenarioParam = ScenarioParam | ScenarioChoiceParam | ScenarioBoolParam
+
+
 @dataclass
 class ScenarioDefinition:
     key: str
     label: str
     description: str
     build: Callable[..., Match]   # (rng_reduction, **kwargs) -> Match
-    params: list[ScenarioParam] = field(default_factory=list)
+    params: list[AnyScenarioParam] = field(default_factory=list)
     on_tick: Callable[[Match, int], None] | None = None
 
 
@@ -630,16 +657,17 @@ def phase1_training_on_tick(match: Match, trial_tick: int) -> None:
 
 
 def _load_trainer(checkpoint_path: str):
-    """Load a PPOTrainer from a checkpoint file. Returns (trainer, error_str)."""
+    """Load a PPOTrainer in inference-only mode (no optimizer).
+
+    Uses PPOTrainer.load_for_inference() which skips torch.optim.Adam creation,
+    preventing the torch._dynamo → triton import that segfaults inside pygame.
+    """
     import os
     if not checkpoint_path or not os.path.exists(checkpoint_path):
         return None, f"No checkpoint found ({checkpoint_path})"
     try:
         from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
-        trainer = PPOTrainer.from_config()
-        trainer.load_checkpoint(Path(checkpoint_path))
-        trainer.decision_net.eval()
-        trainer.execution_net.eval()
+        trainer = PPOTrainer.load_for_inference(checkpoint_path)
         return trainer, None
     except Exception as e:
         return None, str(e)
@@ -691,24 +719,23 @@ def _apply_neural_action(trainer, match: Match, player_id: str, trial_tick: int)
             player.current_order = GetPossessionOrder()
 
 
-def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run5"):
-    """Factory returning a (build_fn, on_tick_fn) pair for the Phase 1 UI scenario.
+def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
+    """Factory returning (build_fn, on_tick_fn, params_list) for the Phase 1 UI scenario.
 
-    Exposes four params:
-      trainee_checkpoint_idx  — index into sorted .pt files (0 = rules-based)
-      opponent_checkpoint_idx — index into sorted .pt files (0 = rules-based)
-      ball_max_speed_mps
-      restitution_sigma
+    Params:
+      trainee_checkpoint   — ScenarioChoiceParam dropdown over all .pt files in checkpoint_dir
+      trainee_rules        — ScenarioBoolParam checkbox (overrides to rules-based)
+      opponent_checkpoint  — same dropdown for opponent
+      opponent_rules       — ScenarioBoolParam checkbox
+      ball_max_speed_mps   — ScenarioParam slider
 
-    Trainers are cached per resolved path so switching checkpoints via the
-    slider only re-loads when the path actually changes.
+    Trainers are cached per resolved path so switching checkpoints only re-loads on change.
     """
     import logging
     log_ui = logging.getLogger("footballcoach.ui.scenarios")
 
     DECISION_INTERVAL_TICKS = 15  # 0.5 s at 30 Hz
 
-    # Cache: path -> trainer (or None on load failure)
     _trainer_cache: dict[str, object] = {}
 
     def _get_trainer(checkpoint_path: str | None):
@@ -721,35 +748,50 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run5"):
             _trainer_cache[checkpoint_path] = trainer
         return _trainer_cache[checkpoint_path]
 
-    # Shared mutable state between build and on_tick
     state: dict = {
         "trainee_trainer": None,
         "opponent_trainer": None,
         "ticks_trainee": 0,
         "ticks_opponent": 0,
-        "checkpoints": [],          # sorted list of .pt paths discovered at last build
     }
 
-    def _resolve_trainer(idx: float, checkpoints: list[str]):
-        """idx=0 → rules-based (None), idx>=1 → checkpoints[round(idx)-1]."""
-        i = round(idx)
-        if i <= 0 or not checkpoints:
+    # Build the params list (choices populated from disk at call time)
+    checkpoints = _discover_checkpoints(checkpoint_dir)
+    # Friendly display names: just the filename without path
+    ckpt_labels = tuple(Path(c).name for c in checkpoints) if checkpoints else ("(none)",)
+    ckpt_default = ckpt_labels[-1]  # most recent
+
+    params_list: list = [
+        ScenarioChoiceParam("trainee_checkpoint", "Trainee checkpoint", ckpt_labels, ckpt_default),
+        ScenarioBoolParam("trainee_rules", "Trainee: rules-based override", False),
+        ScenarioChoiceParam("opponent_checkpoint", "Opponent checkpoint", ckpt_labels, ckpt_default),
+        ScenarioBoolParam("opponent_rules", "Opponent: rules-based override", True),
+        ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 8.0, 0.5, 4.0),
+        ScenarioParam("restitution_sigma", "Restitution σ", 0.0, 0.3, 0.01, 0.08),
+    ]
+
+    def _resolve_trainer_from_name(ckpt_name: str, use_rules: bool):
+        if use_rules:
             return None
-        return _get_trainer(checkpoints[min(i - 1, len(checkpoints) - 1)])
+        # Map friendly name back to full path
+        match_path = next((c for c in checkpoints if Path(c).name == ckpt_name), None)
+        if match_path is None:
+            return None
+        return _get_trainer(match_path)
 
     def build(
         rng_reduction: float = 0.3,
         *,
-        trainee_checkpoint_idx: float = 0.0,
-        opponent_checkpoint_idx: float = 0.0,
+        trainee_checkpoint: str = ckpt_default,
+        trainee_rules: bool = False,
+        opponent_checkpoint: str = ckpt_default,
+        opponent_rules: bool = True,
         ball_max_speed_mps: float = 4.0,
         restitution_sigma: float = 0.08,
+        **_ignored,  # absorb sim_dt_s etc injected by ScenarioEnv
     ) -> Match:
-        checkpoints = _discover_checkpoints(checkpoint_dir)
-        state["checkpoints"] = checkpoints
-
-        trainee_trainer = _resolve_trainer(trainee_checkpoint_idx, checkpoints)
-        opponent_trainer = _resolve_trainer(opponent_checkpoint_idx, checkpoints)
+        trainee_trainer = _resolve_trainer_from_name(trainee_checkpoint, trainee_rules)
+        opponent_trainer = _resolve_trainer_from_name(opponent_checkpoint, opponent_rules)
         state["trainee_trainer"] = trainee_trainer
         state["opponent_trainer"] = opponent_trainer
         state["ticks_trainee"] = 0
@@ -759,59 +801,53 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run5"):
             rng_reduction,
             ball_max_speed_mps=ball_max_speed_mps,
             restitution_sigma=restitution_sigma,
-            ball_max_dist_from_trainee_m=55.0,
+            ball_max_dist_from_trainee_m=45.0,
         )
 
-        # Override player.ai assignments made by build_1v1_scenario:
-        # trainee: rules-based if no trainer, else neural (on_tick drives it, ai=None)
         try:
-            trainee = match.player_by_id("trainee")
-            trainee.ai = None if trainee_trainer is not None else Phase1RulesAI()
+            match.player_by_id("trainee").ai = None if trainee_trainer is not None else Phase1RulesAI()
+        except KeyError:
+            pass
+        try:
+            match.player_by_id("opponent").ai = None if opponent_trainer is not None else Phase1RulesAI()
         except KeyError:
             pass
 
-        # opponent: rules-based if no trainer, else neural (on_tick drives it, ai=None)
-        # build_1v1_scenario already set opponent.ai to Phase1RulesAI or None randomly;
-        # override explicitly based on the user's choice.
-        try:
-            opponent = match.player_by_id("opponent")
-            opponent.ai = None if opponent_trainer is not None else Phase1RulesAI()
-        except KeyError:
-            pass
-
-        n = len(checkpoints)
-        log_ui.info(
-            f"Phase 1 UI: {n} checkpoint(s) in '{checkpoint_dir}'. "
-            f"trainee={'neural@'+checkpoints[round(trainee_checkpoint_idx)-1] if trainee_trainer else 'rules'}, "
-            f"opponent={'neural@'+checkpoints[round(opponent_checkpoint_idx)-1] if opponent_trainer else 'rules'}"
-            if n else f"Phase 1 UI: no checkpoints found in '{checkpoint_dir}', both players use rules-based AI."
-        )
+        tr_label = trainee_checkpoint if not trainee_rules else "rules"
+        op_label = opponent_checkpoint if not opponent_rules else "rules"
+        log_ui.info(f"Phase 1 UI: trainee={tr_label}  opponent={op_label}")
         return match
 
     def on_tick(match: Match, trial_tick: int) -> None:
         trainee_trainer = state["trainee_trainer"]
         opponent_trainer = state["opponent_trainer"]
 
-        # --- Trainee ---
         if trainee_trainer is not None:
             state["ticks_trainee"] += 1
             if state["ticks_trainee"] >= DECISION_INTERVAL_TICKS:
                 state["ticks_trainee"] = 0
                 _apply_neural_action(trainee_trainer, match, "trainee", trial_tick)
-        # else: trainee.ai = Phase1RulesAI() drives it via Match.step()
 
-        # --- Opponent ---
         if opponent_trainer is not None:
             state["ticks_opponent"] += 1
             if state["ticks_opponent"] >= DECISION_INTERVAL_TICKS:
                 state["ticks_opponent"] = 0
                 _apply_neural_action(opponent_trainer, match, "opponent", trial_tick)
-        # else: opponent.ai = Phase1RulesAI() drives it via Match.step()
+
+    # Attach the params list so the SCENARIOS entry can reference it
+    build._phase1_params = params_list  # type: ignore[attr-defined]
 
     return build, on_tick
 
 
-_phase1_build, _phase1_on_tick = _make_phase1_scenario_pair()
+def _find_latest_phase1_checkpoint_dir() -> str:
+    """Return the highest-numbered checkpoints/phase1_run* directory found at import time."""
+    import glob
+    dirs = sorted(glob.glob("checkpoints/phase1_run*/"))
+    return dirs[-1].rstrip("/") if dirs else "checkpoints/phase1_run1"
+
+
+_phase1_build, _phase1_on_tick = _make_phase1_scenario_pair(_find_latest_phase1_checkpoint_dir())
 
 
 def build_1v1_scenario(
@@ -821,8 +857,9 @@ def build_1v1_scenario(
     opponent_tier: str = "generic",
     ball_max_speed_mps: float = 10.0,
     restitution_sigma: float = 0.08,
-    ball_max_dist_from_trainee_m: float = 55.0,
+    ball_max_dist_from_trainee_m: float = 45.0,
     trainee_team: "Team | None" = None,
+    sim_dt_s: float = 1.0 / 30.0,
 ) -> Match:
     """Phase 1 curriculum: 1v1 get-possession/move-toward-goal.
 
@@ -919,6 +956,7 @@ def build_1v1_scenario(
         rng=rng,
         ball_physics_params=ball_params,
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
+        dt_s=sim_dt_s,
     )
     # 50% chance opponent uses rules-based AI; rest is immobile (neural training).
     # player.ai is set so Match.step() drives it automatically.
@@ -933,6 +971,35 @@ def build_1v1_scenario(
 # ---------------------------------------------------------------------------
 
 SCENARIOS: list[ScenarioDefinition] = [
+    # ---- AI scenarios (shown first in menu) ----
+    ScenarioDefinition(
+        key="phase1_neural_ai",
+        label="Phase 1: Neural AI vs opponent (checkpoint picker)",
+        description=(
+            "1v1 Phase 1 scenario. Use the dropdowns to select a checkpoint for each player. "
+            "Tick the 'rules-based override' checkbox to force that player to use the rules AI "
+            "regardless of the checkpoint selection. Checkpoints are loaded from the most recent "
+            "checkpoints/phase1_run*/ directory."
+        ),
+        build=_phase1_build,
+        on_tick=_phase1_on_tick,
+        params=_phase1_build._phase1_params,  # type: ignore[attr-defined]
+    ),
+    ScenarioDefinition(
+        key="1v1_phase1",
+        label="1v1: Phase 1 get possession (rules-based only)",
+        description=(
+            "Both players randomly placed, random ball, random attributes. "
+            "Phase 1 curriculum scenario. Trainee chases ball; opponent immobile."
+        ),
+        build=build_1v1_scenario,
+        on_tick=_1v1_on_tick,
+        params=[
+            ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 15.0, 0.5, 10.0),
+            ScenarioParam("restitution_sigma", "Restitution randomness (sigma)", 0.0, 0.3, 0.01, 0.08),
+        ],
+    ),
+    # ---- Balance scenarios ----
     ScenarioDefinition(
         key="save_close",
         label="Shot vs keeper (close range, mixed outcome)",
@@ -1027,37 +1094,6 @@ SCENARIOS: list[ScenarioDefinition] = [
         params=[
             ScenarioParam("obstacle_on_path", "Obstacle on path (1=centre, 0=5m aside)", 0.0, 1.0, 0.1, 1.0),
             ScenarioParam("attacker_skill", "Attacker skill", 0.3, 1.0, 0.05, 0.9),
-        ],
-    ),
-    ScenarioDefinition(
-        key="1v1_phase1",
-        label="1v1: Phase 1 get possession (AI training)",
-        description=(
-            "Both players randomly placed, random ball, random attributes. "
-            "Phase 1 curriculum scenario. Trainee chases ball; opponent immobile."
-        ),
-        build=build_1v1_scenario,
-        on_tick=_1v1_on_tick,
-        params=[
-            ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 15.0, 0.5, 10.0),
-            ScenarioParam("restitution_sigma", "Restitution randomness (sigma)", 0.0, 0.3, 0.01, 0.08),
-        ],
-    ),
-    ScenarioDefinition(
-        key="phase1_neural_ai",
-        label="Phase 1: Neural AI vs opponent (checkpoint picker)",
-        description=(
-            "1v1 Phase 1 scenario with selectable checkpoints for trainee and opponent. "
-            "Index 0 = rules-based AI. Index 1 = earliest checkpoint, higher = later checkpoints "
-            "from checkpoints/phase1_run5/ (sorted by step). Both players can be mixed freely."
-        ),
-        build=_phase1_build,
-        on_tick=_phase1_on_tick,
-        params=[
-            ScenarioParam("trainee_checkpoint_idx", "Trainee checkpoint (0=rules)", 0.0, 25.0, 1.0, 0.0),
-            ScenarioParam("opponent_checkpoint_idx", "Opponent checkpoint (0=rules)", 0.0, 25.0, 1.0, 0.0),
-            ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 8.0, 0.5, 4.0),
-            ScenarioParam("restitution_sigma", "Restitution randomness (sigma)", 0.0, 0.3, 0.01, 0.08),
         ],
     ),
 ]
