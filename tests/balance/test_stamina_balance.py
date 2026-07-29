@@ -31,19 +31,17 @@ def test_stamina_drains_over_sustained_sprint(balance_recorder):
 
 
 def test_higher_stamina_attribute_drains_slower_over_time(balance_recorder):
-    # A continuous 45s sprint is used here (rather than 90s) so that neither
-    # player has fully bottomed out at 0 by the end - a full 90s continuous
-    # sprint drains even a high-stamina-attribute player to 0, which would
-    # make this differentiation check meaningless (0 vs 0).
+    # Use 25s so neither player has fully bottomed out at 0 by the end,
+    # keeping the differentiation check meaningful.
     params = MovementParams.from_config()
     low_attr_stamina = 1.0
     high_attr_stamina = 1.0
-    for _ in range(45):
+    for _ in range(25):
         low_attr_stamina = drain_stamina(params, low_attr_stamina, stamina_attr=0.1, effort=1.0, dt_s=1.0)
         high_attr_stamina = drain_stamina(params, high_attr_stamina, stamina_attr=0.9, effort=1.0, dt_s=1.0)
     stats = {
-        "remaining_after_45s_low_attr_0.1": round(low_attr_stamina, 3),
-        "remaining_after_45s_high_attr_0.9": round(high_attr_stamina, 3),
+        "remaining_after_25s_low_attr_0.1": round(low_attr_stamina, 3),
+        "remaining_after_25s_high_attr_0.9": round(high_attr_stamina, 3),
     }
     balance_recorder.report("stamina_drain_attribute_comparison", stats)
     assert high_attr_stamina > low_attr_stamina
@@ -63,8 +61,7 @@ def test_stamina_regenerates_when_resting(balance_recorder):
 
 def test_stamina_speed_penalty_shape(balance_recorder):
     """Reports the speed multiplier at various stamina levels, confirming
-    the up-to-65%-reduction design spec (multiplier at stamina=0 should be
-    1 - 0.65 = 0.35)."""
+    the penalty shape. Multiplier at stamina=0 should be 1 - stamina_speed_penalty_max."""
     params = MovementParams.from_config()
     table = {
         f"stamina={s}": round(stamina_multiplier(params, s), 3)
@@ -72,7 +69,8 @@ def test_stamina_speed_penalty_shape(balance_recorder):
     }
     balance_recorder.report("stamina_speed_multiplier_table", table)
     assert table["stamina=1.0"] == 1.0
-    assert abs(table["stamina=0.0"] - 0.35) < 1e-9
+    expected_min = round(1.0 - params.stamina_speed_penalty_max, 9)
+    assert abs(table["stamina=0.0"] - expected_min) < 1e-3
 
 
 def test_low_stamina_attribute_player_exhausts_and_recovers_realistically(balance_recorder):

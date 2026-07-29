@@ -6,9 +6,9 @@ You may also have stuff in memory/storage for this repo.
 Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_plan.md, the ai_design_document.md and the ai_trainer_knowledge.md
 
 Immedaite task!!
+- get some demonstrations, and train
 Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 50k
-- are tests failing??
-- please give me MUCH larger bounds on all UI scenario parameters in the UI, keep the default values as they are, I just dont see why you would limit parameters like start distance or ball speed, or any other really, so unlimit anything thats reasonable (e.g. still no speed <0). I also want the AI checkpoint chooser to be a dropdown
+- very suspicious that the ai "wins" against rules sometimes, given that it never wins in the UI. wins do only count when you get in the enemy box, correct?
 
 Immediate AI stuff
 - Can we do some trainings runs and then see and see if the trained AI is able to beat the rules-based AI more consistently or at least at a simiar rate than another rules-based AI could?
@@ -32,8 +32,7 @@ AI stuff:
 NB Immediate Immediate:
 - 2V2 scenario is completely broken, I think GK is on the wrong team, and probbaly other shit. Fix it. Also, the through ball pass is doing an awful job of predicting where the player will be, can we hit the pass harder? Maybe for the scenario, make the second attacker move slower, also, is he running GetPossession during the pass?
 - The goalkeeper clearly teleports after saving the ball sometimes, wtf is that about??
-- Goalkeeper in 1v2 is still going crazy often. The AI should be super simple. Go to goal centre, stop. Then do nothing, wait for a shot and then do save order. Then repeat once save order terminated. Explain the AI to me.
-- Tackles seem to behave a bit weird, I think the players often stop almost completely, and while I think speed should be reduced somewhat for both players, it's maybe too strong, also I think collisions should be turned off once a tackle has been engaged, I think that is supposed to happen with one of them going inactive but I just want to make sure the collision isn't being triggered on the same tick as the tackle either way.
+- Controlling the ball also makes players static I think probably change that
 - We want a bit more visual excitment. Can we display some icons under/over/on top of a player for 1.2 seconds after he carries out an action like kick, tackle, taking control (do a differenet one for goalies) or switching between moving stances/speeds - you can use the leg, hand(GK), wind, running, idle (U+1F574) and soccer ball icons, or any you think are more appropriate, but please no more than 2 per icons per action.
 - Why is the ball.possessed_by still using a player_id?? Do we enforce unique player_ids?? It seems so much easier to use just use the possesed_by field be player type rather than string, ball.possessed_by = kicker, instead of kicker.player_id. Is there an issue with circular references or something? If so, can't it be solved gracefully by refactoring or something? If not, it's okay, it just seems ugly
 - Maybe slightly reduce the size of the player spheres?

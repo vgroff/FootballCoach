@@ -58,6 +58,12 @@ class App:
         self._pending_scenario_definition: scenarios.ScenarioDefinition | None = None
         self._pending_scenario_params: dict[str, float] = {}
         self._params_button_rects: dict[str, tuple[pygame.Rect, pygame.Rect]] = {}
+        self._open_choice_param: str | None = None  # which ScenarioChoiceParam dropdown is open
+
+        # Simulation speed multiplier: physics steps per visual frame.
+        # Cycle with ] (faster) and [ (slower).
+        self._sim_speed: int = 1
+        self._SIM_SPEED_OPTIONS: tuple[int, ...] = (1, 2, 4, 8)
 
     @staticmethod
     def _temp_pitch():
@@ -135,6 +141,12 @@ class App:
             self.input_controller.issue_save_order()
         elif key == pygame.K_x:
             self.input_controller.issue_stop_order()
+        elif key == pygame.K_RIGHTBRACKET:
+            idx = self._SIM_SPEED_OPTIONS.index(self._sim_speed)
+            self._sim_speed = self._SIM_SPEED_OPTIONS[(idx + 1) % len(self._SIM_SPEED_OPTIONS)]
+        elif key == pygame.K_LEFTBRACKET:
+            idx = self._SIM_SPEED_OPTIONS.index(self._sim_speed)
+            self._sim_speed = self._SIM_SPEED_OPTIONS[(idx - 1) % len(self._SIM_SPEED_OPTIONS)]
 
     def _handle_match_mouse_event(self, event: pygame.event.Event) -> None:
         if self.input_controller is None:
@@ -166,18 +178,32 @@ class App:
     def _enter_params_screen(self, definition: scenarios.ScenarioDefinition) -> None:
         self._pending_scenario_definition = definition
         self._pending_scenario_params = {p.name: p.default for p in definition.params}
+        self._open_choice_param = None
         self.screen = Screen.SCENARIO_PARAMS
 
     def _handle_params_click(self, pos: tuple[int, int]) -> None:
         if self._pending_scenario_definition is None:
             return
+
+        # Check dropdown option rects first (they overlay other content when open).
+        for key, (r, _) in self._params_button_rects.items():
+            if "__option__" in key and r.collidepoint(pos):
+                param_name, _, idx_str = key.partition("__option__")
+                self._pending_scenario_params[param_name] = idx_str  # stored as string key
+                self._open_choice_param = None
+                return
+
         for name, (minus_rect, plus_rect) in self._params_button_rects.items():
+            if "__option__" in name:
+                continue
             if name == "__start__":
                 if minus_rect.collidepoint(pos):
+                    self._open_choice_param = None
                     self._start_scenario_with_params()
                 continue
             if name == "__back__":
                 if minus_rect.collidepoint(pos):
+                    self._open_choice_param = None
                     self.screen = Screen.MENU
                 continue
             param = next((p for p in self._pending_scenario_definition.params if p.name == name), None)
@@ -185,17 +211,22 @@ class App:
                 continue
 
             if isinstance(param, ScenarioBoolParam):
-                if minus_rect.collidepoint(pos):  # same rect for both sides
+                if minus_rect.collidepoint(pos):
                     self._pending_scenario_params[name] = not bool(
                         self._pending_scenario_params.get(name, param.default)
                     )
             elif isinstance(param, ScenarioChoiceParam):
-                current = self._pending_scenario_params.get(name, param.default)
-                idx = list(param.choices).index(current) if current in param.choices else 0
+                # Clicking the value area (minus_rect == value_rect here) toggles the dropdown.
+                # Clicking [<] or [>] still cycles.
                 if minus_rect.collidepoint(pos):
-                    self._pending_scenario_params[name] = param.choices[(idx - 1) % len(param.choices)]
+                    self._open_choice_param = name if self._open_choice_param != name else None
                 elif plus_rect.collidepoint(pos):
+                    current = self._pending_scenario_params.get(name, param.default)
+                    idx = list(param.choices).index(current) if current in param.choices else 0
                     self._pending_scenario_params[name] = param.choices[(idx + 1) % len(param.choices)]
+                    self._open_choice_param = None
+                else:
+                    self._open_choice_param = None
             else:
                 current = self._pending_scenario_params.get(name, param.default)
                 if minus_rect.collidepoint(pos):
@@ -256,27 +287,34 @@ class App:
 
     def _step_match(self) -> None:
         assert self.match is not None
+        # Don't fast-forward while paused — keep exactly one step so the HUD
+        # stays responsive (e.g. to un-pause).
+        steps = self._sim_speed if not self.match.paused else 1
 
         if self._scenario_loop is not None:
             loop = self._scenario_loop
-            trial_ended = loop.step()
-            self.match = loop.match
-            if loop.complete:
-                self.screen = Screen.MENU
-                self.match = None
-                self.input_controller = None
-                self._scenario_loop = None
-            elif trial_ended:
-                # New trial started — wire log to the fresh match and sync input.
-                self._wire_match_log(loop.match)
-                self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
-                self.input_controller.on_order_complete = self._on_human_order_complete
-            else:
-                if self.input_controller is not None:
-                    self.input_controller.match = loop.match
+            for _ in range(steps):
+                trial_ended = loop.step()
+                self.match = loop.match
+                if loop.complete:
+                    self.screen = Screen.MENU
+                    self.match = None
+                    self.input_controller = None
+                    self._scenario_loop = None
+                    return
+                elif trial_ended:
+                    # New trial started — wire log to the fresh match and sync input.
+                    self._wire_match_log(loop.match)
+                    self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
+                    self.input_controller.on_order_complete = self._on_human_order_complete
+                    break  # render one frame of the new trial before stepping further
+                else:
+                    if self.input_controller is not None:
+                        self.input_controller.match = loop.match
             return
 
-        self.match.step()
+        for _ in range(steps):
+            self.match.step()
         if self.is_training_mode:
             current_tally = (self.match.scoreboard.left_goals, self.match.scoreboard.right_goals)
             # Wait until the engine's goal linger is done (linger_remaining == 0)
@@ -396,7 +434,8 @@ class App:
             self.renderer.draw_drag_indicator(self.surface, start_world, current_screen, style.DRAG_KICK_LINE)
 
         hud_lines = [self.mode_label]
-        paused_str = "PAUSED" if self.match.paused else "Playing"
+        speed_str = f"  ⚡{self._sim_speed}x" if self._sim_speed > 1 else ""
+        paused_str = "PAUSED" if self.match.paused else f"Playing{speed_str}"
         if self._scenario_loop is not None:
             loop = self._scenario_loop
             if loop.max_trials > 0:
@@ -441,6 +480,7 @@ class App:
             defn.params,
             self._pending_scenario_params,
             title=f"Configure: {defn.label}",
+            open_choice_param=self._open_choice_param,
         )
 
     def _draw_help_button(self) -> None:
@@ -477,6 +517,7 @@ class App:
             "S                        - issue a Save order (goalkeeper only): tracks and blocks shots",
             "X                        - stop: decelerate selected player to a standstill",
             "Space                    - pause/resume the simulation",
+            "] / [                    - increase / decrease simulation speed (1x / 2x / 4x / 8x)",
             "H or Help button         - toggle this help overlay",
             "L                        - cycle game log level (INFO / DEBUG)",
             "Esc                      - close this overlay, or return to the menu / quit",

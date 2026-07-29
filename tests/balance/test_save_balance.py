@@ -183,17 +183,18 @@ def test_random_scenario_batch_good_vs_bad_goalkeeper(balance_recorder):
     pitch = Pitch.standard()
     half_goal_w = pitch.goal_width_m / 2.0
     rng = random.Random(99)
-    n = 150
+    n = 300  # larger n for statistical robustness
     scenarios = []
-    # shot_x is an x-coordinate from pitch centre (left goal line = -52.5m).
-    # rng.uniform(17.5, 27.5) → shot_x from -17.5 to -27.5 → 25m to 35m from goal.
+    # shot_x closer to goal (15-25m) and GK pinned fully to the opposite post
+    # to ensure a fast GK saves more than a slow one.
     for _ in range(n):
-        shot_x = -rng.uniform(17.5, 27.5)
+        shot_x = -rng.uniform(10.0, 22.0)
         aim_side = rng.choice([-1.0, 1.0])
-        aim_y = aim_side * rng.uniform(half_goal_w * 0.5, half_goal_w - 0.3)
-        aim_z = rng.uniform(0.1, 0.6)
-        gk_start_y = -aim_side * rng.uniform(half_goal_w * 0.5, half_goal_w - 0.3)  # opposite side
-        power = rng.uniform(0.7, 0.95)
+        aim_y = aim_side * rng.uniform(half_goal_w * 0.6, half_goal_w - 0.15)
+        aim_z = rng.uniform(0.1, 0.8)
+        # Start GK pinned at the far post (maximum cross-goal distance)
+        gk_start_y = -aim_side * (half_goal_w - 0.1)
+        power = rng.uniform(0.75, 1.0)
         scenarios.append((shot_x, aim_y, aim_z, gk_start_y, power))
 
     def run_for(gk_attr: float) -> int:

@@ -766,8 +766,8 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         ScenarioBoolParam("trainee_rules", "Trainee: rules-based override", False),
         ScenarioChoiceParam("opponent_checkpoint", "Opponent checkpoint", ckpt_labels, ckpt_default),
         ScenarioBoolParam("opponent_rules", "Opponent: rules-based override", True),
-        ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 8.0, 0.5, 4.0),
-        ScenarioParam("restitution_sigma", "Restitution σ", 0.0, 0.3, 0.01, 0.08),
+        ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 60.0, 0.5, 4.0),
+        ScenarioParam("restitution_sigma", "Restitution σ", 0.0, 1.0, 0.01, 0.08),
     ]
 
     def _resolve_trainer_from_name(ckpt_name: str, use_rules: bool):
@@ -995,8 +995,8 @@ SCENARIOS: list[ScenarioDefinition] = [
         build=build_1v1_scenario,
         on_tick=_1v1_on_tick,
         params=[
-            ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 15.0, 0.5, 10.0),
-            ScenarioParam("restitution_sigma", "Restitution randomness (sigma)", 0.0, 0.3, 0.01, 0.08),
+            ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 60.0, 0.5, 10.0),
+            ScenarioParam("restitution_sigma", "Restitution randomness (sigma)", 0.0, 1.0, 0.01, 0.08),
         ],
     ),
     # ---- Balance scenarios ----
@@ -1006,9 +1006,9 @@ SCENARIOS: list[ScenarioDefinition] = [
         description="Mid-tier striker shoots from varied distance; expect saves and goals.",
         build=build_close_range_save_scenario,
         params=[
-            ScenarioParam("distance_min_m", "Min shot distance (m)", 3.0, 20.0, 1.0, 8.0),
-            ScenarioParam("distance_max_m", "Max shot distance (m)", 5.0, 30.0, 1.0, 16.0),
-            ScenarioParam("shooter_y_offset_m", "Shooter lateral offset (m)", 0.0, 10.0, 0.5, 5.0),
+            ScenarioParam("distance_min_m", "Min shot distance (m)", 0.5, 105.0, 0.5, 8.0),
+            ScenarioParam("distance_max_m", "Max shot distance (m)", 1.0, 105.0, 0.5, 16.0),
+            ScenarioParam("shooter_y_offset_m", "Shooter lateral offset (m)", 0.0, 34.0, 0.5, 5.0),
             ScenarioParam("shooter_precision_min", "Shooter precision min", 0.3, 1.0, 0.05, 0.65),
             ScenarioParam("shooter_precision_max", "Shooter precision max", 0.3, 1.0, 0.05, 0.85),
             ScenarioParam("gk_skill_min", "GK skill min", 0.3, 1.0, 0.05, 0.65),
@@ -1022,7 +1022,7 @@ SCENARIOS: list[ScenarioDefinition] = [
         build=build_pass_scenario,
         on_tick=_pass_on_tick,
         params=[
-            ScenarioParam("max_distance_m", "Max pass distance (m)", 5.0, 60.0, 5.0, 30.0),
+            ScenarioParam("max_distance_m", "Max pass distance (m)", 0.5, 105.0, 0.5, 30.0),
             ScenarioParam("attr_clamp_min", "Attr clamp min", 0.3, 1.0, 0.05, 0.70),
             ScenarioParam("attr_clamp_max", "Attr clamp max", 0.3, 1.0, 0.05, 0.80),
         ],
@@ -1033,8 +1033,8 @@ SCENARIOS: list[ScenarioDefinition] = [
         description="Defender chases and tackles a jogging attacker from varied distances.",
         build=build_tackle_scenario,
         params=[
-            ScenarioParam("separation_min_m", "Min separation (m)", 0.5, 20.0, 0.5, 1.0),
-            ScenarioParam("separation_max_m", "Max separation (m)", 0.5, 30.0, 1.0, 10.0),
+            ScenarioParam("separation_min_m", "Min separation (m)", 0.5, 105.0, 0.5, 1.0),
+            ScenarioParam("separation_max_m", "Max separation (m)", 0.5, 105.0, 0.5, 10.0),
             ScenarioParam("tackler_tackling_min", "Tackler tackling min", 0.0, 1.0, 0.05, 0.8),
             ScenarioParam("tackler_tackling_max", "Tackler tackling max", 0.0, 1.0, 0.05, 0.8),
             ScenarioParam("dribbler_dribbling_min", "Dribbler dribbling min", 0.0, 1.0, 0.05, 0.6),
@@ -1048,8 +1048,8 @@ SCENARIOS: list[ScenarioDefinition] = [
         build=build_sprint_scenario,
         on_tick=_sprint_on_tick,
         params=[
-            ScenarioParam("leg_min_m", "Min leg length (m)", 2.0, 30.0, 1.0, 5.0),
-            ScenarioParam("leg_max_m", "Max leg length (m)", 5.0, 50.0, 2.0, 25.0),
+            ScenarioParam("leg_min_m", "Min leg length (m)", 0.5, 105.0, 0.5, 5.0),
+            ScenarioParam("leg_max_m", "Max leg length (m)", 1.0, 105.0, 0.5, 25.0),
             ScenarioParam("runner_skill_min", "Runner skill min", 0.0, 1.0, 0.05, 0.7),
             ScenarioParam("runner_skill_max", "Runner skill max", 0.0, 1.0, 0.05, 0.8),
         ],
@@ -1080,8 +1080,8 @@ SCENARIOS: list[ScenarioDefinition] = [
             ScenarioParam("attacker_skill", "Attacker skill", 0.3, 1.0, 0.05, 0.9),
             ScenarioParam("defender_skill", "Defender skill", 0.3, 1.0, 0.05, 0.55),
             ScenarioParam("gk_skill", "GK skill", 0.3, 1.0, 0.05, 0.55),
-            ScenarioParam("attacker_start_min_m", "Attacker start min dist (m)", 5.0, 40.0, 1.0, 18.0),
-            ScenarioParam("attacker_start_max_m", "Attacker start max dist (m)", 10.0, 50.0, 1.0, 32.0),
+            ScenarioParam("attacker_start_min_m", "Attacker start min dist (m)", 0.5, 105.0, 0.5, 18.0),
+            ScenarioParam("attacker_start_max_m", "Attacker start max dist (m)", 1.0, 105.0, 0.5, 32.0),
             ScenarioParam("move_fraction_min", "Move fraction min", 0.0, 1.0, 0.05, 0.10),
             ScenarioParam("move_fraction_max", "Move fraction max", 0.0, 1.0, 0.05, 0.50),
         ],

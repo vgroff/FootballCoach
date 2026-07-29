@@ -291,13 +291,17 @@ class Renderer:
         params: list["AnyScenarioParam"],
         values: dict[str, object],
         title: str = "Scenario Parameters",
+        open_choice_param: "str | None" = None,
     ) -> dict[str, tuple[pygame.Rect, pygame.Rect]]:
         """Draws the scenario-parameter adjustment screen and returns a dict
         mapping param name → (left_rect, right_rect) for click detection.
 
         - ScenarioParam:       [-]  value  [+]
-        - ScenarioChoiceParam: [<]  choice [>]  (cycle through choices list)
+        - ScenarioChoiceParam: click value area to open dropdown, or [>] to cycle
         - ScenarioBoolParam:   [checkbox]  label
+
+        When ``open_choice_param`` is set, a dropdown list is rendered below that
+        param row.  Dropdown option rects are keyed as ``"{name}__option__{value}"``.
         """
         from footballcoach.ui.scenarios import ScenarioBoolParam, ScenarioChoiceParam
         surface.fill(style.HUD_BG)
@@ -348,24 +352,31 @@ class Renderer:
                 button_rects[param.name] = (box_rect, box_rect)
 
             elif isinstance(param, ScenarioChoiceParam):
-                # Dropdown-style: [<] current_choice [>]
+                # Dropdown: clickable value area opens a list; [>] cycles.
                 current = values.get(param.name, param.default)
-                minus_rect = pygame.Rect(col_minus_x, y + (row_h - btn_h) // 2, btn_w, btn_h)
-                plus_rect  = pygame.Rect(col_plus_x,  y + (row_h - btn_h) // 2, btn_w, btn_h)
-                for rect, symbol in ((minus_rect, "<"), (plus_rect, ">")):
-                    hovered = rect.collidepoint(mouse_pos)
-                    bg_colour = (70, 70, 90) if hovered else (40, 40, 55)
-                    pygame.draw.rect(surface, bg_colour, rect, border_radius=4)
-                    sym = self.hud_font.render(symbol, True, style.HUD_ACCENT)
-                    surface.blit(sym, (rect.x + (btn_w - sym.get_width()) // 2,
-                                       rect.y + (btn_h - sym.get_height()) // 2))
-                # Truncate long choice strings
+                is_open = (open_choice_param == param.name)
+                val_w = 200 + btn_w + gap  # value area spans to where [+] was
+                val_rect = pygame.Rect(col_minus_x, y + (row_h - btn_h) // 2, val_w, btn_h)
+                arrow_rect = pygame.Rect(col_plus_x, y + (row_h - btn_h) // 2, btn_w, btn_h)
+                # Value / toggle area
+                hovered_val = val_rect.collidepoint(mouse_pos)
+                val_bg = (70, 90, 110) if is_open else ((60, 70, 90) if hovered_val else (40, 40, 55))
+                pygame.draw.rect(surface, val_bg, val_rect, border_radius=4)
+                pygame.draw.rect(surface, style.HUD_ACCENT if is_open else (80, 80, 100), val_rect, 1, border_radius=4)
                 choice_str = str(current)
-                if len(choice_str) > 28:
-                    choice_str = "…" + choice_str[-27:]
-                val_surf = self.hud_font.render(choice_str, True, style.HUD_ACCENT)
-                surface.blit(val_surf, (col_val_x, y + (row_h - val_surf.get_height()) // 2))
-                button_rects[param.name] = (minus_rect, plus_rect)
+                if len(choice_str) > 30:
+                    choice_str = "…" + choice_str[-29:]
+                arrow_sym = "▲" if is_open else "▼"
+                val_surf = self.hud_font.render(f"{choice_str}  {arrow_sym}", True, style.HUD_ACCENT)
+                surface.blit(val_surf, (val_rect.x + 6, val_rect.y + (btn_h - val_surf.get_height()) // 2))
+                # [>] cycle button (still available)
+                hov_arr = arrow_rect.collidepoint(mouse_pos)
+                pygame.draw.rect(surface, (70, 70, 90) if hov_arr else (40, 40, 55), arrow_rect, border_radius=4)
+                sym = self.hud_font.render(">", True, style.HUD_ACCENT)
+                surface.blit(sym, (arrow_rect.x + (btn_w - sym.get_width()) // 2,
+                                   arrow_rect.y + (btn_h - sym.get_height()) // 2))
+                # val_rect = "minus" (toggle), arrow_rect = "plus" (cycle)
+                button_rects[param.name] = (val_rect, arrow_rect)
 
             else:
                 # Standard numeric slider: [-] value [+]
@@ -382,6 +393,33 @@ class Renderer:
                     surface.blit(sym_surf, (rect.x + (btn_w - sym_surf.get_width()) // 2,
                                             rect.y + (btn_h - sym_surf.get_height()) // 2))
                 button_rects[param.name] = (minus_rect, plus_rect)
+
+        # Render open dropdown list (drawn after all rows so it overlays them).
+        if open_choice_param is not None:
+            open_param = next((p for p in params if p.name == open_choice_param), None)
+            if open_param is not None and isinstance(open_param, ScenarioChoiceParam):
+                open_idx = params.index(open_param)
+                open_y = start_y + open_idx * row_h + row_h  # just below the row
+                item_h = 30
+                list_w = 200 + btn_w + gap
+                list_x = col_minus_x
+                # Draw backdrop
+                list_rect = pygame.Rect(list_x - 2, open_y - 2, list_w + 4, len(open_param.choices) * item_h + 4)
+                pygame.draw.rect(surface, (25, 25, 38), list_rect, border_radius=4)
+                pygame.draw.rect(surface, style.HUD_ACCENT, list_rect, 1, border_radius=4)
+                current = values.get(open_param.name, open_param.default)
+                for ci, choice in enumerate(open_param.choices):
+                    item_rect = pygame.Rect(list_x, open_y + ci * item_h, list_w, item_h)
+                    hov = item_rect.collidepoint(mouse_pos)
+                    sel = (choice == current)
+                    item_bg = (60, 90, 60) if sel else ((55, 55, 75) if hov else (30, 30, 45))
+                    pygame.draw.rect(surface, item_bg, item_rect)
+                    label_str = str(choice)
+                    if len(label_str) > 32:
+                        label_str = "…" + label_str[-31:]
+                    lsurf = self.hud_font.render(label_str, True, style.HUD_ACCENT if sel else style.HUD_TEXT)
+                    surface.blit(lsurf, (item_rect.x + 6, item_rect.y + (item_h - lsurf.get_height()) // 2))
+                    button_rects[f"{open_param.name}__option__{choice}"] = (item_rect, item_rect)
 
         # Start / Back buttons near the bottom.
         bottom_y = start_y + len(params) * row_h + 30

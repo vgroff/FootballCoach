@@ -354,14 +354,11 @@ class Match:
             if are_touching(player, carrier):
                 if carrier.is_available_to_tackle():
                     if self._gk_immune_from_tackle(carrier):
-                        # Phase B: GK in own box with ball is untackleable.
-                        player.velocity = player.velocity * self.tackling_params.tackle_attempt_tackler_speed_mult
-                        player.state = PlayerState.INACTIVE_TACKLED
-                        player.state_timer_s = self.tackling_params.tackle_cooldown_s
+                        self._apply_gk_immune_penalty(player)
                     else:
                         result = attempt_tackle(
                             player.attributes.tackling,
-                            self._effective_dribbling(carrier),  # Phase B: CONTROLLING_BALL penalty
+                            self._effective_dribbling(carrier),
                             self.rng_reduction,
                             self.rng,
                             self.tackling_params,
@@ -370,7 +367,7 @@ class Match:
                                 carrier.heading_rad, carrier.position, player.position,
                                 self.tackling_params,
                             ),
-                            gk_outside_box=self._gk_outside_own_box(player),  # Phase B: GK penalty
+                            gk_outside_box=self._gk_outside_own_box(player),
                         )
                         self._log_tackle_result(player.player_id, carrier.player_id, result)
                         if result.tackler_won and self._target_has_or_controls_ball(carrier):
@@ -378,10 +375,15 @@ class Match:
                         apply_tackle_result(result, player, carrier, self.tackling_params)
                 return True  # tackle attempted (or target not available) — terminal
             else:
+                from footballcoach.orders import _compute_movement_intent
                 intercept = self._intercept_target(player, carrier.position, carrier.velocity)
-                direction = intercept - player.position
-                step_player_towards(player, direction, speed_mode, dt, self.movement_params, has_ball)
-                player.stamina = _drain_if_sprinting(self.movement_params, player, sprint, dt)
+                adj_dir, sm = _compute_movement_intent(
+                    player, intercept - player.position, self,
+                    sprint=sprint, arrival_dist=None,
+                    use_repulsion=False, use_brake_to_turn=True,
+                )
+                player.desired_direction = adj_dir
+                player.desired_speed_mode = sm
                 return False
         else:
             # Ball is loose — run to intercept; pickup via _update_loose_ball_pickup.
@@ -389,8 +391,14 @@ class Match:
             direction = intercept - player.position
             if direction.length_xy() <= self.pickup_radius_m:
                 return True  # at the ball — pickup will complete next tick
-            step_player_towards(player, direction, speed_mode, dt, self.movement_params, has_ball)
-            player.stamina = _drain_if_sprinting(self.movement_params, player, sprint, dt)
+            from footballcoach.orders import _compute_movement_intent
+            adj_dir, sm = _compute_movement_intent(
+                player, direction, self,
+                sprint=sprint, arrival_dist=None,
+                use_repulsion=False, use_brake_to_turn=True,
+            )
+            player.desired_direction = adj_dir
+            player.desired_speed_mode = sm
             return False
 
     def _sync_possessed_ball(self) -> None:

@@ -34,6 +34,144 @@ class OrderStatus(Enum):
     COMPLETE = auto()
 
 
+# ---------------------------------------------------------------------------
+# Shared movement-intent helper
+# ---------------------------------------------------------------------------
+
+# Brake-to-turn / close-proximity constants (all orders share these values).
+_BRAKE_THRESH_RAD: float = 1.57    # ~90° heading change → brake first
+_BRAKE_MIN_SPEED: float = 2.0      # don't bother below this speed
+_CLOSE_PROX_M: float = 5.0         # close-proximity lateral-overshoot guard
+_CLOSE_PROX_COS: float = 0.01      # cos-sim threshold for lateral overshoot
+
+
+def _compute_movement_intent(
+    player: "Player",
+    target_direction: "Vector3",
+    match: "Match",
+    *,
+    sprint: bool = True,
+    arrival_dist: float | None = None,
+    arrival_speed: float | None = None,
+    use_repulsion: bool = True,
+    use_brake_to_turn: bool = True,
+) -> "tuple[Vector3, object]":
+    """Compute ``(adjusted_direction, speed_mode)`` for a movement intent tick.
+
+    All movement orders call this rather than duplicating braking / turning /
+    repulsion logic.
+
+    Parameters
+    ----------
+    target_direction:
+        Raw direction vector toward the destination (un-normalised; zero = stop).
+    arrival_dist:
+        Current distance to target in metres.  When provided, the braking
+        curve (``braking_speed_mode``) and close-proximity checks are applied.
+        ``None`` means no braking — sprint/jog the whole way (e.g. chasing).
+    arrival_speed:
+        Desired speed on arrival (m/s).  ``None`` → resolved to jog speed.
+    use_repulsion:
+        Apply player-repulsion steering.  ``False`` for SaveOrder, chase paths.
+    use_brake_to_turn:
+        Apply the brake-to-turn heuristic (decelerate when heading change >90°).
+    """
+    from footballcoach.engine.movement import (
+        SpeedMode, angle_diff, braking_speed_mode,
+        effective_acceleration, effective_top_speed,
+    )
+    from footballcoach.steering import compute_repulsion
+
+    has_ball = match.ball.possessed_by == player.player_id
+    jog_speed = effective_top_speed(
+        match.movement_params, player.attributes.top_speed, player.stamina,
+        has_ball, player.attributes.ball_control, player.is_goalkeeper,
+    ) * 0.5
+
+    # ── Speed mode ──────────────────────────────────────────────────────────
+    if arrival_dist is not None:
+        a_max = effective_acceleration(
+            match.movement_params, player.attributes.acceleration,
+            player.stamina, player.is_goalkeeper,
+        )
+        eff_arrival = arrival_speed if arrival_speed is not None else jog_speed
+        speed_mode = braking_speed_mode(
+            arrival_dist, player.speed_mps, eff_arrival, a_max,
+            match.movement_params.standstill_decel_multiplier, jog_speed, sprint,
+        )
+    else:
+        speed_mode = SpeedMode.SPRINT if sprint else SpeedMode.JOG
+
+    # ── Repulsion ────────────────────────────────────────────────────────────
+    if use_repulsion and target_direction.length_xy() > 1e-9:
+        adj_dir, speed_mult = compute_repulsion(
+            player, target_direction, match.players,
+            match.ball.possessed_by, match.repulsion_params,
+        )
+        if speed_mode is SpeedMode.SPRINT and speed_mult < 0.75:
+            speed_mode = SpeedMode.JOG
+    else:
+        adj_dir = target_direction
+        speed_mult = 1.0  # noqa: F841
+
+    # ── Close-proximity lateral-overshoot brake ──────────────────────────────
+    if (arrival_dist is not None and arrival_dist <= _CLOSE_PROX_M
+            and player.speed_mps > _BRAKE_MIN_SPEED):
+        vel_xy = player.velocity.xy()
+        if vel_xy.length() > 1e-9 and adj_dir.length() > 1e-9:
+            if vel_xy.normalized().dot(adj_dir.normalized()) < _CLOSE_PROX_COS:
+                speed_mode = SpeedMode.STANDSTILL
+
+    # ── Brake-to-turn ────────────────────────────────────────────────────────
+    if (use_brake_to_turn and speed_mode is not SpeedMode.STANDSTILL
+            and adj_dir.length() > 1e-9 and player.speed_mps > _BRAKE_MIN_SPEED):
+        desired_heading = adj_dir.angle_xy()
+        heading_error = abs(angle_diff(player.heading_rad, desired_heading))
+        if heading_error > _BRAKE_THRESH_RAD:
+            speed_mode = SpeedMode.STANDSTILL
+
+    return adj_dir, speed_mode
+
+
+def _gk_should_sprint(
+    player: "Player",
+    match: "Match",
+    dist_to_save: float,
+    gk_top_speed: float,
+) -> bool:
+    """Return True if the GK should sprint to the save point this tick.
+
+    Sprints when the ball is heading toward goal and the GK travel time is within
+    2× the ball arrival time (i.e. a real save attempt is needed).  Jogs when the
+    ball is moving away, loose near the centre, or the GK easily has time to walk.
+    """
+    from footballcoach.entities.player import Team
+
+    ball_vel = match.ball.velocity
+    ball_speed = ball_vel.length()
+    if match.ball.possessed_by is not None or ball_speed < 0.5:
+        return False  # ball not in flight
+
+    # Velocity component directly toward the GK's own goal line.
+    if player.team == Team.LEFT:
+        vel_toward_goal = -ball_vel.x  # negative x = toward left goal
+    else:
+        vel_toward_goal = ball_vel.x   # positive x = toward right goal
+
+    if vel_toward_goal <= 0.3:
+        return False  # ball moving away from or sideways to goal
+
+    # Estimate ball arrival time at goal line (xy only).
+    if player.team == Team.LEFT:
+        dist_ball_to_goal = abs(-match.pitch.half_length - match.ball.position.x)
+    else:
+        dist_ball_to_goal = abs(match.pitch.half_length - match.ball.position.x)
+
+    t_ball = dist_ball_to_goal / vel_toward_goal
+    t_gk = dist_to_save / gk_top_speed if gk_top_speed > 0.1 else float("inf")
+    return t_ball < t_gk * 2.0  # sprint if GK would otherwise be beaten
+
+
 @dataclass
 class MoveOrder:
     target_position: Vector3
@@ -58,22 +196,8 @@ class MoveOrder:
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
-        """Execute one tick of movement toward target_position.  Returns True when arrived.
-
-        Sets player.desired_direction and player.desired_speed_mode; the engine
-        applies actual movement via match._apply_movement() after all orders run.
-        """
-        from footballcoach.engine.movement import (
-            SpeedMode, angle_diff, braking_speed_mode,
-            effective_acceleration, effective_top_speed,
-        )
-        from footballcoach.steering import compute_repulsion
-
-        # _BRAKE_TO_TURN constants (same values as match.py)
-        _BRAKE_THRESH_RAD = 1.57
-        _BRAKE_MIN_SPEED = 2.0
-        _CLOSE_PROX_M = 5.0
-        _CLOSE_PROX_COS = 0.01
+        """Execute one tick of movement toward target_position.  Returns True when arrived."""
+        from footballcoach.engine.movement import SpeedMode, effective_top_speed
 
         self.status = OrderStatus.IN_PROGRESS
         has_ball = match.ball.possessed_by == player.player_id
@@ -113,31 +237,11 @@ class MoveOrder:
                 player.desired_direction = Vector3.zero()
                 player.desired_speed_mode = SpeedMode.STANDSTILL
         else:
-            a_max = effective_acceleration(
-                match.movement_params, player.attributes.acceleration,
-                player.stamina, player.is_goalkeeper,
+            adj_dir, speed_mode = _compute_movement_intent(
+                player, direction, match,
+                sprint=self.sprint, arrival_dist=dist, arrival_speed=arrival_speed,
+                use_repulsion=True, use_brake_to_turn=True,
             )
-            speed_mode = braking_speed_mode(
-                dist, player.speed_mps, arrival_speed, a_max,
-                match.movement_params.standstill_decel_multiplier, jog_speed, self.sprint,
-            )
-            adj_dir, speed_mult = compute_repulsion(
-                player, direction, match.players,
-                match.ball.possessed_by, match.repulsion_params,
-            )
-            if speed_mode is SpeedMode.SPRINT and speed_mult < 0.75:
-                speed_mode = SpeedMode.JOG
-            if dist <= _CLOSE_PROX_M and player.speed_mps > _BRAKE_MIN_SPEED:
-                vel_xy = player.velocity.xy()
-                if vel_xy.length() > 1e-9 and adj_dir.length() > 1e-9:
-                    cos_sim = vel_xy.normalized().dot(adj_dir.normalized())
-                    if cos_sim < _CLOSE_PROX_COS:
-                        speed_mode = SpeedMode.STANDSTILL
-            if speed_mode is not SpeedMode.STANDSTILL and adj_dir.length() > 1e-9:
-                desired_heading = adj_dir.angle_xy()
-                heading_error = abs(angle_diff(player.heading_rad, desired_heading))
-                if heading_error > _BRAKE_THRESH_RAD and player.speed_mps > _BRAKE_MIN_SPEED:
-                    speed_mode = SpeedMode.STANDSTILL
             player.desired_direction = adj_dir
             player.desired_speed_mode = speed_mode
         return False
@@ -268,7 +372,6 @@ class ChaseTackleOrder:
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
         """Chase target and attempt one tackle on contact.  Returns True once contact is resolved."""
         from footballcoach.engine.collision import are_touching
-        from footballcoach.engine.movement import SpeedMode
         from footballcoach.engine.tackling import apply_tackle_result, attempt_tackle, tackle_angle_modifier
 
         self.status = OrderStatus.IN_PROGRESS
@@ -299,8 +402,13 @@ class ChaseTackleOrder:
                     apply_tackle_result(result, player, target, match.tackling_params)
             return True
         else:
-            player.desired_direction = target.position - player.position
-            player.desired_speed_mode = SpeedMode.SPRINT
+            adj_dir, speed_mode = _compute_movement_intent(
+                player, target.position - player.position, match,
+                sprint=True, arrival_dist=None,
+                use_repulsion=False, use_brake_to_turn=True,
+            )
+            player.desired_direction = adj_dir
+            player.desired_speed_mode = speed_mode
             return False
 
 
@@ -313,7 +421,16 @@ class SaveOrder:
     sensible default position (goal centre) when no shot is incoming and
     reacting the instant one is. Issue it once; it stays in effect until
     replaced by another order.
+
+    ``auto_sprint`` (default ``True``): each tick the order measures whether the
+    ball is heading toward goal and whether there is enough time to jog or whether
+    sprinting is needed to beat the ball.  Sprint is used when the estimated ball
+    arrival time is within 2× the GK travel time.  Set to ``False`` and use
+    ``sprint=False`` for Phase-1 training repositioning where no live shot is
+    expected and jogging looks more natural.
     """
+    auto_sprint: bool = True
+    sprint: bool = True  # fallback when auto_sprint=False
     status: OrderStatus = OrderStatus.PENDING
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
@@ -321,6 +438,7 @@ class SaveOrder:
         """Move keeper toward save position each tick.  Never returns True (persistent duty)."""
         from footballcoach.engine.goalkeeping import early_intercept_target, save_target_position
         from footballcoach.engine.movement import SpeedMode, effective_top_speed
+        from footballcoach.entities.player import Team
 
         self.status = OrderStatus.IN_PROGRESS
         has_ball = match.ball.possessed_by == player.player_id
@@ -357,16 +475,26 @@ class SaveOrder:
             match.goalkeeping_params,
         )
         direction = target_position - player.position
+        dist_to_save = direction.length_xy()
         snap_threshold = max(0.15, gk_top_speed * dt)
-        if direction.length_xy() < snap_threshold:
+        if dist_to_save < snap_threshold:
             # GK is within one tick's reach — snap position then brake.
-            # This is a deliberate physics shortcut (teleport to save point).
             player.position = target_position.with_z(player.position.z)
             player.desired_direction = Vector3.zero()
             player.desired_speed_mode = SpeedMode.STANDSTILL
         else:
-            player.desired_direction = direction
-            player.desired_speed_mode = SpeedMode.SPRINT
+            # Decide sprint vs jog.
+            if self.auto_sprint:
+                use_sprint = _gk_should_sprint(player, match, dist_to_save, gk_top_speed)
+            else:
+                use_sprint = self.sprint
+            adj_dir, speed_mode = _compute_movement_intent(
+                player, direction, match,
+                sprint=use_sprint, arrival_dist=dist_to_save, arrival_speed=None,
+                use_repulsion=False, use_brake_to_turn=True,
+            )
+            player.desired_direction = adj_dir
+            player.desired_speed_mode = speed_mode
         return False  # never auto-completes
 
 
@@ -451,11 +579,9 @@ class MarkOrder:
 
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
         """Mark target player; persistent (never auto-completes)."""
-        from footballcoach.engine.movement import braking_speed_mode, effective_acceleration, effective_top_speed
         from footballcoach.entities.player import PlayerState
 
         self.status = OrderStatus.IN_PROGRESS
-        has_ball = match.ball.possessed_by == player.player_id
         try:
             mark_target = match.player_by_id(self.target_player_id)
         except KeyError:
@@ -472,19 +598,12 @@ class MarkOrder:
         toward_ball = to_ball.normalized() if to_ball.length() > 1e-6 else Vector3.zero()
         mark_pos = mark_target.position.with_z(0.0) + toward_ball * match.marking_params.mark_standoff_m
         direction = mark_pos - player.position
-        a_max = effective_acceleration(
-            match.movement_params, player.attributes.acceleration,
-            player.stamina, player.is_goalkeeper,
+        adj_dir, speed_mode = _compute_movement_intent(
+            player, direction, match,
+            sprint=True, arrival_dist=direction.length_xy(), arrival_speed=0.0,
+            use_repulsion=False, use_brake_to_turn=True,
         )
-        jog_speed = effective_top_speed(
-            match.movement_params, player.attributes.top_speed, player.stamina,
-            has_ball, player.attributes.ball_control, player.is_goalkeeper,
-        ) * 0.5
-        speed_mode = braking_speed_mode(
-            direction.length_xy(), player.speed_mps, 0.0, a_max,
-            match.movement_params.standstill_decel_multiplier, jog_speed, True,
-        )
-        player.desired_direction = direction
+        player.desired_direction = adj_dir
         player.desired_speed_mode = speed_mode
         return False  # never auto-completes
 

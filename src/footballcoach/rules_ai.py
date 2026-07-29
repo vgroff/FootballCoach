@@ -35,6 +35,7 @@ class Phase1RulesAI(PlayerAI):
 
     def act(self, player: Player, match: Match, trial_tick: int) -> None:
         if match.ball.possessed_by == player.player_id:
+            # Have the ball — run toward a random point inside the opponent box.
             if not isinstance(player.current_order, MoveOrder):
                 pitch = match.pitch
                 half_box_w = pitch.box_width_m / 2.0
@@ -55,19 +56,51 @@ class Phase1RulesAI(PlayerAI):
                     sprint=True,
                 )
         else:
-            if player.current_order is None:
+            # Don't have the ball — ensure we're chasing it.
+            # Replace any stale MoveOrder left over from when we had possession.
+            if not isinstance(player.current_order, GetPossessionOrder):
                 player.current_order = GetPossessionOrder(
                     sprint=random.random() >= 0.25
                 )
 
 
 class StagedGoalkeeperAI(PlayerAI):
-    """Once the GK's initial MoveOrder (to goal centre) completes and the GK
-    does not have the ball, issue a SaveOrder."""
+    """GK AI: jogs to its initial position, then holds a SaveOrder.
+
+    If a shot is detected (ball loose, heading toward goal at meaningful speed)
+    while the GK is still in its initial MoveOrder, the MoveOrder is immediately
+    replaced with a SaveOrder.  The SaveOrder uses ``auto_sprint=True`` so the GK
+    sprints only when the ball arrival time demands it, and jogs otherwise.
+
+    ``jog_to_centre``: when ``True`` (default), the GK will jog to the default
+    repositioning position and stop before beginning save duty.  Pass ``False``
+    to skip this (e.g. if the scenario already places the GK at the right spot).
+    """
+
+    def __init__(self, jog_to_centre: bool = True) -> None:
+        self._jog_to_centre = jog_to_centre
+
+    def _ball_heading_to_goal(self, player: Player, match: Match) -> bool:
+        """True if the ball is loose and heading toward this GK's goal at meaningful speed."""
+        from footballcoach.entities.player import Team
+        if match.ball.possessed_by is not None:
+            return False
+        ball_speed = match.ball.velocity.length()
+        if ball_speed < 1.0:
+            return False
+        if player.team == Team.LEFT:
+            return match.ball.velocity.x < -0.3 * ball_speed
+        else:
+            return match.ball.velocity.x > 0.3 * ball_speed
 
     def act(self, player: Player, match: Match, trial_tick: int) -> None:
+        # If a shot is incoming, override whatever we're doing immediately.
+        if self._ball_heading_to_goal(player, match) and not isinstance(player.current_order, SaveOrder):
+            player.current_order = SaveOrder(auto_sprint=True)
+            return
+
         if player.current_order is None and match.ball.possessed_by != player.player_id:
-            player.current_order = SaveOrder()
+            player.current_order = SaveOrder(auto_sprint=True)
 
 
 class BallCarrierAttackerAI(PlayerAI):

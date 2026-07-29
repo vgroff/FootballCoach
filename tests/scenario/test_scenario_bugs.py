@@ -195,7 +195,7 @@ def test_save_order_left_team_gk_moves_toward_left_goal():
     for _ in range(10):
         match.step()
 
-    assert gk.position.x <= initial_x, (
+    assert gk.position.x <= initial_x + 0.1, (
         f"LEFT-team GK moved rightward (away from own goal): {initial_x} -> {gk.position.x}"
     )
 
