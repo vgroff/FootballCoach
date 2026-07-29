@@ -1,5 +1,9 @@
 # Python-generated files
 __pycache__/
+checkpoints/
+results/
+/tmp/
+debug_*.py
 *.py[oc]
 build/
 dist/
