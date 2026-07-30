@@ -211,22 +211,37 @@ def main() -> None:
     # Quick pre-PPO evaluation: neural vs rules-based AND vs immobile opponent
     if args.pre_ppo_eval_trials > 0:
         from footballcoach.ai.scripts.evaluate import _run_evaluation
-        log.info(f"Pre-PPO eval: {args.pre_ppo_eval_trials} episodes (mixed rules/immobile)...")
-        eval_stats = _run_evaluation(trainer, env, args.pre_ppo_eval_trials)
-        log.info(
-            f"Pre-PPO eval result: win={eval_stats['win_rate_pct']:.1f}%  "
-            f"mean_rew={eval_stats['mean_reward']:.3f}  "
-            f"outcomes={eval_stats['outcomes']}"
-        )
-
-        # Also evaluate explicitly against immobile opponent only
         from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
         from footballcoach.ai.env.scenario_env import ScenarioEnv
+
+        # Evaluate against rules-based opponent only
+        def _rules_build(*args, **kwargs):
+            from footballcoach.rules_ai import Phase1RulesAI
+            match = build_1v1_scenario(*args, **kwargs)
+            opp = match.player_by_id("opponent")
+            opp.ai = Phase1RulesAI()
+            match._opponent_use_rules_ai = True
+            match._opponent_is_immobile = False
+            return match
+        rules_defn = ScenarioDefinition(key="1v1_rules", label="1v1 rules", description="1v1 vs rules-based opponent", build=_rules_build)
+        rules_env = ScenarioEnv(
+            rules_defn, trainee_player_id="trainee", phase=1,
+            max_episode_s=env.max_episode_s,
+        )
+        rules_stats = _run_evaluation(trainer, rules_env, args.pre_ppo_eval_trials)
+        log.info(
+            f"Pre-PPO eval (rules opp): win={rules_stats['win_rate_pct']:.1f}%  "
+            f"mean_rew={rules_stats['mean_reward']:.3f}  "
+            f"outcomes={rules_stats['outcomes']}"
+        )
+
+        # Evaluate against immobile opponent only
         def _immobile_build(*args, **kwargs):
             match = build_1v1_scenario(*args, **kwargs)
             opp = match.player_by_id("opponent")
             opp.ai = None
             match._opponent_use_rules_ai = False
+            match._opponent_is_immobile = True
             return match
         immobile_defn = ScenarioDefinition(key="1v1_immobile", label="1v1 immobile", description="1v1 vs immobile opponent", build=_immobile_build)
         immobile_env = ScenarioEnv(

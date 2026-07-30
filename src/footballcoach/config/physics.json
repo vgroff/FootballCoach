@@ -38,7 +38,7 @@
     "accel_base_mps2": 3.0,
     "accel_scale_mps2": 4.5,
     "stamina_speed_penalty_max": 0.6,
-    "stamina_drain_sprint_base_per_s": 0.031111111111111112,
+    "stamina_drain_sprint_base_per_s": 0.0081111111111111112,
     "stamina_drain_attr_lo": 1.6,
     "stamina_drain_attr_hi": 1.1,
     "stamina_regen_idle_base_per_s": 0.016666666666666666,

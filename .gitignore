@@ -2,6 +2,7 @@
 __pycache__/
 checkpoints/
 results/
+demonstrations/
 /tmp/
 debug_*.py
 *.py[oc]

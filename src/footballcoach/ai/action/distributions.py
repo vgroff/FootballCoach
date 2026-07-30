@@ -177,9 +177,14 @@ class DirectionHead:
             log_std: (..., 2) or scalar log standard deviation.
             log_std_min/max: clamp bounds (configurable; defaults match original hardcoded values).
         """
+        eps = 1e-6
+        # Normalize to unit vector so the Gaussian mean stays on the unit circle.
+        # Prevents raw_vector magnitude drift from inflating KL between rollout
+        # collection and PPO update (the "stored_norm >> 1" bug).
+        normalized = raw_vector / (raw_vector.norm(dim=-1, keepdim=True) + eps)
         std = torch.exp(log_std.clamp(log_std_min, log_std_max))
-        self.dist = torch.distributions.Normal(raw_vector, std)
-        self._raw = raw_vector
+        self.dist = torch.distributions.Normal(normalized, std)
+        self._raw = normalized
 
     def sample_raw(self) -> torch.Tensor:
         """Sample from the 2D Gaussian (pre-normalization)."""

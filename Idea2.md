@@ -12,7 +12,7 @@ Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_
 
 Immedaite task!!
 Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 50k . We're only going against immovile opnent, should it should be easy
--  we were supposed to have the number of layers frozen for the value network during for the pretraining but im not seeing it
+- make the stamina physics less punishing, sprinting is probably barely worth it - re-run demonstrations with higher AI number
 - Is the AI completely ignoring all the kick mechanics like direction and spin and just aimming for the centre of the box when it kicks? Why on earth was this implemented???
 - I'd like the decision network to have a good latent space representation. Maybe I can even pre-train it (freeze the latent space) for a few epochs before the execution network starts pre-training? (maybe it should give the critic/value output? however that works)
 

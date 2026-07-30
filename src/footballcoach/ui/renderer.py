@@ -247,12 +247,15 @@ class Renderer:
         """
         from footballcoach.ui.gamelog import LogLevel
         entries = game_log.entries_above(min_level)[-max_lines:]
-        if not entries:
+        linger_frac = getattr(game_log, "linger_frac", 0.0)  # 0.0 = not lingering
+        show_linger = linger_frac > 0.0
+        if not entries and not show_linger:
             return
 
         line_h = self.hud_font.get_height() + 2
         box_w = 480
-        box_h = len(entries) * line_h + 6
+        linger_h = line_h + 2 if show_linger else 0
+        box_h = len(entries) * line_h + 6 + linger_h
         bar_h = 34  # hotkey bar height — sit just above it
         box_x = surface.get_width() - box_w - 6
         box_y = surface.get_height() - bar_h - box_h - 4
@@ -265,6 +268,15 @@ class Renderer:
             colour = style.HUD_TEXT if entry.level == LogLevel.INFO else style.HOTKEY_DISABLED
             text = self.hud_font.render(entry.message[:72], True, colour)
             surface.blit(text, (box_x + 4, box_y + 3 + i * line_h))
+
+        if show_linger:
+            # Hourglass / sand-timer progress bar above the bottom of the log box.
+            bar_y = box_y + box_h - linger_h
+            filled_w = max(2, int((box_w - 8) * linger_frac))
+            pygame.draw.rect(surface, (40, 40, 60), (box_x + 4, bar_y + 3, box_w - 8, line_h - 4), border_radius=3)
+            pygame.draw.rect(surface, style.HUD_ACCENT, (box_x + 4, bar_y + 3, filled_w, line_h - 4), border_radius=3)
+            label = self.hud_font.render("⏳ resetting…", True, style.HUD_TEXT)
+            surface.blit(label, (box_x + 8, bar_y + 3))
 
     def draw_pause_notification(self, surface: pygame.Surface, message: str) -> None:
         """Draws a prominent centred banner when the game is auto-paused after

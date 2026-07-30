@@ -473,6 +473,13 @@ class App:
         self.renderer.draw_hud_text(self.surface, hud_lines)
         self._draw_help_button()
         self.renderer.draw_hotkey_bar(self.surface, self._hotkey_entries())
+        # Expose linger progress to the game-log renderer (0.0 = not lingering).
+        if self._scenario_loop is not None and self._scenario_loop._pending_outcome is not None:
+            loop = self._scenario_loop
+            total = loop.linger_s if loop._pending_outcome in ("goal", "saved", "dispossessed", "other") else loop.linger_s * 0.5
+            self.game_log.linger_frac = loop._linger_remaining_s / max(total, 0.001)
+        else:
+            self.game_log.linger_frac = 0.0
         self.renderer.draw_game_log(self.surface, self.game_log, self.log_min_level)
         if self._pause_notification:
             self.renderer.draw_pause_notification(self.surface, self._pause_notification)

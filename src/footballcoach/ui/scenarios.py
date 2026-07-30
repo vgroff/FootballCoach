@@ -1374,6 +1374,19 @@ class ScenarioLoop:
             if ball.possessed_by is None and ball.velocity.length() < 0.1 and not any_controlling:
                 return "miss", self.linger_s * 0.5
 
+        # Box possession: any player reached the opponent's box with the ball.
+        # Mirrors ScenarioEnv's box_terminal / opponent_box_terminal logic:
+        # Team.LEFT attacks +x so their opponent box is the right box (left=False).
+        from footballcoach.entities.player import Team as _Team
+        for player in self._match.players:
+            if ball.possessed_by == player.player_id:
+                in_opp_box = pitch.is_in_box(
+                    ball.position,
+                    left=(player.team == _Team.RIGHT),  # opponent box for LEFT; mirrored for RIGHT
+                )
+                if in_opp_box:
+                    return "other", self.linger_s
+
         from footballcoach.rules_ai import NeuralPlayerAI
         # Only trigger early termination if there are rules-based AI players
         # (players with an AI that is NOT NeuralPlayerAI). Neural players and
