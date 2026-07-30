@@ -105,6 +105,8 @@ def record_episodes(
     ball_feats = []
     global_feats = []
     bc_labels = []
+    rewards = []
+    dones = []
 
     steps_total = 0
     steps_valid = 0
@@ -115,7 +117,9 @@ def record_episodes(
     if total_episodes is None:
         total_episodes = n_episodes
 
-    def _record_now():
+    _pending_reward: list[float] = [0.0]  # mutable cell for closure
+
+    def _record_now(reward: float = 0.0, done: bool = False):
         obs = env._get_obs()
         label = label_fn(env)
         label_arr = label.to_array()
@@ -125,6 +129,8 @@ def record_episodes(
         ball_feats.append(obs.ball_feat.copy())
         global_feats.append(obs.global_feat.copy())
         bc_labels.append(label_arr)
+        rewards.append(np.float32(reward))
+        dones.append(np.float32(done))
         nonlocal steps_total, steps_valid
         steps_total += 1
         if label.valid:
@@ -163,10 +169,16 @@ def record_episodes(
         done = False
         last_info = None
         while not done:
-            # Timed sample at sample_interval_s cadence
-            _record_now()
+            # Timed sample at sample_interval_s cadence (reward=0 for mid-step samples;
+            # the actual reward from env.step() is assigned to the NEXT sample or
+            # appended to the episode-end step below).
+            _record_now(reward=0.0, done=False)
             # Advance sim by sample_interval_s; kick/tackle callbacks fire inside
             _obs, _reward, done, last_info = env.step()
+            # Backfill reward onto the sample we just recorded
+            rewards[-1] = np.float32(_reward)
+            if done:
+                dones[-1] = np.float32(1.0)
 
         # Track episode outcome
         outcome = getattr(last_info, "trial_outcome", None) or "unknown"
@@ -198,6 +210,8 @@ def record_episodes(
         "obs_ball_feat":   np.stack(ball_feats).astype(np.float32),
         "obs_global_feat": np.stack(global_feats).astype(np.float32),
         "bc_labels":       np.stack(bc_labels).astype(np.float32),
+        "rewards":         np.array(rewards, dtype=np.float32),
+        "dones":           np.array(dones, dtype=np.float32),
         "meta_phase":      np.array(phase_id, dtype=np.int32),
         "meta_scenario":   np.bytes_(scenario_key),
     }

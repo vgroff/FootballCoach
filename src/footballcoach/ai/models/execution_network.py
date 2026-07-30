@@ -112,6 +112,7 @@ class ExecutionNetwork(nn.Module):
         global_mlp_hidden: int = 32,
         decision_mlp_hidden: int = 64,
         trunk_hidden: int = 256,
+        dir_log_std_init: float = -2.0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -158,14 +159,13 @@ class ExecutionNetwork(nn.Module):
         # Critic value head (shared trunk, Option A)
         self.value_head = nn.Linear(trunk_hidden, 1)
 
-        # Fixed (non-learnable) log_std for direction heads.
-        # Direction heads are included in the PPO log_prob ratio. The mean is
-        # constrained to the unit circle (|mean|=1), so max mean-shift is 2 and
-        # KL contribution per step is bounded (~O(1) vs the previous ~2000 when
-        # the raw vector could drift to magnitude 25-50). These buffers only
-        # control rollout sampling noise via DirectionHead.sample_raw().
-        self.move_dir_log_std = nn.Parameter(torch.zeros(2))
-        self.kick_dir_log_std = nn.Parameter(torch.zeros(2))
+        # Learnable log_std for direction heads (move_dir, kick_dir).
+        # Initialized from config (dir_log_std_init). Lower = tighter sampling
+        # (σ≈0.13 at -2.0, σ≈0.22 at -1.5, σ≈0.37 at -1.0).
+        # KL spikes if too tight: a 4° mean shift at σ=0.13 → ratio~50×.
+        # Clamped during forward() to [dir_log_std_min, dir_log_std_max].
+        self.move_dir_log_std = nn.Parameter(torch.full((2,), dir_log_std_init))
+        self.kick_dir_log_std = nn.Parameter(torch.full((2,), dir_log_std_init))
         self.kick_power_log_std = nn.Parameter(torch.zeros(1))
         self.kick_spin_log_std = nn.Parameter(torch.zeros(3))
 
@@ -208,7 +208,9 @@ class ExecutionNetwork(nn.Module):
     @classmethod
     def from_config(cls) -> "ExecutionNetwork":
         from footballcoach.ai.config import load_ai_config
-        cfg = load_ai_config()["network"]
+        full_cfg = load_ai_config()
+        cfg = full_cfg["network"]
+        ppo_cfg = full_cfg["ppo"]
         return cls(
             latent_dim=cfg["latent_dim"],
             entity_embed_dim=cfg["entity_embed_dim"],
@@ -218,4 +220,5 @@ class ExecutionNetwork(nn.Module):
             global_mlp_hidden=cfg["global_mlp_hidden"],
             decision_mlp_hidden=cfg["decision_mlp_hidden"],
             trunk_hidden=cfg["trunk_hidden"],
+            dir_log_std_init=ppo_cfg.get("dir_log_std_init", -2.0),
         )

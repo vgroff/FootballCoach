@@ -104,6 +104,11 @@ class PPOTrainer:
         self._bc_dir_loss_w = float(bc_cfg.get("direction_loss_weight", 3.0))
         self._bc_region_loss_w = float(bc_cfg.get("region_loss_weight", 1.0))
         self._value_pretrain_frozen_layers = int(bc_cfg.get("value_pretrain_frozen_layers", -1))
+        self._demo_value_pretrain_epochs = int(bc_cfg.get("demo_value_pretrain_epochs", 10))
+        self._demo_value_pretrain_lr = float(bc_cfg.get("demo_value_pretrain_lr", 4e-3))
+        self._demo_value_pretrain_gamma = float(bc_cfg.get("demo_value_pretrain_gamma", 0.99))
+        # Weight of value loss added to BC loss during BC epochs (0 = disabled)
+        self._demo_value_bc_coef = float(bc_cfg.get("demo_value_bc_coef", 0.5))
 
         lr = float(ppo_cfg.get("learning_rate", 3e-4))
         if not inference_only:
@@ -432,24 +437,119 @@ class PPOTrainer:
             lr=value_lr, eps=1e-5,
         )
 
+        # --- Phase 0: value head warm-up on demo returns (before any BC epochs) ---
+        # Trains value heads to predict discounted returns from the demo trajectories.
+        # Uses stored rewards/dones so no env interaction is needed.
+        # Skipped if the dataset has no reward data or demo_value_pretrain_epochs=0.
+        _demo_epochs = self._demo_value_pretrain_epochs
+        if _demo_epochs > 0 and dataset.has_rewards:
+            _demo_val_opt = torch.optim.Adam(
+                list(self.decision_net.value_head.parameters())
+                + list(self.execution_net.value_head.parameters()),
+                lr=self._demo_value_pretrain_lr, eps=1e-5,
+            )
+            _freeze_params = self._get_value_pretrain_freeze_params()
+            for p in _freeze_params:
+                p.requires_grad_(False)
+            demo_returns = dataset.compute_returns(gamma=self._demo_value_pretrain_gamma)
+            ret_t_all = torch.from_numpy(demo_returns).to(self.device)
+            ret_std = ret_t_all.std().clamp(min=1.0)
+            log.info(
+                f"Phase 0 — demo value pretrain: {_demo_epochs} epoch(s), "
+                f"gamma={self._demo_value_pretrain_gamma}, "
+                f"returns mean={ret_t_all.mean():.2f}  std={ret_std:.2f}  "
+                f"lr={self._demo_value_pretrain_lr}"
+            )
+            for epoch in range(_demo_epochs):
+                epoch_losses: list[float] = []
+                for obs_dict, ret_batch in dataset.iterate_minibatches_with_returns(
+                    batch_size=batch_size, returns=demo_returns,
+                    shuffle=True, device=self.device,
+                ):
+                    d_heads = self.decision_net(
+                        obs_dict["self_feat"], obs_dict["other_feat"],
+                        obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                    )
+                    e_heads = self.execution_net(
+                        obs_dict["self_feat"], obs_dict["other_feat"],
+                        obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                        d_heads,
+                    )
+                    v_dec = d_heads.value.squeeze(-1)
+                    v_exc = e_heads.value.squeeze(-1)
+                    ret_norm = ret_batch / ret_std
+                    val_loss = 0.5 * (
+                        ((v_dec - ret_norm) ** 2).mean()
+                        + ((v_exc - ret_norm) ** 2).mean()
+                    )
+                    _demo_val_opt.zero_grad()
+                    val_loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        list(self.decision_net.value_head.parameters())
+                        + list(self.execution_net.value_head.parameters()),
+                        self.max_grad_norm,
+                    )
+                    _demo_val_opt.step()
+                    epoch_losses.append(val_loss.item())
+                log.info(
+                    f"  Demo value epoch {epoch + 1}/{_demo_epochs}: "
+                    f"val_loss={np.mean(epoch_losses):.4f}"
+                )
+            for p in _freeze_params:
+                p.requires_grad_(True)
+            log.info(f"Phase 0 done (demo value pretrain, {_demo_epochs} epoch(s))")
+        elif _demo_epochs > 0 and not dataset.has_rewards:
+            log.info(
+                "Phase 0 skipped — dataset has no reward data "
+                "(re-record demonstrations to enable demo value pretrain)"
+            )
+
         # --- Phase 1: BC epochs over the dataset ---
-        # Do this first so the rollout is collected with the BC-warmed policy,
+        # If dataset has reward data and demo_value_bc_coef > 0, also add a
+        # value loss term (MSE against demo returns) in the same backward pass.
+        _use_joint_val = (
+            self._demo_value_bc_coef > 0.0
+            and dataset.has_rewards
+        )
+        if _use_joint_val:
+            _joint_returns = dataset.compute_returns(gamma=self._demo_value_pretrain_gamma)
+            _joint_ret_std = float(np.std(_joint_returns).clip(1.0))
+            log.info(
+                f"Phase 1 BC epochs will include joint value loss "
+                f"(coef={self._demo_value_bc_coef}, gamma={self._demo_value_pretrain_gamma}, "
+                f"returns std={_joint_ret_std:.2f})"
+            )
+        else:
+            _joint_returns = None
+            _joint_ret_std = 1.0
+
+        # Do BC first so the rollout is collected with the BC-warmed policy,
         # giving on-policy value targets instead of random-init targets.
         for epoch in range(n_epochs):
             bc_losses = []
+            val_losses: list[float] = []
             dir_cosines: list[float] = []
             move_probs: list[float] = []
             sprint_probs: list[float] = []
             _bkdn_acc: dict[str, float] = {}
             _bkdn_n: int = 0
-            for obs_dict, bc_labels in dataset.iterate_minibatches(
-                batch_size=batch_size, shuffle=True, device=self.device, valid_only=True
+            for mb in dataset.iterate_minibatches(
+                batch_size=batch_size, shuffle=True, device=self.device,
+                valid_only=True, returns=_joint_returns,
             ):
+                if _use_joint_val:
+                    obs_dict, bc_labels, ret_batch = mb
+                else:
+                    obs_dict, bc_labels = mb
+                    ret_batch = None
                 # Augment with geometric flips + slot permutations (ALWAYS applied).
                 if self.augment_n_slot_shuffles > 0:
                     obs_dict, bc_labels = augment_obs_bc(
                         obs_dict, bc_labels, self.augment_n_slot_shuffles, self._aug_rng
                     )
+                    if ret_batch is not None:
+                        n_aug = 4 * max(1, self.augment_n_slot_shuffles)
+                        ret_batch = ret_batch.repeat(n_aug)
                 d_heads = self.decision_net(
                     obs_dict["self_feat"], obs_dict["other_feat"],
                     obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
@@ -465,8 +565,19 @@ class PPOTrainer:
                     region_loss_weight=self._bc_region_loss_w,
                     return_breakdown=True,
                 )
+                total_loss = bc_loss
+                if ret_batch is not None:
+                    ret_norm = ret_batch / _joint_ret_std
+                    v_dec = d_heads.value.squeeze(-1)
+                    v_exc = e_heads.value.squeeze(-1)
+                    val_loss = 0.5 * (
+                        ((v_dec - ret_norm) ** 2).mean()
+                        + ((v_exc - ret_norm) ** 2).mean()
+                    )
+                    total_loss = bc_loss + self._demo_value_bc_coef * val_loss
+                    val_losses.append(val_loss.item())
                 bc_opt.zero_grad()
-                bc_loss.backward()
+                total_loss.backward()
                 nn.utils.clip_grad_norm_(
                     list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
                     self.max_grad_norm,
@@ -497,9 +608,11 @@ class PPOTrainer:
             mean_mv = float(np.mean(move_probs)) if move_probs else float('nan')
             mean_spr = float(np.mean(sprint_probs)) if sprint_probs else float('nan')
             bkdn_str = "  ".join(f"{k}={v/_bkdn_n:.3f}" for k, v in _bkdn_acc.items()) if _bkdn_n else ""
+            val_str = f"  val_loss={np.mean(val_losses):.4f}" if val_losses else ""
             log.info(
                 f"  BC epoch {epoch + 1}/{n_epochs}: bc_loss={np.mean(bc_losses):.4f}"
-                f"  dir_cos={mean_cos:.3f}  mv_p={mean_mv:.3f}  spr_p={mean_spr:.3f}"
+                + val_str
+                + f"  dir_cos={mean_cos:.3f}  mv_p={mean_mv:.3f}  spr_p={mean_spr:.3f}"
                 + (f"  [{bkdn_str}]" if bkdn_str else "")
             )
             dir_cosines.clear()

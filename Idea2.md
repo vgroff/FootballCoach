@@ -6,15 +6,18 @@ You may also have stuff in memory/storage for this repo.
 I'm going to give another agent the following task, empty context:
 Read ai_trainer_knowledge.md, and then run a training run.
 
-I want you to add 100-300 words of extra detail on the current situation/problems, debug logs you've added, things to look out for, lines of investigation etc... Also state that the demonstration needs re-doing, and give the relevant terminal commands to run both
+I want you to add 200-400 words of prompt for agent that will carry out more training, give extra detail on the current situation/problems, recent changes, debug logs you've added, things to look out for, lines of investigation etc... Say that the trainer knowledge file needs to be read first thing. Also state that the demonstration needs re-doing, and give the relevant terminal commands to run both that and training
 
 Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_plan.md, the ai_design_document.md and the ai_trainer_knowledge.md
 
 Immedaite task!!
 Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 50k . We're only going against immovile opnent, should it should be easy
-- make the stamina physics less punishing, sprinting is probably barely worth it - re-run demonstrations with higher AI number
+- parralelise the simulation somehow? player decision? maybe even movements/updates, though potentially dangerous
+- Looks like the value network might be strulggling - why??
+- train the decision network during the pre-pre-train too
 - Is the AI completely ignoring all the kick mechanics like direction and spin and just aimming for the centre of the box when it kicks? Why on earth was this implemented???
 - I'd like the decision network to have a good latent space representation. Maybe I can even pre-train it (freeze the latent space) for a few epochs before the execution network starts pre-training? (maybe it should give the critic/value output? however that works)
+    - maybe ideal pre-train regime, first train the decision network to predict decision and final reward (add as a dummy neuron) from demos, then train bc network for like 3 epochs, then train value network for 2 epochs, then bc again for 1, then value for 1, then final repair round. what do we think?
 
 Immediate AI stuff
 - Can we do some trainings runs and then see and see if the trained AI is able to beat the rules-based AI more consistently or at least at a simiar rate than another rules-based AI could?
@@ -68,6 +71,9 @@ NB:
 
 
 Past MVP - Late Stage Plans
+
+Mechanics
+- Think about introducing non-linearities in kick power, stamina etc... stuff that maybe less spearated in effect than theye are in rarity (gaussian), or the reverse (e.g. dribbling, maybe gets extra good at 80+)
 
 Coaching
 - 
