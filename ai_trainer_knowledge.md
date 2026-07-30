@@ -100,15 +100,29 @@ Override the save directory with `--checkpoint-dir path/`.
 | `src/footballcoach/ai/models/decision_network.py` | `DecisionNetwork.from_config()` |
 | `src/footballcoach/ai/models/execution_network.py` | `ExecutionNetwork.from_config()` |
 | `src/footballcoach/ai/action/gating.py` | `select_action()` — winner-take-all, NO gradients |
-| `src/footballcoach/ai/action/to_orders.py` | Maps `GatingResult` → engine `Order` objects + illegal-action detection |
+| `src/footballcoach/ai/action/to_orders.py` | Applies execution outputs DIRECTLY to player — **no Orders**. Sets `desired_direction`, `desired_speed_mode`, calls `kick_direct()`, `tackle_direct()` |
 | `src/footballcoach/ai/action/distributions.py` | `IndependentBernoulli`, `MaskedCategorical`, `SquashedNormalHead`, `DirectionHead` |
+| `src/footballcoach/ai/obs/augment.py` | Geometric + slot-permutation augmentation. **CRITICAL**: target slot indices (pass/tackle/mark) are remapped through the inverse permutation — do not remove this |
+
+### !!!! CRITICAL ARCHITECTURE RULE — THE NETWORK NEVER ISSUES ORDERS !!!!
+
+The neural network NEVER sets `player.current_order`. It ONLY:
+1. Sets `player.desired_direction` (Vector3) + `player.desired_speed_mode` (SpeedMode) directly
+2. Calls `player.kick_direct(match, ...)` when `kick_this_tick` is True
+3. Calls `player.tackle_direct(match, ...)` when `tackle_attempt` is True
+
+The decision heads (`shoot`, `pass_`, `move`, `get_possession`, etc.) are
+**inputs to the execution network** providing strategic context. They do NOT
+trigger any Orders at inference time.
+
+Orders are for the rules-based AI and human input only.
 
 ### Tier 4: Read only if you need to understand the underlying engine
 
 | File | Why it matters |
 |------|----------------|
 | `src/footballcoach/engine/match.py` | `Match.step()` — the sim tick; AI is a pure consumer, not a modifier |
-| `src/footballcoach/orders.py` | `MoveOrder`, `ShootOrder`, `GetPossessionOrder`, etc. — what `to_orders.py` produces |
+| `src/footballcoach/orders.py` | `MoveOrder`, `GetPossessionOrder`, etc. — used by rules-based AI only, NOT by neural network |
 | `src/footballcoach/entities/player.py` | `Player`, `PlayerState`, `Team` |
 | `src/footballcoach/entities/ball.py` | `Ball`, `Ball.at_rest()` |
 | `src/footballcoach/entities/pitch.py` | `Pitch.standard()`, `pitch.half_length`, `pitch.is_in_box()` |

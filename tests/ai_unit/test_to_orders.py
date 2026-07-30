@@ -1,12 +1,13 @@
-"""Unit tests for action/to_orders.py - GatingResult -> engine orders.
+"""Unit tests for action/to_orders.py - neural network execution outputs -> direct player state.
 
-Tests both the legal-action path (correct order type assigned) and the
-illegal-action detection path (flag set, reason recorded).
+The neural network NEVER issues Orders. It sets player.desired_direction,
+player.desired_speed_mode, and calls player.kick_direct() / player.tackle_direct().
 
-IMPORTANT: these tests use real Match objects (from conftest.py) and verify
-the engine state, not just return values.  If the precondition checks in
-to_orders.py drift out of sync with the engine's own guards, these tests
-will catch it.
+These tests verify:
+  - Movement sets desired_direction and desired_speed_mode directly (no Orders).
+  - Kick calls player.kick_direct() when player has possession; illegal otherwise.
+  - Tackle calls player.tackle_direct() with correct precondition checks.
+  - Decision head selections (SHOOT/PASS/MOVE/etc.) do NOT cause Orders.
 """
 import random
 
@@ -14,17 +15,9 @@ import pytest
 
 from footballcoach.ai.action.gating import GatingResult, SelectedAction
 from footballcoach.ai.action.to_orders import apply_action_to_player
+from footballcoach.engine.movement import SpeedMode
 from footballcoach.entities.player import PlayerState
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import (
-    ChaseTackleOrder,
-    GetPossessionOrder,
-    KickOrder,
-    MarkOrder,
-    MoveOrder,
-    OrderStatus,
-    PassOrder,
-)
 
 import numpy as np
 
@@ -67,72 +60,35 @@ def _apply(gating, match, player_id, slot_player_ids=None, decision_physical=Non
 
 
 # ---------------------------------------------------------------------------
-# SHOOT
+# KICK (kick_this_tick output from execution network)
 # ---------------------------------------------------------------------------
 
-class TestShoot:
-    def test_shoot_with_possession_legal(self, duel_match):
-        """p1 has the ball -> shoot is legal -> KickOrder assigned."""
-        result = _apply(_gating(SelectedAction.SHOOT), duel_match, "p1")
+class TestKick:
+    def test_kick_with_possession_legal(self, duel_match):
+        """kick_this_tick=True + has ball -> kick_direct() fires, no illegal."""
+        result = _apply(_gating(SelectedAction.NONE, kick=True), duel_match, "p1")
         assert not result.illegal_action
-        assert isinstance(duel_match.player_by_id("p1").current_order, KickOrder)
 
-    def test_shoot_without_possession_illegal(self, duel_match):
-        """p2 does NOT have the ball -> shoot is illegal."""
-        result = _apply(_gating(SelectedAction.SHOOT), duel_match, "p2")
+    def test_kick_without_possession_illegal(self, duel_match):
+        """kick_this_tick=True but no possession -> illegal."""
+        result = _apply(_gating(SelectedAction.NONE, kick=True), duel_match, "p2")
         assert result.illegal_action
         assert "possession" in result.illegal_reason
 
-    def test_shoot_without_possession_no_order(self, duel_match):
-        """Illegal shoot must not assign a KickOrder."""
-        p2 = duel_match.player_by_id("p2")
-        p2.current_order = None
-        _apply(_gating(SelectedAction.SHOOT), duel_match, "p2")
-        assert not isinstance(p2.current_order, KickOrder)
+    def test_no_kick_no_order_set(self, duel_match):
+        """kick_this_tick=False -> current_order not touched by kick path."""
+        p1 = duel_match.player_by_id("p1")
+        p1.current_order = None
+        _apply(_gating(SelectedAction.NONE, kick=False), duel_match, "p1")
+        assert p1.current_order is None  # movement sets desired_* not current_order
+
+
+# PASS is a decision-context input — the neural network does not issue PassOrders.
+# No pass tests needed here; passing will be trained via BC labels.
 
 
 # ---------------------------------------------------------------------------
-# PASS
-# ---------------------------------------------------------------------------
-
-class TestPass:
-    def _slot_ids_with_p2(self, match, slot=3):
-        ids = [None] * 21
-        ids[slot] = "p2"
-        return ids
-
-    def test_pass_with_possession_legal(self, duel_match):
-        slot_ids = self._slot_ids_with_p2(duel_match)
-        result = _apply(
-            _gating(SelectedAction.PASS, target_slot=3),
-            duel_match, "p1",
-            slot_player_ids=slot_ids,
-        )
-        assert not result.illegal_action
-        assert isinstance(duel_match.player_by_id("p1").current_order, PassOrder)
-
-    def test_pass_without_possession_illegal(self, duel_match):
-        slot_ids = self._slot_ids_with_p2(duel_match)
-        result = _apply(
-            _gating(SelectedAction.PASS, target_slot=3),
-            duel_match, "p2",
-            slot_player_ids=slot_ids,
-        )
-        assert result.illegal_action
-
-    def test_pass_no_valid_target_illegal(self, duel_match):
-        """target_slot=5 but slot 5 is None -> illegal."""
-        result = _apply(
-            _gating(SelectedAction.PASS, target_slot=5),
-            duel_match, "p1",
-            slot_player_ids=[None] * 21,
-        )
-        assert result.illegal_action
-        assert "target" in result.illegal_reason
-
-
-# ---------------------------------------------------------------------------
-# TACKLE
+# TACKLE (tackle_attempt output from execution network)
 # ---------------------------------------------------------------------------
 
 class TestTackle:
@@ -142,20 +98,20 @@ class TestTackle:
         return ids
 
     def test_tackle_active_player_legal(self, duel_match):
+        """tackle_attempt=True + valid target -> no illegal (out-of-range is fine)."""
         slot_ids = self._slot_ids_with_opponent()
         result = _apply(
-            _gating(SelectedAction.TACKLE, target_slot=2),
+            _gating(SelectedAction.NONE, tackle_attempt=True, target_slot=2),
             duel_match, "p1",
             slot_player_ids=slot_ids,
         )
         assert not result.illegal_action
-        assert isinstance(duel_match.player_by_id("p1").current_order, ChaseTackleOrder)
 
     def test_tackle_while_inactive_illegal(self, duel_match):
         duel_match.player_by_id("p1").state = PlayerState.INACTIVE_TACKLED
         slot_ids = self._slot_ids_with_opponent()
         result = _apply(
-            _gating(SelectedAction.TACKLE, target_slot=2),
+            _gating(SelectedAction.NONE, tackle_attempt=True, target_slot=2),
             duel_match, "p1",
             slot_player_ids=slot_ids,
         )
@@ -179,7 +135,7 @@ class TestTackle:
         slot_ids = [None] * 21
         slot_ids[0] = "p2"
         result = _apply(
-            _gating(SelectedAction.TACKLE, target_slot=0),
+            _gating(SelectedAction.NONE, tackle_attempt=True, target_slot=0),
             match, "p1",
             slot_player_ids=slot_ids,
         )
@@ -188,135 +144,48 @@ class TestTackle:
 
     def test_tackle_no_valid_target_illegal(self, duel_match):
         result = _apply(
-            _gating(SelectedAction.TACKLE, target_slot=10),
+            _gating(SelectedAction.NONE, tackle_attempt=True, target_slot=10),
             duel_match, "p1",
             slot_player_ids=[None] * 21,
         )
         assert result.illegal_action
 
 
-# ---------------------------------------------------------------------------
-# GET_POSSESSION
-# ---------------------------------------------------------------------------
-
-class TestGetPossession:
-    def test_active_player_legal(self, duel_match):
-        result = _apply(_gating(SelectedAction.GET_POSSESSION), duel_match, "p2")
-        assert not result.illegal_action
-        assert isinstance(duel_match.player_by_id("p2").current_order, GetPossessionOrder)
-
-    def test_inactive_player_illegal(self, duel_match):
-        duel_match.player_by_id("p2").state = PlayerState.INACTIVE_TACKLED
-        result = _apply(_gating(SelectedAction.GET_POSSESSION), duel_match, "p2")
-        assert result.illegal_action
+# GET_POSSESSION and MARK are decision-context inputs — the neural network
+# does not issue GetPossessionOrder or MarkOrder. No tests needed here.
 
 
 # ---------------------------------------------------------------------------
-# MARK
-# ---------------------------------------------------------------------------
-
-class TestMark:
-    def test_mark_opponent_legal(self, duel_match):
-        slot_ids = [None] * 21
-        slot_ids[0] = "p2"
-        result = _apply(
-            _gating(SelectedAction.MARK, target_slot=0),
-            duel_match, "p1",
-            slot_player_ids=slot_ids,
-        )
-        assert not result.illegal_action
-        assert isinstance(duel_match.player_by_id("p1").current_order, MarkOrder)
-
-    def test_mark_own_team_illegal(self, standard_pitch):
-        """Cannot mark own teammate."""
-        import random as _r
-        from footballcoach.engine.match import Match
-        from footballcoach.entities.player import Player, Team
-        from footballcoach.entities.attributes import PlayerAttributes
-        from footballcoach.entities.ball import Ball
-
-        attrs = PlayerAttributes(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
-        p1 = Player.create("p1", Team.LEFT, attrs, position=Vector3(0, 0, 0))
-        p2 = Player.create("p2", Team.LEFT, attrs, position=Vector3(5, 0, 0))
-        ball = Ball.at_rest(Vector3(0, 0, 0))
-        match = Match(pitch=standard_pitch, players=[p1, p2], ball=ball,
-                      rng_reduction=1.0, rng=_r.Random(0))
-        slot_ids = [None] * 21
-        slot_ids[0] = "p2"
-        result = _apply(
-            _gating(SelectedAction.MARK, target_slot=0),
-            match, "p1",
-            slot_player_ids=slot_ids,
-        )
-        assert result.illegal_action
-        assert "teammate" in result.illegal_reason
-
-
-# ---------------------------------------------------------------------------
-# MOVE / HOLD_POSITION
+# MOVEMENT (desired_direction / desired_speed_mode — no Orders)
 # ---------------------------------------------------------------------------
 
 class TestMove:
-    def test_move_assigns_move_order(self, solo_match):
-        result = _apply(
-            _gating(SelectedAction.MOVE),
-            solo_match, "p1",
-            decision_physical={"move_region_center_m": np.array([10.0, 5.0])},
-        )
-        assert not result.illegal_action
-        order = solo_match.player_by_id("p1").current_order
-        assert isinstance(order, MoveOrder)
-
-    def test_move_target_uses_execution_direction(self, solo_match):
-        """Movement target is player.position + move_direction * 50m, not
-        the decision network's move_region_center."""
+    def test_move_dir_sets_desired_direction(self, solo_match):
+        """move_direction sets player.desired_direction directly, no MoveOrder."""
         player = solo_match.player_by_id("p1")
-        player.position = Vector3(0.0, 0.0, 0.0)
-        move_dir = np.array([0.0, 1.0])  # pointing +y
-        _apply(
-            _gating(SelectedAction.MOVE, move_dir=move_dir),
-            solo_match, "p1",
-            decision_physical={"move_region_center_m": np.array([15.0, -3.0])},
-        )
-        order = solo_match.player_by_id("p1").current_order
-        assert isinstance(order, MoveOrder)
-        # Target should be ~50m in the +y direction, ignoring move_region_center
-        assert order.target_position.x == pytest.approx(0.0, abs=1.0)
-        assert order.target_position.y == pytest.approx(50.0, abs=1.0)
+        move_dir = np.array([0.0, 1.0])
+        _apply(_gating(SelectedAction.MOVE, move_dir=move_dir, sprint=False), solo_match, "p1")
+        assert player.desired_direction.y == pytest.approx(1.0, abs=0.01)
+        assert player.desired_direction.x == pytest.approx(0.0, abs=0.01)
+        assert player.desired_speed_mode == SpeedMode.JOG
+        assert player.current_order is None  # NO Order issued
 
-    def test_hold_position_assigns_move_order(self, solo_match):
-        result = _apply(
-            _gating(SelectedAction.HOLD_POSITION),
-            solo_match, "p1",
-            decision_physical={"move_region_center_m": np.array([0.0, 0.0])},
-        )
-        assert not result.illegal_action
-        assert isinstance(solo_match.player_by_id("p1").current_order, MoveOrder)
+    def test_sprint_sets_sprint_mode(self, solo_match):
+        player = solo_match.player_by_id("p1")
+        _apply(_gating(SelectedAction.MOVE, sprint=True), solo_match, "p1")
+        assert player.desired_speed_mode == SpeedMode.SPRINT
 
+    def test_zero_direction_sets_standstill(self, solo_match):
+        """Zero / None move_direction -> STANDSTILL, no movement."""
+        player = solo_match.player_by_id("p1")
+        _apply(_gating(SelectedAction.NONE, move_dir=np.zeros(2)), solo_match, "p1")
+        assert player.desired_speed_mode == SpeedMode.STANDSTILL
+        assert player.current_order is None
 
-# ---------------------------------------------------------------------------
-# NONE (no action selected)
-# ---------------------------------------------------------------------------
-
-class TestNone:
-    def test_none_always_sets_stop_order(self, solo_match):
-        """NONE (all heads < 0.5) always issues StopOrder (STANDSTILL).
-        move_logit < 0.5 means the player should decelerate, not keep drifting."""
-        from footballcoach.orders import StopOrder
-        solo_match.player_by_id("p1").current_order = None
-        result = _apply(
-            _gating(SelectedAction.NONE, move_dir=np.array([1.0, 0.0])),
-            solo_match, "p1",
-        )
-        assert not result.illegal_action
-        assert isinstance(solo_match.player_by_id("p1").current_order, StopOrder)
-
-    def test_none_overwrites_stale_in_progress_order(self, solo_match):
-        """NONE overwrites any existing order with StopOrder — the player
-        should decelerate regardless of what it was previously doing."""
-        from footballcoach.orders import StopOrder
-        existing = MoveOrder(target_position=Vector3(20, 0, 0))
-        existing.status = OrderStatus.IN_PROGRESS
-        solo_match.player_by_id("p1").current_order = existing
-        _apply(_gating(SelectedAction.NONE), solo_match, "p1")
-        assert isinstance(solo_match.player_by_id("p1").current_order, StopOrder)
+    def test_none_action_with_direction_still_moves(self, solo_match):
+        """NONE (all decision heads < 0.5) does NOT stop the player.
+        The execution network's move_direction always drives desired_speed_mode.
+        STANDSTILL only happens when move_direction is near-zero (see test_zero_direction_sets_standstill)."""
+        player = solo_match.player_by_id("p1")
+        _apply(_gating(SelectedAction.NONE, move_dir=np.array([1.0, 0.0]), sprint=True), solo_match, "p1")
+        assert player.desired_speed_mode == SpeedMode.SPRINT

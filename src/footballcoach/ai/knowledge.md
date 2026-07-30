@@ -27,7 +27,7 @@ ai/
     schema.py         # DecisionHeadsRaw, DecisionAction, ExecutionHeadsRaw, ExecutionAction
     distributions.py  # IndependentBernoulli, MaskedCategorical, SquashedNormalHead, DirectionHead
     gating.py         # select_action() - pure Python winner-take-all, NEVER in gradient graph
-    to_orders.py      # GatingResult -> engine orders + illegal-action detection
+    to_orders.py      # Execution outputs -> DIRECT player physics (NO ORDERS - see below)
   models/
     entity_encoder.py    # shared per-entity MLP + nn.MultiheadAttention
     decision_network.py  # DecisionNetwork.from_config() + derive_get_possession_prob()
@@ -100,6 +100,28 @@ Sampling strategy:
 
 ## Critical design rules
 
+### !!!! CRITICAL: THE NEURAL NETWORK NEVER ISSUES ORDERS !!!!
+
+The neural network does NOT set `player.current_order` to anything, ever.
+Orders (`MoveOrder`, `GetPossessionOrder`, `MarkOrder`, `ChaseTackleOrder`,
+etc.) are used **only** by:
+- The rules-based AI (`Phase1RulesAI`, `StagedGoalkeeper`, etc.)
+- Human input in the UI
+
+The **only** things `apply_action_to_player()` in `to_orders.py` does:
+1. **Movement**: sets `player.desired_direction` (Vector3) and
+   `player.desired_speed_mode` (SpeedMode) directly from `gating.move_direction`
+   and `gating.sprint`. The engine's `_apply_movement()` loop reads these fields.
+2. **Kick**: calls `player.kick_direct(match, aim_pt, power, spin)` if
+   `gating.kick_this_tick` is True. This executes kick physics immediately with
+   no KickOrder.
+3. **Tackle**: calls `player.tackle_direct(match, target_id)` if
+   `gating.tackle_attempt` is True and preconditions are met.
+
+The decision network heads (`shoot`, `pass_`, `move`, `get_possession`, `mark`,
+`hold_position`) are **inputs to the execution network** — they provide
+strategic context. They do NOT trigger any Orders.
+
 ### Neural players use `NeuralPlayerAI` — `_sample_action` is called inside it
 `PPOTrainer.train()` sets `env.sample_action_fn = self._sample_action`.
 `ScenarioEnv.reset()` then assigns `NeuralPlayerAI(sample_action_fn, ...)`
@@ -154,9 +176,16 @@ invariance.
 - n slot permutations per flip (exact for permutation-invariant attention)
 Field indices for each flip are derived from `fields(PlayerFeatures)` /
 `fields(BallFeatures)` at import time — see `obs/augment.py` for the full
-derivation including pseudovector (spin) transforms.  Tests in `tests/ai_unit/test_obs_encoder.py` verify that (a)
-features are identical across different shuffle seeds and (b) different seeds
-actually produce different slot assignments.
+derivation including pseudovector (spin) transforms.
+
+**IMPORTANT — target slot index remapping**: when a slot permutation is
+applied, the stored `pass_target`, `tackle_target`, `mark_target` action
+indices must be remapped through the **inverse permutation** so they still
+refer to the correct player in the permuted `other_feat`. `augment_batch()`
+does this via `inv_perm = argsort(perm)`. Forgetting this causes
+`MaskedCategorical.log_prob()` to return `-inf` (target index points to a
+now-masked slot), which blows up `approx_kl` to `inf`. This was a bug that
+was fixed — do not revert this remapping.
 
 ### time_remaining_s is caller-managed
 

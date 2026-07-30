@@ -23,6 +23,21 @@ as `object | None` here to avoid a circular import between `entities` and
 `radius_m`/`height_m` from `physics.json` so they stay in sync with the rest
 of the engine.
 
+### Direct-physics methods for the neural network
+
+Two methods on `Player` exist **exclusively for the neural network** to call
+via `to_orders.py`. They bypass the Orders system entirely:
+
+- `player.kick_direct(match, aim_point, power_fraction, spin)` — executes kick
+  physics immediately (same logic as `KickOrder.execute()`, which now delegates
+  here). No `KickOrder` is created. Only fires if `ball.possessed_by == player.player_id`.
+- `player.tackle_direct(match, target_player_id)` — attempts an immediate
+  tackle if in contact range. Returns `True` if contact was resolved, `False`
+  if out of range. No `ChaseTackleOrder` is created.
+
+All other action methods (`kick()`, `move_to()`, `get_possession()`, etc.)
+set `current_order` and are for the **rules-based AI and human input only**.
+
 `PlayerState` is a small state machine:
 - `ACTIVE` - normal play, follows orders, regenerates stamina.
 - `INACTIVE_TACKLED` - just been tackled (or just missed a tackle attempt

@@ -232,6 +232,22 @@ def augment_batch(
                     dtype=torch.long,
                 )
 
+            # Build inverse permutation: old slot i → new position inv_perm[i]
+            inv_perm = torch.argsort(perm)
+
+            # Remap categorical target slot indices through the inverse permutation.
+            # pass_target/tackle_target/mark_target store the slot index of the
+            # target player; after permuting other_feat, that player now lives at
+            # inv_perm[old_slot].
+            _TARGET_KEYS = {"action/pass_target", "action/tackle_target", "action/mark_target"}
+            remapped_actions: dict = {}
+            for k, v in flipped_actions.items():
+                if k in _TARGET_KEYS:
+                    # v is (N, 1) long-ish float; map each index through inv_perm
+                    remapped_actions[k] = inv_perm[v.long()].float()
+                else:
+                    remapped_actions[k] = v
+
             part: dict = {
                 "obs/self_feat":   sf,
                 "obs/other_feat":  of[:, perm, :],
@@ -246,7 +262,7 @@ def augment_batch(
                 "returns":    batch["returns"],
                 "dones":      batch["dones"],
             }
-            part.update(flipped_actions)
+            part.update(remapped_actions)
             if bc_labels_flipped is not None:
                 part["bc_labels"] = bc_labels_flipped
 

@@ -1120,8 +1120,12 @@ class PPOTrainer:
                     _lp_movedir_after  = self._dir_head(e_after.move_direction, _log_std_move).log_prob(_stored_raw_mb)
                     movedir_hyp_kl = (_lp_movedir_before - _lp_movedir_after).mean().item()
 
-                approx_kl = (mb_old_lp - new_log_probs).mean().item()
-                kl_after_step = (mb_old_lp - lp_after).mean().item()
+                # Clamp to finite floor before KL to avoid inf from near-zero-probability
+                # samples in the current policy (log_prob = -inf → KL = +inf).
+                _lp_clamped = new_log_probs.clamp(min=-1e6)
+                _la_clamped = lp_after.clamp(min=-1e6)
+                approx_kl = (mb_old_lp - _lp_clamped).mean().item()
+                kl_after_step = (mb_old_lp - _la_clamped).mean().item()
 
                 mb_i = start // self.minibatch_size
                 log.debug(

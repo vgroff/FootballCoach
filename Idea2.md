@@ -9,7 +9,7 @@ Immedaite task!!
 - get some demonstrations, and train
 Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 50k
 - very suspicious that the ai "wins" against rules sometimes, given that it never wins in the UI. wins do only count when you get in the enemy box, correct?
-
+- Is the AI completely ignoring all the kick mechanics like direction and spin and just aimming for the centre of the box when it kicks? Why on earth was this implemented???
 
 Immediate AI stuff
 - Can we do some trainings runs and then see and see if the trained AI is able to beat the rules-based AI more consistently or at least at a simiar rate than another rules-based AI could?
