@@ -157,7 +157,7 @@
     "_comment": "AI/order-layer steering — used ONLY in steering.py / MoveOrder handling. NOT engine physics. radius_m: distance at which repulsion begins. strength_base: peak directional weight at d=0 (m/s-equivalent, blended into heading not force). ball_carrier_repulsion_mult: extra boost when the moving player has the ball. ball_carrier_speed_penalty_max: max fractional speed penalty for ball carriers (0.4 = 40% reduction). speed_penalty_scale: converts |net_repulsion| to speed penalty fraction. alignment_dot_threshold: trigger orthogonal nudge when rel_vel . net_repulsion < this (i.e. heading nearly straight into obstacle). min_orthogonal_adjust_mps: sideways nudge magnitude (primary tuning knob — start at 1.5, tune via balance test).",
     "radius_m": 8.0,
     "strength_base": 0.3,
-    "ball_carrier_repulsion_mult": 2.2,
+    "ball_carrier_repulsion_mult": 2.4,
     "ball_carrier_speed_penalty_max": 0.4,
     "speed_penalty_scale": 0.14,
     "alignment_dot_threshold": -0.7,

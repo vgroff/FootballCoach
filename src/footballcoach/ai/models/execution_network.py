@@ -9,7 +9,8 @@ Structurally similar to the decision network (entity encoder + trunk), but:
 
 Outputs:
   move_direction   - unit vector (L2-normalized inside forward(); mean is always on unit circle)
-  sprint_logit     - Bernoulli: sprint vs jog
+  exec_move_logit  - Bernoulli: move vs standstill
+  sprint_logit     - Bernoulli: sprint vs jog (only meaningful when exec_move=1)
   kick_logit       - Bernoulli: kick this tick?
   kick_direction   - unit vector (L2-normalized inside forward(); mean is always on unit circle)
   kick_power       - raw scalar; sigmoid -> [0, 1] power_fraction
@@ -146,7 +147,8 @@ class ExecutionNetwork(nn.Module):
 
         # Motor output heads
         self.move_direction = nn.Linear(trunk_hidden, 2)    # L2-normalized to unit vector in forward()
-        self.sprint_logit = nn.Linear(trunk_hidden, 1)       # Bernoulli
+        self.exec_move_logit = nn.Linear(trunk_hidden, 1)   # Bernoulli: move vs standstill
+        self.sprint_logit = nn.Linear(trunk_hidden, 1)       # Bernoulli: sprint vs jog
         self.kick_logit = nn.Linear(trunk_hidden, 1)          # Bernoulli
         self.kick_direction = nn.Linear(trunk_hidden, 2)       # L2-normalized to unit vector in forward()
         self.kick_power = nn.Linear(trunk_hidden, 1)            # raw; sigmoid -> [0,1]
@@ -193,6 +195,7 @@ class ExecutionNetwork(nn.Module):
 
         return ExecutionHeadsRaw(
             move_direction=raw_move / (raw_move.norm(dim=-1, keepdim=True) + eps),
+            exec_move_logit=self.exec_move_logit(h),
             sprint_logit=self.sprint_logit(h),
             kick_logit=self.kick_logit(h),
             kick_direction=raw_kick / (raw_kick.norm(dim=-1, keepdim=True) + eps),

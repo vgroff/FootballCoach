@@ -25,7 +25,7 @@ from typing import Optional
 import numpy as np
 
 from footballcoach.ai.action.gating import select_action
-from footballcoach.ai.action.to_orders import (
+from footballcoach.ai.action.apply_nn_action import (
     OrderTranslationResult,
     apply_action_to_player,
     encode_slot_player_ids,

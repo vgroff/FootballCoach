@@ -268,9 +268,9 @@ class PPOTrainer:
                 ha = metrics.get("head_act", {})
                 act_str = (
                     f"  act: mv={ha.get('mv','?'):>3} gp={ha.get('gp','?'):>3}"
-                    f" spr={ha.get('spr','?'):>3} kck={ha.get('kck','?'):>3}"
-                    f" tk={ha.get('tk','?'):>3} sh={ha.get('sh','?'):>3}"
-                    f" hld={ha.get('hld','?'):>3}"
+                    f" emv={ha.get('emv','?'):>3} spr={ha.get('spr','?'):>3}"
+                    f" kck={ha.get('kck','?'):>3} tk={ha.get('tk','?'):>3}"
+                    f" sh={ha.get('sh','?'):>3} hld={ha.get('hld','?'):>3}"
                 ) if ha else ""
                 log.info(
                     f"step={self._total_steps:,} | "
@@ -788,6 +788,7 @@ class PPOTrainer:
         e_heads = self.execution_net(sf, of, em, bf, gf, d_heads)
 
         # Sample execution heads
+        exec_move = IndependentBernoulli(e_heads.exec_move_logit).sample()
         sprint = IndependentBernoulli(e_heads.sprint_logit).sample()
         kick = IndependentBernoulli(e_heads.kick_logit).sample()
         tackle_attempt = IndependentBernoulli(e_heads.tackle_attempt_logit).sample()
@@ -807,6 +808,7 @@ class PPOTrainer:
         kick_spin_raw = e_heads.kick_spin.squeeze(0)
 
         execution_physical = {
+            "exec_move": bool(exec_move.item() > 0.5),
             "move_direction": move_dir_phys.cpu().numpy(),
             "sprint": bool(sprint.item() > 0.5),
             "kick_this_tick": bool(kick.item() > 0.5),
@@ -822,7 +824,8 @@ class PPOTrainer:
             "shoot": shoot, "pass_": pass_, "move": move,
             "tackle": tackle, "gp_extra": gp_extra, "mark": mark, "hold": hold,
             "pass_tgt": pass_tgt, "tackle_tgt": tackle_tgt, "mark_tgt": mark_tgt,
-            "sprint": sprint, "kick": kick, "tackle_attempt": tackle_attempt,
+            "exec_move": exec_move, "sprint": sprint, "kick": kick,
+            "tackle_attempt": tackle_attempt,
             "move_dir_raw": move_dir_raw, "kick_dir_raw": kick_dir_raw,
             "kick_power_raw": e_heads.kick_power,
         }, em)
@@ -847,6 +850,7 @@ class PPOTrainer:
 
         # Raw execution samples needed to recompute log_prob during PPO update
         raw_exec_samples = {
+            "exec_move": np.array([float(exec_move)], dtype=np.float32),
             "sprint": np.array([float(sprint)], dtype=np.float32),
             "kick": np.array([float(kick)], dtype=np.float32),
             "tackle_attempt": np.array([float(tackle_attempt)], dtype=np.float32),
@@ -903,6 +907,7 @@ class PPOTrainer:
             )
 
         # Execution Bernoulli heads
+        lp += IndependentBernoulli(e_heads.exec_move_logit).log_prob(samples["exec_move"]).sum()
         lp += IndependentBernoulli(e_heads.sprint_logit).log_prob(samples["sprint"]).sum()
         lp += IndependentBernoulli(e_heads.kick_logit).log_prob(samples["kick"]).sum()
         lp += IndependentBernoulli(e_heads.tackle_attempt_logit).log_prob(
@@ -1029,6 +1034,7 @@ class PPOTrainer:
                         lp_gp       = _blp(d_heads.get_possession_raw, "get_possession_extra")
                         lp_mark     = _blp(d_heads.mark_logit, "mark")
                         lp_hold     = _blp(d_heads.hold_position_logit, "hold_position")
+                        lp_exec_mv  = _blp(e_heads.exec_move_logit, "exec_move")
                         lp_sprint   = _blp(e_heads.sprint_logit, "sprint")
                         lp_kick     = _blp(e_heads.kick_logit, "kick")
                         lp_tackle_a = _blp(e_heads.tackle_attempt_logit, "tackle_attempt")
@@ -1052,7 +1058,7 @@ class PPOTrainer:
                         f"    new_values={new_values.mean():.3f}  ret(mb)={mb_ret.mean():.3f}\n"
                         f"    shoot={lp_shoot:.3f} pass={lp_pass:.3f} move={lp_move:.3f} tackle={lp_tackle:.3f}\n"
                         f"    gp={lp_gp:.3f} mark={lp_mark:.3f} hold={lp_hold:.3f}\n"
-                        f"    sprint={lp_sprint:.3f} kick={lp_kick:.3f} t_attempt={lp_tackle_a:.3f}\n"
+                        f"    exec_mv={lp_exec_mv:.3f} sprint={lp_sprint:.3f} kick={lp_kick:.3f} t_attempt={lp_tackle_a:.3f}\n"
                         f"    move_dir={lp_movedir:.3f} kick_dir={lp_kickdir:.3f}\n"
                         f"    move_dir log_std={self.execution_net.move_dir_log_std.data.tolist()}\n"
                         f"    [move_dir] cur_norm={current_norm.mean():.3f}  stored_norm={stored_norm.mean():.3f}"
@@ -1234,6 +1240,7 @@ class PPOTrainer:
         head_act = {
             "mv":  _act("move"),
             "gp":  _act("get_possession_extra"),
+            "emv": _act("exec_move"),
             "spr": _act("sprint"),
             "kck": _act("kick"),
             "tk":  _act("tackle_attempt"),
@@ -1268,6 +1275,7 @@ class PPOTrainer:
         lp += _b(d_heads.get_possession_raw, "get_possession_extra")
         lp += _b(d_heads.mark_logit, "mark")
         lp += _b(d_heads.hold_position_logit, "hold_position")
+        lp += _b(e_heads.exec_move_logit, "exec_move")
         lp += _b(e_heads.sprint_logit, "sprint")
         lp += _b(e_heads.kick_logit, "kick")
         lp += _b(e_heads.tackle_attempt_logit, "tackle_attempt")
@@ -1305,8 +1313,8 @@ class PPOTrainer:
         for logit in [
             d_heads.shoot_logit, d_heads.pass_logit, d_heads.move_logit,
             d_heads.tackle_logit, d_heads.get_possession_raw, d_heads.mark_logit,
-            d_heads.hold_position_logit, e_heads.sprint_logit, e_heads.kick_logit,
-            e_heads.tackle_attempt_logit,
+            d_heads.hold_position_logit, e_heads.exec_move_logit, e_heads.sprint_logit,
+            e_heads.kick_logit, e_heads.tackle_attempt_logit,
         ]:
             ent += IndependentBernoulli(logit).entropy().mean()
         for logits in [d_heads.pass_target_logits, d_heads.tackle_target_logits, d_heads.mark_target_logits]:
@@ -1383,6 +1391,7 @@ def _action_to_numpy(action: DecisionAction, exec_samples: dict) -> dict[str, np
         "pass_target": np.array([action.pass_target], dtype=np.float32),
         "tackle_target": np.array([action.tackle_target], dtype=np.float32),
         "mark_target": np.array([action.mark_target], dtype=np.float32),
+        "exec_move": exec_samples["exec_move"],
         "sprint": exec_samples["sprint"],
         "kick": exec_samples["kick"],
         "tackle_attempt": exec_samples["tackle_attempt"],

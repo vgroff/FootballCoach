@@ -1,13 +1,13 @@
 """Apply neural network execution outputs directly to a player.
 
-THE NEURAL NETWORK NEVER ISSUES ORDERS. It sets player.desired_direction,
-player.desired_speed_mode, calls player.kick_direct(), and player.tackle_direct()
-directly. No MoveOrder, GetPossessionOrder, MarkOrder, or any other Order is
-ever created by this module.
+This module is the ONLY point where neural network outputs touch engine state.
+It sets player.desired_direction, player.desired_speed_mode, calls
+player.kick_direct(), and player.tackle_direct() directly.
 
-Orders exist for the rules-based AI only. The only connection between Orders
-and the neural network is that BC labels read what order a rules AI would issue
-and translate that into equivalent physical targets for imitation.
+No Orders are created here. Orders exist for the rules-based AI only.
+The only connection between Orders and the neural network is that BC labels
+read what order a rules AI would issue and translate that into equivalent
+physical targets for imitation.
 
 Slot-index -> player_id mapping: the ``slot_player_ids`` list (produced by
 the obs encoder during the same tick - same random shuffle) maps the
@@ -52,10 +52,13 @@ def apply_action_to_player(
     """
     from footballcoach.engine.movement import SpeedMode
 
-    # --- Movement: always set desired_direction + desired_speed_mode directly ---
-    d = gating.move_direction
-    if d is not None and np.linalg.norm(d) > 1e-6:
-        player.desired_direction = Vector3(float(d[0]), float(d[1]), 0.0)
+    # --- Movement: exec_move decides standstill vs moving; sprint decides speed ---
+    if gating.exec_move:
+        d = gating.move_direction
+        if d is not None and np.linalg.norm(d) > 1e-6:
+            player.desired_direction = Vector3(float(d[0]), float(d[1]), 0.0)
+        else:
+            player.desired_direction = Vector3.zero()
         player.desired_speed_mode = SpeedMode.SPRINT if gating.sprint else SpeedMode.JOG
     else:
         player.desired_direction = Vector3.zero()

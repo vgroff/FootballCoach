@@ -6,8 +6,9 @@ You may also have stuff in memory/storage for this repo.
 Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_plan.md, the ai_design_document.md and the ai_trainer_knowledge.md
 
 Immedaite task!!
-- get some demonstrations, and train
 Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 50k
+- big changes in direction and/or speed mode should also trigger demonstration recordings
+- give an option for the default time recoding resolution of demonstration tasks (different to actual simulation rate) - default at every 0.2 seconds
 - very suspicious that the ai "wins" against rules sometimes, given that it never wins in the UI. wins do only count when you get in the enemy box, correct?
 - Is the AI completely ignoring all the kick mechanics like direction and spin and just aimming for the centre of the box when it kicks? Why on earth was this implemented???
 
@@ -57,4 +58,4 @@ NB:
 - Show player attributes ands stamina somewhere on select
 - Could do grid search on the goalie intercept maneuver and clever positioning - ask that AI how the intercepting is chosen, but really we should calculate distance/speed for both options, and make a weighted choice based on those, no? throw in some params and re-tune the goalie bonuses probably
 - footballer heigh should vary - and therefore jump height
-- At some point ask an AI to read through everything and offer suggestions for refactors or cleanups, duplicate code/logic, comments and criticisms on structure, easy wins, possible bugs and edge cases etc... Do this before extending the game too much beyond the pitch
+- At some point ask an AI to read through everything and offer suggestions for refactors or cleanups, duplicate code/logic, string literals,  comments and criticisms on structure, easy wins, possible bugs and edge cases etc... Do this before extending the game too much beyond the pitch

@@ -70,20 +70,33 @@ def record_episodes(
     phase_id: int,
     episode_offset: int = 0,
     total_episodes: int | None = None,
+    sample_interval_s: float = 0.2,
 ) -> dict:
     """Run *n_episodes* with rules-based AI driving the trainee and opponent.
 
     Sampling strategy:
       - on_kick / on_tackle player callbacks fire at the exact engine tick the
-        action executes (inside the 15-tick window of env.step()) → recorded
-        immediately via closure.
-      - Once per env.step() (0.5s) the current state is also sampled.
+        action executes → always recorded regardless of sample interval.
+      - Time-based sampling at *sample_interval_s* cadence (default 0.2s),
+        independent of the neural-network decision interval (0.5s).
       - env.step() handles all terminal conditions normally (box possession,
         timeout) so episodes end correctly.
+
+    Args:
+        sample_interval_s: How often (in sim-seconds) to record a timed sample.
+            Kicks and tackles are always recorded via callbacks regardless.
+            Default is 0.2s.
 
     Returns a dict of numpy arrays ready to be saved as .npz.
     """
     from footballcoach.rules_ai import Phase1RulesAI
+
+    # Override the env's ticks-per-decision to match sample_interval_s so that
+    # env.step() advances by sample_interval_s and we sample at that cadence.
+    # Kicks/tackle callbacks are unaffected (they fire inside each env.step()).
+    orig_ticks = env._ticks_per_decision
+    sample_ticks = max(1, round(sample_interval_s / env._dt_s))
+    env._ticks_per_decision = sample_ticks
 
     self_feats = []
     other_feats = []
@@ -133,9 +146,9 @@ def record_episodes(
         done = False
         last_info = None
         while not done:
-            # Sample current state (0.5s cadence)
+            # Timed sample at sample_interval_s cadence
             _record_now()
-            # Step 15 physics ticks; callbacks fire inside here for kicks/tackles
+            # Advance sim by sample_interval_s; kick/tackle callbacks fire inside
             _obs, _reward, done, last_info = env.step()
 
         # Track episode outcome
@@ -158,6 +171,8 @@ def record_episodes(
                 f"Ep {global_ep}/{total_episodes} | steps: {steps_total:,} ({steps_valid:,} valid) | "
                 + "  ".join(parts)
             )
+
+    env._ticks_per_decision = orig_ticks  # restore original
 
     return {
         "obs_self_feat":   np.stack(self_feats).astype(np.float32),
@@ -187,6 +202,11 @@ def main() -> None:
     parser.add_argument("--output", type=str, required=True,
                         help="Output directory for .npz files")
     parser.add_argument("--seed", type=int, default=42)
+    _cfg = __import__("footballcoach.ai.config", fromlist=["load_ai_config"]).load_ai_config()
+    _default_interval = float(_cfg.get("bc", {}).get("demo_sample_interval_s", 0.2))
+    parser.add_argument("--sample-interval", type=float, default=_default_interval,
+                        help=f"Sim-seconds between timed samples (default: {_default_interval}). "
+                             "Kicks and tackles are always recorded regardless.")
     parser.add_argument("--info", action="store_true",
                         help="Print info about existing files and exit")
     args = parser.parse_args()
@@ -214,7 +234,8 @@ def main() -> None:
 
     log.info(
         f"Recording {n_eps} episodes of phase {args.phase} ({scenario_key}) "
-        f"→ {n_files} file(s) in {output_dir}"
+        f"→ {n_files} file(s) in {output_dir} "
+        f"[sample_interval={args.sample_interval}s]"
     )
 
     total_steps = 0
@@ -233,6 +254,7 @@ def main() -> None:
             phase_id=args.phase,
             episode_offset=episodes_done,
             total_episodes=n_eps,
+            sample_interval_s=args.sample_interval,
         )
         elapsed = time.time() - t0
 

@@ -241,7 +241,7 @@ class NeuralPlayerAI(PlayerAI):
 
     def act(self, player: "Player", match: "Match", trial_tick: int) -> None:
         from footballcoach.ai.obs.encoder import encode_observation, MAX_OTHER_PLAYERS
-        from footballcoach.ai.action.to_orders import apply_action_to_player
+        from footballcoach.ai.action.apply_nn_action import apply_action_to_player
         from footballcoach.ai.action.gating import select_action
 
         self._episode_ticks += 1

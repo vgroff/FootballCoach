@@ -55,6 +55,7 @@ class GatingResult:
     target_slot: Optional[int] = None
     # Physical (squashed/rescaled) continuous outputs, always set regardless
     # of which action is selected (execution network always runs).
+    exec_move: bool = False                          # True = move, False = standstill
     move_direction: Optional["np.ndarray"] = None   # 2D unit vector, (2,)
     sprint: bool = False
     kick_this_tick: bool = False
@@ -115,6 +116,7 @@ def select_action(
     return GatingResult(
         selected=selected,
         target_slot=target_slot,
+        exec_move=execution_physical.get("exec_move", False),
         move_direction=execution_physical.get("move_direction"),
         sprint=execution_physical.get("sprint", False),
         kick_this_tick=execution_physical.get("kick_this_tick", False),

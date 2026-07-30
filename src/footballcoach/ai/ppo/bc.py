@@ -21,7 +21,7 @@ Design rule: BC labels do NOT go through the PPO importance ratio / clipping.
 They are a separate, additive loss term. This means they can use actions taken
 by the rules-based AI (which has no π_old) without corrupting PPO's math.
 
-Flat tensor layout for stored BC labels (15 floats per step):
+Flat tensor layout for stored BC labels (16 floats per step):
   [0]  shoot
   [1]  pass_
   [2]  move
@@ -37,6 +37,7 @@ Flat tensor layout for stored BC labels (15 floats per step):
   [12] kick_this_tick    (1.0 = player is kicking this step, 0.0 otherwise)
   [13] tackle_attempt    (1.0 = player is tackling this step, 0.0 otherwise)
   [14] valid             (1.0 = use this label, 0.0 = skip BC loss for this step)
+  [15] exec_move         (1.0 = player is moving, 0.0 = standstill)
 """
 from __future__ import annotations
 
@@ -51,7 +52,7 @@ import torch.nn.functional as F
 
 log = logging.getLogger("footballcoach.ai.bc")
 
-BC_LABEL_DIM = 15  # elements in the flat label vector (see module docstring)
+BC_LABEL_DIM = 16  # elements in the flat label vector (see module docstring)
 
 # Indices into the flat label vector
 _I_SHOOT          = 0
@@ -69,6 +70,7 @@ _I_REGION_Y       = 11
 _I_KICK_THIS_TICK = 12
 _I_TACKLE_ATTEMPT = 13
 _I_VALID          = 14
+_I_EXEC_MOVE      = 15
 
 # Standard pitch half-dimensions used to normalise move_region supervision.
 # Kept as constants here so bc_loss_from_tensor doesn't need a pitch object.
@@ -97,6 +99,7 @@ class BCLabel:
     move_region_center_m: Optional[np.ndarray] = None  # shape (2,) physical metres
     kick_this_tick: float = 0.0   # execution: 1.0 if player is kicking this step
     tackle_attempt: float = 0.0   # execution: 1.0 if player is attempting a tackle
+    exec_move: float = 1.0        # execution: 1.0 if player is moving, 0.0 = standstill
     valid: bool = True
 
     def to_array(self) -> np.ndarray:
@@ -119,6 +122,7 @@ class BCLabel:
         arr[_I_KICK_THIS_TICK] = self.kick_this_tick
         arr[_I_TACKLE_ATTEMPT] = self.tackle_attempt
         arr[_I_VALID]          = 1.0 if self.valid else 0.0
+        arr[_I_EXEC_MOVE]      = self.exec_move
         return arr
 
     @staticmethod
@@ -151,12 +155,14 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     except (KeyError, AttributeError):
         return BCLabel.invalid()
 
-    # Execution heads (kick_this_tick, tackle_attempt, sprint) reflect what the
-    # rules AI is physically doing RIGHT NOW — i.e. the current order it's executing,
-    # before any new decision is made.
+    # Execution heads reflect what the rules AI is physically doing RIGHT NOW —
+    # i.e. the current order it's executing, before any new decision is made.
+    from footballcoach.orders import MoveOrder as _MoveOrder, GetPossessionOrder as _GPOrder
     current_exec = player.current_order
     kick_this_tick = 1.0 if isinstance(current_exec, (ShootOrder, KickOrder, PassOrder)) else 0.0
     tackle_attempt = 1.0 if isinstance(current_exec, ChaseTackleOrder) else 0.0
+    # exec_move: 1 if the rules AI is currently executing any movement order
+    exec_move_now = 1.0 if isinstance(current_exec, (_MoveOrder, _GPOrder)) else 0.0
 
     # Decision heads reflect what the rules AI DECIDES next.
     # Temporarily clear current_order so the AI always produces a fresh decision.
@@ -182,6 +188,7 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
             move_region_center_m=np.array([tgt.x, tgt.y], dtype=np.float32),
             kick_this_tick=kick_this_tick,
             tackle_attempt=tackle_attempt,
+            exec_move=1.0,
         )
     elif isinstance(order, GetPossessionOrder):
         ball = match.ball
@@ -199,6 +206,7 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
             move_region_center_m=np.array([bx, by], dtype=np.float32),
             kick_this_tick=kick_this_tick,
             tackle_attempt=tackle_attempt,
+            exec_move=1.0,
         )
     else:
         return BCLabel.invalid()
@@ -245,7 +253,8 @@ def bc_loss_from_tensor(
     loss += _bce(decision_heads.mark_logit,            _I_MARK)
     loss += _bce(decision_heads.hold_position_logit,   _I_HOLD)
 
-    # --- Execution: sprint, kick_this_tick, tackle_attempt Bernoullis ---
+    # --- Execution: exec_move, sprint, kick_this_tick, tackle_attempt Bernoullis ---
+    loss += _bce(exec_heads.exec_move_logit,       _I_EXEC_MOVE)
     loss += _bce(exec_heads.sprint_logit,          _I_SPRINT)
     loss += _bce(exec_heads.kick_logit,            _I_KICK_THIS_TICK)
     loss += _bce(exec_heads.tackle_attempt_logit,  _I_TACKLE_ATTEMPT)

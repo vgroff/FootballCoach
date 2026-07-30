@@ -111,7 +111,8 @@ class ExecutionHeadsRaw:
     See ai_design_doc.md section 8.6 for the full output surface.
     """
     move_direction: "torch.Tensor"         # (batch, 2) unit vector (L2-normalized in forward())
-    sprint_logit: "torch.Tensor"           # (batch, 1) Bernoulli: sprint vs jog
+    exec_move_logit: "torch.Tensor"        # (batch, 1) Bernoulli: move vs standstill
+    sprint_logit: "torch.Tensor"           # (batch, 1) Bernoulli: sprint vs jog (only when moving)
     kick_logit: "torch.Tensor"             # (batch, 1) Bernoulli: kick this tick?
     kick_direction: "torch.Tensor"         # (batch, 2) unit vector (L2-normalized in forward())
     kick_power: "torch.Tensor"             # (batch, 1) raw; sigmoid -> 0-1 power_fraction
@@ -125,7 +126,8 @@ class ExecutionHeadsRaw:
 class ExecutionAction:
     """Sampled action from the execution heads (stored in rollout buffer)."""
     move_direction_raw: np.ndarray = None  # shape (2,) pre-normalization raw 2-vector
-    sprint: float = 0.0                    # 0 = jog, 1 = sprint
+    exec_move: float = 0.0                 # 0 = standstill, 1 = move
+    sprint: float = 0.0                    # 0 = jog, 1 = sprint (only relevant when moving)
     kick: float = 0.0                      # 0 = no kick, 1 = kick this tick
     kick_direction_raw: np.ndarray = None  # shape (2,) pre-normalization
     kick_power_raw: float = 0.0            # pre-sigmoid raw

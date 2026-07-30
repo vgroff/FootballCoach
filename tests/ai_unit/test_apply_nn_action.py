@@ -1,4 +1,4 @@
-"""Unit tests for action/to_orders.py - neural network execution outputs -> direct player state.
+"""Unit tests for action/apply_nn_action.py - neural network execution outputs -> direct player state.
 
 The neural network NEVER issues Orders. It sets player.desired_direction,
 player.desired_speed_mode, and calls player.kick_direct() / player.tackle_direct().
@@ -14,7 +14,7 @@ import random
 import pytest
 
 from footballcoach.ai.action.gating import GatingResult, SelectedAction
-from footballcoach.ai.action.to_orders import apply_action_to_player
+from footballcoach.ai.action.apply_nn_action import apply_action_to_player
 from footballcoach.engine.movement import SpeedMode
 from footballcoach.entities.player import PlayerState
 from footballcoach.mathutils import Vector3
@@ -32,12 +32,13 @@ _KICK_SPIN = np.zeros(3)
 
 
 def _gating(selected: SelectedAction, target_slot: int | None = None,
-             move_dir=None, sprint=True, kick=False,
+             move_dir=None, exec_move=True, sprint=True, kick=False,
              kick_dir=None, kick_power=0.8, kick_spin=None,
              tackle_attempt=False) -> GatingResult:
     return GatingResult(
         selected=selected,
         target_slot=target_slot,
+        exec_move=exec_move,
         move_direction=move_dir if move_dir is not None else _MOVE_DIR,
         sprint=sprint,
         kick_this_tick=kick,
@@ -176,16 +177,14 @@ class TestMove:
         assert player.desired_speed_mode == SpeedMode.SPRINT
 
     def test_zero_direction_sets_standstill(self, solo_match):
-        """Zero / None move_direction -> STANDSTILL, no movement."""
+        """exec_move=False -> STANDSTILL regardless of move_direction."""
         player = solo_match.player_by_id("p1")
-        _apply(_gating(SelectedAction.NONE, move_dir=np.zeros(2)), solo_match, "p1")
+        _apply(_gating(SelectedAction.NONE, exec_move=False, move_dir=np.array([1.0, 0.0])), solo_match, "p1")
         assert player.desired_speed_mode == SpeedMode.STANDSTILL
         assert player.current_order is None
 
     def test_none_action_with_direction_still_moves(self, solo_match):
-        """NONE (all decision heads < 0.5) does NOT stop the player.
-        The execution network's move_direction always drives desired_speed_mode.
-        STANDSTILL only happens when move_direction is near-zero (see test_zero_direction_sets_standstill)."""
+        """NONE (all decision heads < 0.5) with exec_move=True still moves the player."""
         player = solo_match.player_by_id("p1")
-        _apply(_gating(SelectedAction.NONE, move_dir=np.array([1.0, 0.0]), sprint=True), solo_match, "p1")
+        _apply(_gating(SelectedAction.NONE, exec_move=True, move_dir=np.array([1.0, 0.0]), sprint=True), solo_match, "p1")
         assert player.desired_speed_mode == SpeedMode.SPRINT

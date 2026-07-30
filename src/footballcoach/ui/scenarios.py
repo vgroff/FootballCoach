@@ -706,7 +706,7 @@ def _apply_neural_action(trainer, match: Match, player_id: str, trial_tick: int)
     """Run one neural decision for player_id; falls back to GetPossessionOrder on error."""
     import torch
     from footballcoach.ai.obs.encoder import encode_observation, MAX_OTHER_PLAYERS
-    from footballcoach.ai.action.to_orders import apply_action_to_player, encode_slot_player_ids
+    from footballcoach.ai.action.apply_nn_action import apply_action_to_player, encode_slot_player_ids
     from footballcoach.ai.action.gating import select_action
 
     try:

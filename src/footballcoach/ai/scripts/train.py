@@ -55,6 +55,9 @@ def main() -> None:
                         help="Minibatch size for offline BC pre-training (default: bc.bc_pretrain_batch_size in ai_config.json).")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable debug-level logs (per-minibatch details, per-head diagnostics).")
+    parser.add_argument("--pre-ppo-eval-trials", type=int, default=40,
+                        help="Episodes to evaluate vs rules-based AI after pre-training, before "
+                             "PPO starts. Set to 0 to skip (default: 40).")
     args = parser.parse_args()
 
     if args.verbose:
@@ -171,6 +174,17 @@ def main() -> None:
                     n_epochs=value_pretrain_epochs,
                     lr=value_pretrain_lr,
                 )
+
+    # Quick pre-PPO evaluation against rules-based AI
+    if args.pre_ppo_eval_trials > 0:
+        from footballcoach.ai.scripts.evaluate import _run_evaluation
+        log.info(f"Pre-PPO eval: {args.pre_ppo_eval_trials} episodes vs rules-based AI...")
+        eval_stats = _run_evaluation(trainer, env, args.pre_ppo_eval_trials)
+        log.info(
+            f"Pre-PPO eval result: win={eval_stats['win_rate_pct']:.1f}%  "
+            f"mean_rew={eval_stats['mean_reward']:.3f}  "
+            f"outcomes={eval_stats['outcomes']}"
+        )
 
     # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0)
     aux_label_fn = None if (args.no_bc_aux or label_fn is None) else label_fn

@@ -205,6 +205,7 @@ class TestExecutionNetwork:
 
     @pytest.mark.parametrize("field,expected_shape", [
         ("move_direction", (2, 2)),
+        ("exec_move_logit", (2, 1)),
         ("sprint_logit", (2, 1)),
         ("kick_logit", (2, 1)),
         ("kick_direction", (2, 2)),
@@ -224,7 +225,7 @@ class TestExecutionNetwork:
         torch.manual_seed(1)
         heads = self._run(execution_net, decision_net, batch_size=4)
         for field in [
-            "move_direction", "sprint_logit", "kick_logit",
+            "move_direction", "exec_move_logit", "sprint_logit", "kick_logit",
             "kick_direction", "kick_power", "kick_spin",
             "tackle_attempt_logit", "value",
         ]:
@@ -234,6 +235,7 @@ class TestExecutionNetwork:
 
     def test_batch_size_one_works(self, decision_net, execution_net):
         heads = self._run(execution_net, decision_net, batch_size=1)
+        assert heads.exec_move_logit.shape == (1, 1)
         assert heads.sprint_logit.shape == (1, 1)
 
 

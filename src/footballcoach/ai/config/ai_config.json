@@ -56,21 +56,23 @@
   "bc": {
     "_comment": "Behavioural cloning from rules-based AI. Set pretrain_steps=0 to skip pre-training. Set aux_coeff_start=0.0 to disable the PPO auxiliary BC loss.",
     "pretrain_steps": 6000,
-    "pretrain_lr": 1e-3,
+    "pretrain_lr": 7e-3,
     "pretrain_online_batch_size": 16,
     "direction_loss_weight": 3.0,
-    "aux_coeff_start": 0.5,
+    "aux_coeff_start": 0.7,
     "aux_coeff_end": 0.0,
-    "aux_coeff_anneal_fraction": 0.2,
+    "aux_coeff_anneal_fraction": 0.35,
     "_comment_aux": "aux_coeff anneals linearly from start to end over aux_coeff_anneal_fraction of training (e.g. 0.3 = done by 30% of steps). The BC loss is computed on decision Bernoulli heads and execution move_direction.",
-    "bc_pretrain_epochs": 10,
-    "bc_pretrain_batch_size": 2048,
+    "bc_pretrain_epochs": 8,
+    "bc_pretrain_batch_size": 1024,
     "value_pretrain_steps": 4096,
-    "value_pretrain_epochs": 10,
+    "value_pretrain_epochs": 2,
     "value_pretrain_lr": 2e-3,
-    "bc_repair_epochs": 2,
-    "bc_repair_lr": 1e-3,
-    "_comment_value": "After BC pre-training, run value-only MSE warm-up so the critic is near the true return scale before PPO starts. Set value_pretrain_steps=0 to skip."
+    "bc_repair_epochs": 1,
+    "bc_repair_lr": 2e-3,
+    "_comment_value": "After BC pre-training, run value-only MSE warm-up so the critic is near the true return scale before PPO starts. Set value_pretrain_steps=0 to skip.",
+    "demo_sample_interval_s": 1.5,
+    "_comment_demo_sample": "Time between timed observation samples during demonstration recording. Kicks and tackles are always recorded regardless."
   },
 
   "ema": {
