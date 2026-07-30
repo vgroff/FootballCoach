@@ -3,13 +3,29 @@ to the AI: Do not read this ever, they are just notes for me
 Read Idea.md, and all the READMe and knowledge files, except Idea2 and ai_plans and ai_design_doc and the other ai-related ones.
 You may also have stuff in memory/storage for this repo.
 
+I'm going to give another agent the following task, empty context:
+Read ai_trainer_knowledge.md, and then run a training run.
+
+I want you to add 100-300 words of extra detail on the current situation/problems, debug logs you've added, things to look out for, lines of investigation etc... Also state that the demonstration needs re-doing, and give the relevant terminal commands to run both
+
 Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_plan.md, the ai_design_document.md and the ai_trainer_knowledge.md
 
 Immedaite task!!
-Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 30k
-- give an option for the default time recoding resolution of demonstration tasks (different to actual simulation rate) - default at every 0.2 seconds
+Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 50k . We're only going against immovile opnent, should it should be easy
 - very suspicious that the ai "wins" against rules sometimes, given that it never wins in the UI. wins do only count when you get in the enemy box, correct?
 - Is the AI completely ignoring all the kick mechanics like direction and spin and just aimming for the centre of the box when it kicks? Why on earth was this implemented???
+
+What to watch for:
+mv_ls_grad in rollout lines — new field, format mv_ls=[X.XXXX,X.XXXX] g=X.XXe-XX. The grad value tells you what's pushing log_std. Expect very small (~1e-4 to 1e-3); if it's near zero every rollout, the direction uncertainty is genuinely stuck in an entropy/policy gradient equilibrium. If it's large (>1e-2) and log_std keeps moving, something is pulling it hard.
+
+steps_this_update — with target_kl=0.08 (relaxed from 0.05), the 33% of rollouts that were firing at mb0 (1 step) should now get 2–4 steps instead. If you still see frequent steps_this_update=1, the KL is legitimately high and 0.08 isn't enough headroom — consider 0.10.
+
+Win rates after BC annealing ends — BC annealing with aux_coeff_anneal_fraction=0.35 means annealing is complete by step ~17,500. Watch the rollouts from step 20k onward: do win rates hold (≥75%) or drift down? Run23 was stable post-anneal; confirm run24 matches.
+
+UI — the movement bug is fixed. Run the Phase 1 Neural AI scenario with run23's final checkpoint — players should now actively chase the ball every 15 ticks rather than freezing.
+
+pol loss — run23 had pol oscillating −0.11 to +0.12 (healthy). If it goes consistently negative for several rollouts in a row after annealing, that's the policy degrading signal; check KL simultaneously.
+
 
 Immediate AI stuff
 - Can we do some trainings runs and then see and see if the trained AI is able to beat the rules-based AI more consistently or at least at a simiar rate than another rules-based AI could?
@@ -18,6 +34,7 @@ Immediate AI stuff
     - let me also create my own scenarios and play them as training "demonstrations" entirely in the UI, using the actions/orders and having that recorded, and then it gets used for training. store the orders too for neural network training and replaying
     - Allow me to replay the demonstrations in the UI - either through orders or through actions
 - during the demonstration collection, print summary stats of the reward scores for each player (they might sum to 0)
+- We could super easliy remove a whole axis of symmetry by transforming all AI positions to being +x is attacking goal, -x is dending goal, remove the flag for which end youre attacking on and transform back and forth from the engine positions to the AI positions. Would probably mean a smaller/smarter AI
 - Think about how GetPossesion, Tackle and Move orders are going to interact - they could work together. The Orders would need to break down into AI suggestions maybe
 
 Next immediate training:
@@ -33,8 +50,9 @@ AI stuff:
 NB Immediate Immediate:
 - 2V2 scenario is completely broken, I think GK is on the wrong team, and probbaly other shit. Fix it. Also, the through ball pass is doing an awful job of predicting where the player will be, can we hit the pass harder? Maybe for the scenario, make the second attacker move slower, also, is he running GetPossession during the pass?
 - The goalkeeper clearly teleports after saving the ball sometimes, wtf is that about??
-- Controlling the ball also makes players static I think probably change that
+- Controlling the ball also makes players static I think probably change that, same as with tackling
 - We want a bit more visual excitment. Can we display some icons under/over/on top of a player for 1.2 seconds after he carries out an action like kick, tackle, taking control (do a differenet one for goalies) or switching between moving stances/speeds - you can use the leg, hand(GK), wind, running, idle (U+1F574) and soccer ball icons, or any you think are more appropriate, but please no more than 2 per icons per action.
+- Much better kick action UI - 1. start kick action by clicking on already selected player, and point in a direction and give it a length (this is xy direction and power) - show the trajectory and error margins as you do so. 2. once you've clicked to select that, moving the mouse back and forth alters the z direction - keep showing the trajectory, and highlight red the parts of the trajetory that are above goal height. 3. Add left/right and up/down spin by circling the kicking player, and once again show the effect and how the error margins are affected
 - Why is the ball.possessed_by still using a player_id?? Do we enforce unique player_ids?? It seems so much easier to use just use the possesed_by field be player type rather than string, ball.possessed_by = kicker, instead of kicker.player_id. Is there an issue with circular references or something? If so, can't it be solved gracefully by refactoring or something? If not, it's okay, it just seems ugly
 - Maybe slightly reduce the size of the player spheres?
 - Is the game log permanent and can I copy/paste from it?
@@ -56,5 +74,5 @@ NB:
     - also implement rebounds off players for failed ball controls and from succesful tackles
 - Show player attributes ands stamina somewhere on select
 - Could do grid search on the goalie intercept maneuver and clever positioning - ask that AI how the intercepting is chosen, but really we should calculate distance/speed for both options, and make a weighted choice based on those, no? throw in some params and re-tune the goalie bonuses probably
-- footballer heigh should vary - and therefore jump height
-- At some point ask an AI to read through everything and offer suggestions for refactors or cleanups, duplicate code/logic, string literals,  comments and criticisms on structure, easy wins, possible bugs and edge cases etc... Do this before extending the game too much beyond the pitch
+- footballer height should vary - and therefore jump height
+- At some point ask an AI to: "read through everything - except for now, the ai folder (but do read rules_ai.py) and offer suggestions for refactors or cleanups, duplicate code/logic, string literals, inconsistent documentation/knowledge files, comments and criticisms on structure, easy wins, possible bugs and edge cases, test cases etc... Even if you see something is already explained/documented, if you're not convinced by the explanation or if it still seems dodgy/potentially wrong, bring it up". Do this before extending the game too much beyond the pitch

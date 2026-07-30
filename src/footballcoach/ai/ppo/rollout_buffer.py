@@ -19,6 +19,14 @@ from typing import Optional  # noqa: F401 - used in add() signature
 import numpy as np
 import torch
 
+# Fixed-order per-head log_prob keys.  Must stay in sync with _sample_action
+# in ppo_trainer.py and the DEBUG printing in _ppo_update.
+HEAD_LP_KEYS = [
+    "shoot", "pass_", "move", "tackle", "gp_extra", "mark", "hold",
+    "exec_move", "sprint", "kick", "tackle_attempt",
+    "move_dir", "kick_dir",
+]
+
 
 @dataclass
 class RolloutBuffer:
@@ -59,6 +67,11 @@ class RolloutBuffer:
     # is provided (bc_labels[t][_I_VALID] == 0.0 → skip BC loss for this step).
     bc_labels: list[np.ndarray] = field(default_factory=list)
 
+    # Per-head log_probs from the old policy (len(HEAD_LP_KEYS),) float32 array.
+    # Used for DEBUG per-head KL breakdown in _ppo_update.  All-zeros when
+    # not available (secondary player transitions, old checkpoints).
+    head_log_probs: list[np.ndarray] = field(default_factory=list)
+
     def add(
         self,
         obs: dict[str, np.ndarray],
@@ -68,6 +81,7 @@ class RolloutBuffer:
         reward: float,
         done: float,
         bc_label: Optional[np.ndarray] = None,
+        head_log_probs: Optional[np.ndarray] = None,
     ) -> None:
         from footballcoach.ai.ppo.bc import BC_LABEL_DIM
         self.obs.append(obs)
@@ -79,6 +93,10 @@ class RolloutBuffer:
         self.bc_labels.append(
             bc_label if bc_label is not None
             else np.zeros(BC_LABEL_DIM, dtype=np.float32)
+        )
+        self.head_log_probs.append(
+            head_log_probs if head_log_probs is not None
+            else np.zeros(len(HEAD_LP_KEYS), dtype=np.float32)
         )
 
     def __len__(self) -> int:
@@ -169,6 +187,11 @@ class RolloutBuffer:
                 np.stack(self.bc_labels, axis=0).astype(np.float32)
             )
 
+        if self.head_log_probs:
+            result["head_log_probs"] = torch.from_numpy(
+                np.stack(self.head_log_probs, axis=0).astype(np.float32)
+            )
+
         return result
 
     def clear(self) -> None:
@@ -179,3 +202,4 @@ class RolloutBuffer:
         self.rewards.clear()
         self.dones.clear()
         self.bc_labels.clear()
+        self.head_log_probs.clear()

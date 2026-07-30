@@ -453,9 +453,9 @@ class TestGlobalFeatures:
         pitch = solo_match.pitch
         obs = encode_observation(solo_match, "p1", time_remaining_s=60.0,
                                  rng=random.Random(0))
-        # Indices 2,3 are pitch_length_m, pitch_width_m
-        assert obs.global_feat[2] == pytest.approx(pitch.length_m, rel=1e-4)
-        assert obs.global_feat[3] == pytest.approx(pitch.width_m, rel=1e-4)
+        # Indices 2,3 are pitch_length_norm, pitch_width_norm (normalised by standard dims)
+        assert obs.global_feat[2] == pytest.approx(pitch.length_m / 105.0, rel=1e-4)
+        assert obs.global_feat[3] == pytest.approx(pitch.width_m / 68.0, rel=1e-4)
 
 
 # ---------------------------------------------------------------------------

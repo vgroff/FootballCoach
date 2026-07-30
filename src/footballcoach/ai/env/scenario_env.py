@@ -46,7 +46,8 @@ class StepInfo:
     illegal_reason: str = ""
     trial_outcome: Optional[str] = None  # "goal", "miss", "dispossessed", etc.
     ticks_elapsed: int = 0
-    is_rules_episode: bool = False  # True when opponent is rules-based (50% of Phase 1 episodes)
+    is_rules_episode: bool = False    # True when opponent is rules-based
+    is_immobile_episode: bool = False  # True when opponent is immobile
 
 
 class ScenarioEnv:
@@ -171,7 +172,8 @@ class ScenarioEnv:
                 pass
 
             is_rules_episode = getattr(match, "_opponent_use_rules_ai", False)
-            if not is_rules_episode:
+            is_immobile_episode = getattr(match, "_opponent_is_immobile", False)
+            if not is_rules_episode and not is_immobile_episode:
                 for pid in self.secondary_player_ids:
                     try:
                         sec_player = match.player_by_id(pid)
@@ -353,6 +355,7 @@ class ScenarioEnv:
             info.trial_outcome = outcome_label
 
         info.is_rules_episode = getattr(match, "_opponent_use_rules_ai", False)
+        info.is_immobile_episode = getattr(match, "_opponent_is_immobile", False)
         info.ticks_elapsed = self._episode_ticks
 
         # --- Collect trainee transition from NeuralPlayerAI ---

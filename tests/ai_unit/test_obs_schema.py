@@ -25,16 +25,17 @@ from footballcoach.ai.obs.schema import (
 # Dimension constants
 # ---------------------------------------------------------------------------
 
-def test_player_feature_dim_is_25():
-    """PLAYER_FEATURE_DIM must stay 25 (change this test IFF you change the schema).
+def test_player_feature_dim_is_27():
+    """PLAYER_FEATURE_DIM must stay 27 (change this test IFF you change the schema).
 
     Fields: rel_dx, rel_dy, distance_m, velocity_x, velocity_y, speed_mps,
     heading_sin, heading_cos, stamina, top_speed, acceleration, kick_power,
     kick_precision, dribbling, ball_control, tackling, stamina_attr,
     is_own_team, is_self, has_possession, is_inactive_tackled,
-    is_controlling_ball, is_goalkeeper, attacking_direction, exists.
+    is_controlling_ball, is_goalkeeper, attacking_direction, exists,
+    pos_x, pos_y.
     """
-    assert PLAYER_FEATURE_DIM == 25
+    assert PLAYER_FEATURE_DIM == 27
 
 
 def test_ball_feature_dim_is_12():
@@ -114,15 +115,16 @@ def test_player_features_first_three_are_position():
     assert arr[2] == pytest.approx(3.0)
 
 
-def test_player_features_exists_is_last():
-    """'exists' is the last field (index 25)."""
-    feat = PlayerFeatures(exists=1.0)
+def test_player_features_pos_are_last_two():
+    """pos_x and pos_y are the last two fields (indices 25, 26)."""
+    import dataclasses
+    names = [f.name for f in dataclasses.fields(PlayerFeatures)]
+    assert names[-2] == "pos_x"
+    assert names[-1] == "pos_y"
+    feat = PlayerFeatures(pos_x=0.5, pos_y=-0.3)
     arr = feat.to_array()
-    assert arr[-1] == pytest.approx(1.0)
-    # All-zero default except exists -> only last element non-zero
-    feat_zero = PlayerFeatures()  # exists=0.0 by default
-    arr_zero = feat_zero.to_array()
-    assert arr_zero[-1] == pytest.approx(0.0)
+    assert arr[-2] == pytest.approx(0.5)
+    assert arr[-1] == pytest.approx(-0.3)
 
 
 def test_ball_features_is_possessed_second_to_last():

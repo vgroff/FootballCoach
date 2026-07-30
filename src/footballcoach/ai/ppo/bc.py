@@ -220,21 +220,37 @@ def bc_loss_from_tensor(
     labels: torch.Tensor,
     decision_heads,
     exec_heads,
-) -> torch.Tensor:
+    direction_loss_weight: float = 3.0,
+    region_loss_weight: float = 1.0,
+    return_breakdown: bool = False,
+):
     """Compute BC loss for a minibatch, given packed label tensors.
 
     Args:
         labels: (N, BC_LABEL_DIM) float32 tensor from the rollout buffer.
         decision_heads: DecisionHeadsRaw from decision_net forward pass.
         exec_heads: ExecutionHeadsRaw from execution_net forward pass.
+        direction_loss_weight: Multiplier on the move_direction cosine loss.
+            From ai_config.json['bc']['direction_loss_weight'] (default 3.0).
+            Upweights direction relative to ~11 Bernoulli BCE heads so it gets
+            proportional gradient pressure.
+        region_loss_weight: Multiplier on the move_region_center MSE loss.
+            From ai_config.json['bc']['region_loss_weight'] (default 1.0).
+            Separate from direction_loss_weight: in Phase 1 the region target
+            (ball position proxy) is noisy and less critical.
+        return_breakdown: If True, also return a dict of per-group mean losses
+            {decision, exec_bce, sprint, move, direction, region} for diagnostics.
 
     Returns:
-        Scalar BC loss (mean over valid steps).  Returns zero tensor if no
-        valid steps in the batch.
+        Scalar BC loss (mean over valid steps), or (loss, breakdown_dict) if
+        return_breakdown=True.  Returns zero tensor if no valid steps.
     """
     valid = labels[:, _I_VALID] > 0.5  # (N,) bool
+    _zero = torch.zeros(1, device=labels.device)
     if not valid.any():
-        return torch.zeros(1, device=labels.device)
+        if return_breakdown:
+            return _zero, {"decision": 0.0, "exec_bce": 0.0, "sprint": 0.0, "move": 0.0, "direction": 0.0, "region": 0.0}
+        return _zero
 
     loss = torch.zeros(labels.shape[0], device=labels.device)
 
@@ -245,55 +261,75 @@ def bc_loss_from_tensor(
             logit.squeeze(-1), target, reduction="none"
         )
 
-    loss += _bce(decision_heads.shoot_logit,          _I_SHOOT)
-    loss += _bce(decision_heads.pass_logit,            _I_PASS)
-    loss += _bce(decision_heads.move_logit,            _I_MOVE)
-    loss += _bce(decision_heads.tackle_logit,          _I_TACKLE)
-    loss += _bce(decision_heads.get_possession_raw,    _I_GP_EXTRA)
-    loss += _bce(decision_heads.mark_logit,            _I_MARK)
-    loss += _bce(decision_heads.hold_position_logit,   _I_HOLD)
+    dec_loss = (
+        _bce(decision_heads.shoot_logit,          _I_SHOOT)
+        + _bce(decision_heads.pass_logit,          _I_PASS)
+        + _bce(decision_heads.move_logit,          _I_MOVE)
+        + _bce(decision_heads.tackle_logit,        _I_TACKLE)
+        + _bce(decision_heads.get_possession_raw,  _I_GP_EXTRA)
+        + _bce(decision_heads.mark_logit,          _I_MARK)
+        + _bce(decision_heads.hold_position_logit, _I_HOLD)
+    )
+    loss += dec_loss
 
-    # --- Execution: exec_move, sprint, kick_this_tick, tackle_attempt Bernoullis ---
-    loss += _bce(exec_heads.exec_move_logit,       _I_EXEC_MOVE)
-    loss += _bce(exec_heads.sprint_logit,          _I_SPRINT)
-    loss += _bce(exec_heads.kick_logit,            _I_KICK_THIS_TICK)
-    loss += _bce(exec_heads.tackle_attempt_logit,  _I_TACKLE_ATTEMPT)
-
-    # Direction losses are upweighted relative to the 8 BCE terms (weight=3.0).
-    # BCE heads converge quickly; direction needs more gradient pressure.
-    dir_w = 3.0
+    # --- Execution BCE heads: exec_move, sprint, kick, tackle_attempt ---
+    sprint_loss   = _bce(exec_heads.sprint_logit,           _I_SPRINT)
+    move_loss     = _bce(exec_heads.exec_move_logit,        _I_EXEC_MOVE)
+    exec_bce_loss = (
+        move_loss
+        + sprint_loss
+        + _bce(exec_heads.kick_logit,               _I_KICK_THIS_TICK)
+        + _bce(exec_heads.tackle_attempt_logit,     _I_TACKLE_ATTEMPT)
+    )
+    loss += exec_bce_loss
 
     # --- Execution: move_direction cosine loss ---
-    # Only where we have a valid direction (both components nonzero)
+    # Upweighted by direction_loss_weight so the single continuous head gets
+    # proportional gradient against ~11 Bernoulli heads.
+    # 1 - cosine_similarity → 0 when aligned, 2 when opposite.
+    dir_loss_per = torch.zeros(labels.shape[0], device=labels.device)
     has_dir = (labels[:, _I_DIR_X].abs() + labels[:, _I_DIR_Y].abs()) > 1e-6
     if has_dir.any():
         target_dir = labels[:, _I_DIR_X:_I_DIR_Y + 1]  # (N, 2)
         pred_dir = exec_heads.move_direction             # (N, 2) raw (pre-normalize)
         eps = 1e-6
         pred_norm = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
-        # 1 - cosine similarity → 0 when perfectly aligned, 2 when opposite
         cos_loss = 1.0 - (pred_norm * target_dir).sum(dim=-1)
-        loss += dir_w * torch.where(has_dir, cos_loss, torch.zeros_like(cos_loss))
+        dir_loss_per = direction_loss_weight * torch.where(has_dir, cos_loss, torch.zeros_like(cos_loss))
+        loss += dir_loss_per
 
-    # --- Decision: move_region_center MSE (normalised by pitch dims) ---
-    # Supervise the continuous region-center output that becomes the MoveOrder target.
-    # Normalise to [-1,1] so the loss scale matches the other terms.
-    # The network outputs tanh(raw)*[half_length, half_width]; we compare in
-    # normalised space so both are in [-1, 1].
+    # --- Decision: move_region_center MSE (normalised to [-1, 1]) ---
+    # Weighted by region_loss_weight (default 1.0, separate from direction).
+    # In Phase 1 the region target is a noisy proxy for ball position; keep
+    # weight low so it does not inflate the BC loss floor unnecessarily.
+    region_loss_per = torch.zeros(labels.shape[0], device=labels.device)
     has_region = (labels[:, _I_REGION_X].abs() + labels[:, _I_REGION_Y].abs()) > 1e-6
     if has_region.any():
         pitch_scale = torch.tensor(
             [[_PITCH_HALF_LENGTH_M, _PITCH_HALF_WIDTH_M]], device=labels.device
         )
         target_region = labels[:, _I_REGION_X:_I_REGION_Y + 1]  # (N, 2) physical m
-        target_norm = (target_region / pitch_scale).clamp(-1.0, 1.0)  # normalised
+        target_norm = (target_region / pitch_scale).clamp(-1.0, 1.0)
         pred_norm_region = torch.tanh(decision_heads.move_region_center)  # (N, 2) in [-1,1]
-        region_loss = ((pred_norm_region - target_norm) ** 2).sum(dim=-1)  # per-sample MSE * 2
-        loss += dir_w * torch.where(has_region, region_loss, torch.zeros_like(region_loss))
+        region_mse = ((pred_norm_region - target_norm) ** 2).sum(dim=-1)
+        region_loss_per = region_loss_weight * torch.where(has_region, region_mse, torch.zeros_like(region_mse))
+        loss += region_loss_per
 
     # Mask to valid steps only and mean
     valid_loss = loss[valid]
-    return valid_loss.mean() if len(valid_loss) > 0 else torch.zeros(1, device=labels.device)
+    total = valid_loss.mean() if len(valid_loss) > 0 else _zero
+
+    if return_breakdown:
+        breakdown = {
+            "decision":  float(dec_loss[valid].mean()),
+            "exec_bce":  float(exec_bce_loss[valid].mean()),
+            "sprint":    float(sprint_loss[valid].mean()),
+            "move":      float(move_loss[valid].mean()),
+            "direction": float(dir_loss_per[valid].mean()),
+            "region":    float(region_loss_per[valid].mean()),
+        }
+        return total, breakdown
+    return total
 
 
 # ---------------------------------------------------------------------------

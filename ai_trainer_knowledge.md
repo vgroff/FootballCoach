@@ -43,6 +43,14 @@ uv run python -m footballcoach.ai.scripts.train \
 # BC aux loss anneals to zero by 30% of training (aux_coeff_anneal_fraction=0.3 in config)
 # — after that the network is fully free to explore via PPO rewards.
 
+# Skip pre-training by reusing an existing pretrained checkpoint — fastest iteration.
+# --from-pretrained accepts a directory (auto-finds checkpoint_pretrained.pt) or a file path.
+# BC pre-training is saved as checkpoint_pretrained.pt in the checkpoint-dir automatically.
+uv run python -m footballcoach.ai.scripts.train \
+    --phase 1 --total-steps 50000 --seed 42 \
+    --checkpoint-dir checkpoints/phase1_run24/ \
+    --from-pretrained checkpoints/phase1_run23/
+
 # Resume from a checkpoint (BC pre-training is skipped on resume)
 uv run python -m footballcoach.ai.scripts.train \
     --phase 1 --total-steps 200000 \
@@ -95,7 +103,7 @@ Override the save directory with `--checkpoint-dir path/`.
 
 | File | Why it matters |
 |------|----------------|
-| `src/footballcoach/ai/obs/schema.py` | Feature vector dataclasses; defines `PLAYER_FEATURE_DIM=26`, `BALL_FEATURE_DIM=12`, `GLOBAL_FEATURE_DIM=12` |
+| `src/footballcoach/ai/obs/schema.py` | Feature vector dataclasses; defines `PLAYER_FEATURE_DIM=27`, `BALL_FEATURE_DIM=12`, `GLOBAL_FEATURE_DIM=11` |
 | `src/footballcoach/ai/obs/encoder.py` | `encode_observation(match, player_id, time_remaining_s, ...)` → `ObservationBatch` |
 | `src/footballcoach/ai/models/decision_network.py` | `DecisionNetwork.from_config()` |
 | `src/footballcoach/ai/models/execution_network.py` | `ExecutionNetwork.from_config()` |
@@ -193,21 +201,33 @@ loop:
     env.step() → (next_obs, reward, done, info)
     # NeuralPlayerAI sampled inside Match.step(); transition in env.last_trainee_transition
     tr = env.last_trainee_transition
-    buffer.add(obs=tr["obs"], action=..., log_prob=tr["log_prob"], ...)
-    if buffer full (2048 steps):
+    buffer.add(obs=tr["obs"], action=..., log_prob=tr["log_prob"],
+               head_log_probs=tr["head_log_probs"], ...)  # per-head lps for DEBUG KL
+    if buffer full (4096 steps):
+        augment_batch (12× with flips + slot permutations)
         compute_gae(gamma=0.99, lam=0.95, last_value)
-        _ppo_update(batch) → 4 epochs, minibatches of 64
+        _ppo_update(batch) → up to 4 epochs × minibatches of 64
+            # early stop fires per-MINIBATCH when KL > target_kl (0.05)
+            # typically stops after 1-3 minibatch steps
         _save_checkpoint(step)
         buffer.clear()
     if done: env.reset()
 ```
 
-One rollout = 2048 decision steps = ~1024 sim-seconds = ~8.5 min of sim time.
+One rollout = 4096 decision steps (12× augmented = 49,152 effective samples).
+With target_kl=0.05 and per-minibatch early stop, each rollout typically
+generates 1–10 gradient steps rather than 768+ (which caused policy collapse).
+
+**Per-head log_probs in buffer**: `tr["head_log_probs"]` stores the 13 individual
+head log_probs (shoot, pass, move, tackle, gp_extra, mark, hold, exec_move, sprint,
+kick, tackle_attempt, move_dir, kick_dir) computed at sample time.  These are
+packed into `batch["head_log_probs"]` and used in the `[KL > threshold]` diagnostic
+block to show which heads changed most since the rollout was collected.
 
 ### 3.4 Observation encoding
 
 `encode_observation(match, player_id, time_remaining_s, ...)`:
-- Builds `PlayerFeatures` for self (rel_dx=0, is_self=1) and up to 21 others.
+- Builds `PlayerFeatures` (28 floats) for self (rel_dx=0, is_self=1) and up to 21 others.
 - **Randomly shuffles** real players into random slots each call (permutation
   invariance — do not "fix" this).
 - Pads unused slots to zero; `exists=0.0` distinguishes empty from real.
@@ -215,6 +235,20 @@ One rollout = 2048 decision steps = ~1024 sim-seconds = ~8.5 min of sim time.
   time by `log1p(t) / log1p(7200)`.
 - Returns `ObservationBatch` with `.to_torch_dict()` → `{self_feat, other_feat,
   ball_feat, global_feat, exists_mask}`.
+
+**`PlayerFeatures` layout (27 floats)** — last two fields are new absolute position:
+- `pos_x = player.position.x / 52.5` — world-frame x, ≈[-1,1] on standard pitch
+- `pos_y = player.position.y / 34.0` — world-frame y, ≈[-1,1] on standard pitch
+- Both are negated by the augmenter under `flip_x` / `flip_y` respectively.
+- Self slot has non-zero `pos_x`/`pos_y` (unlike `rel_dx`/`rel_dy` which are always 0 for self).
+
+**`GlobalFeatures` pitch/goal/box dims** are now normalised by standard values
+(105m, 68m, 7.32m, 2.44m, 16.5m, 40.32m) so the network sees ≈1.0 on a standard
+pitch and a fraction on smaller training pitches. Fields renamed from `*_m` to `*_norm`.
+
+**⚠ Schema break**: `PLAYER_FEATURE_DIM` changed from 26 → 28. All existing
+`.pt` checkpoints and `.npz` demonstration files are **incompatible** and must
+be regenerated before training.
 
 ### 3.5 Model saving
 
@@ -306,14 +340,24 @@ torch.save(ckpt["execution_net"], "models/execution_net_500k.pt")
   (dataset=None) is noisy and oscillates on episode resets.
 
 **BC aux loss annealing** (`ai_config.json::bc.aux_coeff_anneal_fraction`):
-- `aux_coeff_start=0.35` → `aux_coeff_end=0.0`, reaching zero by
-  `aux_coeff_anneal_fraction × total_steps` (default 0.2 = 20% of training).
+- `aux_coeff_start=0.95` → `aux_coeff_end=0.0`, reaching zero by
+  `aux_coeff_anneal_fraction × total_steps` (default 0.35 = 35% of training).
 - After that the network is purely RL-driven.  This is intentional — early
   guidance, then full freedom to explore.
 
-**Direction cosine logged per BC epoch**: `pretrain_combined()` logs
-`dir_cos=X.XXX` alongside `bc_loss` at each offline epoch so you can track
-how quickly the `move_direction` head aligns with rules-based labels.
+**Per-epoch BC breakdown logged**: `pretrain_combined()` logs per-epoch:
+`bc_loss`, `dir_cos`, `mv_p` (exec_move prob), `spr_p` (sprint prob), plus a
+`[decision=X  exec_bce=X  sprint=X  move=X  direction=X  region=X]` breakdown
+showing where the loss is coming from.  Sprint and region are the common floors.
+
+**BC loss weights** — two separate config keys, both in `bc` section:
+- `direction_loss_weight` (default 3.0): multiplier on move_direction cosine loss.
+  Needed because one continuous head competes with ~11 Bernoulli BCE heads.
+- `region_loss_weight` (default 1.0): multiplier on move_region_center MSE.
+  **Deliberately lower than direction** — in Phase 1, the region target is a
+  noisy proxy for ball position (the rules AI uses `GetPossessionOrder`, not
+  `MoveOrder`) and inflating it raises the BC loss floor without benefit.
+  The old code used `dir_w=3.0` for both — region is now decoupled.
 
 ### Phase 2: Shooting
 
@@ -344,46 +388,50 @@ Never hardcode them.  Key sections:
 ```json
 {
   "ppo": {
-    "gamma": 0.99,          // discount factor
-    "lam": 0.95,            // GAE lambda
-    "clip_range": 0.2,      // PPO clipping epsilon
-    "learning_rate": 3e-4,
-    "n_epochs": 4,          // PPO epochs per rollout
+    "gamma": 0.99,              // discount factor
+    "lam": 0.95,                // GAE lambda
+    "clip_range": 0.1,          // PPO clipping epsilon
+    "learning_rate": 1e-5,      // conservative — augmentation multiplies effective batch 12×
+    "n_epochs": 4,              // PPO epochs per rollout (often early-stops after 1)
     "minibatch_size": 64,
-    "rollout_steps": 2048,  // steps before each update
-    "target_kl": 0.02       // early-stop threshold per epoch
+    "rollout_steps": 4096,      // steps before each update
+    "target_kl": 0.05,          // per-MINIBATCH early-stop threshold (not per-epoch)
+    "ent_coef": 0.1,
+    "ent_dir_weight": 0.05,     // direction head weight in log_prob AND entropy
+    "augment_n_slot_shuffles": 3  // 12× effective batch; reduces needed gradient steps
   },
   "bc": {
     "pretrain_steps": 6000,               // online pre-training steps (fallback, no dataset)
-    "pretrain_lr": 6e-3,                  // learning rate for online BC pre-training
-    "pretrain_online_batch_size": 4,      // online BC gradient accumulation batch size
+    "pretrain_lr": 5e-3,
+    "pretrain_online_batch_size": 16,
     "direction_loss_weight": 3.0,         // weight on cosine direction loss vs BCE heads
-                                          // NOTE: high values corrupt the trunk at low step
-                                          // counts — keep ≤0.5 for online pre-training tests
-    "bc_pretrain_epochs": 50,            // offline BC epochs (used with --bc-dataset)
-    "bc_pretrain_batch_size": 256,        // offline BC minibatch size
-    "aux_coeff_start": 0.35,             // BC aux loss weight at PPO step 0
-    "aux_coeff_end": 0.0,                 // BC aux loss weight at end of annealing window
-    "aux_coeff_anneal_fraction": 0.2,     // fraction of total_steps over which coeff anneals
-    "value_pretrain_steps": 4096,         // rollout steps collected for value warm-up
-    "value_pretrain_epochs": 20,          // value-head epochs over that rollout
-    "value_pretrain_lr": 1e-2,           // value warm-up learning rate
-    "bc_repair_epochs": 10,              // joint BC+value repair epochs after value warm-up
-    "bc_repair_lr": 3e-3                 // learning rate for BC repair pass
+                                          // NOTE: keep ≤0.5 for short online pre-training
+    "region_loss_weight": 1.0,            // weight on move_region_center MSE (separate from
+                                          // direction — in Phase 1 this is a noisy proxy)
+    "bc_pretrain_epochs": 15,             // offline BC epochs (used with --bc-dataset)
+    "bc_pretrain_batch_size": 1024,
+    "aux_coeff_start": 0.95,              // BC aux loss weight at PPO step 0
+    "aux_coeff_end": 0.0,
+    "aux_coeff_anneal_fraction": 0.35,    // fraction of total_steps over which coeff anneals
+    "value_pretrain_steps": 4096,
+    "value_pretrain_epochs": 15,
+    "value_pretrain_lr": 6e-3,
+    "bc_repair_epochs": 2,
+    "bc_repair_lr": 2e-3
   },
   "reward": {
     "phase1": {
       "ball_distance_shaping": 0.05,
       "gain_possession_bonus": 1.0,
-      "ball_progress_scale": 0.1,
+      "ball_progress_scale": 0.5,
       "ball_out_penalty": -1.0,
       "illegal_action_penalty": -0.2,
       "box_possession_terminal": 5.0
     }
   },
   "curriculum": {
-    "rng_reduction_start": 0.55,  // physics randomness at step 0
-    "rng_reduction_end": 0.3      // physics randomness at end
+    "rng_reduction_start": 0.55,
+    "rng_reduction_end": 0.3
   }
 }
 ```
@@ -451,6 +499,13 @@ of total training steps (default 0.2 → 0.0 by 30%), then stays 0.0.
 | `--bc-pretrain-steps N` | Override `bc.pretrain_steps` from config |
 | `--bc-pretrain-steps 0` | Skip pre-training entirely |
 | `--no-bc-aux` | Disable BC auxiliary loss during PPO |
+| `--no-head-freeze` | Skip `phase.frozen_heads` — train all decision heads during PPO |
+
+**Head freezing**: `PPOTrainer.set_frozen_heads(names)` sets `requires_grad=False` on
+named `nn.Module` attributes of `decision_net`. Applied automatically from
+`phase.frozen_heads` in `phases.py` before PPO starts (after pre-training, so BC
+still updates all heads). Phase 1 freezes shoot/pass/tackle/mark/hold heads, leaving
+only move, get_possession, latent_vector, and trunk active during PPO.
 
 ---
 

@@ -719,7 +719,7 @@ def _apply_neural_action(trainer, match: Match, player_id: str, trial_tick: int)
         obs_dict = obs.to_torch_dict()  # _sample_action adds the batch dim internally
         with torch.no_grad():
             result = trainer._sample_action(obs_dict)
-        (_action, _lp, _val, decision_probs, exec_phys, dec_phys, target_slots, _raw_exec) = result
+        (_action, _lp, _val, decision_probs, exec_phys, dec_phys, target_slots, _raw_exec, _head_log_probs) = result
         # Build slot_player_ids as [None]*MAX_OTHER_PLAYERS (target resolution not needed for UI)
         slot_player_ids = [None] * MAX_OTHER_PLAYERS
         gating = select_action(
@@ -940,6 +940,8 @@ def build_1v1_scenario(
     stamina_max: float | None = None,
     trainee_team: "Team | None" = None,
     sim_dt_s: float = 1.0 / 30.0,
+    opponent_rules_prob: float = 0.0,
+    opponent_immobile_prob: float = 1.0,
 ) -> Match:
     """Phase 1 curriculum: 1v1 get-possession/move-toward-goal.
 
@@ -1054,11 +1056,23 @@ def build_1v1_scenario(
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
         dt_s=sim_dt_s,
     )
-    # 50% chance opponent uses rules-based AI; rest is immobile (neural training).
-    # player.ai is set so Match.step() drives it automatically.
-    use_rules = rng.random() < 0.5
-    opponent.ai = Phase1RulesAI() if use_rules else None
-    match._opponent_use_rules_ai = use_rules  # kept for ScenarioEnv secondary-player gating
+    # Randomise opponent type per episode based on caller-supplied probabilities.
+    # rules_prob + immobile_prob must be <= 1; the remainder becomes neural (secondary player).
+    _r = rng.random()
+    if _r < opponent_rules_prob:
+        from footballcoach.rules_ai import Phase1RulesAI as _Phase1RulesAI
+        opponent.ai = _Phase1RulesAI()
+        match._opponent_use_rules_ai = True
+        match._opponent_is_immobile = False
+    elif _r < opponent_rules_prob + opponent_immobile_prob:
+        opponent.ai = None
+        match._opponent_use_rules_ai = False
+        match._opponent_is_immobile = True
+    else:
+        # Neural — ScenarioEnv assigns NeuralPlayerAI on reset when sample_action_fn is set.
+        opponent.ai = None
+        match._opponent_use_rules_ai = False
+        match._opponent_is_immobile = False
     return match
 
 

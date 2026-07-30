@@ -211,6 +211,8 @@ def _player_features(
         is_goalkeeper=1.0 if player.is_goalkeeper else 0.0,
         attacking_direction=attacking_dir,
         exists=1.0,
+        pos_x=player.position.x / 52.5,
+        pos_y=player.position.y / 34.0,
     )
     return feat.to_array()
 
@@ -277,12 +279,12 @@ def _global_features(
     feat = GlobalFeatures(
         score_diff=score_diff,
         time_remaining_norm=time_norm,
-        pitch_length_m=pitch.length_m,
-        pitch_width_m=pitch.width_m,
-        goal_width_m=pitch.goal_width_m,
-        goal_height_m=pitch.goal_height_m,
-        box_length_m=pitch.box_length_m,
-        box_width_m=pitch.box_width_m,
+        pitch_length_norm=pitch.length_m / 105.0,
+        pitch_width_norm=pitch.width_m / 68.0,
+        goal_width_norm=pitch.goal_width_m / 7.32,
+        goal_height_norm=pitch.goal_height_m / 2.44,
+        box_length_norm=pitch.box_length_m / 16.5,
+        box_width_norm=pitch.box_width_m / 40.32,
         ball_restitution_coefficient=restitution,
         rng_reduction=match.rng_reduction,
         attack_defence_smoothed=attack_defence_smoothed,

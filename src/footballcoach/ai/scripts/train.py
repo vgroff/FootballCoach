@@ -55,9 +55,20 @@ def main() -> None:
                         help="Minibatch size for offline BC pre-training (default: bc.bc_pretrain_batch_size in ai_config.json).")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable debug-level logs (per-minibatch details, per-head diagnostics).")
+    parser.add_argument("--from-pretrained", type=str, default=None, metavar="PATH",
+                        help=(
+                            "Load a pre-trained checkpoint and skip all BC/value pre-training. "
+                            "If PATH is a directory, checkpoint_pretrained.pt inside it is used "
+                            "automatically. Useful for iterating on PPO hyperparameters without "
+                            "re-running the expensive BC pre-training stage."
+                        ))
     parser.add_argument("--pre-ppo-eval-trials", type=int, default=40,
                         help="Episodes to evaluate vs rules-based AI after pre-training, before "
                              "PPO starts. Set to 0 to skip (default: 40).")
+    parser.add_argument("--no-head-freeze", action="store_true",
+                        help="Skip frozen_heads from the curriculum phase definition — all "
+                             "decision-network heads are trained during PPO. Default: the "
+                             "phase's frozen_heads list is applied before PPO starts.")
     args = parser.parse_args()
 
     if args.verbose:
@@ -120,13 +131,29 @@ def main() -> None:
     if args.checkpoint:
         trainer.load_checkpoint(Path(args.checkpoint))
 
+    # --from-pretrained: load a pre-trained checkpoint and skip all pre-training
+    if args.from_pretrained:
+        pretrained_path = Path(args.from_pretrained)
+        if pretrained_path.is_dir():
+            # Auto-discover: use checkpoint_pretrained.pt in that directory
+            candidate = pretrained_path / "checkpoint_pretrained.pt"
+            if not candidate.exists():
+                log.error(f"--from-pretrained: no checkpoint_pretrained.pt found in {pretrained_path}")
+                return
+            pretrained_path = candidate
+        if not pretrained_path.exists():
+            log.error(f"--from-pretrained: file not found: {pretrained_path}")
+            return
+        trainer.load_checkpoint(pretrained_path)
+        log.info(f"Loaded pre-trained checkpoint: {pretrained_path} — skipping BC/value pre-training")
+
     # Pre-training phase: BC + value jointly when a dataset is available,
     # otherwise fall back to online BC then separate value pre-training.
     value_pretrain_steps = int(bc_cfg.get("value_pretrain_steps", 0))
     value_pretrain_epochs = int(bc_cfg.get("value_pretrain_epochs", 20))
     value_pretrain_lr = float(bc_cfg.get("value_pretrain_lr", 1e-3))
 
-    if not args.checkpoint:
+    if not args.checkpoint and not args.from_pretrained:
         from footballcoach.ai.bc.dataset import DemonstrationDataset
         dataset = None
         if args.bc_dataset:
@@ -176,7 +203,7 @@ def main() -> None:
                 )
 
     # Save a checkpoint of the pre-trained model before PPO starts
-    if not args.checkpoint and checkpoint_dir is not None:
+    if not args.checkpoint and not args.from_pretrained and checkpoint_dir is not None:
         pretrain_ckpt = checkpoint_dir / "checkpoint_pretrained.pt"
         trainer._save_checkpoint_to(pretrain_ckpt)
         log.info(f"Pre-trained checkpoint saved: {pretrain_ckpt}")
@@ -212,6 +239,10 @@ def main() -> None:
             f"mean_rew={immobile_stats['mean_reward']:.3f}  "
             f"outcomes={immobile_stats['outcomes']}"
         )
+
+    # Apply curriculum head freezing (after pre-training, before PPO)
+    if not args.no_head_freeze and phase.frozen_heads:
+        trainer.set_frozen_heads(phase.frozen_heads)
 
     # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0)
     aux_label_fn = None if (args.no_bc_aux or label_fn is None) else label_fn

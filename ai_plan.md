@@ -27,6 +27,7 @@ AI Design:
             - This is is a number between 0 and 1, the network is penalised much more aggresively when both iself and the move order are enabled and the player is outside the region designated by the move order, and the further they are the harsher the penalty
         - Region of play
             - A region that is at least 15m*15m and up to 40m*40m denoting the region of play - players are rewarded for staying in/nearer to this region, but not punished particularly harshly for straying outside of it
+            - Maybe also penalise for never leaving it
         - Region of play importance
             - Number between 0 - 1. If set high (>0.8) and hold position is low (<0.3), player will prefer being in region of play to move order
         - A value between 0 and 1 - defence/attack weighting - this changes the reward function during training - tackling and keeping posessionn is more rewarded with high defence but moving up the field, shooting and scoring is more heavily weighted with high attack. This value should not change dramatically (i.e. it should start at the output value and then if it changes, the change should happen over minutes when it's then presented to the execution network (or maybe this behaviour can be baked into the neural net, some kind of moving average? not sure, it has to be controllable and simple mainly)). When a goal happens this value is allow to change more aggresively. Otherwise, it should have this high latency to represent long term strategy

@@ -91,6 +91,7 @@ PLAYER_FLIP_X_IDX: list[int] = [
     _field_index(PlayerFeatures, "velocity_x"),
     _field_index(PlayerFeatures, "heading_cos"),       # cos(π-θ) = -cos(θ)
     _field_index(PlayerFeatures, "attacking_direction"),  # +x → -x
+    _field_index(PlayerFeatures, "pos_x"),             # absolute x negated under flip_x
 ]
 
 #: PlayerFeatures indices negated by flip_y
@@ -98,6 +99,7 @@ PLAYER_FLIP_Y_IDX: list[int] = [
     _field_index(PlayerFeatures, "rel_dy"),
     _field_index(PlayerFeatures, "velocity_y"),
     _field_index(PlayerFeatures, "heading_sin"),       # sin(-θ) = -sin(θ)
+    _field_index(PlayerFeatures, "pos_y"),             # absolute y negated under flip_y
 ]
 
 #: BallFeatures indices negated by flip_x (includes pseudovector spin)
@@ -119,6 +121,8 @@ BALL_FLIP_Y_IDX: list[int] = [
 # BC label column layout (see bc.py::BCLabel.to_array())
 _BC_DIR_X_COL: int = 7   # move_direction x component
 _BC_DIR_Y_COL: int = 8   # move_direction y component
+_BC_REGION_X_COL: int = 10  # move_region_center x (absolute pitch metres — negate on flip_x)
+_BC_REGION_Y_COL: int = 11  # move_region_center y (absolute pitch metres — negate on flip_y)
 
 # Action dict keys that are 2D direction/position vectors and need flipping.
 # All other action keys are Bernoulli (0/1) or scalar — they are invariant.
@@ -216,9 +220,11 @@ def augment_batch(
         if has_bc:
             bc_labels_flipped = batch["bc_labels"].clone()
             if flip_x:
-                bc_labels_flipped[:, _BC_DIR_X_COL] *= -1.0
+                bc_labels_flipped[:, _BC_DIR_X_COL]    *= -1.0
+                bc_labels_flipped[:, _BC_REGION_X_COL] *= -1.0
             if flip_y:
-                bc_labels_flipped[:, _BC_DIR_Y_COL] *= -1.0
+                bc_labels_flipped[:, _BC_DIR_Y_COL]    *= -1.0
+                bc_labels_flipped[:, _BC_REGION_Y_COL] *= -1.0
 
         # ---- Slot permutation variants ----
         em_base = batch["obs/exists_mask"]
@@ -318,12 +324,14 @@ def augment_obs_bc(
             sf[:, _px]    *= -1.0
             of[:, :, _px] *= -1.0
             bf[:, _bx]    *= -1.0
-            bc[:, _BC_DIR_X_COL] *= -1.0
+            bc[:, _BC_DIR_X_COL]    *= -1.0
+            bc[:, _BC_REGION_X_COL] *= -1.0
         if flip_y:
             sf[:, _py]    *= -1.0
             of[:, :, _py] *= -1.0
             bf[:, _by]    *= -1.0
-            bc[:, _BC_DIR_Y_COL] *= -1.0
+            bc[:, _BC_DIR_Y_COL]    *= -1.0
+            bc[:, _BC_REGION_Y_COL] *= -1.0
 
         em_base = obs_dict["exists_mask"]
         for shuffle_i in range(n_slot_shuffles):

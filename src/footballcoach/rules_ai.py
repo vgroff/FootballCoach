@@ -278,7 +278,7 @@ class NeuralPlayerAI(PlayerAI):
 
         result = self.sample_action_fn(obs_dict)
         (action, log_prob, value, decision_probs, exec_phys,
-         dec_phys, target_slots, raw_exec) = result
+         dec_phys, target_slots, raw_exec, head_log_probs) = result
 
         slot_player_ids = [None] * MAX_OTHER_PLAYERS  # safe default; NeuralPlayerAI does not need target resolution
         gating = select_action(decision_probs, exec_phys, target_slots)
@@ -297,5 +297,6 @@ class NeuralPlayerAI(PlayerAI):
             "log_prob": float(log_prob),
             "value": float(value),
             "raw_exec": raw_exec,
+            "head_log_probs": head_log_probs,
             "illegal_action": translation.illegal_action,
         }

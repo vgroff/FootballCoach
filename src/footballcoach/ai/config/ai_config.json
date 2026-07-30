@@ -3,8 +3,8 @@
 
   "observation": {
     "max_other_players": 21,
-    "decision_interval_s": 0.8,
-    "sim_dt_s": 0.12,
+    "decision_interval_s": 0.7,
+    "sim_dt_s": 0.1,
     "_comment_sim_dt_s": "Physics tick size. Default 0.0333 (30Hz). Increase for faster training: 0.05=20Hz (~1.5x), 0.067=15Hz (~2x). UI ignores this and always uses 30Hz.",
     "ball_spin_norm_max_rad_s": 30.0,
     "time_remaining_norm_max_s": 7200.0,
@@ -29,16 +29,16 @@
     "lam": 0.95,
     "clip_range": 0.1,
     "vf_coef": 0.5,
-    "ent_coef": 0.05,
+    "ent_coef": 0.1,
     "max_grad_norm": 0.5,
-    "learning_rate": 1e-4,
+    "learning_rate": 1e-5,
     "n_epochs": 4,
     "minibatch_size": 64,
-    "target_kl": 0.02,
-    "rollout_steps": 2048,
+    "target_kl": 0.07,
+    "rollout_steps": 4096,
     "dir_log_std_min": -5.0,
-    "dir_log_std_max": 2.0,
-    "ent_dir_weight": 0.2,
+    "dir_log_std_max": 0.5,
+    "ent_dir_weight": 0.05,
     "_comment_ent_dir_weight": "Weight applied to continuous direction heads (move_dir, kick_dir) in entropy computation. 1.0 = equal weight. Lower values prevent direction entropy from drowning out Bernoulli heads.",
     "augment_n_slot_shuffles": 3,
     "_comment_augment": "Slot permutations per geometric flip variant. Total batch multiplier = 4 * n. Use 1 for 4x (flips only), 3 for 12x, 0 to disable. See ai/obs/augment.py.",
@@ -50,7 +50,11 @@
     "rng_reduction_end": 0.3,
     "pitch_standard_fraction": 0.8,
     "pitch_min_scale": 0.33,
-    "goal_min_scale": 0.5
+    "goal_min_scale": 0.5,
+    "phase1_opponent_rules_prob": 0.0,
+    "phase1_opponent_immobile_prob": 1.0,
+    "_comment_phase1_opponent": "phase1 training opponent split: rules_prob + immobile_prob must be <=1; remainder is neural (secondary player). phase1_demo_opponent_rules_prob is the default for record_demonstrations --opponent-rules-prob.",
+    "phase1_demo_opponent_rules_prob": 0.3
   },
 
   "bc": {
@@ -58,20 +62,21 @@
     "pretrain_steps": 6000,
     "pretrain_lr": 5e-3,
     "pretrain_online_batch_size": 16,
-    "direction_loss_weight": 3.0,
-    "aux_coeff_start": 0.6,
+    "direction_loss_weight": 4.0,
+    "region_loss_weight": 0.5,
+    "aux_coeff_start": 0.95,
     "aux_coeff_end": 0.0,
     "aux_coeff_anneal_fraction": 0.4,
     "_comment_aux": "aux_coeff anneals linearly from start to end over aux_coeff_anneal_fraction of training (e.g. 0.3 = done by 30% of steps). The BC loss is computed on decision Bernoulli heads and execution move_direction.",
-    "bc_pretrain_epochs": 15,
-    "bc_pretrain_batch_size": 512,
+    "bc_pretrain_epochs": 25,
+    "bc_pretrain_batch_size": 1024,
     "value_pretrain_steps": 4096,
-    "value_pretrain_epochs": 3,
-    "value_pretrain_lr": 2e-3,
-    "bc_repair_epochs": 1,
+    "value_pretrain_epochs": 30,
+    "value_pretrain_lr": 1e-2,
+    "bc_repair_epochs": 3,
     "bc_repair_lr": 2e-3,
     "_comment_value": "After BC pre-training, run value-only MSE warm-up so the critic is near the true return scale before PPO starts. Set value_pretrain_steps=0 to skip.",
-    "demo_sample_interval_s": 2.0,
+    "demo_sample_interval_s": 1.0,
     "_comment_demo_sample": "Time between timed observation samples during demonstration recording. Kicks and tackles are always recorded regardless."
   },
 
@@ -102,11 +107,11 @@
 
   "phase1_scenario": {
     "ball_max_speed_mps": 12.0,
-    "ball_max_dist_from_trainee_m": 45.0,
+    "ball_max_dist_from_trainee_m": 33.0,
     "restitution_sigma": 0.08,
     "stamina_min": 0.4,
     "stamina_max": 1.0,
     "trainee_tier": "premier_league",
-    "opponent_tier": "premier_league"
+    "opponent_tier": "generic"
   }
 }

@@ -70,6 +70,14 @@ class PlayerFeatures:
     # --- Existence mask ---
     exists: float = 0.0          # 1.0 for a real player, 0.0 for a padded slot
 
+    # --- Absolute position (scaled by standard pitch half-dims) ---
+    # Uses same axis convention as the engine: origin at pitch centre,
+    # x in [-52.5, 52.5], y in [-34, 34].  Divided by standard half-dims
+    # so values are ≈[-1, 1] on a standard pitch and scale gracefully on
+    # smaller pitches.  Negated under flip_x / flip_y in augment.py.
+    pos_x: float = 0.0           # player.position.x / 52.5
+    pos_y: float = 0.0           # player.position.y / 34.0
+
     def to_array(self) -> np.ndarray:
         return np.array(astuple(self), dtype=np.float32)
 
@@ -120,12 +128,16 @@ class GlobalFeatures:
     score_diff: float = 0.0         # own_goals - opp_goals (team-relative, not raw scores)
     time_remaining_norm: float = 1.0  # log1p(t_s) / log1p(7200), ~[0,1]
 
-    pitch_length_m: float = 105.0
-    pitch_width_m: float = 68.0
-    goal_width_m: float = 7.32
-    goal_height_m: float = 2.44
-    box_length_m: float = 16.5
-    box_width_m: float = 40.32
+    # Pitch / goal / box dimensions, normalised by standard values so the
+    # network receives ≈1.0 on a standard pitch and a fraction on smaller ones.
+    # Standard values: length=105m, width=68m, goal_w=7.32m, goal_h=2.44m,
+    # box_length=16.5m, box_width=40.32m  (from physics.json).
+    pitch_length_norm: float = 1.0   # pitch.length_m / 105.0
+    pitch_width_norm: float = 1.0    # pitch.width_m / 68.0
+    goal_width_norm: float = 1.0     # pitch.goal_width_m / 7.32
+    goal_height_norm: float = 1.0    # pitch.goal_height_m / 2.44
+    box_length_norm: float = 1.0     # pitch.box_length_m / 16.5
+    box_width_norm: float = 1.0      # pitch.box_width_m / 40.32
 
     ball_restitution_coefficient: float = 0.6
     rng_reduction: float = 0.3
@@ -140,7 +152,7 @@ class GlobalFeatures:
 # Dimension constants (derived from the dataclasses - single source of truth)
 # ---------------------------------------------------------------------------
 
-PLAYER_FEATURE_DIM: int = len(fields(PlayerFeatures))   # 26
+PLAYER_FEATURE_DIM: int = len(fields(PlayerFeatures))   # 27  (was 25 pre pos_x/pos_y)
 BALL_FEATURE_DIM: int = len(fields(BallFeatures))       # 12
 GLOBAL_FEATURE_DIM: int = len(fields(GlobalFeatures))   # 11
 MAX_OTHER_PLAYERS: int = 21  # full 11v11 minus self

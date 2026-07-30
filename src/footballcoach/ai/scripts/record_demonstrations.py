@@ -71,6 +71,7 @@ def record_episodes(
     episode_offset: int = 0,
     total_episodes: int | None = None,
     sample_interval_s: float = 0.2,
+    opponent_rules_prob: float = 0.0,
 ) -> dict:
     """Run *n_episodes* with rules-based AI driving the trainee and opponent.
 
@@ -143,6 +144,22 @@ def record_episodes(
         except (AttributeError, KeyError):
             pass
 
+        # Randomise opponent: rules-based with probability opponent_rules_prob,
+        # immobile otherwise (no neural opponent during demo recording).
+        try:
+            match = env._loop.match
+            opp = match.player_by_id("opponent")
+            if np.random.random() < opponent_rules_prob:
+                opp.ai = Phase1RulesAI()
+                match._opponent_use_rules_ai = True
+                match._opponent_is_immobile = False
+            else:
+                opp.ai = None
+                match._opponent_use_rules_ai = False
+                match._opponent_is_immobile = True
+        except (AttributeError, KeyError):
+            pass
+
         done = False
         last_info = None
         while not done:
@@ -207,6 +224,11 @@ def main() -> None:
     parser.add_argument("--sample-interval", type=float, default=_default_interval,
                         help=f"Sim-seconds between timed samples (default: {_default_interval}). "
                              "Kicks and tackles are always recorded regardless.")
+    _default_opp_rules_prob = float(_cfg.get("curriculum", {}).get("phase1_demo_opponent_rules_prob", 0.3))
+    parser.add_argument("--opponent-rules-prob", type=float, default=_default_opp_rules_prob,
+                        help=f"Probability (0–1) that the opponent uses the rules-based AI each "
+                             f"demo episode (default: {_default_opp_rules_prob} from config). "
+                             "Remainder are immobile.")
     parser.add_argument("--info", action="store_true",
                         help="Print info about existing files and exit")
     args = parser.parse_args()
@@ -235,7 +257,7 @@ def main() -> None:
     log.info(
         f"Recording {n_eps} episodes of phase {args.phase} ({scenario_key}) "
         f"→ {n_files} file(s) in {output_dir} "
-        f"[sample_interval={args.sample_interval}s]"
+        f"[sample_interval={args.sample_interval}s, opponent_rules_prob={args.opponent_rules_prob:.0%}]"
     )
 
     total_steps = 0
@@ -255,6 +277,7 @@ def main() -> None:
             episode_offset=episodes_done,
             total_episodes=n_eps,
             sample_interval_s=args.sample_interval,
+            opponent_rules_prob=args.opponent_rules_prob,
         )
         elapsed = time.time() - t0
 
