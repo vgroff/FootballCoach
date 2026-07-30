@@ -11,8 +11,13 @@ I want you to add 200-400 words of prompt for agent that will carry out more tra
 Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_plan.md, the ai_design_document.md and the ai_trainer_knowledge.md
 
 Immedaite task!!
-Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 50k . We're only going against immovile opnent, should it should be easy
-- We could super easliy remove a whole axis of symmetry by transforming all AI positions to being +x is attacking goal, -x is dending goal, remove the flag for which end youre attacking on and transform back and forth from the engine positions to the AI positions. Would probably mean a smaller/smarter AI and faster trainnig from fewer augmentations
+Read ai_trainer_knowledge.md, and then run a training run.
+- We could super easliy remove a whole axis of symmetry by transforming all AI positions to being +x is attacking goal, -x is dending goal, remove the flag for which end youre attacking on and transform back and forth from the engine positions to the AI positions. Would probably mean a smaller/smarter AI and faster trainnig from fewer augmentations (half the training time)
+    - I think all that needs changing is absolute coordinates - i.e. player position and move region (?). and then augmentation and team flags removed.
+- ADD SPEED TO THE PHASE 1 REWARD! ball progress scale/winning should be scaled by time? or at least have a timed component to it? maybe normalised by ball distance to player/opponent goal?
+- definitely need a phase 0 type thing where we just teach movement, with and without the ball, going between waypoints for a start, it struggle with movement a lot
+- how could I speed up training? parrallelise the engine itself? increase the tick time when nothing much is going on (e.g. ball controlled and nobody near controller?) what is most likely taking up time in this?
+- can i forcesome smart exploration by e.g. making the neural net tackle when it's legal and making it learn to do?
 - parralelise the simulation somehow? player decision? maybe even movements/updates, though potentially dangerous
 - Is the AI completely ignoring all the kick mechanics like direction and spin and just aimming for the centre of the box when it kicks? Why on earth was this implemented???
 

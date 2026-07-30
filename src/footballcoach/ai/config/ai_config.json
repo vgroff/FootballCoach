@@ -26,21 +26,40 @@
 
   "ppo": {
     "gamma": 0.995,
+    "_comment_gamma": "Discount factor: how much future rewards are worth vs immediate ones. Think of it as 'I care about a reward in N steps at gamma^N of its face value'. 0.99 = reward 100 steps away is worth 37% of today's reward. 0.995 = same reward is still worth 61%. Typical range: 0.95–0.999. We use 0.995 because episodes are long (~120s, ~170 decision steps) and the terminal reward (+5) is the main signal — too low and the agent gives up on distant goals, too high and variance explodes. Raise toward 0.999 if the agent seems short-sighted; lower toward 0.99 if training is unstable.",
+
     "lam": 0.97,
-    "clip_range": 0.1,
+    "_comment_lam": "GAE lambda: controls the bias/variance tradeoff in advantage estimation. lam=1.0 is pure Monte Carlo (low bias, high variance — noisy but unbiased). lam=0.0 is pure TD(0) (high bias, low variance — smooth but wrong). Typical range: 0.9–0.99. We use 0.97 as a standard middle ground. Lower (e.g. 0.9) if gradients are noisy and training oscillates; raise (e.g. 0.99) if the agent seems to discount future steps too aggressively.",
+
+    "clip_range": 0.05,
+    "_comment_clip_range": "PPO clipping: the policy ratio (new_prob / old_prob) is clamped to [1-clip, 1+clip] = [0.95, 1.05] here. This stops a single update from changing the policy too drastically — the gradient is zeroed for any sample where the ratio goes outside the band. Typical value is 0.2; we use 0.05 (very conservative) because the KL was spiking to 0.4+ with 0.1, causing early-stop after just 2 minibatches. Lower clip = more conservative updates, more minibatches get through. If you see 25+ minibatches per rollout and training is slow, try raising to 0.1.",
+
     "vf_coef": 0.5,
+    "_comment_vf_coef": "Value function loss coefficient: scales how hard the critic trains relative to the actor. total_loss = policy_loss + vf_coef*value_loss - ent_coef*entropy. Typical: 0.5. Raise if the value estimates are wildly off (large RMSE vs returns std); lower if value gradients seem to destabilise the policy (rare).",
+
     "ent_coef": 0.1,
+    "_comment_ent_coef": "Entropy bonus: rewards the policy for being uncertain/exploratory. Higher = more random behaviour, harder to converge to a good strategy but less likely to get stuck in local optima. Typical range: 0.0–0.1. We use 0.1 (fairly high) because the agent needs to explore a large action space and sprint/kick/tackle heads that start at ~50% probability. Lower toward 0.01 later in training once the policy has converged to sensible behaviour.",
+
     "max_grad_norm": 0.5,
-    "learning_rate": 1e-5,
-    "dir_log_std_init": -1.0,
+    "_comment_max_grad_norm": "Gradient clipping: if the total gradient vector has magnitude > this, all gradients are scaled down proportionally. Acts as a safety valve against catastrophic updates from rare high-loss samples. 0.5 is standard for PPO. Raise to 1.0 if gradients feel too constrained (loss barely moves per step); lower to 0.3 if you see sudden policy collapses. Check the 'g=' value in the per-rollout log — if it's consistently hitting 0.5 exactly, you're clipping every update.",
+
+    "learning_rate": 5e-6,
+    "_comment_learning_rate": "Step size for Adam optimiser. Typical PPO LR is 3e-4, but we use 5e-6 because (a) augmentation multiplies the effective batch by 12x meaning each gradient step sees more signal, and (b) the BC-pretrained policy is already near a good point so large steps would destroy it. Raise to 1e-5 if training feels too slow; lower to 1e-6 if the policy collapses after pretraining.",
+
+    "dir_log_std_init": -1.2,
     "n_epochs": 4,
     "minibatch_size": 64,
-    "target_kl": 0.5,
-    "rollout_steps": 4096,
+
+    "target_kl": 0.4,
+    "_comment_target_kl": "Per-minibatch early-stop threshold. KL divergence measures how much the policy distribution has changed since the rollout was collected — KL=0 means no change, KL=0.4 means fairly significant shift. When any minibatch's KL exceeds this, the entire epoch loop stops early. Typical value is 0.01–0.05; we use 0.4 (very permissive) because we want to see how many minibatches naturally get through. The real constraint is clip_range=0.05. LOWER this (e.g. 0.1) to make early-stop fire sooner and protect the policy more aggressively — you'll see fewer minibatches per rollout but more stable training. RAISE it if you want to see the full picture of how the policy changes per rollout.",
+
+    "rollout_steps": 8096,
     "dir_log_std_min": -5.0,
     "dir_log_std_max": 0.5,
+
     "ent_dir_weight": 0.05,
-    "_comment_ent_dir_weight": "Weight applied to continuous direction heads (move_dir, kick_dir) in entropy computation. 1.0 = equal weight. Lower values prevent direction entropy from drowning out Bernoulli heads.",
+    "_comment_ent_dir_weight": "Weight applied to continuous direction heads (move_dir, kick_dir) in the entropy bonus. The direction heads output a Gaussian distribution; their raw entropy is much larger in scale than a Bernoulli head. 1.0 = equal weight = direction entropy dominates the bonus and the Bernoulli heads (shoot, sprint etc.) get almost no exploration pressure. 0.05 = direction entropy contributes only 5% — Bernoulli heads drive exploration. Lower toward 0.01 if the agent spins randomly (too much directional noise); raise toward 0.2 if kicks/passes cluster on one angle.",
+
     "augment_n_slot_shuffles": 3,
     "_comment_augment": "Slot permutations per geometric flip variant. Total batch multiplier = 4 * n. Use 1 for 4x (flips only), 3 for 12x, 0 to disable. See ai/obs/augment.py.",
     "_comment": "Standard PPO defaults from CleanRL-style reference implementations. Tune empirically."
@@ -55,32 +74,34 @@
     "phase1_opponent_rules_prob": 0.0,
     "phase1_opponent_immobile_prob": 0.0,
     "_comment_phase1_opponent": "phase1 training opponent split: rules_prob + immobile_prob must be <=1; remainder is neural (secondary player). phase1_demo_opponent_rules_prob is the default for record_demonstrations --opponent-rules-prob.",
-    "phase1_demo_opponent_rules_prob": 1.0
+    "phase1_demo_opponent_rules_prob": 1.0,
+    "secondary_weight": 1.0,
+    "_comment_secondary_weight": "Importance weight applied to secondary (opponent) player transitions in the PPO loss. 1.0 = equal weight, 0.5 = half weight, 0.0 = ignore secondary transitions."
   },
 
   "bc": {
     "_comment": "Behavioural cloning from rules-based AI. Set pretrain_steps=0 to skip pre-training. Set aux_coeff_start=0.0 to disable the PPO auxiliary BC loss.",
     "pretrain_steps": 6000,
-    "pretrain_lr": 1.5e-3,
+    "pretrain_lr": 2e-3,
     "pretrain_online_batch_size": 16,
     "direction_loss_weight": 4.0,
     "region_loss_weight": 1.0,
-    "aux_coeff_start": 0.7,
+    "aux_coeff_start": 1.0,
     "aux_coeff_end": 0.0,
-    "aux_coeff_anneal_fraction": 0.3,
+    "aux_coeff_anneal_fraction": 0.65,
     "_comment_aux": "aux_coeff anneals linearly from start to end over aux_coeff_anneal_fraction of training (e.g. 0.3 = done by 30% of steps). The BC loss is computed on decision Bernoulli heads and execution move_direction.",
-    "bc_pretrain_epochs": 3,
-    "bc_pretrain_batch_size": 512,
+    "bc_pretrain_epochs": 6,
+    "bc_pretrain_batch_size": 312,
     "value_pretrain_steps": 4096,
-    "value_pretrain_epochs": 1,
+    "value_pretrain_epochs": 2,
     "value_pretrain_lr": 2e-3,
-    "demo_value_pretrain_epochs": 2,
+    "demo_value_pretrain_epochs": 10,
     "demo_value_pretrain_lr": 3e-3,
     "demo_value_pretrain_gamma": 0.995,    
     "demo_value_bc_coef": 1.5,    
     "bc_repair_epochs": 0,
     "bc_repair_lr": 1e-3,
-    "value_pretrain_frozen_layers": -1,
+    "value_pretrain_frozen_layers": 2,
     "_comment_frozen_layers": "Layers frozen (requires_grad=False) during value head warm-up. -1=all non-value layers (encoders + full trunk). 0=nothing frozen (gradients flow freely through trunk). 1=encoders only. 2=encoders + trunk layer 1. 3=encoders + full trunk (same as -1). Default -1 matches prior behaviour.",
     "_comment_value": "After BC pre-training, run value-only MSE warm-up so the critic is near the true return scale before PPO starts. Set value_pretrain_steps=0 to skip.",
     "demo_sample_interval_s": 1.0,
@@ -113,12 +134,15 @@
   },
 
   "phase1_scenario": {
-    "ball_max_speed_mps": 12.0,
-    "ball_max_dist_from_trainee_m": 42.0,
+    "ball_max_speed_mps": 11.0,
+    "ball_max_dist_from_trainee_m": 20.0,
     "restitution_sigma": 0.08,
     "stamina_min": 0.45,
     "stamina_max": 0.95,
     "trainee_tier": "premier_league",
-    "opponent_tier": "generic"
+    "opponent_tier": "generic",
+    "opponent_min_dist_m": 13.0,
+    "opponent_max_dist_m": 50.0,
+    "_comment_opponent_dist": "Constrain opponent placement distance from trainee. Both default to unconstrained. E.g. min=5, max=20 keeps opponent nearby but not on top."
   }
 }

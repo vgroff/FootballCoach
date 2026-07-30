@@ -72,6 +72,10 @@ class RolloutBuffer:
     # not available (secondary player transitions, old checkpoints).
     head_log_probs: list[np.ndarray] = field(default_factory=list)
 
+    # Per-sample importance weight (default 1.0).  Used to down-weight secondary
+    # player transitions via curriculum.secondary_weight in ai_config.json.
+    weights: list[float] = field(default_factory=list)
+
     def add(
         self,
         obs: dict[str, np.ndarray],
@@ -82,6 +86,7 @@ class RolloutBuffer:
         done: float,
         bc_label: Optional[np.ndarray] = None,
         head_log_probs: Optional[np.ndarray] = None,
+        weight: float = 1.0,
     ) -> None:
         from footballcoach.ai.ppo.bc import BC_LABEL_DIM
         self.obs.append(obs)
@@ -98,6 +103,7 @@ class RolloutBuffer:
             head_log_probs if head_log_probs is not None
             else np.zeros(len(HEAD_LP_KEYS), dtype=np.float32)
         )
+        self.weights.append(weight)
 
     def __len__(self) -> int:
         return len(self.rewards)
@@ -192,6 +198,8 @@ class RolloutBuffer:
                 np.stack(self.head_log_probs, axis=0).astype(np.float32)
             )
 
+        result["sample_weights"] = torch.tensor(self.weights, dtype=torch.float32)
+
         return result
 
     def clear(self) -> None:
@@ -203,3 +211,4 @@ class RolloutBuffer:
         self.dones.clear()
         self.bc_labels.clear()
         self.head_log_probs.clear()
+        self.weights.clear()

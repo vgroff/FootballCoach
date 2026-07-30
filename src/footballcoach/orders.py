@@ -39,10 +39,9 @@ class OrderStatus(Enum):
 # ---------------------------------------------------------------------------
 
 # Brake-to-turn / close-proximity constants (all orders share these values).
-_BRAKE_THRESH_RAD: float = 1.57    # ~90° heading change → brake first
+# brake_turn_angle_rad, close_prox_cos_threshold and close_prox_radius_m are
+# read from MovementParams (physics.json), so they update at runtime without restarting.
 _BRAKE_MIN_SPEED: float = 2.0      # don't bother below this speed
-_CLOSE_PROX_M: float = 5.0         # close-proximity lateral-overshoot guard
-_CLOSE_PROX_COS: float = 0.01      # cos-sim threshold for lateral overshoot
 
 
 def _compute_movement_intent(
@@ -115,11 +114,11 @@ def _compute_movement_intent(
         speed_mult = 1.0  # noqa: F841
 
     # ── Close-proximity lateral-overshoot brake ──────────────────────────────
-    if (arrival_dist is not None and arrival_dist <= _CLOSE_PROX_M
+    if (arrival_dist is not None and arrival_dist <= match.movement_params.close_prox_radius_m
             and player.speed_mps > _BRAKE_MIN_SPEED):
         vel_xy = player.velocity.xy()
         if vel_xy.length() > 1e-9 and adj_dir.length() > 1e-9:
-            if vel_xy.normalized().dot(adj_dir.normalized()) < _CLOSE_PROX_COS:
+            if vel_xy.normalized().dot(adj_dir.normalized()) < match.movement_params.close_prox_cos_threshold:
                 speed_mode = SpeedMode.STANDSTILL
 
     # ── Brake-to-turn ────────────────────────────────────────────────────────
@@ -127,7 +126,7 @@ def _compute_movement_intent(
             and adj_dir.length() > 1e-9 and player.speed_mps > _BRAKE_MIN_SPEED):
         desired_heading = adj_dir.angle_xy()
         heading_error = abs(angle_diff(player.heading_rad, desired_heading))
-        if heading_error > _BRAKE_THRESH_RAD:
+        if heading_error > match.movement_params.brake_turn_angle_rad:
             speed_mode = SpeedMode.STANDSTILL
 
     return adj_dir, speed_mode

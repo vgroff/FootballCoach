@@ -809,10 +809,21 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         "ticks_opponent": 0,
     }
 
-    # Build the params list (choices populated from disk at call time)
-    checkpoints = _discover_checkpoints(checkpoint_dir)
-    # Friendly display names: just the filename without path
-    ckpt_labels = tuple(Path(c).name for c in checkpoints) if checkpoints else ("(none)",)
+    # Build the params list: scan ALL phase1_run* dirs so checkpoints from every
+    # run are visible, not just the one dir passed in.
+    import glob as _glob, re as _re
+    _all_run_dirs = sorted(
+        _glob.glob("checkpoints/phase1_run*/"),
+        key=lambda d: int(m.group(1)) if (m := _re.search(r"phase1_run(\d+)", d)) else -1,
+    )
+    checkpoints = []
+    for _d in _all_run_dirs:
+        checkpoints.extend(_discover_checkpoints(_d.rstrip("/")))
+    # Friendly display names: run{N}/filename
+    def _ckpt_label(p: str) -> str:
+        parts = Path(p).parts
+        return f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else parts[-1]
+    ckpt_labels = tuple(_ckpt_label(c) for c in checkpoints) if checkpoints else ("(none)",)
     ckpt_default = ckpt_labels[-1]  # most recent
 
     _cfg = _phase1_scenario_cfg()
@@ -834,7 +845,11 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         if use_rules:
             return None
         # Map friendly name back to full path
-        match_path = next((c for c in checkpoints if Path(c).name == ckpt_name), None)
+        # Match by "runN/filename" label (new format) or plain filename (fallback)
+        match_path = next(
+            (c for c in checkpoints if _ckpt_label(c) == ckpt_name or Path(c).name == ckpt_name),
+            None,
+        )
         if match_path is None:
             return None
         return _get_trainer(match_path)
@@ -942,6 +957,8 @@ def build_1v1_scenario(
     sim_dt_s: float = 1.0 / 30.0,
     opponent_rules_prob: float = 0.0,
     opponent_immobile_prob: float = 1.0,
+    opponent_min_dist_m: float | None = None,
+    opponent_max_dist_m: float | None = None,
 ) -> Match:
     """Phase 1 curriculum: 1v1 get-possession/move-toward-goal.
 
@@ -979,6 +996,10 @@ def build_1v1_scenario(
         stamina_min = float(_cfg.get("stamina_min", 0.3))
     if stamina_max is None:
         stamina_max = float(_cfg.get("stamina_max", 1.0))
+    if opponent_min_dist_m is None:
+        opponent_min_dist_m = float(_cfg.get("opponent_min_dist_m", 0.0))
+    if opponent_max_dist_m is None:
+        opponent_max_dist_m = float(_cfg.get("opponent_max_dist_m", 9999.0))
 
     rng = random.Random()
     pitch = Pitch.standard()
@@ -1003,7 +1024,18 @@ def build_1v1_scenario(
 
     # --- Opponent (opposite team) --- immobile, no order ---
     opponent_attrs = generate_attributes(tier=opponent_tier, rng=rng)
-    opponent = Player.create("opponent", opponent_team, opponent_attrs, position=_rand_pos())
+    # Opponent placement: respect min/max distance from trainee if configured
+    _opp_pos = _rand_pos()
+    if opponent_min_dist_m > 0.0 or opponent_max_dist_m < 9999.0:
+        for _opp_attempt in range(50):
+            _opp_pos = _rand_pos()
+            _opp_dist = math.hypot(
+                _opp_pos.x - trainee.position.x,
+                _opp_pos.y - trainee.position.y,
+            )
+            if opponent_min_dist_m <= _opp_dist <= opponent_max_dist_m:
+                break
+    opponent = Player.create("opponent", opponent_team, opponent_attrs, position=_opp_pos)
     opponent.stamina = rng.uniform(stamina_min, stamina_max)
     opponent.heading_rad = rng.uniform(-math.pi, math.pi)
 

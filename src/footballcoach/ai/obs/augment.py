@@ -261,12 +261,13 @@ def augment_batch(
                 "obs/ball_feat":   bf,
                 "obs/global_feat": gf,
                 # Scalar trajectory fields — copied unchanged
-                "log_probs":  batch["log_probs"],
-                "values":     batch["values"],
-                "rewards":    batch["rewards"],
-                "advantages": batch["advantages"],
-                "returns":    batch["returns"],
-                "dones":      batch["dones"],
+                "log_probs":      batch["log_probs"],
+                "values":         batch["values"],
+                "rewards":        batch["rewards"],
+                "advantages":     batch["advantages"],
+                "returns":        batch["returns"],
+                "dones":          batch["dones"],
+                "sample_weights": batch["sample_weights"],
             }
             part.update(remapped_actions)
             if bc_labels_flipped is not None:

@@ -103,6 +103,7 @@ class PPOTrainer:
         self._bc_cfg = bc_cfg
         self._bc_dir_loss_w = float(bc_cfg.get("direction_loss_weight", 3.0))
         self._bc_region_loss_w = float(bc_cfg.get("region_loss_weight", 1.0))
+        self._secondary_weight = float(curriculum_cfg.get("secondary_weight", 1.0))
         self._value_pretrain_frozen_layers = int(bc_cfg.get("value_pretrain_frozen_layers", -1))
         self._demo_value_pretrain_epochs = int(bc_cfg.get("demo_value_pretrain_epochs", 10))
         self._demo_value_pretrain_lr = float(bc_cfg.get("demo_value_pretrain_lr", 4e-3))
@@ -209,6 +210,8 @@ class PPOTrainer:
         steps_this_rollout = 0
         episode_rewards: list[float] = []
         episode_reward_accum = 0.0
+        secondary_episode_rewards: list[float] = []
+        secondary_episode_reward_accum = 0.0
         episode_outcomes_vs_rules: list[str] = []
         episode_outcomes_vs_neural: list[str] = []
         episode_outcomes_vs_immobile: list[str] = []
@@ -270,7 +273,12 @@ class PPOTrainer:
                     reward=sec["reward"],
                     done=sec["done"],
                     bc_label=None,
+                    weight=self._secondary_weight,
                 )
+                secondary_episode_reward_accum += sec["reward"]
+                if sec["done"]:
+                    secondary_episode_rewards.append(secondary_episode_reward_accum)
+                    secondary_episode_reward_accum = 0.0
                 steps_this_rollout += 1
                 self._total_steps += 1
 
@@ -314,6 +322,11 @@ class PPOTrainer:
                 mean_ep_reward = (
                     float(np.mean(episode_rewards[-20:])) if episode_rewards else 0.0
                 )
+                mean_opp_reward = (
+                    float(np.mean(secondary_episode_rewards[-20:])) if secondary_episode_rewards else float('nan')
+                )
+                episode_rewards.clear()
+                secondary_episode_rewards.clear()
                 bc_str = (
                     f"  bc={metrics['bc_loss']:.4f}(x{metrics['bc_coeff']:.2f})"
                     if metrics.get("bc_coeff", 0.0) > 0.0 else ""
@@ -348,9 +361,10 @@ class PPOTrainer:
                     f" kck={ha.get('kck','?'):>3} tk={ha.get('tk','?'):>3}"
                     f" sh={ha.get('sh','?'):>3} hld={ha.get('hld','?'):>3}"
                 ) if ha else ""
+                opp_rew_str = f"/{mean_opp_reward:.2f}" if not (mean_opp_reward != mean_opp_reward) else ""
                 log.info(
                     f"step={self._total_steps:,} | "
-                    f"rew={mean_ep_reward:.2f} | "
+                    f"rew={mean_ep_reward:.2f}{opp_rew_str} | "
                     f"pol={metrics['policy_loss']:.4f} "
                     f"val={metrics['value_loss']:.4f} "
                     f"ent={metrics['entropy']:.4f} "
@@ -373,14 +387,22 @@ class PPOTrainer:
                 # Quick periodic eval vs rules-based AI (always, regardless of training opponent)
                 try:
                     from footballcoach.rules_ai import Phase1RulesAI
-                    from footballcoach.ui.scenarios import build_1v1_scenario
+                    from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
                     from footballcoach.ai.env.scenario_env import ScenarioEnv
-                    _eval_match = build_1v1_scenario()
-                    _opp = _eval_match.player_by_id("opponent")
-                    _opp.ai = Phase1RulesAI()
-                    _eval_match._opponent_use_rules_ai = True
-                    _eval_match._opponent_is_immobile = False
-                    _eval_env = ScenarioEnv(_eval_match, trainee_player_id="trainee")
+
+                    def _eval_rules_build(*_a, **_kw):
+                        _m = build_1v1_scenario(*_a, **_kw)
+                        _m.player_by_id("opponent").ai = Phase1RulesAI()
+                        _m._opponent_use_rules_ai = True
+                        _m._opponent_is_immobile = False
+                        return _m
+
+                    _eval_env = ScenarioEnv(
+                        ScenarioDefinition(key="_eval_rules", label="eval_rules",
+                                           description="periodic rules eval", build=_eval_rules_build),
+                        trainee_player_id="trainee",
+                        max_episode_s=env.max_episode_s,
+                    )
                     _eval_env.sample_action_fn = self._sample_action
                     _eval_n = 10
                     _eval_wins = 0
@@ -1313,6 +1335,9 @@ class PPOTrainer:
                 mb_adv = adv[mb_idx].to(self.device)
                 mb_ret = returns[mb_idx].to(self.device)
                 mb_old_lp = old_log_probs[mb_idx].to(self.device)
+                # Normalised per-sample weights: sum to minibatch size so loss scale is stable
+                mb_w_raw = batch["sample_weights"][mb_idx].to(self.device)
+                mb_w = mb_w_raw * (len(mb_w_raw) / mb_w_raw.sum().clamp(min=1e-8))
 
                 # Recompute log_probs and values with current policy
                 sf = mb_obs["self_feat"]
@@ -1378,12 +1403,12 @@ class PPOTrainer:
                 else:
                     _diag_done = True  # skip computation when not in DEBUG
 
-                # PPO clipped objective
+                # PPO clipped objective (weighted by per-sample importance weights)
                 ratio = torch.exp(new_log_probs - mb_old_lp)
                 all_ratios.append(ratio.detach().cpu())
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * mb_adv
-                policy_loss = -torch.min(surr1, surr2).mean()
+                policy_loss = -(torch.min(surr1, surr2) * mb_w).mean()
 
                 # Value loss — normalise by return variance so it stays ~O(1)
                 # regardless of how large/negative the returns are. This keeps

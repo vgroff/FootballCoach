@@ -29,8 +29,8 @@ def main() -> None:
                         help="PPO decision-steps to train for, excluding pre-training (default: 500000)")
     parser.add_argument("--checkpoint", type=str, default=None,
                         help="Path to a checkpoint .pt file to resume from")
-    parser.add_argument("--checkpoint-dir", type=str, default="checkpoints/",
-                        help="Directory to save training checkpoints")
+    parser.add_argument("--checkpoint-dir", type=str, default=None,
+                        help="Directory to save training checkpoints (default: auto-generated as checkpoints/phase{N}_run{next}/)")
     parser.add_argument("--device", type=str, default="cpu",
                         help="PyTorch device (default: cpu)")
     parser.add_argument("--seed", type=int, default=42,
@@ -85,7 +85,21 @@ def main() -> None:
     random.seed(args.seed)
 
     device = torch.device(args.device)
-    checkpoint_dir = Path(args.checkpoint_dir)
+
+    # Auto-generate checkpoint dir if not specified: checkpoints/phase{N}_run{next}
+    if args.checkpoint_dir is None:
+        _ckpt_base = Path("checkpoints")
+        _prefix = f"phase{args.phase}_run"
+        _existing = sorted(
+            int(p.name[len(_prefix):]) for p in _ckpt_base.glob(f"{_prefix}*")
+            if p.is_dir() and p.name[len(_prefix):].isdigit()
+        ) if _ckpt_base.exists() else []
+        _next = (_existing[-1] + 1) if _existing else 1
+        checkpoint_dir = _ckpt_base / f"{_prefix}{_next}"
+    else:
+        checkpoint_dir = Path(args.checkpoint_dir)
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    log.info(f"Checkpoint dir: {checkpoint_dir}")
 
     from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
     from footballcoach.ai.curriculum.phases import PHASES_BY_ID
@@ -270,6 +284,17 @@ def main() -> None:
             f"mean_rew={immobile_stats['mean_reward']:.3f}  "
             f"outcomes={immobile_stats['outcomes']}"
         )
+
+    # Rules vs rules baseline (always runs, 12 trials)
+    try:
+        from footballcoach.ai.scripts.evaluate import _run_baseline_evaluation
+        baseline_stats = _run_baseline_evaluation(env, n_trials=12)
+        log.info(
+            f"Baseline (rules vs rules, 12 trials): trainee_win={baseline_stats['win_rate_pct']:.1f}%  "
+            f"outcomes={baseline_stats['outcomes']}"
+        )
+    except Exception as _e:
+        log.warning(f"Baseline eval failed: {_e}")
 
     # Apply curriculum head freezing (after pre-training, before PPO)
     if not args.no_head_freeze and phase.frozen_heads:

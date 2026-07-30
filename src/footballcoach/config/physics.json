@@ -52,7 +52,12 @@
     "min_speed_for_turn_mps": 0.1,
     "goalkeeper_accel_multiplier": 4.0,
     "goalkeeper_speed_multiplier": 1.4,
-    "standstill_decel_multiplier": 1.5
+    "standstill_decel_multiplier": 1.5,
+    "brake_turn_angle_deg": 75.0,
+    "_comment_brake_turn": "Heading change above this triggers brake-to-turn (decelerate to STANDSTILL). 90=original, lower=more aggressive.",
+    "close_prox_cos_threshold": 0.3,
+    "close_prox_radius_m": 6.0,
+    "_comment_close_prox": "Lateral-overshoot brake: within close_prox_radius_m of target, if velocity cos-sim < close_prox_cos_threshold, brake to STANDSTILL. cos 0.3=~73° off-axis."
   },
   "kicking": {
     "_comment": "sigma_angle in radians = base + scale*(1 - precision^precision_exponent). power in m/s = base + scale*attr. running_power_coefficient: max run boost = coefficient (at full sprint in line with kick). power_base/scale rescaled from 15/20 so full-sprint run_mult=1.7 gives same peak speed as old coeff=0.3 (run_mult=1.3): factor=1.3/1.7=0.765. running_direction_precision_*: reduce kick precision by up to 75% when kicking against the run direction (backwards). cos_high=0.35 (~70° forward cone), cos_low=-0.2 (~102°), penalty_mid=0.25 at cos_low, penalty_max=0.75 at cos=-1. See design doc for worked tables.",

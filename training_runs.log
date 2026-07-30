@@ -1,0 +1,23 @@
+2026-07-31 00:44:48,415 INFO Checkpoint dir: checkpoints/phase1_run40
+2026-07-31 00:44:48,429 INFO Starting training: phase=phase1_get_possession, total_steps=65,000
+2026-07-31 00:44:48,429 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
+2026-07-31 00:44:49,658 INFO Loading 1000 demonstration file(s) from demonstrations/phase1
+2026-07-31 00:44:51,327 INFO Dataset: 103,837 steps loaded
+2026-07-31 00:44:51,328 INFO Offline BC dataset: 103,837 steps from demonstrations/phase1/
+2026-07-31 00:44:51,328 INFO Combined BC + value pre-training: 5 epoch(s), batch_size=312, dataset=103,837 steps, rollout_steps=8096
+2026-07-31 00:44:51,353 INFO Phase 0 — demo value pretrain: 1 epoch(s), gamma=0.995, returns mean=16.01  std=12.84  lr=0.003
+2026-07-31 00:44:57,635 INFO   Demo value epoch 1/1: val_loss=1.0512  rmse=13.17 (returns std=12.8)
+2026-07-31 00:44:57,635 INFO Phase 0 done (demo value pretrain, 1 epoch(s))
+2026-07-31 00:44:57,662 INFO Phase 1 BC epochs will include joint value loss (coef=1.5, gamma=0.995, returns std=12.84)
+/home/vincent/Documents/not_work/repos/FootballCoach/src/footballcoach/ai/ppo/bc.py:324: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:822.)
+  "decision":  float(dec_loss[valid].mean()),
+2026-07-31 00:45:31,520 INFO Checkpoint dir: checkpoints/phase1_run41
+2026-07-31 00:45:31,530 INFO Starting training: phase=phase1_get_possession, total_steps=65,000
+2026-07-31 00:45:31,530 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
+2026-07-31 00:45:32,610 INFO Loading 1000 demonstration file(s) from demonstrations/phase1
+2026-07-31 00:45:34,154 INFO Dataset: 103,837 steps loaded
+2026-07-31 00:45:34,155 INFO Offline BC dataset: 103,837 steps from demonstrations/phase1/
+2026-07-31 00:45:34,155 INFO Combined BC + value pre-training: 6 epoch(s), batch_size=312, dataset=103,837 steps, rollout_steps=8096
+2026-07-31 00:45:34,180 INFO Phase 0 — demo value pretrain: 10 epoch(s), gamma=0.995, returns mean=16.01  std=12.84  lr=0.003
+2026-07-31 00:45:40,327 INFO   Demo value epoch 1/10: val_loss=1.0519  rmse=13.17 (returns std=12.8)
