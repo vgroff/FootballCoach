@@ -706,7 +706,7 @@ def _apply_neural_action(trainer, match: Match, player_id: str, trial_tick: int)
     """Run one neural decision for player_id; falls back to GetPossessionOrder on error."""
     import torch
     from footballcoach.ai.obs.encoder import encode_observation, MAX_OTHER_PLAYERS
-    from footballcoach.ai.action.apply_nn_action import apply_action_to_player, encode_slot_player_ids
+    from footballcoach.ai.action.apply_nn_action import apply_action_to_player
     from footballcoach.ai.action.gating import select_action
 
     try:
@@ -716,16 +716,21 @@ def _apply_neural_action(trainer, match: Match, player_id: str, trial_tick: int)
     try:
         time_remaining = max(0.0, 120.0 - trial_tick / 30.0)
         obs = encode_observation(match=match, player_id=player_id, time_remaining_s=time_remaining)
-        obs_dict = {k: v.unsqueeze(0) for k, v in obs.to_torch_dict().items()}
+        obs_dict = obs.to_torch_dict()  # _sample_action adds the batch dim internally
         with torch.no_grad():
             result = trainer._sample_action(obs_dict)
         (_action, _lp, _val, decision_probs, exec_phys, dec_phys, target_slots, _raw_exec) = result
-        slot_player_ids = encode_slot_player_ids(match, player_id, MAX_OTHER_PLAYERS)
+        # Build slot_player_ids as [None]*MAX_OTHER_PLAYERS (target resolution not needed for UI)
+        slot_player_ids = [None] * MAX_OTHER_PLAYERS
         gating = select_action(
             decision_probs=decision_probs,
             execution_physical=exec_phys,
             target_slots=target_slots,
         )
+        # Cache gating on player so between-decision ticks can re-apply direction/speed
+        player._cached_nn_gating = gating
+        player._cached_nn_slot_player_ids = slot_player_ids
+        player._cached_nn_dec_phys = dec_phys
         apply_action_to_player(
             gating=gating,
             player=player,
@@ -736,6 +741,27 @@ def _apply_neural_action(trainer, match: Match, player_id: str, trial_tick: int)
     except Exception:
         if player.current_order is None:
             player.current_order = GetPossessionOrder()
+
+
+def _reapply_cached_neural_action(match: Match, player_id: str) -> None:
+    """Re-apply the last cached neural gating on between-decision ticks so the player keeps moving."""
+    from footballcoach.ai.action.apply_nn_action import apply_action_to_player
+    try:
+        player = match.player_by_id(player_id)
+    except KeyError:
+        return
+    gating = getattr(player, "_cached_nn_gating", None)
+    if gating is None:
+        return
+    slot_player_ids = getattr(player, "_cached_nn_slot_player_ids", [None] * 21)
+    dec_phys = getattr(player, "_cached_nn_dec_phys", {})
+    apply_action_to_player(
+        gating=gating,
+        player=player,
+        match=match,
+        slot_player_ids=slot_player_ids,
+        decision_physical=dec_phys,
+    )
 
 
 def _phase1_scenario_cfg() -> dict:
@@ -870,12 +896,16 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
             if state["ticks_trainee"] >= DECISION_INTERVAL_TICKS:
                 state["ticks_trainee"] = 0
                 _apply_neural_action(trainee_trainer, match, "trainee", trial_tick)
+            else:
+                _reapply_cached_neural_action(match, "trainee")
 
         if opponent_trainer is not None:
             state["ticks_opponent"] += 1
             if state["ticks_opponent"] >= DECISION_INTERVAL_TICKS:
                 state["ticks_opponent"] = 0
                 _apply_neural_action(opponent_trainer, match, "opponent", trial_tick)
+            else:
+                _reapply_cached_neural_action(match, "opponent")
 
     # Attach the params list so the SCENARIOS entry can reference it
     build._phase1_params = params_list  # type: ignore[attr-defined]

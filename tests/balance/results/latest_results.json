@@ -128,9 +128,9 @@
     "direct_travel_ticks": 25
   },
   "repulsion_ball_carrier_avoidance": {
-    "min_sep_with_ball_m": 1.744,
+    "min_sep_with_ball_m": 1.7769,
     "min_sep_without_ball_m": 1.6331,
-    "mean_close_approach_speed_with_ball_mps": 7.972,
+    "mean_close_approach_speed_with_ball_mps": 7.958,
     "mean_close_approach_speed_without_ball_mps": 8.27,
     "carrier_is_slower": true
   },

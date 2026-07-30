@@ -161,7 +161,8 @@ All players share **one** `DecisionNetwork` and **one** `ExecutionNetwork`
 
 **Execution network** runs second:
 - **Inputs**: same observation + full decision-network output (all heads)
-- **Outputs**: `move_direction` (unit vec), `sprint` (Bernoulli),
+- **Outputs**: `exec_move` (Bernoulli: move vs standstill → sets `desired_speed_mode`),
+  `move_direction` (unit vec → sets `desired_direction`), `sprint` (Bernoulli: SPRINT vs JOG),
   `kick_this_tick` (Bernoulli), `kick_direction`, `kick_power`, `kick_spin`,
   `tackle_attempt` (Bernoulli), `value`
 

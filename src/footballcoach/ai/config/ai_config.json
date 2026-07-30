@@ -61,17 +61,17 @@
     "direction_loss_weight": 3.0,
     "aux_coeff_start": 0.7,
     "aux_coeff_end": 0.0,
-    "aux_coeff_anneal_fraction": 0.35,
+    "aux_coeff_anneal_fraction": 0.6,
     "_comment_aux": "aux_coeff anneals linearly from start to end over aux_coeff_anneal_fraction of training (e.g. 0.3 = done by 30% of steps). The BC loss is computed on decision Bernoulli heads and execution move_direction.",
-    "bc_pretrain_epochs": 8,
-    "bc_pretrain_batch_size": 1024,
+    "bc_pretrain_epochs": 7,
+    "bc_pretrain_batch_size": 512,
     "value_pretrain_steps": 4096,
     "value_pretrain_epochs": 2,
     "value_pretrain_lr": 2e-3,
     "bc_repair_epochs": 1,
     "bc_repair_lr": 2e-3,
     "_comment_value": "After BC pre-training, run value-only MSE warm-up so the critic is near the true return scale before PPO starts. Set value_pretrain_steps=0 to skip.",
-    "demo_sample_interval_s": 1.5,
+    "demo_sample_interval_s": 2.0,
     "_comment_demo_sample": "Time between timed observation samples during demonstration recording. Kicks and tackles are always recorded regardless."
   },
 
@@ -86,7 +86,7 @@
     "phase1": {
       "ball_distance_shaping": 0.05,
       "gain_possession_bonus": 1.0,
-      "ball_progress_scale": 0.1,
+      "ball_progress_scale": 0.5,
       "ball_out_penalty": -1.0,
       "illegal_action_penalty": -0.2,
       "box_possession_terminal": 5.0

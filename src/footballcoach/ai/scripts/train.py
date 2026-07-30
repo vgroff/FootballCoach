@@ -175,15 +175,42 @@ def main() -> None:
                     lr=value_pretrain_lr,
                 )
 
-    # Quick pre-PPO evaluation against rules-based AI
+    # Save a checkpoint of the pre-trained model before PPO starts
+    if not args.checkpoint and checkpoint_dir is not None:
+        pretrain_ckpt = checkpoint_dir / "checkpoint_pretrained.pt"
+        trainer._save_checkpoint_to(pretrain_ckpt)
+        log.info(f"Pre-trained checkpoint saved: {pretrain_ckpt}")
+
+    # Quick pre-PPO evaluation: neural vs rules-based AND vs immobile opponent
     if args.pre_ppo_eval_trials > 0:
         from footballcoach.ai.scripts.evaluate import _run_evaluation
-        log.info(f"Pre-PPO eval: {args.pre_ppo_eval_trials} episodes vs rules-based AI...")
+        log.info(f"Pre-PPO eval: {args.pre_ppo_eval_trials} episodes (mixed rules/immobile)...")
         eval_stats = _run_evaluation(trainer, env, args.pre_ppo_eval_trials)
         log.info(
             f"Pre-PPO eval result: win={eval_stats['win_rate_pct']:.1f}%  "
             f"mean_rew={eval_stats['mean_reward']:.3f}  "
             f"outcomes={eval_stats['outcomes']}"
+        )
+
+        # Also evaluate explicitly against immobile opponent only
+        from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
+        from footballcoach.ai.env.scenario_env import ScenarioEnv
+        def _immobile_build(*args, **kwargs):
+            match = build_1v1_scenario(*args, **kwargs)
+            opp = match.player_by_id("opponent")
+            opp.ai = None
+            match._opponent_use_rules_ai = False
+            return match
+        immobile_defn = ScenarioDefinition(key="1v1_immobile", label="1v1 immobile", description="1v1 vs immobile opponent", build=_immobile_build)
+        immobile_env = ScenarioEnv(
+            immobile_defn, trainee_player_id="trainee", phase=1,
+            max_episode_s=env.max_episode_s,
+        )
+        immobile_stats = _run_evaluation(trainer, immobile_env, args.pre_ppo_eval_trials)
+        log.info(
+            f"Pre-PPO eval (immobile opp): win={immobile_stats['win_rate_pct']:.1f}%  "
+            f"mean_rew={immobile_stats['mean_reward']:.3f}  "
+            f"outcomes={immobile_stats['outcomes']}"
         )
 
     # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0)

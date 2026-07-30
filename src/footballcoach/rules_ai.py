@@ -233,11 +233,13 @@ class NeuralPlayerAI(PlayerAI):
         self._ticks_since_decision: int = decision_interval_ticks  # act on first tick
         self._episode_ticks: int = 0
         self.last_transition = None
+        self._last_gating = None  # cached gating result; re-applied every tick
 
     def reset(self) -> None:
         self._ticks_since_decision = self.decision_interval_ticks
         self._episode_ticks = 0
         self.last_transition = None
+        self._last_gating = None
 
     def act(self, player: "Player", match: "Match", trial_tick: int) -> None:
         from footballcoach.ai.obs.encoder import encode_observation, MAX_OTHER_PLAYERS
@@ -248,6 +250,17 @@ class NeuralPlayerAI(PlayerAI):
         self._ticks_since_decision += 1
 
         if self._ticks_since_decision < self.decision_interval_ticks:
+            # Re-apply last cached gating so desired_direction/speed_mode
+            # are set every tick (not just on decision ticks).
+            if self._last_gating is not None:
+                from footballcoach.ai.action.apply_nn_action import apply_action_to_player
+                apply_action_to_player(
+                    gating=self._last_gating,
+                    player=player,
+                    match=match,
+                    slot_player_ids=[None] * 21,
+                    decision_physical={},
+                )
             return
         # New decision interval — clear stale transition, then sample.
         self.last_transition = None
@@ -269,6 +282,7 @@ class NeuralPlayerAI(PlayerAI):
 
         slot_player_ids = [None] * MAX_OTHER_PLAYERS  # safe default; NeuralPlayerAI does not need target resolution
         gating = select_action(decision_probs, exec_phys, target_slots)
+        self._last_gating = gating  # cache so between-decision ticks can re-apply direction/speed
         translation = apply_action_to_player(
             gating=gating,
             player=player,

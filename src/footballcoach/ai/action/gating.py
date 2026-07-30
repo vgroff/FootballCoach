@@ -49,7 +49,7 @@ class SelectedAction(Enum):
 
 @dataclass
 class GatingResult:
-    """Output of select_action(); consumed by to_orders.py."""
+    """Output of select_action(); consumed by apply_nn_action.py."""
     selected: SelectedAction
     # Target slot index (for PASS/TACKLE/MARK), or None
     target_slot: Optional[int] = None

@@ -367,6 +367,8 @@ class PPOTrainer:
         for epoch in range(n_epochs):
             bc_losses = []
             dir_cosines: list[float] = []
+            move_probs: list[float] = []
+            sprint_probs: list[float] = []
             for obs_dict, bc_labels in dataset.iterate_minibatches(
                 batch_size=batch_size, shuffle=True, device=self.device, valid_only=True
             ):
@@ -406,10 +408,17 @@ class PPOTrainer:
                         pred_n = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
                         cos_vals = (pred_n * tgt_dir).sum(dim=-1)
                         dir_cosines.append(cos_vals.mean().item())
+                    if valid_mask.any():
+                        move_probs.append(torch.sigmoid(e_heads.exec_move_logit.squeeze(-1)[valid_mask]).mean().item())
+                        sprint_probs.append(torch.sigmoid(e_heads.sprint_logit.squeeze(-1)[valid_mask]).mean().item())
 
             mean_cos = float(np.mean(dir_cosines)) if dir_cosines else float('nan')
-            log.info(f"  BC epoch {epoch + 1}/{n_epochs}: bc_loss={np.mean(bc_losses):.4f}  dir_cos={mean_cos:.3f}")
+            mean_mv = float(np.mean(move_probs)) if move_probs else float('nan')
+            mean_spr = float(np.mean(sprint_probs)) if sprint_probs else float('nan')
+            log.info(f"  BC epoch {epoch + 1}/{n_epochs}: bc_loss={np.mean(bc_losses):.4f}  dir_cos={mean_cos:.3f}  mv_p={mean_mv:.3f}  spr_p={mean_spr:.3f}")
             dir_cosines.clear()
+            move_probs.clear()
+            sprint_probs.clear()
         log.info(f"BC pre-training done ({n_epochs} epoch(s), final bc_loss={np.mean(bc_losses):.4f})")
 
         # --- Phase 2: collect rollout with BC-warmed policy for value targets ---
@@ -528,6 +537,8 @@ class PPOTrainer:
             for epoch in range(repair_epochs):
                 repair_losses = []
                 dir_cosines_r: list[float] = []
+                move_probs_r: list[float] = []
+                sprint_probs_r: list[float] = []
                 for obs_dict, bc_labels in dataset.iterate_minibatches(
                     batch_size=batch_size, shuffle=True, device=self.device, valid_only=True
                 ):
@@ -565,8 +576,13 @@ class PPOTrainer:
                             eps = 1e-6
                             pred_n = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
                             dir_cosines_r.append((pred_n * tgt_dir).sum(dim=-1).mean().item())
+                        if valid_mask.any():
+                            move_probs_r.append(torch.sigmoid(e_r.exec_move_logit.squeeze(-1)[valid_mask]).mean().item())
+                            sprint_probs_r.append(torch.sigmoid(e_r.sprint_logit.squeeze(-1)[valid_mask]).mean().item())
 
                 mean_cos_r = float(np.mean(dir_cosines_r)) if dir_cosines_r else float('nan')
+                mean_mv_r = float(np.mean(move_probs_r)) if move_probs_r else float('nan')
+                mean_spr_r = float(np.mean(sprint_probs_r)) if sprint_probs_r else float('nan')
                 # Also measure value loss on the stored rollout returns (no gradient)
                 with torch.no_grad():
                     val_losses_r = []
@@ -585,8 +601,8 @@ class PPOTrainer:
                         )
                         pred_vr = ((d_vr.value + e_vr.value) / 2.0).squeeze(-1)
                         val_losses_r.append(F.mse_loss(pred_vr, mb_ret_r).item() / (ret_std ** 2).item())
-                log.info(f"  BC repair epoch {epoch + 1}/{repair_epochs}: bc_loss={np.mean(repair_losses):.4f}  dir_cos={mean_cos_r:.3f}  val_loss={np.mean(val_losses_r):.4f}")
-            log.info(f"BC repair done ({repair_epochs} epoch(s), final bc_loss={np.mean(repair_losses):.4f}  dir_cos={mean_cos_r:.3f}  val_loss={np.mean(val_losses_r):.4f})")
+                log.info(f"  BC repair epoch {epoch + 1}/{repair_epochs}: bc_loss={np.mean(repair_losses):.4f}  dir_cos={mean_cos_r:.3f}  mv_p={mean_mv_r:.3f}  spr_p={mean_spr_r:.3f}  val_loss={np.mean(val_losses_r):.4f}")
+            log.info(f"BC repair done ({repair_epochs} epoch(s), final bc_loss={np.mean(repair_losses):.4f}  dir_cos={mean_cos_r:.3f}  mv_p={mean_mv_r:.3f}  spr_p={mean_spr_r:.3f}  val_loss={np.mean(val_losses_r):.4f})")
 
         log.info("Combined pre-training complete.")
 
@@ -1337,6 +1353,16 @@ class PPOTrainer:
             "optimizer": self.optimizer.state_dict(),
         }, path)
         log.info(f"Saved checkpoint: {path}")
+
+    def _save_checkpoint_to(self, path: Path) -> None:
+        """Save a checkpoint to an explicit path (used for pre-trained snapshot)."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save({
+            "step": self._total_steps,
+            "decision_net": self.decision_net.state_dict(),
+            "execution_net": self.execution_net.state_dict(),
+            "optimizer": self.optimizer.state_dict(),
+        }, path)
 
     def load_checkpoint(self, path: Path) -> int:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
