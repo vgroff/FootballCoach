@@ -4,7 +4,7 @@
   "observation": {
     "max_other_players": 21,
     "decision_interval_s": 0.8,
-    "sim_dt_s": 0.05,
+    "sim_dt_s": 0.12,
     "_comment_sim_dt_s": "Physics tick size. Default 0.0333 (30Hz). Increase for faster training: 0.05=20Hz (~1.5x), 0.067=15Hz (~2x). UI ignores this and always uses 30Hz.",
     "ball_spin_norm_max_rad_s": 30.0,
     "time_remaining_norm_max_s": 7200.0,

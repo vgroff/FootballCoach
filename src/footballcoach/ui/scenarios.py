@@ -1360,7 +1360,14 @@ class ScenarioLoop:
             if ball.possessed_by is None and ball.velocity.length() < 0.1 and not any_controlling:
                 return "miss", self.linger_s * 0.5
 
-        if self._trial_tick >= 30 and all(p.current_order is None for p in self._match.players):
+        from footballcoach.rules_ai import NeuralPlayerAI
+        # Only trigger early termination if there are rules-based AI players
+        # (players with an AI that is NOT NeuralPlayerAI). Neural players and
+        # immobile players (ai=None) should not trigger this — the ball settling
+        # is normal during neural play.
+        rules_players = [p for p in self._match.players
+                         if p.ai is not None and not isinstance(p.ai, NeuralPlayerAI)]
+        if rules_players and self._trial_tick >= 30 and all(p.current_order is None for p in rules_players):
             if ball.velocity.length() < 0.1:
                 return "other", self.linger_s
 
