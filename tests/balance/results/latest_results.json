@@ -8,19 +8,19 @@
   },
   "save_random_scenarios_good_vs_bad": {
     "n_scenarios": 300,
-    "good_gk_save_rate_pct": 89.7,
-    "bad_gk_save_rate_pct": 88.3
+    "good_gk_save_rate_pct": 98.0,
+    "bad_gk_save_rate_pct": 98.0
   },
   "save_far_post_fast_vs_slow_gk": {
     "fast_gk": {
       "n_trials": 300,
-      "saved": 266,
-      "save_rate_pct": 88.67
+      "saved": 299,
+      "save_rate_pct": 99.67
     },
     "slow_gk": {
       "n_trials": 300,
-      "saved": 0,
-      "save_rate_pct": 0.0
+      "saved": 299,
+      "save_rate_pct": 99.67
     }
   },
   "save_centre_aim_easy_case": {
@@ -36,15 +36,15 @@
     }
   },
   "save_rate_grid_pct": {
-    "gk_speed=0.1_near_post": 84.7,
-    "gk_speed=0.1_centre": 96.0,
-    "gk_speed=0.1_far_post": 0.7,
-    "gk_speed=0.5_near_post": 84.7,
-    "gk_speed=0.5_centre": 96.7,
-    "gk_speed=0.5_far_post": 55.3,
-    "gk_speed=0.9_near_post": 84.7,
-    "gk_speed=0.9_centre": 96.7,
-    "gk_speed=0.9_far_post": 79.3
+    "gk_speed=0.1_near_post": 100.0,
+    "gk_speed=0.1_centre": 100.0,
+    "gk_speed=0.1_far_post": 100.0,
+    "gk_speed=0.5_near_post": 100.0,
+    "gk_speed=0.5_centre": 100.0,
+    "gk_speed=0.5_far_post": 100.0,
+    "gk_speed=0.9_near_post": 100.0,
+    "gk_speed=0.9_centre": 100.0,
+    "gk_speed=0.9_far_post": 100.0
   },
   "gk_tackle_inside_vs_outside_box": {
     "n": 2000,
@@ -511,18 +511,18 @@
   },
   "penalty_precision_0.5_centre_aim": {
     "n_trials": 2000,
-    "scored": 1986,
-    "score_rate_pct": 99.3
+    "scored": 2000,
+    "score_rate_pct": 100.0
   },
   "penalty_precision_0.5_corner_aim": {
     "n_trials": 2000,
-    "scored": 1565,
-    "score_rate_pct": 78.25
+    "scored": 1852,
+    "score_rate_pct": 92.6
   },
   "penalty_precision_0.8_corner_aim": {
     "n_trials": 2000,
-    "scored": 1872,
-    "score_rate_pct": 93.6
+    "scored": 1994,
+    "score_rate_pct": 99.7
   },
   "shoot_stationary_no_penalty": {
     "n_trials": 300,

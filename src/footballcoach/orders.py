@@ -259,36 +259,7 @@ class KickOrder:
 
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
         """Kick the ball this tick if the player has possession.  Always completes in one tick."""
-        from footballcoach.engine.kicking import kick_ball, compensate_power_for_run_mult, running_power_multiplier
-        from footballcoach.engine.movement import effective_top_speed
-
-        if match.ball.possessed_by == player.player_id:
-            top_speed = effective_top_speed(
-                match.movement_params, player.attributes.top_speed, player.stamina,
-                has_ball=True, ball_control_attr=player.attributes.ball_control,
-            )
-            run_mult = running_power_multiplier(
-                match.kicking_params.running_power_coefficient, player.velocity,
-                self.aim_point - player.position, top_speed,
-            )
-            kick_ball(
-                match.ball,
-                player.position,
-                self.aim_point,
-                compensate_power_for_run_mult(self.power_fraction, run_mult) if self.compensate_for_run else self.power_fraction,
-                player.attributes.kick_precision,
-                player.attributes.kick_power,
-                self.spin,
-                match.rng_reduction,
-                match.rng,
-                match.kicking_params,
-                kicker_velocity=player.velocity,
-                kicker_top_speed_mps=top_speed,
-            )
-            match._start_release_grace(player.player_id)
-            match._log_debug(f"{player.player_id} kicked  power={self.power_fraction:.2f}")
-            if player.on_kick is not None:
-                player.on_kick(player)
+        player.kick_direct(match, self.aim_point, self.power_fraction, self.spin)
         return True
 
 
