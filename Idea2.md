@@ -12,12 +12,9 @@ Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_
 
 Immedaite task!!
 Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 50k . We're only going against immovile opnent, should it should be easy
+- We could super easliy remove a whole axis of symmetry by transforming all AI positions to being +x is attacking goal, -x is dending goal, remove the flag for which end youre attacking on and transform back and forth from the engine positions to the AI positions. Would probably mean a smaller/smarter AI and faster trainnig from fewer augmentations
 - parralelise the simulation somehow? player decision? maybe even movements/updates, though potentially dangerous
-- Looks like the value network might be strulggling - why??
-- train the decision network during the pre-pre-train too
 - Is the AI completely ignoring all the kick mechanics like direction and spin and just aimming for the centre of the box when it kicks? Why on earth was this implemented???
-- I'd like the decision network to have a good latent space representation. Maybe I can even pre-train it (freeze the latent space) for a few epochs before the execution network starts pre-training? (maybe it should give the critic/value output? however that works)
-    - maybe ideal pre-train regime, first train the decision network to predict decision and final reward (add as a dummy neuron) from demos, then train bc network for like 3 epochs, then train value network for 2 epochs, then bc again for 1, then value for 1, then final repair round. what do we think?
 
 Immediate AI stuff
 - Can we do some trainings runs and then see and see if the trained AI is able to beat the rules-based AI more consistently or at least at a simiar rate than another rules-based AI could?
@@ -26,7 +23,6 @@ Immediate AI stuff
     - let me also create my own scenarios and play them as training "demonstrations" entirely in the UI, using the actions/orders and having that recorded, and then it gets used for training. store the orders too for neural network training and replaying
     - Allow me to replay the demonstrations in the UI - either through orders or through actions
 - during the demonstration collection, print summary stats of the reward scores for each player (they might sum to 0)
-- We could super easliy remove a whole axis of symmetry by transforming all AI positions to being +x is attacking goal, -x is dending goal, remove the flag for which end youre attacking on and transform back and forth from the engine positions to the AI positions. Would probably mean a smaller/smarter AI
 - Think about how GetPossesion, Tackle and Move orders are going to interact - they could work together. The Orders would need to break down into AI suggestions maybe
 
 Next immediate training:

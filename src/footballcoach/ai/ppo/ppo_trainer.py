@@ -370,6 +370,39 @@ class PPOTrainer:
                 if self.checkpoint_dir is not None:
                     self._save_checkpoint(self._total_steps)
 
+                # Quick periodic eval vs rules-based AI (always, regardless of training opponent)
+                try:
+                    from footballcoach.rules_ai import Phase1RulesAI
+                    from footballcoach.ui.scenarios import build_1v1_scenario
+                    from footballcoach.ai.env.scenario_env import ScenarioEnv
+                    _eval_match = build_1v1_scenario()
+                    _opp = _eval_match.player_by_id("opponent")
+                    _opp.ai = Phase1RulesAI()
+                    _eval_match._opponent_use_rules_ai = True
+                    _eval_match._opponent_is_immobile = False
+                    _eval_env = ScenarioEnv(_eval_match, trainee_player_id="trainee")
+                    _eval_env.sample_action_fn = self._sample_action
+                    _eval_n = 10
+                    _eval_wins = 0
+                    _eval_outcomes: dict[str, int] = {}
+                    for _ in range(_eval_n):
+                        _eval_env.reset()
+                        _eval_done = False
+                        _eval_info = None
+                        while not _eval_done:
+                            _, _, _eval_done, _eval_info = _eval_env.step()
+                        _oc = _eval_info.trial_outcome if _eval_info else "unknown"
+                        _eval_outcomes[_oc] = _eval_outcomes.get(_oc, 0) + 1
+                        if _oc == "box_possession":
+                            _eval_wins += 1
+                    log.info(
+                        f"  [eval vs rules] step={self._total_steps:,}  "
+                        f"win={_eval_wins}/{_eval_n} ({_eval_wins/_eval_n*100:.0f}%)  "
+                        f"outcomes={_eval_outcomes}"
+                    )
+                except Exception as _e:
+                    log.warning(f"  [eval vs rules] failed: {_e}")
+
         # Always save a final checkpoint so the result of the run is not lost
         # even if total_steps is not an exact multiple of rollout_steps.
         if self.checkpoint_dir is not None:
@@ -448,9 +481,6 @@ class PPOTrainer:
                 + list(self.execution_net.value_head.parameters()),
                 lr=self._demo_value_pretrain_lr, eps=1e-5,
             )
-            _freeze_params = self._get_value_pretrain_freeze_params()
-            for p in _freeze_params:
-                p.requires_grad_(False)
             demo_returns = dataset.compute_returns(gamma=self._demo_value_pretrain_gamma)
             ret_t_all = torch.from_numpy(demo_returns).to(self.device)
             ret_std = ret_t_all.std().clamp(min=1.0)
@@ -462,6 +492,7 @@ class PPOTrainer:
             )
             for epoch in range(_demo_epochs):
                 epoch_losses: list[float] = []
+                raw_mse_losses: list[float] = []
                 for obs_dict, ret_batch in dataset.iterate_minibatches_with_returns(
                     batch_size=batch_size, returns=demo_returns,
                     shuffle=True, device=self.device,
@@ -482,6 +513,10 @@ class PPOTrainer:
                         ((v_dec - ret_norm) ** 2).mean()
                         + ((v_exc - ret_norm) ** 2).mean()
                     )
+                    raw_mse = 0.5 * (
+                        F.mse_loss(v_dec * ret_std, ret_batch)
+                        + F.mse_loss(v_exc * ret_std, ret_batch)
+                    )
                     _demo_val_opt.zero_grad()
                     val_loss.backward()
                     nn.utils.clip_grad_norm_(
@@ -491,12 +526,13 @@ class PPOTrainer:
                     )
                     _demo_val_opt.step()
                     epoch_losses.append(val_loss.item())
+                    raw_mse_losses.append(raw_mse.item())
                 log.info(
                     f"  Demo value epoch {epoch + 1}/{_demo_epochs}: "
-                    f"val_loss={np.mean(epoch_losses):.4f}"
+                    f"val_loss={np.mean(epoch_losses):.4f}  "
+                    f"rmse={np.sqrt(np.mean(raw_mse_losses)):.2f} "
+                    f"(returns std={ret_std:.1f})"
                 )
-            for p in _freeze_params:
-                p.requires_grad_(True)
             log.info(f"Phase 0 done (demo value pretrain, {_demo_epochs} epoch(s))")
         elif _demo_epochs > 0 and not dataset.has_rewards:
             log.info(
@@ -528,6 +564,7 @@ class PPOTrainer:
         for epoch in range(n_epochs):
             bc_losses = []
             val_losses: list[float] = []
+            val_raw_mse_losses: list[float] = []
             dir_cosines: list[float] = []
             move_probs: list[float] = []
             sprint_probs: list[float] = []
@@ -576,6 +613,13 @@ class PPOTrainer:
                     )
                     total_loss = bc_loss + self._demo_value_bc_coef * val_loss
                     val_losses.append(val_loss.item())
+                    # raw unnormalised MSE for RMSE reporting
+                    with torch.no_grad():
+                        raw_mse = 0.5 * (
+                            ((v_dec * _joint_ret_std - ret_batch) ** 2).mean()
+                            + ((v_exc * _joint_ret_std - ret_batch) ** 2).mean()
+                        )
+                        val_raw_mse_losses.append(raw_mse.item())
                 bc_opt.zero_grad()
                 total_loss.backward()
                 nn.utils.clip_grad_norm_(
@@ -608,7 +652,11 @@ class PPOTrainer:
             mean_mv = float(np.mean(move_probs)) if move_probs else float('nan')
             mean_spr = float(np.mean(sprint_probs)) if sprint_probs else float('nan')
             bkdn_str = "  ".join(f"{k}={v/_bkdn_n:.3f}" for k, v in _bkdn_acc.items()) if _bkdn_n else ""
-            val_str = f"  val_loss={np.mean(val_losses):.4f}" if val_losses else ""
+            if val_losses:
+                val_rmse = float(np.sqrt(np.mean(val_raw_mse_losses))) if val_raw_mse_losses else float('nan')
+                val_str = f"  val_loss={np.mean(val_losses):.4f}  rmse={val_rmse:.2f} (returns std={_joint_ret_std:.1f})"
+            else:
+                val_str = ""
             log.info(
                 f"  BC epoch {epoch + 1}/{n_epochs}: bc_loss={np.mean(bc_losses):.4f}"
                 + val_str

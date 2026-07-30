@@ -62,6 +62,12 @@ def main() -> None:
                             "automatically. Useful for iterating on PPO hyperparameters without "
                             "re-running the expensive BC pre-training stage."
                         ))
+    parser.add_argument("--pretrain-from-checkpoint", type=str, default=None, metavar="PATH",
+                        help=(
+                            "Load weights from a checkpoint then still run the full BC/value "
+                            "pre-training loop. Unlike --checkpoint (which skips pre-training), "
+                            "this lets you re-pretrain an existing policy with new config or demos."
+                        ))
     parser.add_argument("--pre-ppo-eval-trials", type=int, default=40,
                         help="Episodes to evaluate vs rules-based AI after pre-training, before "
                              "PPO starts. Set to 0 to skip (default: 40).")
@@ -130,6 +136,16 @@ def main() -> None:
     # Optionally resume from checkpoint
     if args.checkpoint:
         trainer.load_checkpoint(Path(args.checkpoint))
+
+    # --pretrain-from-checkpoint: load weights but still run pretraining
+    if args.pretrain_from_checkpoint:
+        ptrain_path = Path(args.pretrain_from_checkpoint)
+        if not ptrain_path.exists():
+            log.error(f"--pretrain-from-checkpoint: file not found: {ptrain_path}")
+            return
+        trainer.load_checkpoint(ptrain_path)
+        trainer._total_steps = 0  # reset step counter so pretraining + full PPO run from scratch
+        log.info(f"Loaded checkpoint for re-pretraining: {ptrain_path} — will still run BC/value pre-training")
 
     # --from-pretrained: load a pre-trained checkpoint and skip all pre-training
     if args.from_pretrained:
@@ -203,7 +219,7 @@ def main() -> None:
                 )
 
     # Save a checkpoint of the pre-trained model before PPO starts
-    if not args.checkpoint and not args.from_pretrained and checkpoint_dir is not None:
+    if not args.checkpoint and not args.from_pretrained and not args.pretrain_from_checkpoint and checkpoint_dir is not None:
         pretrain_ckpt = checkpoint_dir / "checkpoint_pretrained.pt"
         trainer._save_checkpoint_to(pretrain_ckpt)
         log.info(f"Pre-trained checkpoint saved: {pretrain_ckpt}")
