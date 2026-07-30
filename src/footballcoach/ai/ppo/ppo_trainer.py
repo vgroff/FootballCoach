@@ -103,6 +103,7 @@ class PPOTrainer:
         self._bc_cfg = bc_cfg
         self._bc_dir_loss_w = float(bc_cfg.get("direction_loss_weight", 3.0))
         self._bc_region_loss_w = float(bc_cfg.get("region_loss_weight", 1.0))
+        self._value_pretrain_frozen_layers = int(bc_cfg.get("value_pretrain_frozen_layers", -1))
 
         lr = float(ppo_cfg.get("learning_rate", 3e-4))
         if not inference_only:
@@ -119,6 +120,36 @@ class PPOTrainer:
     # -----------------------------------------------------------------------
     # Curriculum helpers
     # -----------------------------------------------------------------------
+
+    def _get_value_pretrain_freeze_params(self) -> list:
+        """Return params to set requires_grad=False during value warm-up.
+
+        Controlled by ``bc.value_pretrain_frozen_layers`` in ai_config.json:
+          -1 / 3 : encoders + full trunk (default — matches prior behaviour)
+          2       : encoders + first trunk Linear only
+          1       : pre-trunk encoders only
+          0       : nothing frozen (gradients flow through trunk freely)
+        """
+        n = self._value_pretrain_frozen_layers
+        if n == 0:
+            return []
+        params: list[nn.Parameter] = []
+        for net in (self.decision_net, self.execution_net):
+            pre_trunk: list[nn.Module] = [
+                net.entity_encoder, net.self_mlp, net.ball_mlp, net.global_mlp,
+            ]
+            if hasattr(net, "decision_mlp"):
+                pre_trunk.append(net.decision_mlp)
+            layer_groups = [
+                pre_trunk,
+                [net.trunk[0]],
+                [net.trunk[2]],
+            ]
+            count = len(layer_groups) if n == -1 else min(n, len(layer_groups))
+            for group in layer_groups[:count]:
+                for m in group:
+                    params.extend(m.parameters())
+        return params
 
     def set_frozen_heads(self, frozen_head_names: list[str]) -> None:
         """Freeze named decision-network heads so PPO gradients skip them.
@@ -511,6 +542,10 @@ class PPOTrainer:
         log.debug(f"  [combined pretrain] rollout returns: mean={returns_t.mean():.2f}  std={ret_std:.2f}")
 
         # --- Phase 3: value head warm-up on on-policy returns ---
+        # Freeze trunk layers so backward() skips useless gradient computation.
+        _freeze_params = self._get_value_pretrain_freeze_params()
+        for p in _freeze_params:
+            p.requires_grad_(False)
         # Augment rollout_batch with geometric flips + slot permutations (ALWAYS applied).
         if self.augment_n_slot_shuffles > 0:
             rollout_batch = augment_batch(rollout_batch, self.augment_n_slot_shuffles, self._aug_rng)
@@ -549,6 +584,8 @@ class PPOTrainer:
                 val_losses.append(value_loss.item())
             log.info(f"  Value epoch {epoch + 1}/{val_epochs}: val_loss={np.mean(val_losses):.4f}")
         log.info(f"Value pre-training done ({val_epochs} epoch(s), final val_loss={np.mean(val_losses):.4f})")
+        for p in _freeze_params:
+            p.requires_grad_(True)
 
         # --- BC degradation check: re-evaluate BC loss over dataset after value warm-up ---
         self.decision_net.eval()
@@ -694,8 +731,10 @@ class PPOTrainer:
             lr: Learning rate for value pre-training (higher than PPO lr, e.g. 1e-3)
         """
         log.info(f"Value pre-training: {n_steps} steps, {n_epochs} epochs, lr={lr}")
-        # Only train the value heads — not the shared trunk — so BC-learned
-        # policy weights are not corrupted.
+        # Freeze trunk layers so BC-learned policy weights are not corrupted.
+        _freeze_params = self._get_value_pretrain_freeze_params()
+        for p in _freeze_params:
+            p.requires_grad_(False)
         value_opt = torch.optim.Adam(
             list(self.decision_net.value_head.parameters())
             + list(self.execution_net.value_head.parameters()),
@@ -788,8 +827,8 @@ class PPOTrainer:
                 pred_vals = ((d_s.value + e_s.value) / 2.0).squeeze(-1)
             log.debug(f"  [value pretrain epoch {ep:2d}] loss={mean_loss:.4f}"
                       f"  pred_val mean={pred_vals.mean():.2f}  target mean={returns_t[:64].mean():.2f}")
-
-        log.info("Value pre-training complete.")
+        for p in _freeze_params:
+            p.requires_grad_(True)
 
     # -----------------------------------------------------------------------
     # Policy sampling
