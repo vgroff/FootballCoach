@@ -56,18 +56,18 @@
   "bc": {
     "_comment": "Behavioural cloning from rules-based AI. Set pretrain_steps=0 to skip pre-training. Set aux_coeff_start=0.0 to disable the PPO auxiliary BC loss.",
     "pretrain_steps": 6000,
-    "pretrain_lr": 6e-3,
-    "pretrain_online_batch_size": 4,
+    "pretrain_lr": 1e-3,
+    "pretrain_online_batch_size": 16,
     "direction_loss_weight": 3.0,
     "aux_coeff_start": 0.5,
     "aux_coeff_end": 0.0,
     "aux_coeff_anneal_fraction": 0.2,
     "_comment_aux": "aux_coeff anneals linearly from start to end over aux_coeff_anneal_fraction of training (e.g. 0.3 = done by 30% of steps). The BC loss is computed on decision Bernoulli heads and execution move_direction.",
-    "bc_pretrain_epochs": 30,
-    "bc_pretrain_batch_size": 256,
+    "bc_pretrain_epochs": 10,
+    "bc_pretrain_batch_size": 2048,
     "value_pretrain_steps": 4096,
-    "value_pretrain_epochs": 200,
-    "value_pretrain_lr": 2e-2,
+    "value_pretrain_epochs": 10,
+    "value_pretrain_lr": 2e-3,
     "bc_repair_epochs": 2,
     "bc_repair_lr": 1e-3,
     "_comment_value": "After BC pre-training, run value-only MSE warm-up so the critic is near the true return scale before PPO starts. Set value_pretrain_steps=0 to skip."
@@ -96,5 +96,15 @@
       "illegal_action_penalty": -0.2,
       "possession_lost_to_keeper_penalty": -0.5
     }
+  },
+
+  "phase1_scenario": {
+    "ball_max_speed_mps": 12.0,
+    "ball_max_dist_from_trainee_m": 45.0,
+    "restitution_sigma": 0.08,
+    "stamina_min": 0.4,
+    "stamina_max": 1.0,
+    "trainee_tier": "premier_league",
+    "opponent_tier": "premier_league"
   }
 }

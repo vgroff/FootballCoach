@@ -201,6 +201,12 @@ def _apply_get_possession(player: Player, match: Match) -> OrderTranslationResul
     if not player.is_available_to_tackle():
         return OrderTranslationResult(illegal_action=True, illegal_reason="get_possession_while_inactive")
 
+    # If the player already has the ball, don't re-issue GetPossessionOrder —
+    # it would resolve immediately and leave current_order=None, stopping the
+    # player.  Fall through so apply_movement_to_player drives movement instead.
+    if match.ball.possessed_by == player.player_id:
+        return OrderTranslationResult()
+
     player.get_possession()
     return OrderTranslationResult()
 

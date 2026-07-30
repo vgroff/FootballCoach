@@ -310,10 +310,13 @@ class Renderer:
         title_surf = self.title_font.render(title, True, style.HUD_ACCENT)
         surface.blit(title_surf, ((sw - title_surf.get_width()) // 2, 30))
 
-        row_h = 44
+        n_rows = len(params)
+        available_h = sh - 160  # reserve top (title+padding) + bottom (buttons)
+        row_h = max(32, min(44, available_h // max(n_rows, 1)))
+        btn_h = max(22, row_h - 10)
         start_y = 100
-        btn_w, btn_h = 32, 28
-        gap = 16
+        btn_w = 32
+        gap = 12
 
         max_label_w = max(
             (self.hud_font.size(p.label)[0] for p in params),

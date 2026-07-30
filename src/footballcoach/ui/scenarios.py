@@ -105,6 +105,25 @@ def make_training_match(rng_reduction: float = 0.3, tier: str = "premier_league"
 
 AnyScenarioParam = ScenarioParam | ScenarioChoiceParam | ScenarioBoolParam
 
+# Universal params appended to every scenario's params screen by the UI.
+# They are NOT forwarded to build(); app.py pops them before calling build().
+UNIVERSAL_PARAMS: list[AnyScenarioParam] = [
+    ScenarioParam(
+        name="timeout_ticks",
+        label="Timeout (ticks, 30/s)",
+        min_value=50,
+        max_value=18000,
+        step=50,
+        default=800,
+    ),
+    ScenarioChoiceParam(
+        name="sim_speed",
+        label="Sim speed",
+        choices=("1x", "2x", "4x", "8x"),
+        default="1x",
+    ),
+]
+
 
 @dataclass
 class ScenarioDefinition:
@@ -719,6 +738,15 @@ def _apply_neural_action(trainer, match: Match, player_id: str, trial_tick: int)
             player.current_order = GetPossessionOrder()
 
 
+def _phase1_scenario_cfg() -> dict:
+    """Return the phase1_scenario section from ai_config.json, with fallback defaults."""
+    try:
+        from footballcoach.ai.config import load_ai_config
+        return load_ai_config().get("phase1_scenario", {})
+    except Exception:
+        return {}
+
+
 def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
     """Factory returning (build_fn, on_tick_fn, params_list) for the Phase 1 UI scenario.
 
@@ -761,13 +789,19 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
     ckpt_labels = tuple(Path(c).name for c in checkpoints) if checkpoints else ("(none)",)
     ckpt_default = ckpt_labels[-1]  # most recent
 
+    _cfg = _phase1_scenario_cfg()
     params_list: list = [
         ScenarioChoiceParam("trainee_checkpoint", "Trainee checkpoint", ckpt_labels, ckpt_default),
         ScenarioBoolParam("trainee_rules", "Trainee: rules-based override", False),
         ScenarioChoiceParam("opponent_checkpoint", "Opponent checkpoint", ckpt_labels, ckpt_default),
         ScenarioBoolParam("opponent_rules", "Opponent: rules-based override", True),
-        ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 60.0, 0.5, 4.0),
-        ScenarioParam("restitution_sigma", "Restitution σ", 0.0, 1.0, 0.01, 0.08),
+        ScenarioChoiceParam("trainee_tier", "Trainee tier", ("generic", "amateur", "semi_pro", "premier_league"), str(_cfg.get("trainee_tier", "generic"))),
+        ScenarioChoiceParam("opponent_tier", "Opponent tier", ("generic", "amateur", "semi_pro", "premier_league"), str(_cfg.get("opponent_tier", "generic"))),
+        ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 60.0, 0.5, float(_cfg.get("ball_max_speed_mps", 10.0))),
+        ScenarioParam("ball_max_dist_from_trainee_m", "Ball max dist from trainee (m)", 1.0, 75.0, 1.0, float(_cfg.get("ball_max_dist_from_trainee_m", 45.0))),
+        ScenarioParam("stamina_min", "Stamina min", 0.0, 1.0, 0.05, float(_cfg.get("stamina_min", 0.3))),
+        ScenarioParam("stamina_max", "Stamina max", 0.0, 1.0, 0.05, float(_cfg.get("stamina_max", 1.0))),
+        ScenarioParam("restitution_sigma", "Restitution σ", 0.0, 1.0, 0.01, float(_cfg.get("restitution_sigma", 0.08))),
     ]
 
     def _resolve_trainer_from_name(ckpt_name: str, use_rules: bool):
@@ -786,8 +820,13 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         trainee_rules: bool = False,
         opponent_checkpoint: str = ckpt_default,
         opponent_rules: bool = True,
-        ball_max_speed_mps: float = 4.0,
-        restitution_sigma: float = 0.08,
+        trainee_tier: str = str(_cfg.get("trainee_tier", "generic")),
+        opponent_tier: str = str(_cfg.get("opponent_tier", "generic")),
+        ball_max_speed_mps: float = float(_cfg.get("ball_max_speed_mps", 10.0)),
+        ball_max_dist_from_trainee_m: float = float(_cfg.get("ball_max_dist_from_trainee_m", 45.0)),
+        stamina_min: float = float(_cfg.get("stamina_min", 0.3)),
+        stamina_max: float = float(_cfg.get("stamina_max", 1.0)),
+        restitution_sigma: float = float(_cfg.get("restitution_sigma", 0.08)),
         **_ignored,  # absorb sim_dt_s etc injected by ScenarioEnv
     ) -> Match:
         trainee_trainer = _resolve_trainer_from_name(trainee_checkpoint, trainee_rules)
@@ -799,9 +838,13 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
 
         match = build_1v1_scenario(
             rng_reduction,
+            trainee_tier=trainee_tier,
+            opponent_tier=opponent_tier,
             ball_max_speed_mps=ball_max_speed_mps,
             restitution_sigma=restitution_sigma,
-            ball_max_dist_from_trainee_m=45.0,
+            ball_max_dist_from_trainee_m=ball_max_dist_from_trainee_m,
+            stamina_min=stamina_min,
+            stamina_max=stamina_max,
         )
 
         try:
@@ -843,7 +886,12 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
 def _find_latest_phase1_checkpoint_dir() -> str:
     """Return the highest-numbered checkpoints/phase1_run* directory found at import time."""
     import glob
-    dirs = sorted(glob.glob("checkpoints/phase1_run*/"))
+    import re
+    dirs = glob.glob("checkpoints/phase1_run*/")
+    def _run_num(d: str) -> int:
+        m = re.search(r"phase1_run(\d+)", d)
+        return int(m.group(1)) if m else -1
+    dirs = sorted(dirs, key=_run_num)
     return dirs[-1].rstrip("/") if dirs else "checkpoints/phase1_run1"
 
 
@@ -853,11 +901,13 @@ _phase1_build, _phase1_on_tick = _make_phase1_scenario_pair(_find_latest_phase1_
 def build_1v1_scenario(
     rng_reduction: float = 0.3,
     *,
-    trainee_tier: str = "generic",
-    opponent_tier: str = "generic",
-    ball_max_speed_mps: float = 10.0,
-    restitution_sigma: float = 0.08,
-    ball_max_dist_from_trainee_m: float = 45.0,
+    trainee_tier: str | None = None,
+    opponent_tier: str | None = None,
+    ball_max_speed_mps: float | None = None,
+    restitution_sigma: float | None = None,
+    ball_max_dist_from_trainee_m: float | None = None,
+    stamina_min: float | None = None,
+    stamina_max: float | None = None,
     trainee_team: "Team | None" = None,
     sim_dt_s: float = 1.0 / 30.0,
 ) -> Match:
@@ -882,6 +932,22 @@ def build_1v1_scenario(
 
     See ai_design_doc.md sections 4 and 9.2 for the full design rationale.
     """
+    _cfg = _phase1_scenario_cfg()
+    if trainee_tier is None:
+        trainee_tier = str(_cfg.get("trainee_tier", "generic"))
+    if opponent_tier is None:
+        opponent_tier = str(_cfg.get("opponent_tier", "generic"))
+    if ball_max_speed_mps is None:
+        ball_max_speed_mps = float(_cfg.get("ball_max_speed_mps", 10.0))
+    if restitution_sigma is None:
+        restitution_sigma = float(_cfg.get("restitution_sigma", 0.08))
+    if ball_max_dist_from_trainee_m is None:
+        ball_max_dist_from_trainee_m = float(_cfg.get("ball_max_dist_from_trainee_m", 45.0))
+    if stamina_min is None:
+        stamina_min = float(_cfg.get("stamina_min", 0.3))
+    if stamina_max is None:
+        stamina_max = float(_cfg.get("stamina_max", 1.0))
+
     rng = random.Random()
     pitch = Pitch.standard()
 
@@ -900,13 +966,13 @@ def build_1v1_scenario(
     # --- Trainee (random team) ---
     trainee_attrs = generate_attributes(tier=trainee_tier, rng=rng)
     trainee = Player.create("trainee", trainee_team, trainee_attrs, position=_rand_pos())
-    trainee.stamina = rng.uniform(0.3, 1.0)
+    trainee.stamina = rng.uniform(stamina_min, stamina_max)
     trainee.heading_rad = rng.uniform(-math.pi, math.pi)
 
     # --- Opponent (opposite team) --- immobile, no order ---
     opponent_attrs = generate_attributes(tier=opponent_tier, rng=rng)
     opponent = Player.create("opponent", opponent_team, opponent_attrs, position=_rand_pos())
-    opponent.stamina = rng.uniform(0.3, 1.0)
+    opponent.stamina = rng.uniform(stamina_min, stamina_max)
     opponent.heading_rad = rng.uniform(-math.pi, math.pi)
 
     # --- Ball: random placement within ball_max_dist_from_trainee_m of trainee, in bounds ---

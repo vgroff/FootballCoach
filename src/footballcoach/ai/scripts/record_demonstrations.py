@@ -68,6 +68,8 @@ def record_episodes(
     n_episodes: int,
     scenario_key: str,
     phase_id: int,
+    episode_offset: int = 0,
+    total_episodes: int | None = None,
 ) -> dict:
     """Run *n_episodes* with rules-based AI driving the trainee and opponent.
 
@@ -92,6 +94,12 @@ def record_episodes(
 
     steps_total = 0
     steps_valid = 0
+
+    # Outcome counters
+    outcome_counts: dict[str, int] = {}
+
+    if total_episodes is None:
+        total_episodes = n_episodes
 
     def _record_now():
         obs = env._get_obs()
@@ -123,16 +131,32 @@ def record_episodes(
             pass
 
         done = False
+        last_info = None
         while not done:
             # Sample current state (0.5s cadence)
             _record_now()
             # Step 15 physics ticks; callbacks fire inside here for kicks/tackles
-            _obs, _reward, done, _info = env.step()
+            _obs, _reward, done, last_info = env.step()
 
-        if (ep + 1) % 20 == 0 or ep == n_episodes - 1:
+        # Track episode outcome
+        outcome = getattr(last_info, "trial_outcome", None) or "unknown"
+        outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+
+        global_ep = episode_offset + ep + 1
+        if global_ep % 10 == 0 or global_ep == total_episodes:
+            total_eps = sum(outcome_counts.values())
+            parts = []
+            for k in ("box_possession", "opponent_box_possession", "timeout"):
+                c = outcome_counts.get(k, 0)
+                pct = 100.0 * c / total_eps if total_eps else 0.0
+                short = {"box_possession": "trainee_box", "opponent_box_possession": "opp_box", "timeout": "timeout"}[k]
+                parts.append(f"{short}={c}({pct:.0f}%)")
+            for k, c in sorted(outcome_counts.items()):
+                if k not in ("box_possession", "opponent_box_possession", "timeout"):
+                    parts.append(f"{k}={c}")
             log.info(
-                f"Episode {ep + 1}/{n_episodes} | "
-                f"steps so far: {steps_total:,} ({steps_valid:,} valid)"
+                f"Ep {global_ep}/{total_episodes} | steps: {steps_total:,} ({steps_valid:,} valid) | "
+                + "  ".join(parts)
             )
 
     return {
@@ -196,6 +220,7 @@ def main() -> None:
     total_steps = 0
     file_idx = 0
     remaining = n_eps
+    episodes_done = 0
 
     while remaining > 0:
         batch = min(eps_per_file, remaining)
@@ -206,6 +231,8 @@ def main() -> None:
             n_episodes=batch,
             scenario_key=scenario_key,
             phase_id=args.phase,
+            episode_offset=episodes_done,
+            total_episodes=n_eps,
         )
         elapsed = time.time() - t0
 
@@ -221,6 +248,7 @@ def main() -> None:
 
         file_idx += 1
         remaining -= batch
+        episodes_done += batch
 
     log.info(
         f"Done. {file_idx} file(s), {total_steps:,} total steps → {output_dir}"

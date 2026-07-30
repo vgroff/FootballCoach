@@ -10,6 +10,7 @@ Immedaite task!!
 Read ai_trainer_knowledge.md, and then run a training run. Do a shortish training, 50k
 - very suspicious that the ai "wins" against rules sometimes, given that it never wins in the UI. wins do only count when you get in the enemy box, correct?
 
+
 Immediate AI stuff
 - Can we do some trainings runs and then see and see if the trained AI is able to beat the rules-based AI more consistently or at least at a simiar rate than another rules-based AI could?
 - watch the 1v1s

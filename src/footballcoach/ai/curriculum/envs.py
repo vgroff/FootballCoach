@@ -48,7 +48,7 @@ def _build_phase1_env(phase: CurriculumPhase):
         key="phase1_1v1",
         label="Phase 1: 1v1 Get Possession",
         description="1v1 scenario for curriculum phase 1",
-        build=functools.partial(build_1v1_scenario, ball_max_speed_mps=4.0),
+        build=functools.partial(build_1v1_scenario, ball_max_speed_mps=10.0),
         on_tick=phase1_training_on_tick,
     )
     return ScenarioEnv(

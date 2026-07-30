@@ -170,14 +170,12 @@ class App:
             self._start_match(scenarios.make_training_match(), "Training mode", is_training_mode=True)
         elif kind == "scenario":
             definition = next(s for s in scenarios.SCENARIOS if s.key == key)
-            if definition.params:
-                self._enter_params_screen(definition)
-            else:
-                self._start_scenario(definition)
+            self._enter_params_screen(definition)
 
     def _enter_params_screen(self, definition: scenarios.ScenarioDefinition) -> None:
         self._pending_scenario_definition = definition
-        self._pending_scenario_params = {p.name: p.default for p in definition.params}
+        all_params = list(definition.params) + scenarios.UNIVERSAL_PARAMS
+        self._pending_scenario_params = {p.name: p.default for p in all_params}
         self._open_choice_param = None
         self.screen = Screen.SCENARIO_PARAMS
 
@@ -206,7 +204,8 @@ class App:
                     self._open_choice_param = None
                     self.screen = Screen.MENU
                 continue
-            param = next((p for p in self._pending_scenario_definition.params if p.name == name), None)
+            all_params = list(self._pending_scenario_definition.params) + scenarios.UNIVERSAL_PARAMS
+            param = next((p for p in all_params if p.name == name), None)
             if param is None:
                 continue
 
@@ -215,31 +214,40 @@ class App:
                     self._pending_scenario_params[name] = not bool(
                         self._pending_scenario_params.get(name, param.default)
                     )
+                    break
             elif isinstance(param, ScenarioChoiceParam):
                 # Clicking the value area (minus_rect == value_rect here) toggles the dropdown.
-                # Clicking [<] or [>] still cycles.
+                # Clicking [>] cycles. Only act if this row was actually hit.
                 if minus_rect.collidepoint(pos):
                     self._open_choice_param = name if self._open_choice_param != name else None
+                    break
                 elif plus_rect.collidepoint(pos):
                     current = self._pending_scenario_params.get(name, param.default)
                     idx = list(param.choices).index(current) if current in param.choices else 0
                     self._pending_scenario_params[name] = param.choices[(idx + 1) % len(param.choices)]
                     self._open_choice_param = None
-                else:
-                    self._open_choice_param = None
+                    break
             else:
                 current = self._pending_scenario_params.get(name, param.default)
                 if minus_rect.collidepoint(pos):
                     self._pending_scenario_params[name] = max(param.min_value, current - param.step)
+                    break
                 elif plus_rect.collidepoint(pos):
                     self._pending_scenario_params[name] = min(param.max_value, current + param.step)
+                    break
 
     def _start_scenario_with_params(self) -> None:
         if self._pending_scenario_definition is None:
             return
+        kwargs = dict(self._pending_scenario_params)
+        timeout_ticks = int(kwargs.pop("timeout_ticks", 800))
+        sim_speed_str = kwargs.pop("sim_speed", "1x")
+        sim_speed = int(sim_speed_str.rstrip("x"))
         self._start_scenario(
             self._pending_scenario_definition,
-            kwargs=dict(self._pending_scenario_params),
+            kwargs=kwargs,
+            timeout_ticks=timeout_ticks,
+            sim_speed=sim_speed,
         )
         self._pending_scenario_definition = None
         self._pending_scenario_params = {}
@@ -265,10 +273,12 @@ class App:
             self.input_controller.selected_player_id = match.players[0].player_id
 
     def _start_scenario(
-        self, definition: scenarios.ScenarioDefinition, kwargs: dict | None = None
+        self, definition: scenarios.ScenarioDefinition, kwargs: dict | None = None,
+        timeout_ticks: int = 800, sim_speed: int = 1,
     ) -> None:
         """Builds a ScenarioLoop and begins the first trial."""
-        loop = scenarios.ScenarioLoop(definition=definition, kwargs=kwargs or {})
+        self._sim_speed = sim_speed
+        loop = scenarios.ScenarioLoop(definition=definition, kwargs=kwargs or {}, timeout_ticks=timeout_ticks)
         self._scenario_loop = loop
         self.match = loop.match
         self._wire_match_log(loop.match)
@@ -475,9 +485,10 @@ class App:
             self.screen = Screen.MENU
             return
         defn = self._pending_scenario_definition
+        all_params = list(defn.params) + scenarios.UNIVERSAL_PARAMS
         self._params_button_rects = self.renderer.draw_scenario_params(
             self.surface,
-            defn.params,
+            all_params,
             self._pending_scenario_params,
             title=f"Configure: {defn.label}",
             open_choice_param=self._open_choice_param,
