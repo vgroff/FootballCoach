@@ -111,13 +111,17 @@ class ScenarioEnv:
         self._trial_done: bool = False
         self._episode_ticks: int = 0
         self._last_ball_dist: float = 0.0
+        self._start_ball_to_box_dist_m: float = 1.0
+        self._max_episode_ticks: int = 1
         self._ball_touched_by_trainee: bool = False
+        self._trainee_had_possession_last_step: bool = False
         self._prev_goal_count: tuple[int, int] = (0, 0)
 
         # Per-secondary-player state
         self._sec_last_ball_dist: dict = {}
         self._sec_ball_touched: dict = {}
         self._sec_ema: dict = {}
+        self._sec_had_possession_last_step: dict = {}
         # Populated after each step(); drained by PPOTrainer for the rollout buffer.
         # last_trainee_transition: dict with obs/action/log_prob/value/raw_exec/illegal_action
         # last_secondary_results: list of same dicts for secondary neural players
@@ -151,6 +155,10 @@ class ScenarioEnv:
             self._loop.match.scoreboard.right_goals,
         )
         self._last_ball_dist = self._ball_dist_to_trainee()
+        self._max_episode_ticks = max(1, int(self.max_episode_s / self._dt_s))
+        self._start_ball_to_box_dist_m = self._ball_dist_to_opponent_box()
+        self._trainee_had_possession_last_step = False
+        self._sec_had_possession_last_step = {pid: False for pid in self.secondary_player_ids}
         self.last_trainee_transition = None
         self.last_secondary_results = []
 
@@ -293,11 +301,11 @@ class ScenarioEnv:
             match.ball.position,
             left=(player.team == Team.RIGHT),  # opponent's box
         )
-        gained_possession = (
-            match.ball.possessed_by == self.trainee_player_id
-            and prev_ball_dist > 0.5
-        )
-        box_terminal = in_opponent_box and match.ball.possessed_by == self.trainee_player_id
+        trainee_has_possession_now = match.ball.possessed_by == self.trainee_player_id
+        gained_possession = trainee_has_possession_now and not self._trainee_had_possession_last_step
+        lost_possession = self._trainee_had_possession_last_step and not trainee_has_possession_now
+        self._trainee_had_possession_last_step = trainee_has_possession_now
+        box_terminal = in_opponent_box and trainee_has_possession_now
 
         # Opponent reached trainee's box with possession (phase 1 terminal — trainee loses)
         in_trainee_box = match.pitch.is_in_box(
@@ -310,17 +318,24 @@ class ScenarioEnv:
             and match.ball.possessed_by != self.trainee_player_id
         )
 
+        timeout = self._episode_ticks >= int(self.max_episode_s / self._dt_s)
         if self.phase == 1:
             reward = phase1_reward(
                 prev_ball_dist=prev_ball_dist,
                 curr_ball_dist=curr_ball_dist,
-                has_possession_now=(match.ball.possessed_by == self.trainee_player_id),
+                has_possession_now=trainee_has_possession_now,
                 gained_possession_this_step=gained_possession,
+                lost_possession_this_step=lost_possession,
                 ball_progress_toward_goal_m=ball_progress,
                 ball_went_out_after_touch=ball_went_out,
                 illegal_action_attempted=info.illegal_action,
                 reached_opponent_box_with_possession=box_terminal,
                 cfg=self._reward_cfg["phase1"],
+                time_fraction_remaining=1.0 - self._episode_ticks / self._max_episode_ticks,
+                start_ball_to_box_dist_m=self._start_ball_to_box_dist_m,
+                opponent_reached_trainee_box=opponent_box_terminal,
+                timed_out=timeout and not box_terminal and not opponent_box_terminal and not trial_ended_this_step,
+                ball_dist_to_opponent_box_m=self._ball_dist_to_opponent_box(),
             )
         else:
             reward = phase2_reward(
@@ -335,7 +350,6 @@ class ScenarioEnv:
             )
 
         # --- Done? ---
-        timeout = self._episode_ticks >= int(self.max_episode_s / self._dt_s)
         any_box_terminal = box_terminal or opponent_box_terminal
         done = trial_ended_this_step or timeout or any_box_terminal
 
@@ -387,10 +401,10 @@ class ScenarioEnv:
                 and outcome_this_step == "miss"
                 and self._sec_ball_touched.get(pid, False)
             )
-            sec_gained_poss = (
-                match.ball.possessed_by == pid
-                and pre["prev_ball_dist"] > 0.5
-            )
+            sec_has_poss_now = match.ball.possessed_by == pid
+            sec_gained_poss = sec_has_poss_now and not self._sec_had_possession_last_step.get(pid, False)
+            sec_lost_poss = self._sec_had_possession_last_step.get(pid, False) and not sec_has_poss_now
+            self._sec_had_possession_last_step[pid] = sec_has_poss_now
             sec_in_atk_box = match.pitch.is_in_box(
                 match.ball.position,
                 left=(sec_player.team == Team.RIGHT),
@@ -401,13 +415,19 @@ class ScenarioEnv:
                 sec_reward = phase1_reward(
                     prev_ball_dist=pre["prev_ball_dist"],
                     curr_ball_dist=sec_curr_ball_dist,
-                    has_possession_now=(match.ball.possessed_by == pid),
+                    has_possession_now=sec_has_poss_now,
                     gained_possession_this_step=sec_gained_poss,
+                    lost_possession_this_step=sec_lost_poss,
                     ball_progress_toward_goal_m=sec_ball_prog,
                     ball_went_out_after_touch=sec_ball_went_out,
                     illegal_action_attempted=sec_player.ai.last_transition.get("illegal_action", False),
                     reached_opponent_box_with_possession=sec_box_terminal,
                     cfg=self._reward_cfg["phase1"],
+                    time_fraction_remaining=1.0 - self._episode_ticks / self._max_episode_ticks,
+                    start_ball_to_box_dist_m=self._start_ball_to_box_dist_m,
+                    opponent_reached_trainee_box=box_terminal,  # from sec's POV, trainee winning = sec losing
+                    timed_out=timeout and not sec_box_terminal and not box_terminal and not trial_ended_this_step,
+                    ball_dist_to_opponent_box_m=self._ball_dist_to_opponent_box(),
                 )
             else:
                 sec_reward = 0.0
@@ -439,6 +459,23 @@ class ScenarioEnv:
 
     def _ball_dist_to_trainee(self) -> float:
         return self._ball_dist_for_player(self.trainee_player_id)
+
+    def _ball_dist_to_opponent_box(self) -> float:
+        """Distance from the ball to the near edge of the opponent's box at call time."""
+        try:
+            match = self._loop.match
+            ball = match.ball.position
+            player = match.player_by_id(self.trainee_player_id)
+            pitch = match.pitch
+            # Opponent box near edge: half_length - box_length_m from centre
+            box_edge_x = pitch.half_length - pitch.box_length_m
+            if player.team == Team.LEFT:
+                dist_x = max(0.0, box_edge_x - ball.x)
+            else:
+                dist_x = max(0.0, box_edge_x - (-ball.x))
+            return float(dist_x)
+        except (KeyError, AttributeError):
+            return 1.0
 
     def _ball_dist_for_player(self, player_id: str) -> float:
         try:

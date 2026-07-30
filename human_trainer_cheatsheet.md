@@ -18,7 +18,7 @@ uv run python -m footballcoach.ai.scripts.train \
 uv run python -m footballcoach.ai.scripts.train \
     --phase 1 --seed 42 \
     --from-pretrained checkpoints/phase1_run35/checkpoint_pretrained.pt \
-    --verbose 2>&1 | tee -a training_runs.log
+    --verbose 2>&1 --total-steps 40000 | tee -a training_runs.log
 # --total-steps 40000
 ```
 
@@ -26,9 +26,9 @@ uv run python -m footballcoach.ai.scripts.train \
 ```bash
 uv run python -m footballcoach.ai.scripts.train \
     --phase 1 --seed 42 \
-    --pretrain-from-checkpoint checkpoints/phase1_run39/checkpoint_00020000.pt \
+    --pretrain-from-checkpoint checkpoints/phase1_run41/checkpoint_00065000.pt \
     --bc-dataset demonstrations/phase1/ \
-    --verbose 2>&1 | tee -a training_runs.log
+    --verbose 2>&1 --total-steps 40000 | tee -a training_runs.log
 # --total-steps 60000
 ```
 

@@ -122,6 +122,7 @@ class PPOTrainer:
         self.execution_net.to(self.device)
 
         self._total_steps = 0
+        self._checkpoint_count = 0  # sequential counter for checkpoint{N}.pt naming
 
     # -----------------------------------------------------------------------
     # Curriculum helpers
@@ -216,7 +217,7 @@ class PPOTrainer:
         episode_outcomes_vs_neural: list[str] = []
         episode_outcomes_vs_immobile: list[str] = []
 
-        log.info(f"PPO training started: total_steps={total_steps}")
+        log.info(f"PPO training started: steps_so_far={self._total_steps:,}  target={self._total_steps + total_steps:,}  (+{total_steps:,} this run)")
 
         rollout_start = time.perf_counter()
 
@@ -431,7 +432,7 @@ class PPOTrainer:
             self._save_checkpoint(self._total_steps)
             log.info("Final checkpoint saved.")
 
-        log.info("Training complete.")
+        log.info(f"Training complete. Total steps: {self._total_steps:,}")
 
     # -----------------------------------------------------------------------
     # Value pre-training
@@ -1717,13 +1718,20 @@ class PPOTrainer:
         if self.checkpoint_dir is None:
             return
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
-        path = self.checkpoint_dir / f"checkpoint_{step:08d}.pt"
+        self._checkpoint_count += 1
+        path = self.checkpoint_dir / f"checkpoint{self._checkpoint_count}.pt"
         torch.save({
             "step": step,
+            "checkpoint_count": self._checkpoint_count,
             "decision_net": self.decision_net.state_dict(),
             "execution_net": self.execution_net.state_dict(),
             "optimizer": self.optimizer.state_dict(),
         }, path)
+        # Update latest.pt symlink
+        latest = self.checkpoint_dir / "latest.pt"
+        if latest.is_symlink() or latest.exists():
+            latest.unlink()
+        latest.symlink_to(path.name)
         log.info(f"Saved checkpoint: {path}")
 
     def _save_checkpoint_to(self, path: Path) -> None:

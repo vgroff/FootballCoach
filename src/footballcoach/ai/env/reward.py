@@ -24,6 +24,12 @@ def phase1_reward(
     illegal_action_attempted: bool,
     reached_opponent_box_with_possession: bool,
     cfg: dict,
+    time_fraction_remaining: float = 0.0,
+    start_ball_to_box_dist_m: float = 1.0,
+    opponent_reached_trainee_box: bool = False,
+    lost_possession_this_step: bool = False,
+    timed_out: bool = False,
+    ball_dist_to_opponent_box_m: float = 9999.0,
 ) -> float:
     """GetPossession/Move experiment reward (curriculum phase 1).
 
@@ -42,6 +48,11 @@ def phase1_reward(
             flag from to_orders.py.
         reached_opponent_box_with_possession: Terminal bonus condition.
         cfg: The 'reward.phase1' section of ai_config.json.
+        time_fraction_remaining: 1 - (ticks_elapsed / max_ticks), in [0, 1].
+            Used for the speed bonus on terminal.
+        start_ball_to_box_dist_m: Distance from ball to opponent box edge at
+            episode start. Normalises the speed bonus so long runs score higher
+            than trivial nearby finishes.
     """
     r = 0.0
     r += cfg["ball_distance_shaping"] * (prev_ball_dist - curr_ball_dist)
@@ -55,6 +66,26 @@ def phase1_reward(
         r += cfg["illegal_action_penalty"]
     if reached_opponent_box_with_possession:
         r += cfg["box_possession_terminal"]
+        # Speed bonus: reward finishing faster, scaled by how far the ball
+        # had to travel so a nearby start doesn't trivially earn a large bonus.
+        # bonus = scale × time_remaining_fraction × clamp(start_dist / 30m, 0, 1.5)
+        # Max possible bonus: scale × 1.0 × 1.5  (ball starts 45m+ from box)
+        speed_scale = float(cfg.get("speed_bonus_scale", 0.0))
+        if speed_scale > 0.0:
+            dist_weight = min(start_ball_to_box_dist_m / 30.0, 1.5)
+            r += speed_scale * time_fraction_remaining * dist_weight
+    if lost_possession_this_step:
+        r += cfg.get("loss_of_possession_penalty", 0.0)
+    if opponent_reached_trainee_box:
+        r += cfg.get("loss_terminal", 0.0)
+    if timed_out:
+        r += cfg.get("timeout_penalty", 0.0)
+        # Proximity bonus on timeout: consolation for how close you got with the ball.
+        # scale * max(0, 1 - dist_to_box / 30m)  → 0 if 30m+ away, scale if at box edge.
+        prox_scale = float(cfg.get("proximity_bonus_scale", 0.0))
+        if prox_scale > 0.0:
+            prox = max(0.0, 1.0 - ball_dist_to_opponent_box_m / 30.0)
+            r += prox_scale * prox
     return r
 
 

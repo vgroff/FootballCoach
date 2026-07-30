@@ -693,13 +693,25 @@ def _load_trainer(checkpoint_path: str):
 
 
 def _discover_checkpoints(checkpoint_dir: str) -> list[str]:
-    """Return sorted list of .pt checkpoint paths in checkpoint_dir."""
+    """Return sorted list of .pt checkpoint paths in checkpoint_dir.
+
+    Matches both old-style checkpoint_NNNNNNNN.pt and new-style checkpointN.pt.
+    Excludes latest.pt (symlink) and checkpoint_pretrained.pt to avoid duplicates.
+    """
     import glob
     import os
     if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
         return []
-    paths = sorted(glob.glob(os.path.join(checkpoint_dir, "checkpoint_*.pt")))
-    return paths
+    old_style = glob.glob(os.path.join(checkpoint_dir, "checkpoint_*.pt"))
+    new_style = glob.glob(os.path.join(checkpoint_dir, "checkpoint[0-9]*.pt"))
+    all_paths = set(old_style) | set(new_style)
+    # Exclude pretrained snapshot and symlinks
+    all_paths = {
+        p for p in all_paths
+        if not os.path.basename(p).startswith("checkpoint_pretrained")
+        and not os.path.islink(p)
+    }
+    return sorted(all_paths)
 
 
 def _apply_neural_action(trainer, match: Match, player_id: str, trial_tick: int) -> None:
