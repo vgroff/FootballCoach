@@ -1,9 +1,10 @@
 {
   "_comment": "Visual display constants. Edit freely to tune the look without touching code. See ui/knowledge.md for details on how each value is used.",
   "player": {
-    "_comment": "min_radius_px: smallest on-screen circle radius drawn for a player. Physical world positions are unaffected — only the rendered dot size is boosted for visibility. possession_outline_thickness: pixel width of the white ring drawn around the ball carrier (1=thin, 3=bold).",
+    "_comment": "min_radius_px: smallest on-screen circle radius drawn for a player. Physical world positions are unaffected — only the rendered dot size is boosted for visibility. possession_outline_thickness: pixel width of the white ring drawn around the ball carrier (1=thin, 3=bold). inactive_alpha: opacity (0-255) of a player drawn translucent after being tackled (0=invisible, 255=fully opaque).",
     "min_radius_px": 7,
-    "possession_outline_thickness": 1
+    "possession_outline_thickness": 1,
+    "inactive_alpha": 165
   },
   "ball": {
     "_comment": "min_radius_px: smallest on-screen circle radius drawn for the ball. outline: whether to draw a thin dark outline around the ball circle.",
@@ -26,5 +27,10 @@
     "_comment": "threshold: stamina fraction (0-1) below which a flashing warning outline pulses around the player. flash_hz: flashes per second (wall-clock).",
     "threshold": 0.3,
     "flash_hz": 2.5
+  },
+  "heading_indicator": {
+    "_comment": "Short line showing which direction a player is facing. length_px: how far the tip extends beyond the player circle edge. alpha: 0=invisible, 255=fully opaque. Set alpha to 0 to hide entirely.",
+    "length_px": 6,
+    "alpha": 60
   }
 }

@@ -27,6 +27,8 @@ class TacklingParams:
     loser_speed_penalty_scale: float
     loser_speed_penalty_max: float
     head_on_min_charge_speed_mps: float
+    auto_tackle_overlap_factor: float
+    auto_tackle_min_closing_mps: float
     angle_modifier_frontal: float
     angle_modifier_side: float
     angle_modifier_behind: float
@@ -47,6 +49,8 @@ class TacklingParams:
             loser_speed_penalty_scale=d["loser_speed_penalty_scale"],
             loser_speed_penalty_max=d["loser_speed_penalty_max"],
             head_on_min_charge_speed_mps=d["head_on_min_charge_speed_mps"],
+            auto_tackle_overlap_factor=d.get("auto_tackle_overlap_factor", 1.3),
+            auto_tackle_min_closing_mps=d.get("auto_tackle_min_closing_mps", 0.2),
             angle_modifier_frontal=d["angle_modifier_frontal"],
             angle_modifier_side=d["angle_modifier_side"],
             angle_modifier_behind=d["angle_modifier_behind"],

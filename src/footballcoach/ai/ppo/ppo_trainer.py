@@ -99,6 +99,7 @@ class PPOTrainer:
         self.dir_log_std_max = float(ppo_cfg.get("dir_log_std_max", 2.0))
         self.ent_dir_weight = float(ppo_cfg.get("ent_dir_weight", 1.0))
         self.augment_n_slot_shuffles = int(ppo_cfg.get("augment_n_slot_shuffles", 0))
+        self.rollout_eval_trials = int(ppo_cfg.get("rollout_eval_trials", 10))
         self._aug_rng = random.Random()
         self._bc_cfg = bc_cfg
         self._bc_dir_loss_w = float(bc_cfg.get("direction_loss_weight", 3.0))
@@ -368,7 +369,7 @@ class PPOTrainer:
                 opp_rew_str = f"/{mean_opp_reward:.2f}" if not (mean_opp_reward != mean_opp_reward) else ""
                 comp_parts = [
                     f"{k}={v:+.2f}"
-                    for k in ("dist", "poss", "prog", "out", "ill", "box", "spd", "lpos", "lterm", "tout", "prox")
+                    for k in ("appr", "retr", "poss", "prog", "out", "ill", "box", "spd", "lpos", "lterm", "tout", "prox")
                     if abs(rollout_components.get(k, 0.0)) > 0.01
                     for v in (rollout_components[k],)
                 ]
@@ -398,6 +399,8 @@ class PPOTrainer:
                     self._save_checkpoint(self._total_steps)
 
                 # Quick periodic eval vs rules-based AI (always, regardless of training opponent)
+                if self.rollout_eval_trials <= 0:
+                    continue
                 try:
                     from footballcoach.rules_ai import Phase1RulesAI
                     from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
@@ -417,7 +420,7 @@ class PPOTrainer:
                         max_episode_s=env.max_episode_s,
                     )
                     _eval_env.sample_action_fn = self._sample_action
-                    _eval_n = 10
+                    _eval_n = self.rollout_eval_trials
                     _eval_wins = 0
                     _eval_outcomes: dict[str, int] = {}
                     for _ in range(_eval_n):

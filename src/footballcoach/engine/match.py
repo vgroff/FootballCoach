@@ -548,28 +548,29 @@ class Match:
 
     def _check_head_on_tackles(self) -> None:
         """Automatically triggers a tackle when two players from opposite teams
-        are overlapping, one has the ball, and both are charging directly
-        towards each other (head-on collision). This replaces the normal
-        push-apart resolution for such a pair, since two players sprinting
-        at each other frontally should not just bounce off - the player
-        without the ball is attempting to win it.
+        are in serious overlap (distance < auto_tackle_overlap_factor * combined_radius)
+        and have a net closing velocity above auto_tackle_min_closing_mps.
 
-        Only one such tackle is resolved per tick (the first qualifying pair
-        found). The resulting tackle uses the same skill-check, inactivity
-        penalties, and dribble-speed-penalty model as regular tackles.
+        This replaces the old requirement that BOTH players charge head-on at
+        >= 1 m/s, which was too restrictive and never fired when one player was
+        slower or approaching from an angle.  The new condition fires whenever
+        the players are deeply overlapping and moving toward each other at all.
+
+        Only one such tackle is resolved per tick (the first qualifying pair).
+        The resulting tackle uses the same skill-check, inactivity penalties,
+        and dribble-speed-penalty model as regular tackles.
         """
         carrier = self.ball_carrier()
         if carrier is None or carrier.is_inactive:
             return
 
-        min_charge = self.tackling_params.head_on_min_charge_speed_mps
+        overlap_factor = self.tackling_params.auto_tackle_overlap_factor
+        min_closing = self.tackling_params.auto_tackle_min_closing_mps
 
         for other in self.players:
             if other.player_id == carrier.player_id:
                 continue
             if other.is_inactive or other.team == carrier.team:
-                continue
-            if not are_touching(carrier, other):
                 continue
 
             # Direction from carrier to other player.
@@ -577,13 +578,21 @@ class Match:
             dist = delta.length()
             if dist < 1e-9:
                 continue
+
+            # Trigger only on serious overlap (beyond mere touching).
+            min_distance = carrier.radius_m + other.radius_m
+            if dist >= overlap_factor * min_distance:
+                continue
+
             direction = delta / dist  # unit vector carrier -> other
 
-            # Both must be charging towards each other along this axis.
+            # Net closing speed: sum of each player's velocity component toward
+            # the other.  Positive = getting closer together.
             carrier_speed_towards = carrier.velocity.xy().dot(direction)
             other_speed_towards = -(other.velocity.xy().dot(direction))
+            closing_speed = carrier_speed_towards + other_speed_towards
 
-            if carrier_speed_towards < min_charge or other_speed_towards < min_charge:
+            if closing_speed < min_closing:
                 continue
 
             # Head-on: resolve as a tackle (other player is the tackler).

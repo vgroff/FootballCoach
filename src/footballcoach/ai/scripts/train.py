@@ -79,6 +79,11 @@ def main() -> None:
                         help="Resume from the most recent checkpoint across all phase{N}_run* "
                              "dirs. Equivalent to --checkpoint <latest.pt>: skips pretraining "
                              "and continues the step counter. Errors if no checkpoints exist.")
+    parser.add_argument("--latest-pretrain", action="store_true",
+                        help="Load the most recent checkpoint then still run the full BC/value "
+                             "pre-training loop (equivalent to combining --latest resolution "
+                             "with --pretrain-from-checkpoint). Resets the step counter. "
+                             "Requires --bc-dataset for combined pre-training.")
     args = parser.parse_args()
 
     if args.verbose:
@@ -151,8 +156,8 @@ def main() -> None:
     else:
         trainer = PPOTrainer.from_config(device=device, checkpoint_dir=checkpoint_dir)
 
-    # --latest: auto-discover the most recent checkpoint across all run dirs.
-    if args.latest:
+    # --latest / --latest-pretrain: auto-discover the most recent checkpoint.
+    if args.latest or args.latest_pretrain:
         import glob as _glob, re as _re, os as _os
         _ckpt_base = Path("checkpoints")
         _prefix = f"phase{args.phase}_run"
@@ -182,10 +187,14 @@ def main() -> None:
         if _latest_path is None:
             log.error(f"--latest: no checkpoints found under {_ckpt_base}/{_prefix}*/")
             return
-        log.info(f"--latest: resolved to {_latest_path}")
-        if args.checkpoint:
-            log.warning("--latest overrides --checkpoint")
-        args.checkpoint = str(_latest_path)
+        log.info(f"--latest{'(-pretrain)' if args.latest_pretrain else ''}: resolved to {_latest_path}")
+        if args.latest_pretrain:
+            # Route through pretrain-from-checkpoint logic instead of resume
+            args.pretrain_from_checkpoint = str(_latest_path)
+        else:
+            if args.checkpoint:
+                log.warning("--latest overrides --checkpoint")
+            args.checkpoint = str(_latest_path)
 
     # Optionally resume from checkpoint
     if args.checkpoint:

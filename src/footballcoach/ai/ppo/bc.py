@@ -160,7 +160,18 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     from footballcoach.orders import MoveOrder as _MoveOrder, GetPossessionOrder as _GPOrder
     current_exec = player.current_order
     kick_this_tick = 1.0 if isinstance(current_exec, (ShootOrder, KickOrder, PassOrder)) else 0.0
-    tackle_attempt = 1.0 if isinstance(current_exec, ChaseTackleOrder) else 0.0
+    # tackle_attempt: ChaseTackleOrder always, OR GetPossessionOrder when the player
+    # is currently touching the ball carrier — that's when GP behaviour resolves a tackle.
+    _is_gp_tackling = False
+    if isinstance(current_exec, _GPOrder):
+        try:
+            carrier = match.ball_carrier()
+            if carrier is not None and carrier.player_id != player.player_id:
+                from footballcoach.engine.geometry import are_touching
+                _is_gp_tackling = are_touching(player, carrier)
+        except Exception:
+            pass
+    tackle_attempt = 1.0 if (isinstance(current_exec, ChaseTackleOrder) or _is_gp_tackling) else 0.0
     # exec_move: 1 if the rules AI is currently executing any movement order
     exec_move_now = 1.0 if isinstance(current_exec, (_MoveOrder, _GPOrder)) else 0.0
 

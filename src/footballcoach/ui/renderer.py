@@ -75,6 +75,7 @@ class Renderer:
         self._icon_cache: dict[str, pygame.Surface] = {}
         self.min_player_radius_px: int = gcfg["player"]["min_radius_px"]
         self._possession_outline_thickness: int = gcfg["player"].get("possession_outline_thickness", 2)
+        self._inactive_alpha: int = int(gcfg["player"].get("inactive_alpha", style.INACTIVE_ALPHA))
         self.min_ball_radius_px: int = gcfg["ball"]["min_radius_px"]
         self._ball_outline: bool = gcfg["ball"].get("outline", False)
         sl = gcfg["speed_lines"]
@@ -85,6 +86,9 @@ class Renderer:
         sf = gcfg["stamina_flash"]
         self._stamina_flash_threshold: float = sf["threshold"]
         self._stamina_flash_hz: float = sf["flash_hz"]
+        hi = gcfg.get("heading_indicator", {})
+        self._heading_length_px: int = int(hi.get("length_px", 8))
+        self._heading_alpha: int = int(hi.get("alpha", 255))
 
     def draw_pitch(self, surface: pygame.Surface, pitch: Pitch) -> None:
         surface.fill(style.PITCH_GREEN)
@@ -216,7 +220,7 @@ class Renderer:
             diameter = radius_px * 2 + 4
             player_surf = pygame.Surface((diameter, diameter), pygame.SRCALPHA)
             centre = (diameter // 2, diameter // 2)
-            pygame.draw.circle(player_surf, (*colour, style.INACTIVE_ALPHA), centre, radius_px)
+            pygame.draw.circle(player_surf, (*colour, self._inactive_alpha), centre, radius_px)
             surface.blit(player_surf, (pos[0] - centre[0], pos[1] - centre[1]))
         else:
             pygame.draw.circle(surface, colour, pos, radius_px)
@@ -242,12 +246,22 @@ class Renderer:
             pygame.draw.circle(surface, style.SELECTED_OUTLINE, pos, radius_px + 7, 2)
 
         # Heading indicator - a short line showing facing direction.
-        heading_len_px = radius_px + 8
-        tip = (
-            pos[0] + math.cos(-player.heading_rad) * heading_len_px,
-            pos[1] + math.sin(-player.heading_rad) * heading_len_px,
-        )
-        pygame.draw.line(surface, style.PITCH_LINE_WHITE, pos, tip, 2)
+        if self._heading_alpha > 0:
+            heading_len_px = radius_px + self._heading_length_px
+            tip_dx = math.cos(-player.heading_rad) * heading_len_px
+            tip_dy = math.sin(-player.heading_rad) * heading_len_px
+            # Use a small SRCALPHA surface so the alpha is respected.
+            pad = 2
+            sx = int(min(pos[0], pos[0] + tip_dx)) - pad
+            sy = int(min(pos[1], pos[1] + tip_dy)) - pad
+            sw = int(abs(tip_dx)) + pad * 2 + 2
+            sh = int(abs(tip_dy)) + pad * 2 + 2
+            h_surf = pygame.Surface((sw, sh), pygame.SRCALPHA)
+            lp0 = (pos[0] - sx, pos[1] - sy)
+            lp1 = (pos[0] + tip_dx - sx, pos[1] + tip_dy - sy)
+            r, g, b = style.PITCH_LINE_WHITE
+            pygame.draw.line(h_surf, (r, g, b, self._heading_alpha), lp0, lp1, 2)
+            surface.blit(h_surf, (sx, sy))
 
         label = self.hud_font.render(player.player_id, True, style.HUD_TEXT)
         surface.blit(label, (pos[0] - label.get_width() // 2, pos[1] + radius_px + 2))

@@ -50,7 +50,7 @@
     "n_epochs": 4,
     "minibatch_size": 64,
 
-    "target_kl": 0.4,
+    "target_kl": 0.06,
     "_comment_target_kl": "Per-minibatch early-stop threshold. KL divergence measures how much the policy distribution has changed since the rollout was collected — KL=0 means no change, KL=0.4 means fairly significant shift. When any minibatch's KL exceeds this, the entire epoch loop stops early. Typical value is 0.01–0.05; we use 0.4 (very permissive) because we want to see how many minibatches naturally get through. The real constraint is clip_range=0.05. LOWER this (e.g. 0.1) to make early-stop fire sooner and protect the policy more aggressively — you'll see fewer minibatches per rollout but more stable training. RAISE it if you want to see the full picture of how the policy changes per rollout.",
 
     "rollout_steps": 8096,
@@ -62,16 +62,18 @@
 
     "augment_n_slot_shuffles": 3,
     "_comment_augment": "Slot permutations per geometric flip variant. Total batch multiplier = 4 * n. Use 1 for 4x (flips only), 3 for 12x, 0 to disable. See ai/obs/augment.py.",
+    "rollout_eval_trials": 13,
+    "_comment_rollout_eval": "Number of trials run vs rules-based AI after each PPO rollout update. Set to 0 to disable the per-rollout eval entirely.",
     "_comment": "Standard PPO defaults from CleanRL-style reference implementations. Tune empirically."
   },
 
   "curriculum": {
     "_comment_todo": "TODO: implement and wire up: rng_reduction_start/end (randomisation annealing over training), pitch_standard_fraction (fraction of episodes on standard pitch), pitch_min_scale / goal_min_scale (curriculum pitch scaling). Currently not read by any code.",
-    "phase1_opponent_rules_prob": 0.0,
+    "phase1_opponent_rules_prob": 0.33,
     "phase1_opponent_immobile_prob": 0.0,
     "_comment_phase1_opponent": "phase1 training opponent split: rules_prob + immobile_prob must be <=1; remainder is neural (secondary player). phase1_demo_opponent_rules_prob is the default for record_demonstrations --opponent-rules-prob.",
     "phase1_demo_opponent_rules_prob": 1.0,
-    "secondary_weight": 0.35,
+    "secondary_weight": 0.5,
     "_comment_secondary_weight": "Importance weight applied to secondary (opponent) player transitions in the PPO loss. 1.0 = equal weight, 0.5 = half weight, 0.0 = ignore secondary transitions."
   },
 
@@ -82,16 +84,16 @@
     "pretrain_online_batch_size": 16,
     "direction_loss_weight": 4.0,
     "region_loss_weight": 1.0,
-    "aux_coeff_start": 0.5,
+    "aux_coeff_start": 0.95,
     "aux_coeff_end": 0.0,
-    "aux_coeff_anneal_fraction": 0.25,
+    "aux_coeff_anneal_fraction": 0.6,
     "_comment_aux": "aux_coeff anneals linearly from start to end over aux_coeff_anneal_fraction of training (e.g. 0.3 = done by 30% of steps). The BC loss is computed on decision Bernoulli heads and execution move_direction.",
-    "bc_pretrain_epochs": 3,
+    "bc_pretrain_epochs": 0,
     "bc_pretrain_batch_size": 312,
     "value_pretrain_steps": 4096,
-    "value_pretrain_epochs": 5,
+    "value_pretrain_epochs": 1,
     "value_pretrain_lr": 1e-3,
-    "demo_value_pretrain_epochs": 3,
+    "demo_value_pretrain_epochs": 0,
     "demo_value_pretrain_lr": 7e-3,
     "demo_value_pretrain_gamma": 0.995,
     "demo_value_bc_coef": 1.5,    
@@ -113,15 +115,17 @@
 
   "reward": {
     "phase1": {
-      "ball_distance_shaping": 0.002,
-      "gain_possession_bonus": 0.4,
+      "ball_approach_bonus": 0.02,
+      "ball_retreat_penalty": 0.05,
+      "_comment_dist_shaping": "Asymmetric ball-distance shaping. approach_bonus: reward per metre closed toward ball. retreat_penalty: penalty per metre moved away (use positive value, applied negatively). Set equal for symmetric. Falls back to ball_distance_shaping if keys absent.",
+      "gain_possession_bonus": 0.5,
       "ball_progress_scale": 0.003,
       "ball_out_penalty": -1.0,
       "illegal_action_penalty": -0.2,
       "box_possession_terminal": 7.0,
       "loss_terminal": -2.5,
       "_comment_loss_terminal": "Penalty applied when the opponent reaches the trainee's box with possession (trainee loses). Should be negative and less than box_possession_terminal in magnitude.",      
-      "loss_of_possession_penalty": -0.25,
+      "loss_of_possession_penalty": -0.3,
       "_comment_loss_of_possession": "Small penalty per step the trainee loses the ball to the opponent. Creates symmetric signal with gain_possession_bonus.",
       "timeout_penalty": -0.2,
       "_comment_timeout_penalty": "Penalty if the episode times out (no resolution). Makes timeouts clearly worse than active play.",

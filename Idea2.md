@@ -46,6 +46,7 @@ NB Immediate Immediate:
 - Why is the ball.possessed_by still using a player_id?? Do we enforce unique player_ids?? It seems so much easier to use just use the possesed_by field be player type rather than string, ball.possessed_by = kicker, instead of kicker.player_id. Is there an issue with circular references or something? If so, can't it be solved gracefully by refactoring or something? If not, it's okay, it just seems ugly
 - Maybe slightly reduce the size of the player spheres?
 - Is the game log permanent and can I copy/paste from it?
+- At some point the details of tackling, auto-tackling, and collisions should be worked out, I'm not sre its all that realistic
 
 NB Immediate:
 - Goalkeeper snaps in save order - not sure its needed if we program things correctly

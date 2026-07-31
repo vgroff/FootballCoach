@@ -56,9 +56,16 @@ def phase1_reward(
     r = 0.0
     comps: dict[str, float] = {}
 
-    dist_r = cfg["ball_distance_shaping"] * (prev_ball_dist - curr_ball_dist)
-    r += dist_r
-    comps["dist"] = dist_r
+    _delta = prev_ball_dist - curr_ball_dist  # positive = closing, negative = retreating
+    if _delta >= 0:
+        appr_r = cfg.get("ball_approach_bonus", cfg.get("ball_distance_shaping", 0.002)) * _delta
+        retr_r = 0.0
+    else:
+        appr_r = 0.0
+        retr_r = cfg.get("ball_retreat_penalty", cfg.get("ball_distance_shaping", 0.002)) * _delta
+    r += appr_r + retr_r
+    comps["appr"] = appr_r
+    comps["retr"] = retr_r
 
     poss_r = cfg["gain_possession_bonus"] if gained_possession_this_step else 0.0
     r += poss_r
