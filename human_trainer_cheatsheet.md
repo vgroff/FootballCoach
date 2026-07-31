@@ -4,6 +4,18 @@
 
 All commands append to `training_runs.log` and print live to terminal via `tee -a`.
 
+### Default behaviour (no checkpoint flags)
+
+With **no** `--checkpoint`, `--from-pretrained`, or `--pretrain-from-checkpoint` flag:
+- Starts from a **fresh, randomly-initialised** network.
+- Runs **full BC pre-training** (offline dataset if `--bc-dataset` is given, otherwise online rollout BC for `pretrain_steps` from ai_config.json).
+- Then runs PPO for `--total-steps` (default: 500,000).
+- Auto-creates a new `checkpoints/phase1_runN/` dir.
+
+To continue from the most recent run without re-pretraining, use `--from-pretrained`
+(see below). There is no "load latest and skip pretraining" automatic behaviour —
+you must pass the checkpoint path explicitly.
+
 ### Fresh run (full BC pretraining from scratch)
 ```bash
 uv run python -m footballcoach.ai.scripts.train \
@@ -11,7 +23,20 @@ uv run python -m footballcoach.ai.scripts.train \
     --bc-dataset demonstrations/phase1/ \
     --verbose 2>&1 | tee -a training_runs.log
 # change steps: add --total-steps 40000
+
 ```
+
+### Resume from the latest checkpoint automatically
+```bash
+uv run python -m footballcoach.ai.scripts.train \
+    --phase 1 --seed 42 \
+    --latest \
+    --verbose 2>&1 --total-steps 100000 | tee -a training_runs.log
+```
+Finds the most recent `latest.pt` (or highest-numbered checkpoint) across all
+`checkpoints/phase1_run*/` dirs. Skips pretraining and continues the step counter.
+Equivalent to `--checkpoint <that file>` but without needing to know the path.
+
 
 ### Continue from a pretrained checkpoint — skip BC pretraining entirely
 ```bash
@@ -32,7 +57,8 @@ uv run python -m footballcoach.ai.scripts.train \
 # --total-steps 60000
 ```
 
-### Resume a mid-run checkpoint (skips pretraining, continues step count)
+
+### Resume a specific mid-run checkpoint (skips pretraining, continues step count)
 ```bash
 uv run python -m footballcoach.ai.scripts.train \
     --phase 1 --seed 42 \

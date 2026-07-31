@@ -1753,3 +1753,1226 @@ Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pyto
 2026-07-31 01:52:57,252 INFO Offline BC dataset: 103,837 steps from demonstrations/phase1/
 2026-07-31 01:52:57,252 INFO Combined BC + value pre-training: 3 epoch(s), batch_size=312, dataset=103,837 steps, rollout_steps=8096
 2026-07-31 01:52:57,276 INFO Phase 0 — demo value pretrain: 1 epoch(s), gamma=0.995, returns mean=16.01  std=12.84  lr=0.007
+2026-07-31 01:53:03,279 INFO   Demo value epoch 1/1: val_loss=16.4098  rmse=52.03 (returns std=12.8)
+2026-07-31 01:53:03,279 INFO Phase 0 done (demo value pretrain, 1 epoch(s))
+2026-07-31 01:53:03,303 INFO Phase 1 BC epochs will include joint value loss (coef=1.5, gamma=0.995, returns std=12.84)
+/home/vincent/Documents/not_work/repos/FootballCoach/src/footballcoach/ai/ppo/bc.py:324: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:822.)
+  "decision":  float(dec_loss[valid].mean()),
+2026-07-31 01:54:21,801 INFO   BC epoch 1/3: bc_loss=0.4106  val_loss=0.2297  rmse=6.16 (returns std=12.8)  dir_cos=0.979  mv_p=1.000  spr_p=0.864  [decision=0.000  exec_bce=0.307  sprint=0.307  move=0.000  direction=0.084  region=0.020]
+2026-07-31 01:55:53,347 INFO   BC epoch 2/3: bc_loss=0.4031  val_loss=0.2199  rmse=6.02 (returns std=12.8)  dir_cos=0.981  mv_p=1.000  spr_p=0.863  [decision=0.000  exec_bce=0.307  sprint=0.307  move=0.000  direction=0.076  region=0.020]
+2026-07-31 01:57:24,093 INFO   BC epoch 3/3: bc_loss=0.4023  val_loss=0.2173  rmse=5.99 (returns std=12.8)  dir_cos=0.981  mv_p=1.000  spr_p=0.863  [decision=0.000  exec_bce=0.307  sprint=0.307  move=0.000  direction=0.076  region=0.020]
+2026-07-31 01:57:24,093 INFO BC pre-training done (3 epoch(s), final bc_loss=0.4023)
+2026-07-31 01:58:31,510 DEBUG   [combined pretrain] rollout returns: mean=3.74  std=4.17
+2026-07-31 01:58:34,497 INFO   Value epoch 1/3: val_loss=0.8402
+2026-07-31 01:58:37,381 INFO   Value epoch 2/3: val_loss=0.5751
+2026-07-31 01:58:40,099 INFO   Value epoch 3/3: val_loss=0.5316
+2026-07-31 01:58:40,099 INFO Value pre-training done (3 epoch(s), final val_loss=0.5316)
+2026-07-31 01:58:42,077 INFO BC check after value warm-up: bc_loss=0.3798 (before=0.4023, delta=-0.0225)  OK
+2026-07-31 01:58:42,077 INFO Combined pre-training complete.
+2026-07-31 01:58:43,497 INFO   [neural] trial 10/40: outcome=opponent_box_possession, reward=-1.78
+2026-07-31 01:58:44,624 INFO   [neural] trial 20/40: outcome=opponent_box_possession, reward=-1.95
+2026-07-31 01:58:45,433 INFO   [neural] trial 30/40: outcome=opponent_box_possession, reward=-2.01
+2026-07-31 01:58:46,422 INFO   [neural] trial 40/40: outcome=opponent_box_possession, reward=-2.01
+2026-07-31 01:58:46,422 INFO Pre-PPO eval (rules opp): win=25.0%  mean_rew=1.232  outcomes={'opponent_box_possession': 30, 'box_possession': 10}
+2026-07-31 01:58:47,783 INFO   [neural] trial 10/40: outcome=box_possession, reward=12.12
+2026-07-31 01:58:49,050 INFO   [neural] trial 20/40: outcome=box_possession, reward=7.53
+2026-07-31 01:58:51,167 INFO   [neural] trial 30/40: outcome=box_possession, reward=9.39
+2026-07-31 01:58:53,203 INFO   [neural] trial 40/40: outcome=box_possession, reward=10.10
+2026-07-31 01:58:53,203 INFO Pre-PPO eval (immobile opp): win=97.5%  mean_rew=10.083  outcomes={'box_possession': 39, 'miss': 1}
+2026-07-31 01:58:53,334 INFO   [baseline] trial 10/12: outcome=box_possession
+2026-07-31 01:58:53,364 INFO Baseline (rules vs rules, 12 trials): trainee_win=75.0%  outcomes={'box_possession': 9, 'opponent_box_possession': 3}
+2026-07-31 01:58:53,364 INFO Frozen decision_net.shoot_logit
+2026-07-31 01:58:53,364 INFO Frozen decision_net.pass_logit
+2026-07-31 01:58:53,364 INFO Frozen decision_net.tackle_logit
+2026-07-31 01:58:53,365 INFO Frozen decision_net.get_possession_raw
+2026-07-31 01:58:53,365 INFO Frozen decision_net.mark_logit
+2026-07-31 01:58:53,365 INFO Frozen decision_net.hold_position_logit
+2026-07-31 01:58:53,365 INFO Frozen decision_net.pass_target_logits
+2026-07-31 01:58:53,365 INFO Frozen decision_net.tackle_target_logits
+2026-07-31 01:58:53,365 INFO Frozen decision_net.mark_target_logits
+2026-07-31 01:58:53,366 INFO PPO training started: steps_so_far=0  target=110,000  (+110,000 this run)
+2026-07-31 01:59:27,391 DEBUG [PPO UPDATE] step=8,096  n=97152  progress=0.074
+  old_log_prob: mean=-0.459  std=0.546  min=-12.601  max=0.055
+  returns:      mean=5.208  std=3.277  min=-3.160  max=11.238
+  advantages:   mean=-0.849  std=6.571  min=-25.711  max=17.761
+  values(old):  mean=6.056  std=5.954  min=-7.471  max=24.703
+  rewards:      mean=0.1605  std=1.2702  nonzero=97152/97152
+2026-07-31 01:59:27,397 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.485  new_lp=-0.913  diff=-0.428
+    ratio: mean=0.7236  std=0.2857  min=0.1795  max=1.0680
+    new_values=3.121  ret(mb)=5.240
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.422 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.709 kick_dir=-9.099
+    move_dir log_std=[-1.1998354196548462, -1.1998149156570435]
+    [move_dir] cur_norm=1.000  stored_norm=1.067  angle=30.6deg
+2026-07-31 01:59:27,430 DEBUG   [e0 mb00]  grad=4.6  total=2.853  pol=0.138  val=2.184  kl=0.4278  mv_shift=0.000  mv_kl=0.0001  kk_shift=0.001
+2026-07-31 01:59:27,430 INFO   [early stop e0 mb0]  KL=0.42784 > target=0.4  steps_this_update=1
+2026-07-31 01:59:27,430 DEBUG   [epoch 0] kl=0.42784  t=39ms
+2026-07-31 01:59:27,431 INFO   [KL=0.4278 > 0.1] ratio percentiles:  p5=0.272  p25=0.392  p50=0.821  p75=1.000  p95=1.005  max=1.068
+  move_dir_log_std=[-1.1998333930969238, -1.1998114585876465]  kick_dir_log_std=[-1.1997534036636353, -1.199735403060913]
+2026-07-31 01:59:27,437 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.418  kick=-0.000  t_att=-0.000
+    move_dir=-0.508 (min=-5.011 max=0.557)  kick_dir=-0.325 (min=-4.555 max=0.558)
+  [worst sample] idx=62  ratio=2.670  old_lp=-0.196  new_lp=0.786
+    stored move_dir=143.7°  new_mean=149.5°  angular_diff=5.7°
+2026-07-31 01:59:27,459 INFO step=8,096 | rew=4.53/3.73 | pol=0.1385 val=2.1841 ent=0.4592 kl=0.4278  bc=1.9019(x0.88) | 240sps  mv_ls=[-1.1998,-1.1998] g=7.61e-03  act: mv= 25 gp= 75 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(164): 54%/43%
+2026-07-31 01:59:27,653 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint1.pt
+2026-07-31 01:59:28,730 INFO   [eval vs rules] step=8,096  win=1/10 (10%)  outcomes={'box_possession': 1, 'opponent_box_possession': 9}
+2026-07-31 02:00:02,645 DEBUG [PPO UPDATE] step=16,192  n=97152  progress=0.147
+  old_log_prob: mean=-0.476  std=0.519  min=-9.336  max=0.053
+  returns:      mean=5.234  std=3.231  min=-3.069  max=10.700
+  advantages:   mean=-0.562  std=6.338  min=-22.419  max=16.373
+  values(old):  mean=5.796  std=5.746  min=-6.742  max=23.575
+  rewards:      mean=0.1596  std=1.2782  nonzero=97152/97152
+2026-07-31 02:00:02,651 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.462  new_lp=-0.758  diff=-0.296
+    ratio: mean=0.7970  std=0.2565  min=0.2295  max=1.1218
+    new_values=2.820  ret(mb)=4.903
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.411 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.409 kick_dir=-6.514
+    move_dir log_std=[-1.1998333930969238, -1.1998114585876465]
+    [move_dir] cur_norm=1.000  stored_norm=1.070  angle=83.6deg
+2026-07-31 02:00:02,670 DEBUG   [e0 mb00]  grad=5.1  total=2.521  pol=0.102  val=2.416  kl=0.2959  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:00:02,692 DEBUG   [e0 mb01]  grad=10.5  total=3.154  pol=0.006  val=2.617  kl=0.4318  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:00:02,692 INFO   [early stop e0 mb1]  KL=0.43179 > target=0.4  steps_this_update=2
+2026-07-31 02:00:02,693 DEBUG   [epoch 0] kl=0.36384  t=47ms
+2026-07-31 02:00:02,693 INFO   [KL=0.3638 > 0.1] ratio percentiles:  p5=0.327  p25=0.528  p50=0.839  p75=1.000  p95=1.018  max=1.122
+  move_dir_log_std=[-1.199829339981079, -1.1998050212860107]  kick_dir_log_std=[-1.1997451782226562, -1.1997264623641968]
+2026-07-31 02:00:02,707 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.391  kick=-0.000  t_att=-0.000
+    move_dir=-0.493 (min=-8.136 max=0.553)  kick_dir=-0.482 (min=-6.147 max=0.561)
+  [worst sample] idx=38  ratio=2.731  old_lp=0.053  new_lp=1.057
+    stored move_dir=175.4°  new_mean=174.0°  angular_diff=1.4°
+2026-07-31 02:00:02,734 INFO step=16,192 | rew=5.22/2.87 | pol=0.0538 val=2.5162 ent=0.4854 kl=0.3638  bc=2.0856(x0.75) | 234sps  mv_ls=[-1.1998,-1.1998] g=9.67e-03  act: mv= 23 gp= 77 emv=100 spr= 81 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(159): 55%/42%
+2026-07-31 02:00:02,923 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint2.pt
+2026-07-31 02:00:04,076 INFO   [eval vs rules] step=16,192  win=4/10 (40%)  outcomes={'opponent_box_possession': 6, 'box_possession': 4}
+2026-07-31 02:00:37,562 DEBUG [PPO UPDATE] step=24,288  n=97152  progress=0.221
+  old_log_prob: mean=-0.465  std=0.500  min=-2.026  max=0.054
+  returns:      mean=5.891  std=3.152  min=-2.943  max=10.687
+  advantages:   mean=-0.015  std=6.436  min=-17.710  max=17.002
+  values(old):  mean=5.906  std=6.031  min=-7.091  max=23.751
+  rewards:      mean=0.1619  std=1.2788  nonzero=97152/97152
+2026-07-31 02:00:37,568 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.462  new_lp=-0.861  diff=-0.399
+    ratio: mean=0.7283  std=0.2630  min=0.1846  max=1.0330
+    new_values=2.696  ret(mb)=4.679
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.440 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.304 kick_dir=-8.110
+    move_dir log_std=[-1.199829339981079, -1.1998050212860107]
+    [move_dir] cur_norm=1.000  stored_norm=1.030  angle=169.6deg
+2026-07-31 02:00:37,594 DEBUG   [e0 mb00]  grad=7.1  total=3.098  pol=0.191  val=2.170  kl=0.3988  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:00:37,615 DEBUG   [e0 mb01]  grad=6.5  total=3.323  pol=0.182  val=2.544  kl=0.4490  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:00:37,615 INFO   [early stop e0 mb1]  KL=0.44898 > target=0.4  steps_this_update=2
+2026-07-31 02:00:37,615 DEBUG   [epoch 0] kl=0.42388  t=53ms
+2026-07-31 02:00:37,616 INFO   [KL=0.4239 > 0.1] ratio percentiles:  p5=0.311  p25=0.476  p50=0.719  p75=1.000  p95=1.005  max=1.222
+  move_dir_log_std=[-1.1998252868652344, -1.1997992992401123]  kick_dir_log_std=[-1.1997381448745728, -1.1997185945510864]
+2026-07-31 02:00:37,621 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.342  kick=-0.000  t_att=-0.000
+    move_dir=-0.376 (min=-4.251 max=0.561)  kick_dir=-0.373 (min=-9.760 max=0.561)
+  [worst sample] idx=90  ratio=2.572  old_lp=-0.212  new_lp=0.732
+    stored move_dir=166.2°  new_mean=169.7°  angular_diff=3.5°
+2026-07-31 02:00:37,643 INFO step=24,288 | rew=7.00/1.25 | pol=0.1863 val=2.3569 ent=0.4771 kl=0.4239  bc=2.9959(x0.63) | 236sps  mv_ls=[-1.1998,-1.1998] g=8.70e-03  act: mv= 24 gp= 76 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(155): 68%/31%
+2026-07-31 02:00:37,826 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint3.pt
+2026-07-31 02:00:38,653 INFO   [eval vs rules] step=24,288  win=2/10 (20%)  outcomes={'opponent_box_possession': 8, 'box_possession': 2}
+2026-07-31 02:01:14,141 DEBUG [PPO UPDATE] step=32,384  n=97152  progress=0.294
+  old_log_prob: mean=-0.463  std=0.533  min=-12.409  max=0.054
+  returns:      mean=5.672  std=3.270  min=-3.036  max=11.015
+  advantages:   mean=-0.365  std=6.487  min=-19.499  max=17.143
+  values(old):  mean=6.037  std=6.005  min=-6.627  max=23.917
+  rewards:      mean=0.1601  std=1.2783  nonzero=97152/97152
+2026-07-31 02:01:14,147 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.513  new_lp=-0.890  diff=-0.377
+    ratio: mean=0.7471  std=0.2754  min=0.2484  max=1.1085
+    new_values=2.835  ret(mb)=5.374
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.464 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.595 kick_dir=-7.905
+    move_dir log_std=[-1.1998252868652344, -1.1997992992401123]
+    [move_dir] cur_norm=1.000  stored_norm=1.074  angle=13.2deg
+2026-07-31 02:01:14,164 DEBUG   [e0 mb00]  grad=6.7  total=2.722  pol=0.189  val=2.316  kl=0.3765  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:01:14,188 DEBUG   [e0 mb01]  grad=5.7  total=1.991  pol=0.001  val=2.808  kl=0.4479  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:01:14,189 INFO   [early stop e0 mb1]  KL=0.44794 > target=0.4  steps_this_update=2
+2026-07-31 02:01:14,189 DEBUG   [epoch 0] kl=0.41220  t=47ms
+2026-07-31 02:01:14,189 INFO   [KL=0.4122 > 0.1] ratio percentiles:  p5=0.278  p25=0.450  p50=0.798  p75=1.000  p95=1.015  max=1.109
+  move_dir_log_std=[-1.1998213529586792, -1.199793815612793]  kick_dir_log_std=[-1.1997315883636475, -1.199711799621582]
+2026-07-31 02:01:14,198 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.405  kick=-0.000  t_att=-0.000
+    move_dir=-0.426 (min=-5.217 max=0.559)  kick_dir=-0.397 (min=-5.646 max=0.560)
+  [worst sample] idx=233  ratio=2.667  old_lp=0.052  new_lp=1.032
+    stored move_dir=-5.4°  new_mean=-1.5°  angular_diff=3.9°
+2026-07-31 02:01:14,228 INFO step=32,384 | rew=5.18/3.82 | pol=0.0950 val=2.5619 ent=0.4828 kl=0.4122  bc=2.0196(x0.51) | 225sps  mv_ls=[-1.1998,-1.1998] g=1.12e-02  act: mv= 24 gp= 76 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(155): 61%/37%
+2026-07-31 02:01:14,419 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint4.pt
+2026-07-31 02:01:15,665 INFO   [eval vs rules] step=32,384  win=1/10 (10%)  outcomes={'box_possession': 1, 'opponent_box_possession': 8, 'miss': 1}
+2026-07-31 02:01:54,232 DEBUG [PPO UPDATE] step=40,480  n=97152  progress=0.368
+  old_log_prob: mean=-0.456  std=0.511  min=-12.751  max=0.055
+  returns:      mean=5.607  std=3.162  min=-2.981  max=11.248
+  advantages:   mean=-0.342  std=6.403  min=-21.943  max=17.470
+  values(old):  mean=5.949  std=5.906  min=-7.257  max=24.134
+  rewards:      mean=0.1552  std=1.2478  nonzero=97152/97152
+2026-07-31 02:01:54,239 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.447  new_lp=-0.908  diff=-0.461
+    ratio: mean=0.7043  std=0.2977  min=0.2161  max=1.1995
+    new_values=3.246  ret(mb)=5.374
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.400 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.366 kick_dir=-9.786
+    move_dir log_std=[-1.1998213529586792, -1.199793815612793]
+    [move_dir] cur_norm=1.000  stored_norm=1.040  angle=-86.1deg
+2026-07-31 02:01:54,258 DEBUG   [e0 mb00]  grad=6.8  total=2.407  pol=0.213  val=2.278  kl=0.4612  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:01:54,258 INFO   [early stop e0 mb0]  KL=0.46118 > target=0.4  steps_this_update=1
+2026-07-31 02:01:54,258 DEBUG   [epoch 0] kl=0.46118  t=26ms
+2026-07-31 02:01:54,259 INFO   [KL=0.4612 > 0.1] ratio percentiles:  p5=0.253  p25=0.404  p50=0.774  p75=1.000  p95=1.047  max=1.200
+  move_dir_log_std=[-1.1998193264007568, -1.1997911930084229]  kick_dir_log_std=[-1.1997286081314087, -1.1997084617614746]
+2026-07-31 02:01:54,267 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.414  kick=-0.000  t_att=-0.000
+    move_dir=-0.381 (min=-4.572 max=0.561)  kick_dir=-0.501 (min=-6.759 max=0.560)
+  [worst sample] idx=122  ratio=2.851  old_lp=-1.377  new_lp=-0.329
+    stored move_dir=12.3°  new_mean=13.5°  angular_diff=1.2°
+2026-07-31 02:01:54,295 INFO step=40,480 | rew=4.07/4.75 | pol=0.2129 val=2.2779 ent=0.4404 kl=0.4612  bc=2.8418(x0.39) | 205sps  mv_ls=[-1.1998,-1.1998] g=1.15e-02  act: mv= 23 gp= 77 emv=100 spr= 83 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(154): 62%/36%
+2026-07-31 02:01:54,482 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint5.pt
+2026-07-31 02:01:55,392 INFO   [eval vs rules] step=40,480  win=3/10 (30%)  outcomes={'box_possession': 3, 'opponent_box_possession': 7}
+2026-07-31 02:02:31,750 DEBUG [PPO UPDATE] step=48,576  n=97152  progress=0.442
+  old_log_prob: mean=-0.455  std=0.517  min=-11.827  max=0.054
+  returns:      mean=5.303  std=3.222  min=-3.952  max=11.010
+  advantages:   mean=-0.742  std=6.537  min=-21.539  max=17.164
+  values(old):  mean=6.046  std=5.964  min=-7.155  max=24.423
+  rewards:      mean=0.1549  std=1.2457  nonzero=97152/97152
+2026-07-31 02:02:31,755 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.378  new_lp=-0.787  diff=-0.409
+    ratio: mean=0.7169  std=0.2548  min=0.2148  max=1.0701
+    new_values=3.205  ret(mb)=4.568
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.322 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.457 kick_dir=-8.849
+    move_dir log_std=[-1.1998193264007568, -1.1997911930084229]
+    [move_dir] cur_norm=1.000  stored_norm=1.016  angle=124.3deg
+2026-07-31 02:02:31,773 DEBUG   [e0 mb00]  grad=3.7  total=1.679  pol=0.209  val=1.725  kl=0.4093  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:02:31,773 INFO   [early stop e0 mb0]  KL=0.40928 > target=0.4  steps_this_update=1
+2026-07-31 02:02:31,773 DEBUG   [epoch 0] kl=0.40928  t=23ms
+2026-07-31 02:02:31,773 INFO   [KL=0.4093 > 0.1] ratio percentiles:  p5=0.308  p25=0.486  p50=0.729  p75=0.989  p95=1.000  max=1.070
+  move_dir_log_std=[-1.1998169422149658, -1.1997886896133423]  kick_dir_log_std=[-1.1997255086898804, -1.1997052431106567]
+2026-07-31 02:02:31,779 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.445  kick=-0.000  t_att=-0.000
+    move_dir=-0.426 (min=-6.962 max=0.561)  kick_dir=-0.455 (min=-5.553 max=0.559)
+  [worst sample] idx=65  ratio=2.610  old_lp=-0.244  new_lp=0.715
+    stored move_dir=11.4°  new_mean=15.8°  angular_diff=4.3°
+2026-07-31 02:02:31,804 INFO step=48,576 | rew=6.31/1.82 | pol=0.2090 val=1.7249 ent=0.4286 kl=0.4093  bc=2.4645(x0.26) | 219sps  mv_ls=[-1.1998,-1.1998] g=1.42e-02  act: mv= 25 gp= 75 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(157): 55%/41%
+2026-07-31 02:02:31,993 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint6.pt
+2026-07-31 02:02:33,334 INFO   [eval vs rules] step=48,576  win=4/10 (40%)  outcomes={'opponent_box_possession': 6, 'box_possession': 4}
+2026-07-31 02:03:00,756 DEBUG [PPO UPDATE] step=56,672  n=97152  progress=0.515
+  old_log_prob: mean=-0.462  std=0.526  min=-11.481  max=0.054
+  returns:      mean=5.721  std=3.237  min=-2.927  max=10.830
+  advantages:   mean=-0.503  std=6.579  min=-25.629  max=16.661
+  values(old):  mean=6.224  std=6.065  min=-8.308  max=24.535
+  rewards:      mean=0.1608  std=1.2688  nonzero=97152/97152
+2026-07-31 02:03:00,761 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.470  new_lp=-0.862  diff=-0.392
+    ratio: mean=0.7216  std=0.2461  min=0.3115  max=1.0952
+    new_values=3.217  ret(mb)=5.872
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.416 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.628 kick_dir=-8.292
+    move_dir log_std=[-1.1998169422149658, -1.1997886896133423]
+    [move_dir] cur_norm=1.000  stored_norm=1.051  angle=-141.1deg
+2026-07-31 02:03:00,775 DEBUG   [e0 mb00]  grad=4.7  total=1.723  pol=0.179  val=2.139  kl=0.3919  mv_shift=0.000  mv_kl=0.0001  kk_shift=0.001
+2026-07-31 02:03:00,795 DEBUG   [e0 mb01]  grad=4.9  total=1.722  pol=0.179  val=2.277  kl=0.4823  mv_shift=0.000  mv_kl=0.0001  kk_shift=0.001
+2026-07-31 02:03:00,795 INFO   [early stop e0 mb1]  KL=0.48231 > target=0.4  steps_this_update=2
+2026-07-31 02:03:00,795 DEBUG   [epoch 0] kl=0.43711  t=39ms
+2026-07-31 02:03:00,795 INFO   [KL=0.4371 > 0.1] ratio percentiles:  p5=0.312  p25=0.459  p50=0.693  p75=1.000  p95=1.000  max=1.095
+  move_dir_log_std=[-1.1998120546340942, -1.1997838020324707]  kick_dir_log_std=[-1.1997194290161133, -1.1996990442276]
+2026-07-31 02:03:00,801 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.043  hold=-0.000
+    sprint=-0.391  kick=-0.000  t_att=-0.000
+    move_dir=-0.438 (min=-3.662 max=0.561)  kick_dir=-0.422 (min=-4.912 max=0.549)
+  [worst sample] idx=247  ratio=2.734  old_lp=-0.226  new_lp=0.779
+    stored move_dir=-179.2°  new_mean=-179.0°  angular_diff=0.2°
+2026-07-31 02:03:00,826 INFO step=56,672 | rew=5.87/3.15 | pol=0.1791 val=2.2080 ent=0.4507 kl=0.4371  bc=3.4298(x0.14) | 284sps  mv_ls=[-1.1998,-1.1998] g=8.78e-03  act: mv= 25 gp= 75 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(158): 61%/37%
+2026-07-31 02:03:01,004 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint7.pt
+2026-07-31 02:03:01,902 INFO   [eval vs rules] step=56,672  win=8/10 (80%)  outcomes={'box_possession': 8, 'opponent_box_possession': 2}
+2026-07-31 02:03:31,646 DEBUG [PPO UPDATE] step=64,768  n=97152  progress=0.589
+  old_log_prob: mean=-0.460  std=0.537  min=-12.807  max=0.056
+  returns:      mean=5.392  std=3.331  min=-3.018  max=12.575
+  advantages:   mean=-0.613  std=6.436  min=-19.467  max=17.655
+  values(old):  mean=6.005  std=5.931  min=-6.170  max=24.139
+  rewards:      mean=0.1588  std=1.2689  nonzero=97152/97152
+2026-07-31 02:03:31,651 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.611  new_lp=-0.968  diff=-0.357
+    ratio: mean=0.7493  std=0.2491  min=0.2728  max=1.0333
+    new_values=2.086  ret(mb)=5.947
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.590 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.332 kick_dir=-7.221
+    move_dir log_std=[-1.1998120546340942, -1.1997838020324707]
+    [move_dir] cur_norm=1.000  stored_norm=1.027  angle=61.3deg
+2026-07-31 02:03:31,672 DEBUG   [e0 mb00]  grad=5.2  total=1.270  pol=-0.029  val=2.597  kl=0.3567  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:03:31,697 DEBUG   [e0 mb01]  grad=3.9  total=1.078  pol=0.092  val=2.010  kl=0.3557  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:03:31,720 DEBUG   [e0 mb02]  grad=4.9  total=1.518  pol=0.210  val=2.541  kl=0.4935  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:03:31,721 INFO   [early stop e0 mb2]  KL=0.49348 > target=0.4  steps_this_update=3
+2026-07-31 02:03:31,721 DEBUG   [epoch 0] kl=0.40194  t=75ms
+2026-07-31 02:03:31,721 INFO   [KL=0.4019 > 0.1] ratio percentiles:  p5=0.288  p25=0.487  p50=0.768  p75=1.000  p95=1.001  max=1.068
+  move_dir_log_std=[-1.1998063325881958, -1.1997759342193604]  kick_dir_log_std=[-1.1997101306915283, -1.1996898651123047]
+2026-07-31 02:03:31,730 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.332  kick=-0.000  t_att=-0.000
+    move_dir=-0.452 (min=-5.042 max=0.557)  kick_dir=-0.505 (min=-5.848 max=0.561)
+  [worst sample] idx=29  ratio=2.738  old_lp=0.053  new_lp=1.060
+    stored move_dir=18.0°  new_mean=15.1°  angular_diff=2.9°
+2026-07-31 02:03:31,754 INFO step=64,768 | rew=3.62/3.36 | pol=0.0908 val=2.3826 ent=0.5012 kl=0.4019  bc=3.0375(x0.02) | 267sps  mv_ls=[-1.1998,-1.1998] g=1.19e-02  act: mv= 24 gp= 76 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(154): 58%/40%
+2026-07-31 02:03:31,936 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint8.pt
+2026-07-31 02:03:32,780 INFO   [eval vs rules] step=64,768  win=3/10 (30%)  outcomes={'opponent_box_possession': 7, 'box_possession': 3}
+2026-07-31 02:04:00,340 DEBUG [PPO UPDATE] step=72,864  n=97152  progress=0.662
+  old_log_prob: mean=-0.459  std=0.500  min=-2.071  max=0.055
+  returns:      mean=5.771  std=3.268  min=-3.046  max=10.889
+  advantages:   mean=-0.283  std=6.551  min=-25.931  max=16.425
+  values(old):  mean=6.054  std=6.037  min=-7.346  max=24.550
+  rewards:      mean=0.1677  std=1.3071  nonzero=97152/97152
+2026-07-31 02:04:00,345 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.345  new_lp=-0.769  diff=-0.424
+    ratio: mean=0.7063  std=0.2592  min=0.2317  max=1.0625
+    new_values=3.310  ret(mb)=5.694
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.289 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.691 kick_dir=-8.888
+    move_dir log_std=[-1.1998063325881958, -1.1997759342193604]
+    [move_dir] cur_norm=1.000  stored_norm=1.040  angle=178.3deg
+2026-07-31 02:04:00,357 DEBUG   [e0 mb00]  grad=3.5  total=1.387  pol=0.241  val=2.379  kl=0.4241  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:04:00,357 INFO   [early stop e0 mb0]  KL=0.42410 > target=0.4  steps_this_update=1
+2026-07-31 02:04:00,357 DEBUG   [epoch 0] kl=0.42410  t=17ms
+2026-07-31 02:04:00,358 INFO   [KL=0.4241 > 0.1] ratio percentiles:  p5=0.340  p25=0.481  p50=0.655  p75=1.000  p95=1.013  max=1.063
+  move_dir_log_std=[-1.1998045444488525, -1.1997729539871216]  kick_dir_log_std=[-1.19970703125, -1.1996867656707764]
+2026-07-31 02:04:00,364 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.443  kick=-0.000  t_att=-0.000
+    move_dir=-0.529 (min=-3.919 max=0.561)  kick_dir=-0.439 (min=-5.086 max=0.561)
+  [worst sample] idx=121  ratio=2.757  old_lp=-0.233  new_lp=0.781
+    stored move_dir=-150.9°  new_mean=-151.6°  angular_diff=0.7°
+2026-07-31 02:04:00,389 INFO step=72,864 | rew=5.62/3.02 | pol=0.2413 val=2.3793 ent=0.4418 kl=0.4241 | 288sps  mv_ls=[-1.1998,-1.1998] g=9.72e-03  act: mv= 24 gp= 76 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(166): 63%/34%
+2026-07-31 02:04:00,563 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint9.pt
+2026-07-31 02:04:01,252 INFO   [eval vs rules] step=72,864  win=4/10 (40%)  outcomes={'miss': 1, 'opponent_box_possession': 5, 'box_possession': 4}
+2026-07-31 02:04:29,214 DEBUG [PPO UPDATE] step=80,960  n=97152  progress=0.736
+  old_log_prob: mean=-0.465  std=0.549  min=-12.438  max=0.054
+  returns:      mean=5.733  std=3.218  min=-3.072  max=22.380
+  advantages:   mean=-0.416  std=6.563  min=-21.530  max=20.683
+  values(old):  mean=6.150  std=5.989  min=-7.354  max=24.613
+  rewards:      mean=0.1579  std=1.2578  nonzero=97152/97152
+2026-07-31 02:04:29,221 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.487  new_lp=-0.909  diff=-0.422
+    ratio: mean=0.7171  std=0.2743  min=0.2377  max=1.0219
+    new_values=3.171  ret(mb)=6.361
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.438 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.676 kick_dir=-8.738
+    move_dir log_std=[-1.1998045444488525, -1.1997729539871216]
+    [move_dir] cur_norm=1.000  stored_norm=1.027  angle=-131.9deg
+2026-07-31 02:04:29,238 DEBUG   [e0 mb00]  grad=4.5  total=1.104  pol=0.113  val=2.073  kl=0.4221  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:04:29,238 INFO   [early stop e0 mb0]  KL=0.42214 > target=0.4  steps_this_update=1
+2026-07-31 02:04:29,238 DEBUG   [epoch 0] kl=0.42214  t=24ms
+2026-07-31 02:04:29,239 INFO   [KL=0.4221 > 0.1] ratio percentiles:  p5=0.305  p25=0.451  p50=0.803  p75=1.000  p95=1.000  max=1.022
+  move_dir_log_std=[-1.1998028755187988, -1.1997699737548828]  kick_dir_log_std=[-1.1997040510177612, -1.1996837854385376]
+2026-07-31 02:04:29,245 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.048  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.444  kick=-0.000  t_att=-0.000
+    move_dir=-0.452 (min=-5.638 max=0.561)  kick_dir=-0.488 (min=-6.735 max=0.556)
+  [worst sample] idx=122  ratio=2.707  old_lp=-0.209  new_lp=0.787
+    stored move_dir=148.7°  new_mean=145.3°  angular_diff=3.4°
+2026-07-31 02:04:29,269 INFO step=80,960 | rew=4.61/3.07 | pol=0.1129 val=2.0725 ent=0.4507 kl=0.4221 | 285sps  mv_ls=[-1.1998,-1.1998] g=6.43e-03  act: mv= 25 gp= 75 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(157): 62%/36%
+2026-07-31 02:04:29,471 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint10.pt
+2026-07-31 02:04:30,389 INFO   [eval vs rules] step=80,960  win=1/10 (10%)  outcomes={'opponent_box_possession': 9, 'box_possession': 1}
+2026-07-31 02:05:00,226 DEBUG [PPO UPDATE] step=89,056  n=97152  progress=0.810
+  old_log_prob: mean=-0.454  std=0.526  min=-11.657  max=0.055
+  returns:      mean=5.565  std=3.217  min=-3.105  max=10.802
+  advantages:   mean=-0.463  std=6.496  min=-19.664  max=16.637
+  values(old):  mean=6.028  std=5.974  min=-7.077  max=25.716
+  rewards:      mean=0.1566  std=1.2621  nonzero=97152/97152
+2026-07-31 02:05:00,243 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.433  new_lp=-0.841  diff=-0.408
+    ratio: mean=0.7307  std=0.2795  min=0.2118  max=1.0717
+    new_values=3.257  ret(mb)=5.113
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.370 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.432 kick_dir=-8.989
+    move_dir log_std=[-1.1998028755187988, -1.1997699737548828]
+    [move_dir] cur_norm=1.000  stored_norm=1.067  angle=-89.8deg
+2026-07-31 02:05:00,258 DEBUG   [e0 mb00]  grad=3.5  total=1.175  pol=0.241  val=1.960  kl=0.4055  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.005
+2026-07-31 02:05:00,259 INFO   [early stop e0 mb0]  KL=0.40547 > target=0.4  steps_this_update=1
+2026-07-31 02:05:00,259 DEBUG   [epoch 0] kl=0.40547  t=33ms
+2026-07-31 02:05:00,259 INFO   [KL=0.4055 > 0.1] ratio percentiles:  p5=0.297  p25=0.476  p50=0.800  p75=1.000  p95=1.017  max=1.072
+  move_dir_log_std=[-1.1998014450073242, -1.1997672319412231]  kick_dir_log_std=[-1.199700951576233, -1.1996809244155884]
+2026-07-31 02:05:00,266 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.338  kick=-0.000  t_att=-0.000
+    move_dir=-0.510 (min=-5.872 max=0.555)  kick_dir=-0.477 (min=-4.343 max=0.561)
+  [worst sample] idx=147  ratio=2.665  old_lp=0.051  new_lp=1.032
+    stored move_dir=4.4°  new_mean=-0.4°  angular_diff=4.8°
+2026-07-31 02:05:00,290 INFO step=89,056 | rew=7.79/1.37 | pol=0.2413 val=1.9596 ent=0.4583 kl=0.4055 | 265sps  mv_ls=[-1.1998,-1.1998] g=1.76e-03  act: mv= 25 gp= 75 emv=100 spr= 83 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(151): 60%/39%
+2026-07-31 02:05:00,465 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint11.pt
+2026-07-31 02:05:01,315 INFO   [eval vs rules] step=89,056  win=4/10 (40%)  outcomes={'opponent_box_possession': 6, 'box_possession': 4}
+2026-07-31 02:05:34,457 DEBUG [PPO UPDATE] step=97,152  n=97152  progress=0.883
+  old_log_prob: mean=-0.457  std=0.506  min=-8.446  max=0.055
+  returns:      mean=5.447  std=3.232  min=-3.164  max=11.031
+  advantages:   mean=-0.606  std=6.468  min=-25.863  max=15.647
+  values(old):  mean=6.053  std=5.954  min=-5.930  max=24.436
+  rewards:      mean=0.1566  std=1.2603  nonzero=97152/97152
+2026-07-31 02:05:34,464 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.351  new_lp=-0.801  diff=-0.450
+    ratio: mean=0.7018  std=0.2771  min=0.2151  max=1.0520
+    new_values=3.242  ret(mb)=4.872
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.308 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.554 kick_dir=-9.305
+    move_dir log_std=[-1.1998014450073242, -1.1997672319412231]
+    [move_dir] cur_norm=1.000  stored_norm=1.077  angle=-49.4deg
+2026-07-31 02:05:34,482 DEBUG   [e0 mb00]  grad=2.8  total=1.329  pol=0.270  val=2.207  kl=0.4504  mv_shift=0.000  mv_kl=0.0001  kk_shift=0.001
+2026-07-31 02:05:34,482 INFO   [early stop e0 mb0]  KL=0.45036 > target=0.4  steps_this_update=1
+2026-07-31 02:05:34,482 DEBUG   [epoch 0] kl=0.45036  t=25ms
+2026-07-31 02:05:34,483 INFO   [KL=0.4504 > 0.1] ratio percentiles:  p5=0.260  p25=0.448  p50=0.759  p75=1.000  p95=1.015  max=1.052
+  move_dir_log_std=[-1.199799656867981, -1.1997648477554321]  kick_dir_log_std=[-1.1996978521347046, -1.1996780633926392]
+2026-07-31 02:05:34,490 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.406  kick=-0.000  t_att=-0.000
+    move_dir=-0.298 (min=-6.566 max=0.556)  kick_dir=-0.364 (min=-4.858 max=0.554)
+  [worst sample] idx=102  ratio=2.815  old_lp=-0.221  new_lp=0.814
+    stored move_dir=-174.4°  new_mean=-173.4°  angular_diff=1.0°
+2026-07-31 02:05:34,511 INFO step=97,152 | rew=4.11/3.54 | pol=0.2699 val=2.2067 ent=0.4420 kl=0.4504 | 240sps  mv_ls=[-1.1998,-1.1998] g=7.50e-03  act: mv= 24 gp= 76 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(155): 59%/40%
+2026-07-31 02:05:34,703 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint12.pt
+2026-07-31 02:05:35,825 INFO   [eval vs rules] step=97,152  win=2/10 (20%)  outcomes={'opponent_box_possession': 7, 'miss': 1, 'box_possession': 2}
+2026-07-31 02:06:14,551 DEBUG [PPO UPDATE] step=105,248  n=97152  progress=0.957
+  old_log_prob: mean=-0.453  std=0.521  min=-13.274  max=0.052
+  returns:      mean=5.621  std=3.274  min=-3.060  max=11.564
+  advantages:   mean=-0.574  std=6.666  min=-24.672  max=17.352
+  values(old):  mean=6.196  std=6.124  min=-7.483  max=24.040
+  rewards:      mean=0.1609  std=1.2804  nonzero=97152/97152
+2026-07-31 02:06:14,558 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.394  new_lp=-0.733  diff=-0.338
+    ratio: mean=0.7573  std=0.2366  min=0.2889  max=1.0000
+    new_values=3.211  ret(mb)=5.647
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.358 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.425 kick_dir=-7.057
+    move_dir log_std=[-1.199799656867981, -1.1997648477554321]
+    [move_dir] cur_norm=1.000  stored_norm=1.078  angle=-58.6deg
+2026-07-31 02:06:14,577 DEBUG   [e0 mb00]  grad=3.6  total=1.102  pol=0.129  val=2.035  kl=0.3384  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:06:14,600 DEBUG   [e0 mb01]  grad=4.4  total=1.077  pol=0.030  val=2.195  kl=0.4016  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:06:14,601 INFO   [early stop e0 mb1]  KL=0.40162 > target=0.4  steps_this_update=2
+2026-07-31 02:06:14,601 DEBUG   [epoch 0] kl=0.36999  t=49ms
+2026-07-31 02:06:14,601 INFO   [KL=0.3700 > 0.1] ratio percentiles:  p5=0.302  p25=0.542  p50=0.770  p75=1.000  p95=1.000  max=1.105
+  move_dir_log_std=[-1.1997959613800049, -1.19976007938385]  kick_dir_log_std=[-1.1996911764144897, -1.1996723413467407]
+2026-07-31 02:06:14,609 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.395  kick=-0.000  t_att=-0.000
+    move_dir=-0.453 (min=-5.453 max=0.555)  kick_dir=-0.409 (min=-6.427 max=0.553)
+  [worst sample] idx=32  ratio=2.456  old_lp=-0.229  new_lp=0.670
+    stored move_dir=-123.1°  new_mean=-124.4°  angular_diff=1.3°
+2026-07-31 02:06:14,635 INFO step=105,248 | rew=4.33/4.10 | pol=0.0795 val=2.1152 ent=0.4728 kl=0.3700 | 205sps  mv_ls=[-1.1998,-1.1998] g=6.79e-03  act: mv= 26 gp= 74 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(157): 57%/41%
+2026-07-31 02:06:14,820 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint13.pt
+2026-07-31 02:06:15,842 INFO   [eval vs rules] step=105,248  win=2/10 (20%)  outcomes={'opponent_box_possession': 7, 'miss': 1, 'box_possession': 2}
+2026-07-31 02:06:38,882 INFO Saved checkpoint: checkpoints/phase1_run46/checkpoint14.pt
+2026-07-31 02:06:38,882 INFO Final checkpoint saved.
+2026-07-31 02:06:38,882 INFO Training complete. Total steps: 110,000
+2026-07-31 02:12:04,945 INFO Checkpoint dir: checkpoints/phase1_run47
+2026-07-31 02:12:04,956 INFO Starting training: phase=phase1_get_possession, total_steps=180,000
+2026-07-31 02:12:04,956 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
+2026-07-31 02:12:06,157 INFO Loaded checkpoint: checkpoints/phase1_run46/checkpoint14.pt (step 110000)
+2026-07-31 02:12:06,157 INFO Loaded pre-trained checkpoint: checkpoints/phase1_run46/checkpoint14.pt — skipping BC/value pre-training
+2026-07-31 02:12:07,266 INFO   [neural] trial 10/40: outcome=box_possession, reward=12.18
+2026-07-31 02:12:08,606 INFO   [neural] trial 20/40: outcome=opponent_box_possession, reward=-2.10
+2026-07-31 02:12:09,492 INFO   [neural] trial 30/40: outcome=opponent_box_possession, reward=-1.85
+2026-07-31 02:12:10,518 INFO   [neural] trial 40/40: outcome=opponent_box_possession, reward=-1.71
+2026-07-31 02:12:10,518 INFO Pre-PPO eval (rules opp): win=27.5%  mean_rew=1.611  outcomes={'miss': 2, 'opponent_box_possession': 27, 'box_possession': 11}
+2026-07-31 02:12:12,150 INFO   [neural] trial 10/40: outcome=box_possession, reward=9.61
+2026-07-31 02:12:13,911 INFO   [neural] trial 20/40: outcome=box_possession, reward=9.83
+2026-07-31 02:12:14,772 INFO   [neural] trial 30/40: outcome=box_possession, reward=8.47
+2026-07-31 02:12:16,229 INFO   [neural] trial 40/40: outcome=box_possession, reward=11.43
+2026-07-31 02:12:16,229 INFO Pre-PPO eval (immobile opp): win=100.0%  mean_rew=9.800  outcomes={'box_possession': 40}
+2026-07-31 02:12:16,303 INFO   [baseline] trial 10/12: outcome=box_possession
+2026-07-31 02:12:16,322 INFO Baseline (rules vs rules, 12 trials): trainee_win=75.0%  outcomes={'box_possession': 9, 'miss': 1, 'opponent_box_possession': 2}
+2026-07-31 02:12:16,322 INFO Frozen decision_net.shoot_logit
+2026-07-31 02:12:16,323 INFO Frozen decision_net.pass_logit
+2026-07-31 02:12:16,323 INFO Frozen decision_net.tackle_logit
+2026-07-31 02:12:16,323 INFO Frozen decision_net.get_possession_raw
+2026-07-31 02:12:16,323 INFO Frozen decision_net.mark_logit
+2026-07-31 02:12:16,323 INFO Frozen decision_net.hold_position_logit
+2026-07-31 02:12:16,323 INFO Frozen decision_net.pass_target_logits
+2026-07-31 02:12:16,323 INFO Frozen decision_net.tackle_target_logits
+2026-07-31 02:12:16,323 INFO Frozen decision_net.mark_target_logits
+2026-07-31 02:12:16,323 INFO PPO training started: steps_so_far=110,000  target=290,000  (+180,000 this run)
+2026-07-31 02:12:54,212 DEBUG [PPO UPDATE] step=118,096  n=97152  progress=0.656
+  old_log_prob: mean=-0.466  std=0.544  min=-11.540  max=0.055
+  returns:      mean=5.502  std=3.201  min=-3.067  max=15.449
+  advantages:   mean=-0.432  std=6.406  min=-24.829  max=16.930
+  values(old):  mean=5.933  std=5.824  min=-7.626  max=24.345
+  rewards:      mean=0.1515  std=1.2401  nonzero=97152/97152
+2026-07-31 02:12:54,219 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.421  new_lp=-0.882  diff=-0.462
+    ratio: mean=0.6906  std=0.2740  min=0.2387  max=1.1044
+    new_values=3.065  ret(mb)=6.003
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.381 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.483 kick_dir=-9.545
+    move_dir log_std=[-1.1997959613800049, -1.19976007938385]
+    [move_dir] cur_norm=1.000  stored_norm=1.074  angle=167.4deg
+2026-07-31 02:12:54,236 DEBUG   [e0 mb00]  grad=4.4  total=1.628  pol=0.231  val=2.884  kl=0.4614  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:12:54,236 INFO   [early stop e0 mb0]  KL=0.46142 > target=0.4  steps_this_update=1
+2026-07-31 02:12:54,236 DEBUG   [epoch 0] kl=0.46142  t=24ms
+2026-07-31 02:12:54,237 INFO   [KL=0.4614 > 0.1] ratio percentiles:  p5=0.281  p25=0.462  p50=0.662  p75=1.000  p95=1.009  max=1.104
+  move_dir_log_std=[-1.199794054031372, -1.199757695198059]  kick_dir_log_std=[-1.1996878385543823, -1.1996694803237915]
+2026-07-31 02:12:54,244 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.450  kick=-0.000  t_att=-0.000
+    move_dir=-0.345 (min=-5.489 max=0.558)  kick_dir=-0.383 (min=-4.684 max=0.560)
+  [worst sample] idx=239  ratio=2.725  old_lp=-1.416  new_lp=-0.413
+    stored move_dir=69.1°  new_mean=70.8°  angular_diff=1.8°
+2026-07-31 02:12:54,271 INFO step=118,096 | rew=4.70/3.91 | pol=0.2309 val=2.8843 ent=0.4493 kl=0.4614 | 216sps  mv_ls=[-1.1998,-1.1998] g=7.12e-03  act: mv= 23 gp= 77 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(145): 56%/42%
+2026-07-31 02:12:54,450 INFO Saved checkpoint: checkpoints/phase1_run47/checkpoint1.pt
+2026-07-31 02:12:55,711 INFO   [eval vs rules] step=118,096  win=7/10 (70%)  outcomes={'box_possession': 7, 'opponent_box_possession': 3}
+2026-07-31 02:13:33,585 DEBUG [PPO UPDATE] step=126,192  n=97152  progress=0.701
+  old_log_prob: mean=-0.467  std=0.552  min=-12.056  max=0.055
+  returns:      mean=5.792  std=3.170  min=-2.931  max=10.804
+  advantages:   mean=-0.349  std=6.523  min=-24.541  max=17.482
+  values(old):  mean=6.140  std=6.055  min=-7.253  max=23.799
+  rewards:      mean=0.1537  std=1.2442  nonzero=97152/97152
+2026-07-31 02:13:33,591 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.346  new_lp=-0.761  diff=-0.415
+    ratio: mean=0.7094  std=0.2558  min=0.3047  max=1.0657
+    new_values=3.601  ret(mb)=5.781
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.298 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.445 kick_dir=-8.808
+    move_dir log_std=[-1.199794054031372, -1.199757695198059]
+    [move_dir] cur_norm=1.000  stored_norm=1.042  angle=168.0deg
+2026-07-31 02:13:33,607 DEBUG   [e0 mb00]  grad=3.8  total=1.400  pol=0.277  val=2.329  kl=0.4152  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:13:33,607 INFO   [early stop e0 mb0]  KL=0.41519 > target=0.4  steps_this_update=1
+2026-07-31 02:13:33,607 DEBUG   [epoch 0] kl=0.41519  t=22ms
+2026-07-31 02:13:33,608 INFO   [KL=0.4152 > 0.1] ratio percentiles:  p5=0.356  p25=0.466  p50=0.707  p75=1.000  p95=1.004  max=1.066
+  move_dir_log_std=[-1.199792504310608, -1.1997555494308472]  kick_dir_log_std=[-1.1996846199035645, -1.1996666193008423]
+2026-07-31 02:13:33,614 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.400  kick=-0.000  t_att=-0.000
+    move_dir=-0.518 (min=-5.172 max=0.561)  kick_dir=-0.387 (min=-4.071 max=0.561)
+  [worst sample] idx=44  ratio=2.839  old_lp=-0.201  new_lp=0.843
+    stored move_dir=28.5°  new_mean=27.9°  angular_diff=0.6°
+2026-07-31 02:13:33,634 INFO step=126,192 | rew=7.61/0.38 | pol=0.2774 val=2.3291 ent=0.4236 kl=0.4152 | 209sps  mv_ls=[-1.1998,-1.1998] g=2.04e-03  act: mv= 24 gp= 76 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(147): 61%/37%
+2026-07-31 02:13:33,817 INFO Saved checkpoint: checkpoints/phase1_run47/checkpoint2.pt
+2026-07-31 02:13:35,189 INFO   [eval vs rules] step=126,192  win=3/10 (30%)  outcomes={'opponent_box_possession': 7, 'box_possession': 3}
+2026-07-31 02:14:11,626 DEBUG [PPO UPDATE] step=134,288  n=97152  progress=0.746
+  old_log_prob: mean=-0.457  std=0.509  min=-9.623  max=0.053
+  returns:      mean=5.298  std=3.304  min=-3.092  max=10.936
+  advantages:   mean=-0.805  std=6.620  min=-22.984  max=16.008
+  values(old):  mean=6.103  std=6.008  min=-6.063  max=23.993
+  rewards:      mean=0.1647  std=1.2885  nonzero=97152/97152
+2026-07-31 02:14:11,642 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.392  new_lp=-0.771  diff=-0.379
+    ratio: mean=0.7405  std=0.2675  min=0.2524  max=1.0970
+    new_values=3.837  ret(mb)=5.432
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.335 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.586 kick_dir=-8.122
+    move_dir log_std=[-1.199792504310608, -1.1997555494308472]
+    [move_dir] cur_norm=1.000  stored_norm=1.051  angle=18.4deg
+2026-07-31 02:14:11,661 DEBUG   [e0 mb00]  grad=2.8  total=1.121  pol=0.266  val=1.790  kl=0.3790  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:14:11,685 DEBUG   [e0 mb01]  grad=4.4  total=1.250  pol=0.044  val=2.504  kl=0.4285  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:14:11,686 INFO   [early stop e0 mb1]  KL=0.42845 > target=0.4  steps_this_update=2
+2026-07-31 02:14:11,686 DEBUG   [epoch 0] kl=0.40375  t=59ms
+2026-07-31 02:14:11,686 INFO   [KL=0.4038 > 0.1] ratio percentiles:  p5=0.305  p25=0.469  p50=0.747  p75=1.000  p95=1.022  max=1.097
+  move_dir_log_std=[-1.1997880935668945, -1.1997506618499756]  kick_dir_log_std=[-1.19967782497406, -1.1996606588363647]
+2026-07-31 02:14:11,693 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.371  kick=-0.000  t_att=-0.000
+    move_dir=-0.391 (min=-5.234 max=0.557)  kick_dir=-0.430 (min=-5.656 max=0.556)
+  [worst sample] idx=217  ratio=2.685  old_lp=0.052  new_lp=1.039
+    stored move_dir=24.9°  new_mean=19.9°  angular_diff=5.0°
+2026-07-31 02:14:11,714 INFO step=134,288 | rew=5.91/2.10 | pol=0.1547 val=2.1466 ent=0.4280 kl=0.4038 | 216sps  mv_ls=[-1.1998,-1.1998] g=1.10e-02  act: mv= 25 gp= 75 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(162): 54%/46%
+2026-07-31 02:14:11,899 INFO Saved checkpoint: checkpoints/phase1_run47/checkpoint3.pt
+2026-07-31 02:14:12,701 INFO   [eval vs rules] step=134,288  win=4/10 (40%)  outcomes={'opponent_box_possession': 6, 'box_possession': 4}
+2026-07-31 02:14:46,937 DEBUG [PPO UPDATE] step=142,384  n=97152  progress=0.791
+  old_log_prob: mean=-0.446  std=0.486  min=-1.960  max=0.054
+  returns:      mean=5.534  std=3.116  min=-3.047  max=11.302
+  advantages:   mean=-0.557  std=6.451  min=-22.306  max=15.759
+  values(old):  mean=6.091  std=5.866  min=-8.421  max=24.145
+  rewards:      mean=0.1533  std=1.2358  nonzero=97152/97152
+2026-07-31 02:14:46,959 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.566  new_lp=-1.113  diff=-0.548
+    ratio: mean=0.6380  std=0.2630  min=0.2082  max=1.0618
+    new_values=2.936  ret(mb)=4.910
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.521 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.551 kick_dir=-11.289
+    move_dir log_std=[-1.1997880935668945, -1.1997506618499756]
+    [move_dir] cur_norm=1.000  stored_norm=1.084  angle=-123.6deg
+2026-07-31 02:14:46,978 DEBUG   [e0 mb00]  grad=4.6  total=1.112  pol=0.221  val=1.876  kl=0.5478  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:14:46,978 INFO   [early stop e0 mb0]  KL=0.54782 > target=0.4  steps_this_update=1
+2026-07-31 02:14:46,978 DEBUG   [epoch 0] kl=0.54782  t=41ms
+2026-07-31 02:14:46,979 INFO   [KL=0.5478 > 0.1] ratio percentiles:  p5=0.243  p25=0.401  p50=0.633  p75=0.822  p95=1.000  max=1.062
+  move_dir_log_std=[-1.199785828590393, -1.199748158454895]  kick_dir_log_std=[-1.199674367904663, -1.199657678604126]
+2026-07-31 02:14:46,991 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.420  kick=-0.000  t_att=-0.000
+    move_dir=-0.409 (min=-4.775 max=0.562)  kick_dir=-0.351 (min=-6.515 max=0.550)
+  [worst sample] idx=223  ratio=2.746  old_lp=-0.226  new_lp=0.784
+    stored move_dir=9.5°  new_mean=10.7°  angular_diff=1.2°
+2026-07-31 02:14:47,018 INFO step=142,384 | rew=8.39/-0.07 | pol=0.2210 val=1.8762 ent=0.4689 kl=0.5478 | 233sps  mv_ls=[-1.1998,-1.1997] g=1.10e-02  act: mv= 24 gp= 76 emv=100 spr= 83 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(152): 61%/39%
+2026-07-31 02:14:47,205 INFO Saved checkpoint: checkpoints/phase1_run47/checkpoint4.pt
+2026-07-31 02:14:48,124 INFO   [eval vs rules] step=142,384  win=4/10 (40%)  outcomes={'box_possession': 4, 'opponent_box_possession': 5, 'other': 1}
+2026-07-31 02:15:24,665 DEBUG [PPO UPDATE] step=150,480  n=97152  progress=0.836
+  old_log_prob: mean=-0.472  std=0.527  min=-10.714  max=0.052
+  returns:      mean=5.592  std=3.217  min=-3.012  max=11.058
+  advantages:   mean=-0.316  std=6.361  min=-21.745  max=15.923
+  values(old):  mean=5.908  std=5.798  min=-6.699  max=24.583
+  rewards:      mean=0.1624  std=1.2900  nonzero=97152/97152
+2026-07-31 02:15:24,678 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.405  new_lp=-0.828  diff=-0.423
+    ratio: mean=0.7101  std=0.2504  min=0.1527  max=1.0260
+    new_values=2.938  ret(mb)=5.292
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.378 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.551 kick_dir=-8.446
+    move_dir log_std=[-1.199785828590393, -1.199748158454895]
+    [move_dir] cur_norm=1.000  stored_norm=1.050  angle=-136.6deg
+2026-07-31 02:15:24,692 DEBUG   [e0 mb00]  grad=3.6  total=1.454  pol=0.320  val=2.364  kl=0.4233  mv_shift=0.000  mv_kl=0.0001  kk_shift=0.000
+2026-07-31 02:15:24,693 INFO   [early stop e0 mb0]  KL=0.42328 > target=0.4  steps_this_update=1
+2026-07-31 02:15:24,693 DEBUG   [epoch 0] kl=0.42328  t=28ms
+2026-07-31 02:15:24,693 INFO   [KL=0.4233 > 0.1] ratio percentiles:  p5=0.256  p25=0.529  p50=0.735  p75=1.000  p95=1.000  max=1.026
+  move_dir_log_std=[-1.199783444404602, -1.1997456550598145]  kick_dir_log_std=[-1.1996710300445557, -1.1996545791625977]
+2026-07-31 02:15:24,699 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.458  kick=-0.000  t_att=-0.000
+    move_dir=-0.456 (min=-6.915 max=0.559)  kick_dir=-0.498 (min=-5.986 max=0.556)
+  [worst sample] idx=164  ratio=2.655  old_lp=-0.225  new_lp=0.751
+    stored move_dir=179.9°  new_mean=179.4°  angular_diff=0.5°
+2026-07-31 02:15:24,723 INFO step=150,480 | rew=4.81/3.93 | pol=0.3203 val=2.3639 ent=0.4828 kl=0.4233 | 218sps  mv_ls=[-1.1998,-1.1997] g=1.04e-02  act: mv= 23 gp= 77 emv=100 spr= 81 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(163): 61%/36%
+2026-07-31 02:15:24,904 INFO Saved checkpoint: checkpoints/phase1_run47/checkpoint5.pt
+2026-07-31 02:15:25,897 INFO   [eval vs rules] step=150,480  win=1/10 (10%)  outcomes={'box_possession': 1, 'opponent_box_possession': 9}
+2026-07-31 02:16:01,842 DEBUG [PPO UPDATE] step=158,576  n=97152  progress=0.881
+  old_log_prob: mean=-0.461  std=0.522  min=-10.241  max=0.055
+  returns:      mean=5.948  std=3.170  min=-3.025  max=10.946
+  advantages:   mean=-0.219  std=6.558  min=-19.838  max=16.271
+  values(old):  mean=6.168  std=6.114  min=-7.223  max=25.491
+  rewards:      mean=0.1639  std=1.2884  nonzero=97152/97152
+2026-07-31 02:16:01,866 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.575  new_lp=-1.124  diff=-0.549
+    ratio: mean=0.6574  std=0.2965  min=0.1332  max=1.0045
+    new_values=3.015  ret(mb)=5.787
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.522 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.765 kick_dir=-11.264
+    move_dir log_std=[-1.199783444404602, -1.1997456550598145]
+    [move_dir] cur_norm=1.000  stored_norm=1.104  angle=-138.1deg
+2026-07-31 02:16:01,882 DEBUG   [e0 mb00]  grad=3.8  total=1.162  pol=0.246  val=1.926  kl=0.5486  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:16:01,882 INFO   [early stop e0 mb0]  KL=0.54855 > target=0.4  steps_this_update=1
+2026-07-31 02:16:01,883 DEBUG   [epoch 0] kl=0.54855  t=40ms
+2026-07-31 02:16:01,883 INFO   [KL=0.5486 > 0.1] ratio percentiles:  p5=0.237  p25=0.388  p50=0.659  p75=1.000  p95=1.000  max=1.005
+  move_dir_log_std=[-1.199781060218811, -1.1997431516647339]  kick_dir_log_std=[-1.1996676921844482, -1.1996515989303589]
+2026-07-31 02:16:01,890 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.428  kick=-0.000  t_att=-0.000
+    move_dir=-0.454 (min=-3.999 max=0.561)  kick_dir=-0.339 (min=-4.285 max=0.559)
+  [worst sample] idx=216  ratio=2.709  old_lp=-0.222  new_lp=0.775
+    stored move_dir=-171.1°  new_mean=-173.2°  angular_diff=2.2°
+2026-07-31 02:16:01,912 INFO step=158,576 | rew=7.94/-0.18 | pol=0.2456 val=1.9262 ent=0.4643 kl=0.5486 | 221sps  mv_ls=[-1.1998,-1.1997] g=5.36e-03  act: mv= 25 gp= 75 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(157): 66%/34%
+2026-07-31 02:16:02,098 INFO Saved checkpoint: checkpoints/phase1_run47/checkpoint6.pt
+2026-07-31 02:16:02,958 INFO   [eval vs rules] step=158,576  win=4/10 (40%)  outcomes={'box_possession': 4, 'opponent_box_possession': 6}
+2026-07-31 02:16:37,195 DEBUG [PPO UPDATE] step=166,672  n=97152  progress=0.926
+  old_log_prob: mean=-0.458  std=0.530  min=-10.784  max=0.056
+  returns:      mean=5.917  std=3.138  min=-3.097  max=10.899
+  advantages:   mean=-0.161  std=6.462  min=-20.415  max=16.540
+  values(old):  mean=6.078  std=5.962  min=-6.828  max=23.363
+  rewards:      mean=0.1651  std=1.2889  nonzero=97152/97152
+2026-07-31 02:16:37,211 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.470  new_lp=-0.866  diff=-0.396
+    ratio: mean=0.7272  std=0.2583  min=0.2013  max=1.1057
+    new_values=2.701  ret(mb)=5.380
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.445 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.226 kick_dir=-8.207
+    move_dir log_std=[-1.199781060218811, -1.1997431516647339]
+    [move_dir] cur_norm=1.000  stored_norm=1.068  angle=16.2deg
+2026-07-31 02:16:37,227 DEBUG   [e0 mb00]  grad=4.6  total=1.380  pol=0.198  val=2.459  kl=0.3961  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:16:37,249 DEBUG   [e0 mb01]  grad=2.9  total=1.328  pol=0.356  val=2.029  kl=0.4544  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:16:37,249 INFO   [early stop e0 mb1]  KL=0.45438 > target=0.4  steps_this_update=2
+2026-07-31 02:16:37,249 DEBUG   [epoch 0] kl=0.42522  t=54ms
+2026-07-31 02:16:37,250 INFO   [KL=0.4252 > 0.1] ratio percentiles:  p5=0.285  p25=0.481  p50=0.729  p75=0.993  p95=1.000  max=1.106
+  move_dir_log_std=[-1.19977605342865, -1.1997385025024414]  kick_dir_log_std=[-1.199661135673523, -1.1996458768844604]
+2026-07-31 02:16:37,257 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.378  kick=-0.000  t_att=-0.000
+    move_dir=-0.467 (min=-4.563 max=0.561)  kick_dir=-0.358 (min=-6.318 max=0.558)
+  [worst sample] idx=177  ratio=2.620  old_lp=-1.410  new_lp=-0.447
+    stored move_dir=113.3°  new_mean=109.1°  angular_diff=4.2°
+2026-07-31 02:16:37,284 INFO step=166,672 | rew=6.30/1.91 | pol=0.2768 val=2.2442 ent=0.4485 kl=0.4252 | 233sps  mv_ls=[-1.1998,-1.1997] g=6.76e-03  act: mv= 24 gp= 76 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(160): 68%/32%
+2026-07-31 02:16:37,474 INFO Saved checkpoint: checkpoints/phase1_run47/checkpoint7.pt
+2026-07-31 02:16:38,554 INFO   [eval vs rules] step=166,672  win=3/10 (30%)  outcomes={'opponent_box_possession': 7, 'box_possession': 3}
+2026-07-31 02:17:12,969 DEBUG [PPO UPDATE] step=174,768  n=97152  progress=0.971
+  old_log_prob: mean=-0.463  std=0.516  min=-8.790  max=0.056
+  returns:      mean=5.653  std=3.238  min=-3.116  max=10.975
+  advantages:   mean=-0.449  std=6.600  min=-25.655  max=16.647
+  values(old):  mean=6.102  std=6.026  min=-6.683  max=24.336
+  rewards:      mean=0.1589  std=1.2702  nonzero=97152/97152
+2026-07-31 02:17:12,975 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.466  new_lp=-0.817  diff=-0.350
+    ratio: mean=0.7540  std=0.2503  min=0.2443  max=1.0089
+    new_values=2.298  ret(mb)=5.553
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.429 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.505 kick_dir=-7.251
+    move_dir log_std=[-1.19977605342865, -1.1997385025024414]
+    [move_dir] cur_norm=1.000  stored_norm=1.052  angle=77.6deg
+2026-07-31 02:17:12,990 DEBUG   [e0 mb00]  grad=4.9  total=1.313  pol=0.070  val=2.586  kl=0.3504  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:17:13,009 DEBUG   [e0 mb01]  grad=5.3  total=1.442  pol=0.094  val=2.789  kl=0.3517  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:17:13,028 DEBUG   [e0 mb02]  grad=4.6  total=1.436  pol=0.194  val=2.582  kl=0.4711  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:17:13,028 INFO   [early stop e0 mb2]  KL=0.47112 > target=0.4  steps_this_update=3
+2026-07-31 02:17:13,028 DEBUG   [epoch 0] kl=0.39105  t=60ms
+2026-07-31 02:17:13,029 INFO   [KL=0.3911 > 0.1] ratio percentiles:  p5=0.294  p25=0.497  p50=0.767  p75=1.000  p95=1.000  max=1.163
+  move_dir_log_std=[-1.1997689008712769, -1.199731469154358]  kick_dir_log_std=[-1.1996519565582275, -1.1996371746063232]
+2026-07-31 02:17:13,038 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.478  kick=-0.000  t_att=-0.000
+    move_dir=-0.383 (min=-5.109 max=0.561)  kick_dir=-0.476 (min=-5.713 max=0.553)
+  [worst sample] idx=77  ratio=2.809  old_lp=-0.221  new_lp=0.812
+    stored move_dir=-85.1°  new_mean=-86.0°  angular_diff=0.9°
+2026-07-31 02:17:13,068 INFO step=174,768 | rew=6.62/1.60 | pol=0.1192 val=2.6525 ent=0.4825 kl=0.3911 | 230sps  mv_ls=[-1.1998,-1.1997] g=8.28e-03  act: mv= 24 gp= 75 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(156): 59%/38%
+2026-07-31 02:17:13,268 INFO Saved checkpoint: checkpoints/phase1_run47/checkpoint8.pt
+2026-07-31 02:17:14,511 INFO   [eval vs rules] step=174,768  win=3/10 (30%)  outcomes={'opponent_box_possession': 7, 'box_possession': 3}
+2026-07-31 02:17:48,726 INFO Saved checkpoint: checkpoints/phase1_run47/checkpoint9.pt
+2026-07-31 02:17:48,727 INFO Final checkpoint saved.
+2026-07-31 02:17:48,727 INFO Training complete. Total steps: 180,000
+2026-07-31 02:21:34,034 INFO Checkpoint dir: checkpoints/phase1_run48
+2026-07-31 02:21:34,047 INFO Starting training: phase=phase1_get_possession, total_steps=220,000
+2026-07-31 02:21:34,047 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
+2026-07-31 02:21:35,380 INFO Loaded checkpoint: checkpoints/phase1_run47/checkpoint9.pt (step 180000)
+2026-07-31 02:21:35,381 INFO Loaded pre-trained checkpoint: checkpoints/phase1_run47/checkpoint9.pt — skipping BC/value pre-training
+2026-07-31 02:21:36,636 INFO   [neural] trial 10/40: outcome=opponent_box_possession, reward=-2.09
+2026-07-31 02:21:37,319 INFO   [neural] trial 20/40: outcome=opponent_box_possession, reward=-2.22
+2026-07-31 02:21:38,381 INFO   [neural] trial 30/40: outcome=opponent_box_possession, reward=-2.10
+2026-07-31 02:21:39,068 INFO   [neural] trial 40/40: outcome=opponent_box_possession, reward=-1.74
+2026-07-31 02:21:39,068 INFO Pre-PPO eval (rules opp): win=22.5%  mean_rew=0.718  outcomes={'opponent_box_possession': 30, 'box_possession': 9, 'miss': 1}
+2026-07-31 02:21:40,522 INFO   [neural] trial 10/40: outcome=box_possession, reward=7.62
+2026-07-31 02:21:41,628 INFO   [neural] trial 20/40: outcome=box_possession, reward=9.51
+2026-07-31 02:21:43,088 INFO   [neural] trial 30/40: outcome=box_possession, reward=11.38
+2026-07-31 02:21:44,517 INFO   [neural] trial 40/40: outcome=box_possession, reward=10.28
+2026-07-31 02:21:44,518 INFO Pre-PPO eval (immobile opp): win=97.5%  mean_rew=10.212  outcomes={'box_possession': 39, 'miss': 1}
+2026-07-31 02:21:44,625 INFO   [baseline] trial 10/12: outcome=box_possession
+2026-07-31 02:21:44,635 INFO Baseline (rules vs rules, 12 trials): trainee_win=91.7%  outcomes={'box_possession': 11, 'opponent_box_possession': 1}
+2026-07-31 02:21:44,635 INFO Frozen decision_net.shoot_logit
+2026-07-31 02:21:44,635 INFO Frozen decision_net.pass_logit
+2026-07-31 02:21:44,635 INFO Frozen decision_net.tackle_logit
+2026-07-31 02:21:44,635 INFO Frozen decision_net.get_possession_raw
+2026-07-31 02:21:44,635 INFO Frozen decision_net.mark_logit
+2026-07-31 02:21:44,635 INFO Frozen decision_net.hold_position_logit
+2026-07-31 02:21:44,635 INFO Frozen decision_net.pass_target_logits
+2026-07-31 02:21:44,635 INFO Frozen decision_net.tackle_target_logits
+2026-07-31 02:21:44,635 INFO Frozen decision_net.mark_target_logits
+2026-07-31 02:21:44,636 INFO PPO training started: steps_so_far=180,000  target=400,000  (+220,000 this run)
+2026-07-31 02:22:17,728 DEBUG [PPO UPDATE] step=188,096  n=97152  progress=0.855
+  old_log_prob: mean=-0.466  std=0.521  min=-10.727  max=0.054
+  returns:      mean=5.438  std=3.235  min=-3.082  max=10.720
+  advantages:   mean=-0.547  std=6.278  min=-22.232  max=16.211
+  values(old):  mean=5.985  std=5.774  min=-6.047  max=24.121
+  rewards:      mean=0.1520  std=1.2402  nonzero=97152/97152
+2026-07-31 02:22:17,734 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.523  new_lp=-0.931  diff=-0.408
+    ratio: mean=0.7307  std=0.2773  min=0.2122  max=1.0566
+    new_values=2.517  ret(mb)=5.056
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.492 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.381 kick_dir=-8.403
+    move_dir log_std=[-1.1997689008712769, -1.199731469154358]
+    [move_dir] cur_norm=1.000  stored_norm=1.035  angle=107.7deg
+2026-07-31 02:22:17,752 DEBUG   [e0 mb00]  grad=3.6  total=1.143  pol=0.093  val=2.206  kl=0.4081  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:22:17,752 INFO   [early stop e0 mb0]  KL=0.40809 > target=0.4  steps_this_update=1
+2026-07-31 02:22:17,752 DEBUG   [epoch 0] kl=0.40809  t=24ms
+2026-07-31 02:22:17,752 INFO   [KL=0.4081 > 0.1] ratio percentiles:  p5=0.265  p25=0.467  p50=0.828  p75=1.000  p95=1.001  max=1.057
+  move_dir_log_std=[-1.1997663974761963, -1.1997289657592773]  kick_dir_log_std=[-1.1996490955352783, -1.199634313583374]
+2026-07-31 02:22:17,761 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.384  kick=-0.000  t_att=-0.000
+    move_dir=-0.406 (min=-6.134 max=0.555)  kick_dir=-0.438 (min=-5.466 max=0.557)
+  [worst sample] idx=43  ratio=2.601  old_lp=-1.291  new_lp=-0.335
+    stored move_dir=8.4°  new_mean=4.9°  angular_diff=3.5°
+2026-07-31 02:22:17,787 INFO step=188,096 | rew=1.32/6.91 | pol=0.0929 val=2.2064 ent=0.5293 kl=0.4081 | 248sps  mv_ls=[-1.1998,-1.1997] g=9.99e-03  act: mv= 22 gp= 78 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(151): 60%/38%
+2026-07-31 02:22:17,969 INFO Saved checkpoint: checkpoints/phase1_run48/checkpoint1.pt
+2026-07-31 02:22:18,933 INFO   [eval vs rules] step=188,096  win=4/10 (40%)  outcomes={'opponent_box_possession': 6, 'box_possession': 4}
+2026-07-31 02:22:50,747 DEBUG [PPO UPDATE] step=196,192  n=97152  progress=0.892
+  old_log_prob: mean=-0.466  std=0.511  min=-8.685  max=0.054
+  returns:      mean=5.533  std=3.248  min=-3.173  max=13.839
+  advantages:   mean=-0.472  std=6.451  min=-22.417  max=15.899
+  values(old):  mean=6.005  std=5.935  min=-6.020  max=25.045
+  rewards:      mean=0.1568  std=1.2603  nonzero=97152/97152
+2026-07-31 02:22:50,754 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.513  new_lp=-0.988  diff=-0.475
+    ratio: mean=0.6900  std=0.2850  min=0.2130  max=1.0456
+    new_values=2.765  ret(mb)=5.248
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.463 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.528 kick_dir=-9.963
+    move_dir log_std=[-1.1997663974761963, -1.1997289657592773]
+    [move_dir] cur_norm=1.000  stored_norm=1.082  angle=122.5deg
+2026-07-31 02:22:50,772 DEBUG   [e0 mb00]  grad=3.8  total=1.247  pol=0.153  val=2.288  kl=0.4746  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:22:50,773 INFO   [early stop e0 mb0]  KL=0.47461 > target=0.4  steps_this_update=1
+2026-07-31 02:22:50,773 DEBUG   [epoch 0] kl=0.47461  t=25ms
+2026-07-31 02:22:50,773 INFO   [KL=0.4746 > 0.1] ratio percentiles:  p5=0.244  p25=0.449  p50=0.653  p75=1.000  p95=1.030  max=1.046
+  move_dir_log_std=[-1.1997642517089844, -1.1997263431549072]  kick_dir_log_std=[-1.1996461153030396, -1.1996314525604248]
+2026-07-31 02:22:50,780 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.388  kick=-0.000  t_att=-0.000
+    move_dir=-0.396 (min=-4.546 max=0.557)  kick_dir=-0.428 (min=-3.848 max=0.560)
+  [worst sample] idx=183  ratio=2.580  old_lp=0.050  new_lp=0.998
+    stored move_dir=23.2°  new_mean=17.7°  angular_diff=5.6°
+2026-07-31 02:22:50,809 INFO step=196,192 | rew=6.58/1.03 | pol=0.1534 val=2.2877 ent=0.4979 kl=0.4746 | 249sps  mv_ls=[-1.1998,-1.1997] g=7.62e-03  act: mv= 23 gp= 77 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(154): 59%/39%
+2026-07-31 02:22:51,004 INFO Saved checkpoint: checkpoints/phase1_run48/checkpoint2.pt
+2026-07-31 02:22:51,748 INFO   [eval vs rules] step=196,192  win=3/10 (30%)  outcomes={'opponent_box_possession': 7, 'box_possession': 3}
+2026-07-31 02:23:23,249 DEBUG [PPO UPDATE] step=204,288  n=97152  progress=0.929
+  old_log_prob: mean=-0.471  std=0.520  min=-10.364  max=0.055
+  returns:      mean=5.209  std=3.113  min=-2.788  max=10.910
+  advantages:   mean=-0.789  std=6.156  min=-23.749  max=16.676
+  values(old):  mean=5.998  std=5.593  min=-6.719  max=24.368
+  rewards:      mean=0.1426  std=1.1914  nonzero=97152/97152
+2026-07-31 02:23:23,268 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.502  new_lp=-0.906  diff=-0.404
+    ratio: mean=0.7297  std=0.2706  min=0.2006  max=1.0309
+    new_values=3.032  ret(mb)=4.463
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.468 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.526 kick_dir=-8.228
+    move_dir log_std=[-1.1997642517089844, -1.1997263431549072]
+    [move_dir] cur_norm=1.000  stored_norm=1.061  angle=-50.8deg
+2026-07-31 02:23:23,286 DEBUG   [e0 mb00]  grad=2.9  total=1.256  pol=0.216  val=2.175  kl=0.4044  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:23:23,286 INFO   [early stop e0 mb0]  KL=0.40438 > target=0.4  steps_this_update=1
+2026-07-31 02:23:23,286 DEBUG   [epoch 0] kl=0.40438  t=37ms
+2026-07-31 02:23:23,287 INFO   [KL=0.4044 > 0.1] ratio percentiles:  p5=0.259  p25=0.498  p50=0.809  p75=1.000  p95=1.000  max=1.031
+  move_dir_log_std=[-1.1997621059417725, -1.1997231245040894]  kick_dir_log_std=[-1.1996430158615112, -1.199628472328186]
+2026-07-31 02:23:23,296 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.412  kick=-0.000  t_att=-0.000
+    move_dir=-0.503 (min=-5.100 max=0.558)  kick_dir=-0.452 (min=-5.533 max=0.560)
+  [worst sample] idx=122  ratio=8194.974  old_lp=-10.364  new_lp=-1.353
+    stored move_dir=-168.5°  new_mean=155.3°  angular_diff=36.3°
+2026-07-31 02:23:23,316 INFO step=204,288 | rew=6.42/2.44 | pol=0.2163 val=2.1747 ent=0.4752 kl=0.4044 | 254sps  mv_ls=[-1.1998,-1.1997] g=1.39e-02  act: mv= 23 gp= 77 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(142): 52%/45%
+2026-07-31 02:23:23,506 INFO Saved checkpoint: checkpoints/phase1_run48/checkpoint3.pt
+2026-07-31 02:23:24,601 INFO   [eval vs rules] step=204,288  win=4/10 (40%)  outcomes={'opponent_box_possession': 6, 'box_possession': 4}
+2026-07-31 02:23:57,488 DEBUG [PPO UPDATE] step=212,384  n=97152  progress=0.965
+  old_log_prob: mean=-0.459  std=0.515  min=-10.828  max=0.054
+  returns:      mean=5.020  std=3.242  min=-2.924  max=11.180
+  advantages:   mean=-1.109  std=6.407  min=-19.602  max=16.195
+  values(old):  mean=6.129  std=5.756  min=-6.436  max=24.852
+  rewards:      mean=0.1567  std=1.2505  nonzero=97152/97152
+2026-07-31 02:23:57,506 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.481  new_lp=-0.900  diff=-0.419
+    ratio: mean=0.7255  std=0.2819  min=0.1603  max=1.0938
+    new_values=3.017  ret(mb)=5.064
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.433 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.465 kick_dir=-8.867
+    move_dir log_std=[-1.1997621059417725, -1.1997231245040894]
+    [move_dir] cur_norm=1.000  stored_norm=0.981  angle=38.5deg
+2026-07-31 02:23:57,522 DEBUG   [e0 mb00]  grad=3.6  total=1.221  pol=0.029  val=2.479  kl=0.4194  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:23:57,522 INFO   [early stop e0 mb0]  KL=0.41940 > target=0.4  steps_this_update=1
+2026-07-31 02:23:57,522 DEBUG   [epoch 0] kl=0.41940  t=34ms
+2026-07-31 02:23:57,523 INFO   [KL=0.4194 > 0.1] ratio percentiles:  p5=0.272  p25=0.515  p50=0.671  p75=1.000  p95=1.019  max=1.094
+  move_dir_log_std=[-1.199759840965271, -1.1997205018997192]  kick_dir_log_std=[-1.1996396780014038, -1.1996254920959473]
+2026-07-31 02:23:57,530 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.398  kick=-0.000  t_att=-0.000
+    move_dir=-0.397 (min=-5.250 max=0.555)  kick_dir=-0.471 (min=-6.111 max=0.552)
+  [worst sample] idx=231  ratio=2.679  old_lp=-0.235  new_lp=0.750
+    stored move_dir=173.1°  new_mean=174.4°  angular_diff=1.3°
+2026-07-31 02:23:57,552 INFO step=212,384 | rew=5.15/2.96 | pol=0.0294 val=2.4790 ent=0.4825 kl=0.4194 | 241sps  mv_ls=[-1.1998,-1.1997] g=7.36e-03  act: mv= 23 gp= 77 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(156): 47%/51%
+2026-07-31 02:23:57,744 INFO Saved checkpoint: checkpoints/phase1_run48/checkpoint4.pt
+2026-07-31 02:23:58,620 INFO   [eval vs rules] step=212,384  win=2/10 (20%)  outcomes={'opponent_box_possession': 8, 'box_possession': 2}
+2026-07-31 02:24:27,788 INFO Saved checkpoint: checkpoints/phase1_run48/checkpoint5.pt
+2026-07-31 02:24:27,788 INFO Final checkpoint saved.
+2026-07-31 02:24:27,788 INFO Training complete. Total steps: 220,000
+2026-07-31 02:25:41,115 INFO Checkpoint dir: checkpoints/phase1_run49
+2026-07-31 02:25:41,127 INFO Starting training: phase=phase1_get_possession, total_steps=280,000
+2026-07-31 02:25:41,127 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
+2026-07-31 02:25:42,384 INFO Loaded checkpoint: checkpoints/phase1_run47/checkpoint9.pt (step 180000)
+2026-07-31 02:25:42,384 INFO Loaded pre-trained checkpoint: checkpoints/phase1_run47/checkpoint9.pt — skipping BC/value pre-training
+2026-07-31 02:25:43,467 INFO   [neural] trial 10/40: outcome=opponent_box_possession, reward=-2.01
+2026-07-31 02:25:44,406 INFO   [neural] trial 20/40: outcome=opponent_box_possession, reward=-2.00
+2026-07-31 02:25:45,406 INFO   [neural] trial 30/40: outcome=box_possession, reward=15.03
+2026-07-31 02:25:46,489 INFO   [neural] trial 40/40: outcome=opponent_box_possession, reward=-2.00
+2026-07-31 02:25:46,489 INFO Pre-PPO eval (rules opp): win=30.0%  mean_rew=2.789  outcomes={'opponent_box_possession': 28, 'box_possession': 12}
+2026-07-31 02:25:48,158 INFO   [neural] trial 10/40: outcome=box_possession, reward=14.89
+2026-07-31 02:25:48,977 INFO   [neural] trial 20/40: outcome=box_possession, reward=11.15
+2026-07-31 02:25:50,617 INFO   [neural] trial 30/40: outcome=box_possession, reward=12.71
+2026-07-31 02:25:52,521 INFO   [neural] trial 40/40: outcome=box_possession, reward=14.05
+2026-07-31 02:25:52,522 INFO Pre-PPO eval (immobile opp): win=97.5%  mean_rew=12.794  outcomes={'box_possession': 39, 'miss': 1}
+2026-07-31 02:25:52,588 INFO   [baseline] trial 10/12: outcome=box_possession
+2026-07-31 02:25:52,614 INFO Baseline (rules vs rules, 12 trials): trainee_win=91.7%  outcomes={'box_possession': 11, 'opponent_box_possession': 1}
+2026-07-31 02:25:52,614 INFO Frozen decision_net.shoot_logit
+2026-07-31 02:25:52,614 INFO Frozen decision_net.pass_logit
+2026-07-31 02:25:52,614 INFO Frozen decision_net.tackle_logit
+2026-07-31 02:25:52,614 INFO Frozen decision_net.get_possession_raw
+2026-07-31 02:25:52,614 INFO Frozen decision_net.mark_logit
+2026-07-31 02:25:52,614 INFO Frozen decision_net.hold_position_logit
+2026-07-31 02:25:52,614 INFO Frozen decision_net.pass_target_logits
+2026-07-31 02:25:52,614 INFO Frozen decision_net.tackle_target_logits
+2026-07-31 02:25:52,614 INFO Frozen decision_net.mark_target_logits
+2026-07-31 02:25:52,615 INFO PPO training started: steps_so_far=180,000  target=460,000  (+280,000 this run)
+2026-07-31 02:26:30,907 DEBUG [PPO UPDATE] step=188,096  n=97152  progress=0.672
+  old_log_prob: mean=-0.452  std=0.497  min=-6.369  max=0.053
+  returns:      mean=6.186  std=4.008  min=-2.091  max=14.987
+  advantages:   mean=-0.006  std=6.926  min=-22.819  max=19.593
+  values(old):  mean=6.192  std=5.941  min=-6.817  max=23.254
+  rewards:      mean=0.2171  std=1.7619  nonzero=97152/97152
+2026-07-31 02:26:30,913 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.520  new_lp=-0.912  diff=-0.392
+    ratio: mean=0.7343  std=0.2708  min=0.2397  max=1.0821
+    new_values=2.484  ret(mb)=5.972
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.473 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.531 kick_dir=-8.244
+    move_dir log_std=[-1.1997689008712769, -1.199731469154358]
+    [move_dir] cur_norm=1.000  stored_norm=1.017  angle=-122.6deg
+2026-07-31 02:26:30,931 DEBUG   [e0 mb00]  grad=3.4  total=1.005  pol=0.031  val=2.055  kl=0.3922  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:26:30,952 DEBUG   [e0 mb01]  grad=2.3  total=1.238  pol=0.221  val=2.115  kl=0.4465  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:26:30,952 INFO   [early stop e0 mb1]  KL=0.44649 > target=0.4  steps_this_update=2
+2026-07-31 02:26:30,952 DEBUG   [epoch 0] kl=0.41937  t=45ms
+2026-07-31 02:26:30,953 INFO   [KL=0.4194 > 0.1] ratio percentiles:  p5=0.272  p25=0.457  p50=0.747  p75=1.000  p95=1.000  max=1.082
+  move_dir_log_std=[-1.1997634172439575, -1.1997263431549072]  kick_dir_log_std=[-1.1996458768844604, -1.1996312141418457]
+2026-07-31 02:26:30,960 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.383  kick=-0.000  t_att=-0.000
+    move_dir=-0.445 (min=-6.134 max=0.555)  kick_dir=-0.453 (min=-5.419 max=0.557)
+  [worst sample] idx=17  ratio=2.564  old_lp=-0.179  new_lp=0.762
+    stored move_dir=58.5°  new_mean=60.4°  angular_diff=1.8°
+2026-07-31 02:26:30,988 INFO step=188,096 | rew=8.26/2.65 | pol=0.1259 val=2.0852 ent=0.4681 kl=0.4194 | 213sps  mv_ls=[-1.1998,-1.1997] g=1.01e-02  act: mv= 25 gp= 75 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(157): 59%/40%
+2026-07-31 02:26:31,165 INFO Saved checkpoint: checkpoints/phase1_run49/checkpoint1.pt
+2026-07-31 02:26:32,101 INFO   [eval vs rules] step=188,096  win=4/10 (40%)  outcomes={'box_possession': 4, 'opponent_box_possession': 6}
+2026-07-31 02:27:15,706 INFO Checkpoint dir: checkpoints/phase1_run50
+2026-07-31 02:27:15,716 INFO Starting training: phase=phase1_get_possession, total_steps=280,000
+2026-07-31 02:27:15,716 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
+2026-07-31 02:27:16,828 INFO Loaded checkpoint: checkpoints/phase1_run48/checkpoint5.pt (step 220000)
+2026-07-31 02:27:16,829 INFO Loaded pre-trained checkpoint: checkpoints/phase1_run48/checkpoint5.pt — skipping BC/value pre-training
+2026-07-31 02:27:17,649 INFO   [neural] trial 10/40: outcome=box_possession, reward=14.94
+2026-07-31 02:27:18,417 INFO   [neural] trial 20/40: outcome=box_possession, reward=13.11
+2026-07-31 02:27:19,441 INFO   [neural] trial 30/40: outcome=opponent_box_possession, reward=-2.00
+2026-07-31 02:27:20,329 INFO   [neural] trial 40/40: outcome=box_possession, reward=15.02
+2026-07-31 02:27:20,330 INFO Pre-PPO eval (rules opp): win=52.5%  mean_rew=6.448  outcomes={'box_possession': 21, 'opponent_box_possession': 19}
+2026-07-31 02:27:21,406 INFO   [neural] trial 10/40: outcome=box_possession, reward=14.55
+2026-07-31 02:27:22,873 INFO   [neural] trial 20/40: outcome=box_possession, reward=10.69
+2026-07-31 02:27:24,057 INFO   [neural] trial 30/40: outcome=box_possession, reward=12.26
+2026-07-31 02:27:25,473 INFO   [neural] trial 40/40: outcome=box_possession, reward=12.63
+2026-07-31 02:27:25,473 INFO Pre-PPO eval (immobile opp): win=97.5%  mean_rew=12.832  outcomes={'box_possession': 39, 'miss': 1}
+2026-07-31 02:27:25,541 INFO   [baseline] trial 10/12: outcome=box_possession
+2026-07-31 02:27:25,553 INFO Baseline (rules vs rules, 12 trials): trainee_win=100.0%  outcomes={'box_possession': 12}
+2026-07-31 02:27:25,554 INFO Frozen decision_net.shoot_logit
+2026-07-31 02:27:25,554 INFO Frozen decision_net.pass_logit
+2026-07-31 02:27:25,554 INFO Frozen decision_net.tackle_logit
+2026-07-31 02:27:25,554 INFO Frozen decision_net.get_possession_raw
+2026-07-31 02:27:25,554 INFO Frozen decision_net.mark_logit
+2026-07-31 02:27:25,554 INFO Frozen decision_net.hold_position_logit
+2026-07-31 02:27:25,554 INFO Frozen decision_net.pass_target_logits
+2026-07-31 02:27:25,554 INFO Frozen decision_net.tackle_target_logits
+2026-07-31 02:27:25,554 INFO Frozen decision_net.mark_target_logits
+2026-07-31 02:27:25,555 INFO PPO training started: steps_so_far=220,000  target=500,000  (+280,000 this run)
+2026-07-31 02:27:52,241 DEBUG [PPO UPDATE] step=228,096  n=97152  progress=0.815
+  old_log_prob: mean=-0.458  std=0.514  min=-10.868  max=0.055
+  returns:      mean=6.475  std=3.978  min=-2.110  max=14.880
+  advantages:   mean=0.452  std=6.814  min=-23.820  max=19.720
+  values(old):  mean=6.023  std=5.944  min=-6.330  max=24.356
+  rewards:      mean=0.2127  std=1.7480  nonzero=97152/97152
+2026-07-31 02:27:52,247 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.482  new_lp=-0.865  diff=-0.383
+    ratio: mean=0.7256  std=0.2387  min=0.3328  max=1.0046
+    new_values=3.143  ret(mb)=7.751
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.443 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.395 kick_dir=-8.029
+    move_dir log_std=[-1.199759840965271, -1.1997205018997192]
+    [move_dir] cur_norm=1.000  stored_norm=1.051  angle=-146.2deg
+2026-07-31 02:27:52,265 DEBUG   [e0 mb00]  grad=4.0  total=1.206  pol=0.098  val=2.310  kl=0.3831  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:27:52,284 DEBUG   [e0 mb01]  grad=2.5  total=1.297  pol=0.413  val=1.855  kl=0.4424  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:27:52,284 INFO   [early stop e0 mb1]  KL=0.44243 > target=0.4  steps_this_update=2
+2026-07-31 02:27:52,285 DEBUG   [epoch 0] kl=0.41275  t=43ms
+2026-07-31 02:27:52,285 INFO   [KL=0.4128 > 0.1] ratio percentiles:  p5=0.334  p25=0.465  p50=0.705  p75=1.000  p95=1.001  max=1.135
+  move_dir_log_std=[-1.1997549533843994, -1.1997151374816895]  kick_dir_log_std=[-1.199633240699768, -1.1996195316314697]
+2026-07-31 02:27:52,292 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.487  kick=-0.000  t_att=-0.000
+    move_dir=-0.323 (min=-5.492 max=0.558)  kick_dir=-0.346 (min=-4.688 max=0.559)
+  [worst sample] idx=225  ratio=2.725  old_lp=-1.402  new_lp=-0.399
+    stored move_dir=26.3°  new_mean=27.5°  angular_diff=1.2°
+2026-07-31 02:27:52,318 INFO step=228,096 | rew=8.87/1.97 | pol=0.2557 val=2.0824 ent=0.4500 kl=0.4128 | 307sps  mv_ls=[-1.1998,-1.1997] g=8.73e-03  act: mv= 23 gp= 77 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(157): 64%/32%
+2026-07-31 02:27:52,491 INFO Saved checkpoint: checkpoints/phase1_run50/checkpoint1.pt
+2026-07-31 02:27:53,038 INFO   [eval vs rules] step=228,096  win=4/10 (40%)  outcomes={'box_possession': 4, 'opponent_box_possession': 6}
+2026-07-31 02:28:21,812 DEBUG [PPO UPDATE] step=236,192  n=97152  progress=0.844
+  old_log_prob: mean=-0.471  std=0.535  min=-10.539  max=0.055
+  returns:      mean=6.508  std=4.033  min=-2.161  max=15.121
+  advantages:   mean=0.559  std=6.821  min=-25.452  max=20.420
+  values(old):  mean=5.949  std=5.948  min=-6.519  max=24.367
+  rewards:      mean=0.2289  std=1.8199  nonzero=97152/97152
+2026-07-31 02:28:21,820 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.417  new_lp=-0.890  diff=-0.473
+    ratio: mean=0.6921  std=0.2783  min=0.1540  max=1.0510
+    new_values=3.006  ret(mb)=7.720
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.379 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.403 kick_dir=-9.815
+    move_dir log_std=[-1.1997549533843994, -1.1997151374816895]
+    [move_dir] cur_norm=1.000  stored_norm=1.009  angle=8.3deg
+2026-07-31 02:28:21,840 DEBUG   [e0 mb00]  grad=3.9  total=1.362  pol=0.130  val=2.558  kl=0.4725  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:28:21,840 INFO   [early stop e0 mb0]  KL=0.47251 > target=0.4  steps_this_update=1
+2026-07-31 02:28:21,840 DEBUG   [epoch 0] kl=0.47251  t=28ms
+2026-07-31 02:28:21,841 INFO   [KL=0.4725 > 0.1] ratio percentiles:  p5=0.239  p25=0.463  p50=0.707  p75=1.000  p95=1.000  max=1.051
+  move_dir_log_std=[-1.1997528076171875, -1.1997119188308716]  kick_dir_log_std=[-1.1996301412582397, -1.1996164321899414]
+2026-07-31 02:28:21,848 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.407  kick=-0.000  t_att=-0.000
+    move_dir=-0.524 (min=-4.546 max=0.557)  kick_dir=-0.415 (min=-4.077 max=0.561)
+  [worst sample] idx=145  ratio=2.849  old_lp=-0.226  new_lp=0.821
+    stored move_dir=-20.2°  new_mean=-18.5°  angular_diff=1.7°
+2026-07-31 02:28:21,875 INFO step=236,192 | rew=7.93/3.36 | pol=0.1303 val=2.5578 ent=0.4753 kl=0.4725 | 279sps  mv_ls=[-1.1998,-1.1997] g=1.63e-02  act: mv= 23 gp= 77 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(169): 64%/33%
+2026-07-31 02:28:22,085 INFO Saved checkpoint: checkpoints/phase1_run50/checkpoint2.pt
+2026-07-31 02:28:22,910 INFO   [eval vs rules] step=236,192  win=3/10 (30%)  outcomes={'opponent_box_possession': 7, 'box_possession': 3}
+2026-07-31 02:28:53,524 DEBUG [PPO UPDATE] step=244,288  n=97152  progress=0.872
+  old_log_prob: mean=-0.467  std=0.526  min=-12.389  max=0.055
+  returns:      mean=6.053  std=3.981  min=-2.108  max=15.063
+  advantages:   mean=0.025  std=6.787  min=-22.718  max=18.609
+  values(old):  mean=6.028  std=5.955  min=-6.618  max=25.979
+  rewards:      mean=0.2057  std=1.7201  nonzero=97152/97152
+2026-07-31 02:28:53,529 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.472  new_lp=-0.870  diff=-0.398
+    ratio: mean=0.7194  std=0.2503  min=0.3251  max=1.1772
+    new_values=3.208  ret(mb)=5.822
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.423 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.455 kick_dir=-8.490
+    move_dir log_std=[-1.1997528076171875, -1.1997119188308716]
+    [move_dir] cur_norm=1.000  stored_norm=1.061  angle=-53.0deg
+2026-07-31 02:28:53,543 DEBUG   [e0 mb00]  grad=3.1  total=1.132  pol=0.231  val=1.894  kl=0.3974  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:28:53,569 DEBUG   [e0 mb01]  grad=3.1  total=1.164  pol=0.118  val=2.187  kl=0.4787  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:28:53,569 INFO   [early stop e0 mb1]  KL=0.47872 > target=0.4  steps_this_update=2
+2026-07-31 02:28:53,569 DEBUG   [epoch 0] kl=0.43806  t=45ms
+2026-07-31 02:28:53,570 INFO   [KL=0.4381 > 0.1] ratio percentiles:  p5=0.290  p25=0.451  p50=0.707  p75=0.967  p95=1.000  max=1.177
+  move_dir_log_std=[-1.199748158454895, -1.1997056007385254]  kick_dir_log_std=[-1.1996241807937622, -1.1996099948883057]
+2026-07-31 02:28:53,578 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.428  kick=-0.000  t_att=-0.000
+    move_dir=-0.403 (min=-5.192 max=0.558)  kick_dir=-0.425 (min=-5.509 max=0.560)
+  [worst sample] idx=137  ratio=2.839  old_lp=-0.216  new_lp=0.828
+    stored move_dir=-81.8°  new_mean=-81.2°  angular_diff=0.6°
+2026-07-31 02:28:53,605 INFO step=244,288 | rew=7.73/4.61 | pol=0.1744 val=2.0404 ent=0.4658 kl=0.4381 | 260sps  mv_ls=[-1.1997,-1.1997] g=5.81e-03  act: mv= 23 gp= 77 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(151): 58%/40%
+2026-07-31 02:28:53,825 INFO Saved checkpoint: checkpoints/phase1_run50/checkpoint3.pt
+2026-07-31 02:28:54,826 INFO   [eval vs rules] step=244,288  win=4/10 (40%)  outcomes={'opponent_box_possession': 6, 'box_possession': 4}
+2026-07-31 02:29:29,452 DEBUG [PPO UPDATE] step=252,384  n=97152  progress=0.901
+  old_log_prob: mean=-0.458  std=0.511  min=-8.338  max=0.055
+  returns:      mean=5.740  std=3.917  min=-2.086  max=15.045
+  advantages:   mean=-0.338  std=6.695  min=-23.508  max=19.165
+  values(old):  mean=6.078  std=5.713  min=-6.089  max=23.410
+  rewards:      mean=0.2055  std=1.7111  nonzero=97152/97152
+2026-07-31 02:29:29,476 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.436  new_lp=-0.883  diff=-0.447
+    ratio: mean=0.6976  std=0.2669  min=0.2348  max=1.0539
+    new_values=3.140  ret(mb)=5.999
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.411 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.134 kick_dir=-9.297
+    move_dir log_std=[-1.199748158454895, -1.1997056007385254]
+    [move_dir] cur_norm=1.000  stored_norm=1.004  angle=-46.5deg
+2026-07-31 02:29:29,493 DEBUG   [e0 mb00]  grad=3.2  total=1.034  pol=0.122  val=1.919  kl=0.4468  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.001
+2026-07-31 02:29:29,494 INFO   [early stop e0 mb0]  KL=0.44681 > target=0.4  steps_this_update=1
+2026-07-31 02:29:29,494 DEBUG   [epoch 0] kl=0.44681  t=41ms
+2026-07-31 02:29:29,494 INFO   [KL=0.4468 > 0.1] ratio percentiles:  p5=0.264  p25=0.435  p50=0.742  p75=1.000  p95=1.000  max=1.054
+  move_dir_log_std=[-1.1997458934783936, -1.199702501296997]  kick_dir_log_std=[-1.1996209621429443, -1.1996066570281982]
+2026-07-31 02:29:29,503 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.487  kick=-0.000  t_att=-0.000
+    move_dir=-0.522 (min=-5.250 max=0.558)  kick_dir=-0.495 (min=-6.126 max=0.542)
+  [worst sample] idx=118  ratio=2.679  old_lp=-0.231  new_lp=0.754
+    stored move_dir=-59.0°  new_mean=-61.0°  angular_diff=1.9°
+2026-07-31 02:29:29,525 INFO step=252,384 | rew=10.09/0.33 | pol=0.1216 val=1.9192 ent=0.4681 kl=0.4468 | 229sps  mv_ls=[-1.1997,-1.1997] g=7.02e-03  act: mv= 23 gp= 77 emv=100 spr= 83 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(153): 52%/44%
+2026-07-31 02:29:29,715 INFO Saved checkpoint: checkpoints/phase1_run50/checkpoint4.pt
+2026-07-31 02:29:30,615 INFO   [eval vs rules] step=252,384  win=2/10 (20%)  outcomes={'opponent_box_possession': 8, 'box_possession': 2}
+2026-07-31 02:30:02,148 DEBUG [PPO UPDATE] step=260,480  n=97152  progress=0.930
+  old_log_prob: mean=-0.457  std=0.525  min=-9.116  max=0.054
+  returns:      mean=6.424  std=4.001  min=-2.106  max=15.080
+  advantages:   mean=0.150  std=7.022  min=-23.014  max=19.301
+  values(old):  mean=6.273  std=6.142  min=-6.310  max=25.891
+  rewards:      mean=0.2095  std=1.7323  nonzero=97152/97152
+2026-07-31 02:30:02,153 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.569  new_lp=-0.936  diff=-0.367
+    ratio: mean=0.8093  std=0.2602  min=0.0005  max=1.3056
+    new_values=2.997  ret(mb)=7.396
+    shoot=-0.000 pass=-0.000 move=-0.301 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.329 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.240 kick_dir=-5.878
+    move_dir log_std=[-1.1997458934783936, -1.199702501296997]
+    [move_dir] cur_norm=1.000  stored_norm=1.028  angle=16.0deg
+2026-07-31 02:30:02,177 DEBUG   [e0 mb00]  grad=4.6  total=1.333  pol=0.039  val=2.679  kl=0.3667  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:30:02,196 DEBUG   [e0 mb01]  grad=3.7  total=1.449  pol=0.084  val=2.823  kl=0.4192  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:30:02,196 INFO   [early stop e0 mb1]  KL=0.41916 > target=0.4  steps_this_update=2
+2026-07-31 02:30:02,196 DEBUG   [epoch 0] kl=0.39291  t=48ms
+2026-07-31 02:30:02,197 INFO   [KL=0.3929 > 0.1] ratio percentiles:  p5=0.292  p25=0.556  p50=0.814  p75=1.000  p95=1.000  max=1.306
+  move_dir_log_std=[-1.199741244316101, -1.199696660041809]  kick_dir_log_std=[-1.1996145248413086, -1.199600100517273]
+2026-07-31 02:30:02,205 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.025  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.404  kick=-0.000  t_att=-0.000
+    move_dir=-0.450 (min=-6.032 max=0.560)  kick_dir=-0.460 (min=-4.899 max=0.559)
+  [worst sample] idx=134  ratio=2.826  old_lp=-0.212  new_lp=0.827
+    stored move_dir=169.6°  new_mean=170.1°  angular_diff=0.5°
+2026-07-31 02:30:02,228 INFO step=260,480 | rew=6.62/5.34 | pol=0.0615 val=2.7512 ent=0.4629 kl=0.3929 | 252sps  mv_ls=[-1.1997,-1.1997] g=8.21e-03  act: mv= 26 gp= 75 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(157): 61%/35%
+2026-07-31 02:30:02,404 INFO Saved checkpoint: checkpoints/phase1_run50/checkpoint5.pt
+2026-07-31 02:30:03,395 INFO   [eval vs rules] step=260,480  win=5/10 (50%)  outcomes={'box_possession': 5, 'opponent_box_possession': 5}
+2026-07-31 02:30:34,327 DEBUG [PPO UPDATE] step=268,576  n=97152  progress=0.959
+  old_log_prob: mean=-0.473  std=0.515  min=-9.964  max=0.055
+  returns:      mean=6.418  std=3.916  min=-2.201  max=15.083
+  advantages:   mean=0.370  std=6.671  min=-19.006  max=20.039
+  values(old):  mean=6.048  std=5.788  min=-6.529  max=24.293
+  rewards:      mean=0.2108  std=1.7459  nonzero=97152/97152
+2026-07-31 02:30:34,334 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.496  new_lp=-0.904  diff=-0.408
+    ratio: mean=0.7254  std=0.2780  min=0.2508  max=1.1160
+    new_values=3.391  ret(mb)=6.364
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.459 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.601 kick_dir=-8.292
+    move_dir log_std=[-1.199741244316101, -1.199696660041809]
+    [move_dir] cur_norm=1.000  stored_norm=1.046  angle=4.1deg
+2026-07-31 02:30:34,353 DEBUG   [e0 mb00]  grad=3.3  total=1.117  pol=0.162  val=2.000  kl=0.4081  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:30:34,353 INFO   [early stop e0 mb0]  KL=0.40812 > target=0.4  steps_this_update=1
+2026-07-31 02:30:34,353 DEBUG   [epoch 0] kl=0.40812  t=26ms
+2026-07-31 02:30:34,353 INFO   [KL=0.4081 > 0.1] ratio percentiles:  p5=0.317  p25=0.443  p50=0.815  p75=1.000  p95=1.039  max=1.116
+  move_dir_log_std=[-1.199738621711731, -1.1996935606002808]  kick_dir_log_std=[-1.1996111869812012, -1.199596881866455]
+2026-07-31 02:30:34,361 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.460  kick=-0.000  t_att=-0.000
+    move_dir=-0.501 (min=-5.179 max=0.559)  kick_dir=-0.514 (min=-5.561 max=0.560)
+  [worst sample] idx=49  ratio=2.561  old_lp=-0.211  new_lp=0.730
+    stored move_dir=-79.0°  new_mean=-85.6°  angular_diff=6.7°
+2026-07-31 02:30:34,382 INFO step=268,576 | rew=6.56/4.97 | pol=0.1621 val=2.0003 ent=0.4568 kl=0.4081 | 256sps  mv_ls=[-1.1997,-1.1997] g=1.06e-02  act: mv= 23 gp= 77 emv=100 spr= 81 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(154): 62%/36%
+2026-07-31 02:30:34,573 INFO Saved checkpoint: checkpoints/phase1_run50/checkpoint6.pt
+2026-07-31 02:30:35,636 INFO   [eval vs rules] step=268,576  win=4/10 (40%)  outcomes={'opponent_box_possession': 6, 'box_possession': 4}
+2026-07-31 02:31:07,013 DEBUG [PPO UPDATE] step=276,672  n=97152  progress=0.988
+  old_log_prob: mean=-0.465  std=0.517  min=-10.988  max=0.054
+  returns:      mean=6.387  std=4.003  min=-2.227  max=15.110
+  advantages:   mean=0.303  std=6.780  min=-24.154  max=18.968
+  values(old):  mean=6.084  std=5.882  min=-5.844  max=24.347
+  rewards:      mean=0.2170  std=1.7754  nonzero=97152/97152
+2026-07-31 02:31:07,037 DEBUG   [DIAG e0 mb0]
+    old_lp=-0.555  new_lp=-0.922  diff=-0.366
+    ratio: mean=0.7576  std=0.2748  min=0.1934  max=1.1710
+    new_values=3.076  ret(mb)=6.535
+    shoot=-0.000 pass=-0.000 move=-0.000 tackle=-0.000
+    gp=-0.000 mark=-0.000 hold=-0.000
+    exec_mv=-0.000 sprint=-0.508 kick=-0.000 t_attempt=-0.000
+    move_dir=-0.517 kick_dir=-7.742
+    move_dir log_std=[-1.199738621711731, -1.1996935606002808]
+    [move_dir] cur_norm=1.000  stored_norm=1.032  angle=167.5deg
+2026-07-31 02:31:07,053 DEBUG   [e0 mb00]  grad=3.1  total=1.163  pol=0.206  val=2.003  kl=0.3664  mv_shift=0.000  mv_kl=-0.0000  kk_shift=0.000
+2026-07-31 02:31:07,075 DEBUG   [e0 mb01]  grad=4.2  total=1.314  pol=0.092  val=2.538  kl=0.3738  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:31:07,097 DEBUG   [e0 mb02]  grad=3.1  total=1.061  pol=0.163  val=1.893  kl=0.4384  mv_shift=0.000  mv_kl=0.0000  kk_shift=0.001
+2026-07-31 02:31:07,097 INFO   [early stop e0 mb2]  KL=0.43839 > target=0.4  steps_this_update=3
+2026-07-31 02:31:07,097 DEBUG   [epoch 0] kl=0.39286  t=84ms
+2026-07-31 02:31:07,097 INFO   [KL=0.3929 > 0.1] ratio percentiles:  p5=0.277  p25=0.510  p50=0.786  p75=1.000  p95=1.005  max=1.171
+  move_dir_log_std=[-1.1997301578521729, -1.1996852159500122]  kick_dir_log_std=[-1.1996017694473267, -1.1995877027511597]
+2026-07-31 02:31:07,107 INFO   [per-head new lp means, n=256]
+    shoot=-0.000  pass=-0.000  move=-0.000  tackle=-0.000  gp=-0.000  mark=-0.000  hold=-0.000
+    sprint=-0.418  kick=-0.000  t_att=-0.000
+    move_dir=-0.484 (min=-5.244 max=0.561)  kick_dir=-0.444 (min=-5.433 max=0.559)
+  [worst sample] idx=38  ratio=2.834  old_lp=-1.351  new_lp=-0.310
+    stored move_dir=75.0°  new_mean=72.9°  angular_diff=2.1°
+2026-07-31 02:31:07,130 INFO step=276,672 | rew=8.59/1.94 | pol=0.1539 val=2.1447 ent=0.4658 kl=0.3929 | 251sps  mv_ls=[-1.1997,-1.1997] g=7.76e-03  act: mv= 23 gp= 77 emv=100 spr= 82 kck=  0 tk=  0 sh=  0 hld=  0  vs_neural(158): 62%/35%
+2026-07-31 02:31:07,298 INFO Saved checkpoint: checkpoints/phase1_run50/checkpoint7.pt
+2026-07-31 02:31:08,186 INFO   [eval vs rules] step=276,672  win=0/10 (0%)  outcomes={'opponent_box_possession': 9, 'miss': 1}
+2026-07-31 02:31:19,789 INFO Saved checkpoint: checkpoints/phase1_run50/checkpoint8.pt
+2026-07-31 02:31:19,789 INFO Final checkpoint saved.
+2026-07-31 02:31:19,789 INFO Training complete. Total steps: 280,000
+2026-07-31 02:34:35,364 INFO Checkpoint dir: checkpoints/phase1_run51
+2026-07-31 02:34:35,374 INFO Starting training: phase=phase1_get_possession, total_steps=100,000
+2026-07-31 02:34:35,374 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
+2026-07-31 02:34:36,403 INFO --latest: resolved to checkpoints/phase1_run50/latest.pt
+2026-07-31 02:34:36,416 INFO Loaded checkpoint: checkpoints/phase1_run50/latest.pt (step 280000)
+2026-07-31 02:34:37,377 INFO   [neural] trial 10/40: outcome=opponent_box_possession, reward=-4.03
+2026-07-31 02:34:38,147 INFO   [neural] trial 20/40: outcome=box_possession, reward=8.79
+2026-07-31 02:34:39,050 INFO   [neural] trial 30/40: outcome=box_possession, reward=14.52
+2026-07-31 02:34:39,711 INFO   [neural] trial 40/40: outcome=box_possession, reward=10.41
+2026-07-31 02:34:39,711 INFO Pre-PPO eval (rules opp): win=35.0%  mean_rew=1.458  outcomes={'opponent_box_possession': 25, 'box_possession': 14, 'miss': 1}
+2026-07-31 02:34:40,418 INFO   [neural] trial 10/40: outcome=box_possession, reward=13.86
+2026-07-31 02:34:41,520 INFO   [neural] trial 20/40: outcome=box_possession, reward=12.98
+2026-07-31 02:34:42,657 INFO   [neural] trial 30/40: outcome=box_possession, reward=14.35
+2026-07-31 02:34:44,270 INFO   [neural] trial 40/40: outcome=box_possession, reward=12.38
+2026-07-31 02:34:44,270 INFO Pre-PPO eval (immobile opp): win=97.5%  mean_rew=11.550  outcomes={'box_possession': 39, 'miss': 1}
+2026-07-31 02:34:44,359 INFO   [baseline] trial 10/12: outcome=opponent_box_possession
+2026-07-31 02:34:44,391 INFO Baseline (rules vs rules, 12 trials): trainee_win=83.3%  outcomes={'box_possession': 10, 'opponent_box_possession': 2}
+2026-07-31 02:34:44,391 INFO Frozen decision_net.shoot_logit
+2026-07-31 02:34:44,391 INFO Frozen decision_net.pass_logit
+2026-07-31 02:34:44,391 INFO Frozen decision_net.tackle_logit
+2026-07-31 02:34:44,391 INFO Frozen decision_net.get_possession_raw
+2026-07-31 02:34:44,391 INFO Frozen decision_net.mark_logit
+2026-07-31 02:34:44,391 INFO Frozen decision_net.hold_position_logit
+2026-07-31 02:34:44,391 INFO Frozen decision_net.pass_target_logits
+2026-07-31 02:34:44,391 INFO Frozen decision_net.tackle_target_logits
+2026-07-31 02:34:44,391 INFO Frozen decision_net.mark_target_logits
+2026-07-31 02:34:44,392 INFO PPO training started: steps_so_far=280,000  target=380,000  (+100,000 this run)
+2026-07-31 02:34:44,414 INFO Saved checkpoint: checkpoints/phase1_run51/checkpoint1.pt
+2026-07-31 02:34:44,415 INFO Final checkpoint saved.
+2026-07-31 02:34:44,415 INFO Training complete. Total steps: 280,000
+2026-07-31 02:34:54,478 INFO Checkpoint dir: checkpoints/phase1_run52
+2026-07-31 02:34:54,490 INFO Starting training: phase=phase1_get_possession, total_steps=400,000
+2026-07-31 02:34:54,490 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
+2026-07-31 02:34:55,551 INFO --latest: resolved to checkpoints/phase1_run51/latest.pt
+2026-07-31 02:34:55,568 INFO Loaded checkpoint: checkpoints/phase1_run51/latest.pt (step 280000)
+2026-07-31 02:34:56,546 INFO   [neural] trial 10/40: outcome=miss, reward=0.01
+2026-07-31 02:34:57,183 INFO   [neural] trial 20/40: outcome=opponent_box_possession, reward=-4.00
+2026-07-31 02:34:57,949 INFO   [neural] trial 30/40: outcome=opponent_box_possession, reward=-3.99
+2026-07-31 02:34:58,483 INFO   [neural] trial 40/40: outcome=opponent_box_possession, reward=-4.03
+2026-07-31 02:34:58,484 INFO Pre-PPO eval (rules opp): win=22.5%  mean_rew=0.067  outcomes={'opponent_box_possession': 27, 'box_possession': 9, 'miss': 3, 'other': 1}
+2026-07-31 02:34:59,899 INFO   [neural] trial 10/40: outcome=box_possession, reward=11.24
+2026-07-31 02:35:01,125 INFO   [neural] trial 20/40: outcome=box_possession, reward=14.50
+2026-07-31 02:35:02,557 INFO   [neural] trial 30/40: outcome=box_possession, reward=14.13
+2026-07-31 02:35:03,705 INFO   [neural] trial 40/40: outcome=box_possession, reward=10.44
+2026-07-31 02:35:03,705 INFO Pre-PPO eval (immobile opp): win=92.5%  mean_rew=11.063  outcomes={'box_possession': 37, 'miss': 3}
+2026-07-31 02:35:03,801 INFO   [baseline] trial 10/12: outcome=box_possession
+2026-07-31 02:35:03,825 INFO Baseline (rules vs rules, 12 trials): trainee_win=75.0%  outcomes={'box_possession': 9, 'opponent_box_possession': 3}
+2026-07-31 02:35:03,825 INFO Frozen decision_net.shoot_logit
+2026-07-31 02:35:03,825 INFO Frozen decision_net.pass_logit
+2026-07-31 02:35:03,825 INFO Frozen decision_net.tackle_logit
+2026-07-31 02:35:03,825 INFO Frozen decision_net.get_possession_raw
+2026-07-31 02:35:03,825 INFO Frozen decision_net.mark_logit
+2026-07-31 02:35:03,825 INFO Frozen decision_net.hold_position_logit
+2026-07-31 02:35:03,825 INFO Frozen decision_net.pass_target_logits
+2026-07-31 02:35:03,825 INFO Frozen decision_net.tackle_target_logits
+2026-07-31 02:35:03,825 INFO Frozen decision_net.mark_target_logits
+2026-07-31 02:35:03,826 INFO PPO training started: steps_so_far=280,000  target=680,000  (+400,000 this run)

@@ -37,12 +37,20 @@ HOTKEY_ACTIVE = (120, 200, 255)  # accent: current mode is active (same as HUD_A
 FONT_NAME = None  # None = pygame default font
 HUD_FONT_SIZE = 18
 TITLE_FONT_SIZE = 32
+ICON_FONT_SIZE = 11  # font size for action icons drawn above players (fallback; overridden by graphics.json font_size_px)
 
 # A true-to-scale player (0.3m) or ball (0.11m) renders as only a couple of
 # pixels at typical zoom levels - these floors keep them visible without
 # affecting their (physically accurate) world position.
-MIN_PLAYER_RADIUS_PX = 8
-MIN_BALL_RADIUS_PX = 4
+# Actual values are loaded from config/graphics.json by the Renderer at init.
+MIN_PLAYER_RADIUS_PX = 8  # fallback default only — Renderer overrides from graphics.json
+MIN_BALL_RADIUS_PX = 4    # fallback default only — Renderer overrides from graphics.json
+
+# Speed lines: colour of trailing motion lines drawn behind fast-moving players.
+SPEED_LINE_COLOUR = (160, 210, 255)  # light blue
+
+# Low-stamina flash: pulsing outline when stamina drops below the configured threshold.
+STAMINA_FLASH_OUTLINE = (255, 50, 50)  # bright red (brighter than INACTIVE_OUTLINE)
 
 # Player stat bars (stamina + speed), drawn below the player icon.
 STAMINA_BAR_HIGH = (80, 200, 100)   # green — high stamina

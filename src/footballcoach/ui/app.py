@@ -8,6 +8,7 @@ from enum import Enum, auto
 
 import pygame
 
+from footballcoach.config import load_graphics_config
 from footballcoach.engine.match import Match
 from footballcoach.ui import scenarios, style
 from footballcoach.ui.camera import Camera
@@ -53,6 +54,13 @@ class App:
         # Auto-pause notification: set when a human-issued order completes.
         # Cleared the next time the player resumes (Space).
         self._pause_notification: str | None = None
+
+        # Action icon state: player_id -> (icon_str, wall_clock_expiry_s).
+        # Icons are polled from player.action_icon each frame after stepping,
+        # stored here with an expiry, and cleared from the player immediately.
+        self._action_icon_state: dict[str, tuple[str, float]] = {}
+        gcfg = load_graphics_config()
+        self._icon_linger_s: float = gcfg["action_icons"]["linger_s"]
 
         # Pending scenario params (Screen.SCENARIO_PARAMS state)
         self._pending_scenario_definition: scenarios.ScenarioDefinition | None = None
@@ -261,6 +269,8 @@ class App:
     def _start_match(self, match: Match, label: str, is_training_mode: bool = False) -> None:
         self.match = match
         self._wire_match_log(match)
+        self._wire_player_icon_callbacks(match)
+        self._action_icon_state.clear()
         self.input_controller = MatchInputController(match=match, camera=self.camera)
         self.input_controller.on_order_complete = self._on_human_order_complete
         self.mode_label = label
@@ -282,6 +292,8 @@ class App:
         self._scenario_loop = loop
         self.match = loop.match
         self._wire_match_log(loop.match)
+        self._wire_player_icon_callbacks(loop.match)
+        self._action_icon_state.clear()
         self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
         self.input_controller.on_order_complete = self._on_human_order_complete
         self.mode_label = f"Balance scenario: {definition.label}"
@@ -294,6 +306,43 @@ class App:
         """Attach the game log callback to a newly created Match."""
         game_log = self.game_log
         match.log_callback = lambda level, msg: game_log.add(level, msg, match.time_s)
+
+    def _wire_player_icon_callbacks(self, match: Match) -> None:
+        """Wire on_kick / on_tackle / on_possession_gained callbacks on every
+        player in *match* so the engine can signal the UI action-icon system.
+
+        Icons are set on the player's `action_icon` field; `_poll_action_icons`
+        picks them up each frame and records them with a wall-clock expiry.
+        """
+        def _kick_cb(player):  # noqa: ANN001
+            player.action_icon = "⚽"
+
+        def _tackle_cb(player):  # noqa: ANN001
+            player.action_icon = "🧤" if player.is_goalkeeper else "🦵"
+
+        def _possession_cb(player):  # noqa: ANN001
+            # Only show icon for goalkeepers (catch/save); outfield first-touch
+            # control is already signalled via _update_loose_ball_pickup → "✋".
+            if player.is_goalkeeper:
+                player.action_icon = "🧤"
+
+        for player in match.players:
+            player.on_kick = _kick_cb
+            player.on_tackle = _tackle_cb
+            player.on_possession_gained = _possession_cb
+
+    def _poll_action_icons(self, match: Match) -> None:
+        """After each physics step, harvest `player.action_icon` signals set by
+        the engine and record them in `_action_icon_state` with a wall-clock
+        expiry.  The field is cleared immediately so each event is only counted
+        once even if multiple ticks fire between rendered frames.
+        """
+        now_s = pygame.time.get_ticks() / 1000.0
+        expiry_s = now_s + self._icon_linger_s
+        for player in match.players:
+            if player.action_icon is not None:
+                self._action_icon_state[player.player_id] = (player.action_icon, expiry_s)
+                player.action_icon = None
 
     def _step_match(self) -> None:
         assert self.match is not None
@@ -313,18 +362,22 @@ class App:
                     self._scenario_loop = None
                     return
                 elif trial_ended:
-                    # New trial started — wire log to the fresh match and sync input.
+                    # New trial started — wire log and icon callbacks to the fresh match.
                     self._wire_match_log(loop.match)
+                    self._wire_player_icon_callbacks(loop.match)
+                    self._action_icon_state.clear()
                     self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
                     self.input_controller.on_order_complete = self._on_human_order_complete
                     break  # render one frame of the new trial before stepping further
                 else:
                     if self.input_controller is not None:
                         self.input_controller.match = loop.match
+            self._poll_action_icons(self.match)
             return
 
         for _ in range(steps):
             self.match.step()
+        self._poll_action_icons(self.match)
         if self.is_training_mode:
             current_tally = (self.match.scoreboard.left_goals, self.match.scoreboard.right_goals)
             # Wait until the engine's goal linger is done (linger_remaining == 0)
@@ -431,10 +484,20 @@ class App:
         # Draw the ball carrier last so they always render on top of every
         # other player, per the design spec.
         ordered_players = sorted(self.match.players, key=lambda p: p.player_id == carrier_id)
+        now_s = pygame.time.get_ticks() / 1000.0
         for player in ordered_players:
+            pid = player.player_id
+            action_icon: str | None = None
+            if pid in self._action_icon_state:
+                icon, expiry = self._action_icon_state[pid]
+                if now_s < expiry:
+                    action_icon = icon
+                else:
+                    del self._action_icon_state[pid]
             self.renderer.draw_player(
-                self.surface, player, selected=player.player_id == selected_id,
-                has_ball=player.player_id == carrier_id,
+                self.surface, player, selected=pid == selected_id,
+                has_ball=pid == carrier_id,
+                action_icon=action_icon,
             )
         self.renderer.draw_ball(self.surface, self.match.ball)
 

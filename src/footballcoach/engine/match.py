@@ -440,6 +440,8 @@ class Match:
             # whatever height it was caught/received at) - see the note in
             # step() on why a ball mid-control-time must not keep flying.
             self.ball.velocity = Vector3.zero()
+            # Display hint for the UI action-icon system (consumed by renderer, not engine logic).
+            player.action_icon = "🧤" if player.is_goalkeeper else "✋"
             return  # only one player starts controlling per tick (first come)
 
     def _any_player_controlling_ball(self) -> bool:

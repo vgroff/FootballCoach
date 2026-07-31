@@ -12,6 +12,7 @@ Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_
 
 Immedaite task!!
 Read ai_trainer_knowledge.md, and then run a training run.
+- I still don't like the per-tick rewards, because longer trials have more of the, it doesnt make sense really have to be very careful
 - We could super easliy remove a whole axis of symmetry by transforming all AI positions to being +x is attacking goal, -x is dending goal, remove the flag for which end youre attacking on and transform back and forth from the engine positions to the AI positions. Would probably mean a smaller/smarter AI and faster trainnig from fewer augmentations (half the training time)
     - I think all that needs changing is absolute coordinates - i.e. player position and move region (?). and then augmentation and team flags removed.
 - definitely need a phase 0 type thing where we just teach movement, with and without the ball, going between waypoints for a start, it struggle with movement a lot
@@ -21,12 +22,9 @@ Read ai_trainer_knowledge.md, and then run a training run.
 - Is the AI completely ignoring all the kick mechanics like direction and spin and just aimming for the centre of the box when it kicks? Why on earth was this implemented???
 
 Immediate AI stuff
-- Can we do some trainings runs and then see and see if the trained AI is able to beat the rules-based AI more consistently or at least at a simiar rate than another rules-based AI could?
-- watch the 1v1s
 - Add training to the UI - let me execute training runs against various phases and let me watch/evalute scenarios entirely in the UI
     - let me also create my own scenarios and play them as training "demonstrations" entirely in the UI, using the actions/orders and having that recorded, and then it gets used for training. store the orders too for neural network training and replaying
     - Allow me to replay the demonstrations in the UI - either through orders or through actions
-- during the demonstration collection, print summary stats of the reward scores for each player (they might sum to 0)
 - Think about how GetPossesion, Tackle and Move orders are going to interact - they could work together. The Orders would need to break down into AI suggestions maybe
 
 Next immediate training:
@@ -43,7 +41,6 @@ NB Immediate Immediate:
 - 2V2 scenario is completely broken, I think GK is on the wrong team, and probbaly other shit. Fix it. Also, the through ball pass is doing an awful job of predicting where the player will be, can we hit the pass harder? Maybe for the scenario, make the second attacker move slower, also, is he running GetPossession during the pass?
 - The goalkeeper clearly teleports after saving the ball sometimes, wtf is that about??
 - Controlling the ball also makes players static I think probably change that, same as with tackling
-- We want a bit more visual excitment. Can we display some icons under/over/on top of a player for 1.2 seconds after he carries out an action like kick, tackle, taking control (do a differenet one for goalies) or switching between moving stances/speeds - you can use the leg, hand(GK), wind, running, idle (U+1F574) and soccer ball icons, or any you think are more appropriate, but please no more than 2 per icons per action. Maybe we can also give people speed lines when theyre going above a certain speed, and flashing red outline when stamina is low.
 - Much better kick action UI - 1. start kick action by clicking on already selected player, and point in a direction and give it a length (this is xy direction and power) - show the trajectory and error margins as you do so. 2. once you've clicked to select that, moving the mouse back and forth alters the z direction - keep showing the trajectory, and highlight red the parts of the trajetory that are above goal height. 3. Add left/right and up/down spin by circling the kicking player, and once again show the effect and how the error margins are affected
 - Why is the ball.possessed_by still using a player_id?? Do we enforce unique player_ids?? It seems so much easier to use just use the possesed_by field be player type rather than string, ball.possessed_by = kicker, instead of kicker.player_id. Is there an issue with circular references or something? If so, can't it be solved gracefully by refactoring or something? If not, it's okay, it just seems ugly
 - Maybe slightly reduce the size of the player spheres?
@@ -64,10 +61,11 @@ NB:
     - Ask the AI to explain the kick power calculations - maybe we need a non-linearity
 - implement goalie rebounds and "failed" saves of various kinds
     - also implement rebounds off players for failed ball controls and from succesful tackles
-- Show player attributes ands stamina somewhere on select
+- Show player attributes somewhere on select
 - Could do grid search on the goalie intercept maneuver and clever positioning - ask that AI how the intercepting is chosen, but really we should calculate distance/speed for both options, and make a weighted choice based on those, no? throw in some params and re-tune the goalie bonuses probably
 - footballer height should vary - and therefore jump height
 - At some point ask an AI to: "read through everything - except for now, the ai folder (but do read rules_ai.py) and offer suggestions for refactors or cleanups, duplicate code/logic, string literals, inconsistent documentation/knowledge files, comments and criticisms on structure, easy wins, possible bugs and edge cases, test cases etc... Even if you see something is already explained/documented, if you're not convinced by the explanation or if it still seems dodgy/potentially wrong, bring it up". Do this before extending the game too much beyond the pitch
+- certain things in physics.json should probably be in attributes.json or a differently names config file, we should probably hve an entire audit of these and figure out how best to organise the files/config params
 
 
 Past MVP - Late Stage Plans

@@ -70,6 +70,12 @@ class Player:
     on_tackle: object | None = field(default=None, repr=False)   # fired when a tackle attempt executes
     on_possession_gained: object | None = field(default=None, repr=False)  # fired by match._set_possession() when this player gains the ball
 
+    # Display hint: set by the engine when an action fires (kick, tackle,
+    # first-touch control, GK save).  The UI layer polls this each frame,
+    # records the icon with a wall-clock expiry, then clears it.  Engine
+    # logic must not depend on this field.
+    action_icon: str | None = field(default=None, repr=False, compare=False)
+
     # Movement intent — set by execute() / AI each tick, consumed by match._apply_movement().
     # Orders/AI MUST NOT call step_player_towards directly; they set these two fields and the
     # engine applies them via step_player_towards.  desired_speed_mode=None means no movement.

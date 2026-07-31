@@ -33,6 +33,12 @@ def load_attributes_config() -> dict[str, Any]:
     return _load_json("attributes.json")
 
 
+@lru_cache(maxsize=1)
+def load_graphics_config() -> dict[str, Any]:
+    """Returns the parsed contents of graphics.json (cached)."""
+    return _load_json("graphics.json")
+
+
 def clear_config_cache() -> None:
     """Clears cached config, forcing a re-read from disk on next access.
 
@@ -40,6 +46,7 @@ def clear_config_cache() -> None:
     """
     load_physics_config.cache_clear()
     load_attributes_config.cache_clear()
+    load_graphics_config.cache_clear()
 
 
 @dataclass(frozen=True)

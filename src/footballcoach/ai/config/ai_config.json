@@ -4,7 +4,7 @@
   "observation": {
     "max_other_players": 21,
     "decision_interval_s": 0.7,
-    "sim_dt_s": 0.1,
+    "sim_dt_s": 0.08,
     "_comment_sim_dt_s": "Physics tick size. Default 0.0333 (30Hz). Increase for faster training: 0.05=20Hz (~1.5x), 0.067=15Hz (~2x). UI ignores this and always uses 30Hz.",
     "ball_spin_norm_max_rad_s": 30.0,
     "time_remaining_norm_max_s": 7200.0,
@@ -82,9 +82,9 @@
     "pretrain_online_batch_size": 16,
     "direction_loss_weight": 4.0,
     "region_loss_weight": 1.0,
-    "aux_coeff_start": 1.0,
+    "aux_coeff_start": 0.5,
     "aux_coeff_end": 0.0,
-    "aux_coeff_anneal_fraction": 0.6,
+    "aux_coeff_anneal_fraction": 0.25,
     "_comment_aux": "aux_coeff anneals linearly from start to end over aux_coeff_anneal_fraction of training (e.g. 0.3 = done by 30% of steps). The BC loss is computed on decision Bernoulli heads and execution move_direction.",
     "bc_pretrain_epochs": 3,
     "bc_pretrain_batch_size": 312,
@@ -113,13 +113,13 @@
 
   "reward": {
     "phase1": {
-      "ball_distance_shaping": 0.02,
-      "gain_possession_bonus": 0.5,
-      "ball_progress_scale": 0.02,
+      "ball_distance_shaping": 0.002,
+      "gain_possession_bonus": 0.7,
+      "ball_progress_scale": 0.003,
       "ball_out_penalty": -1.0,
       "illegal_action_penalty": -0.2,
-      "box_possession_terminal": 7.0,
-      "loss_terminal": -2.0,
+      "box_possession_terminal": 8.0,
+      "loss_terminal": -4.0,
       "_comment_loss_terminal": "Penalty applied when the opponent reaches the trainee's box with possession (trainee loses). Should be negative and less than box_possession_terminal in magnitude.",      
       "loss_of_possession_penalty": -0.15,
       "_comment_loss_of_possession": "Small penalty per step the trainee loses the ball to the opponent. Creates symmetric signal with gain_possession_bonus.",
@@ -127,7 +127,7 @@
       "_comment_timeout_penalty": "Penalty if the episode times out (no resolution). Makes timeouts clearly worse than active play.",
       "proximity_bonus_scale": 3.0,
       "_comment_proximity_bonus": "On timeout only: bonus for how close the ball was to the opponent box. scale * max(0, 1 - dist/30m). Max = scale at box edge. Rewards making progress even when not winning.", 
-      "speed_bonus_scale": 2.5,
+      "speed_bonus_scale": 4.0,
       "_comment_speed_bonus": "Bonus for finishing fast: scale * time_remaining_fraction * min(start_ball_to_box_dist/30m, 1.5). Max bonus = 3.0 (instant finish, ball 45m+ from box). Set to 0.0 to disable."
     },
     "phase2": {

@@ -1,0 +1,28 @@
+{
+  "_comment": "Visual display constants. Edit freely to tune the look without touching code. See ui/knowledge.md for details on how each value is used.",
+  "player": {
+    "_comment": "min_radius_px: smallest on-screen circle radius drawn for a player. Physical world positions are unaffected — only the rendered dot size is boosted for visibility.",
+    "min_radius_px": 7
+  },
+  "ball": {
+    "_comment": "min_radius_px: smallest on-screen circle radius drawn for the ball.",
+    "min_radius_px": 4
+  },
+  "action_icons": {
+    "_comment": "linger_s: wall-clock seconds an action icon stays visible above a player after the action fires. font_size_px: point size of the icon font — keep small (10-14) or they'll dominate the screen.",
+    "linger_s": 1.5,
+    "font_size_px": 11
+  },
+  "speed_lines": {
+    "_comment": "threshold_mps: player ground speed above which trailing speed lines are drawn behind the player. count: number of parallel lines. length_px: length of each line in pixels. gap_px: spacing between successive lines.",
+    "threshold_mps": 7.0,
+    "count": 3,
+    "length_px": 4,
+    "gap_px": 2
+  },
+  "stamina_flash": {
+    "_comment": "threshold: stamina fraction (0-1) below which a flashing warning outline pulses around the player. flash_hz: flashes per second (wall-clock).",
+    "threshold": 0.25,
+    "flash_hz": 2.5
+  }
+}

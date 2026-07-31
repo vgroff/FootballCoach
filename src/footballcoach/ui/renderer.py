@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING
 
 import pygame
 
+from footballcoach.config import load_graphics_config
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.pitch import Pitch
 from footballcoach.entities.player import Player, PlayerState, Team
@@ -18,6 +19,19 @@ if TYPE_CHECKING:
     from footballcoach.ui.gamelog import GameLog, LogLevel
     from footballcoach.ui.scenarios import AnyScenarioParam, ScenarioBoolParam, ScenarioChoiceParam, ScenarioParam
 
+# Font family names tried in order when searching for a font that can render
+# Unicode emoji/symbols.  The monochrome Noto Emoji font is best on Linux;
+# Symbola is a good fallback; if none match we fall back to the pygame default
+# (icons will render as replacement boxes on unsupported fonts, which is benign).
+_EMOJI_FONT_CANDIDATES = [
+    "noto emoji",
+    "notoemoji",
+    "noto color emoji",
+    "symbola",
+    "unifont",
+    "seguiemj",
+]
+
 
 class Renderer:
     def __init__(self, camera: Camera) -> None:
@@ -25,6 +39,50 @@ class Renderer:
         pygame.font.init()
         self.hud_font = pygame.font.Font(style.FONT_NAME, style.HUD_FONT_SIZE)
         self.title_font = pygame.font.Font(style.FONT_NAME, style.TITLE_FONT_SIZE)
+
+        # Load graphics config for tunable display constants.
+        gcfg = load_graphics_config()
+
+        icon_font_size = gcfg["action_icons"].get("font_size_px", style.ICON_FONT_SIZE)
+        self._icon_target_px: int = icon_font_size
+
+        # Find an emoji-capable font for action icons.
+        # NotoColorEmoji is a fixed-size bitmap font (128px/glyph) that ignores
+        # the size argument — we render at native size then scale down.
+        # Other candidates (symbola, unifont) would scale normally if present.
+        icon_font_path = None
+        self._icon_font_is_bitmap = False
+        for name in _EMOJI_FONT_CANDIDATES:
+            path = pygame.font.match_font(name)
+            if path:
+                icon_font_path = path
+                # Detect the NotoColorEmoji bitmap font: render a test char and
+                # check if the rendered height is much larger than requested.
+                probe = pygame.font.Font(path, icon_font_size)
+                _, probe_h = probe.size("A")
+                if probe_h > icon_font_size * 4:
+                    # Bitmap font — load at native size, scale surface later.
+                    self._icon_font_is_bitmap = True
+                    self.icon_font = pygame.font.Font(path, 109)  # NotoColorEmoji native size
+                else:
+                    self.icon_font = probe
+                break
+        else:
+            # No emoji font found — fall back to pygame default (boxes, but harmless).
+            self.icon_font = pygame.font.Font(style.FONT_NAME, icon_font_size)
+
+        # Pre-render + scale-down cache so we don't do the slow transform every frame.
+        self._icon_cache: dict[str, pygame.Surface] = {}
+        self.min_player_radius_px: int = gcfg["player"]["min_radius_px"]
+        self.min_ball_radius_px: int = gcfg["ball"]["min_radius_px"]
+        sl = gcfg["speed_lines"]
+        self._speed_line_threshold: float = sl["threshold_mps"]
+        self._speed_line_count: int = sl["count"]
+        self._speed_line_length_px: int = sl["length_px"]
+        self._speed_line_gap_px: int = sl["gap_px"]
+        sf = gcfg["stamina_flash"]
+        self._stamina_flash_threshold: float = sf["threshold"]
+        self._stamina_flash_hz: float = sf["flash_hz"]
 
     def draw_pitch(self, surface: pygame.Surface, pitch: Pitch) -> None:
         surface.fill(style.PITCH_GREEN)
@@ -80,7 +138,7 @@ class Renderer:
         # positions stay physically accurate, only the drawn dot size is
         # boosted. The height effect is then exaggerated on top of that
         # minimum, and a small height label is shown, per the design spec.
-        base_radius_px = max(style.MIN_BALL_RADIUS_PX, cam.scale_length(ball.radius_m))
+        base_radius_px = max(self.min_ball_radius_px, cam.scale_length(ball.radius_m))
         height_boost = 1.0 + min(ball.height_m, 5.0) * 0.35  # exaggerated
         radius_px = max(2, int(base_radius_px * height_boost))
 
@@ -101,7 +159,8 @@ class Renderer:
             surface.blit(label, (pos[0] + radius_px + 2, pos[1] - label.get_height() // 2))
 
     def draw_player(
-        self, surface: pygame.Surface, player: Player, selected: bool, has_ball: bool = False
+        self, surface: pygame.Surface, player: Player, selected: bool,
+        has_ball: bool = False, action_icon: str | None = None,
     ) -> None:
         """Draws one player. Per the design spec:
         - goalkeepers are drawn in a distinct orange colour rather than
@@ -115,10 +174,12 @@ class Renderer:
           engine/knowledge.md) are drawn translucent rather than solid,
           instead of a flat grey tint, so their team/goalkeeper colour is
           still faintly visible.
+        - `action_icon`: if set, a small emoji/text label is drawn above the
+          player for the configured linger duration (tracked by app.py).
         """
         cam = self.camera
         pos = cam.world_to_screen(player.position.x, player.position.y)
-        radius_px = max(style.MIN_PLAYER_RADIUS_PX, cam.scale_length(player.radius_m))
+        radius_px = max(self.min_player_radius_px, cam.scale_length(player.radius_m))
 
         if player.is_goalkeeper:
             colour = style.GOALKEEPER_COLOUR
@@ -126,6 +187,19 @@ class Renderer:
             colour = style.TEAM_LEFT_COLOUR if player.team == Team.LEFT else style.TEAM_RIGHT_COLOUR
 
         is_inactive = player.state == PlayerState.INACTIVE_TACKLED
+
+        # --- Speed lines: drawn first so they appear behind the player circle ---
+        if player.speed_mps > self._speed_line_threshold:
+            # Trailing lines go opposite to heading direction (behind the player).
+            trail_dx = -math.cos(-player.heading_rad)
+            trail_dy = -math.sin(-player.heading_rad)
+            for i in range(self._speed_line_count):
+                start_dist = radius_px + (i + 1) * self._speed_line_gap_px
+                sx = pos[0] + trail_dx * start_dist
+                sy = pos[1] + trail_dy * start_dist
+                ex = sx + trail_dx * self._speed_line_length_px
+                ey = sy + trail_dy * self._speed_line_length_px
+                pygame.draw.line(surface, style.SPEED_LINE_COLOUR, (int(sx), int(sy)), (int(ex), int(ey)), 2)
 
         if is_inactive:
             # Draw on a small per-pixel-alpha surface so the player reads as
@@ -137,6 +211,13 @@ class Renderer:
             surface.blit(player_surf, (pos[0] - centre[0], pos[1] - centre[1]))
         else:
             pygame.draw.circle(surface, colour, pos, radius_px)
+
+        # --- Low-stamina flash: outermost ring, pulsing at configured hz ---
+        if player.stamina < self._stamina_flash_threshold and not is_inactive:
+            period_ms = 1000.0 / max(self._stamina_flash_hz, 0.1)
+            flash_on = (pygame.time.get_ticks() % int(period_ms * 2)) < int(period_ms)
+            if flash_on:
+                pygame.draw.circle(surface, style.STAMINA_FLASH_OUTLINE, pos, radius_px + 11, 2)
 
         # State outline rings: CONTROLLING_BALL (cyan) and INACTIVE_TACKLED (red).
         # These are separate from the possession/selection outlines, and stack
@@ -185,6 +266,24 @@ class Renderer:
         pygame.draw.rect(surface, style.STAT_BAR_BG, (bar_x, bar_y_speed, bar_w, bar_h))
         speed_fill = max(0.0, min(1.0, player.speed_mps / style.SPEED_BAR_MAX_MPS))
         pygame.draw.rect(surface, style.SPEED_BAR_COLOUR, (bar_x, bar_y_speed, int(bar_w * speed_fill), bar_h))
+
+        # --- Action icon: emoji/text label floating above the player circle ---
+        if action_icon is not None:
+            if action_icon not in self._icon_cache:
+                raw = self.icon_font.render(action_icon, True, style.HUD_TEXT)
+                if self._icon_font_is_bitmap and raw.get_height() > self._icon_target_px * 2:
+                    # Scale the native-size bitmap down to the configured target.
+                    scale = self._icon_target_px / raw.get_height()
+                    new_w = max(1, int(raw.get_width() * scale))
+                    self._icon_cache[action_icon] = pygame.transform.smoothscale(
+                        raw, (new_w, self._icon_target_px)
+                    )
+                else:
+                    self._icon_cache[action_icon] = raw
+            icon_surf = self._icon_cache[action_icon]
+            icon_x = pos[0] - icon_surf.get_width() // 2
+            icon_y = pos[1] - radius_px - icon_surf.get_height() - 4
+            surface.blit(icon_surf, (icon_x, icon_y))
 
     def draw_drag_indicator(
         self,

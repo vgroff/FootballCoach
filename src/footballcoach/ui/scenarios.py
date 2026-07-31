@@ -695,23 +695,40 @@ def _load_trainer(checkpoint_path: str):
 def _discover_checkpoints(checkpoint_dir: str) -> list[str]:
     """Return sorted list of .pt checkpoint paths in checkpoint_dir.
 
-    Matches both old-style checkpoint_NNNNNNNN.pt and new-style checkpointN.pt.
-    Excludes latest.pt (symlink) and checkpoint_pretrained.pt to avoid duplicates.
+    Matches both old-style checkpoint_NNNNNNNN.pt and new-style checkpointN.pt,
+    plus latest.pt if it exists (always placed last, as the most recent).
+    Excludes checkpoint_pretrained.pt to avoid duplicates.
+
+    Sorting is by numeric suffix so checkpoint14.pt > checkpoint9.pt.
     """
     import glob
     import os
+    import re
     if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
         return []
     old_style = glob.glob(os.path.join(checkpoint_dir, "checkpoint_*.pt"))
     new_style = glob.glob(os.path.join(checkpoint_dir, "checkpoint[0-9]*.pt"))
     all_paths = set(old_style) | set(new_style)
-    # Exclude pretrained snapshot and symlinks
+    # Exclude pretrained snapshot; keep symlinks (latest.pt is a symlink)
     all_paths = {
         p for p in all_paths
         if not os.path.basename(p).startswith("checkpoint_pretrained")
-        and not os.path.islink(p)
     }
-    return sorted(all_paths)
+
+    def _sort_key(p: str) -> tuple[int, str]:
+        name = os.path.basename(p)
+        m = re.search(r"(\d+)", name)
+        return (int(m.group(1)) if m else -1, name)
+
+    numbered = sorted(
+        (p for p in all_paths if os.path.basename(p) != "latest.pt"),
+        key=_sort_key,
+    )
+    # latest.pt goes at the very end so the default picker lands on it
+    latest = os.path.join(checkpoint_dir, "latest.pt")
+    if os.path.exists(latest):
+        numbered.append(latest)
+    return numbered
 
 
 def _apply_neural_action(trainer, match: Match, player_id: str, trial_tick: int) -> None:

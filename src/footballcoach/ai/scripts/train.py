@@ -75,6 +75,10 @@ def main() -> None:
                         help="Skip frozen_heads from the curriculum phase definition — all "
                              "decision-network heads are trained during PPO. Default: the "
                              "phase's frozen_heads list is applied before PPO starts.")
+    parser.add_argument("--latest", action="store_true",
+                        help="Resume from the most recent checkpoint across all phase{N}_run* "
+                             "dirs. Equivalent to --checkpoint <latest.pt>: skips pretraining "
+                             "and continues the step counter. Errors if no checkpoints exist.")
     args = parser.parse_args()
 
     if args.verbose:
@@ -146,6 +150,42 @@ def main() -> None:
         )
     else:
         trainer = PPOTrainer.from_config(device=device, checkpoint_dir=checkpoint_dir)
+
+    # --latest: auto-discover the most recent checkpoint across all run dirs.
+    if args.latest:
+        import glob as _glob, re as _re, os as _os
+        _ckpt_base = Path("checkpoints")
+        _prefix = f"phase{args.phase}_run"
+        # Prefer latest.pt symlinks first (always the newest in their run dir),
+        # then fall back to the numerically-sorted regular checkpoints.
+        _run_dirs = sorted(
+            _glob.glob(str(_ckpt_base / f"{_prefix}*/")),
+            key=lambda d: int(m.group(1)) if (m := _re.search(rf"{_prefix}(\d+)", d)) else -1,
+        )
+        _latest_path: Path | None = None
+        for _rd in reversed(_run_dirs):
+            _symlink = Path(_rd) / "latest.pt"
+            if _symlink.exists():
+                _latest_path = _symlink
+                break
+            # No latest.pt — find highest-numbered checkpoint in this dir
+            _pts = [
+                Path(p) for p in _glob.glob(str(Path(_rd) / "checkpoint*.pt"))
+                if not _os.path.basename(p).startswith("checkpoint_pretrained")
+            ]
+            if _pts:
+                _latest_path = max(
+                    _pts,
+                    key=lambda p: int(m.group(1)) if (m := _re.search(r"(\d+)", p.name)) else -1,
+                )
+                break
+        if _latest_path is None:
+            log.error(f"--latest: no checkpoints found under {_ckpt_base}/{_prefix}*/")
+            return
+        log.info(f"--latest: resolved to {_latest_path}")
+        if args.checkpoint:
+            log.warning("--latest overrides --checkpoint")
+        args.checkpoint = str(_latest_path)
 
     # Optionally resume from checkpoint
     if args.checkpoint:
