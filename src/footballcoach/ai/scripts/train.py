@@ -200,6 +200,12 @@ def main() -> None:
         trainer.load_checkpoint(ptrain_path)
         trainer._total_steps = 0  # reset step counter so pretraining + full PPO run from scratch
         log.info(f"Loaded checkpoint for re-pretraining: {ptrain_path} — will still run BC/value pre-training")
+        if not args.bc_dataset:
+            log.warning(
+                "--pretrain-from-checkpoint used without --bc-dataset: "
+                "will fall back to noisy online BC pre-training. "
+                "Pass --bc-dataset demonstrations/phase1/ for full combined pre-training."
+            )
 
     # --from-pretrained: load a pre-trained checkpoint and skip all pre-training
     if args.from_pretrained:

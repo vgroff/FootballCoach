@@ -74,7 +74,9 @@ class Renderer:
         # Pre-render + scale-down cache so we don't do the slow transform every frame.
         self._icon_cache: dict[str, pygame.Surface] = {}
         self.min_player_radius_px: int = gcfg["player"]["min_radius_px"]
+        self._possession_outline_thickness: int = gcfg["player"].get("possession_outline_thickness", 2)
         self.min_ball_radius_px: int = gcfg["ball"]["min_radius_px"]
+        self._ball_outline: bool = gcfg["ball"].get("outline", False)
         sl = gcfg["speed_lines"]
         self._speed_line_threshold: float = sl["threshold_mps"]
         self._speed_line_count: int = sl["count"]
@@ -143,7 +145,8 @@ class Renderer:
         radius_px = max(2, int(base_radius_px * height_boost))
 
         pygame.draw.circle(surface, style.BALL_COLOUR, pos, radius_px)
-        pygame.draw.circle(surface, style.BALL_OUTLINE, pos, radius_px, 1)
+        if self._ball_outline:
+            pygame.draw.circle(surface, style.BALL_OUTLINE, pos, radius_px, 1)
 
         # Ball state indicator rings (drawn on top of the ball circle).
         # Priority: just_bounced > flying > rolling (mutually exclusive for display).
@@ -190,13 +193,19 @@ class Renderer:
 
         # --- Speed lines: drawn first so they appear behind the player circle ---
         if player.speed_mps > self._speed_line_threshold:
-            # Trailing lines go opposite to heading direction (behind the player).
+            # Trail direction: opposite to heading (behind the player).
             trail_dx = -math.cos(-player.heading_rad)
             trail_dy = -math.sin(-player.heading_rad)
-            for i in range(self._speed_line_count):
-                start_dist = radius_px + (i + 1) * self._speed_line_gap_px
-                sx = pos[0] + trail_dx * start_dist
-                sy = pos[1] + trail_dy * start_dist
+            # Perpendicular (90° to heading): lines are spread side-by-side
+            # across the player's width, not stacked along the trail.
+            perp_dx = -trail_dy
+            perp_dy = trail_dx
+            start_dist = radius_px + 2
+            n = self._speed_line_count
+            for i in range(n):
+                perp_offset = (i - (n - 1) / 2.0) * self._speed_line_gap_px
+                sx = pos[0] + trail_dx * start_dist + perp_dx * perp_offset
+                sy = pos[1] + trail_dy * start_dist + perp_dy * perp_offset
                 ex = sx + trail_dx * self._speed_line_length_px
                 ey = sy + trail_dy * self._speed_line_length_px
                 pygame.draw.line(surface, style.SPEED_LINE_COLOUR, (int(sx), int(sy)), (int(ex), int(ey)), 2)
@@ -228,7 +237,7 @@ class Renderer:
             pygame.draw.circle(surface, style.INACTIVE_OUTLINE, pos, radius_px + 4, 2)
 
         if has_ball:
-            pygame.draw.circle(surface, style.POSSESSION_OUTLINE, pos, radius_px + 2, 2)
+            pygame.draw.circle(surface, style.POSSESSION_OUTLINE, pos, radius_px + 2, self._possession_outline_thickness)
         if selected:
             pygame.draw.circle(surface, style.SELECTED_OUTLINE, pos, radius_px + 7, 2)
 

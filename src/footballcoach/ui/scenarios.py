@@ -133,6 +133,10 @@ class ScenarioDefinition:
     build: Callable[..., Match]   # (rng_reduction, **kwargs) -> Match
     params: list[AnyScenarioParam] = field(default_factory=list)
     on_tick: Callable[[Match, int], None] | None = None
+    box_possession_terminal: bool = True
+    """If False, ScenarioLoop never ends a trial on box possession alone.
+    Use for scenarios (e.g. 1v2) where the attacker is expected to enter
+    the box and should be allowed to shoot, get tackled, or score naturally."""
 
 
 def build_penalty_scenario(rng_reduction: float = 0.3) -> Match:
@@ -1247,6 +1251,7 @@ SCENARIOS: list[ScenarioDefinition] = [
         description="Elite attacker (skill=0.9) runs at goal; average defender+GK defend.",
         build=build_1v2_scenario,
         on_tick=None,
+        box_possession_terminal=False,  # attacker enters box to shoot; only end on goal/out/dispossession
         params=[
             ScenarioParam("attacker_skill", "Attacker skill", 0.3, 1.0, 0.05, 0.9),
             ScenarioParam("defender_skill", "Defender skill", 0.3, 1.0, 0.05, 0.55),
@@ -1438,15 +1443,18 @@ class ScenarioLoop:
         # Box possession: any player reached the opponent's box with the ball.
         # Mirrors ScenarioEnv's box_terminal / opponent_box_terminal logic:
         # Team.LEFT attacks +x so their opponent box is the right box (left=False).
-        from footballcoach.entities.player import Team as _Team
-        for player in self._match.players:
-            if ball.possessed_by == player.player_id:
-                in_opp_box = pitch.is_in_box(
-                    ball.position,
-                    left=(player.team == _Team.RIGHT),  # opponent box for LEFT; mirrored for RIGHT
-                )
-                if in_opp_box:
-                    return "other", self.linger_s
+        # Skipped when definition.box_possession_terminal is False (e.g. 1v2,
+        # where the attacker is meant to enter the box and play to a natural end).
+        if self.definition.box_possession_terminal:
+            from footballcoach.entities.player import Team as _Team
+            for player in self._match.players:
+                if ball.possessed_by == player.player_id:
+                    in_opp_box = pitch.is_in_box(
+                        ball.position,
+                        left=(player.team == _Team.RIGHT),  # opponent box for LEFT; mirrored for RIGHT
+                    )
+                    if in_opp_box:
+                        return "other", self.linger_s
 
         from footballcoach.rules_ai import NeuralPlayerAI
         # Only trigger early termination if there are rules-based AI players
