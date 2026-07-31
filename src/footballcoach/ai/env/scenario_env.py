@@ -127,6 +127,7 @@ class ScenarioEnv:
         # last_secondary_results: list of same dicts for secondary neural players
         self.last_trainee_transition: Optional[dict] = None
         self.last_secondary_results: list = []
+        self.last_reward_components: dict[str, float] = {}
 
     # -----------------------------------------------------------------------
     # Gym-like API
@@ -161,6 +162,7 @@ class ScenarioEnv:
         self._sec_had_possession_last_step = {pid: False for pid in self.secondary_player_ids}
         self.last_trainee_transition = None
         self.last_secondary_results = []
+        self.last_reward_components: dict[str, float] = {}
 
         # Assign NeuralPlayerAI to trainee (and secondary players) when a
         # sampling function is available.  Rules-based and immobile players
@@ -320,7 +322,7 @@ class ScenarioEnv:
 
         timeout = self._episode_ticks >= int(self.max_episode_s / self._dt_s)
         if self.phase == 1:
-            reward = phase1_reward(
+            reward, self.last_reward_components = phase1_reward(
                 prev_ball_dist=prev_ball_dist,
                 curr_ball_dist=curr_ball_dist,
                 has_possession_now=trainee_has_possession_now,
@@ -412,7 +414,7 @@ class ScenarioEnv:
             sec_box_terminal = sec_in_atk_box and match.ball.possessed_by == pid
 
             if self.phase == 1:
-                sec_reward = phase1_reward(
+                sec_reward, _sec_comps = phase1_reward(
                     prev_ball_dist=pre["prev_ball_dist"],
                     curr_ball_dist=sec_curr_ball_dist,
                     has_possession_now=sec_has_poss_now,
@@ -431,12 +433,16 @@ class ScenarioEnv:
                 )
             else:
                 sec_reward = 0.0
+                _sec_comps = {}
 
             self.last_secondary_results.append({
                 **sec_player.ai.last_transition,
                 "reward": sec_reward,
                 "done": 1.0 if done else 0.0,
             })
+            # Accumulate secondary components into last_reward_components
+            for _k, _v in _sec_comps.items():
+                self.last_reward_components[_k] = self.last_reward_components.get(_k, 0.0) + _v
 
         return self._get_obs(), reward, done, info
 

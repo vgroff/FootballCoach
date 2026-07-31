@@ -36,6 +36,6 @@
     "league_one": { "mean": 0.4, "sigma": 0.09 },
     "league_two": { "mean": 0.32, "sigma": 0.08 },
     "league_three": { "mean": 0.25, "sigma": 0.07 },
-    "generic": { "mean": 0.5, "sigma": 0.2 }
+    "generic": { "mean": 0.55, "sigma": 0.23 }
   }
 }

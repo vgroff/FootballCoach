@@ -12,7 +12,7 @@ Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_
 
 Immedaite task!!
 Read ai_trainer_knowledge.md, and then run a training run.
-- the tackling and taking control/possession seems to work weirdly
+- the tackling and taking control/possession seems to work weirdly - check the logs in a 1v2 rules scenario
 - I still don't like the per-tick rewards, because longer trials have more of the, it doesnt make sense really have to be very careful
 - We could super easliy remove a whole axis of symmetry by transforming all AI positions to being +x is attacking goal, -x is dending goal, remove the flag for which end youre attacking on and transform back and forth from the engine positions to the AI positions. Would probably mean a smaller/smarter AI and faster trainnig from fewer augmentations (half the training time)
     - I think all that needs changing is absolute coordinates - i.e. player position and move region (?). and then augmentation and team flags removed.

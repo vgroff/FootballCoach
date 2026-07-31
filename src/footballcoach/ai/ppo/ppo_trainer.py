@@ -216,6 +216,7 @@ class PPOTrainer:
         episode_outcomes_vs_rules: list[str] = []
         episode_outcomes_vs_neural: list[str] = []
         episode_outcomes_vs_immobile: list[str] = []
+        rollout_components: dict[str, float] = {}
 
         log.info(f"PPO training started: steps_so_far={self._total_steps:,}  target={self._total_steps + total_steps:,}  (+{total_steps:,} this run)")
 
@@ -284,6 +285,8 @@ class PPOTrainer:
                 self._total_steps += 1
 
             episode_reward_accum += reward
+            for _k, _v in getattr(env, "last_reward_components", {}).items():
+                rollout_components[_k] = rollout_components.get(_k, 0.0) + _v
             self._total_steps += 1
             steps_this_rollout += 1
 
@@ -363,6 +366,14 @@ class PPOTrainer:
                     f" sh={ha.get('sh','?'):>3} hld={ha.get('hld','?'):>3}"
                 ) if ha else ""
                 opp_rew_str = f"/{mean_opp_reward:.2f}" if not (mean_opp_reward != mean_opp_reward) else ""
+                comp_parts = [
+                    f"{k}={v:+.2f}"
+                    for k in ("dist", "poss", "prog", "out", "ill", "box", "spd", "lpos", "lterm", "tout", "prox")
+                    if abs(rollout_components.get(k, 0.0)) > 0.01
+                    for v in (rollout_components[k],)
+                ]
+                comp_str = ("  rew_src: " + " ".join(comp_parts)) if comp_parts else ""
+                rollout_components.clear()
                 log.info(
                     f"step={self._total_steps:,} | "
                     f"rew={mean_ep_reward:.2f}{opp_rew_str} | "
@@ -375,6 +386,7 @@ class PPOTrainer:
                     f"{mv_ls_str}"
                     f"{act_str}"
                     f"{outcome_str}"
+                    f"{comp_str}"
                 )
 
                 buffer.clear()
@@ -1145,6 +1157,10 @@ class PPOTrainer:
         # Per-head log_probs for DEBUG KL breakdown (stored alongside total in buffer)
         _lsm = self.execution_net.move_dir_log_std
         _lsk = self.execution_net.kick_dir_log_std
+        # Debug per-head log_probs: apply same masking as _compute_log_prob
+        # so these values match what went into the stored total log_prob.
+        _exec_move_active = float(exec_move) > 0.5
+        _kick_active = float(kick) > 0.5
         head_log_probs = np.array([
             float(IndependentBernoulli(d_heads.shoot_logit).log_prob(shoot).sum()),
             float(IndependentBernoulli(d_heads.pass_logit).log_prob(pass_).sum()),
@@ -1154,11 +1170,14 @@ class PPOTrainer:
             float(IndependentBernoulli(d_heads.mark_logit).log_prob(mark).sum()),
             float(IndependentBernoulli(d_heads.hold_position_logit).log_prob(hold).sum()),
             float(IndependentBernoulli(e_heads.exec_move_logit).log_prob(exec_move).sum()),
-            float(IndependentBernoulli(e_heads.sprint_logit).log_prob(sprint).sum()),
+            # sprint: only when exec_move=True
+            float(IndependentBernoulli(e_heads.sprint_logit).log_prob(sprint).sum()) if _exec_move_active else 0.0,
             float(IndependentBernoulli(e_heads.kick_logit).log_prob(kick).sum()),
             float(IndependentBernoulli(e_heads.tackle_attempt_logit).log_prob(tackle_attempt).sum()),
-            float(self.ent_dir_weight * self._dir_head(e_heads.move_direction, _lsm).log_prob(move_dir_raw)),
-            float(self.ent_dir_weight * self._dir_head(e_heads.kick_direction, _lsk).log_prob(kick_dir_raw)),
+            # move_dir: only when exec_move=True
+            float(self.ent_dir_weight * self._dir_head(e_heads.move_direction, _lsm).log_prob(move_dir_raw)) if _exec_move_active else 0.0,
+            # kick_dir: only when kick=True
+            float(self.ent_dir_weight * self._dir_head(e_heads.kick_direction, _lsk).log_prob(kick_dir_raw)) if _kick_active else 0.0,
         ], dtype=np.float32)
 
         # Build DecisionAction for storage
@@ -1238,24 +1257,29 @@ class PPOTrainer:
                 samples["mark_tgt"]
             )
 
-        # Execution Bernoulli heads
+        # Unconditional execution Bernoulli heads
         lp += IndependentBernoulli(e_heads.exec_move_logit).log_prob(samples["exec_move"]).sum()
-        lp += IndependentBernoulli(e_heads.sprint_logit).log_prob(samples["sprint"]).sum()
         lp += IndependentBernoulli(e_heads.kick_logit).log_prob(samples["kick"]).sum()
         lp += IndependentBernoulli(e_heads.tackle_attempt_logit).log_prob(
             samples["tackle_attempt"]
         ).sum()
 
-        # Direction heads: weighted to prevent large continuous-head variance from
-        # dominating the ratio. ent_dir_weight < 1 damps their contribution.
+        # Sub-parameters gated by parent action — only contribute to log_prob
+        # when the parent was actually taken.  Unconditional inclusion injects
+        # large-variance noise from unused heads and inflates KL divergence.
         log_std_move = self.execution_net.move_dir_log_std
         log_std_kick = self.execution_net.kick_dir_log_std
-        lp += self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).log_prob(
-            samples["move_dir_raw"]
-        )
-        lp += self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
-            samples["kick_dir_raw"]
-        )
+        # sprint + move_dir: only when exec_move=True (player was moving)
+        if float(samples["exec_move"]) > 0.5:
+            lp += IndependentBernoulli(e_heads.sprint_logit).log_prob(samples["sprint"]).sum()
+            lp += self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).log_prob(
+                samples["move_dir_raw"]
+            )
+        # kick_dir: only when kick=True (a kick was taken)
+        if float(samples["kick"]) > 0.5:
+            lp += self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+                samples["kick_dir_raw"]
+            )
 
         return lp
 
@@ -1659,11 +1683,10 @@ class PPOTrainer:
         lp += _b(d_heads.mark_logit, "mark")
         lp += _b(d_heads.hold_position_logit, "hold_position")
         lp += _b(e_heads.exec_move_logit, "exec_move")
-        lp += _b(e_heads.sprint_logit, "sprint")
         lp += _b(e_heads.kick_logit, "kick")
         lp += _b(e_heads.tackle_attempt_logit, "tackle_attempt")
 
-        # Target categorical log_probs (gated by intent)
+        # Target categorical log_probs (gated by parent intent)
         pass_mask = mb_actions["pass_"].squeeze(-1) > 0.5
         tackle_mask = mb_actions["tackle"].squeeze(-1) > 0.5
         mark_mask = mb_actions["mark"].squeeze(-1) > 0.5
@@ -1679,35 +1702,55 @@ class PPOTrainer:
                 )
                 lp[mask] += cat_lp[mask]
 
-        # Direction heads: weighted to match _compute_log_prob (must stay consistent).
+        # Sub-parameters gated by parent action (vectorised float mask over minibatch).
+        # sprint + move_dir only contribute when exec_move=True.
+        # kick_dir only contributes when kick=True.
+        # Without this gating, unused heads inject large-variance log_prob noise
+        # that inflates KL and triggers spurious early stops every rollout.
         log_std_move = self.execution_net.move_dir_log_std.to(self.device)
         log_std_kick = self.execution_net.kick_dir_log_std.to(self.device)
-        lp += self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).log_prob(
-            mb_actions["move_dir_raw"]
+        exec_move_mask = (mb_actions["exec_move"].squeeze(-1) > 0.5).float()
+        kick_mask = (mb_actions["kick"].squeeze(-1) > 0.5).float()
+        lp += exec_move_mask * _b(e_heads.sprint_logit, "sprint")
+        lp += exec_move_mask * (
+            self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).log_prob(
+                mb_actions["move_dir_raw"]
+            )
         )
-        lp += self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
-            mb_actions["kick_dir_raw"]
+        lp += kick_mask * (
+            self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+                mb_actions["kick_dir_raw"]
+            )
         )
 
         return lp
 
     def _compute_entropy(self, d_heads, e_heads, exists_mask) -> torch.Tensor:
+        """Entropy bonus, consistent with the masked log_prob.
+
+        Sub-parameter heads (sprint, move_dir, kick_dir) are weighted by
+        E[parent active] to match the masking in _recompute_log_prob where
+        those terms are 0 when the parent is not taken.
+        """
         ent = torch.zeros(1, device=self.device)
+        # Unconditional heads (no parent gate)
         for logit in [
             d_heads.shoot_logit, d_heads.pass_logit, d_heads.move_logit,
             d_heads.tackle_logit, d_heads.get_possession_raw, d_heads.mark_logit,
-            d_heads.hold_position_logit, e_heads.exec_move_logit, e_heads.sprint_logit,
+            d_heads.hold_position_logit, e_heads.exec_move_logit,
             e_heads.kick_logit, e_heads.tackle_attempt_logit,
         ]:
             ent += IndependentBernoulli(logit).entropy().mean()
         for logits in [d_heads.pass_target_logits, d_heads.tackle_target_logits, d_heads.mark_target_logits]:
             ent += MaskedCategorical(logits, exists_mask).entropy().mean()
-        # Direction heads: weighted by ent_dir_weight to stay consistent with
-        # how direction contributes to log_prob (and therefore the ratio).
+        # Sub-parameters: scale by E[parent active] to match masked log_prob.
         log_std_move = self.execution_net.move_dir_log_std
         log_std_kick = self.execution_net.kick_dir_log_std
-        ent += self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).entropy().mean()
-        ent += self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).entropy().mean()
+        p_exec_move = torch.sigmoid(e_heads.exec_move_logit).mean()
+        p_kick = torch.sigmoid(e_heads.kick_logit).mean()
+        ent += p_exec_move * IndependentBernoulli(e_heads.sprint_logit).entropy().mean()
+        ent += p_exec_move * self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).entropy().mean()
+        ent += p_kick * self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).entropy().mean()
         return ent
 
     # -----------------------------------------------------------------------

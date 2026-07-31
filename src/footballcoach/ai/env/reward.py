@@ -10,6 +10,20 @@ reward for that step.
 
 Convention: reward is always a Python float, accumulated over the engine
 ticks within one decision interval and returned as one scalar per step.
+
+phase1_reward() returns a (float, dict[str, float]) tuple where the dict
+breaks the total down by source key:
+  dist  — ball distance shaping
+  poss  — gain possession bonus
+  prog  — ball progress while in possession
+  out   — ball out of bounds penalty
+  ill   — illegal action penalty
+  box   — box possession terminal
+  spd   — speed bonus (fast finish)
+  lpos  — loss of possession penalty
+  lterm — loss terminal (opponent reaches trainee box)
+  tout  — timeout penalty
+  prox  — proximity bonus on timeout
 """
 from __future__ import annotations
 
@@ -30,42 +44,42 @@ def phase1_reward(
     lost_possession_this_step: bool = False,
     timed_out: bool = False,
     ball_dist_to_opponent_box_m: float = 9999.0,
-) -> float:
+) -> tuple[float, dict[str, float]]:
     """GetPossession/Move experiment reward (curriculum phase 1).
 
-    See ai_design_doc.md section 10.1.
+    Returns a (total_reward, components) tuple where components maps short
+    source keys to their individual contributions for this step.
+    See module docstring for key definitions.
 
-    Args:
-        prev_ball_dist: Distance to ball at start of this decision step.
-        curr_ball_dist: Distance to ball at end of this decision step.
-        has_possession_now: Player currently has ball.
-        gained_possession_this_step: Player won the ball during this step.
-        ball_progress_toward_goal_m: Metres the ball advanced toward the
-            opponent's goal during this step (negative = moved away).
-        ball_went_out_after_touch: Ball went out of bounds after the
-            trainee player touched it.
-        illegal_action_attempted: reward function received an illegal-action
-            flag from to_orders.py.
-        reached_opponent_box_with_possession: Terminal bonus condition.
-        cfg: The 'reward.phase1' section of ai_config.json.
-        time_fraction_remaining: 1 - (ticks_elapsed / max_ticks), in [0, 1].
-            Used for the speed bonus on terminal.
-        start_ball_to_box_dist_m: Distance from ball to opponent box edge at
-            episode start. Normalises the speed bonus so long runs score higher
-            than trivial nearby finishes.
+    See ai_design_doc.md section 10.1.
     """
     r = 0.0
-    r += cfg["ball_distance_shaping"] * (prev_ball_dist - curr_ball_dist)
-    if gained_possession_this_step:
-        r += cfg["gain_possession_bonus"]
-    if has_possession_now:
-        r += cfg["ball_progress_scale"] * ball_progress_toward_goal_m
-    if ball_went_out_after_touch:
-        r += cfg["ball_out_penalty"]
-    if illegal_action_attempted:
-        r += cfg["illegal_action_penalty"]
+    comps: dict[str, float] = {}
+
+    dist_r = cfg["ball_distance_shaping"] * (prev_ball_dist - curr_ball_dist)
+    r += dist_r
+    comps["dist"] = dist_r
+
+    poss_r = cfg["gain_possession_bonus"] if gained_possession_this_step else 0.0
+    r += poss_r
+    comps["poss"] = poss_r
+
+    prog_r = cfg["ball_progress_scale"] * ball_progress_toward_goal_m if has_possession_now else 0.0
+    r += prog_r
+    comps["prog"] = prog_r
+
+    out_r = cfg["ball_out_penalty"] if ball_went_out_after_touch else 0.0
+    r += out_r
+    comps["out"] = out_r
+
+    ill_r = cfg["illegal_action_penalty"] if illegal_action_attempted else 0.0
+    r += ill_r
+    comps["ill"] = ill_r
+
+    box_r = 0.0
+    spd_r = 0.0
     if reached_opponent_box_with_possession:
-        r += cfg["box_possession_terminal"]
+        box_r = cfg["box_possession_terminal"]
         # Speed bonus: reward finishing faster, scaled by how far the ball
         # had to travel so a nearby start doesn't trivially earn a large bonus.
         # bonus = scale × time_remaining_fraction × clamp(start_dist / 30m, 0, 1.5)
@@ -73,20 +87,34 @@ def phase1_reward(
         speed_scale = float(cfg.get("speed_bonus_scale", 0.0))
         if speed_scale > 0.0:
             dist_weight = min(start_ball_to_box_dist_m / 30.0, 1.5)
-            r += speed_scale * time_fraction_remaining * dist_weight
-    if lost_possession_this_step:
-        r += cfg.get("loss_of_possession_penalty", 0.0)
-    if opponent_reached_trainee_box:
-        r += cfg.get("loss_terminal", 0.0)
+            spd_r = speed_scale * time_fraction_remaining * dist_weight
+    r += box_r + spd_r
+    comps["box"] = box_r
+    comps["spd"] = spd_r
+
+    lpos_r = cfg.get("loss_of_possession_penalty", 0.0) if lost_possession_this_step else 0.0
+    r += lpos_r
+    comps["lpos"] = lpos_r
+
+    lterm_r = cfg.get("loss_terminal", 0.0) if opponent_reached_trainee_box else 0.0
+    r += lterm_r
+    comps["lterm"] = lterm_r
+
+    tout_r = 0.0
+    prox_r = 0.0
     if timed_out:
-        r += cfg.get("timeout_penalty", 0.0)
+        tout_r = cfg.get("timeout_penalty", 0.0)
         # Proximity bonus on timeout: consolation for how close you got with the ball.
         # scale * max(0, 1 - dist_to_box / 30m)  → 0 if 30m+ away, scale if at box edge.
         prox_scale = float(cfg.get("proximity_bonus_scale", 0.0))
         if prox_scale > 0.0:
             prox = max(0.0, 1.0 - ball_dist_to_opponent_box_m / 30.0)
-            r += prox_scale * prox
-    return r
+            prox_r = prox_scale * prox
+    r += tout_r + prox_r
+    comps["tout"] = tout_r
+    comps["prox"] = prox_r
+
+    return r, comps
 
 
 def phase2_reward(
