@@ -258,7 +258,7 @@ class KickOrder:
 
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
         """Kick the ball this tick if the player has possession.  Always completes in one tick."""
-        player.kick_direct(match, self.aim_point, self.power_fraction, self.spin)
+        player.kick_direct(match, self.aim_point, self.power_fraction, self.spin, self.compensate_for_run)
         return True
 
 
@@ -610,24 +610,28 @@ class ShootOrder:
 
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
         """Shoot at aim_point if player has possession; may pause when a blocker is on the line."""
-        from footballcoach.engine.kicking import compensate_power_for_run_mult, has_blocker_on_shot_line, kick_ball, running_power_multiplier
+        from footballcoach.engine.kicking import (
+            SHOT_BLOCKER_THRESHOLD_M,
+            SHOT_PAUSE_ADVANCE_M,
+            compensate_power_for_run_mult,
+            has_blocker_on_shot_line,
+            kick_ball,
+            running_power_multiplier,
+        )
         from footballcoach.engine.movement import effective_top_speed
-
-        _SHOT_BLOCKER_M = 1.0
-        _SHOT_PAUSE_M = 2.0
 
         if match.ball.possessed_by != player.player_id:
             return True  # no-op: lost ball
 
         opposition = [p for p in match.players if p.team != player.team]
         if (self.chance_of_pausing > 0.0
-                and has_blocker_on_shot_line(player.position, self.aim_point, opposition, _SHOT_BLOCKER_M)
+                and has_blocker_on_shot_line(player.position, self.aim_point, opposition, SHOT_BLOCKER_THRESHOLD_M)
                 and match.rng.random() < self.chance_of_pausing):
             aim_dir = (self.aim_point - player.position).xy()
             aim_len = aim_dir.length_xy()
             if aim_len > 1e-9:
                 step_dir = aim_dir / aim_len
-                raw_target = player.position.xy() + step_dir * _SHOT_PAUSE_M
+                raw_target = player.position.xy() + step_dir * SHOT_PAUSE_ADVANCE_M
                 clamped_target = Vector3(
                     max(-match.pitch.half_length + 0.5, min(match.pitch.half_length - 0.5, raw_target.x)),
                     max(-match.pitch.half_width + 0.5, min(match.pitch.half_width - 0.5, raw_target.y)),

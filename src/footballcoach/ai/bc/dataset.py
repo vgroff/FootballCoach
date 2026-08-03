@@ -38,7 +38,20 @@ from typing import Generator
 import numpy as np
 import torch
 
-from footballcoach.ai.ppo.bc import BC_LABEL_DIM
+from footballcoach.ai.obs.schema import AI_TYPE_ONE_HOT_DIM
+from footballcoach.ai.ppo.bc import (
+    AI_TYPE_IMMOBILE,
+    AI_TYPE_NEURAL,
+    AI_TYPE_RULES,
+    BC_LABEL_DIM,
+    _I_AI_TYPE,
+    _I_DIR_X,
+    _I_DIR_Y,
+    _I_KICK_THIS_TICK,
+    _I_OPPONENT_AI_TYPE,
+    _I_TACKLE_ATTEMPT,
+    _I_VALID,
+)
 
 log = logging.getLogger("footballcoach.ai.bc.dataset")
 
@@ -71,6 +84,7 @@ class DemonstrationDataset:
         self._rewards = rewards if rewards is not None else np.zeros(n, dtype=np.float32)
         self._dones   = dones   if dones   is not None else np.zeros(n, dtype=np.float32)
         self._n = n
+        self._trivial_mask_cache: np.ndarray | None = None
 
     @property
     def has_rewards(self) -> bool:
@@ -85,13 +99,28 @@ class DemonstrationDataset:
         """Load a single .npz file."""
         data = np.load(path)
         n = len(data["obs_self_feat"])
+        bc_labels = data["bc_labels"]
+        # Schema guard: bc_labels' last dim must match the current BC_LABEL_DIM
+        # (currently 18, after the W6 opponent_ai_type field was appended at
+        # index 17, on top of the W5 ai_type field at index 16).
+        # Older recordings (16- or 17-wide) are no longer loadable — they
+        # must be re-recorded via record_demonstrations.py.
+        if bc_labels.shape[-1] != BC_LABEL_DIM:
+            raise ValueError(
+                f"{path}: bc_labels has width {bc_labels.shape[-1]}, expected "
+                f"BC_LABEL_DIM={BC_LABEL_DIM}. This .npz was recorded with an "
+                f"older BC label schema (e.g. missing the ai_type/opponent_ai_type field). "
+                f"Re-record demonstrations: "
+                f"uv run python -m footballcoach.ai.scripts.record_demonstrations "
+                f"--phase 1 --n-episodes <N> --output <dir>"
+            )
         return cls(
             obs_self_feat=data["obs_self_feat"],
             obs_other_feat=data["obs_other_feat"],
             obs_exists_mask=data["obs_exists_mask"],
             obs_ball_feat=data["obs_ball_feat"],
             obs_global_feat=data["obs_global_feat"],
-            bc_labels=data["bc_labels"],
+            bc_labels=bc_labels,
             rewards=data["rewards"] if "rewards" in data else np.zeros(n, dtype=np.float32),
             dones=data["dones"]     if "dones"   in data else np.zeros(n, dtype=np.float32),
         )
@@ -127,9 +156,131 @@ class DemonstrationDataset:
         log.info(f"Dataset: {len(ds):,} steps loaded")
         return ds
 
-    # Only steps where bc_labels[:, -1] == 1.0 (valid flag) are useful.
+    # Only steps where bc_labels[:, _I_VALID] == 1.0 (valid flag) are useful.
     def valid_indices(self) -> np.ndarray:
-        return np.where(self._labels[:, -1] > 0.5)[0]
+        return np.where(self._labels[:, _I_VALID] > 0.5)[0]
+
+    def compute_pos_weights(self) -> dict[str, float]:
+        """Inverse-frequency weights for rare Bernoulli BC targets.
+
+        weight = n_negative / max(n_positive, 1), matching
+        ``torch.nn.functional.binary_cross_entropy_with_logits``'s
+        ``pos_weight`` argument semantics (weight applied to the positive
+        class term). Computed once over all valid rows in this dataset.
+        """
+        valid = self.valid_indices()
+        labels = self._labels[valid]
+        out: dict[str, float] = {}
+        for name, col in [
+            ("kick", _I_KICK_THIS_TICK),
+            ("tackle_attempt", _I_TACKLE_ATTEMPT),
+        ]:
+            n_pos = float((labels[:, col] > 0.5).sum())
+            n_neg = float(len(labels)) - n_pos
+            out[name] = n_neg / max(n_pos, 1.0)
+        return out
+
+    def _compute_trivial_mask(
+        self,
+        cos_threshold: float = 0.98,
+        exclude_radius_steps: int = 5,
+    ) -> np.ndarray:
+        """Static (epoch-independent) mask of rows eligible for downsampling.
+
+        A row is "trivial" if its ``move_direction`` label is closely aligned
+        (cosine similarity above ``cos_threshold``) with the immediately
+        preceding row's ``move_direction`` *within the same episode* — i.e.
+        "moving the same way as before, nothing interesting changed".
+
+        Row 0 of every episode (no valid "previous" row within the episode)
+        is never eligible. Rows within ``exclude_radius_steps`` of a
+        ``kick_this_tick=1`` or ``tackle_attempt=1`` row (same episode) are
+        also never eligible, so straight-line run-ups immediately preceding
+        a rare event are not stripped.
+
+        Computed once at load time; the *exclusion subset* drawn from this
+        mask is what gets freshly re-rolled every epoch (see
+        ``iterate_minibatches``).
+        """
+        n = self._n
+        trivial = np.zeros(n, dtype=bool)
+        if n == 0:
+            return trivial
+
+        dir_x = self._labels[:, _I_DIR_X]
+        dir_y = self._labels[:, _I_DIR_Y]
+        norm = np.sqrt(dir_x ** 2 + dir_y ** 2)
+        has_dir = norm > 1e-6
+
+        # Episode-boundary-aware "previous row" lookup: row i's previous row
+        # is i-1, unless dones[i-1] marks i-1 as an episode's final step.
+        prev_is_same_episode = np.ones(n, dtype=bool)
+        prev_is_same_episode[0] = False
+        if n > 1:
+            prev_is_same_episode[1:] = self._dones[:-1] <= 0.5
+
+        cos_sim = np.zeros(n, dtype=np.float64)
+        eligible = has_dir & prev_is_same_episode
+        eligible[1:] &= has_dir[:-1]
+        idx = np.where(eligible)[0]
+        if len(idx) > 0:
+            cur = np.stack([dir_x[idx], dir_y[idx]], axis=-1)
+            prev = np.stack([dir_x[idx - 1], dir_y[idx - 1]], axis=-1)
+            cur_n = cur / np.maximum(np.linalg.norm(cur, axis=-1, keepdims=True), 1e-6)
+            prev_n = prev / np.maximum(np.linalg.norm(prev, axis=-1, keepdims=True), 1e-6)
+            cos_sim[idx] = (cur_n * prev_n).sum(axis=-1)
+        trivial[idx] = cos_sim[idx] > cos_threshold
+
+        # Exclude rows within exclude_radius_steps of a rare event, same episode.
+        rare_event = (self._labels[:, _I_KICK_THIS_TICK] > 0.5) | (self._labels[:, _I_TACKLE_ATTEMPT] > 0.5)
+        if exclude_radius_steps > 0 and rare_event.any():
+            near_rare = np.zeros(n, dtype=bool)
+            rare_idx = np.where(rare_event)[0]
+            # Episode ids via cumulative-sum of dones (shifted so boundary row
+            # keeps the episode it belongs to).
+            episode_id = np.concatenate([[0], np.cumsum(self._dones[:-1] > 0.5)]) if n > 1 else np.zeros(1)
+            for ri in rare_idx:
+                lo = max(0, ri - exclude_radius_steps)
+                hi = min(n, ri + exclude_radius_steps + 1)
+                same_ep = episode_id[lo:hi] == episode_id[ri]
+                near_rare[lo:hi] |= same_ep
+            trivial &= ~near_rare
+
+        return trivial
+
+    def downsample_trivial_stats(
+        self,
+        valid_only: bool = True,
+        cos_threshold: float = 0.98,
+        exclude_radius_steps: int = 5,
+        frac: float = 0.0,
+    ) -> dict:
+        """Report how many rows qualify as "trivial" and how many would be
+        excluded at a given ``frac``, for logging/diagnostics.
+
+        Uses (and populates) the same cached ``_trivial_mask_cache`` as
+        ``iterate_minibatches(downsample_trivial_frac=...)``, so the reported
+        counts match what training actually sees.
+
+        Returns:
+            dict with ``n_total``, ``n_trivial``, ``trivial_frac`` (fraction
+            of ``n_total`` classified trivial), ``n_excluded_at_frac``
+            (expected row count excluded this epoch at the given ``frac``).
+        """
+        indices = self.valid_indices() if valid_only else np.arange(self._n)
+        if self._trivial_mask_cache is None:
+            self._trivial_mask_cache = self._compute_trivial_mask(
+                cos_threshold=cos_threshold,
+                exclude_radius_steps=exclude_radius_steps,
+            )
+        n_total = len(indices)
+        n_trivial = int(self._trivial_mask_cache[indices].sum())
+        return {
+            "n_total": n_total,
+            "n_trivial": n_trivial,
+            "trivial_frac": n_trivial / n_total if n_total > 0 else 0.0,
+            "n_excluded_at_frac": int(round(n_trivial * frac)),
+        }
 
     def compute_returns(self, gamma: float = 0.99) -> np.ndarray:
         """Compute discounted returns G_t = r_t + gamma*r_{t+1} + ... per step.
@@ -163,6 +314,7 @@ class DemonstrationDataset:
         returns: np.ndarray,
         shuffle: bool = True,
         device: torch.device | None = None,
+        valid_only: bool = False,
     ):
         """Yield (obs_dict, returns_batch) minibatches for value pre-training.
 
@@ -171,20 +323,33 @@ class DemonstrationDataset:
             returns: Pre-computed return array from ``compute_returns()``.
             shuffle: Shuffle indices each epoch.
             device: torch device.
+            valid_only: If True, only yield steps where bc_label.valid==1.
+                Default False (preserves prior behaviour: value-target
+                fitting benefits from the full return distribution,
+                including "boring"/invalid-BC-label states — those are
+                still informative for the critic). Deliberately NOT
+                combined with trivial-row downsampling here: downsampling
+                is specifically about reducing redundant *BC* signal, not
+                value-target signal.
         """
-        indices = np.arange(self._n)
+        indices = self.valid_indices() if valid_only else np.arange(self._n)
         if shuffle:
             np.random.shuffle(indices)
         for start in range(0, len(indices), batch_size):
             idx = indices[start:start + batch_size]
             if len(idx) == 0:
                 continue
+            self_ai_type, other_ai_type = _build_ai_type_arrays(
+                self._labels[idx], self._exists_mask[idx]
+            )
             obs_dict = {
                 "self_feat":   _to_tensor(self._self_feat[idx],   device),
                 "other_feat":  _to_tensor(self._other_feat[idx],  device),
                 "exists_mask": _to_tensor(self._exists_mask[idx], device),
                 "ball_feat":   _to_tensor(self._ball_feat[idx],   device),
                 "global_feat": _to_tensor(self._global_feat[idx], device),
+                "self_ai_type":  _to_tensor(self_ai_type,  device),
+                "other_ai_type": _to_tensor(other_ai_type, device),
             }
             ret_batch = _to_tensor(returns[idx], device)
             yield obs_dict, ret_batch
@@ -196,6 +361,10 @@ class DemonstrationDataset:
         device: torch.device | None = None,
         valid_only: bool = True,
         returns: np.ndarray | None = None,
+        downsample_trivial_frac: float = 0.0,
+        downsample_trivial_cos_threshold: float = 0.98,
+        downsample_trivial_exclude_radius_steps: int = 5,
+        rng: np.random.Generator | None = None,
     ) -> Generator:
         """Yield (obs_dict, bc_labels) or (obs_dict, bc_labels, returns) minibatches.
 
@@ -207,8 +376,39 @@ class DemonstrationDataset:
             returns: Optional pre-computed return array from ``compute_returns()``.
                 When provided, yields 3-tuples ``(obs_dict, labels, returns_batch)``
                 instead of 2-tuples so callers can add a value loss in the same pass.
+            downsample_trivial_frac: Fraction of "trivial" movement rows
+                (see ``_compute_trivial_mask()``) to exclude from THIS call.
+                0.0 (default) disables downsampling entirely. A fresh random
+                subset is drawn each call (i.e. each epoch), not a fixed mask —
+                non-trivial rows are never excluded regardless of this value.
+            downsample_trivial_cos_threshold: Cosine-similarity threshold for
+                the trivial-row classification (see ``_compute_trivial_mask()``).
+            downsample_trivial_exclude_radius_steps: Rows within this many
+                steps of a kick/tackle event (same episode) are never
+                eligible for downsampling.
+            rng: Optional ``numpy.random.Generator`` for reproducible
+                per-epoch re-rolling of the excluded subset. Defaults to a
+                fresh, unseeded generator each call.
         """
         indices = self.valid_indices() if valid_only else np.arange(self._n)
+
+        if downsample_trivial_frac > 0.0:
+            if self._trivial_mask_cache is None:
+                self._trivial_mask_cache = self._compute_trivial_mask(
+                    cos_threshold=downsample_trivial_cos_threshold,
+                    exclude_radius_steps=downsample_trivial_exclude_radius_steps,
+                )
+            trivial_in_indices = self._trivial_mask_cache[indices]
+            trivial_positions = np.where(trivial_in_indices)[0]
+            if len(trivial_positions) > 0:
+                _rng = rng if rng is not None else np.random.default_rng()
+                n_exclude = int(round(len(trivial_positions) * downsample_trivial_frac))
+                if n_exclude > 0:
+                    excluded = _rng.choice(trivial_positions, size=n_exclude, replace=False)
+                    keep_mask = np.ones(len(indices), dtype=bool)
+                    keep_mask[excluded] = False
+                    indices = indices[keep_mask]
+
         if shuffle:
             np.random.shuffle(indices)
 
@@ -216,12 +416,17 @@ class DemonstrationDataset:
             idx = indices[start:start + batch_size]
             if len(idx) == 0:
                 continue
+            self_ai_type, other_ai_type = _build_ai_type_arrays(
+                self._labels[idx], self._exists_mask[idx]
+            )
             obs_dict = {
                 "self_feat":   _to_tensor(self._self_feat[idx],   device),
                 "other_feat":  _to_tensor(self._other_feat[idx],  device),
                 "exists_mask": _to_tensor(self._exists_mask[idx], device),
                 "ball_feat":   _to_tensor(self._ball_feat[idx],   device),
                 "global_feat": _to_tensor(self._global_feat[idx], device),
+                "self_ai_type":  _to_tensor(self_ai_type,  device),
+                "other_ai_type": _to_tensor(other_ai_type, device),
             }
             labels = _to_tensor(self._labels[idx], device)
             if returns is not None:
@@ -238,12 +443,17 @@ class DemonstrationDataset:
         """Sample a random batch (with replacement)."""
         pool = self.valid_indices() if valid_only else np.arange(self._n)
         idx = np.random.choice(pool, size=min(batch_size, len(pool)), replace=True)
+        self_ai_type, other_ai_type = _build_ai_type_arrays(
+            self._labels[idx], self._exists_mask[idx]
+        )
         obs_dict = {
             "self_feat":   _to_tensor(self._self_feat[idx],   device),
             "other_feat":  _to_tensor(self._other_feat[idx],  device),
             "exists_mask": _to_tensor(self._exists_mask[idx], device),
             "ball_feat":   _to_tensor(self._ball_feat[idx],   device),
             "global_feat": _to_tensor(self._global_feat[idx], device),
+            "self_ai_type":  _to_tensor(self_ai_type,  device),
+            "other_ai_type": _to_tensor(other_ai_type, device),
         }
         labels = _to_tensor(self._labels[idx], device)
         return obs_dict, labels
@@ -252,3 +462,39 @@ class DemonstrationDataset:
 def _to_tensor(arr: np.ndarray, device: torch.device | None) -> torch.Tensor:
     t = torch.from_numpy(arr.astype(np.float32))
     return t.to(device) if device is not None else t
+
+
+def _ai_type_code_to_one_hot(codes: np.ndarray) -> np.ndarray:
+    """Map AI_TYPE_RULES/IMMOBILE/NEURAL float codes -> (N, AI_TYPE_ONE_HOT_DIM) one-hot.
+
+    Column order matches ai/obs/encoder.py::_ai_type_one_hot: [is_rules, is_immobile, is_neural].
+    """
+    out = np.zeros((len(codes), AI_TYPE_ONE_HOT_DIM), dtype=np.float32)
+    out[codes == AI_TYPE_RULES, 0] = 1.0
+    out[codes == AI_TYPE_IMMOBILE, 1] = 1.0
+    out[codes == AI_TYPE_NEURAL, 2] = 1.0
+    return out
+
+
+def _build_ai_type_arrays(
+    labels: np.ndarray, exists_mask: np.ndarray
+) -> tuple[np.ndarray, np.ndarray]:
+    """Build (self_ai_type, other_ai_type) arrays for a batch of BC rows.
+
+    Demo recordings are strictly 1v1 (Phase 1) so ``exists_mask`` has exactly
+    one real "other player" slot per row - the opponent. ``bc_labels``'
+    ``ai_type``/``opponent_ai_type`` columns (recorded directly at demo time,
+    see ai/ppo/bc.py) give the correct one-hot for self and that single
+    opponent slot respectively; every other (padded) slot stays all-zero.
+    This mirrors ai/obs/encoder.py's ``_ai_type_one_hot`` for live rollouts.
+    """
+    n, n_slots = exists_mask.shape
+    self_ai_type = _ai_type_code_to_one_hot(labels[:, _I_AI_TYPE])
+    opp_one_hot = _ai_type_code_to_one_hot(labels[:, _I_OPPONENT_AI_TYPE])
+    other_ai_type = np.zeros((n, n_slots, AI_TYPE_ONE_HOT_DIM), dtype=np.float32)
+    # Slot index of the (single) real opponent per row; rows with no real
+    # opponent slot (shouldn't happen for valid 1v1 demo rows) are left zero.
+    has_opponent = exists_mask.any(axis=1)
+    opp_slot = np.argmax(exists_mask, axis=1)
+    other_ai_type[np.where(has_opponent)[0], opp_slot[has_opponent]] = opp_one_hot[has_opponent]
+    return self_ai_type, other_ai_type

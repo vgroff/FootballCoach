@@ -450,17 +450,25 @@ class ScenarioEnv:
     # Internal helpers
     # -----------------------------------------------------------------------
 
-    def _get_obs(self) -> ObservationBatch:
+    def _get_obs(self, player_id: str | None = None) -> ObservationBatch:
+        """Encode the observation for *player_id* (default: the trainee).
+
+        Passing an explicit ``player_id`` lets callers (e.g.
+        record_demonstrations.py) encode observations for other players
+        (the opponent) without disturbing any of the trainee-specific
+        internal call sites, which all call this with no arguments.
+        """
         time_remaining = max(
             0.0,
             self.max_episode_s - self._episode_ticks * self._dt_s
         )
         return encode_observation(
             match=self._loop.match,
-            player_id=self.trainee_player_id,
+            player_id=player_id if player_id is not None else self.trainee_player_id,
             time_remaining_s=time_remaining,
             attack_defence_smoothed=self._ema.smoothed,
             rng=self.rng,
+            phase=self.phase,
         )
 
     def _ball_dist_to_trainee(self) -> float:
@@ -503,6 +511,7 @@ class ScenarioEnv:
             time_remaining_s=time_remaining,
             attack_defence_smoothed=sec_ema.smoothed,
             rng=self.rng,
+            phase=self.phase,
         )
 
     def _find_trainee(self, match: Match):

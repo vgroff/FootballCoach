@@ -19,11 +19,7 @@ from __future__ import annotations
 
 import math
 import random
-import sys
 from itertools import product
-from pathlib import Path
-
-sys.path.insert(0, str(Path(__file__).parent.parent / "src"))
 
 import footballcoach.config.loader as loader_mod
 

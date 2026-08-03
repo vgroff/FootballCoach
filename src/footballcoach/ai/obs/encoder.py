@@ -26,8 +26,10 @@ import numpy as np
 
 from footballcoach.ai.config import load_ai_config
 from footballcoach.ai.obs.schema import (
+    AI_TYPE_ONE_HOT_DIM,
     BALL_FEATURE_DIM,
     GLOBAL_FEATURE_DIM,
+    MAX_TASK_IDS,
     PLAYER_FEATURE_DIM,
     BallFeatures,
     GlobalFeatures,
@@ -47,6 +49,7 @@ def encode_observation(
     time_remaining_s: float,
     attack_defence_smoothed: float = 0.5,
     rng: Optional[random.Random] = None,
+    phase: Optional[int] = None,
 ) -> ObservationBatch:
     """Build the observation for a single player at the current match state.
 
@@ -60,6 +63,12 @@ def encode_observation(
             ai_design_doc.md section 2.7).
         rng: Optional Random for slot shuffling.  Pass a seeded instance for
             deterministic tests.
+        phase: Active curriculum phase/task id (1-based, e.g. 1 for Phase 1).
+            Populates the GlobalFeatures task-id one-hot at index
+            ``phase - 1``.  ``None`` (default) encodes an all-zero task-id
+            (scaffolding only, see ai/knowledge.md "Task-id: scaffolded, not
+            yet load-bearing"). Out-of-range values (< 1 or > MAX_TASK_IDS)
+            are clamped to an all-zero task-id rather than raising.
 
     Returns:
         ObservationBatch with all arrays ready for the neural network.
@@ -101,6 +110,7 @@ def encode_observation(
 
     other_feat = np.zeros((MAX_OTHER_PLAYERS, PLAYER_FEATURE_DIM), dtype=np.float32)
     exists_mask = np.zeros(MAX_OTHER_PLAYERS, dtype=np.float32)
+    other_ai_type = np.zeros((MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM), dtype=np.float32)
 
     for slot_idx, other_player in zip(slot_indices, other_players[:MAX_OTHER_PLAYERS]):
         feat = _player_features(
@@ -115,6 +125,12 @@ def encode_observation(
         )
         other_feat[slot_idx] = feat
         exists_mask[slot_idx] = 1.0
+        # Populated in the SAME loop iteration as other_feat/exists_mask so it
+        # is structurally impossible for this to desync from the slot shuffle
+        # (see ai/knowledge.md "Opponent-AI-type (value-only)").
+        other_ai_type[slot_idx] = _ai_type_one_hot(other_player)
+
+    self_ai_type = _ai_type_one_hot(self_player)
 
     # Ball features
     ball_feat = _ball_features(
@@ -134,6 +150,7 @@ def encode_observation(
         time_remaining_s=time_remaining_s,
         time_norm_max=time_norm_max,
         attack_defence_smoothed=attack_defence_smoothed,
+        phase=phase,
     )
 
     return ObservationBatch(
@@ -142,12 +159,36 @@ def encode_observation(
         exists_mask=exists_mask,
         ball_feat=ball_feat,
         global_feat=global_feat,
+        self_ai_type=self_ai_type,
+        other_ai_type=other_ai_type,
     )
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _ai_type_one_hot(player: Player) -> np.ndarray:
+    """One-hot [is_rules, is_immobile, is_neural] for the AI controlling *player*.
+
+    Value-only side channel (see ai/knowledge.md) - never fed to policy heads.
+    ``player.ai is None`` is treated as immobile (matches the convention used
+    throughout record_demonstrations.py / bc.py for the "no AI assigned"
+    case). NeuralPlayerAI is checked by name rather than isinstance to avoid
+    importing footballcoach.ai.env.scenario_env / rules_ai at module import
+    time (would create a circular import: rules_ai -> ai.env -> ai.obs).
+    """
+    from footballcoach.rules_ai import Phase1RulesAI, NeuralPlayerAI
+
+    one_hot = np.zeros(AI_TYPE_ONE_HOT_DIM, dtype=np.float32)
+    if isinstance(player.ai, NeuralPlayerAI):
+        one_hot[2] = 1.0  # is_neural
+    elif isinstance(player.ai, Phase1RulesAI):
+        one_hot[0] = 1.0  # is_rules
+    else:
+        one_hot[1] = 1.0  # is_immobile (player.ai is None, or any other/unknown AI)
+    return one_hot
+
 
 def _find_player(match: Match, player_id: str) -> Player:
     for p in match.players:
@@ -258,6 +299,7 @@ def _global_features(
     time_remaining_s: float,
     time_norm_max: float,
     attack_defence_smoothed: float,
+    phase: Optional[int] = None,
 ) -> np.ndarray:
     pitch = match.pitch
 
@@ -276,6 +318,8 @@ def _global_features(
     # Restitution coefficient: use the vertical bounce coefficient from params
     restitution = match.ball_physics_params.bounce_restitution_vertical
 
+    task_id_kwargs = _task_id_one_hot_kwargs(phase)
+
     feat = GlobalFeatures(
         score_diff=score_diff,
         time_remaining_norm=time_norm,
@@ -288,5 +332,18 @@ def _global_features(
         ball_restitution_coefficient=restitution,
         rng_reduction=match.rng_reduction,
         attack_defence_smoothed=attack_defence_smoothed,
+        **task_id_kwargs,
     )
     return feat.to_array()
+
+
+def _task_id_one_hot_kwargs(phase: Optional[int]) -> dict:
+    """Build the ``task_id_N`` one-hot kwargs for GlobalFeatures.
+
+    ``phase`` is 1-based (phase 1 -> index 0). None, or an out-of-range
+    phase (< 1 or > MAX_TASK_IDS), yields an all-zero one-hot rather than
+    raising — this is scaffolding, see ai/knowledge.md.
+    """
+    if phase is None or phase < 1 or phase > MAX_TASK_IDS:
+        return {}
+    return {f"task_id_{phase - 1}": 1.0}

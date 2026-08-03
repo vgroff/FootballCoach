@@ -6,7 +6,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from footballcoach.config import load_physics_config
+from footballcoach.config import load_physics_config, require_section
 from footballcoach.entities.ball import Ball
 from footballcoach.mathutils import Vector3
 
@@ -34,12 +34,14 @@ class BallPhysicsParams:
     block_restitution: float
     goal_net_restitution: float = 0.15
     just_bounced_display_duration_s: float = 0.3
+    bounce_threshold_mps: float = 0.5  # min incoming vertical speed to count as a real bounce vs. rest/rolling
 
     @staticmethod
     def from_config() -> "BallPhysicsParams":
-        world = load_physics_config()["world"]
-        ball = load_physics_config()["ball"]
-        bp = load_physics_config()["ball_physics"]
+        cfg = load_physics_config()
+        world = require_section(cfg, "world")
+        ball = require_section(cfg, "ball")
+        bp = require_section(cfg, "ball_physics")
         return BallPhysicsParams(
             gravity_mps2=world["gravity_mps2"],
             air_density_kgpm3=world["air_density_kgpm3"],
@@ -55,6 +57,7 @@ class BallPhysicsParams:
             block_restitution=bp["block_restitution"],
             goal_net_restitution=bp.get("goal_net_restitution", 0.15),
             just_bounced_display_duration_s=bp.get("just_bounced_display_duration_s", 0.3),
+            bounce_threshold_mps=bp.get("bounce_threshold_mps", 0.5),
         )
 
 
@@ -118,13 +121,12 @@ def step_ball(ball: Ball, dt_s: float, params: BallPhysicsParams | None = None) 
     # real bug (see engine/knowledge.md's "ground contact" note) that made
     # slow, grounded balls (e.g. a gentle pass) stop dead within a few
     # ticks.
-    BOUNCE_THRESHOLD_MPS = 0.5
     real_bounce_this_tick = False
     if new_position.z <= params.ball_radius_m:
         new_position = new_position.with_z(params.ball_radius_m)
-        if new_velocity.z < -BOUNCE_THRESHOLD_MPS:
+        if new_velocity.z < -params.bounce_threshold_mps:
             outgoing_vz = -new_velocity.z * params.bounce_restitution_vertical
-            if outgoing_vz < BOUNCE_THRESHOLD_MPS:
+            if outgoing_vz < params.bounce_threshold_mps:
                 # The bounce would produce a smaller upward vz than the threshold.
                 # Continuing to bounce would create a perpetual micro-bounce loop
                 # (the ball never settles because restitution keeps it airborne by
@@ -164,6 +166,28 @@ def step_ball(ball: Ball, dt_s: float, params: BallPhysicsParams | None = None) 
     elif ball.just_bounced_timer_s > 0.0:
         ball.just_bounced_timer_s = max(0.0, ball.just_bounced_timer_s - dt_s)
 
+def _reflect_axis(ball: Ball, axis: str, boundary: float, net_e: float, moving_towards_boundary: bool) -> None:
+    """Clamp `ball.position[axis]` to `boundary` and negate+damp the matching
+    velocity component (scaling the other two components by `net_e` too),
+    but only if the ball is actually moving towards the boundary.
+
+    Shared by `resolve_goal_boundary`'s back-wall/side-post/crossbar checks,
+    which otherwise repeat this "clamp position, negate velocity component,
+    apply restitution" pattern three times.
+    """
+    if not moving_towards_boundary:
+        return
+    pos = {"x": ball.position.x, "y": ball.position.y, "z": ball.position.z}
+    vel = {"x": ball.velocity.x, "y": ball.velocity.y, "z": ball.velocity.z}
+    pos[axis] = boundary
+    vel[axis] = -vel[axis] * net_e
+    for other in ("x", "y", "z"):
+        if other != axis:
+            vel[other] *= net_e
+    ball.position = Vector3(pos["x"], pos["y"], pos["z"])
+    ball.velocity = Vector3(vel["x"], vel["y"], vel["z"])
+
+
 def resolve_goal_boundary(ball: Ball, pitch: "Pitch", params: BallPhysicsParams) -> None:
     """Bounces the ball off the interior surfaces of whichever goal it has
     entered (back wall, side posts, crossbar).  Ground collisions inside the
@@ -192,24 +216,14 @@ def resolve_goal_boundary(ball: Ball, pitch: "Pitch", params: BallPhysicsParams)
 
     if in_left:
         back_wall_x = -(pitch.half_length + pitch.goal_depth_m)
-        if ball.position.x <= back_wall_x + r and ball.velocity.x < 0.0:
-            ball.position = Vector3(back_wall_x + r, ball.position.y, ball.position.z)
-            ball.velocity = Vector3(-ball.velocity.x * net_e, ball.velocity.y * net_e, ball.velocity.z * net_e)
+        _reflect_axis(ball, "x", back_wall_x + r, net_e, ball.position.x <= back_wall_x + r and ball.velocity.x < 0.0)
     else:
         back_wall_x = pitch.half_length + pitch.goal_depth_m
-        if ball.position.x >= back_wall_x - r and ball.velocity.x > 0.0:
-            ball.position = Vector3(back_wall_x - r, ball.position.y, ball.position.z)
-            ball.velocity = Vector3(-ball.velocity.x * net_e, ball.velocity.y * net_e, ball.velocity.z * net_e)
+        _reflect_axis(ball, "x", back_wall_x - r, net_e, ball.position.x >= back_wall_x - r and ball.velocity.x > 0.0)
 
     # Side posts (y): clamp and reflect.
-    if ball.position.y > half_goal_w - r and ball.velocity.y > 0.0:
-        ball.position = Vector3(ball.position.x, half_goal_w - r, ball.position.z)
-        ball.velocity = Vector3(ball.velocity.x * net_e, -ball.velocity.y * net_e, ball.velocity.z * net_e)
-    elif ball.position.y < -(half_goal_w - r) and ball.velocity.y < 0.0:
-        ball.position = Vector3(ball.position.x, -(half_goal_w - r), ball.position.z)
-        ball.velocity = Vector3(ball.velocity.x * net_e, -ball.velocity.y * net_e, ball.velocity.z * net_e)
+    _reflect_axis(ball, "y", half_goal_w - r, net_e, ball.position.y > half_goal_w - r and ball.velocity.y > 0.0)
+    _reflect_axis(ball, "y", -(half_goal_w - r), net_e, ball.position.y < -(half_goal_w - r) and ball.velocity.y < 0.0)
 
     # Crossbar (z): clamp and reflect.
-    if ball.position.z > pitch.goal_height_m - r and ball.velocity.z > 0.0:
-        ball.position = ball.position.with_z(pitch.goal_height_m - r)
-        ball.velocity = Vector3(ball.velocity.x * net_e, ball.velocity.y * net_e, -ball.velocity.z * net_e)
+    _reflect_axis(ball, "z", pitch.goal_height_m - r, net_e, ball.position.z > pitch.goal_height_m - r and ball.velocity.z > 0.0)

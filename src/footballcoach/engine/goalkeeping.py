@@ -10,7 +10,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from footballcoach.config import load_physics_config
+from footballcoach.config import load_physics_config, require_section
 from footballcoach.entities.pitch import Pitch
 from footballcoach.entities.player import Team
 from footballcoach.mathutils import Vector3
@@ -21,17 +21,15 @@ class GoalkeepingParams:
     goal_frame_margin_m: float
     default_position_fraction_of_half_length: float
     early_intercept_max_distance_m: float  # max GK-to-ball distance for early intercept to activate
-    early_intercept_safety_margin: float   # (legacy, unused in new logic) kept for config back-compat
     goal_line_save_weight: float           # multiplier on goal-line margin; >1 prefers goal-line saves
 
     @staticmethod
     def from_config() -> "GoalkeepingParams":
-        d = load_physics_config()["goalkeeping"]
+        d = require_section(load_physics_config(), "goalkeeping")
         return GoalkeepingParams(
             goal_frame_margin_m=d["goal_frame_margin_m"],
             default_position_fraction_of_half_length=d["default_position_fraction_of_half_length"],
             early_intercept_max_distance_m=d.get("early_intercept_max_distance_m", 10.0),
-            early_intercept_safety_margin=d.get("early_intercept_safety_margin", 0.85),
             goal_line_save_weight=d.get("goal_line_save_weight", 1.0),
         )
 
@@ -135,7 +133,7 @@ def early_intercept_target(
     if gk_to_ball <= params.early_intercept_max_distance_m:
         ball_speed_xy = ball_velocity.length_xy()
         # Estimate where the ball will be when the GK could reach it (one
-        # linear step capped at 2 s, same approach as Match._intercept_target).
+        # linear step capped at 2 s, same approach as engine.interception.intercept_target).
         t_estimate = min(gk_to_ball / gk_speed, 2.0)
         predicted_xy = ball_position + ball_velocity.xy() * t_estimate
         t_ball_at_intercept = (

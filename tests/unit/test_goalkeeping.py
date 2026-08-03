@@ -104,7 +104,6 @@ def test_save_target_plane_in_front_of_true_goal_line():
 
 def _make_gk_params(
     early_intercept_max_distance_m: float = 10.0,
-    early_intercept_safety_margin: float = 0.85,
     goal_line_save_weight: float = 1.0,
 ) -> GoalkeepingParams:
     base = GoalkeepingParams.from_config()
@@ -113,7 +112,6 @@ def _make_gk_params(
         goal_frame_margin_m=base.goal_frame_margin_m,
         default_position_fraction_of_half_length=base.default_position_fraction_of_half_length,
         early_intercept_max_distance_m=early_intercept_max_distance_m,
-        early_intercept_safety_margin=early_intercept_safety_margin,
         goal_line_save_weight=goal_line_save_weight,
     )
 
@@ -236,7 +234,7 @@ def test_early_intercept_fast_far_shot_falls_back_to_goal_line():
     fast the GK cannot beat it to an intercept point, but can still get to
     the goal-line save position → returns goal-line target."""
     pitch = Pitch.standard()
-    params = _make_gk_params(early_intercept_max_distance_m=10.0, early_intercept_safety_margin=0.85)
+    params = _make_gk_params(early_intercept_max_distance_m=10.0)
     gk_pos = Vector3(-pitch.half_length + 1.0, 0, 0)
     # Ball 9m from GK (just inside gate), travelling at 30 m/s (very fast)
     ball_pos = Vector3(-pitch.half_length + 10.0, 0, 1.0)

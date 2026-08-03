@@ -119,6 +119,13 @@ BALL_FLIP_Y_IDX: list[int] = [
 ]
 
 # BC label column layout (see bc.py::BCLabel.to_array())
+# NOTE: these are hardcoded magic numbers, NOT derived from bc.py's `_I_*`
+# index constants. They happen to still be correct today because every
+# bc.py layout change so far has only appended new fields after `valid`
+# (currently the last-but-one field). If a FUTURE bc.py change ever
+# inserts/reorders fields at or before index 11, these constants will
+# silently go stale — cross-check them against `_I_DIR_X`/`_I_DIR_Y`/
+# `_I_REGION_X`/`_I_REGION_Y` in bc.py whenever BC_LABEL_DIM's layout changes.
 _BC_DIR_X_COL: int = 7   # move_direction x component
 _BC_DIR_Y_COL: int = 8   # move_direction y component
 _BC_REGION_X_COL: int = 10  # move_region_center x (absolute pitch metres — negate on flip_x)
@@ -173,6 +180,7 @@ def augment_batch(
     n_slot_shuffles = max(1, n_slot_shuffles)
     n_slots: int = batch["obs/other_feat"].shape[1]
     has_bc: bool = "bc_labels" in batch
+    has_ai_type: bool = "obs/self_ai_type" in batch and "obs/other_ai_type" in batch
 
     # Pre-build index tensors once (avoids repeated Python list → tensor conv)
     _px = torch.tensor(PLAYER_FLIP_X_IDX, dtype=torch.long)
@@ -189,6 +197,12 @@ def augment_batch(
         bf = batch["obs/ball_feat"].clone()
         # global_feat has no geometric content (pitch dims, score, time) — shared
         gf = batch["obs/global_feat"]
+        # self_ai_type/other_ai_type are NOT geometric (not positional/directional)
+        # — pass through unchanged under flip_x/flip_y, see ai/knowledge.md
+        # "Opponent-AI-type (value-only)". other_ai_type still needs the SAME
+        # slot permutation as other_feat (applied below, per shuffle variant).
+        sat = batch["obs/self_ai_type"] if has_ai_type else None
+        oat_base = batch["obs/other_ai_type"] if has_ai_type else None
 
         if flip_x:
             sf[:, _px]    *= -1.0
@@ -269,6 +283,13 @@ def augment_batch(
                 "dones":          batch["dones"],
                 "sample_weights": batch["sample_weights"],
             }
+            if has_ai_type:
+                # self_ai_type: pass-through (no geometric or slot content).
+                # other_ai_type: SAME slot permutation as other_feat, so a
+                # given real player's ai-type one-hot never desyncs from its
+                # feature vector (see ai/knowledge.md).
+                part["obs/self_ai_type"] = sat
+                part["obs/other_ai_type"] = oat_base[:, perm, :]
             part.update(remapped_actions)
             if bc_labels_flipped is not None:
                 part["bc_labels"] = bc_labels_flipped
@@ -306,6 +327,7 @@ def augment_obs_bc(
     """
     n_slot_shuffles = max(1, n_slot_shuffles)
     n_slots: int = obs_dict["other_feat"].shape[1]
+    has_ai_type: bool = "self_ai_type" in obs_dict and "other_ai_type" in obs_dict
 
     _px = torch.tensor(PLAYER_FLIP_X_IDX, dtype=torch.long)
     _py = torch.tensor(PLAYER_FLIP_Y_IDX, dtype=torch.long)
@@ -313,6 +335,7 @@ def augment_obs_bc(
     _by = torch.tensor(BALL_FLIP_Y_IDX,   dtype=torch.long)
 
     sf_parts, of_parts, em_parts, bf_parts, gf_parts, bc_parts = [], [], [], [], [], []
+    sat_parts, oat_parts = [], []
 
     for flip_x, flip_y in _FLIP_VARIANTS:
         sf = obs_dict["self_feat"].clone()
@@ -335,6 +358,8 @@ def augment_obs_bc(
             bc[:, _BC_REGION_Y_COL] *= -1.0
 
         em_base = obs_dict["exists_mask"]
+        sat = obs_dict["self_ai_type"] if has_ai_type else None
+        oat_base = obs_dict["other_ai_type"] if has_ai_type else None
         for shuffle_i in range(n_slot_shuffles):
             if shuffle_i == 0:
                 perm = torch.arange(n_slots, dtype=torch.long)
@@ -346,6 +371,11 @@ def augment_obs_bc(
             bf_parts.append(bf)
             gf_parts.append(gf)
             bc_parts.append(bc)
+            if has_ai_type:
+                # self_ai_type: pass-through (not geometric). other_ai_type:
+                # SAME slot permutation as other_feat (see ai/knowledge.md).
+                sat_parts.append(sat)
+                oat_parts.append(oat_base[:, perm, :])
 
     aug_obs = {
         "self_feat":   torch.cat(sf_parts, dim=0),
@@ -354,5 +384,8 @@ def augment_obs_bc(
         "ball_feat":   torch.cat(bf_parts, dim=0),
         "global_feat": torch.cat(gf_parts, dim=0),
     }
+    if has_ai_type:
+        aug_obs["self_ai_type"] = torch.cat(sat_parts, dim=0)
+        aug_obs["other_ai_type"] = torch.cat(oat_parts, dim=0)
     aug_bc = torch.cat(bc_parts, dim=0)
     return aug_obs, aug_bc

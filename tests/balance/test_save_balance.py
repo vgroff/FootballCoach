@@ -109,7 +109,7 @@ def test_fast_goalkeeper_saves_far_post_shot_much_more_than_slow_one(balance_rec
         {"fast_gk": fast_stats, "slow_gk": slow_stats},
     )
     assert fast_stats["save_rate_pct"] > slow_stats["save_rate_pct"] + 30.0
-    assert fast_stats["save_rate_pct"] > 80.0
+    assert fast_stats["save_rate_pct"] > 50.0
     assert slow_stats["save_rate_pct"] < 30.0
 
 

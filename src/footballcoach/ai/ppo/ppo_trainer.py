@@ -54,6 +54,17 @@ from footballcoach.ai.ppo.schedules import TrainingSchedules
 log = logging.getLogger("footballcoach.ai.ppo")
 
 
+def _ai_types(obs_dict: dict) -> tuple:
+    """Extract (self_ai_type, other_ai_type) tensors from an obs dict, or
+    (None, None) if absent — DecisionNetwork/ExecutionNetwork.forward()
+    default to all-zero one-hots in that case. Centralised here so every
+    ``decision_net(...)``/``execution_net(...)`` call site in this file uses
+    the identical fallback behaviour. See ai/knowledge.md "Opponent-AI-type
+    (value-only)".
+    """
+    return obs_dict.get("self_ai_type"), obs_dict.get("other_ai_type")
+
+
 class PPOTrainer:
     """PPO trainer for the two-network (decision + execution) player AI.
 
@@ -104,6 +115,22 @@ class PPOTrainer:
         self._bc_cfg = bc_cfg
         self._bc_dir_loss_w = float(bc_cfg.get("direction_loss_weight", 3.0))
         self._bc_region_loss_w = float(bc_cfg.get("region_loss_weight", 1.0))
+        # pos_weight_*: None means "auto-compute from the training dataset at
+        # load time" (see DemonstrationDataset.compute_pos_weights()). Set to
+        # a float in config to override. Populated once pretrain_combined()
+        # is given a dataset (see below); default 1.0 (no reweighting) until then.
+        self._bc_pos_weight_kick_cfg = bc_cfg.get("pos_weight_kick")
+        self._bc_pos_weight_tackle_attempt_cfg = bc_cfg.get("pos_weight_tackle_attempt")
+        self._bc_pos_weight_kick = 1.0 if self._bc_pos_weight_kick_cfg is None else float(self._bc_pos_weight_kick_cfg)
+        self._bc_pos_weight_tackle_attempt = (
+            1.0 if self._bc_pos_weight_tackle_attempt_cfg is None else float(self._bc_pos_weight_tackle_attempt_cfg)
+        )
+        self._downsample_trivial_enabled = bool(bc_cfg.get("downsample_trivial_enabled", False))
+        self._downsample_trivial_frac_default = float(bc_cfg.get("downsample_trivial_frac_default", 0.5))
+        self._downsample_trivial_frac_high_epoch = float(bc_cfg.get("downsample_trivial_frac_high_epoch", 0.65))
+        self._downsample_trivial_epoch_threshold = int(bc_cfg.get("downsample_trivial_epoch_threshold", 5))
+        self._downsample_trivial_cos_threshold = float(bc_cfg.get("downsample_trivial_cos_threshold", 0.98))
+        self._downsample_trivial_exclude_radius_steps = int(bc_cfg.get("downsample_trivial_exclude_radius_steps", 5))
         self._secondary_weight = float(curriculum_cfg.get("secondary_weight", 1.0))
         self._value_pretrain_frozen_layers = int(bc_cfg.get("value_pretrain_frozen_layers", -1))
         self._demo_value_pretrain_epochs = int(bc_cfg.get("demo_value_pretrain_epochs", 10))
@@ -111,6 +138,9 @@ class PPOTrainer:
         self._demo_value_pretrain_gamma = float(bc_cfg.get("demo_value_pretrain_gamma", 0.99))
         # Weight of value loss added to BC loss during BC epochs (0 = disabled)
         self._demo_value_bc_coef = float(bc_cfg.get("demo_value_bc_coef", 0.5))
+        # Weight of value loss added to decision-heads-only BC loss in Phase 0
+        # (demo value pretrain). See pretrain_combined()'s Phase 0 block.
+        self._phase0_value_coef = float(bc_cfg.get("phase0_value_coef", 1.0))
 
         lr = float(ppo_cfg.get("learning_rate", 3e-4))
         if not inference_only:
@@ -332,8 +362,9 @@ class PPOTrainer:
                 )
                 episode_rewards.clear()
                 secondary_episode_rewards.clear()
+                _bc_tk = metrics.get("bc_tackle_loss", 0.0)
                 bc_str = (
-                    f"  bc={metrics['bc_loss']:.4f}(x{metrics['bc_coeff']:.2f})"
+                    f"  bc={metrics['bc_loss']:.4f}(x{metrics['bc_coeff']:.2f})[tk={_bc_tk:.3f}]"
                     if metrics.get("bc_coeff", 0.0) > 0.0 else ""
                 )
                 # Phase-1 outcome win-rate over this rollout's episodes, split by opponent type
@@ -492,6 +523,19 @@ class PPOTrainer:
         from footballcoach.ai.ppo.bc import bc_loss_from_tensor
         from footballcoach.ai.bc.dataset import DemonstrationDataset
 
+        # pos_weight_*: auto-compute from this dataset if not overridden in config.
+        if self._bc_pos_weight_kick_cfg is None or self._bc_pos_weight_tackle_attempt_cfg is None:
+            _auto_weights = dataset.compute_pos_weights()
+            if self._bc_pos_weight_kick_cfg is None:
+                self._bc_pos_weight_kick = _auto_weights["kick"]
+            if self._bc_pos_weight_tackle_attempt_cfg is None:
+                self._bc_pos_weight_tackle_attempt = _auto_weights["tackle_attempt"]
+            log.info(
+                f"BC pos_weight (auto-computed from dataset): "
+                f"kick={self._bc_pos_weight_kick:.2f}  "
+                f"tackle_attempt={self._bc_pos_weight_tackle_attempt:.2f}"
+            )
+
         log.info(
             f"Combined BC + value pre-training: {n_epochs} epoch(s), "
             f"batch_size={batch_size}, dataset={len(dataset):,} steps, "
@@ -502,76 +546,86 @@ class PPOTrainer:
             list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
             lr=bc_lr, eps=1e-5,
         )
-        value_opt = torch.optim.Adam(
-            list(self.decision_net.value_head.parameters())
-            + list(self.execution_net.value_head.parameters()),
-            lr=value_lr, eps=1e-5,
-        )
+        # NOTE: the value-only optimizer used to be built here, but Phase 2/3's
+        # value warm-up now delegates to pretrain_value(), which builds its own
+        # internal value_opt over decision_net.value_head + execution_net.value_head
+        # (identical param set) — see the pretrain_value() call further below.
 
-        # --- Phase 0: value head warm-up on demo returns (before any BC epochs) ---
-        # Trains value heads to predict discounted returns from the demo trajectories.
-        # Uses stored rewards/dones so no env interaction is needed.
-        # Skipped if the dataset has no reward data or demo_value_pretrain_epochs=0.
+        # --- Phase 0: decision-network-only warm-up on demo data (before any BC epochs) ---
+        # Combined decision-heads-only BC loss + value MSE loss, ONE backward pass,
+        # over ALL decision_net parameters (encoders + trunk + value_head) — no
+        # frozen layers here (unlike pretrain_value()'s standalone freezing; these
+        # are two different call sites with two different freezing decisions, see
+        # ai/knowledge.md "Phase 0" note). execution_net is NOT trained in this
+        # phase; it gets its BC training in Phase 1 below. Uses stored
+        # rewards/dones so no env interaction is needed. Skipped if the dataset
+        # has no reward data or demo_value_pretrain_epochs=0.
         _demo_epochs = self._demo_value_pretrain_epochs
         if _demo_epochs > 0 and dataset.has_rewards:
-            _demo_val_opt = torch.optim.Adam(
-                list(self.decision_net.value_head.parameters())
-                + list(self.execution_net.value_head.parameters()),
+            demo_opt = torch.optim.Adam(
+                list(self.decision_net.parameters()),
                 lr=self._demo_value_pretrain_lr, eps=1e-5,
             )
             demo_returns = dataset.compute_returns(gamma=self._demo_value_pretrain_gamma)
             ret_t_all = torch.from_numpy(demo_returns).to(self.device)
             ret_std = ret_t_all.std().clamp(min=1.0)
             log.info(
-                f"Phase 0 — demo value pretrain: {_demo_epochs} epoch(s), "
+                f"Phase 0 — decision-net warm-up (BC + value, combined): {_demo_epochs} epoch(s), "
                 f"gamma={self._demo_value_pretrain_gamma}, "
                 f"returns mean={ret_t_all.mean():.2f}  std={ret_std:.2f}  "
-                f"lr={self._demo_value_pretrain_lr}"
+                f"lr={self._demo_value_pretrain_lr}  phase0_value_coef={self._phase0_value_coef}"
             )
             for epoch in range(_demo_epochs):
                 epoch_losses: list[float] = []
+                epoch_bc_losses: list[float] = []
+                epoch_val_losses: list[float] = []
                 raw_mse_losses: list[float] = []
-                for obs_dict, ret_batch in dataset.iterate_minibatches_with_returns(
-                    batch_size=batch_size, returns=demo_returns,
-                    shuffle=True, device=self.device,
+                for obs_dict, bc_labels, ret_batch in dataset.iterate_minibatches(
+                    batch_size=batch_size, shuffle=True, device=self.device,
+                    valid_only=True, returns=demo_returns,
                 ):
+                    _sat, _oat = _ai_types(obs_dict)
                     d_heads = self.decision_net(
                         obs_dict["self_feat"], obs_dict["other_feat"],
                         obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
-                    )
-                    e_heads = self.execution_net(
-                        obs_dict["self_feat"], obs_dict["other_feat"],
-                        obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
-                        d_heads,
+                        _sat, _oat,
                     )
                     v_dec = d_heads.value.squeeze(-1)
-                    v_exc = e_heads.value.squeeze(-1)
                     ret_norm = ret_batch / ret_std
-                    val_loss = 0.5 * (
-                        ((v_dec - ret_norm) ** 2).mean()
-                        + ((v_exc - ret_norm) ** 2).mean()
+                    # NOTE: Phase 0 fits decision_net.value ALONE (execution_net
+                    # is not run here), unlike Phase 2/3 (pretrain_value) which
+                    # average decision_net.value and execution_net.value. This
+                    # is an intentional, documented inconsistency — Phase 0 is
+                    # scoped as a decision-network-only high-level warm-up.
+                    val_loss = ((v_dec - ret_norm) ** 2).mean()
+                    dec_bc_loss, _ = bc_loss_from_tensor(
+                        bc_labels, d_heads, exec_heads=None,
+                        direction_loss_weight=self._bc_dir_loss_w,
+                        region_loss_weight=self._bc_region_loss_w,
+                        return_breakdown=True,
                     )
-                    raw_mse = 0.5 * (
-                        F.mse_loss(v_dec * ret_std, ret_batch)
-                        + F.mse_loss(v_exc * ret_std, ret_batch)
-                    )
-                    _demo_val_opt.zero_grad()
-                    val_loss.backward()
+                    combined = dec_bc_loss + self._phase0_value_coef * val_loss
+                    raw_mse = F.mse_loss(v_dec * ret_std, ret_batch)
+                    demo_opt.zero_grad()
+                    combined.backward()
                     nn.utils.clip_grad_norm_(
-                        list(self.decision_net.value_head.parameters())
-                        + list(self.execution_net.value_head.parameters()),
+                        list(self.decision_net.parameters()),
                         self.max_grad_norm,
                     )
-                    _demo_val_opt.step()
-                    epoch_losses.append(val_loss.item())
+                    demo_opt.step()
+                    epoch_losses.append(combined.item())
+                    epoch_bc_losses.append(dec_bc_loss.item())
+                    epoch_val_losses.append(val_loss.item())
                     raw_mse_losses.append(raw_mse.item())
                 log.info(
-                    f"  Demo value epoch {epoch + 1}/{_demo_epochs}: "
-                    f"val_loss={np.mean(epoch_losses):.4f}  "
+                    f"  Phase 0 epoch {epoch + 1}/{_demo_epochs}: "
+                    f"loss={np.mean(epoch_losses):.4f}  "
+                    f"dec_bc={np.mean(epoch_bc_losses):.4f}  "
+                    f"val={np.mean(epoch_val_losses):.4f}  "
                     f"rmse={np.sqrt(np.mean(raw_mse_losses)):.2f} "
                     f"(returns std={ret_std:.1f})"
                 )
-            log.info(f"Phase 0 done (demo value pretrain, {_demo_epochs} epoch(s))")
+            log.info(f"Phase 0 done (decision-net warm-up, {_demo_epochs} epoch(s))")
         elif _demo_epochs > 0 and not dataset.has_rewards:
             log.info(
                 "Phase 0 skipped — dataset has no reward data "
@@ -608,9 +662,33 @@ class PPOTrainer:
             sprint_probs: list[float] = []
             _bkdn_acc: dict[str, float] = {}
             _bkdn_n: int = 0
+            if self._downsample_trivial_enabled:
+                _ds_frac = (
+                    self._downsample_trivial_frac_high_epoch
+                    if epoch >= self._downsample_trivial_epoch_threshold
+                    else self._downsample_trivial_frac_default
+                )
+                _ds_stats = dataset.downsample_trivial_stats(
+                    valid_only=True,
+                    cos_threshold=self._downsample_trivial_cos_threshold,
+                    exclude_radius_steps=self._downsample_trivial_exclude_radius_steps,
+                    frac=_ds_frac,
+                )
+                log.info(
+                    f"  Downsample trivial rows (epoch {epoch + 1}): "
+                    f"{_ds_stats['n_trivial']:,}/{_ds_stats['n_total']:,} "
+                    f"({_ds_stats['trivial_frac']:.1%}) rows classified trivial, "
+                    f"excluding ~{_ds_stats['n_excluded_at_frac']:,} this epoch "
+                    f"(frac={_ds_frac:.2f})"
+                )
+            else:
+                _ds_frac = 0.0
             for mb in dataset.iterate_minibatches(
                 batch_size=batch_size, shuffle=True, device=self.device,
                 valid_only=True, returns=_joint_returns,
+                downsample_trivial_frac=_ds_frac,
+                downsample_trivial_cos_threshold=self._downsample_trivial_cos_threshold,
+                downsample_trivial_exclude_radius_steps=self._downsample_trivial_exclude_radius_steps,
             ):
                 if _use_joint_val:
                     obs_dict, bc_labels, ret_batch = mb
@@ -625,19 +703,23 @@ class PPOTrainer:
                     if ret_batch is not None:
                         n_aug = 4 * max(1, self.augment_n_slot_shuffles)
                         ret_batch = ret_batch.repeat(n_aug)
+                _sat, _oat = _ai_types(obs_dict)
                 d_heads = self.decision_net(
                     obs_dict["self_feat"], obs_dict["other_feat"],
                     obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                    _sat, _oat,
                 )
                 e_heads = self.execution_net(
                     obs_dict["self_feat"], obs_dict["other_feat"],
                     obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
-                    d_heads,
+                    d_heads, _sat, _oat,
                 )
                 bc_loss, bkdn = bc_loss_from_tensor(
                     bc_labels, d_heads, e_heads,
                     direction_loss_weight=self._bc_dir_loss_w,
                     region_loss_weight=self._bc_region_loss_w,
+                    pos_weight_kick=self._bc_pos_weight_kick,
+                    pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
                     return_breakdown=True,
                 )
                 total_loss = bc_loss
@@ -708,83 +790,21 @@ class PPOTrainer:
             _bkdn_n = 0
         log.info(f"BC pre-training done ({n_epochs} epoch(s), final bc_loss={np.mean(bc_losses):.4f})")
 
-        # --- Phase 2: collect rollout with BC-warmed policy for value targets ---
-        env.sample_action_fn = self._sample_action
-        env.reset()
-        buffer = RolloutBuffer()
-        next_obs = None
-
-        for _ in range(rollout_steps):
-            next_obs, reward, done, _ = env.step()
-            tr = env.last_trainee_transition
-            if tr is not None:
-                buffer.add(
-                    obs=tr["obs"],
-                    action=_action_to_numpy(tr["action"], tr["raw_exec"]),
-                    log_prob=tr["log_prob"],
-                    value=tr["value"],
-                    reward=reward,
-                    done=1.0 if done else 0.0,
-                )
-            if done:
-                env.reset()
-
-        with torch.no_grad():
-            last_obs_dict = {k: v.unsqueeze(0).to(self.device)
-                             for k, v in (next_obs or env.reset()).to_torch_dict().items()}
-            last_value = self._get_value(last_obs_dict)
-
-        _, returns = buffer.compute_gae(self.gamma, self.lam, last_value)
-        rollout_batch = buffer.as_tensors(_, returns)
-        returns_t = rollout_batch["returns"].to(self.device)
-        ret_std = returns_t.std().clamp(min=1.0)
-        log.debug(f"  [combined pretrain] rollout returns: mean={returns_t.mean():.2f}  std={ret_std:.2f}")
-
-        # --- Phase 3: value head warm-up on on-policy returns ---
-        # Freeze trunk layers so backward() skips useless gradient computation.
-        _freeze_params = self._get_value_pretrain_freeze_params()
-        for p in _freeze_params:
-            p.requires_grad_(False)
-        # Augment rollout_batch with geometric flips + slot permutations (ALWAYS applied).
-        if self.augment_n_slot_shuffles > 0:
-            rollout_batch = augment_batch(rollout_batch, self.augment_n_slot_shuffles, self._aug_rng)
-        returns_t = rollout_batch["returns"].to(self.device)
-        ret_std = returns_t.std().clamp(min=1.0)  # recompute after expansion
-
-        n_rollout = len(returns_t)
-        val_epochs = max(1, value_epochs)
-        for epoch in range(val_epochs):
-            val_losses = []
-            indices = torch.randperm(n_rollout)
-            for start in range(0, n_rollout, batch_size):
-                mb_idx = indices[start:start + batch_size]
-                mb_obs = {k.replace("obs/", ""): rollout_batch[k][mb_idx].to(self.device)
-                          for k in rollout_batch if k.startswith("obs/")}
-                mb_ret = returns_t[mb_idx]
-                d_v = self.decision_net(
-                    mb_obs["self_feat"], mb_obs["other_feat"],
-                    mb_obs["exists_mask"], mb_obs["ball_feat"], mb_obs["global_feat"],
-                )
-                e_v = self.execution_net(
-                    mb_obs["self_feat"], mb_obs["other_feat"],
-                    mb_obs["exists_mask"], mb_obs["ball_feat"], mb_obs["global_feat"],
-                    d_v,
-                )
-                pred_values = ((d_v.value + e_v.value) / 2.0).squeeze(-1)
-                value_loss = F.mse_loss(pred_values, mb_ret) / (ret_std ** 2)
-                value_opt.zero_grad()
-                value_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    list(self.decision_net.value_head.parameters())
-                    + list(self.execution_net.value_head.parameters()),
-                    self.max_grad_norm,
-                )
-                value_opt.step()
-                val_losses.append(value_loss.item())
-            log.info(f"  Value epoch {epoch + 1}/{val_epochs}: val_loss={np.mean(val_losses):.4f}")
-        log.info(f"Value pre-training done ({val_epochs} epoch(s), final val_loss={np.mean(val_losses):.4f})")
-        for p in _freeze_params:
-            p.requires_grad_(True)
+        # --- Phase 2/3: collect on-policy rollout + value head warm-up ---
+        # Delegates to pretrain_value(), which collects rollout_steps of
+        # experience with the BC-warmed policy, computes GAE returns, applies
+        # augmentation, and fits the value heads for value_epochs (with trunk
+        # freezing retained — a DIFFERENT freezing decision than Phase 0 above,
+        # see pretrain_value()'s docstring). This used to be duplicated inline
+        # here; extracted so pretrain_value() remains the single source of
+        # truth and is also usable standalone.
+        self.pretrain_value(
+            env,
+            n_steps=rollout_steps,
+            n_epochs=max(1, value_epochs),
+            lr=value_lr,
+            batch_size=batch_size,
+        )
 
         # --- BC degradation check: re-evaluate BC loss over dataset after value warm-up ---
         self.decision_net.eval()
@@ -794,16 +814,22 @@ class PPOTrainer:
             for obs_dict, bc_labels in dataset.iterate_minibatches(
                 batch_size=batch_size, shuffle=False, device=self.device, valid_only=True
             ):
+                _sat, _oat = _ai_types(obs_dict)
                 d_check = self.decision_net(
                     obs_dict["self_feat"], obs_dict["other_feat"],
                     obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                    _sat, _oat,
                 )
                 e_check = self.execution_net(
                     obs_dict["self_feat"], obs_dict["other_feat"],
                     obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
-                    d_check,
+                    d_check, _sat, _oat,
                 )
-                post_bc_losses.append(bc_loss_from_tensor(bc_labels, d_check, e_check).item())
+                post_bc_losses.append(bc_loss_from_tensor(
+                    bc_labels, d_check, e_check,
+                    pos_weight_kick=self._bc_pos_weight_kick,
+                    pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
+                ).item())
         self.decision_net.train()
         self.execution_net.train()
         post_bc_loss = float(np.mean(post_bc_losses))
@@ -842,19 +868,23 @@ class PPOTrainer:
                         obs_dict, bc_labels = augment_obs_bc(
                             obs_dict, bc_labels, self.augment_n_slot_shuffles, self._aug_rng
                         )
+                    _sat, _oat = _ai_types(obs_dict)
                     d_r = self.decision_net(
                         obs_dict["self_feat"], obs_dict["other_feat"],
                         obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                        _sat, _oat,
                     )
                     e_r = self.execution_net(
                         obs_dict["self_feat"], obs_dict["other_feat"],
                         obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
-                        d_r,
+                        d_r, _sat, _oat,
                     )
                     loss_r, bkdn_r = bc_loss_from_tensor(
                         bc_labels, d_r, e_r,
                         direction_loss_weight=self._bc_dir_loss_w,
                         region_loss_weight=self._bc_region_loss_w,
+                        pos_weight_kick=self._bc_pos_weight_kick,
+                        pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
                         return_breakdown=True,
                     )
                     repair_opt.zero_grad()
@@ -893,14 +923,16 @@ class PPOTrainer:
                         mb_obs_r = {k.replace("obs/", ""): rollout_batch[k][start_r:start_r+batch_size].to(self.device)
                                     for k in rollout_batch if k.startswith("obs/")}
                         mb_ret_r = returns_t[start_r:start_r+batch_size]
+                        _sat_r, _oat_r = _ai_types(mb_obs_r)
                         d_vr = self.decision_net(
                             mb_obs_r["self_feat"], mb_obs_r["other_feat"],
                             mb_obs_r["exists_mask"], mb_obs_r["ball_feat"], mb_obs_r["global_feat"],
+                            _sat_r, _oat_r,
                         )
                         e_vr = self.execution_net(
                             mb_obs_r["self_feat"], mb_obs_r["other_feat"],
                             mb_obs_r["exists_mask"], mb_obs_r["ball_feat"], mb_obs_r["global_feat"],
-                            d_vr,
+                            d_vr, _sat_r, _oat_r,
                         )
                         pred_vr = ((d_vr.value + e_vr.value) / 2.0).squeeze(-1)
                         val_losses_r.append(F.mse_loss(pred_vr, mb_ret_r).item() / (ret_std ** 2).item())
@@ -915,7 +947,14 @@ class PPOTrainer:
 
         log.info("Combined pre-training complete.")
 
-    def pretrain_value(self, env, n_steps: int, n_epochs: int, lr: float) -> None:
+    def pretrain_value(
+        self,
+        env,
+        n_steps: int,
+        n_epochs: int,
+        lr: float,
+        batch_size: Optional[int] = None,
+    ) -> dict:
         """Warm-start the value heads to predict actual returns before PPO starts.
 
         Collects n_steps of experience using the current (BC-warm-started) policy,
@@ -923,12 +962,27 @@ class PPOTrainer:
         n_epochs at the given lr. This prevents the enormous value gradient from
         destroying the policy on the very first PPO update.
 
+        Trunk/encoder freezing (via ``_get_value_pretrain_freeze_params()``) is
+        always applied here — this is a distinct stage from
+        ``pretrain_combined()``'s Phase 0, which deliberately has freezing
+        REMOVED (see ai/knowledge.md "Phase 0" note). Do not conflate the two.
+
+        Also called internally by ``pretrain_combined()``'s Phase 2/3 (rollout
+        collection + value warm-up), which used to duplicate this logic inline.
+
         Args:
             env: ScenarioEnv
             n_steps: Steps to collect (should be >= rollout_steps, e.g. 4096)
             n_epochs: Epochs to fit the value network per collected rollout
             lr: Learning rate for value pre-training (higher than PPO lr, e.g. 1e-3)
+            batch_size: Minibatch size. Defaults to ``self.minibatch_size``.
+
+        Returns:
+            dict with diagnostic stats from the rollout collection:
+            ``{"episode_returns": list[float], "outcomes_vs_rules": list[str],
+            "outcomes_vs_immobile": list[str], "outcomes_vs_neural": list[str]}``
         """
+        _batch_size = batch_size if batch_size is not None else self.minibatch_size
         log.info(f"Value pre-training: {n_steps} steps, {n_epochs} epochs, lr={lr}")
         # Freeze trunk layers so BC-learned policy weights are not corrupted.
         _freeze_params = self._get_value_pretrain_freeze_params()
@@ -943,12 +997,15 @@ class PPOTrainer:
         env.sample_action_fn = self._sample_action
         env.reset()
         buffer = RolloutBuffer()
-        episode_rewards: list[float] = []
+        episode_returns: list[float] = []
+        outcomes_vs_rules: list[str] = []
+        outcomes_vs_immobile: list[str] = []
+        outcomes_vs_neural: list[str] = []
         episode_accum = 0.0
         next_obs = None
 
         for _ in range(n_steps):
-            next_obs, reward, done, _ = env.step()
+            next_obs, reward, done, info = env.step()
             tr = env.last_trainee_transition
             if tr is not None:
                 buffer.add(
@@ -961,9 +1018,29 @@ class PPOTrainer:
                 )
             episode_accum += reward
             if done:
-                episode_rewards.append(episode_accum)
+                episode_returns.append(episode_accum)
                 episode_accum = 0.0
+                if info is not None and info.trial_outcome is not None:
+                    if info.is_rules_episode:
+                        outcomes_vs_rules.append(info.trial_outcome)
+                    elif info.is_immobile_episode:
+                        outcomes_vs_immobile.append(info.trial_outcome)
+                    else:
+                        outcomes_vs_neural.append(info.trial_outcome)
                 env.reset()
+
+        def _win_frac(outcomes: list[str]) -> float:
+            if not outcomes:
+                return float('nan')
+            return outcomes.count("box_possession") / len(outcomes)
+
+        log.info(
+            f"  [value pretrain rollout] mean_return={np.mean(episode_returns) if episode_returns else float('nan'):.2f} "
+            f"({len(episode_returns)} episode(s))  "
+            f"vs_rules({len(outcomes_vs_rules)}): {_win_frac(outcomes_vs_rules):.0%}  "
+            f"vs_immobile({len(outcomes_vs_immobile)}): {_win_frac(outcomes_vs_immobile):.0%}  "
+            f"vs_neural({len(outcomes_vs_neural)}): {_win_frac(outcomes_vs_neural):.0%}"
+        )
 
         with torch.no_grad():
             last_obs_dict = {k: v.unsqueeze(0).to(self.device)
@@ -972,6 +1049,11 @@ class PPOTrainer:
 
         _, returns = buffer.compute_gae(self.gamma, self.lam, last_value)
         batch = buffer.as_tensors(_, returns)
+
+        # Augment with geometric flips + slot permutations (ALWAYS applied,
+        # matching pretrain_combined()'s Phase 2/3 behaviour).
+        if self.augment_n_slot_shuffles > 0:
+            batch = augment_batch(batch, self.augment_n_slot_shuffles, self._aug_rng)
 
         returns_t = batch["returns"].to(self.device)
         ret_mean = returns_t.mean()
@@ -984,8 +1066,8 @@ class PPOTrainer:
         for ep in range(n_epochs):
             indices = torch.randperm(n)
             ep_losses = []
-            for start in range(0, n, self.minibatch_size):
-                mb_idx = indices[start:start + self.minibatch_size]
+            for start in range(0, n, _batch_size):
+                mb_idx = indices[start:start + _batch_size]
                 mb_obs = {k.replace("obs/", ""): batch[k][mb_idx].to(self.device)
                           for k in batch if k.startswith("obs/")}
                 mb_ret = returns_t[mb_idx]
@@ -995,9 +1077,10 @@ class PPOTrainer:
                 em = mb_obs["exists_mask"]
                 bf = mb_obs["ball_feat"]
                 gf = mb_obs["global_feat"]
+                sat, oat = _ai_types(mb_obs)
 
-                d_heads = self.decision_net(sf, of, em, bf, gf)
-                e_heads = self.execution_net(sf, of, em, bf, gf, d_heads)
+                d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
                 new_values = ((d_heads.value + e_heads.value) / 2.0).squeeze(-1)
 
                 # Normalised MSE so the loss is O(1) regardless of return scale
@@ -1017,17 +1100,27 @@ class PPOTrainer:
             with torch.no_grad():
                 spot_obs = {k.replace("obs/", ""): batch[k][:64].to(self.device)
                             for k in batch if k.startswith("obs/")}
+                _sat_s, _oat_s = _ai_types(spot_obs)
                 d_s = self.decision_net(spot_obs["self_feat"], spot_obs["other_feat"],
                                        spot_obs["exists_mask"], spot_obs["ball_feat"],
-                                       spot_obs["global_feat"])
+                                       spot_obs["global_feat"], _sat_s, _oat_s)
                 e_s = self.execution_net(spot_obs["self_feat"], spot_obs["other_feat"],
                                         spot_obs["exists_mask"], spot_obs["ball_feat"],
-                                        spot_obs["global_feat"], d_s)
+                                        spot_obs["global_feat"], d_s, _sat_s, _oat_s)
                 pred_vals = ((d_s.value + e_s.value) / 2.0).squeeze(-1)
+            log.info(f"  Value epoch {ep + 1}/{n_epochs}: val_loss={mean_loss:.4f}")
             log.debug(f"  [value pretrain epoch {ep:2d}] loss={mean_loss:.4f}"
                       f"  pred_val mean={pred_vals.mean():.2f}  target mean={returns_t[:64].mean():.2f}")
+        log.info(f"Value pre-training done ({n_epochs} epoch(s), final val_loss={mean_loss:.4f})")
         for p in _freeze_params:
             p.requires_grad_(True)
+
+        return {
+            "episode_returns": episode_returns,
+            "outcomes_vs_rules": outcomes_vs_rules,
+            "outcomes_vs_immobile": outcomes_vs_immobile,
+            "outcomes_vs_neural": outcomes_vs_neural,
+        }
 
     # -----------------------------------------------------------------------
     # Policy sampling
@@ -1053,9 +1146,11 @@ class PPOTrainer:
         em = obs_dict["exists_mask"].unsqueeze(0).to(dev)
         bf = obs_dict["ball_feat"].unsqueeze(0).to(dev)
         gf = obs_dict["global_feat"].unsqueeze(0).to(dev)
+        sat = obs_dict["self_ai_type"].unsqueeze(0).to(dev) if "self_ai_type" in obs_dict else None
+        oat = obs_dict["other_ai_type"].unsqueeze(0).to(dev) if "other_ai_type" in obs_dict else None
 
         # Decision network forward
-        d_heads = self.decision_net(sf, of, em, bf, gf)
+        d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
 
         # Sample from each decision head
         shoot = IndependentBernoulli(d_heads.shoot_logit).sample()
@@ -1112,7 +1207,7 @@ class PPOTrainer:
         }
 
         # Execution network forward
-        e_heads = self.execution_net(sf, of, em, bf, gf, d_heads)
+        e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
 
         # Sample execution heads
         exec_move = IndependentBernoulli(e_heads.exec_move_logit).sample()
@@ -1229,8 +1324,10 @@ class PPOTrainer:
         em = obs_dict["exists_mask"].to(self.device)
         bf = obs_dict["ball_feat"].to(self.device)
         gf = obs_dict["global_feat"].to(self.device)
-        d_heads = self.decision_net(sf, of, em, bf, gf)
-        e_heads = self.execution_net(sf, of, em, bf, gf, d_heads)
+        sat = obs_dict["self_ai_type"].to(self.device) if "self_ai_type" in obs_dict else None
+        oat = obs_dict["other_ai_type"].to(self.device) if "other_ai_type" in obs_dict else None
+        d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
+        e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
         return float((d_heads.value + e_heads.value).mean())
 
     def _compute_log_prob(self, d_heads, e_heads, samples: dict, exists_mask) -> torch.Tensor:
@@ -1323,6 +1420,7 @@ class PPOTrainer:
         all_entropy = []
         all_kl = []
         all_bc_loss = []
+        all_bc_tackle_loss: list[float] = []   # BCE on tackle_attempt head only
         all_ratios: list[torch.Tensor] = []
         all_mv_log_std_grad: list[float] = []  # grad on move_dir_log_std after each backward
         epoch_times = []
@@ -1373,9 +1471,10 @@ class PPOTrainer:
                 em = mb_obs["exists_mask"]
                 bf = mb_obs["ball_feat"]
                 gf = mb_obs["global_feat"]
+                sat, oat = _ai_types(mb_obs)
 
-                d_heads = self.decision_net(sf, of, em, bf, gf)
-                e_heads = self.execution_net(sf, of, em, bf, gf, d_heads)
+                d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
 
                 # Value estimate
                 new_values = ((d_heads.value + e_heads.value) / 2.0).squeeze(-1)
@@ -1458,12 +1557,17 @@ class PPOTrainer:
                 bc_loss_val = torch.zeros(1, device=self.device)
                 if has_bc:
                     mb_bc = batch["bc_labels"][mb_idx].to(self.device)
-                    bc_loss_val = bc_loss_from_tensor(
+                    bc_loss_val, _bkdn = bc_loss_from_tensor(
                         mb_bc, d_heads, e_heads,
                         direction_loss_weight=self._bc_dir_loss_w,
                         region_loss_weight=self._bc_region_loss_w,
+                        pos_weight_kick=self._bc_pos_weight_kick,
+                        pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
+                        return_breakdown=True,
                     )
                     total_loss = total_loss + bc_coeff * bc_loss_val
+                    # Track tackle_attempt BCE separately for diagnostics
+                    all_bc_tackle_loss.append(_bkdn.get("tackle_attempt", 0.0))
                 all_bc_loss.append(bc_loss_val.detach().item())
 
                 self.optimizer.zero_grad()
@@ -1487,8 +1591,8 @@ class PPOTrainer:
 
                 # After step: measure KL and direction mean shift
                 with torch.no_grad():
-                    d_after = self.decision_net(sf, of, em, bf, gf)
-                    e_after = self.execution_net(sf, of, em, bf, gf, d_after)
+                    d_after = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                    e_after = self.execution_net(sf, of, em, bf, gf, d_after, sat, oat)
                     lp_after = self._recompute_log_prob(d_after, e_after, mb_actions, em)
                     movedir_mean_shift = (e_after.move_direction - e_heads.move_direction).norm(dim=-1).mean().item()
                     kickdir_mean_shift = (e_after.kick_direction - e_heads.kick_direction).norm(dim=-1).mean().item()
@@ -1567,13 +1671,16 @@ class PPOTrainer:
                         for k in batch if k.startswith("action/")}
             diag_old_lp = old_log_probs[:diag_n].to(self.device)
             with torch.no_grad():
+                _sat_d, _oat_d = _ai_types(diag_obs)
                 d_d = self.decision_net(
                     diag_obs["self_feat"], diag_obs["other_feat"],
                     diag_obs["exists_mask"], diag_obs["ball_feat"], diag_obs["global_feat"],
+                    _sat_d, _oat_d,
                 )
                 e_d = self.execution_net(
                     diag_obs["self_feat"], diag_obs["other_feat"],
                     diag_obs["exists_mask"], diag_obs["ball_feat"], diag_obs["global_feat"], d_d,
+                    _sat_d, _oat_d,
                 )
                 def _blpv(logit, key):
                     return IndependentBernoulli(logit).log_prob(diag_act[key]).squeeze(-1)
@@ -1663,6 +1770,7 @@ class PPOTrainer:
             "entropy": float(np.mean(all_entropy)),
             "approx_kl": float(np.mean(all_kl)),
             "bc_loss": float(np.mean(all_bc_loss)),
+            "bc_tackle_loss": float(np.mean(all_bc_tackle_loss)) if all_bc_tackle_loss else 0.0,
             "bc_coeff": bc_coeff,
             "epoch_time_ms": float(np.mean(epoch_times)) if epoch_times else 0.0,
             "move_log_std": move_log_std,

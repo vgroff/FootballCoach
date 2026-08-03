@@ -1,5 +1,12 @@
 # Football Coach
 
+> **Documentation must stay in sync with code.** Any significant change, and
+> any change that conflicts with existing documentation, must be followed by
+> additions or edits to the relevant documentation (this file, knowledge.md
+> files, design docs, plans). When writing plans, design documents, prompts,
+> or other work-related files, always include this same statement at the top
+> of that file. Otherwise documentation goes stale and confusion occurs.
+
 A personal project: a football (soccer) coaching game where players are
 eventually controlled by independently-acting neural networks (trained with
 PPO), while a human coach can set tactics and issue live orders.

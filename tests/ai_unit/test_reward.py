@@ -22,133 +22,182 @@ _CFG2 = load_ai_config()["reward"]["phase2"]
 # ---------------------------------------------------------------------------
 
 class TestPhase1Reward:
+    """Tests for phase1_reward(), which returns a (float, dict[str, float]) tuple.
 
-    def test_zero_when_nothing_happens(self):
-        r = phase1_reward(
+    The float is the total scalar reward; the dict breaks it down by component.
+    Config now uses asymmetric ball-distance shaping: ball_approach_bonus and
+    ball_retreat_penalty (retreat coefficient is larger than approach).
+    """
+
+    def _call(self, **kwargs) -> tuple[float, dict]:
+        """Call phase1_reward with no-op defaults; kwargs override specific fields."""
+        defaults = dict(
             prev_ball_dist=5.0, curr_ball_dist=5.0,
             has_possession_now=False, gained_possession_this_step=False,
             ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
             illegal_action_attempted=False, reached_opponent_box_with_possession=False,
             cfg=_CFG1,
         )
-        assert r == pytest.approx(0.0, abs=1e-7)
+        defaults.update(kwargs)
+        return phase1_reward(**defaults)
 
-    def test_closing_distance_positive(self):
-        r = phase1_reward(
+    def test_returns_tuple_of_float_and_dict(self):
+        result = self._call()
+        total, comps = result
+        assert isinstance(total, float)
+        assert isinstance(comps, dict)
+
+    def test_components_dict_has_all_keys(self):
+        _, comps = self._call()
+        assert set(comps.keys()) == {
+            "appr", "retr", "poss", "prog", "out", "ill",
+            "box", "spd", "lpos", "lterm", "tout", "prox",
+        }
+
+    def test_total_always_equals_sum_of_components(self):
+        """Invariant: total == sum(comps.values()) for any input."""
+        total, comps = self._call(
             prev_ball_dist=10.0, curr_ball_dist=5.0,
-            has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1,
+            has_possession_now=True, gained_possession_this_step=True,
+            ball_progress_toward_goal_m=2.0,
         )
-        expected = _CFG1["ball_distance_shaping"] * (10.0 - 5.0)
-        assert r == pytest.approx(expected, rel=1e-5)
+        assert total == pytest.approx(sum(comps.values()), rel=1e-5)
 
-    def test_moving_away_from_ball_negative(self):
-        r = phase1_reward(
-            prev_ball_dist=5.0, curr_ball_dist=10.0,
-            has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1,
-        )
-        assert r < 0.0
+    def test_zero_when_nothing_happens(self):
+        total, _ = self._call()
+        assert total == pytest.approx(0.0, abs=1e-7)
+
+    def test_closing_distance_gives_approach_reward(self):
+        total, comps = self._call(prev_ball_dist=10.0, curr_ball_dist=5.0)
+        expected = _CFG1["ball_approach_bonus"] * 5.0
+        assert total == pytest.approx(expected, rel=1e-5)
+        assert comps["appr"] == pytest.approx(expected, rel=1e-5)
+        assert comps["retr"] == pytest.approx(0.0, abs=1e-7)
+
+    def test_moving_away_from_ball_gives_retreat_penalty(self):
+        total, comps = self._call(prev_ball_dist=5.0, curr_ball_dist=10.0)
+        expected = _CFG1["ball_retreat_penalty"] * (-5.0)
+        assert total == pytest.approx(expected, rel=1e-5)
+        assert comps["retr"] == pytest.approx(expected, rel=1e-5)
+        assert comps["appr"] == pytest.approx(0.0, abs=1e-7)
+        assert total < 0.0
+
+    def test_retreat_penalty_larger_than_approach_bonus(self):
+        """Config asymmetry: retreat is punished harder than approach is rewarded."""
+        assert _CFG1["ball_retreat_penalty"] > _CFG1["ball_approach_bonus"]
 
     def test_gaining_possession_bonus(self):
-        r = phase1_reward(
-            prev_ball_dist=1.0, curr_ball_dist=1.0,
+        total, comps = self._call(
             has_possession_now=True, gained_possession_this_step=True,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1,
+            prev_ball_dist=1.0, curr_ball_dist=1.0,
         )
-        assert r >= _CFG1["gain_possession_bonus"]
+        assert comps["poss"] == pytest.approx(_CFG1["gain_possession_bonus"], rel=1e-5)
+        assert total == pytest.approx(_CFG1["gain_possession_bonus"], rel=1e-5)
 
     def test_ball_progress_when_possessed(self):
         progress_m = 3.0
-        r = phase1_reward(
+        total, comps = self._call(
+            has_possession_now=True, ball_progress_toward_goal_m=progress_m,
             prev_ball_dist=0.5, curr_ball_dist=0.5,
-            has_possession_now=True, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=progress_m, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1,
         )
-        assert r == pytest.approx(_CFG1["ball_progress_scale"] * progress_m, rel=1e-5)
+        assert comps["prog"] == pytest.approx(_CFG1["ball_progress_scale"] * progress_m, rel=1e-5)
+        assert total == pytest.approx(_CFG1["ball_progress_scale"] * progress_m, rel=1e-5)
 
     def test_no_ball_progress_reward_without_possession(self):
-        """ball_progress is only rewarded if has_possession_now."""
-        r_with = phase1_reward(
+        """ball_progress is only rewarded when has_possession_now is True."""
+        r_with, _ = self._call(
+            has_possession_now=True, ball_progress_toward_goal_m=5.0,
             prev_ball_dist=0.5, curr_ball_dist=0.5,
-            has_possession_now=True, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=5.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1,
         )
-        r_without = phase1_reward(
+        r_without, _ = self._call(
+            has_possession_now=False, ball_progress_toward_goal_m=5.0,
             prev_ball_dist=0.5, curr_ball_dist=0.5,
-            has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=5.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1,
         )
         assert r_with > r_without
 
     def test_ball_out_penalty(self):
-        r = phase1_reward(
-            prev_ball_dist=1.0, curr_ball_dist=1.0,
-            has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=True,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1,
-        )
-        assert r <= _CFG1["ball_out_penalty"]
+        total, comps = self._call(ball_went_out_after_touch=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
+        assert comps["out"] == pytest.approx(_CFG1["ball_out_penalty"], rel=1e-5)
+        assert total == pytest.approx(_CFG1["ball_out_penalty"], rel=1e-5)
+        assert total < 0.0
 
     def test_illegal_action_penalty(self):
-        r = phase1_reward(
-            prev_ball_dist=1.0, curr_ball_dist=1.0,
-            has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=True, reached_opponent_box_with_possession=False,
-            cfg=_CFG1,
-        )
-        assert r <= _CFG1["illegal_action_penalty"]
+        total, comps = self._call(illegal_action_attempted=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
+        assert comps["ill"] == pytest.approx(_CFG1["illegal_action_penalty"], rel=1e-5)
+        assert total == pytest.approx(_CFG1["illegal_action_penalty"], rel=1e-5)
+        assert total < 0.0
 
     def test_box_possession_terminal_large_bonus(self):
-        r = phase1_reward(
+        total, comps = self._call(
+            has_possession_now=True, reached_opponent_box_with_possession=True,
             prev_ball_dist=0.5, curr_ball_dist=0.5,
-            has_possession_now=True, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=True,
-            cfg=_CFG1,
         )
-        assert r >= _CFG1["box_possession_terminal"]
+        assert comps["box"] == pytest.approx(_CFG1["box_possession_terminal"], rel=1e-5)
+        assert total >= _CFG1["box_possession_terminal"]
 
     def test_all_penalties_stack(self):
-        """Multiple bad things happening should stack (all negative)."""
-        r = phase1_reward(
+        """ball_out + illegal action together should be worse than either alone."""
+        r_both, _ = self._call(
+            ball_went_out_after_touch=True, illegal_action_attempted=True,
+            prev_ball_dist=1.0, curr_ball_dist=1.0,
+        )
+        r_out, _ = self._call(ball_went_out_after_touch=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
+        r_ill, _ = self._call(illegal_action_attempted=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
+        assert r_both < r_out
+        assert r_both < r_ill
+
+    def test_loss_of_possession_penalty(self):
+        total, comps = self._call(lost_possession_this_step=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
+        assert comps["lpos"] == pytest.approx(_CFG1.get("loss_of_possession_penalty", 0.0), rel=1e-5)
+        assert total < 0.0
+
+    def test_opponent_reached_box_loss_terminal(self):
+        total, comps = self._call(opponent_reached_trainee_box=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
+        assert comps["lterm"] == pytest.approx(_CFG1.get("loss_terminal", 0.0), rel=1e-5)
+        assert total < 0.0
+
+    def test_timeout_penalty_no_proximity(self):
+        """Ball far from box on timeout: only the timeout penalty fires, prox=0."""
+        total, comps = self._call(timed_out=True, ball_dist_to_opponent_box_m=9999.0,
+                                  prev_ball_dist=1.0, curr_ball_dist=1.0)
+        assert comps["tout"] == pytest.approx(_CFG1.get("timeout_penalty", 0.0), rel=1e-5)
+        assert comps["prox"] == pytest.approx(0.0, abs=1e-7)
+        assert total < 0.0
+
+    def test_proximity_bonus_on_timeout_increases_with_closeness(self):
+        """Ball near the box on timeout earns a larger prox bonus than ball far away."""
+        _, comps_near = phase1_reward(
             prev_ball_dist=1.0, curr_ball_dist=1.0,
             has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=True,
-            illegal_action_attempted=True, reached_opponent_box_with_possession=False,
-            cfg=_CFG1,
+            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+            cfg=_CFG1, timed_out=True, ball_dist_to_opponent_box_m=1.0,
         )
-        assert r < _CFG1["ball_out_penalty"]  # worse than just ball_out alone
+        _, comps_far = phase1_reward(
+            prev_ball_dist=1.0, curr_ball_dist=1.0,
+            has_possession_now=False, gained_possession_this_step=False,
+            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+            cfg=_CFG1, timed_out=True, ball_dist_to_opponent_box_m=9999.0,
+        )
+        assert comps_near["prox"] > comps_far["prox"]
 
     def test_reward_is_additive(self):
-        """Total reward should equal sum of individual components."""
-        r_total = phase1_reward(
+        """Total matches sum of components and matches expected arithmetic."""
+        total, comps = phase1_reward(
             prev_ball_dist=10.0, curr_ball_dist=5.0,
             has_possession_now=True, gained_possession_this_step=True,
             ball_progress_toward_goal_m=2.0, ball_went_out_after_touch=False,
             illegal_action_attempted=False, reached_opponent_box_with_possession=False,
             cfg=_CFG1,
         )
+        assert total == pytest.approx(sum(comps.values()), rel=1e-5)
         expected = (
-            _CFG1["ball_distance_shaping"] * 5.0
+            _CFG1["ball_approach_bonus"] * 5.0
             + _CFG1["gain_possession_bonus"]
             + _CFG1["ball_progress_scale"] * 2.0
         )
-        assert r_total == pytest.approx(expected, rel=1e-5)
+        assert total == pytest.approx(expected, rel=1e-5)
 
 
 # ---------------------------------------------------------------------------

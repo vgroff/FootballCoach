@@ -1,5 +1,36 @@
 # Human Trainer Cheatsheet
 
+## Demonstrations
+
+Demonstrations are used for BC pre-training (offline). Re-record whenever the reward
+function, scenario config, or rules AI behaviour changes significantly.
+
+### Re-record demonstrations (delete old + record fresh)
+```bash
+# Delete existing demos and record fresh ones (adjust --n-episodes as needed)
+rm -f demonstrations/phase1/*.npz && \
+uv run python -m footballcoach.ai.scripts.record_demonstrations \
+    --phase 1 --n-episodes 12000 --episodes-per-file 8 \
+    --output demonstrations/phase1/ --seed 42 2>&1 | tee /tmp/record_demos.log
+```
+
+| Flag | Effect |
+|------|--------|
+| `--n-episodes N` | Total episodes to record. 4000 ≈ 44k steps at 1s interval. 1000 = fast check (~11k steps). |
+| `--episodes-per-file N` | Episodes per .npz file (default 8). Lower = more files, finer resume granularity. |
+| `--output PATH` | Output directory (auto-created). |
+| `--seed N` | Random seed for reproducibility. |
+| `--info` | Print summary of existing .npz files in directory and exit (no recording). |
+| `--opponent-rules-prob F` | Fraction of episodes where opponent is rules-based (default from config). |
+
+### Inspect existing demonstrations
+```bash
+uv run python -m footballcoach.ai.scripts.record_demonstrations \
+    --phase 1 --n-episodes 0 --output demonstrations/phase1/ --info
+```
+
+---
+
 ## Core training commands
 
 All commands append to `training_runs.log` and print live to terminal via `tee -a`.
@@ -21,8 +52,7 @@ you must pass the checkpoint path explicitly.
 uv run python -m footballcoach.ai.scripts.train \
     --phase 1 --seed 42 \
     --bc-dataset demonstrations/phase1/ \
-    --verbose 2>&1 | tee -a training_runs.log
-# change steps: add --total-steps 40000
+    --verbose 2>&1  --total-steps 40000 | tee -a training_runs.log
 
 ```
 

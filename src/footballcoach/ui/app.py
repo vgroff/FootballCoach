@@ -4,6 +4,7 @@ screen used by both.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass, field
 from enum import Enum, auto
 
 import pygame
@@ -26,12 +27,66 @@ class Screen(Enum):
     SCENARIO_PARAMS = auto()
 
 
+@dataclass
+class ActionIconState:
+    """Tracks per-player action icons (kick/tackle/save/etc.) so they can
+    linger on screen for a moment after the triggering event, independent of
+    how often the engine actually fires the underlying callback.
+    """
+    linger_s: float
+    _icons: dict[str, tuple[str, float]] = field(default_factory=dict)
+
+    def clear(self) -> None:
+        self._icons.clear()
+
+    def record(self, player_id: str, icon: str, now_s: float) -> None:
+        self._icons[player_id] = (icon, now_s + self.linger_s)
+
+    def active_icon(self, player_id: str, now_s: float) -> str | None:
+        """Returns the still-lingering icon for *player_id*, if any, expiring
+        (and forgetting) it if its linger window has passed."""
+        entry = self._icons.get(player_id)
+        if entry is None:
+            return None
+        icon, expiry = entry
+        if now_s < expiry:
+            return icon
+        del self._icons[player_id]
+        return None
+
+
+@dataclass
+class ScenarioParamsUIState:
+    """State for the Screen.SCENARIO_PARAMS configuration screen (picking
+    scenario parameters before starting a balance-scenario trial run)."""
+    definition: scenarios.ScenarioDefinition | None = None
+    values: dict[str, float] = field(default_factory=dict)
+    button_rects: dict[str, tuple[pygame.Rect, pygame.Rect]] = field(default_factory=dict)
+    open_choice_param: str | None = None  # which ScenarioChoiceParam dropdown is open
+
+    def reset_for(self, definition: scenarios.ScenarioDefinition) -> None:
+        self.definition = definition
+        all_params = list(definition.params) + scenarios.UNIVERSAL_PARAMS
+        self.values = {p.name: p.default for p in all_params}
+        self.open_choice_param = None
+
+    def clear(self) -> None:
+        self.definition = None
+        self.values = {}
+
+
 class App:
     def __init__(self) -> None:
         pygame.init()
         pygame.display.set_caption("Football Coach")
 
-        self.camera = Camera.fit_to_pitch(self._temp_pitch())
+        _gcfg = load_graphics_config()
+        _cam_cfg = _gcfg.get("camera", {})
+        self.camera = Camera.fit_to_pitch(
+            self._temp_pitch(),
+            pixels_per_metre=_cam_cfg.get("pixels_per_metre", 9.0),
+            margin_px=int(_cam_cfg.get("margin_px", 40)),
+        )
         self.surface = pygame.display.set_mode((self.camera.screen_width, self.camera.screen_height))
         self.clock = pygame.time.Clock()
         self.renderer = Renderer(self.camera)
@@ -54,19 +109,18 @@ class App:
         # Auto-pause notification: set when a human-issued order completes.
         # Cleared the next time the player resumes (Space).
         self._pause_notification: str | None = None
+        # True iff the current pause was triggered automatically (order complete /
+        # kick issued). False = user pressed Space manually.
+        self._auto_paused: bool = False
 
-        # Action icon state: player_id -> (icon_str, wall_clock_expiry_s).
-        # Icons are polled from player.action_icon each frame after stepping,
-        # stored here with an expiry, and cleared from the player immediately.
-        self._action_icon_state: dict[str, tuple[str, float]] = {}
+        # Action icon state: player.action_icon is polled each frame after
+        # stepping and recorded here with a wall-clock expiry so icons
+        # linger briefly on screen (see ActionIconState).
         gcfg = load_graphics_config()
-        self._icon_linger_s: float = gcfg["action_icons"]["linger_s"]
+        self._action_icons = ActionIconState(linger_s=gcfg["action_icons"]["linger_s"])
 
         # Pending scenario params (Screen.SCENARIO_PARAMS state)
-        self._pending_scenario_definition: scenarios.ScenarioDefinition | None = None
-        self._pending_scenario_params: dict[str, float] = {}
-        self._params_button_rects: dict[str, tuple[pygame.Rect, pygame.Rect]] = {}
-        self._open_choice_param: str | None = None  # which ScenarioChoiceParam dropdown is open
+        self._scenario_params_ui = ScenarioParamsUIState()
 
         # Simulation speed multiplier: physics steps per visual frame.
         # Cycle with ] (faster) and [ (slower).
@@ -114,6 +168,8 @@ class App:
         if key == pygame.K_ESCAPE:
             if self.show_help:
                 self.show_help = False
+            elif self.input_controller is not None and self.input_controller.kick_ui_state() is not None:
+                self.input_controller.cancel_kick_ui()
             elif self.screen == Screen.SCENARIO_PARAMS:
                 self.screen = Screen.MENU
             elif self.input_controller is not None and self.input_controller.order_mode != OrderMode.MOVE:
@@ -140,11 +196,13 @@ class App:
         if key == pygame.K_SPACE:
             self.match.paused = not self.match.paused
             if not self.match.paused:
-                self._pause_notification = None  # clear on resume
+                self._pause_notification = None
+                self._auto_paused = False
         elif key == pygame.K_p:
             self.input_controller.enter_pass_mode()
         elif key == pygame.K_k:
-            self.input_controller.enter_shoot_mode()
+            if not self.input_controller.try_enter_kick_ui():
+                self.input_controller.enter_shoot_mode()
         elif key == pygame.K_s:
             self.input_controller.issue_save_order()
         elif key == pygame.K_x:
@@ -166,6 +224,9 @@ class App:
             self.input_controller.handle_mouse_motion(event.pos, shift_held)
         elif event.type == pygame.MOUSEBUTTONUP and event.button == 1:
             self.input_controller.handle_mouse_up(event.pos)
+        elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
+            if self.input_controller.kick_ui_state() is not None:
+                self.input_controller.regress_kick_ui()
 
     def _handle_menu_click(self, pos: tuple[int, int]) -> None:
         item = self._menu_item_at(pos)
@@ -181,104 +242,134 @@ class App:
             self._enter_params_screen(definition)
 
     def _enter_params_screen(self, definition: scenarios.ScenarioDefinition) -> None:
-        self._pending_scenario_definition = definition
-        all_params = list(definition.params) + scenarios.UNIVERSAL_PARAMS
-        self._pending_scenario_params = {p.name: p.default for p in all_params}
-        self._open_choice_param = None
+        self._scenario_params_ui.reset_for(definition)
         self.screen = Screen.SCENARIO_PARAMS
 
     def _handle_params_click(self, pos: tuple[int, int]) -> None:
-        if self._pending_scenario_definition is None:
+        ui = self._scenario_params_ui
+        if ui.definition is None:
             return
 
         # Check dropdown option rects first (they overlay other content when open).
-        for key, (r, _) in self._params_button_rects.items():
+        for key, (r, _) in ui.button_rects.items():
             if "__option__" in key and r.collidepoint(pos):
                 param_name, _, idx_str = key.partition("__option__")
-                self._pending_scenario_params[param_name] = idx_str  # stored as string key
-                self._open_choice_param = None
+                ui.values[param_name] = idx_str  # stored as string key
+                ui.open_choice_param = None
                 return
 
-        for name, (minus_rect, plus_rect) in self._params_button_rects.items():
+        for name, (minus_rect, plus_rect) in ui.button_rects.items():
             if "__option__" in name:
                 continue
             if name == "__start__":
                 if minus_rect.collidepoint(pos):
-                    self._open_choice_param = None
+                    ui.open_choice_param = None
                     self._start_scenario_with_params()
                 continue
             if name == "__back__":
                 if minus_rect.collidepoint(pos):
-                    self._open_choice_param = None
+                    ui.open_choice_param = None
                     self.screen = Screen.MENU
                 continue
-            all_params = list(self._pending_scenario_definition.params) + scenarios.UNIVERSAL_PARAMS
+            all_params = list(ui.definition.params) + scenarios.UNIVERSAL_PARAMS
             param = next((p for p in all_params if p.name == name), None)
             if param is None:
                 continue
 
             if isinstance(param, ScenarioBoolParam):
                 if minus_rect.collidepoint(pos):
-                    self._pending_scenario_params[name] = not bool(
-                        self._pending_scenario_params.get(name, param.default)
-                    )
+                    ui.values[name] = not bool(ui.values.get(name, param.default))
                     break
             elif isinstance(param, ScenarioChoiceParam):
                 # Clicking the value area (minus_rect == value_rect here) toggles the dropdown.
                 # Clicking [>] cycles. Only act if this row was actually hit.
                 if minus_rect.collidepoint(pos):
-                    self._open_choice_param = name if self._open_choice_param != name else None
+                    ui.open_choice_param = name if ui.open_choice_param != name else None
                     break
                 elif plus_rect.collidepoint(pos):
-                    current = self._pending_scenario_params.get(name, param.default)
+                    current = ui.values.get(name, param.default)
                     idx = list(param.choices).index(current) if current in param.choices else 0
-                    self._pending_scenario_params[name] = param.choices[(idx + 1) % len(param.choices)]
-                    self._open_choice_param = None
+                    ui.values[name] = param.choices[(idx + 1) % len(param.choices)]
+                    ui.open_choice_param = None
                     break
             else:
-                current = self._pending_scenario_params.get(name, param.default)
+                current = ui.values.get(name, param.default)
                 if minus_rect.collidepoint(pos):
-                    self._pending_scenario_params[name] = max(param.min_value, current - param.step)
+                    ui.values[name] = max(param.min_value, current - param.step)
                     break
                 elif plus_rect.collidepoint(pos):
-                    self._pending_scenario_params[name] = min(param.max_value, current + param.step)
+                    ui.values[name] = min(param.max_value, current + param.step)
                     break
 
     def _start_scenario_with_params(self) -> None:
-        if self._pending_scenario_definition is None:
+        ui = self._scenario_params_ui
+        if ui.definition is None:
             return
-        kwargs = dict(self._pending_scenario_params)
+        kwargs = dict(ui.values)
         timeout_ticks = int(kwargs.pop("timeout_ticks", 800))
         sim_speed_str = kwargs.pop("sim_speed", "1x")
         sim_speed = int(sim_speed_str.rstrip("x"))
         self._start_scenario(
-            self._pending_scenario_definition,
+            ui.definition,
             kwargs=kwargs,
             timeout_ticks=timeout_ticks,
             sim_speed=sim_speed,
         )
-        self._pending_scenario_definition = None
-        self._pending_scenario_params = {}
+        ui.clear()
 
     def _on_human_order_complete(self, player_id: str, order_name: str) -> None:
         """Callback fired by input.py when a human-issued order finishes."""
         if self.match is not None:
             self.match.paused = True
+            self._auto_paused = True
         self._pause_notification = f"{player_id}: {order_name} complete — Space to resume"
+
+    def _on_new_order(self) -> None:
+        """Callback fired by input.py whenever any new order is issued.
+
+        Always resumes play regardless of whether the pause was automatic or
+        manual — issuing an order is an intent to act, so the game should run
+        to execute it without needing a separate Space press.
+        """
+        self._pause_notification = None
+        self._auto_paused = False
+        if self.match is not None:
+            self.match.paused = False
+
+    def _on_kick_ui_entered(self) -> None:
+        """Callback fired when kick UI phase 1 is entered.
+
+        Pauses the game immediately so the player freezes while the user aims.
+        """
+        if self.match is not None:
+            self.match.paused = True
+            self._auto_paused = True
+        self._pause_notification = "Aiming kick — click to advance phases  ·  Esc/RClick cancel"
+
+    def _on_kick_issued(self) -> None:
+        """Callback fired when the kick order is queued (after phase 3 click).
+
+        Game is already paused; just update the notification message.
+        """
+        self._pause_notification = "Kick queued — Space to execute"
 
     def _start_match(self, match: Match, label: str, is_training_mode: bool = False) -> None:
         self.match = match
         self._wire_match_log(match)
         self._wire_player_icon_callbacks(match)
-        self._action_icon_state.clear()
+        self._action_icons.clear()
         self.input_controller = MatchInputController(match=match, camera=self.camera)
         self.input_controller.on_order_complete = self._on_human_order_complete
+        self.input_controller.on_new_order = self._on_new_order
+        self.input_controller.on_kick_ui_entered = self._on_kick_ui_entered
+        self.input_controller.on_kick_issued = self._on_kick_issued
         self.mode_label = label
         self.screen = Screen.MATCH
         self.is_training_mode = is_training_mode
         self._scenario_loop = None
         self._last_goal_tally = (match.scoreboard.left_goals, match.scoreboard.right_goals)
         self._pause_notification = None
+        self._auto_paused = False
         if is_training_mode and match.players:
             self.input_controller.selected_player_id = match.players[0].player_id
 
@@ -293,14 +384,18 @@ class App:
         self.match = loop.match
         self._wire_match_log(loop.match)
         self._wire_player_icon_callbacks(loop.match)
-        self._action_icon_state.clear()
+        self._action_icons.clear()
         self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
         self.input_controller.on_order_complete = self._on_human_order_complete
+        self.input_controller.on_new_order = self._on_new_order
+        self.input_controller.on_kick_ui_entered = self._on_kick_ui_entered
+        self.input_controller.on_kick_issued = self._on_kick_issued
         self.mode_label = f"Balance scenario: {definition.label}"
         self.screen = Screen.MATCH
         self.is_training_mode = False
         self._last_goal_tally = (0, 0)
         self._pause_notification = None
+        self._auto_paused = False
 
     def _wire_match_log(self, match: Match) -> None:
         """Attach the game log callback to a newly created Match."""
@@ -333,22 +428,22 @@ class App:
 
     def _poll_action_icons(self, match: Match) -> None:
         """After each physics step, harvest `player.action_icon` signals set by
-        the engine and record them in `_action_icon_state` with a wall-clock
+        the engine and record them in `self._action_icons` with a wall-clock
         expiry.  The field is cleared immediately so each event is only counted
         once even if multiple ticks fire between rendered frames.
         """
         now_s = pygame.time.get_ticks() / 1000.0
-        expiry_s = now_s + self._icon_linger_s
         for player in match.players:
             if player.action_icon is not None:
-                self._action_icon_state[player.player_id] = (player.action_icon, expiry_s)
+                self._action_icons.record(player.player_id, player.action_icon, now_s)
                 player.action_icon = None
 
     def _step_match(self) -> None:
         assert self.match is not None
-        # Don't fast-forward while paused — keep exactly one step so the HUD
-        # stays responsive (e.g. to un-pause).
-        steps = self._sim_speed if not self.match.paused else 1
+        # Run 0 steps when paused so orders (e.g. a queued kick) don't execute
+        # until the user presses Space.  The HUD renders from match state and
+        # doesn't need a physics tick to stay up to date.
+        steps = self._sim_speed if not self.match.paused else 0
 
         if self._scenario_loop is not None:
             loop = self._scenario_loop
@@ -365,9 +460,12 @@ class App:
                     # New trial started — wire log and icon callbacks to the fresh match.
                     self._wire_match_log(loop.match)
                     self._wire_player_icon_callbacks(loop.match)
-                    self._action_icon_state.clear()
+                    self._action_icons.clear()
                     self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
                     self.input_controller.on_order_complete = self._on_human_order_complete
+                    self.input_controller.on_new_order = self._on_new_order
+                    self.input_controller.on_kick_ui_entered = self._on_kick_ui_entered
+                    self.input_controller.on_kick_issued = self._on_kick_issued
                     break  # render one frame of the new trial before stepping further
                 else:
                     if self.input_controller is not None:
@@ -405,37 +503,46 @@ class App:
         """Returns (kind, key, label, screen_rect) for every clickable menu item.
 
         kind: 'training' | 'scenario' | 'header' (headers are non-clickable labels)
+
+        Layout: two columns.  Left column = AI scenarios + Freeplay.
+        Right column = Balance scenarios.
         """
         items: list[tuple[str, str, str, pygame.Rect]] = []
-        x, y = 60, 110
+        col_w = 480
         row_h = 42
         header_h = 28
+        margin = 60
+        gap = 32  # gap between columns
+        col1_x = margin
+        col2_x = margin + col_w + gap
 
-        # -- AI scenarios section --
-        items.append(("header", "", "── AI Scenarios ──", pygame.Rect(x, y, 500, header_h)))
-        y += header_h + 4
+        # ── Left column ──────────────────────────────────────────────────────
+        y1 = 110
+        items.append(("header", "", "── AI Scenarios ──", pygame.Rect(col1_x, y1, col_w, header_h)))
+        y1 += header_h + 4
         ai_keys = {"phase1_neural_ai", "1v1_phase1"}
         for definition in scenarios.SCENARIOS:
             if definition.key in ai_keys:
-                items.append(("scenario", definition.key, definition.label, pygame.Rect(x + 16, y, 500, row_h - 6)))
-                y += row_h
+                items.append(("scenario", definition.key, definition.label,
+                               pygame.Rect(col1_x + 16, y1, col_w - 16, row_h - 6)))
+                y1 += row_h
 
-        # -- Training mode --
-        y += 8
-        items.append(("header", "", "── Freeplay ──", pygame.Rect(x, y, 500, header_h)))
-        y += header_h + 4
-        items.append(("training", "", "Training mode (1 player + ball, free play)", pygame.Rect(x + 16, y, 500, row_h - 6)))
-        y += row_h
+        y1 += 8
+        items.append(("header", "", "── Freeplay ──", pygame.Rect(col1_x, y1, col_w, header_h)))
+        y1 += header_h + 4
+        items.append(("training", "", "Training mode (1 player + ball, free play)",
+                       pygame.Rect(col1_x + 16, y1, col_w - 16, row_h - 6)))
 
-        # -- Balance scenarios --
-        y += 8
-        items.append(("header", "", "── Balance Scenarios ──", pygame.Rect(x, y, 500, header_h)))
-        y += header_h + 4
-        balance_keys = ai_keys  # skip these
+        # ── Right column ─────────────────────────────────────────────────────
+        y2 = 110
+        items.append(("header", "", "── Balance Scenarios ──", pygame.Rect(col2_x, y2, col_w, header_h)))
+        y2 += header_h + 4
+        balance_keys = ai_keys  # skip AI entries already in left column
         for definition in scenarios.SCENARIOS:
             if definition.key not in balance_keys:
-                items.append(("scenario", definition.key, definition.label, pygame.Rect(x + 16, y, 500, row_h - 6)))
-                y += row_h
+                items.append(("scenario", definition.key, definition.label,
+                               pygame.Rect(col2_x + 16, y2, col_w - 16, row_h - 6)))
+                y2 += row_h
 
         return items
 
@@ -487,24 +594,27 @@ class App:
         now_s = pygame.time.get_ticks() / 1000.0
         for player in ordered_players:
             pid = player.player_id
-            action_icon: str | None = None
-            if pid in self._action_icon_state:
-                icon, expiry = self._action_icon_state[pid]
-                if now_s < expiry:
-                    action_icon = icon
-                else:
-                    del self._action_icon_state[pid]
+            action_icon = self._action_icons.active_icon(pid, now_s)
             self.renderer.draw_player(
                 self.surface, player, selected=pid == selected_id,
                 has_ball=pid == carrier_id,
                 action_icon=action_icon,
             )
+        if not self.match.paused:
+            self.renderer.update_ball_effects(self.match.ball, 1.0 / FPS)
         self.renderer.draw_ball(self.surface, self.match.ball)
 
-        drag = self.input_controller.drag_indicator()
-        if drag is not None:
-            start_world, current_screen = drag
-            self.renderer.draw_drag_indicator(self.surface, start_world, current_screen, style.DRAG_KICK_LINE)
+        kick_state = self.input_controller.kick_ui_state()
+        if kick_state is not None:
+            selected = self.input_controller.selected_player()
+            if selected is not None:
+                self.renderer.draw_kick_ui(
+                    self.surface,
+                    kick_state,
+                    selected,
+                    self.match.pitch.goal_height_m,
+                    bottom_reserve_px=70 if self._pause_notification else 0,
+                )
 
         hud_lines = [self.mode_label]
         speed_str = f"  ⚡{self._sim_speed}x" if self._sim_speed > 1 else ""
@@ -528,8 +638,11 @@ class App:
             left, right = self.match.scoreboard.left_goals, self.match.scoreboard.right_goals
             hud_lines.append(f"Score: LEFT {left} - {right} RIGHT  |  {paused_str}")
         if selected_id is not None:
+            kick_st = self.input_controller.kick_ui_state()
             mode = self.input_controller.order_mode
-            if mode != OrderMode.MOVE:
+            if kick_st is not None:
+                hud_lines.append(f"Selected: {selected_id}  [KICK phase {kick_st.phase.name} - Esc cancels]")
+            elif mode != OrderMode.MOVE:
                 hud_lines.append(f"Selected: {selected_id}  [{mode.name} mode - Esc cancels]")
             else:
                 hud_lines.append(f"Selected: {selected_id}")
@@ -551,17 +664,18 @@ class App:
             self._draw_help_overlay()
 
     def _draw_params_screen(self) -> None:
-        if self._pending_scenario_definition is None:
+        ui = self._scenario_params_ui
+        if ui.definition is None:
             self.screen = Screen.MENU
             return
-        defn = self._pending_scenario_definition
+        defn = ui.definition
         all_params = list(defn.params) + scenarios.UNIVERSAL_PARAMS
-        self._params_button_rects = self.renderer.draw_scenario_params(
+        ui.button_rects = self.renderer.draw_scenario_params(
             self.surface,
             all_params,
-            self._pending_scenario_params,
+            ui.values,
             title=f"Configure: {defn.label}",
-            open_choice_param=self._open_choice_param,
+            open_choice_param=ui.open_choice_param,
         )
 
     def _draw_help_button(self) -> None:

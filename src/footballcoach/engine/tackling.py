@@ -9,9 +9,10 @@ import math
 import random
 from dataclasses import dataclass
 
-from footballcoach.config import load_physics_config
+from footballcoach.config import load_physics_config, require_section
 from footballcoach.entities.player import Player, PlayerState
 from footballcoach.mathutils import Vector3
+from footballcoach.mathutils.interp import piecewise_lerp3
 from footballcoach.mathutils.rng import skill_roll
 
 
@@ -26,7 +27,6 @@ class TacklingParams:
     tackle_attempt_tacklee_speed_mult: float
     loser_speed_penalty_scale: float
     loser_speed_penalty_max: float
-    head_on_min_charge_speed_mps: float
     auto_tackle_overlap_factor: float
     auto_tackle_min_closing_mps: float
     angle_modifier_frontal: float
@@ -37,7 +37,7 @@ class TacklingParams:
 
     @staticmethod
     def from_config() -> "TacklingParams":
-        d = load_physics_config()["tackling"]
+        d = require_section(load_physics_config(), "tackling")
         return TacklingParams(
             tackler_boost=d["tackler_boost"],
             goalkeeper_tackle_boost=d["goalkeeper_tackle_boost"],
@@ -48,7 +48,6 @@ class TacklingParams:
             tackle_attempt_tacklee_speed_mult=d["tackle_attempt_tacklee_speed_mult"],
             loser_speed_penalty_scale=d["loser_speed_penalty_scale"],
             loser_speed_penalty_max=d["loser_speed_penalty_max"],
-            head_on_min_charge_speed_mps=d["head_on_min_charge_speed_mps"],
             auto_tackle_overlap_factor=d.get("auto_tackle_overlap_factor", 1.3),
             auto_tackle_min_closing_mps=d.get("auto_tackle_min_closing_mps", 0.2),
             angle_modifier_frontal=d["angle_modifier_frontal"],
@@ -87,16 +86,13 @@ def tackle_angle_modifier(
     d_to_t_normalized = d_to_t / d_to_t_len
     cos_angle = float(dribbler_dir.dot(d_to_t_normalized))
 
-    frontal = params.angle_modifier_frontal
-    side = params.angle_modifier_side
-    behind = params.angle_modifier_behind
-
-    if cos_angle >= 0.0:
-        # Frontal half: lerp from side (cos=0) to frontal (cos=1)
-        return side + (frontal - side) * cos_angle
-    else:
-        # Behind half: lerp from side (cos=0) to behind (cos=-1)
-        return side + (side - behind) * cos_angle
+    return piecewise_lerp3(
+        cos_angle,
+        x_low=-1.0, x_mid=0.0, x_high=1.0,
+        y_low=params.angle_modifier_behind,
+        y_mid=params.angle_modifier_side,
+        y_high=params.angle_modifier_frontal,
+    )
 
 
 @dataclass(frozen=True)
@@ -121,12 +117,6 @@ class TackleResult:
     tacklee_speed_mult: float
     tackler_roll: float = 0.0
     dribbler_roll: float = 0.0
-
-    @property
-    def dribble_speed_multiplier(self) -> float:
-        """Speed multiplier applied to the dribbler (tacklee).  Convenience alias for ``tacklee_speed_mult``."""
-        return self.tacklee_speed_mult
-
 
 def apply_tackle_result(
     result: "TackleResult",

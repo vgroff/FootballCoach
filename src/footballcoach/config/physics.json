@@ -50,14 +50,16 @@
     "lateral_accel_scale_mps2": 4.0,
     "lateral_accel_ball_penalty_max": 0.6,
     "min_speed_for_turn_mps": 0.1,
-    "goalkeeper_accel_multiplier": 4.0,
-    "goalkeeper_speed_multiplier": 1.4,
+    "goalkeeper_accel_multiplier": 2.7,
+    "goalkeeper_speed_multiplier": 1.23,
     "standstill_decel_multiplier": 1.5,
     "brake_turn_angle_deg": 75.0,
     "_comment_brake_turn": "Heading change above this triggers brake-to-turn (decelerate to STANDSTILL). 90=original, lower=more aggressive.",
     "close_prox_cos_threshold": 0.3,
     "close_prox_radius_m": 6.0,
-    "_comment_close_prox": "Lateral-overshoot brake: within close_prox_radius_m of target, if velocity cos-sim < close_prox_cos_threshold, brake to STANDSTILL. cos 0.3=~73° off-axis."
+    "_comment_close_prox": "Lateral-overshoot brake: within close_prox_radius_m of target, if velocity cos-sim < close_prox_cos_threshold, brake to STANDSTILL. cos 0.3=~73° off-axis.",
+    "turn_speed_penalty_max": 0.7,
+    "_comment_turn_speed_penalty": "Max fractional reduction to the speed cap while mid-turn (0.7 = up to 70% reduction at a full 180° heading change)."
   },
   "kicking": {
     "_comment": "sigma_angle in radians = base + scale*(1 - precision^precision_exponent). power in m/s = base + scale*attr. running_power_coefficient: max run boost = coefficient (at full sprint in line with kick). power_base/scale rescaled from 15/20 so full-sprint run_mult=1.7 gives same peak speed as old coeff=0.3 (run_mult=1.3): factor=1.3/1.7=0.765. running_direction_precision_*: reduce kick precision by up to 75% when kicking against the run direction (backwards). cos_high=0.35 (~70° forward cone), cos_low=-0.2 (~102°), penalty_mid=0.25 at cos_low, penalty_max=0.75 at cos=-1. See design doc for worked tables.",
@@ -86,11 +88,10 @@
     "pass_aim_height_m": 0.11
   },
   "goalkeeping": {
-    "_comment": "'Save' action: predicts where an incoming shot crosses the keeper's own goal line and moves the keeper there. See engine/knowledge.md for the crossing-point prediction and the ball-freeze-on-pickup rule that makes saves work with the generic possession model. early_intercept_max_distance_m: GK only attempts early interception when ball is within this range. early_intercept_safety_margin: GK must be reachable at the intercept point in less than this fraction of the time to reach the goal line (guards false positives on fast/far shots).",
+    "_comment": "'Save' action: predicts where an incoming shot crosses the keeper's own goal line and moves the keeper there. See engine/knowledge.md for the crossing-point prediction and the ball-freeze-on-pickup rule that makes saves work with the generic possession model. early_intercept_max_distance_m: GK only attempts early interception when ball is within this range.",
     "goal_frame_margin_m": 0.2,
     "default_position_fraction_of_half_length": 0.02,
     "early_intercept_max_distance_m": 10.0,
-    "early_intercept_safety_margin": 0.95,
     "goal_line_save_weight": 1.1
   },
   "tackling": {
@@ -105,8 +106,6 @@
     "goalkeeper_tackle_boost": 2.0,
     "goalkeeper_outside_box_tackle_penalty": 0.4,
     "control_time_penalty_reference_s": 0.3,
-    "head_on_min_charge_speed_mps": 1.0,
-    "_comment_head_on": "Legacy: head_on_min_charge_speed_mps is superseded by auto_tackle_overlap_factor and auto_tackle_min_closing_mps. Kept for backward compat but no longer used in _check_head_on_tackles.",
     "auto_tackle_overlap_factor": 1.3,
     "auto_tackle_min_closing_mps": 0.2,
     "_comment_auto_tackle": "auto_tackle_overlap_factor: auto-tackle fires when player separation < factor * (r1+r2). 1.0=exact touch, 1.3=serious overlap (0.78m for standard players). auto_tackle_min_closing_mps: minimum net closing speed (carrier_speed_toward_other + other_speed_toward_carrier) to trigger.",
@@ -120,16 +119,18 @@
     "_comment_control_time": "control_time_penalty_reference_s: reference duration used to scale the dribbling penalty for CONTROLLING_BALL players. A player at/above this many seconds remaining gets up to 25% dribbling penalty; near 0s remaining gets no penalty."
   },
   "ball_physics": {
-    "drag_coefficient": 0.25,
+    "drag_coefficient": 0.2,
     "magnus_coefficient": 0.25,
     "bounce_restitution_vertical": 0.75,
     "bounce_restitution_horizontal": 0.8,
     "bounce_spin_retention": 0.5,
-    "rolling_friction_coefficient": 0.06,
+    "rolling_friction_coefficient": 0.05,
     "spin_decay_per_s": 0.15,
     "block_restitution": 0.35,
     "just_bounced_display_duration_s": 0.3,
-    "goal_net_restitution": 0.1
+    "goal_net_restitution": 0.1,
+    "bounce_threshold_mps": 0.5,
+    "_comment_bounce_threshold": "Min incoming vertical speed to count as a real bounce (apply restitution) vs. resting/rolling ground contact. Prevents a resting ball's per-tick gravity integration from being misread as a full bounce and repeatedly damping horizontal speed. See engine/knowledge.md 'ground contact' note."
   },
   "control_time": {
     "_comment": "Time (s) for a player to bring a ball under control on first touch. See knowledge.md in engine/ for full derivation. Jump zone (above player_height_m=1.8m): outfield_jump_scale_at_max_reach multiplies the (height_factor-1) term at outfield_max_reach_height_m; GK's height_factor_scale interpolates toward gk jump_scale_at_max_reach at gk_max_reach_height_m.",
@@ -154,33 +155,9 @@
       "max_reach_height_m": 2.2
     }
   },
-  "offside": {
-    "enabled_by_default": true
-  },
   "collision": {
     "_comment": "Player-player velocity damping on overlap. collision_velocity_retention: fraction of closing speed kept per tick (0.5 = 50% reduction). collision_damping_min_closing_speed_mps: closing speeds below this floor are left untouched, preventing unbounded compounding over many ticks of sustained overlap (see design doc for worked example).",
     "collision_velocity_retention": 0.5,
     "collision_damping_min_closing_speed_mps": 0.3
-  },
-  "repulsion": {
-    "_comment": "AI/order-layer steering — used ONLY in steering.py / MoveOrder handling. NOT engine physics. radius_m: distance at which repulsion begins. strength_base: peak directional weight at d=0 (m/s-equivalent, blended into heading not force). ball_carrier_repulsion_mult: extra boost when the moving player has the ball. ball_carrier_speed_penalty_max: max fractional speed penalty for ball carriers (0.4 = 40% reduction). speed_penalty_scale: converts |net_repulsion| to speed penalty fraction. alignment_dot_threshold: trigger orthogonal nudge when rel_vel . net_repulsion < this (i.e. heading nearly straight into obstacle). min_orthogonal_adjust_mps: sideways nudge magnitude (primary tuning knob — start at 1.5, tune via balance test).",
-    "radius_m": 8.0,
-    "strength_base": 0.3,
-    "ball_carrier_repulsion_mult": 2.4,
-    "ball_carrier_speed_penalty_max": 0.4,
-    "speed_penalty_scale": 0.14,
-    "alignment_dot_threshold": -0.7,
-    "min_orthogonal_adjust_mps": 0.75,
-    "max_deflection_deg": 80.0
-  },
-  "marking": {
-    "_comment": "MarkOrder AI behaviour: marker stands between a target opposition player and the ball, and switches to GetPossession-style chase/tackle when the target has the ball or the ball comes within mark_intercept_radius_m. mark_standoff_m: distance from the target (toward the ball) the marker tries to hold.",
-    "mark_intercept_radius_m": 4.0,
-    "mark_standoff_m": 1.5
-  },
-  "ui": {
-    "_comment": "UI-level timing constants. scenario_linger_s: how long (sim-seconds) a scenario trial keeps running after its outcome is determined before the next trial starts. goal_linger_s: how long (sim-seconds) the ball stays in place after a goal before the engine resets it to centre (giving players/GK time to react visually).",
-    "scenario_linger_s": 1.8,
-    "goal_linger_s": 1.8 
   }
 }

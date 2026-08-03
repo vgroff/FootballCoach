@@ -123,88 +123,18 @@ class Player:
         from footballcoach.orders import KickOrder
         self.current_order = KickOrder(aim_point=aim_point, power_fraction=power_fraction, spin=spin)
 
-    def kick_direct(self, match: "Match", aim_point: Vector3, power_fraction: float, spin: Vector3) -> None:
-        """Execute a kick immediately — THE NEURAL NETWORK CALLS THIS, NO ORDER IS ISSUED.
-
-        KickOrder.execute() also delegates here so all kick physics live in one place.
-        Only has effect if this player currently has possession.
-        """
-        from footballcoach.engine.kicking import kick_ball, compensate_power_for_run_mult, running_power_multiplier
-        from footballcoach.engine.movement import effective_top_speed
-        if match.ball.possessed_by != self.player_id:
-            return
-        top_speed = effective_top_speed(
-            match.movement_params, self.attributes.top_speed, self.stamina,
-            has_ball=True, ball_control_attr=self.attributes.ball_control,
-        )
-        run_mult = running_power_multiplier(
-            match.kicking_params.running_power_coefficient, self.velocity,
-            aim_point - self.position, top_speed,
-        )
-        kick_ball(
-            match.ball,
-            self.position,
-            aim_point,
-            compensate_power_for_run_mult(power_fraction, run_mult),
-            self.attributes.kick_precision,
-            self.attributes.kick_power,
-            spin,
-            match.rng_reduction,
-            match.rng,
-            match.kicking_params,
-            kicker_velocity=self.velocity,
-            kicker_top_speed_mps=top_speed,
-        )
-        match._start_release_grace(self.player_id)
-        match._log_debug(f"{self.player_id} kicked (direct)  power={power_fraction:.2f}")
-        if self.on_kick is not None:
-            self.on_kick(self)
-
-    def tackle_direct(self, match: "Match", target_player_id: str) -> bool:
-        """Attempt an immediate tackle if in contact range — THE NEURAL NETWORK CALLS THIS, NO ORDER IS ISSUED.
-
-        Returns True if contact was made (tackle resolved), False if out of range.
-        """
-        from footballcoach.engine.collision import are_touching
-        from footballcoach.engine.tackling import apply_tackle_result, attempt_tackle, tackle_angle_modifier
-        try:
-            target = match.player_by_id(target_player_id)
-        except KeyError:
-            return False
-        if not are_touching(self, target):
-            return False
-        if not target.is_available_to_tackle():
-            return True
-        if self.on_tackle is not None:
-            self.on_tackle(self)
-        if match._gk_immune_from_tackle(target):
-            match._apply_gk_immune_penalty(self)
-            match._log_info(f"{self.player_id} direct-tackle on {target.player_id} auto-failed [GK immune]")
-        else:
-            result = attempt_tackle(
-                self.attributes.tackling,
-                match._effective_dribbling(target),
-                match.rng_reduction,
-                match.rng,
-                match.tackling_params,
-                is_goalkeeper_tackle=self.is_goalkeeper,
-                angle_modifier=tackle_angle_modifier(
-                    target.heading_rad, target.position, self.position, match.tackling_params
-                ),
-                gk_outside_box=match._gk_outside_own_box(self),
-            )
-            match._log_tackle_result(self.player_id, target.player_id, result)
-            if result.tackler_won and match._target_has_or_controls_ball(target):
-                match._set_possession(self.player_id)
-            apply_tackle_result(result, self, target, match.tackling_params)
-        return True
-
-    def kick_direct(self, match: "Match", aim_point: Vector3, power_fraction: float, spin: Vector3) -> None:
+    def kick_direct(self, match: "Match", aim_point: Vector3, power_fraction: float, spin: Vector3, compensate_for_run: bool = True) -> None:
         """Execute kick physics immediately WITHOUT issuing a KickOrder.
 
         THE NEURAL NETWORK CALLS THIS DIRECTLY — no Order is created.
         KickOrder.execute() also delegates here so all kick logic lives in one place.
         Only has effect if this player currently has possession.
+
+        compensate_for_run=True (default, used by neural net): pre-divides
+        power_fraction by run_mult so the ball leaves at the intended speed
+        regardless of running direction.
+        compensate_for_run=False: power_fraction is used raw, so sprinting in
+        line with the kick adds the full running boost to ball speed.
         """
         from footballcoach.engine.kicking import kick_ball, compensate_power_for_run_mult, running_power_multiplier
         from footballcoach.engine.movement import effective_top_speed
@@ -218,11 +148,16 @@ class Player:
             match.kicking_params.running_power_coefficient, self.velocity,
             aim_point - self.position, top_speed,
         )
+        adjusted_power = (
+            compensate_power_for_run_mult(power_fraction, run_mult)
+            if compensate_for_run
+            else power_fraction
+        )
         kick_ball(
             match.ball,
             self.position,
             aim_point,
-            compensate_power_for_run_mult(power_fraction, run_mult),
+            adjusted_power,
             self.attributes.kick_precision,
             self.attributes.kick_power,
             spin,

@@ -48,7 +48,11 @@ def generate_attributes(
         generator = rng
     elif isinstance(rng, random.Random):
         # Derive a numpy Generator seeded from the Random instance for
-        # reproducibility when a `random.Random` is passed.
+        # reproducibility when a `random.Random` is passed. Note: `rng.randint`
+        # mutates the shared `random.Random` stream on every call, so this only
+        # gives "same rng -> same attributes" reproducibility for a single call
+        # right after a fresh seed - calling this twice with the same `rng`
+        # instance will NOT produce the same attributes the second time.
         generator = np.random.default_rng(rng.randint(0, 2**32 - 1))
     else:
         generator = np.random.default_rng()

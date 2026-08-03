@@ -29,12 +29,11 @@ def _measure_standoff_stability(seed: int, n_ticks: int = 200) -> dict:
     average and max distance from the ideal standoff point each tick."""
     pitch = Pitch.standard()
     ball = Ball.at_rest(Vector3(30, 0, 0))
-    # Start marker near the standoff point (21.5, 0) so warmup is short.
-    marker = make_player("marker", Team.LEFT, position=Vector3(20, 0, 0), attr_value=0.8)
+    # Target at (20, 0). Ideal standoff is 1.5 m toward ball = (21.5, 0).
+    # Marker starts on the correct side (beyond the target, toward the ball)
+    # so it doesn't have to pass through the target to reach the standoff point.
     target = make_player("target", Team.RIGHT, position=Vector3(20, 0, 0))
-    # Separate them slightly so they don't start overlapping.
-    marker.position = Vector3(19, 0, 0)
-    target.position = Vector3(20, 0, 0)
+    marker = make_player("marker", Team.LEFT, position=Vector3(23, 2, 0), attr_value=0.8)
 
     match = Match(
         pitch=pitch,

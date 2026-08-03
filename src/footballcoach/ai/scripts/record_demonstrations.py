@@ -72,6 +72,7 @@ def record_episodes(
     total_episodes: int | None = None,
     sample_interval_s: float = 0.2,
     opponent_rules_prob: float = 0.0,
+    opponent_immobile_prob: float | None = None,
 ) -> dict:
     """Run *n_episodes* with rules-based AI driving the trainee and opponent.
 
@@ -119,22 +120,32 @@ def record_episodes(
 
     _pending_reward: list[float] = [0.0]  # mutable cell for closure
 
-    def _record_now(reward: float = 0.0, done: bool = False):
-        obs = env._get_obs()
-        label = label_fn(env)
-        label_arr = label.to_array()
-        self_feats.append(obs.self_feat.copy())
-        other_feats.append(obs.other_feat.copy())
-        exists_masks.append(obs.exists_mask.copy())
-        ball_feats.append(obs.ball_feat.copy())
-        global_feats.append(obs.global_feat.copy())
-        bc_labels.append(label_arr)
-        rewards.append(np.float32(reward))
-        dones.append(np.float32(done))
+    def _record_now(reward: float = 0.0, done: bool = False, player_id: str | None = None):
+        """Append one (obs, label) sample per player.
+
+        player_id=None (used for timed samples) records BOTH the trainee and
+        the opponent in one call. A specific player_id (used for on_kick/
+        on_tackle callback samples, which fire per-player) records only that
+        player. Kick/tackle callback samples always have reward=0.0 and
+        done=False — the same convention as the trainee-only version had.
+        """
+        ids = [env.trainee_player_id, "opponent"] if player_id is None else [player_id]
         nonlocal steps_total, steps_valid
-        steps_total += 1
-        if label.valid:
-            steps_valid += 1
+        for pid in ids:
+            obs = env._get_obs(player_id=pid)
+            label = label_fn(env, player_id=pid)
+            label_arr = label.to_array()
+            self_feats.append(obs.self_feat.copy())
+            other_feats.append(obs.other_feat.copy())
+            exists_masks.append(obs.exists_mask.copy())
+            ball_feats.append(obs.ball_feat.copy())
+            global_feats.append(obs.global_feat.copy())
+            bc_labels.append(label_arr)
+            rewards.append(np.float32(reward))
+            dones.append(np.float32(done))
+            steps_total += 1
+            if label.valid:
+                steps_valid += 1
 
     for ep in range(n_episodes):
         env.reset()
@@ -145,17 +156,27 @@ def record_episodes(
         try:
             player = env._loop.match.player_by_id(env.trainee_player_id)
             player.ai = Phase1RulesAI()
-            player.on_kick = lambda p: _record_now()
-            player.on_tackle = lambda p: _record_now()
+            player.on_kick = lambda p: _record_now(player_id=env.trainee_player_id)
+            player.on_tackle = lambda p: _record_now(player_id=env.trainee_player_id)
         except (AttributeError, KeyError):
             pass
 
         # Randomise opponent: rules-based with probability opponent_rules_prob,
         # immobile otherwise (no neural opponent during demo recording).
+        # on_kick/on_tackle are wired unconditionally for code simplicity — the
+        # immobile branch never kicks/tackles, so the callbacks are harmless but
+        # inert in that case.
         try:
             match = env._loop.match
             opp = match.player_by_id("opponent")
-            if np.random.random() < opponent_rules_prob:
+            # opponent_immobile_prob (if given) lets immobile-prob be set
+            # independently of rules_prob instead of implicitly = 1 - rules_prob.
+            _roll = np.random.random()
+            if _roll < opponent_rules_prob:
+                opp.ai = Phase1RulesAI()
+                match._opponent_use_rules_ai = True
+                match._opponent_is_immobile = False
+            elif opponent_immobile_prob is not None and _roll >= opponent_rules_prob + opponent_immobile_prob:
                 opp.ai = Phase1RulesAI()
                 match._opponent_use_rules_ai = True
                 match._opponent_is_immobile = False
@@ -163,6 +184,8 @@ def record_episodes(
                 opp.ai = None
                 match._opponent_use_rules_ai = False
                 match._opponent_is_immobile = True
+            opp.on_kick = lambda p: _record_now(player_id="opponent")
+            opp.on_tackle = lambda p: _record_now(player_id="opponent")
         except (AttributeError, KeyError):
             pass
 
@@ -170,15 +193,21 @@ def record_episodes(
         last_info = None
         while not done:
             # Timed sample at sample_interval_s cadence (reward=0 for mid-step samples;
-            # the actual reward from env.step() is assigned to the NEXT sample or
+            # the actual reward from env.step() is assigned to the NEXT sample(s) or
             # appended to the episode-end step below).
+            # player_id=None -> records BOTH trainee and opponent -> appends 2 rows.
+            n_before = len(rewards)
             _record_now(reward=0.0, done=False)
+            n_appended = len(rewards) - n_before
             # Advance sim by sample_interval_s; kick/tackle callbacks fire inside
             _obs, _reward, done, last_info = env.step()
-            # Backfill reward onto the sample we just recorded
-            rewards[-1] = np.float32(_reward)
-            if done:
-                dones[-1] = np.float32(1.0)
+            # Backfill reward/done onto every row just appended for this timed
+            # sample (trainee + opponent both share the env-level reward/done —
+            # there is no separate per-player reward signal at this granularity).
+            for i in range(1, n_appended + 1):
+                rewards[-i] = np.float32(_reward)
+                if done:
+                    dones[-i] = np.float32(1.0)
 
         # Track episode outcome
         outcome = getattr(last_info, "trial_outcome", None) or "unknown"
@@ -242,7 +271,12 @@ def main() -> None:
     parser.add_argument("--opponent-rules-prob", type=float, default=_default_opp_rules_prob,
                         help=f"Probability (0–1) that the opponent uses the rules-based AI each "
                              f"demo episode (default: {_default_opp_rules_prob} from config). "
-                             "Remainder are immobile.")
+                             "Remainder are immobile, unless --opponent-immobile-prob is also given.")
+    _default_opp_immobile_prob = float(_cfg.get("curriculum", {}).get("phase1_demo_opponent_immobile_prob", 0.0))
+    parser.add_argument("--opponent-immobile-prob", type=float, default=_default_opp_immobile_prob,
+                        help=f"Probability (0–1) that the opponent is immobile, independent of "
+                             f"--opponent-rules-prob (default: {_default_opp_immobile_prob} from config). "
+                             "0.0 (default) preserves old behaviour: remainder after rules-prob is immobile.")
     parser.add_argument("--info", action="store_true",
                         help="Print info about existing files and exit")
     args = parser.parse_args()
@@ -292,6 +326,7 @@ def main() -> None:
             total_episodes=n_eps,
             sample_interval_s=args.sample_interval,
             opponent_rules_prob=args.opponent_rules_prob,
+            opponent_immobile_prob=args.opponent_immobile_prob,
         )
         elapsed = time.time() - t0
 

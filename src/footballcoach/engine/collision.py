@@ -27,7 +27,7 @@ import logging
 import math
 from dataclasses import dataclass
 
-from footballcoach.config import load_physics_config
+from footballcoach.config import load_physics_config, require_section
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
@@ -43,10 +43,10 @@ class CollisionParams:
 
     @staticmethod
     def from_config() -> "CollisionParams":
-        d = load_physics_config().get("collision", {})
+        d = require_section(load_physics_config(), "collision")
         return CollisionParams(
-            collision_velocity_retention=d.get("collision_velocity_retention", 0.5),
-            collision_damping_min_closing_speed_mps=d.get("collision_damping_min_closing_speed_mps", 0.3),
+            collision_velocity_retention=d["collision_velocity_retention"],
+            collision_damping_min_closing_speed_mps=d["collision_damping_min_closing_speed_mps"],
         )
 
 

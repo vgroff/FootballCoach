@@ -27,13 +27,13 @@ def _run_trials_collect_multipliers(
     n: int,
     params: TacklingParams,
 ) -> list[float]:
-    """Returns dribble_speed_multiplier for every trial where the dribbler
+    """Returns tacklee_speed_mult for every trial where the dribbler
     wins (tackler_won == False)."""
     results = []
     for seed in range(n):
         r = attempt_tackle(tackling, dribbling, rng_reduction, random.Random(seed), params)
         if not r.tackler_won:
-            results.append(r.dribble_speed_multiplier)
+            results.append(r.tacklee_speed_mult)
     return results
 
 
@@ -102,8 +102,8 @@ def test_speed_penalty_zero_at_threshold(balance_recorder):
     params = TacklingParams.from_config()
     result = attempt_tackle(0.4, 0.7, rng_reduction=1.0, rng=random.Random(0), params=params)
     assert not result.tackler_won
-    assert result.dribble_speed_multiplier == 1.0, (
-        f"Expected no slowdown for large margin win, got {result.dribble_speed_multiplier}"
+    assert result.tacklee_speed_mult == 1.0, (
+        f"Expected no slowdown for large margin win, got {result.tacklee_speed_mult}"
     )
 
 
@@ -119,8 +119,8 @@ def test_speed_penalty_max_at_zero_margin(balance_recorder):
     # relative_margin = (0.7 - 0.694) / 0.694 ≈ 0.009 << 0.35 threshold → heavy slowdown
     result = attempt_tackle(0.555, 0.7, rng_reduction=1.0, rng=random.Random(0), params=params)
     assert not result.tackler_won
-    balance_recorder.report("dribble_penalty_near_zero_margin", {"speed_multiplier": result.dribble_speed_multiplier})
+    balance_recorder.report("dribble_penalty_near_zero_margin", {"speed_multiplier": result.tacklee_speed_mult})
     # The multiplier should be close to the minimum (1 - 0.80 = 0.20).
-    assert result.dribble_speed_multiplier < 0.40, (
-        f"Expected heavy slowdown near zero margin, got {result.dribble_speed_multiplier:.4f}"
+    assert result.tacklee_speed_mult < 0.40, (
+        f"Expected heavy slowdown near zero margin, got {result.tacklee_speed_mult:.4f}"
     )

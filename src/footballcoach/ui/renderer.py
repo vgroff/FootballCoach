@@ -3,6 +3,7 @@ rendering - no game logic or input handling lives here (see input.py / app.py).
 """
 from __future__ import annotations
 
+import collections
 import math
 from typing import TYPE_CHECKING
 
@@ -15,8 +16,11 @@ from footballcoach.entities.player import Player, PlayerState, Team
 from footballcoach.ui import style
 from footballcoach.ui.camera import Camera
 
+from footballcoach.mathutils import Vector3
+
 if TYPE_CHECKING:
     from footballcoach.ui.gamelog import GameLog, LogLevel
+    from footballcoach.ui.input import KickUIState
     from footballcoach.ui.scenarios import AnyScenarioParam, ScenarioBoolParam, ScenarioChoiceParam, ScenarioParam
 
 # Font family names tried in order when searching for a font that can render
@@ -89,6 +93,74 @@ class Renderer:
         hi = gcfg.get("heading_indicator", {})
         self._heading_length_px: int = int(hi.get("length_px", 8))
         self._heading_alpha: int = int(hi.get("alpha", 255))
+        _pn = gcfg.get("pause_notification", {})
+        self.pause_notification_font = pygame.font.Font(style.FONT_NAME, _pn.get("font_size_px", 26))
+
+        # Ball spin dots — 3D model projected to top-down view
+        _sd = gcfg.get("ball_spin_dots", {})
+        self._spin_dot_count: int = _sd.get("count", 9)
+        self._spin_orbit_frac: float = _sd.get("projection_scale_fraction", _sd.get("orbit_radius_fraction", 0.93))
+        self._spin_dot_radius_frac: float = _sd.get("dot_radius_fraction", 0.25)
+        _col = _sd.get("color", [30, 30, 30])
+        self._spin_dot_color: tuple = (int(_col[0]), int(_col[1]), int(_col[2]))
+        # 3x3 rotation matrix tracking ball orientation (identity = initial pose)
+        self._ball_orientation: list = [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]]
+        # Fixed dot positions on unit sphere (Fibonacci lattice)
+        self._ball_dot_positions: list = self._make_fibonacci_sphere(self._spin_dot_count)
+
+        # Ball trail
+        _bt = gcfg.get("ball_trail", {})
+        self._trail_length: int = _bt.get("length", 10)
+        self._trail_min_speed: float = _bt.get("min_speed_mps", 2.0)
+        self._trail_max_alpha: int = _bt.get("max_alpha", 150)
+        self._trail_radius_frac: float = _bt.get("radius_fraction", 0.75)
+        self._ball_trail: collections.deque = collections.deque(maxlen=self._trail_length)
+
+    @staticmethod
+    def _make_fibonacci_sphere(n: int) -> list:
+        """Evenly distribute n points on the unit sphere using the Fibonacci lattice."""
+        points = []
+        phi = math.pi * (3.0 - math.sqrt(5.0))  # golden angle
+        for i in range(n):
+            y = (1.0 - (i / (n - 1)) * 2.0) if n > 1 else 0.0
+            r = math.sqrt(max(0.0, 1.0 - y * y))
+            theta = phi * i
+            points.append((math.cos(theta) * r, y, math.sin(theta) * r))
+        return points
+
+    @staticmethod
+    def _mat_mul3(A: list, B: list) -> list:
+        """3x3 matrix multiply."""
+        return [
+            [A[i][0]*B[0][j] + A[i][1]*B[1][j] + A[i][2]*B[2][j] for j in range(3)]
+            for i in range(3)
+        ]
+
+    def update_ball_effects(self, ball: Ball, dt_s: float) -> None:
+        """Integrate 3D ball orientation from spin and update ghost trail.
+        Call once per rendered frame (only when not paused)."""
+        # Integrate orientation: Rodrigues rotation by spin*dt about spin axis
+        spin_mag = ball.spin.length()
+        if spin_mag > 1e-9:
+            angle = spin_mag * dt_s
+            ax = ball.spin.x / spin_mag
+            ay = ball.spin.y / spin_mag
+            az = ball.spin.z / spin_mag
+            c, s = math.cos(angle), math.sin(angle)
+            t = 1.0 - c
+            dR = [
+                [t*ax*ax + c,     t*ax*ay - s*az, t*ax*az + s*ay],
+                [t*ax*ay + s*az,  t*ay*ay + c,    t*ay*az - s*ax],
+                [t*ax*az - s*ay,  t*ay*az + s*ax, t*az*az + c   ],
+            ]
+            self._ball_orientation = self._mat_mul3(dR, self._ball_orientation)
+
+        speed = ball.velocity.length_xy()
+        if speed >= self._trail_min_speed and ball.possessed_by is None:
+            self._ball_trail.append((ball.position.x, ball.position.y))
+        elif speed < self._trail_min_speed * 0.5 or ball.possessed_by is not None:
+            if self._ball_trail:
+                self._ball_trail.popleft()
 
     def draw_pitch(self, surface: pygame.Surface, pitch: Pitch) -> None:
         surface.fill(style.PITCH_GREEN)
@@ -148,6 +220,21 @@ class Renderer:
         height_boost = 1.0 + min(ball.height_m, 5.0) * 0.35  # exaggerated
         radius_px = max(2, int(base_radius_px * height_boost))
 
+        # --- Ghost trail: drawn before the ball so it's underneath ---
+        n = len(self._ball_trail)
+        if n >= 1:
+            for i, (wx, wy) in enumerate(self._ball_trail):
+                # Oldest = index 0 = most faded; newest = index n-1 = brightest
+                age_frac = (n - 1 - i) / max(n - 1, 1)  # 0=newest, 1=oldest
+                alpha = int(self._trail_max_alpha * (1.0 - age_frac))
+                if alpha < 6:
+                    continue
+                gr = max(1, int(radius_px * self._trail_radius_frac * (1.0 - age_frac * 0.35)))
+                tp = self.camera.world_to_screen(wx, wy)
+                ts = pygame.Surface((gr * 2 + 2, gr * 2 + 2), pygame.SRCALPHA)
+                pygame.draw.circle(ts, (*style.BALL_COLOUR, alpha), (gr + 1, gr + 1), gr)
+                surface.blit(ts, (tp[0] - gr - 1, tp[1] - gr - 1))
+
         pygame.draw.circle(surface, style.BALL_COLOUR, pos, radius_px)
         if self._ball_outline:
             pygame.draw.circle(surface, style.BALL_OUTLINE, pos, radius_px, 1)
@@ -160,6 +247,25 @@ class Renderer:
             pygame.draw.circle(surface, style.BALL_STATE_FLYING_OUTLINE, pos, radius_px + 3, 2)
         elif ball.velocity.length_xy() > 0.05 and ball.possessed_by is None:
             pygame.draw.circle(surface, style.BALL_STATE_ROLLING_OUTLINE, pos, radius_px + 3, 2)
+
+        # --- Dots: fixed points on the 3D ball surface, projected top-down ---
+        # Always shown; rotate as the ball spins. Front hemisphere = opaque,
+        # back hemisphere = faded (depth cue).
+        orbit_r = radius_px * self._spin_orbit_frac
+        dot_r = max(1, int(radius_px * self._spin_dot_radius_frac))
+        pad = int(orbit_r) + dot_r + 2
+        ds = pygame.Surface((pad * 2, pad * 2), pygame.SRCALPHA)
+        R = self._ball_orientation
+        for (lx, ly, lz) in self._ball_dot_positions:
+            wx = R[0][0]*lx + R[0][1]*ly + R[0][2]*lz
+            wy = R[1][0]*lx + R[1][1]*ly + R[1][2]*lz
+            wz = R[2][0]*lx + R[2][1]*ly + R[2][2]*lz
+            sx = pad + int(wx * orbit_r)
+            sy = pad - int(wy * orbit_r)  # y inverted: world +y = screen up
+            if wz < 0:
+                continue  # back hemisphere — hidden from top-down camera
+            pygame.draw.circle(ds, (*self._spin_dot_color, 220), (sx, sy), dot_r)
+        surface.blit(ds, (pos[0] - pad, pos[1] - pad))
 
         if ball.height_m > 0.15:
             label = self.hud_font.render(f"{ball.height_m:.1f}m", True, style.HUD_TEXT)
@@ -319,6 +425,146 @@ class Renderer:
         pygame.draw.line(surface, colour, start_screen, end_screen, 2)
         pygame.draw.circle(surface, colour, end_screen, 4)
 
+    def draw_kick_ui(
+        self,
+        surface: pygame.Surface,
+        kick_state: "KickUIState",
+        player: Player,
+        goal_height_m: float,
+        bottom_reserve_px: int = 0,
+    ) -> None:
+        """Draw the multi-phase kick UI: trajectory (coloured by height/direction)
+        and a translucent 1-sigma XY error cone."""
+        from footballcoach.ui.kick_trajectory import (
+            compute_error_sigma,
+            compute_launch_velocity,
+            compute_speed_mps,
+            build_cone_boundaries,
+            simulate_trajectory,
+        )
+        from footballcoach.ui.input import KickPhase
+
+        cfg = load_graphics_config()["kick_ui"]
+        duration_s: float = cfg["trajectory_duration_s"]
+
+        ku = kick_state
+        from footballcoach.engine.movement import effective_top_speed, MovementParams
+        _mvparams = MovementParams.from_config()
+        top_speed = effective_top_speed(
+            _mvparams, player.attributes.top_speed, player.stamina,
+            has_ball=True, ball_control_attr=player.attributes.ball_control,
+        )
+        speed_mps = compute_speed_mps(
+            player.attributes.kick_power, ku.power_fraction,
+            player_velocity=player.velocity,
+            player_top_speed_mps=top_speed,
+            aim_dir_x=ku.aim_dir_x, aim_dir_y=ku.aim_dir_y,
+        )
+        if speed_mps < 0.1:
+            return
+
+        launch_pos = player.position.with_z(max(player.position.z, 0.11))
+        launch_vel = compute_launch_velocity(
+            ku.aim_dir_x, ku.aim_dir_y, ku.elevation_angle_rad, speed_mps
+        )
+        points = simulate_trajectory(launch_pos, launch_vel, ku.spin, duration_s)
+
+        if len(points) < 2:
+            return
+
+        # --- Error cone (1-sigma, XY only) ----------------------------------
+        sigma_rad = compute_error_sigma(
+            player.attributes.kick_precision, ku.power_fraction,
+            player_velocity=player.velocity,
+            aim_dir_x=ku.aim_dir_x, aim_dir_y=ku.aim_dir_y,
+        )
+        left_pts, right_pts = build_cone_boundaries(
+            player.position,
+            ku.aim_dir_x, ku.aim_dir_y,
+            ku.elevation_angle_rad,
+            speed_mps,
+            sigma_rad,
+            ku.spin,
+            duration_s,
+        )
+
+        n_cone = min(len(left_pts), len(right_pts), len(points))
+        if n_cone >= 2:
+            left_screen = [self.camera.world_to_screen(p.x, p.y) for p in left_pts[:n_cone]]
+            right_screen = [self.camera.world_to_screen(p.x, p.y) for p in right_pts[:n_cone]]
+            # Polygon: left forward + right reversed.
+            poly = left_screen + list(reversed(right_screen))
+            if len(poly) >= 3:
+                cone_surf = pygame.Surface(surface.get_size(), pygame.SRCALPHA)
+                pygame.draw.polygon(
+                    cone_surf,
+                    (*style.TRAJ_CONE_RGB, style.TRAJ_CONE_ALPHA),
+                    poly,
+                )
+                surface.blit(cone_surf, (0, 0))
+
+        # --- Coloured trajectory segments ------------------------------------
+        for i in range(len(points) - 1):
+            p0, p1 = points[i], points[i + 1]
+            s0 = self.camera.world_to_screen(p0.x, p0.y)
+            s1 = self.camera.world_to_screen(p1.x, p1.y)
+
+            above_goal = p0.z > goal_height_m
+            ascending = p1.z > p0.z
+
+            if above_goal:
+                colour = style.TRAJ_ABOVE_GOAL
+            elif ascending:
+                colour = style.TRAJ_ASCENDING
+            else:
+                colour = style.TRAJ_DESCENDING
+
+            pygame.draw.line(surface, colour, s0, s1, 2)
+
+        # --- Endpoint dot ---------------------------------------------------
+        last = points[-1]
+        end_screen = self.camera.world_to_screen(last.x, last.y)
+        pygame.draw.circle(surface, style.TRAJ_ABOVE_GOAL if last.z > goal_height_m else style.TRAJ_DESCENDING, end_screen, 4)
+
+        # --- Phase info + hint panel (bottom of screen, above hotkey bar) ----
+        lines: list[tuple[str, tuple[int, int, int]]] = []
+
+        if ku.phase == KickPhase.AIM_XY:
+            pct = int(ku.power_fraction * 100)
+            lines.append((f"KICK  ·  Power: {pct}%", style.HUD_ACCENT))
+            lines.append(("Move mouse to aim  —  farther = more power", style.HUD_TEXT))
+            lines.append(("Left-click to confirm  ·  Right-click or Esc to cancel", style.HUD_TEXT))
+
+        elif ku.phase == KickPhase.AIM_Z:
+            pct = int(ku.power_fraction * 100)
+            elev_deg = math.degrees(ku.elevation_angle_rad)
+            lines.append((f"KICK  ·  Power: {pct}%    Elevation: {elev_deg:.0f}°", style.HUD_ACCENT))
+            lines.append(("Close to player = loft  ·  Far away = flat", style.HUD_TEXT))
+            lines.append(("Left-click to confirm  ·  Right-click to go back  ·  Esc cancel", style.HUD_TEXT))
+
+        elif ku.phase == KickPhase.SPIN:
+            pct = int(ku.power_fraction * 100)
+            elev_deg = math.degrees(ku.elevation_angle_rad)
+            spin_mag = ku.spin.length()
+            spin_str = f"{spin_mag:.1f} rad/s" if spin_mag > 0.5 else "none"
+            lines.append((f"KICK  ·  Power: {pct}%    Elev: {elev_deg:.0f}°    Spin: {spin_str}", style.HUD_ACCENT))
+            lines.append(("Ahead = topspin  ·  Behind = backspin  ·  Left/right = sidespin", style.HUD_TEXT))
+            lines.append(("Left-click to fire  ·  Right-click to go back  ·  Esc cancel", style.HUD_TEXT))
+
+        if lines:
+            bar_h = 34
+            line_h = self.hud_font.get_height() + 3
+            total_h = len(lines) * line_h + 10
+            max_w = max(self.hud_font.size(t)[0] for t, _ in lines)
+            bx = (surface.get_width() - max_w) // 2 - 12
+            by = surface.get_height() - bar_h - total_h - 8 - bottom_reserve_px
+            bg = pygame.Surface((max_w + 24, total_h), pygame.SRCALPHA)
+            bg.fill((10, 10, 18, 200))
+            surface.blit(bg, (bx, by))
+            for i, (text, colour) in enumerate(lines):
+                surf = self.hud_font.render(text, True, colour)
+                surface.blit(surf, (bx + 12, by + 5 + i * line_h))
+
     def draw_hud_text(self, surface: pygame.Surface, lines: list[str], top_left: tuple[int, int] = (8, 8)) -> None:
         x, y = top_left
         for line in lines:
@@ -407,7 +653,7 @@ class Renderer:
         bar_h = 34  # hotkey bar height
 
         padding_x, padding_y = 28, 14
-        text_surf = self.title_font.render(message, True, style.HUD_ACCENT)
+        text_surf = self.pause_notification_font.render(message, True, style.HUD_ACCENT)
         box_w = text_surf.get_width() + padding_x * 2
         box_h = text_surf.get_height() + padding_y * 2
         box_x = (sw - box_w) // 2

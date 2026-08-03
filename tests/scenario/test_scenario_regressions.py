@@ -87,13 +87,13 @@ def test_pass_scenario_radius_is_six_metres():
 
 def _build_multi_waypoint_sprint(rng_reduction: float = 1.0) -> Match:
     """Three close waypoints so the runner reaches each quickly."""
-    from footballcoach.config import load_physics_config
+    from footballcoach.config import load_gameplay_config
     from footballcoach.entities import PlayerAttributes
     pitch = Pitch.standard()
     player = make_player("runner", Team.LEFT, attr_value=0.8,
                          position=Vector3(-5, 0, 0))
     ball = Ball.at_rest(Vector3(0, 20, 0))
-    ui_cfg = load_physics_config().get("ui", {})
+    ui_cfg = load_gameplay_config().get("ui", {})
     m = Match(pitch=pitch, players=[player], ball=ball,
               rng_reduction=rng_reduction, rng=random.Random(0),
               goal_linger_s=ui_cfg.get("goal_linger_s", 3.0))

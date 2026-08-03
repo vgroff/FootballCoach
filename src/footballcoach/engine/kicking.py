@@ -9,9 +9,10 @@ import math
 import random
 from dataclasses import dataclass
 
-from footballcoach.config import load_physics_config
+from footballcoach.config import load_physics_config, require_section
 from footballcoach.entities.ball import Ball
 from footballcoach.mathutils import Vector3
+from footballcoach.mathutils.interp import piecewise_lerp3
 
 log = logging.getLogger("footballcoach.kicking")
 
@@ -41,7 +42,7 @@ class KickingParams:
 
     @staticmethod
     def from_config() -> "KickingParams":
-        d = load_physics_config()["kicking"]
+        d = require_section(load_physics_config(), "kicking")
         return KickingParams(
             angle_error_base_rad=d["angle_error_base_rad"],
             angle_error_scale_rad=d["angle_error_scale_rad"],
@@ -77,7 +78,7 @@ class PassingParams:
 
     @staticmethod
     def from_config() -> "PassingParams":
-        d = load_physics_config()["passing"]
+        d = require_section(load_physics_config(), "passing")
         return PassingParams(
             power_overshoot_factor=d["power_overshoot_factor"],
             overshoot_drag_factor=d.get("overshoot_drag_factor", 0.0),
@@ -126,6 +127,24 @@ def max_kick_speed_mps(params: KickingParams, kick_power_attr: float) -> float:
     return params.power_base_mps + params.power_scale_mps * kick_power_attr
 
 
+def _run_direction_geometry(kicker_velocity: Vector3, aim_direction: Vector3) -> tuple[float, float] | None:
+    """Shared "how is the kicker running relative to the aim direction" geometry,
+    used by both `running_power_multiplier` and
+    `running_direction_precision_multiplier` (they're always called together).
+
+    Returns ``(run_speed, cos_sim)`` where ``run_speed`` is the kicker's XY
+    ground speed and ``cos_sim`` is the cosine similarity between the
+    kicker's velocity direction and the aim direction, or ``None`` if either
+    vector is degenerate (kicker stationary, or aim direction zero-length).
+    """
+    run_speed = kicker_velocity.length_xy()
+    aim_len = aim_direction.length_xy()
+    if run_speed < 1e-6 or aim_len < 1e-9:
+        return None
+    cos_sim = (kicker_velocity.xy() / run_speed).dot(aim_direction.xy() / aim_len)
+    return run_speed, cos_sim
+
+
 def running_power_multiplier(
     running_power_coefficient: float,
     kicker_velocity: Vector3,
@@ -146,10 +165,10 @@ def running_power_multiplier(
     - currently only `KickingParams.running_power_coefficient` is used by
     default, but the function itself is params-agnostic).
     """
-    run_speed = kicker_velocity.length_xy()
-    if run_speed < 1e-6 or kicker_top_speed_mps < 1e-6 or aim_direction.length_xy() < 1e-9:
+    geom = _run_direction_geometry(kicker_velocity, aim_direction)
+    if geom is None or kicker_top_speed_mps < 1e-6:
         return 1.0
-    cos_angle = kicker_velocity.xy().normalized().dot(aim_direction.xy().normalized())
+    run_speed, cos_angle = geom
     run_speed_fraction = min(1.0, run_speed / kicker_top_speed_mps)
     return 1.0 + running_power_coefficient * cos_angle * run_speed_fraction
 
@@ -174,32 +193,22 @@ def running_direction_precision_multiplier(
     Returns 1.0 (no effect) if the kicker's ground speed is below
     `running_direction_min_speed_mps`, or if either vector is degenerate.
     """
-    run_speed = kicker_velocity.length_xy()
+    geom = _run_direction_geometry(kicker_velocity, aim_direction)
+    if geom is None:
+        return 1.0
+    run_speed, cos_sim = geom
     if run_speed < params.running_direction_min_speed_mps:
         return 1.0
 
-    aim_len = aim_direction.length_xy()
-    if aim_len < 1e-9:
-        return 1.0
-
-    cos_sim = (kicker_velocity.xy() / run_speed).dot(aim_direction.xy() / aim_len)
-
-    cos_high = params.running_direction_precision_cos_high  # 0.35
-    cos_low = params.running_direction_precision_cos_low    # -0.2
-    penalty_mid = params.running_direction_precision_penalty_mid  # 0.25
-    penalty_max = params.running_direction_precision_penalty_max  # 0.75
-
-    if cos_sim >= cos_high:
-        return 1.0
-
-    if cos_sim >= cos_low:
-        # Linear from 1.0 at cos_high to (1-penalty_mid) at cos_low
-        t = (cos_high - cos_sim) / (cos_high - cos_low)
-        return 1.0 - penalty_mid * t
-
-    # Linear from (1-penalty_mid) at cos_low to (1-penalty_max) at cos_sim=-1
-    t = min(1.0, (cos_low - cos_sim) / (cos_low - (-1.0)))
-    return (1.0 - penalty_mid) - (penalty_max - penalty_mid) * t
+    return piecewise_lerp3(
+        cos_sim,
+        x_low=-1.0,
+        x_mid=params.running_direction_precision_cos_low,
+        x_high=params.running_direction_precision_cos_high,
+        y_low=1.0 - params.running_direction_precision_penalty_max,
+        y_mid=1.0 - params.running_direction_precision_penalty_mid,
+        y_high=1.0,
+    )
 
 
 def compensate_power_for_run_mult(power_fraction: float, run_mult: float) -> float:
@@ -334,6 +343,46 @@ def _launch_ball(
     ball.spin = spin
 
 
+def _log_kick_debug(
+    tag: str,
+    kicker_velocity: Vector3,
+    aim_dir: Vector3,
+    run_mult: float,
+    dir_precision_mult: float,
+    kick_precision: float,
+    effective_precision: float,
+    effective_power: float,
+    sigma: float,
+    speed: float,
+    rng_reduction: float,
+    base_power_fraction: float | None = None,
+) -> None:
+    """Shared debug-log formatting for `kick_ball` and `pass_ball` (identical
+    fields aside from `pass_ball`'s extra `base_power_fraction`)."""
+    if not log.isEnabledFor(logging.DEBUG):
+        return
+    kicker_speed_xy = kicker_velocity.length_xy()
+    cos_sim = (
+        (kicker_velocity.xy() / kicker_speed_xy).dot(aim_dir.xy().normalized())
+        if kicker_speed_xy > 1e-6 and aim_dir.length_xy() > 1e-9
+        else float('nan')
+    )
+    base_power_str = "" if base_power_fraction is None else f"base_power_frac={base_power_fraction:.3f} "
+    log.debug(
+        "[%s] kicker_vel=(%.2f,%.2f) kicker_speed=%.2f aim_dir=(%.2f,%.2f) "
+        "cos_sim=%.3f run_mult=%.3f dir_precision_mult=%.3f "
+        "kick_precision=%.3f -> effective_precision=%.3f "
+        "%seffective_power=%.3f sigma=%.5f speed=%.2f rng_reduction=%.2f",
+        tag,
+        kicker_velocity.x, kicker_velocity.y, kicker_speed_xy,
+        aim_dir.x, aim_dir.y,
+        cos_sim, run_mult, dir_precision_mult,
+        kick_precision, effective_precision,
+        base_power_str,
+        effective_power, sigma, speed, rng_reduction,
+    )
+
+
 def kick_ball(
     ball: Ball,
     kicker_position: Vector3,
@@ -378,22 +427,9 @@ def kick_ball(
     sigma = kick_sigma_rad(params, effective_precision, effective_power, rng_reduction) * difficulty_multiplier
     speed = max_kick_speed_mps(params, kick_power_attr) * max(0.0, min(1.0, power_fraction)) * run_mult
 
-    kicker_speed_xy = kicker_velocity.length_xy()
-    cos_sim = (
-        (kicker_velocity.xy() / kicker_speed_xy).dot(aim_dir.xy().normalized())
-        if kicker_speed_xy > 1e-6 and aim_dir.length_xy() > 1e-9
-        else float('nan')
-    )
-    log.debug(
-        "[kick_ball] kicker_vel=(%.2f,%.2f) kicker_speed=%.2f aim_dir=(%.2f,%.2f) "
-        "cos_sim=%.3f run_mult=%.3f dir_precision_mult=%.3f "
-        "kick_precision=%.3f -> effective_precision=%.3f "
-        "effective_power=%.3f sigma=%.5f speed=%.2f rng_reduction=%.2f",
-        kicker_velocity.x, kicker_velocity.y, kicker_speed_xy,
-        aim_dir.x, aim_dir.y,
-        cos_sim, run_mult, dir_precision_mult,
-        kick_precision, effective_precision,
-        effective_power, sigma, speed, rng_reduction,
+    _log_kick_debug(
+        "kick_ball", kicker_velocity, aim_dir, run_mult, dir_precision_mult,
+        kick_precision, effective_precision, effective_power, sigma, speed, rng_reduction,
     )
 
     _launch_ball(ball, kicker_position, aim_point, speed, sigma, spin, r, gravity_mps2)
@@ -463,31 +499,26 @@ def pass_ball(
 
     sigma = kick_sigma_rad(kp, effective_precision, effective_power, rng_reduction)
 
-    kicker_speed_xy = kicker_velocity.length_xy()
-    cos_sim = (
-        (kicker_velocity.xy() / kicker_speed_xy).dot(aim_dir.xy().normalized())
-        if kicker_speed_xy > 1e-6 and aim_dir.length_xy() > 1e-9
-        else float('nan')
-    )
-    log.debug(
-        "[pass_ball] kicker_vel=(%.2f,%.2f) kicker_speed=%.2f aim_dir=(%.2f,%.2f) "
-        "cos_sim=%.3f run_mult=%.3f dir_precision_mult=%.3f "
-        "kick_precision=%.3f -> effective_precision=%.3f "
-        "base_power_frac=%.3f effective_power=%.3f sigma=%.5f speed=%.2f rng_reduction=%.2f",
-        kicker_velocity.x, kicker_velocity.y, kicker_speed_xy,
-        aim_dir.x, aim_dir.y,
-        cos_sim, run_mult, dir_precision_mult,
-        kick_precision, effective_precision,
-        base_power_fraction, effective_power, sigma, speed, rng_reduction,
+    _log_kick_debug(
+        "pass_ball", kicker_velocity, aim_dir, run_mult, dir_precision_mult,
+        kick_precision, effective_precision, effective_power, sigma, speed, rng_reduction,
+        base_power_fraction=base_power_fraction,
     )
 
     _launch_ball(ball, kicker_position, aim_point, speed, sigma, Vector3.zero(), r, gravity_mps2)
+
+# ShootOrder blocker detection: perpendicular-distance threshold from the shot
+# line within which an opposition player is considered to be blocking the shot.
+SHOT_BLOCKER_THRESHOLD_M: float = 1.0
+# How far the shooter moves toward the goal when pausing due to a blocker.
+SHOT_PAUSE_ADVANCE_M: float = 2.0
+
 
 def has_blocker_on_shot_line(
     shooter_pos: Vector3,
     aim_point: Vector3,
     opposition: list,
-    threshold_m: float = 1.0,
+    threshold_m: float = SHOT_BLOCKER_THRESHOLD_M,
 ) -> bool:
     """Return True if any active opposition player lies within *threshold_m*
     of the line segment from *shooter_pos* to *aim_point* (XY plane only)

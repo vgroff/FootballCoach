@@ -34,6 +34,13 @@ HOTKEY_ENABLED = (210, 210, 215)
 HOTKEY_DISABLED = (80, 80, 92)   # dim but still readable
 HOTKEY_ACTIVE = (120, 200, 255)  # accent: current mode is active (same as HUD_ACCENT)
 
+# Multi-phase kick UI: trajectory colour coding and 1-sigma error cone.
+TRAJ_ASCENDING = (30, 30, 30)       # black-ish — ascending, below goal height
+TRAJ_DESCENDING = (80, 140, 255)    # blue — descending, below goal height
+TRAJ_ABOVE_GOAL = (255, 60, 60)     # red — above goal height (highest priority)
+TRAJ_CONE_RGB = (255, 255, 255)     # white fill for the 1-sigma error cone
+TRAJ_CONE_ALPHA = 35                 # translucency (0-255) of the error cone fill
+
 FONT_NAME = None  # None = pygame default font
 HUD_FONT_SIZE = 18
 TITLE_FONT_SIZE = 32

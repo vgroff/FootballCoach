@@ -10,7 +10,7 @@ import math
 from dataclasses import dataclass
 from enum import Enum, auto
 
-from footballcoach.config import load_physics_config
+from footballcoach.config import load_physics_config, require_section
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
 
@@ -62,10 +62,11 @@ class MovementParams:
     brake_turn_angle_rad: float  # heading change above this triggers brake-to-turn
     close_prox_cos_threshold: float  # cos-sim threshold for lateral-overshoot brake
     close_prox_radius_m: float  # radius within which lateral-overshoot brake activates
+    turn_speed_penalty_max: float  # max fractional speed-cap reduction mid-turn (0.7 = up to 70%)
 
     @staticmethod
     def from_config() -> "MovementParams":
-        d = load_physics_config()["movement"]
+        d = require_section(load_physics_config(), "movement")
         return MovementParams(
             top_speed_base_mps=d["top_speed_base_mps"],
             top_speed_scale_mps=d["top_speed_scale_mps"],
@@ -90,6 +91,7 @@ class MovementParams:
             brake_turn_angle_rad=math.radians(d.get("brake_turn_angle_deg", 75.0)),
             close_prox_cos_threshold=d.get("close_prox_cos_threshold", 0.3),
             close_prox_radius_m=d.get("close_prox_radius_m", 5.0),
+            turn_speed_penalty_max=d.get("turn_speed_penalty_max", 0.7),
         )
 
 
@@ -283,7 +285,7 @@ def step_player_towards(
         params, attrs.acceleration, max(current_speed, 0.5), has_ball, attrs.ball_control, player.is_goalkeeper
     )
 
-    heading_diff = _angle_diff(current_heading, desired_heading)
+    heading_diff = angle_diff(current_heading, desired_heading)
     max_turn_this_tick = omega_max * dt_s
     if abs(heading_diff) <= max_turn_this_tick:
         new_heading = desired_heading
@@ -294,7 +296,7 @@ def step_player_towards(
     # the player is turning (large heading changes cost more speed), per the
     # design requirement.
     turn_fraction = min(abs(heading_diff) / math.pi, 1.0) if desired_dir.length() > 1e-9 else 0.0
-    turn_speed_penalty = 1.0 - 0.7 * turn_fraction  # up to 70% speed cap reduction mid-turn
+    turn_speed_penalty = 1.0 - params.turn_speed_penalty_max * turn_fraction
     target_speed = desired_speed * turn_speed_penalty
 
     speed_diff = target_speed - current_speed
@@ -311,32 +313,29 @@ def step_player_towards(
     if new_speed < _STOP_SNAP_THRESHOLD_MPS and desired_speed == 0.0:
         new_speed = 0.0
 
-    log.debug(
-        "[movement] pid=%s  heading: %.2f->%.2f (diff=%.2f)  "
-        "speed: %.2f->%.2f (target=%.2f  a_max=%.2f)  "
-        "turn_frac=%.2f  v_top=%.2f  pos: (%.3f,%.3f)->(%.3f,%.3f)",
-        player.player_id,
-        current_heading, new_heading, heading_diff,
-        current_speed, new_speed, target_speed, a_max,
-        turn_fraction, v_top,
-        player.position.x, player.position.y,
-        player.position.x + Vector3.from_angle_xy(new_heading, new_speed).x * dt_s,
-        player.position.y + Vector3.from_angle_xy(new_heading, new_speed).y * dt_s,
-    )
-
     player.heading_rad = new_heading
     player.velocity = Vector3.from_angle_xy(new_heading, new_speed)
     player.position = player.position + player.velocity * dt_s
+
+    if log.isEnabledFor(logging.DEBUG):
+        log.debug(
+            "[movement] pid=%s  heading: %.2f->%.2f (diff=%.2f)  "
+            "speed: %.2f->%.2f (target=%.2f  a_max=%.2f)  "
+            "turn_frac=%.2f  v_top=%.2f  pos: (%.3f,%.3f)->(%.3f,%.3f)",
+            player.player_id,
+            current_heading, new_heading, heading_diff,
+            current_speed, new_speed, target_speed, a_max,
+            turn_fraction, v_top,
+            player.position.x - player.velocity.x * dt_s,
+            player.position.y - player.velocity.y * dt_s,
+            player.position.x, player.position.y,
+        )
 
 
 def angle_diff(a: float, b: float) -> float:
     """Returns b - a wrapped to [-pi, pi]."""
     d = (b - a + math.pi) % (2 * math.pi) - math.pi
     return d
-
-
-# Keep the private alias so any existing internal callers still work.
-_angle_diff = angle_diff
 
 
 def braking_speed_mode(

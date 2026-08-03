@@ -18,7 +18,8 @@ import numpy as np
 
 @dataclass
 class PlayerFeatures:
-    """Per-player feature vector (26 floats).
+    """Per-player feature vector (see ``PLAYER_FEATURE_DIM`` for the
+    authoritative count).
 
     Used for both the "self" slot and each of the up-to-21 "other player"
     slots.  For the self slot: ``rel_dx=0``, ``rel_dy=0``,
@@ -111,19 +112,33 @@ class BallFeatures:
         return np.array(astuple(self), dtype=np.float32)
 
 
+MAX_TASK_IDS: int = 20  # curriculum phase/task one-hot width (see ai_config.json observation.max_task_ids)
+
+
 @dataclass
 class GlobalFeatures:
-    """Match-context feature vector (11 floats).
+    """Match-context feature vector (see ``GLOBAL_FEATURE_DIM`` for the
+    authoritative count).
 
     ``attack_defence_smoothed`` is technically per-player, but placed here
     (section 7.5 of ai_design_doc.md: "placed in self features in the actual
     tensor packing - listed here for narrative completeness").  In practice
-    it is the 11th element of this vector; the encoder passes it to the
-    network's global_mlp branch.
+    it is fed to the network's global_mlp branch alongside the rest of this
+    vector.
 
     Time remaining: log1p-normalized (``log1p(t) / log1p(max_t)``) so
     the "urgent" 1-20s endgame scenarios are distinguishable from normal play
     (see ai_design_doc.md section 7.5's note on this).
+
+    Task-id (``task_id_0`` .. ``task_id_19``): a MAX_TASK_IDS-wide one-hot
+    identifying which curriculum phase/task is currently active. Fixed-width
+    so the network architecture doesn't change as new phases are added —
+    unused task slots stay zero. Task 0 = phase 1, task 1 = phase 2, etc.
+    (index = phase_id - 1). NOT YET WIRED for mixed multi-phase training —
+    see ai/knowledge.md "Task-id: scaffolded, not yet load-bearing" note.
+    Individual scalar fields (rather than a tuple field) are used
+    deliberately so ``astuple()``/``to_array()`` keep producing a flat
+    float32 array without special-casing.
     """
     score_diff: float = 0.0         # own_goals - opp_goals (team-relative, not raw scores)
     time_remaining_norm: float = 1.0  # log1p(t_s) / log1p(7200), ~[0,1]
@@ -144,6 +159,28 @@ class GlobalFeatures:
 
     attack_defence_smoothed: float = 0.5  # EMA-smoothed attack/defence weighting [0,1]
 
+    # --- Task identifier (one-hot, MAX_TASK_IDS wide) ---
+    task_id_0: float = 0.0
+    task_id_1: float = 0.0
+    task_id_2: float = 0.0
+    task_id_3: float = 0.0
+    task_id_4: float = 0.0
+    task_id_5: float = 0.0
+    task_id_6: float = 0.0
+    task_id_7: float = 0.0
+    task_id_8: float = 0.0
+    task_id_9: float = 0.0
+    task_id_10: float = 0.0
+    task_id_11: float = 0.0
+    task_id_12: float = 0.0
+    task_id_13: float = 0.0
+    task_id_14: float = 0.0
+    task_id_15: float = 0.0
+    task_id_16: float = 0.0
+    task_id_17: float = 0.0
+    task_id_18: float = 0.0
+    task_id_19: float = 0.0
+
     def to_array(self) -> np.ndarray:
         return np.array(astuple(self), dtype=np.float32)
 
@@ -152,9 +189,9 @@ class GlobalFeatures:
 # Dimension constants (derived from the dataclasses - single source of truth)
 # ---------------------------------------------------------------------------
 
-PLAYER_FEATURE_DIM: int = len(fields(PlayerFeatures))   # 27  (was 25 pre pos_x/pos_y)
-BALL_FEATURE_DIM: int = len(fields(BallFeatures))       # 12
-GLOBAL_FEATURE_DIM: int = len(fields(GlobalFeatures))   # 11
+PLAYER_FEATURE_DIM: int = len(fields(PlayerFeatures))
+BALL_FEATURE_DIM: int = len(fields(BallFeatures))
+GLOBAL_FEATURE_DIM: int = len(fields(GlobalFeatures))
 MAX_OTHER_PLAYERS: int = 21  # full 11v11 minus self
 
 
@@ -162,23 +199,48 @@ MAX_OTHER_PLAYERS: int = 21  # full 11v11 minus self
 # Observation batch
 # ---------------------------------------------------------------------------
 
+#: Width of each AI-type one-hot (rules / immobile / neural). See AI_TYPE_*
+#: constants in ai/ppo/bc.py (kept in sync manually - this is a small, fixed
+#: constant, not derived from bc.py to avoid a schema.py -> ppo.bc import).
+AI_TYPE_ONE_HOT_DIM: int = 3
+
+
 @dataclass
 class ObservationBatch:
     """One observation for one player (unbatched arrays; batch dim added by
     the trainer when collecting rollouts from multiple envs/players).
 
     Shapes:
-        self_feat:   (PLAYER_FEATURE_DIM,)
-        other_feat:  (MAX_OTHER_PLAYERS, PLAYER_FEATURE_DIM)
-        exists_mask: (MAX_OTHER_PLAYERS,)  - 1.0 for real, 0.0 for padded
-        ball_feat:   (BALL_FEATURE_DIM,)
-        global_feat: (GLOBAL_FEATURE_DIM,)
+        self_feat:     (PLAYER_FEATURE_DIM,)
+        other_feat:    (MAX_OTHER_PLAYERS, PLAYER_FEATURE_DIM)
+        exists_mask:   (MAX_OTHER_PLAYERS,)  - 1.0 for real, 0.0 for padded
+        ball_feat:     (BALL_FEATURE_DIM,)
+        global_feat:   (GLOBAL_FEATURE_DIM,)
+        self_ai_type:  (AI_TYPE_ONE_HOT_DIM,)  - one-hot: [is_rules, is_immobile, is_neural]
+        other_ai_type: (MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM) - permuted in lockstep
+                        with other_feat/exists_mask (same slot shuffle).
+
+    ``self_ai_type``/``other_ai_type`` are VALUE-ONLY side channels - see
+    ai/knowledge.md "Opponent-AI-type (value-only)". They default to all-zero
+    arrays (meaning: unknown/unset) so existing callers that don't populate
+    them keep working; ``encode_observation()`` always populates them with a
+    real one-hot.
     """
     self_feat: np.ndarray
     other_feat: np.ndarray
     exists_mask: np.ndarray
     ball_feat: np.ndarray
     global_feat: np.ndarray
+    self_ai_type: np.ndarray = None
+    other_ai_type: np.ndarray = None
+
+    def __post_init__(self) -> None:
+        if self.self_ai_type is None:
+            self.self_ai_type = np.zeros(AI_TYPE_ONE_HOT_DIM, dtype=np.float32)
+        if self.other_ai_type is None:
+            self.other_ai_type = np.zeros(
+                (self.other_feat.shape[0], AI_TYPE_ONE_HOT_DIM), dtype=np.float32
+            )
 
     def to_torch_dict(self) -> dict:
         """Convert to a dict of 1-D (unbatched) torch tensors.
@@ -192,4 +254,6 @@ class ObservationBatch:
             "exists_mask": torch.from_numpy(self.exists_mask),
             "ball_feat": torch.from_numpy(self.ball_feat),
             "global_feat": torch.from_numpy(self.global_feat),
+            "self_ai_type": torch.from_numpy(self.self_ai_type),
+            "other_ai_type": torch.from_numpy(self.other_ai_type),
         }

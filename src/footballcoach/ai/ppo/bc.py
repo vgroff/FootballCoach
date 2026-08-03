@@ -21,7 +21,7 @@ Design rule: BC labels do NOT go through the PPO importance ratio / clipping.
 They are a separate, additive loss term. This means they can use actions taken
 by the rules-based AI (which has no π_old) without corrupting PPO's math.
 
-Flat tensor layout for stored BC labels (16 floats per step):
+Flat tensor layout for stored BC labels (17 floats per step):
   [0]  shoot
   [1]  pass_
   [2]  move
@@ -38,6 +38,19 @@ Flat tensor layout for stored BC labels (16 floats per step):
   [13] tackle_attempt    (1.0 = player is tackling this step, 0.0 otherwise)
   [14] valid             (1.0 = use this label, 0.0 = skip BC loss for this step)
   [15] exec_move         (1.0 = player is moving, 0.0 = standstill)
+  [16] ai_type           (0.0=rules, 1.0=immobile, 2.0=neural [reserved, unused] -
+                          which AI controlled this player when the label was
+                          recorded; visible to the VALUE head only, never the
+                          policy heads - see ai/knowledge.md)
+  [17] opponent_ai_type  (same 0/1/2 coding as [16], but for the OTHER player
+                          in the match at this same tick. In 1v1 phases this is
+                          unambiguous - the single other player. Recorded
+                          directly at demo-recording time rather than joined
+                          across rows after the fact, since the two players'
+                          rows are not otherwise correlatable once interleaved.
+                          Used to build the value-only ``other_ai_type``
+                          side-channel for BC/value pretraining - see
+                          ai/knowledge.md "Opponent-AI-type (value-only)".)
 """
 from __future__ import annotations
 
@@ -52,7 +65,7 @@ import torch.nn.functional as F
 
 log = logging.getLogger("footballcoach.ai.bc")
 
-BC_LABEL_DIM = 16  # elements in the flat label vector (see module docstring)
+BC_LABEL_DIM = 18  # elements in the flat label vector (see module docstring)
 
 # Indices into the flat label vector
 _I_SHOOT          = 0
@@ -71,6 +84,13 @@ _I_KICK_THIS_TICK = 12
 _I_TACKLE_ATTEMPT = 13
 _I_VALID          = 14
 _I_EXEC_MOVE      = 15
+_I_AI_TYPE        = 16
+_I_OPPONENT_AI_TYPE = 17
+
+# ai_type integer codes (see module docstring layout table)
+AI_TYPE_RULES    = 0.0
+AI_TYPE_IMMOBILE = 1.0
+AI_TYPE_NEURAL   = 2.0  # reserved, unused - no neural demo-recording mode yet
 
 # Standard pitch half-dimensions used to normalise move_region supervision.
 # Kept as constants here so bc_loss_from_tensor doesn't need a pitch object.
@@ -101,6 +121,8 @@ class BCLabel:
     tackle_attempt: float = 0.0   # execution: 1.0 if player is attempting a tackle
     exec_move: float = 1.0        # execution: 1.0 if player is moving, 0.0 = standstill
     valid: bool = True
+    ai_type: float = AI_TYPE_RULES  # which AI produced this label (see AI_TYPE_* constants)
+    opponent_ai_type: float = AI_TYPE_IMMOBILE  # which AI controls the OTHER player (see AI_TYPE_* constants)
 
     def to_array(self) -> np.ndarray:
         """Pack into a flat float32 array of length BC_LABEL_DIM."""
@@ -123,6 +145,8 @@ class BCLabel:
         arr[_I_TACKLE_ATTEMPT] = self.tackle_attempt
         arr[_I_VALID]          = 1.0 if self.valid else 0.0
         arr[_I_EXEC_MOVE]      = self.exec_move
+        arr[_I_AI_TYPE]        = self.ai_type
+        arr[_I_OPPONENT_AI_TYPE] = self.opponent_ai_type
         return arr
 
     @staticmethod
@@ -154,6 +178,22 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         player = match.player_by_id(player_id)
     except (KeyError, AttributeError):
         return BCLabel.invalid()
+
+    # ai_type reflects which AI actually controls *player* right now (rules
+    # vs immobile) — NOT which AI the label was derived from (this function
+    # always queries Phase1RulesAI internally regardless of the caller).
+    ai_type = AI_TYPE_RULES if isinstance(player.ai, Phase1RulesAI) else AI_TYPE_IMMOBILE
+
+    # opponent_ai_type: which AI controls the OTHER player in the match right
+    # now. Phase 1 is strictly 1v1, so "the other player" is unambiguous —
+    # any player in match.players that isn't `player`. Falls back to
+    # AI_TYPE_IMMOBILE if no other player is found (should not happen in a
+    # well-formed 1v1 scenario).
+    opponent_ai_type = AI_TYPE_IMMOBILE
+    for _p in match.players:
+        if _p.player_id != player.player_id:
+            opponent_ai_type = AI_TYPE_RULES if isinstance(_p.ai, Phase1RulesAI) else AI_TYPE_IMMOBILE
+            break
 
     # Execution heads reflect what the rules AI is physically doing RIGHT NOW —
     # i.e. the current order it's executing, before any new decision is made.
@@ -200,6 +240,8 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
             kick_this_tick=kick_this_tick,
             tackle_attempt=tackle_attempt,
             exec_move=1.0,
+            ai_type=ai_type,
+            opponent_ai_type=opponent_ai_type,
         )
     elif isinstance(order, GetPossessionOrder):
         ball = match.ball
@@ -218,6 +260,8 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
             kick_this_tick=kick_this_tick,
             tackle_attempt=tackle_attempt,
             exec_move=1.0,
+            ai_type=ai_type,
+            opponent_ai_type=opponent_ai_type,
         )
     else:
         return BCLabel.invalid()
@@ -230,9 +274,11 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
 def bc_loss_from_tensor(
     labels: torch.Tensor,
     decision_heads,
-    exec_heads,
+    exec_heads=None,
     direction_loss_weight: float = 3.0,
     region_loss_weight: float = 1.0,
+    pos_weight_kick: float = 1.0,
+    pos_weight_tackle_attempt: float = 1.0,
     return_breakdown: bool = False,
 ):
     """Compute BC loss for a minibatch, given packed label tensors.
@@ -240,17 +286,30 @@ def bc_loss_from_tensor(
     Args:
         labels: (N, BC_LABEL_DIM) float32 tensor from the rollout buffer.
         decision_heads: DecisionHeadsRaw from decision_net forward pass.
-        exec_heads: ExecutionHeadsRaw from execution_net forward pass.
+        exec_heads: ExecutionHeadsRaw from execution_net forward pass, or
+            ``None`` to compute a decision-heads-only loss (skips all
+            exec-dependent terms: exec_move/sprint/kick/tackle_attempt BCE
+            and the move_direction cosine loss). Used by Phase 0 of
+            ``PPOTrainer.pretrain_combined()``, which only trains
+            ``decision_net`` — see ai/knowledge.md "Phase 0" note.
         direction_loss_weight: Multiplier on the move_direction cosine loss.
             From ai_config.json['bc']['direction_loss_weight'] (default 3.0).
             Upweights direction relative to ~11 Bernoulli BCE heads so it gets
-            proportional gradient pressure.
+            proportional gradient pressure. Ignored when exec_heads is None.
         region_loss_weight: Multiplier on the move_region_center MSE loss.
             From ai_config.json['bc']['region_loss_weight'] (default 1.0).
             Separate from direction_loss_weight: in Phase 1 the region target
             (ball position proxy) is noisy and less critical.
+        pos_weight_kick: Positive-class weight (``F.binary_cross_entropy_with_logits``
+            ``pos_weight`` semantics) applied to the ``kick_this_tick`` BCE
+            term only, to counter class imbalance (rare positives). Default
+            1.0 = no reweighting. See ``DemonstrationDataset.compute_pos_weights()``.
+            Ignored when exec_heads is None.
+        pos_weight_tackle_attempt: Same as ``pos_weight_kick`` but for the
+            ``tackle_attempt`` BCE term. Ignored when exec_heads is None.
         return_breakdown: If True, also return a dict of per-group mean losses
             {decision, exec_bce, sprint, move, direction, region} for diagnostics.
+            When exec_heads is None, the exec-dependent entries are all 0.0.
 
     Returns:
         Scalar BC loss (mean over valid steps), or (loss, breakdown_dict) if
@@ -260,16 +319,19 @@ def bc_loss_from_tensor(
     _zero = torch.zeros(1, device=labels.device)
     if not valid.any():
         if return_breakdown:
-            return _zero, {"decision": 0.0, "exec_bce": 0.0, "sprint": 0.0, "move": 0.0, "direction": 0.0, "region": 0.0}
+            return _zero, {"decision": 0.0, "exec_bce": 0.0, "sprint": 0.0, "move": 0.0, "tackle_attempt": 0.0, "direction": 0.0, "region": 0.0}
         return _zero
 
     loss = torch.zeros(labels.shape[0], device=labels.device)
 
     # --- Bernoulli decision heads (BCE from logits) ---
-    def _bce(logit: torch.Tensor, col: int) -> torch.Tensor:
+    def _bce(logit: torch.Tensor, col: int, pos_weight: float = 1.0) -> torch.Tensor:
         target = labels[:, col]
+        pw = None
+        if pos_weight != 1.0:
+            pw = torch.tensor(pos_weight, device=labels.device, dtype=logit.dtype)
         return F.binary_cross_entropy_with_logits(
-            logit.squeeze(-1), target, reduction="none"
+            logit.squeeze(-1), target, reduction="none", pos_weight=pw
         )
 
     dec_loss = (
@@ -283,31 +345,38 @@ def bc_loss_from_tensor(
     )
     loss += dec_loss
 
-    # --- Execution BCE heads: exec_move, sprint, kick, tackle_attempt ---
-    sprint_loss   = _bce(exec_heads.sprint_logit,           _I_SPRINT)
-    move_loss     = _bce(exec_heads.exec_move_logit,        _I_EXEC_MOVE)
-    exec_bce_loss = (
-        move_loss
-        + sprint_loss
-        + _bce(exec_heads.kick_logit,               _I_KICK_THIS_TICK)
-        + _bce(exec_heads.tackle_attempt_logit,     _I_TACKLE_ATTEMPT)
-    )
-    loss += exec_bce_loss
-
-    # --- Execution: move_direction cosine loss ---
-    # Upweighted by direction_loss_weight so the single continuous head gets
-    # proportional gradient against ~11 Bernoulli heads.
-    # 1 - cosine_similarity → 0 when aligned, 2 when opposite.
+    exec_bce_loss = torch.zeros(labels.shape[0], device=labels.device)
+    sprint_loss = torch.zeros(labels.shape[0], device=labels.device)
+    move_loss = torch.zeros(labels.shape[0], device=labels.device)
+    tackle_attempt_loss = torch.zeros(labels.shape[0], device=labels.device)
     dir_loss_per = torch.zeros(labels.shape[0], device=labels.device)
-    has_dir = (labels[:, _I_DIR_X].abs() + labels[:, _I_DIR_Y].abs()) > 1e-6
-    if has_dir.any():
-        target_dir = labels[:, _I_DIR_X:_I_DIR_Y + 1]  # (N, 2)
-        pred_dir = exec_heads.move_direction             # (N, 2) raw (pre-normalize)
-        eps = 1e-6
-        pred_norm = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
-        cos_loss = 1.0 - (pred_norm * target_dir).sum(dim=-1)
-        dir_loss_per = direction_loss_weight * torch.where(has_dir, cos_loss, torch.zeros_like(cos_loss))
-        loss += dir_loss_per
+
+    if exec_heads is not None:
+        # --- Execution BCE heads: exec_move, sprint, kick, tackle_attempt ---
+        sprint_loss        = _bce(exec_heads.sprint_logit,          _I_SPRINT)
+        move_loss          = _bce(exec_heads.exec_move_logit,       _I_EXEC_MOVE)
+        tackle_attempt_loss = _bce(exec_heads.tackle_attempt_logit, _I_TACKLE_ATTEMPT, pos_weight_tackle_attempt)
+        exec_bce_loss = (
+            move_loss
+            + sprint_loss
+            + _bce(exec_heads.kick_logit,               _I_KICK_THIS_TICK, pos_weight_kick)
+            + tackle_attempt_loss
+        )
+        loss += exec_bce_loss
+
+        # --- Execution: move_direction cosine loss ---
+        # Upweighted by direction_loss_weight so the single continuous head gets
+        # proportional gradient against ~11 Bernoulli heads.
+        # 1 - cosine_similarity → 0 when aligned, 2 when opposite.
+        has_dir = (labels[:, _I_DIR_X].abs() + labels[:, _I_DIR_Y].abs()) > 1e-6
+        if has_dir.any():
+            target_dir = labels[:, _I_DIR_X:_I_DIR_Y + 1]  # (N, 2)
+            pred_dir = exec_heads.move_direction             # (N, 2) raw (pre-normalize)
+            eps = 1e-6
+            pred_norm = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
+            cos_loss = 1.0 - (pred_norm * target_dir).sum(dim=-1)
+            dir_loss_per = direction_loss_weight * torch.where(has_dir, cos_loss, torch.zeros_like(cos_loss))
+            loss += dir_loss_per
 
     # --- Decision: move_region_center MSE (normalised to [-1, 1]) ---
     # Weighted by region_loss_weight (default 1.0, separate from direction).
@@ -332,12 +401,13 @@ def bc_loss_from_tensor(
 
     if return_breakdown:
         breakdown = {
-            "decision":  float(dec_loss[valid].mean()),
-            "exec_bce":  float(exec_bce_loss[valid].mean()),
-            "sprint":    float(sprint_loss[valid].mean()),
-            "move":      float(move_loss[valid].mean()),
-            "direction": float(dir_loss_per[valid].mean()),
-            "region":    float(region_loss_per[valid].mean()),
+            "decision":       float(dec_loss[valid].mean()),
+            "exec_bce":       float(exec_bce_loss[valid].mean()),
+            "sprint":         float(sprint_loss[valid].mean()),
+            "move":           float(move_loss[valid].mean()),
+            "tackle_attempt": float(tackle_attempt_loss[valid].mean()),
+            "direction":      float(dir_loss_per[valid].mean()),
+            "region":         float(region_loss_per[valid].mean()),
         }
         return total, breakdown
     return total
@@ -426,14 +496,16 @@ class BCPretrainer:
                 batch_size=batch_size, shuffle=True, device=self.device, valid_only=True
             ):
                 self.optimizer.zero_grad()
+                _sat, _oat = obs_dict.get("self_ai_type"), obs_dict.get("other_ai_type")
                 d_heads = self.decision_net(
                     obs_dict["self_feat"], obs_dict["other_feat"],
                     obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                    _sat, _oat,
                 )
                 e_heads = self.execution_net(
                     obs_dict["self_feat"], obs_dict["other_feat"],
                     obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
-                    d_heads,
+                    d_heads, _sat, _oat,
                 )
                 loss = bc_loss_from_tensor(labels, d_heads, e_heads)
                 loss.backward()
@@ -496,14 +568,16 @@ class BCPretrainer:
                 label_t = torch.stack(batch_labels, dim=0)
 
                 self.optimizer.zero_grad()
+                _sat, _oat = stacked.get("self_ai_type"), stacked.get("other_ai_type")
                 d_heads = self.decision_net(
                     stacked["self_feat"], stacked["other_feat"],
                     stacked["exists_mask"], stacked["ball_feat"], stacked["global_feat"],
+                    _sat, _oat,
                 )
                 e_heads = self.execution_net(
                     stacked["self_feat"], stacked["other_feat"],
                     stacked["exists_mask"], stacked["ball_feat"], stacked["global_feat"],
-                    d_heads,
+                    d_heads, _sat, _oat,
                 )
                 loss = bc_loss_from_tensor(label_t, d_heads, e_heads)
                 loss.backward()

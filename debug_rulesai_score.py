@@ -29,18 +29,11 @@ ep_return = 0.0
 ep_len = 0
 
 while len(episode_returns) < N_EPISODES:
-    # Get rules-based label
+    # Get rules-based label, then build a fake action dict that applies the
+    # label's move_direction/sprint/etc. exactly as if the network had output
+    # them, driving the env through the normal action interface.
     label = phase1_labels(env)
 
-    # Build a fake action dict that exactly applies the label as orders
-    # We use the label's move_direction and sprint directly.
-    # Since we can't easily inject orders, we use a zero-policy action and
-    # rely on the env's label → env translation via bc.py's logic.
-    # Instead: drive directly via the env's internal match object.
-    match = env._env._match if hasattr(env, '_env') else None
-
-    # Just use a null neural action but override with a fake exec that
-    # exactly matches BC output
     import numpy as _np
     move_dir = label.move_direction if label.move_direction is not None else _np.array([1.0, 0.0])
     env_action = {

@@ -39,6 +39,12 @@ def load_graphics_config() -> dict[str, Any]:
     return _load_json("graphics.json")
 
 
+@lru_cache(maxsize=1)
+def load_gameplay_config() -> dict[str, Any]:
+    """Returns the parsed contents of gameplay.json (cached)."""
+    return _load_json("gameplay.json")
+
+
 def clear_config_cache() -> None:
     """Clears cached config, forcing a re-read from disk on next access.
 
@@ -47,6 +53,23 @@ def clear_config_cache() -> None:
     load_physics_config.cache_clear()
     load_attributes_config.cache_clear()
     load_graphics_config.cache_clear()
+    load_gameplay_config.cache_clear()
+
+
+def require_section(config: dict[str, Any], section: str, file_name: str = "physics.json") -> dict[str, Any]:
+    """Returns ``config[section]``, raising a ``KeyError`` that names both
+    the config file and the missing section (rather than a bare
+    ``KeyError('section')``) if it's absent.
+
+    Every ``*Params.from_config()`` in the engine reads a section of
+    ``physics.json`` this way instead of indexing the dict directly, so a
+    missing/renamed section fails loudly with useful context rather than a
+    generic exception or (worse) a silently-defaulted empty dict.
+    """
+    try:
+        return config[section]
+    except KeyError:
+        raise KeyError(f"Missing section '{section}' in {file_name}") from None
 
 
 @dataclass(frozen=True)
@@ -65,7 +88,7 @@ class PitchConfig:
 
     @staticmethod
     def from_config() -> "PitchConfig":
-        d = load_physics_config()["pitch"]
+        d = require_section(load_physics_config(), "pitch")
         return PitchConfig(
             length_m=d["length_m"],
             width_m=d["width_m"],

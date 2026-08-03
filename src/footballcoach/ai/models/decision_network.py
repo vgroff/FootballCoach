@@ -21,12 +21,15 @@ on tackle_logit and get_possession_raw as two independent Bernoullis.
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
 from footballcoach.ai.action.schema import DecisionHeadsRaw
 from footballcoach.ai.models.entity_encoder import EntityEncoder
 from footballcoach.ai.obs.schema import (
+    AI_TYPE_ONE_HOT_DIM,
     BALL_FEATURE_DIM,
     GLOBAL_FEATURE_DIM,
     MAX_OTHER_PLAYERS,
@@ -62,6 +65,7 @@ class DecisionNetwork(nn.Module):
         global_mlp_hidden: int = 32,
         trunk_hidden: int = 256,
         latent_dim: int = 32,
+        value_extra_hidden: int = 16,
     ):
         super().__init__()
         self.entity_encoder = EntityEncoder(
@@ -118,8 +122,19 @@ class DecisionNetwork(nn.Module):
         # Latent vector: passed through to execution network
         self.latent_vector = nn.Linear(trunk_hidden, latent_dim)
 
-        # Shared-trunk value head (critic, Option A)
-        self.value_head = nn.Linear(trunk_hidden, 1)
+        # --- Value-only opponent-AI-type side channel ---
+        # Bypasses the entity encoder/attention and every policy head entirely.
+        # Feeds ONLY value_head. See ai/knowledge.md "Opponent-AI-type
+        # (value-only)" - do not route this through the shared trunk `h` or
+        # any policy head; that would let the policy condition on opponent
+        # identity, which is the exact thing this design avoids.
+        ai_type_flat_dim = AI_TYPE_ONE_HOT_DIM * (1 + MAX_OTHER_PLAYERS)
+        self.value_extra_mlp = nn.Sequential(
+            nn.Linear(ai_type_flat_dim, value_extra_hidden), nn.ReLU(),
+        )
+
+        # Shared-trunk value head (critic, Option A) + value-only ai-type side channel
+        self.value_head = nn.Linear(trunk_hidden + value_extra_hidden, 1)
 
     def forward(
         self,
@@ -128,6 +143,8 @@ class DecisionNetwork(nn.Module):
         exists_mask: torch.Tensor,  # (batch, MAX_OTHER_PLAYERS)
         ball_feat: torch.Tensor,    # (batch, ball_dim)
         global_feat: torch.Tensor,  # (batch, global_dim)
+        self_ai_type: Optional[torch.Tensor] = None,   # (batch, AI_TYPE_ONE_HOT_DIM)
+        other_ai_type: Optional[torch.Tensor] = None,  # (batch, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM)
     ) -> DecisionHeadsRaw:
         entity_ctx = self.entity_encoder(self_feat, other_feat, exists_mask)
         h = torch.cat([
@@ -137,6 +154,21 @@ class DecisionNetwork(nn.Module):
             self.global_mlp(global_feat),
         ], dim=-1)
         h = self.trunk(h)
+
+        # --- Value-only ai-type side channel (bypasses h/trunk entirely for
+        # every head except value_head) ---
+        batch_size = h.shape[0]
+        if self_ai_type is None:
+            self_ai_type = torch.zeros(batch_size, AI_TYPE_ONE_HOT_DIM, device=h.device, dtype=h.dtype)
+        if other_ai_type is None:
+            other_ai_type = torch.zeros(
+                batch_size, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM, device=h.device, dtype=h.dtype
+            )
+        ai_type_flat = torch.cat(
+            [self_ai_type, other_ai_type.reshape(batch_size, -1)], dim=-1
+        )
+        value_extra = self.value_extra_mlp(ai_type_flat)
+        value_input = torch.cat([h, value_extra], dim=-1)
 
         return DecisionHeadsRaw(
             shoot_logit=self.shoot_logit(h),
@@ -156,7 +188,7 @@ class DecisionNetwork(nn.Module):
             region_of_play_size=self.region_of_play_size(h),
             attack_defence_raw=self.attack_defence_raw(h),
             latent_vector=self.latent_vector(h),
-            value=self.value_head(h),
+            value=self.value_head(value_input),
         )
 
     @classmethod
@@ -172,6 +204,7 @@ class DecisionNetwork(nn.Module):
             global_mlp_hidden=cfg["global_mlp_hidden"],
             trunk_hidden=cfg["trunk_hidden"],
             latent_dim=cfg["latent_dim"],
+            value_extra_hidden=cfg.get("value_extra_hidden", 16),
         )
 
 

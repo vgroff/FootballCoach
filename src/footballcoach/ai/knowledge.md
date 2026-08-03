@@ -55,9 +55,12 @@ ai/
     record_demonstrations.py  # CLI: record rules-based episodes as .npz BC datasets
 ```
 
-## BC label vector (BC_LABEL_DIM = 15)
+## BC label vector (BC_LABEL_DIM = 17)
 
-`bc.py` stores 15 floats per step:
+`bc.py` stores 17 floats per step (see the module docstring in `bc.py` for
+the authoritative up-to-date layout table — do not let this count drift out
+of sync, it has already changed twice: 15→16 (added `exec_move`), 16→17
+(added `ai_type`)):
 
 | idx | field | source |
 |-----|-------|--------|
@@ -68,12 +71,98 @@ ai/
 | 12 | **kick_this_tick** | `player.on_kick` callback (fired by engine) |
 | 13 | **tackle_attempt** | `player.on_tackle` callback (fired by engine) |
 | 14 | valid | 1.0 = use this label |
+| 15 | exec_move | 1.0 = player is moving, 0.0 = standstill |
+| 16 | ai_type | 0.0=rules, 1.0=immobile, 2.0=neural (reserved, unused) |
 
 **Critical:** indices 12–13 come from **engine callbacks** (`Player.on_kick`,
 `Player.on_kick`), not from inspecting the current order type.  They reflect
 what the engine physically executed this tick.  Indices 0–11 come from asking
 the rules AI what it *decides* next — these are input to the decision network
 and movement-related execution heads.
+
+### BC class balancing (pos_weight + trivial-row downsampling)
+
+`DemonstrationDataset.compute_pos_weights()` computes inverse-frequency
+`pos_weight` values (matching
+`F.binary_cross_entropy_with_logits`'s `pos_weight` semantics) for the rare
+`kick_this_tick`/`tackle_attempt` Bernoulli targets, over the dataset's
+valid rows. `PPOTrainer` auto-computes these from the training dataset at
+the start of `pretrain_combined()` unless overridden via
+`ai_config.json['bc']['pos_weight_kick']` /
+`['pos_weight_tackle_attempt']` (non-null = explicit override). Threaded
+into **every** `bc_loss_from_tensor()` call site (pretrain BC epochs, BC
+repair, the post-value-warmup BC degradation check, and the annealed
+BC-aux-during-PPO loss) — never applied to the raw PPO policy-gradient
+loss (reweighting that would be a correctness risk, not just variance).
+
+`DemonstrationDataset.iterate_minibatches(..., downsample_trivial_frac=...)`
+gently excludes a fraction of "trivial" movement rows (rows whose
+`move_direction` label is nearly identical to the *previous row in the same
+episode*, cosine similarity above `downsample_trivial_cos_threshold`) each
+epoch. The trivial classification is cached once at load time
+(`_compute_trivial_mask()`), but the actual excluded subset is a **fresh
+random draw every call** (i.e. every epoch) — never a fixed one-time
+filter. Rows within `downsample_trivial_exclude_radius_steps` of a
+`kick_this_tick`/`tackle_attempt` event (same episode) are never eligible
+for exclusion, so run-ups immediately preceding a rare event are preserved.
+Controlled by `ai_config.json['bc']`: `downsample_trivial_enabled`,
+`downsample_trivial_frac_default` (used for early epochs),
+`downsample_trivial_frac_high_epoch` (used once
+`epoch >= downsample_trivial_epoch_threshold`).
+`DemonstrationDataset.downsample_trivial_stats()` reports the trivial-row
+count/fraction and the expected exclusion count at a given `frac` (reuses
+the same cached `_trivial_mask_cache`); `pretrain_combined()` logs this once
+per BC epoch (`Downsample trivial rows (epoch N): X/Y (Z%) ... excluding
+~W this epoch`) when `downsample_trivial_enabled` is true. Deliberately **not**
+applied to `iterate_minibatches_with_returns()` — this iterator is now only
+used standalone (kept for any future direct callers); `pretrain_combined()`'s
+Phase 0 uses `iterate_minibatches(..., returns=...)` instead (see "Phase 0"
+note below). `iterate_minibatches_with_returns()` also gained a `valid_only`
+parameter (default `False`, preserving old behaviour) — value-target
+fitting benefits from seeing the full return distribution including
+"boring"/invalid-BC-label states, so it is deliberately NOT combined with
+trivial-row downsampling (which is specifically about reducing redundant
+*BC* signal).
+
+### Pre-training phases (`pretrain_combined()` / `pretrain_value()`)
+
+`PPOTrainer.pretrain_combined()` runs, in order:
+
+- **Phase 0** — decision-network-only warm-up on demo returns. ONE combined
+  backward pass per minibatch: `decision_bc_loss + phase0_value_coef *
+  value_loss`, over ALL of `decision_net`'s parameters (encoders + trunk +
+  value_head) — **no frozen layers**. `execution_net` is not touched here;
+  it gets its BC training in Phase 1. Uses `bc_loss_from_tensor(bc_labels,
+  d_heads, exec_heads=None, ...)` — the decision-heads-only path (skips
+  exec_move/sprint/kick/tackle_attempt BCE and the move_direction cosine
+  loss; see the `bc_loss_from_tensor()` docstring in `bc.py`). Note: Phase 0
+  fits `decision_net.value` ALONE as its value target/prediction (since
+  `execution_net` isn't run), whereas Phase 2/3 average
+  `decision_net.value` and `execution_net.value` — this is an intentional,
+  documented inconsistency (Phase 0 is scoped as a decision-network-only
+  high-level warm-up), not a bug. Config: `demo_value_pretrain_epochs`,
+  `demo_value_pretrain_lr`, `demo_value_pretrain_gamma`,
+  `phase0_value_coef` (default 1.0). Skipped if the dataset has no reward
+  data or `demo_value_pretrain_epochs=0`.
+- **Phase 1** — BC epochs over the full dataset (all params of both
+  networks), optionally with a joint value-MSE term if
+  `demo_value_bc_coef > 0`.
+- **Phase 2/3** — delegates to `self.pretrain_value(env, n_steps=rollout_steps,
+  n_epochs=value_epochs, lr=value_lr, batch_size=batch_size)` instead of
+  duplicating rollout-collection + GAE + value-epoch-loop logic inline (this
+  used to be duplicated — the duplication was the root cause of a past
+  `pretrain_value()`-vs-`pretrain_combined()` drift bug). `pretrain_value()`
+  freezes trunk/encoder layers during this call (via
+  `_get_value_pretrain_freeze_params()`) — a **different, deliberate**
+  freezing decision from Phase 0 above. Do not conflate the two: Phase 0
+  freezing was removed on purpose; `pretrain_value()`'s freezing was kept on
+  purpose. `pretrain_value()` also applies the same `augment_batch()`
+  augmentation as before (now inside the shared function, so standalone
+  callers get it too) and returns a diagnostics dict
+  (`episode_returns`, `outcomes_vs_rules`, `outcomes_vs_immobile`,
+  `outcomes_vs_neural`) logged as a `vs_rules(N): win%` line matching the
+  main PPO rollout log format.
+- BC degradation check, then optional BC repair epochs (unchanged).
 
 ### Player event callbacks
 
@@ -231,6 +320,21 @@ Key test files:
 - `test_to_orders.py` – legal/illegal action detection, correct order types
 - `test_reward.py` – per-component arithmetic, EMA latency, convergence
 - `test_networks.py` – forward pass shapes, no-NaN, get_possession constraint
+
+## Task-id (GlobalFeatures): scaffolded, not yet load-bearing
+
+`GlobalFeatures` has a `MAX_TASK_IDS`-wide (20) one-hot field
+(`task_id_0`..`task_id_19`) identifying the active curriculum phase/task.
+It is correctly populated by `encode_observation(..., phase=N)` (1-based;
+phase 1 → index 0) via `ScenarioEnv._get_obs()`/`_encode_obs_for_player()`,
+which pass `self.phase` through automatically. `phase=None` or an
+out-of-range value yields an all-zero one-hot (no error).
+
+There is currently **no mixed-multi-phase training loop** that would ever
+populate this with more than one non-zero pattern within a single training
+run — treat any gradient signal through it as currently uninformative
+(constant within a run). Wiring real multi-phase rollout mixing is a
+separate, larger workstream, not yet planned in detail.
 
 ## Curriculum phases (MVP)
 

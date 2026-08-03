@@ -8,8 +8,7 @@ speed to request* from the engine, not a physics mechanic.  The engine
 Only ``engine/match.py``'s MoveOrder handling calls into this module.
 No other order type (ChaseTackle, GetPossession, Save, …) does so.
 
-See ``current_plan.md`` Phase A and ``config/physics.json["repulsion"]``
-for full derivation and tuning notes.
+See ``ai/config/ai_config.json["repulsion"]`` for tuning notes.
 """
 from __future__ import annotations
 
@@ -17,7 +16,8 @@ import logging
 import math
 from dataclasses import dataclass
 
-from footballcoach.config import load_physics_config
+from footballcoach.ai.config import load_ai_config
+from footballcoach.config import require_section
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
 
@@ -26,7 +26,7 @@ log = logging.getLogger("footballcoach.steering")
 
 @dataclass(frozen=True)
 class RepulsionParams:
-    """Config for the repulsion steering mechanic — loaded from physics.json."""
+    """Config for the repulsion steering mechanic — loaded from ai_config.json."""
     radius_m: float
     strength_base: float
     ball_carrier_repulsion_mult: float
@@ -38,7 +38,7 @@ class RepulsionParams:
 
     @staticmethod
     def from_config() -> "RepulsionParams":
-        d = load_physics_config()["repulsion"]
+        d = require_section(load_ai_config(), "repulsion")
         return RepulsionParams(
             radius_m=d["radius_m"],
             strength_base=d["strength_base"],

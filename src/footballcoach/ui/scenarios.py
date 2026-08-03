@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from footballcoach.config import load_physics_config
+from footballcoach.config import load_gameplay_config
 from footballcoach.engine.ball_physics import BallPhysicsParams
 from footballcoach.engine.match import Match
 from footballcoach.engine.movement import MovementParams, effective_top_speed
@@ -89,13 +89,18 @@ class ScenarioBoolParam:
     default: bool
 
 
-def make_training_match(rng_reduction: float = 0.3, tier: str = "premier_league") -> Match:
+def make_training_match(rng_reduction: float = 0.3) -> Match:
     """One player + ball, full pitch, both goals live, no opponent."""
+    from footballcoach.entities.attributes import PlayerAttributes
     pitch = Pitch.standard()
-    attrs = generate_attributes(tier=tier)
+    attrs = PlayerAttributes(
+        top_speed=0.78, acceleration=0.78, stamina=0.78,
+        kick_precision=0.78, kick_power=0.78, dribbling=0.78,
+        ball_control=0.78, tackling=0.78,
+    )
     player = Player.create("trainee", Team.LEFT, attrs, position=Vector3(0, 0, 0))
     ball = Ball.at_rest(Vector3(3, 0, 0))
-    ui_cfg = load_physics_config().get("ui", {})
+    ui_cfg = load_gameplay_config().get("ui", {})
     return Match(
         pitch=pitch, players=[player], ball=ball,
         rng_reduction=rng_reduction, rng=random.Random(),
@@ -198,7 +203,7 @@ def build_tackle_scenario(
     ball = Ball.at_rest(attacker_pos)
     ball.possessed_by = attacker.player_id
 
-    ui_cfg = load_physics_config().get("ui", {})
+    ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[defender, attacker], ball=ball,
         rng_reduction=rng_reduction, rng=rng,
@@ -257,7 +262,7 @@ def build_sprint_scenario(
     waypoints = _make_sprint_waypoints(rng, pitch, start, n_legs=5,
                                        leg_min_m=leg_min_m, leg_max_m=leg_max_m)
     ball = Ball.at_rest(Vector3(0.0, pitch.half_width - 5.0, 0.0))
-    ui_cfg = load_physics_config().get("ui", {})
+    ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[player], ball=ball,
         rng_reduction=rng_reduction, rng=rng,
@@ -341,7 +346,7 @@ def build_close_range_save_scenario(
     ball = Ball.at_rest(shooter_pos)
     ball.possessed_by = shooter.player_id
 
-    ui_cfg = load_physics_config().get("ui", {})
+    ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[gk, shooter], ball=ball,
         rng_reduction=rng_reduction, rng=rng,
@@ -406,7 +411,7 @@ def build_pass_scenario(
     ball = Ball.at_rest(passer_pos)
     ball.possessed_by = passer.player_id
 
-    ui_cfg = load_physics_config().get("ui", {})
+    ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[passer, receiver], ball=ball,
         rng_reduction=rng_reduction, rng=rng,
@@ -467,7 +472,7 @@ def build_2v2_scenario(
     ball = Ball.at_rest(attacker_a.position)
     ball.possessed_by = attacker_a.player_id
 
-    ui_cfg = load_physics_config().get("ui", {})
+    ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[attacker_a, attacker_b, defender, gk],
         ball=ball, rng_reduction=rng_reduction, rng=rng,
@@ -572,7 +577,7 @@ def build_1v2_scenario(
         0, rng.uniform(-half_goal_w * 0.7, half_goal_w * 0.7), rng.uniform(0.2, 1.8)
     )
 
-    ui_cfg = load_physics_config().get("ui", {})
+    ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[attacker, defender, gk],
         ball=ball, rng_reduction=rng_reduction, rng=rng,
@@ -653,7 +658,7 @@ def build_repulsion_obstacle_scenario(
     ball = Ball.at_rest(start)
     ball.possessed_by = attacker.player_id
 
-    ui_cfg = load_physics_config().get("ui", {})
+    ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[attacker, obstacle], ball=ball,
         rng_reduction=rng_reduction, rng=rng,
@@ -1110,7 +1115,7 @@ def build_1v1_scenario(
     restitution = max(0.2, min(0.95, rng.gauss(base_params.bounce_restitution_vertical, restitution_sigma)))
     ball_params = replace(base_params, bounce_restitution_vertical=restitution)
 
-    ui_cfg = load_physics_config().get("ui", {})
+    ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch,
         players=[trainee, opponent],
@@ -1138,6 +1143,173 @@ def build_1v1_scenario(
         opponent.ai = None
         match._opponent_use_rules_ai = False
         match._opponent_is_immobile = False
+    return match
+
+
+# ---------------------------------------------------------------------------
+# Mark standoff stability scenario
+# ---------------------------------------------------------------------------
+
+def build_mark_standoff_scenario(
+    rng_reduction: float = 0.3,
+    *,
+    marker_skill: float = 0.8,
+) -> Match:
+    """MarkOrder standoff (3-player): carrier (Team.RIGHT) holds the ball at (-5, 8);
+    target (Team.RIGHT) is an off-ball runner at (20, 0); marker (Team.LEFT) marks
+    the target, standing 1.5 m between them and the carrier.
+    Watch whether the marker settles on the ideal standoff point or oscillates."""
+    pitch = Pitch.standard()
+    rng = random.Random()
+
+    carrier_pos = Vector3(-5, 8, 0)
+    target_pos = Vector3(20, 0, 0)
+    # Start marker away from the standoff so the approach is visible.
+    marker_start = Vector3(15, 3, 0)
+
+    carrier = Player.create(
+        "carrier", Team.RIGHT,
+        PlayerAttributes.average(0.6),
+        position=carrier_pos,
+    )
+    target = Player.create(
+        "target", Team.RIGHT,
+        PlayerAttributes.average(0.5),
+        position=target_pos,
+    )
+    marker = Player.create(
+        "marker", Team.LEFT,
+        PlayerAttributes.average(marker_skill),
+        position=marker_start,
+    )
+
+    ball = Ball.at_rest(carrier_pos)
+    ball.possessed_by = carrier.player_id
+
+    ui_cfg = load_gameplay_config().get("ui", {})
+    match = Match(
+        pitch=pitch, players=[carrier, target, marker], ball=ball,
+        rng_reduction=rng_reduction, rng=rng,
+        goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
+    )
+    carrier.stop()  # carrier stays put holding the ball
+    marker.mark_player(target_player_id=target.player_id)
+    return match
+
+
+# ---------------------------------------------------------------------------
+# Penalty corner accuracy scenario
+# ---------------------------------------------------------------------------
+
+def build_penalty_corner_accuracy_scenario(
+    rng_reduction: float = 0.3,
+    *,
+    kicker_precision: float = 0.5,
+) -> Match:
+    """Penalty kicker running at full pace, aiming at the bottom corner of the
+    right goal, no goalkeeper. Mirrors test_penalty_balance.py exactly:
+    compensate_for_run=False, power_fraction=0.8.
+    At precision=0.5 the target is 50-80% scored; at 0.8 it is 85-95%."""
+    pitch = Pitch.standard()
+    penalty_spot = pitch.penalty_spot(left=False)
+    rng = random.Random()
+
+    kicker_attrs = PlayerAttributes(
+        top_speed=0.7, acceleration=0.7, stamina=1.0,
+        kick_precision=kicker_precision, kick_power=0.7,
+        dribbling=0.5, ball_control=0.5, tackling=0.5,
+    )
+    kicker = Player.create("kicker", Team.LEFT, kicker_attrs, position=penalty_spot)
+
+    mvmt = MovementParams.from_config()
+    v_run = effective_top_speed(
+        mvmt, kicker.attributes.top_speed, kicker.stamina,
+        has_ball=True, ball_control_attr=kicker.attributes.ball_control,
+    )
+    kicker.velocity = Vector3(v_run, 0.0, 0.0)
+    kicker.heading_rad = 0.0  # facing +x toward right goal
+
+    ball = Ball.at_rest(penalty_spot)
+    ball.possessed_by = kicker.player_id
+
+    ui_cfg = load_gameplay_config().get("ui", {})
+    match = Match(
+        pitch=pitch, players=[kicker], ball=ball,
+        rng_reduction=rng_reduction, rng=rng,
+        goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
+    )
+    # Extreme corner: 0.15 m inside the post, 0.25 m off the ground.
+    corner_offset_y = pitch.goal_width_m / 2.0 - 0.15
+    aim_point = pitch.right_goal_centre + Vector3(0, corner_offset_y, 0.25)
+    kicker.current_order = KickOrder(
+        aim_point=aim_point, power_fraction=0.9,
+        spin=Vector3.zero(), compensate_for_run=False,
+    )
+    return match
+
+
+# ---------------------------------------------------------------------------
+# GK far-post speed scenario
+# ---------------------------------------------------------------------------
+
+def build_gk_far_post_scenario(
+    rng_reduction: float = 0.3,
+    *,
+    gk_attr: float = 0.5,
+    shot_distance_m: float = 25.0,
+) -> Match:
+    """GK starts pinned at the near post; shot aimed at the far corner.
+    Mirrors test_save_balance.py's far-post test: shooter at shot_distance_m
+    from the left goal, power=0.9, precision=0.95, compensate_for_run=False.
+    Vary gk_attr to see whether speed/accel makes a meaningful difference."""
+    pitch = Pitch.standard()
+    half_goal_w = pitch.goal_width_m / 2.0
+    rng = random.Random()
+
+    gk_attrs = PlayerAttributes(
+        top_speed=gk_attr, acceleration=gk_attr, stamina=0.8,
+        kick_precision=0.5, kick_power=0.5, dribbling=0.5,
+        ball_control=0.6, tackling=0.5,
+    )
+    gk = Player.create(
+        "keeper", Team.LEFT, gk_attrs,
+        position=pitch.left_goal_centre + Vector3(0, -half_goal_w + 0.3, 0),
+        is_goalkeeper=True,
+    )
+
+    shot_x = -(pitch.half_length - shot_distance_m)
+    shooter_attrs = PlayerAttributes(
+        top_speed=0.7, acceleration=0.7, stamina=0.8,
+        kick_precision=0.95, kick_power=0.9,
+        dribbling=0.5, ball_control=0.5, tackling=0.5,
+    )
+    shooter = Player.create("shooter", Team.RIGHT, shooter_attrs,
+                            position=Vector3(shot_x, 0, 0))
+
+    mvmt = MovementParams.from_config()
+    run_speed = effective_top_speed(
+        mvmt, shooter.attributes.top_speed, shooter.stamina,
+        has_ball=True, ball_control_attr=shooter.attributes.ball_control,
+    )
+    shooter.velocity = Vector3(-run_speed, 0.0, 0.0)
+    shooter.heading_rad = math.pi  # facing -x toward left goal
+
+    ball = Ball.at_rest(shooter.position)
+    ball.possessed_by = shooter.player_id
+
+    aim_point = pitch.left_goal_centre + Vector3(0, half_goal_w - 0.3, 1.8)
+
+    ui_cfg = load_gameplay_config().get("ui", {})
+    match = Match(
+        pitch=pitch, players=[gk, shooter], ball=ball,
+        rng_reduction=rng_reduction, rng=rng,
+        goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
+    )
+    gk.current_order = SaveOrder()
+    shooter.current_order = KickOrder(
+        aim_point=aim_point, power_fraction=0.95,
+        spin=Vector3.zero(), compensate_for_run=False,
+    )
     return match
 
 
@@ -1272,6 +1444,45 @@ SCENARIOS: list[ScenarioDefinition] = [
             ScenarioParam("attacker_skill", "Attacker skill", 0.3, 1.0, 0.05, 0.9),
         ],
     ),
+    ScenarioDefinition(
+        key="mark_standoff",
+        label="Mark standoff stability",
+        description=(
+            "Marker holds 1.5 m standoff between target and ball (target stationary, ball fixed). "
+            "Mirrors test_marker_standoff_stability. Watch for oscillation vs. stable hovering."
+        ),
+        build=build_mark_standoff_scenario,
+        params=[
+            ScenarioParam("marker_skill", "Marker skill", 0.0, 1.0, 0.05, 0.8),
+        ],
+    ),
+    ScenarioDefinition(
+        key="penalty_corner_accuracy",
+        label="Penalty: corner accuracy (no GK)",
+        description=(
+            "Kicker running at full pace aims at the bottom corner, no goalkeeper. "
+            "At precision=0.5 the balance target is 50-80% scored; at 0.8 it is 85-95%. "
+            "Mirrors test_penalty_balance.py exactly (compensate_for_run=False, power=0.8)."
+        ),
+        build=build_penalty_corner_accuracy_scenario,
+        params=[
+            ScenarioParam("kicker_precision", "Kicker precision", 0.0, 1.0, 0.05, 0.5),
+        ],
+    ),
+    ScenarioDefinition(
+        key="gk_far_post",
+        label="GK far-post speed test",
+        description=(
+            "GK starts pinned at near post; shot aimed at far corner. "
+            "Vary gk_attr to see whether speed/acceleration makes a meaningful difference. "
+            "Mirrors test_save_balance.py's far-post test (shooter 25 m out, power=0.9, precision=0.95)."
+        ),
+        build=build_gk_far_post_scenario,
+        params=[
+            ScenarioParam("gk_attr", "GK top_speed + acceleration attr", 0.0, 1.0, 0.05, 0.5),
+            ScenarioParam("shot_distance_m", "Shot distance from goal (m)", 5.0, 50.0, 1.0, 25.0),
+        ],
+    ),
 ]
 
 
@@ -1304,7 +1515,7 @@ class ScenarioLoop:
     rng_reduction: float = 0.3
     kwargs: dict = field(default_factory=dict)
     linger_s: float = field(
-        default_factory=lambda: load_physics_config().get("ui", {}).get("scenario_linger_s", 3.0)
+        default_factory=lambda: load_gameplay_config().get("ui", {}).get("scenario_linger_s", 3.0)
     )
 
     _trial_count: int = field(default=0, init=False, repr=False)

@@ -42,15 +42,15 @@ class Phase1RulesAI(PlayerAI):
                 # x: random within the full box depth (inner edge → goal line)
                 if player.team == Team.LEFT:
                     box_inner_x = pitch.half_length - pitch.box_length_m
-                    target_x = random.uniform(box_inner_x, pitch.half_length)
+                    target_x = match.rng.uniform(box_inner_x, pitch.half_length)
                 else:
                     box_inner_x = -(pitch.half_length - pitch.box_length_m)
-                    target_x = random.uniform(-pitch.half_length, box_inner_x)
+                    target_x = match.rng.uniform(-pitch.half_length, box_inner_x)
                 # y: random in the nearest half of the box to the player
                 if player.position.y >= 0.0:
-                    target_y = random.uniform(0.0, half_box_w)
+                    target_y = match.rng.uniform(0.0, half_box_w)
                 else:
-                    target_y = random.uniform(-half_box_w, 0.0)
+                    target_y = match.rng.uniform(-half_box_w, 0.0)
                 player.current_order = MoveOrder(
                     target_position=Vector3(target_x, target_y, 0.0),
                     sprint=True,
@@ -60,7 +60,7 @@ class Phase1RulesAI(PlayerAI):
             # Replace any stale MoveOrder left over from when we had possession.
             if not isinstance(player.current_order, GetPossessionOrder):
                 player.current_order = GetPossessionOrder(
-                    sprint=random.random() >= 0.25
+                    sprint=match.rng.random() >= 0.25
                 )
 
 
@@ -253,7 +253,6 @@ class NeuralPlayerAI(PlayerAI):
             # Re-apply last cached gating so desired_direction/speed_mode
             # are set every tick (not just on decision ticks).
             if self._last_gating is not None:
-                from footballcoach.ai.action.apply_nn_action import apply_action_to_player
                 apply_action_to_player(
                     gating=self._last_gating,
                     player=player,

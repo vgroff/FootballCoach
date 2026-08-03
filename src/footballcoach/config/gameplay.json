@@ -1,0 +1,13 @@
+{
+  "_comment": "Game-rule and UI timing constants — not engine physics.",
+
+  "offside": {
+    "enabled_by_default": true
+  },
+
+  "ui": {
+    "_comment": "UI-level timing constants (applies to UI matches/scenarios only). scenario_linger_s: how long (sim-seconds) a scenario trial keeps running after its outcome is determined before the next trial starts. goal_linger_s: how long (sim-seconds) the ball stays in place after a goal before the engine resets it to centre.",
+    "scenario_linger_s": 1.8,
+    "goal_linger_s": 1.8
+  }
+}

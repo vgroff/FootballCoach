@@ -1,5 +1,13 @@
 # src/footballcoach/ (top-level modules)
 
+> **Documentation must stay in sync with code.** Any significant change, and
+> any change that conflicts with existing documentation, must be followed by
+> additions or edits to the relevant documentation (this file, other
+> knowledge.md files, design docs, plans). When writing plans, design
+> documents, prompts, or other work-related files, always include this same
+> statement at the top of that file. Otherwise documentation goes stale and
+> confusion occurs.
+
 Two package-root modules sit above the `engine/`/`entities/`/`ui/`
 sub-packages: `orders.py` and `actions.py`. Both are part of the
 "instruction layer" between a caller (UI, tests, or a future RL policy) and

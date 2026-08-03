@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from footballcoach.config import load_physics_config
+from footballcoach.config import load_physics_config, require_section
 from footballcoach.entities.player import Player
 
 
@@ -42,9 +42,10 @@ class ControlTimeParams:
 
     @staticmethod
     def from_config() -> "ControlTimeParams":
-        d = load_physics_config()["control_time"]
-        player_cfg = load_physics_config()["player"]
-        gk = d["goalkeeper"]
+        cfg = load_physics_config()
+        d = require_section(cfg, "control_time")
+        player_cfg = require_section(cfg, "player")
+        gk = require_section(d, "goalkeeper", file_name="physics.json:control_time")
         return ControlTimeParams(
             t_base_s=d["t_base_s"],
             t_scale_s=d["t_scale_s"],
@@ -113,6 +114,27 @@ def compute_difficulty(
     )
 
 
+def _jump_zone_scale(
+    ball_height_m: float,
+    player_height_m: float,
+    max_reach_height_m: float,
+    scale_at_player_height: float,
+    scale_at_max_reach: float,
+) -> float:
+    """Interpolates the height-factor scale for balls above ``player_height_m``
+    (the "jump zone"): ``scale_at_player_height`` at/below head height, rising
+    linearly to ``scale_at_max_reach`` at ``max_reach_height_m`` and beyond.
+
+    Shared by both the goalkeeper and outfield branches of `control_time_s`,
+    which apply the same interpolation shape with different endpoints.
+    """
+    if ball_height_m <= player_height_m:
+        return scale_at_player_height
+    jump_range = max(max_reach_height_m - player_height_m, 1e-6)
+    jump_frac = min(1.0, (ball_height_m - player_height_m) / jump_range)
+    return scale_at_player_height + (scale_at_max_reach - scale_at_player_height) * jump_frac
+
+
 def control_time_s(
     params: ControlTimeParams,
     ball_height_m: float,
@@ -138,14 +160,10 @@ def control_time_s(
         # ball rises from player_height_m to gk_max_reach_height_m.
         # Beyond gk_max_reach_height_m the scale stays at max (ball is
         # unreachable — height_factor_max cap still applies).
-        if ball_height_m > params.player_height_m:
-            jump_range = max(params.gk_max_reach_height_m - params.player_height_m, 1e-6)
-            jump_frac = min(1.0, (ball_height_m - params.player_height_m) / jump_range)
-            effective_scale = params.gk_height_factor_scale + (
-                params.gk_jump_scale_at_max_reach - params.gk_height_factor_scale
-            ) * jump_frac
-        else:
-            effective_scale = params.gk_height_factor_scale
+        effective_scale = _jump_zone_scale(
+            ball_height_m, params.player_height_m, params.gk_max_reach_height_m,
+            params.gk_height_factor_scale, params.gk_jump_scale_at_max_reach,
+        )
         scaled_height_factor = 1.0 + (height_factor - 1.0) * effective_scale
         difficulty = (
             (scaled_height_factor - 1.0)
@@ -161,9 +179,10 @@ def control_time_s(
         # toward outfield_jump_scale_at_max_reach at outfield_max_reach_height_m.
         if ball_height_m > params.player_height_m:
             height_factor = height_difficulty_factor(params, ball_height_m)
-            jump_range = max(params.outfield_max_reach_height_m - params.player_height_m, 1e-6)
-            jump_frac = min(1.0, (ball_height_m - params.player_height_m) / jump_range)
-            effective_scale = 1.0 + (params.outfield_jump_scale_at_max_reach - 1.0) * jump_frac
+            effective_scale = _jump_zone_scale(
+                ball_height_m, params.player_height_m, params.outfield_max_reach_height_m,
+                1.0, params.outfield_jump_scale_at_max_reach,
+            )
             scaled_height_term = (height_factor - 1.0) * effective_scale
             difficulty = (
                 scaled_height_term

@@ -6,18 +6,26 @@ cached loader.
 ## Files
 
 - `physics.json` - world/pitch/player/ball geometry, movement, kicking,
-  tackling, ball physics, control-time, and repulsion constants. Organized
-  into sections matching the modules that consume them (e.g.
-  `physics.json["movement"]` → `engine/movement.py`,
-  `physics.json["repulsion"]` → `steering.py`).
+  tackling, ball physics, control-time, and collision constants. Organised
+  into sections matching the engine modules that consume them (e.g.
+  `physics.json["movement"]` → `engine/movement.py`). Pure engine physics
+  only — no AI, UI, or game-rule constants live here.
 - `attributes.json` - player attribute generation: the base Gaussian
   distribution, inter-attribute correlations, and per-league "tier" presets
   (mean/sigma overrides) used by `generation/attributes.py`.
-- `loader.py` - loads and `functools.lru_cache`s both JSON files. Use
-  `load_physics_config()` / `load_attributes_config()` rather than reading
-  the files directly, so config is only parsed once per process. Call
-  `clear_config_cache()` in tests if you need to reload after editing a file
-  on disk mid-test-run (not needed in normal test runs).
+- `gameplay.json` - game rules and UI timing: `offside` toggle,
+  `ui.scenario_linger_s`, `ui.goal_linger_s`. Read via `load_gameplay_config()`.
+- `graphics.json` - all visual display constants: player/ball rendering,
+  action icons, speed lines, stamina flash, heading indicator, and `kick_ui`
+  (trajectory preview and spin input params). Read via `load_graphics_config()`.
+- `loader.py` - loads and `functools.lru_cache`s all four JSON files. Use
+  `load_physics_config()` / `load_attributes_config()` / `load_gameplay_config()` /
+  `load_graphics_config()` rather than reading files directly, so config is
+  only parsed once per process. Call `clear_config_cache()` in tests if you
+  need to reload after editing a file on disk mid-test-run.
+- AI steering and marking constants (`repulsion`, `marking`) live in
+  `ai/config/ai_config.json`, loaded via `load_ai_config()` from
+  `footballcoach.ai.config`.
 
 ## Why JSON instead of Python constants?
 

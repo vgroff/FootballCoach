@@ -103,7 +103,7 @@ Override the save directory with `--checkpoint-dir path/`.
 
 | File | Why it matters |
 |------|----------------|
-| `src/footballcoach/ai/obs/schema.py` | Feature vector dataclasses; defines `PLAYER_FEATURE_DIM=27`, `BALL_FEATURE_DIM=12`, `GLOBAL_FEATURE_DIM=11` |
+| `src/footballcoach/ai/obs/schema.py` | Feature vector dataclasses; defines `PLAYER_FEATURE_DIM=27`, `BALL_FEATURE_DIM=12`, `GLOBAL_FEATURE_DIM=31` (11 match-context fields + 20 `task_id_N` one-hot fields, see "Task-id" note in `ai/knowledge.md`) |
 | `src/footballcoach/ai/obs/encoder.py` | `encode_observation(match, player_id, time_remaining_s, ...)` → `ObservationBatch` |
 | `src/footballcoach/ai/models/decision_network.py` | `DecisionNetwork.from_config()` |
 | `src/footballcoach/ai/models/execution_network.py` | `ExecutionNetwork.from_config()` |
@@ -453,12 +453,36 @@ rules-based AI does not have.  Instead, BC is a *separate, additive* loss.
 
 **Mode 1 — Combined offline pre-training (recommended):**
 When `--bc-dataset` is provided, `PPOTrainer.pretrain_combined()` runs:
-  1. N BC epochs over the dataset (all params, stable minibatch SGD)
-  2. Collect one rollout with the now-BC-warmed policy (on-policy value targets)
-  3. M value-head epochs over that rollout (value heads only, trunk frozen)
+  0. **Phase 0** — decision-network-only warm-up on demo returns: combined
+     `decision_bc_loss + phase0_value_coef * value_loss` in ONE backward pass,
+     over ALL `decision_net` parameters (encoders + trunk + value_head —
+     **no frozen layers**, unlike Phase 3 below). `execution_net` is NOT
+     trained here. Uses the decision-heads-only `bc_loss_from_tensor(...,
+     exec_heads=None)` path (skips exec_move/sprint/kick/tackle_attempt BCE
+     and the move_direction cosine loss). Skipped if the dataset has no
+     reward data or `demo_value_pretrain_epochs=0`. Config:
+     `demo_value_pretrain_epochs`, `demo_value_pretrain_lr`,
+     `demo_value_pretrain_gamma`, `phase0_value_coef` (default 1.0).
+  1. **Phase 1** — N BC epochs over the dataset (all params, stable minibatch
+     SGD), optionally with a joint value loss term if `demo_value_bc_coef > 0`.
+  2. **Phase 2/3** — delegates to `PPOTrainer.pretrain_value()` (collect one
+     on-policy rollout with the BC-warmed policy, apply augmentation, fit
+     value heads for M epochs — value heads only, trunk **frozen** here, a
+     different freezing decision than Phase 0). `pretrain_value()` is also
+     usable standalone (used by Mode 2's fallback path) and now returns a
+     dict of rollout diagnostics (`episode_returns`,
+     `outcomes_vs_rules/immobile/neural`) which are logged as a
+     `vs_rules(N): win%` style line, matching the main PPO rollout log format.
+  3. BC degradation check (bc_loss before vs after value warm-up).
+  4. Optional BC repair epochs (`bc_repair_epochs`, default 0/disabled).
 
 This is better than online pre-training because gradients are low-variance
 (minibatch over diverse dataset) and value targets are on-policy.
+
+**Do not conflate Phase 0's freezing (removed) with Phase 2/3's freezing
+(retained via `pretrain_value()`'s `_get_value_pretrain_freeze_params()`)** —
+these are two different call sites with two deliberately different freezing
+decisions.
 
 **Mode 2 — Online pre-training (fallback, no dataset):**
 `BCPretrainer._pretrain_online()` steps the env, accumulates

@@ -42,8 +42,9 @@ def test_ball_feature_dim_is_12():
     assert BALL_FEATURE_DIM == 12
 
 
-def test_global_feature_dim_is_11():
-    assert GLOBAL_FEATURE_DIM == 11
+def test_global_feature_dim_is_31():
+    """11 original fields + MAX_TASK_IDS (20) task_id_N one-hot fields."""
+    assert GLOBAL_FEATURE_DIM == 31
 
 
 def test_max_other_players_is_21():
@@ -83,6 +84,20 @@ def test_global_features_to_array_shape():
 def test_global_features_to_array_dtype():
     arr = GlobalFeatures().to_array()
     assert arr.dtype == np.float32
+
+
+def test_global_features_task_id_default_all_zero():
+    arr = GlobalFeatures().to_array()
+    # Last MAX_TASK_IDS entries are the task_id one-hot block.
+    assert np.all(arr[-20:] == 0.0)
+
+
+def test_global_features_task_id_one_hot():
+    feat = GlobalFeatures(task_id_2=1.0)
+    arr = feat.to_array()
+    task_block = arr[-20:]
+    assert task_block[2] == 1.0
+    assert task_block.sum() == 1.0
 
 
 def test_player_features_defaults_no_nan():
@@ -134,10 +149,11 @@ def test_ball_features_is_possessed_second_to_last():
     assert arr[-1] == pytest.approx(0.0)
 
 
-def test_global_features_attack_defence_is_last():
+def test_global_features_attack_defence_before_task_id_block():
+    """attack_defence_smoothed is the last field before the task_id one-hot block."""
     feat = GlobalFeatures(attack_defence_smoothed=0.7)
     arr = feat.to_array()
-    assert arr[-1] == pytest.approx(0.7)
+    assert arr[-21] == pytest.approx(0.7)
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +169,10 @@ def test_observation_batch_to_torch_dict_keys():
         global_feat=np.zeros(GLOBAL_FEATURE_DIM, dtype=np.float32),
     )
     d = obs.to_torch_dict()
-    assert set(d.keys()) == {"self_feat", "other_feat", "exists_mask", "ball_feat", "global_feat"}
+    assert set(d.keys()) == {
+        "self_feat", "other_feat", "exists_mask", "ball_feat", "global_feat",
+        "self_ai_type", "other_ai_type",
+    }
 
 
 def test_observation_batch_to_torch_dict_shapes():

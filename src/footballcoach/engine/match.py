@@ -15,7 +15,8 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from footballcoach.ui.gamelog import LogLevel
 
-from footballcoach.config import load_physics_config
+from footballcoach.ai.config import load_ai_config
+from footballcoach.config import load_physics_config, require_section
 from footballcoach.engine.ball_physics import BallPhysicsParams, step_ball, resolve_goal_boundary
 from footballcoach.engine.collision import (
     CollisionParams,
@@ -24,6 +25,7 @@ from footballcoach.engine.collision import (
     resolve_ball_block_by_inactive_players,
 )
 from footballcoach.engine.goalkeeping import GoalkeepingParams, early_intercept_target, save_target_position
+from footballcoach.engine.interception import intercept_target
 from footballcoach.engine.kicking import KickingParams, PassingParams, kick_ball, pass_ball, pass_speed_mps, compensate_power_for_run_mult, running_power_multiplier
 from footballcoach.engine.movement import (
     MovementParams,
@@ -71,56 +73,17 @@ _BRAKE_TO_TURN_MIN_SPEED_MPS: float = 2.0    # don't bother below this; turn rat
 _CLOSE_PROXIMITY_BRAKE_M: float = 5.0
 _CLOSE_PROXIMITY_COS_THRESHOLD: float = 0.01
 
-# ShootOrder blocker detection: perpendicular-distance threshold from the shot
-# line within which an opposition player is considered to be blocking the shot.
-_SHOT_BLOCKER_THRESHOLD_M: float = 1.0
-# How far the shooter moves toward the goal when pausing due to a blocker.
-_SHOT_PAUSE_ADVANCE_M: float = 2.0
-
-
-def _has_blocker_on_shot_line(
-    shooter: "Player",
-    aim_point: "Vector3",
-    opposition: "list[Player]",
-    threshold_m: float = _SHOT_BLOCKER_THRESHOLD_M,
-) -> bool:
-    """Return ``True`` if any active opposition player lies within *threshold_m*
-    of the line segment from *shooter.position* to *aim_point* (XY plane only)
-    and is between the shooter and the aim point (not behind either end).
-
-    Inactive (tackled) players are excluded — they cannot intercept a shot.
-    """
-    sx, sy = shooter.position.x, shooter.position.y
-    ax, ay = aim_point.x, aim_point.y
-    dx, dy = ax - sx, ay - sy
-    line_len_sq = dx * dx + dy * dy
-    if line_len_sq < 1e-12:
-        return False
-    for opp in opposition:
-        if opp.state == PlayerState.INACTIVE_TACKLED:
-            continue
-        ox, oy = opp.position.x, opp.position.y
-        # Scalar projection onto the shot line (0 = shooter, 1 = aim point).
-        t = ((ox - sx) * dx + (oy - sy) * dy) / line_len_sq
-        if t <= 0.0 or t >= 1.0:
-            continue  # not between shooter and aim point
-        proj_x = sx + t * dx
-        proj_y = sy + t * dy
-        if math.hypot(ox - proj_x, oy - proj_y) < threshold_m:
-            return True
-    return False
-
 
 @dataclass(frozen=True)
 class MarkingParams:
     """Config for the ``MarkOrder`` AI behaviour — loaded from
-    ``physics.json["marking"]``."""
+    ``ai_config.json["marking"]``."""
     mark_intercept_radius_m: float = 4.0
     mark_standoff_m: float = 1.5
 
     @staticmethod
     def from_config() -> "MarkingParams":
-        d = load_physics_config().get("marking", {})
+        d = require_section(load_ai_config(), "marking")
         return MarkingParams(
             mark_intercept_radius_m=d.get("mark_intercept_radius_m", 4.0),
             mark_standoff_m=d.get("mark_standoff_m", 1.5),
@@ -480,27 +443,8 @@ class Match:
         """Returns the world position this player should sprint toward in order
         to intercept the target (ball or carrier) in the shortest possible time.
 
-        Solves the quadratic: find t >= 0 such that the player (sprinting at
-        their effective top speed v_p) can reach the point target_pos + v_b*t.
-
-            |d + v_b*t|^2 = (v_p * t)^2   where d = target_pos - player_pos
-
-        Expanding:
-            (|v_b|^2 - v_p^2) * t^2 + 2*(d . v_b)*t + |d|^2 = 0
-
-        If the discriminant is negative the player cannot catch the target
-        at their current top speed (target escaping); fall back to the
-        current target position (run toward where it is now).
-
-        If ball speed is near-zero, the quadratic degenerates cleanly to
-        t = |d| / v_p (simple sprint time), which is exactly right.
-
-        Only xy components are used — height is irrelevant for interception runs.
+        See `engine.interception.intercept_target` for the underlying math.
         """
-        import math as _math
-        d = (target_pos - player.position).xy()
-        vb = target_vel.xy()
-
         v_p = effective_top_speed(
             self.movement_params,
             player.attributes.top_speed,
@@ -508,43 +452,7 @@ class Match:
             has_ball=False,
             is_goalkeeper=player.is_goalkeeper,
         )
-
-        vb_sq = vb.dot(vb)
-        vp_sq = v_p * v_p
-        d_dot_vb = d.dot(vb)
-        d_sq = d.dot(d)
-
-        a = vb_sq - vp_sq
-        b = 2.0 * d_dot_vb
-        c = d_sq
-
-        if abs(a) < 1e-6:
-            # Ball and player at same speed: linear solution t = -c/b
-            if abs(b) > 1e-6:
-                t = -c / b
-            else:
-                t = 0.0
-        else:
-            discriminant = b * b - 4.0 * a * c
-            if discriminant < 0.0:
-                # Player cannot catch the target — run to current position.
-                return target_pos.with_z(target_pos.z)
-            sqrt_disc = _math.sqrt(discriminant)
-            t1 = (-b - sqrt_disc) / (2.0 * a)
-            t2 = (-b + sqrt_disc) / (2.0 * a)
-            # Pick smallest non-negative root.
-            t = None
-            for candidate in (t1, t2):
-                if candidate >= 0.0:
-                    if t is None or candidate < t:
-                        t = candidate
-            if t is None:
-                # Both roots negative — target already past us; go to current pos.
-                return target_pos.with_z(target_pos.z)
-
-        t = max(0.0, t)
-        predicted_xy = target_pos + vb * t
-        return predicted_xy.with_z(target_pos.z)
+        return intercept_target(player.position, v_p, target_pos, target_vel)
 
     def _check_head_on_tackles(self) -> None:
         """Automatically triggers a tackle when two players from opposite teams

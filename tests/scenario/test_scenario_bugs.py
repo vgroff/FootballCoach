@@ -85,8 +85,8 @@ def test_move_order_completion_with_no_order_does_not_immediately_end():
         player = make_player("runner", Team.LEFT, attr_value=0.8,
                              position=Vector3(0, 0, 0))
         ball = Ball.at_rest(Vector3(0, 20, 0))
-        from footballcoach.config import load_physics_config
-        ui_cfg = load_physics_config().get("ui", {})
+        from footballcoach.config import load_gameplay_config
+        ui_cfg = load_gameplay_config().get("ui", {})
         m = Match(pitch=pitch, players=[player], ball=ball,
                   rng_reduction=rng_reduction, rng=rng,
                   goal_linger_s=ui_cfg.get("goal_linger_s", 3.0))

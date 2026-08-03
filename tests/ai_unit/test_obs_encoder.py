@@ -447,7 +447,59 @@ class TestGlobalFeatures:
         obs = encode_observation(solo_match, "p1", time_remaining_s=60.0,
                                  attack_defence_smoothed=0.8,
                                  rng=random.Random(0))
-        assert obs.global_feat[-1] == pytest.approx(0.8, abs=1e-6)
+        assert obs.global_feat[-21] == pytest.approx(0.8, abs=1e-6)
+
+
+# ---------------------------------------------------------------------------
+# pos_x / pos_y negation under geometric flip augmentation
+# ---------------------------------------------------------------------------
+#
+# Confirmed by direct read of obs/augment.py: PLAYER_FLIP_X_IDX includes
+# pos_x and PLAYER_FLIP_Y_IDX includes pos_y, so this is a regression guard
+# for behaviour that is already correct, not a bug hunt.
+
+class TestFlipAugmentationPosXY:
+    def _build_obs_dict(self, duel_match):
+        import torch
+        obs = encode_observation(duel_match, "p1", time_remaining_s=60.0,
+                                 rng=random.Random(0))
+        return {
+            "self_feat":   torch.from_numpy(obs.self_feat).unsqueeze(0),
+            "other_feat":  torch.from_numpy(obs.other_feat).unsqueeze(0),
+            "exists_mask": torch.from_numpy(obs.exists_mask).unsqueeze(0),
+            "ball_feat":   torch.from_numpy(obs.ball_feat).unsqueeze(0),
+            "global_feat": torch.from_numpy(obs.global_feat).unsqueeze(0),
+        }, obs
+
+    def test_pos_x_negated_under_flip_x_pos_y_unchanged(self, duel_match):
+        from footballcoach.ai.obs.augment import augment_obs_bc, _FLIP_VARIANTS
+        from footballcoach.ai.ppo.bc import BC_LABEL_DIM
+        import torch
+
+        obs_dict, _ = self._build_obs_dict(duel_match)
+        bc_labels = torch.zeros((1, BC_LABEL_DIM))
+
+        aug_obs, _aug_labels = augment_obs_bc(
+            obs_dict, bc_labels, n_slot_shuffles=1, rng=random.Random(0)
+        )
+
+        pos_x_idx = _pf_idx("pos_x")
+        pos_y_idx = _pf_idx("pos_y")
+
+        original_self = obs_dict["self_feat"][0]
+        # _FLIP_VARIANTS = [identity, flip_x, flip_y, flip_xy], one slot-shuffle
+        # each -> rows 0,1,2,3 of the augmented batch.
+        flip_x_self = aug_obs["self_feat"][1]
+        flip_y_self = aug_obs["self_feat"][2]
+
+        assert _FLIP_VARIANTS[1] == (True, False)
+        assert _FLIP_VARIANTS[2] == (False, True)
+
+        assert flip_x_self[pos_x_idx] == pytest.approx(-original_self[pos_x_idx].item(), abs=1e-6)
+        assert flip_x_self[pos_y_idx] == pytest.approx(original_self[pos_y_idx].item(), abs=1e-6)
+
+        assert flip_y_self[pos_y_idx] == pytest.approx(-original_self[pos_y_idx].item(), abs=1e-6)
+        assert flip_y_self[pos_x_idx] == pytest.approx(original_self[pos_x_idx].item(), abs=1e-6)
 
     def test_pitch_dimensions_in_global(self, solo_match):
         pitch = solo_match.pitch
@@ -477,3 +529,33 @@ class TestNoNaN:
         for arr in [obs.self_feat, obs.other_feat, obs.ball_feat, obs.global_feat]:
             assert not np.any(np.isnan(arr))
             assert not np.any(np.isinf(arr))
+
+
+# ---------------------------------------------------------------------------
+# Task-id one-hot (W3 scaffolding)
+# ---------------------------------------------------------------------------
+
+class TestTaskId:
+    def test_phase_none_is_all_zero(self, solo_match):
+        obs = encode_observation(solo_match, "p1", time_remaining_s=60.0,
+                                 rng=random.Random(0))
+        assert np.all(obs.global_feat[-20:] == 0.0)
+
+    def test_phase_1_sets_index_0(self, solo_match):
+        obs = encode_observation(solo_match, "p1", time_remaining_s=60.0,
+                                 rng=random.Random(0), phase=1)
+        task_block = obs.global_feat[-20:]
+        assert task_block[0] == 1.0
+        assert task_block.sum() == 1.0
+
+    def test_phase_2_sets_index_1(self, solo_match):
+        obs = encode_observation(solo_match, "p1", time_remaining_s=60.0,
+                                 rng=random.Random(0), phase=2)
+        task_block = obs.global_feat[-20:]
+        assert task_block[1] == 1.0
+        assert task_block.sum() == 1.0
+
+    def test_out_of_range_phase_is_all_zero(self, solo_match):
+        obs = encode_observation(solo_match, "p1", time_remaining_s=60.0,
+                                 rng=random.Random(0), phase=999)
+        assert np.all(obs.global_feat[-20:] == 0.0)

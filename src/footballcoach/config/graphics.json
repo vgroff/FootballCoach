@@ -1,5 +1,10 @@
 {
   "_comment": "Visual display constants. Edit freely to tune the look without touching code. See ui/knowledge.md for details on how each value is used.",
+  "camera": {
+    "_comment": "pixels_per_metre: zoom level. 9=1025x692 window, 12=1340x896, 14=1570x1032. margin_px: empty border around pitch.",
+    "pixels_per_metre": 12.0,
+    "margin_px": 40
+  },
   "player": {
     "_comment": "min_radius_px: smallest on-screen circle radius drawn for a player. Physical world positions are unaffected — only the rendered dot size is boosted for visibility. possession_outline_thickness: pixel width of the white ring drawn around the ball carrier (1=thin, 3=bold). inactive_alpha: opacity (0-255) of a player drawn translucent after being tackled (0=invisible, 255=fully opaque).",
     "min_radius_px": 7,
@@ -8,7 +13,7 @@
   },
   "ball": {
     "_comment": "min_radius_px: smallest on-screen circle radius drawn for the ball. outline: whether to draw a thin dark outline around the ball circle.",
-    "min_radius_px": 4,
+    "min_radius_px": 5,
     "outline": false
   },
   "action_icons": {
@@ -30,7 +35,31 @@
   },
   "heading_indicator": {
     "_comment": "Short line showing which direction a player is facing. length_px: how far the tip extends beyond the player circle edge. alpha: 0=invisible, 255=fully opaque. Set alpha to 0 to hide entirely.",
-    "length_px": 6,
+    "length_px": 4,
     "alpha": 60
+  },
+  "kick_ui": {
+    "_comment": "Kick trajectory preview and spin input constants used by the UI kick system.",
+    "trajectory_duration_s": 3.0,
+    "max_loft_angle_deg": 70.0,
+    "max_spin_magnitude_rads": 15.0
+  },
+  "pause_notification": {
+    "_comment": "font_size_px: point size of the auto-pause banner rendered when a human order completes. Default title_font is 32; 26 = ~20% smaller.",
+    "font_size_px": 26
+  },
+  "ball_spin_dots": {
+    "_comment": "Dots on the 3D ball surface (Fibonacci sphere), always shown, rotating with ball spin. Only front-hemisphere dots (facing camera) are drawn — back hemisphere is hidden. count: number of dots. projection_scale_fraction: how wide the projected sphere appears relative to ball drawn radius (1.0 = dots reach ball edge). dot_radius_fraction: dot radius / ball drawn radius. color: RGB.",
+    "count": 9,
+    "projection_scale_fraction": 0.93,
+    "dot_radius_fraction": 0.25,
+    "color": [30, 30, 30]
+  },
+  "ball_trail": {
+    "_comment": "Fading ghost trail behind moving ball. length: number of ghost positions stored. min_speed_mps: no trail below this ground speed. max_alpha: alpha of the newest ghost position. radius_fraction: ghost circle radius relative to ball drawn radius.",
+    "length": 8,
+    "min_speed_mps": 3.0,
+    "max_alpha": 150,
+    "radius_fraction": 0.7
   }
 }
