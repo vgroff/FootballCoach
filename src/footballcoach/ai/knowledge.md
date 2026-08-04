@@ -11,6 +11,43 @@ architecture specification; this file is the operational knowledge note.
 uv sync --group ai   # pulls torch; base game install stays lightweight
 ```
 
+## !!!! CRITICAL: Orders vs execution-network labels boundary !!!!
+
+**Orders are INPUT to the execution network and OUTPUT of the decision
+network. They are NEVER a source for deriving execution-network labels.**
+
+- **Decision network** (`shoot`, `pass_`, `move`, `tackle`, `get_possession_extra`,
+  `mark`, `hold_position` Bernoulli heads, plus `move_region_center`): these
+  ARE supervised by "what order would the rules AI issue right now" — that
+  is legitimately an order-level/intent-level decision, and reading order
+  *type* and order *fields* (e.g. `MoveOrder.target_position`) for THIS
+  purpose is correct.
+- **Execution network** (`move_direction`, `sprint`, `exec_move`, `kick_*`,
+  `tackle_attempt`): these must ONLY be derived from what actually lands on
+  the `Player` object after the engine/order machinery runs — i.e.
+  `player.desired_direction`, `player.desired_speed_mode`,
+  `player.kicked_this_tick`/`last_kick_direction`/`last_kick_power_fraction`/
+  `last_kick_spin`. **Never** by re-deriving geometry from an order's fields
+  (e.g. `normalize(order.target_position - player.position)`) or reading
+  `order.sprint` directly — that bypasses the real physics/turning/braking/
+  repulsion/push-kick logic in `_compute_movement_intent()`/`step_player_towards()`
+  and produces execution labels that don't match what the rules AI actually
+  physically does that tick.
+- The current order's *type* IS legitimate INPUT CONTEXT to the execution
+  network (e.g. `ai_type`/context features) — reading order type for context
+  is fine; reading order *fields* to derive execution *labels* is not.
+
+**This bug has recurred multiple times** — always audit any BC-label-
+generation code that reads an Order's fields and ask: "is this deriving a
+decision-level label (OK) or an execution-level label (NOT OK, must come
+from `player.desired_direction`/`desired_speed_mode`/`kick_direct` output
+instead)?" See `agent_plans/bc_execution_label_boundary_and_followups.md`
+for the concrete fix history and rationale. Implementation: `phase1_labels()`
+in `ai/ppo/bc.py` snapshots player/ball state, runs the decided order's
+`execute()` once, reads back `desired_direction`/`desired_speed_mode`, then
+restores everything — this makes the exploratory call invisible to the real
+simulation.
+
 ## Package layout
 
 ```
@@ -55,7 +92,7 @@ ai/
     record_demonstrations.py  # CLI: record rules-based episodes as .npz BC datasets
 ```
 
-## BC label vector (BC_LABEL_DIM = 17)
+## BC label vector (BC_LABEL_DIM = 24)
 
 `bc.py` stores 17 floats per step (see the module docstring in `bc.py` for
 the authoritative up-to-date layout table — do not let this count drift out
@@ -68,17 +105,44 @@ of sync, it has already changed twice: 15→16 (added `exec_move`), 16→17
 | 7–8 | move_dir_x/y | direction toward target |
 | 9 | sprint | rules AI order |
 | 10–11 | move_region_x/y (metres) | MoveOrder target position |
-| 12 | **kick_this_tick** | `player.on_kick` callback (fired by engine) |
-| 13 | **tackle_attempt** | `player.on_tackle` callback (fired by engine) |
+| 12 | **kick_this_tick** | `Player.kicked_this_tick` flag (set unconditionally by `kick_direct()`) |
+| 13 | **tackle_attempt** | `ChaseTackleOrder` / `GetPossessionOrder` contact-tackle (order-type check, see `phase1_labels()`) |
 | 14 | valid | 1.0 = use this label |
 | 15 | exec_move | 1.0 = player is moving, 0.0 = standstill |
 | 16 | ai_type | 0.0=rules, 1.0=immobile, 2.0=neural (reserved, unused) |
+| 17 | opponent_ai_type | same coding as [16], for the OTHER player in the match |
+| 18-19 | kick_direction | unit vector (dx, dy), read from `Player.last_kick_direction` |
+| 20 | kick_power | power_fraction actually used, [0,1], from `Player.last_kick_power_fraction` |
+| 21-23 | kick_spin | raw spin vector, from `Player.last_kick_spin` |
 
-**Critical:** indices 12–13 come from **engine callbacks** (`Player.on_kick`,
-`Player.on_kick`), not from inspecting the current order type.  They reflect
-what the engine physically executed this tick.  Indices 0–11 come from asking
-the rules AI what it *decides* next — these are input to the decision network
-and movement-related execution heads.
+`kick_direction`/`kick_power`/`kick_spin` (indices 18-23) are captured at the
+same `kick_direct()` chokepoint via `Player.last_kick_direction`/
+`last_kick_power_fraction`/`last_kick_spin` (set unconditionally whenever a
+kick actually executes, reset alongside `kicked_this_tick` in
+`Match._process_orders()`), so BC supervision for the kick execution heads
+works automatically for any AI that kicks — no per-AI wiring needed. See
+`agent_plans/bc_kick_supervision_plan.md`.
+
+**Critical:** index 12 (`kick_this_tick`) is read directly from
+`player.kicked_this_tick` — an unconditional per-tick flag set inside
+`Player.kick_direct()` every time kick physics actually executes, reset to
+`False` for every player at the start of `Match._process_orders()`. This
+flag is set **regardless of which Order (if any) triggered the kick** —
+previously `phase1_labels()` used `isinstance(current_exec, (ShootOrder,
+KickOrder, PassOrder))`, which silently missed kicks fired by `MoveOrder`'s
+push-kick behaviour (`rules_ai.py`'s box-run — the ball carrier kicks ahead
+and sprints to it while `current_order` stays a `MoveOrder`, never becoming
+a `KickOrder`). That bug meant offline demonstration datasets recorded from
+box-run episodes had **zero `kick_this_tick=1` rows** despite kicks being
+clearly visible in the UI. Fixed by making `kick_direct()` the single
+source of truth for "did this player kick THIS tick", independent of order
+bookkeeping — see `Player.kicked_this_tick` docstring in `entities/player.py`.
+Index 13 (`tackle_attempt`) still comes from inspecting the current order
+type (`ChaseTackleOrder`, or `GetPossessionOrder` while touching the
+carrier) — this one was not affected by the bug since tackles are always
+issued via an explicit order. Indices 0–11 come from asking the rules AI
+what it *decides* next — these are input to the decision network and
+movement-related execution heads.
 
 ### BC class balancing (pos_weight + trivial-row downsampling)
 
@@ -170,11 +234,107 @@ trivial-row downsampling (which is specifically about reducing redundant
   main PPO rollout log format.
 - BC degradation check, then optional BC repair epochs (unchanged).
 
+Two separate config keys size the on-policy rollout collected before PPO
+starts — they are **not** the same knob and are never meant to share a
+value, even though they play a similar role:
+- `bc.combined_pretrain_rollout_steps` — sizes the rollout used by
+  `pretrain_combined()`'s Phase 2/3 value warm-up (the path used when
+  `--bc-dataset` is supplied — i.e. normal offline-BC training).
+- `bc.value_pretrain_steps` — sizes the rollout used by the standalone
+  `pretrain_value()` **fallback** path (only used when no `--bc-dataset` is
+  given, i.e. online-BC training). Also independent of `ppo.rollout_steps`
+  (the main PPO rollout buffer size once training is underway).
+
+### Decoupled policy/value learning rates and PPO-time value training
+
+The shared Adam optimizer historically used ONE learning rate for both the
+policy trunk/heads and `execution_net.value_head`/`value_ai_type_channel`. Two
+problems compounded because of this:
+1. `ppo.learning_rate` is deliberately tiny (single-digit `1e-6`s) to protect
+   the BC-primed policy from large destructive steps — but the value head
+   needs a much larger LR to track the returns distribution.
+2. PPO's per-minibatch KL early-stop (`target_kl`, see below) frequently
+   cuts a rollout's gradient steps down to 1–5 minibatches. Since the shared
+   optimizer only steps while the policy loop is running, the value head was
+   getting starved of updates on top of using an LR far too small for it —
+   together these left normalized value loss stuck well above 1.0
+   (worse than "always predict the mean") for the whole PPO phase, despite a
+   well-converged pretrain.
+
+Fixes (`PPOTrainer.__init__` / `_ppo_update()`):
+- The optimizer is now built with **two named param groups** — `"policy"`
+  (everything else) and `"value"` (`execution_net.value_head` +
+  `execution_net.value_ai_type_channel`), identified by parameter name prefix.
+  `ppo.value_learning_rate` sets the value group's LR independently (falls
+  back to `ppo.learning_rate` if absent). `schedules.py`'s
+  `TrainingSchedules.value_lr(progress)` returns a constant schedule reading
+  this key (mirrors `lr()`'s pattern but currently non-annealing).
+  **Not built at all when `separate_value_net=True`** (see "Separate value
+  network" below) — in that mode the "value" param group would be dead
+  weight (`execution_net.value_head`/`value_ai_type_channel` are frozen and
+  unused), so the main optimizer only has `"policy"`/`"direction"` groups
+  and a fully separate `value_net_optimizer` trains `trainer.value_net`
+  instead.
+- `load_checkpoint()` now checks the saved optimizer's param-group count
+  against the live optimizer before calling `load_state_dict()`; on a
+  mismatch (e.g. resuming an old single-group checkpoint after this change)
+  it skips the optimizer-state restore with a `WARNING` log instead of
+  raising `ValueError: loaded state dict has a different number of
+  parameter groups` — network weights still load normally either way.
+- **Value-only continuation**: after the policy epoch loop exits via KL
+  early-stop, `_ppo_update()` runs an additional loop (up to
+  `ppo.value_only_continuation_epochs`, default = `ppo.n_epochs` for
+  backward compat — was previously hardcoded to always reuse `n_epochs`)
+  that trains ONLY the value param group (no policy forward/backward, so no
+  further KL risk) over fresh random minibatch permutations of the **same**
+  rollout batch. Logged as `[value-only continuation] N extra minibatch
+  step(s) after policy early-stop final_val_loss=X`. This is a deliberate,
+  non-standard technique (the value function has no trust-region /
+  importance-ratio constraint, so it's safe to keep training past the
+  policy's early-stop point) but note it does reuse the same stale rollout
+  data rather than fresh on-policy samples, so there's a real (if usually
+  small) risk of overfitting the critic to that batch — raise
+  `value_only_continuation_epochs` cautiously and watch for `val=`
+  oscillating rather than trending down across rollouts.
+
+If `target_kl` (`ppo.target_kl`) is too tight relative to the natural
+per-minibatch KL noise floor, the early-stop fires almost every rollout
+after just 1 minibatch, starving the *policy* itself of gradient signal
+(the value-only continuation above only compensates for the critic, not the
+actor). Symptoms: `steps_this_update=1` in nearly every `[early stop ...]`
+log line. Raise `target_kl` (and/or `minibatch_size`, and/or lower
+`learning_rate` further) if this happens — `clip_range` already bounds the
+per-sample effect of any one step, so a looser KL gate is usually safe.
+
+- **BC-only continuation** (`bc.bc_only_continuation_epochs`, default `0` =
+  disabled/opt-in): mirrors the value-only continuation above, but for the
+  BC auxiliary loss. Runs AFTER the value-only continuation, still gated on
+  `if _early_stopped:`. Rationale: the policy's KL early-stop cuts the
+  *combined* policy+value+BC loop short, which was silently truncating BC's
+  intended per-rollout gradient budget too (only the value head had a
+  dedicated continuation before this). Unlike the value-only continuation,
+  BC updates the SAME `decision_net`/`execution_net` params the policy uses
+  (there's no isolated "BC param group" to safely train in isolation the way
+  `value_head`/`value_ai_type_channel` can be) — but the loop itself still can't
+  trigger further early-stops because it never computes a policy
+  forward/ratio/KL at all, it's a pure supervised step using
+  `bc_loss_from_tensor()` with the SAME annealed `bc_coeff` already computed
+  for the rollout (see `bc.aux_coeff_start/end/aux_coeff_anneal_fraction`).
+  Logged as `[bc-only continuation] N extra minibatch step(s) after policy
+  early-stop final_bc_loss=X`. Raise from `0` (e.g. `2`–`6`) if you suspect
+  BC is contributing less than `aux_coeff` implies because of frequent early
+  stops; leave at `0` (default) otherwise since it's a newer, opt-in
+  mechanism and doubles as an easy on/off switch independent of
+  `value_only_continuation_epochs`.
+
 ### Single value head convention
 
 There are two `value_head` modules in the codebase (`decision_net.value_head`
 and `execution_net.value_head`) for historical/checkpoint-compat reasons, but
-only ONE is ever trained or read: **`execution_net.value_head`**.
+only ONE is ever trained or read: **`execution_net.value_head`** (or
+`trainer.value_net.value_head` when `separate_value_net=True` — see
+"Separate value network" above; in that mode `execution_net.value_head` is
+ALSO frozen/unused, same as `decision_net.value_head`).
 `decision_net.value_head`'s parameters are permanently frozen in
 `PPOTrainer.__init__` (`requires_grad_(False)`) and excluded from every value
 loss and from `_get_value`/`_sample_action`. Previously the two heads were
@@ -185,6 +345,85 @@ silently diverge. All call sites now use `e_heads.value.squeeze(-1)` /
 "Pre-training phases" below), Phase 1 joint BC+value, `pretrain_value()`,
 the PPO update (`_ppo_update`), `_sample_action`, `_get_value`, and the
 BC-repair diagnostic.
+
+### Separate value network (`separate_value_net` / CLI `--separate-value-net`)
+
+A **permanent** architecture switch (distinct from the throwaway
+`experiment_separate_value_net` diagnostic flag inside `pretrain_value()`,
+which only runs in the `--bc-dataset=None` fallback path and is discarded
+afterward). When `PPOTrainer(separate_value_net=True)`, a second, fully
+independent `ExecutionNetwork` (`trainer.value_net` — own trunk/encoders,
+zero weight sharing with `execution_net`) becomes the sole critic for the
+**entire** run:
+
+- `execution_net.value_head` and `execution_net.value_ai_type_channel` are
+  permanently frozen (`requires_grad_(False)`) and excluded from the main
+  optimizer entirely — they are structurally unused in this mode.
+- `pretrain_combined()`'s Phase 0 (`demo_epochs`) and Phase 1 joint
+  value-loss term (`_use_joint_val`) are both force-disabled
+  (`self.separate_value_net` short-circuits them to `0`/`False`) — the
+  entire point of this mode is a critic that never receives a BC gradient,
+  so both of BC's value-loss injection points are skipped rather than
+  redirected.
+- `pretrain_value()` trains `trainer.value_net` (fully unfrozen — no
+  `_get_value_pretrain_freeze_params()` freezing, since there's no BC-primed
+  trunk to protect) via `trainer.value_net_optimizer` instead of the usual
+  `execution_net.value_head`-only Adam instance.
+- `_ppo_update()`'s main value loss forwards a **detached** copy of
+  `d_heads` through `value_net` (`dataclasses.replace(d_heads, ...)` with
+  every field `.detach()`-ed) so its gradient reaches only `value_net`'s own
+  params, never `decision_net` — then does a second, independent
+  `.backward()`/`value_net_optimizer.step()` right after the main
+  `total_loss.backward()`/`self.optimizer.step()`. The value-only
+  continuation loop (see above) also branches to train `value_net` instead
+  of `execution_net.value_head` when this mode is on.
+- `_get_value()`/`_sample_action()` both route their value read through
+  `value_net` when enabled (via the `_value_heads()` helper for the former;
+  `_sample_action` calls `self.value_net(...)` directly under `no_grad()`
+  since `e_heads` there is still needed for the actual action sampling).
+- Checkpoints gain two extra keys, `"value_net"`/`"value_net_optimizer"`,
+  written by `_save_checkpoint()`/`_save_checkpoint_to()` and restored by
+  `load_checkpoint()` (with a `WARNING` log — not a crash — if an older
+  checkpoint lacks them). `PPOTrainer.load_for_inference()` auto-detects
+  `separate_value_net` by peeking at the checkpoint file for a `"value_net"`
+  key before constructing the trainer, so no CLI flag is needed at
+  evaluation/inference time.
+
+See `tests/ai_scenario/test_separate_value_net.py` for coverage (construction,
+value routing, gradient isolation between `value_net` and
+`execution_net.value_head`, checkpoint round-trip, `load_for_inference()`
+auto-detection).
+
+### Value-only opponent-AI-type side channel: permutation invariance
+
+The value-only opponent-ai-type side channel (`value_ai_type_channel`,
+instance of `ValueAiTypeSideChannel` in `ai/models/value_side_channel.py`, on
+both `DecisionNetwork` and `ExecutionNetwork`) used to be a flatten+`Linear`
+over `other_ai_type` (shape `(batch, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM)`
+flattened to `(batch, N*dim)`). That gives each slot position its own
+learned weight block — **not** permutation-invariant, unlike the main
+entity encoder (shared per-slot MLP + attention pooling), meaning swapping
+which physical player occupies slot 3 vs slot 17 changed the value output.
+Slot-shuffle augmentation was the only thing papering over this gap by
+showing many shuffles per real transition.
+
+Fixed by replacing it with `ValueAiTypeSideChannel`: a shared per-slot MLP
+(own weights, zero sharing with `EntityEncoder`) + a dedicated masked
+attention pool, exactly permutation-invariant by construction (same
+guarantee as the main entity encoder). It's also enriched with a **detached**
+copy of the main entity encoder's per-slot embeddings (`entity_encoder(...,
+return_embeds=True)` returns `(context, self_embed, other_embed)` — the
+latter two are the pre-attention per-slot embeddings, still attached to the
+policy's autograd graph until the caller detaches them) so the critic sees
+real spatial/attribute context per opponent, not just a bare AI-type
+one-hot. The `.detach()` call in `DecisionNetwork.forward()`/
+`ExecutionNetwork.forward()` is the load-bearing line keeping this value-only
+— see the "Opponent-AI-type (value-only)" design constraint above (policy
+must never condition on opponent identity).
+
+See `tests/ai_unit/test_ai_type_side_channel.py::TestValueSideChannelPermutationInvariance`
+for the regression test (moving the one real other-player from slot 0 to
+slot 17 must not change `value` at all).
 
 Per-rollout PPO logging now also prints `[V=mean±std R=mean±std
 adv=mean±std]` (value/return/advantage stats), with a DEBUG-level
@@ -224,12 +463,24 @@ State (`_trainee_pending_loss` / `_sec_pending_loss` dicts) persists across
 
 `Player` has two optional callbacks set on the instance:
 ```python
-player.on_kick    = lambda player: ...   # fired when KickOrder/ShootOrder/PassOrder executes
+player.on_kick    = lambda player: ...   # fired when kick_direct() executes kick physics
 player.on_tackle  = lambda player: ...   # fired when ChaseTackleOrder makes contact
 ```
-The engine fires these in `match.py` at the exact tick the action executes —
-not when the order is set.  Useful for: BC recording, UI effects, logging,
-statistics.  Both default to `None` (no-op).
+The engine fires these in `match.py`/`player.py` at the exact tick the action
+executes — not when the order is set.  Useful for: BC recording, UI effects,
+logging, statistics.  Both default to `None` (no-op).
+
+`on_kick` fires from **any** code path that calls `Player.kick_direct()` —
+`KickOrder`/`ShootOrder`/`PassOrder.execute()` all delegate to it, and so does
+`MoveOrder`'s push-kick behaviour (`_do_push_kick()` in `orders.py`) and the
+neural network's direct-drive kick action. Alongside the optional callback,
+`kick_direct()` also unconditionally sets `player.kicked_this_tick = True`
+(reset to `False` for every player at the top of
+`Match._process_orders()`) — this flag exists specifically so code that runs
+*after* order processing (e.g. `bc.py`'s `phase1_labels()`) can check "did
+this player kick this tick" without needing `on_kick` wired up and without
+inspecting order types (which missed the `MoveOrder` push-kick case — see
+the BC label table above).
 
 ### Demonstration recording (`record_demonstrations.py`)
 

@@ -252,8 +252,9 @@ be regenerated before training.
 
 ### 3.5 Model saving
 
-Checkpoints save `decision_net`, `execution_net`, and `optimizer` state.
-Load with:
+Checkpoints save `decision_net`, `execution_net`, and `optimizer` state (plus
+`value_net`/`value_net_optimizer` when `--separate-value-net` was used — see
+"Separate value network (--separate-value-net)" below). Load with:
 ```python
 trainer = PPOTrainer.from_config()
 trainer.load_checkpoint(Path("checkpoints/checkpoint_00500000.pt"))
@@ -265,6 +266,50 @@ ckpt = torch.load("checkpoints/checkpoint_00500000.pt", map_location="cpu")
 torch.save(ckpt["decision_net"], "models/decision_net_500k.pt")
 torch.save(ckpt["execution_net"], "models/execution_net_500k.pt")
 ```
+`PPOTrainer.load_for_inference()` auto-detects `separate_value_net` from
+whether the checkpoint file has a `"value_net"` key — no flag needed when
+evaluating/running a checkpoint trained with `--separate-value-net`.
+
+### 3.6 Separate value network (`--separate-value-net`)
+
+By default the critic is the shared-trunk `execution_net.value_head` (Option
+A from the design doc) — it reads through the same trunk/encoders that get
+BC-pretrained before PPO starts, so the critic's representation is initially
+biased toward whatever features BC needed for the policy, not necessarily
+what's best for value prediction.
+
+`--separate-value-net` constructs a second, **fully independent**
+`ExecutionNetwork` (`trainer.value_net`, own trunk/encoders/optimizer, zero
+weight sharing with `execution_net`) and uses it as the **sole critic for
+the entire run** — BC pre-training (`pretrain_combined()`'s Phase 0/Phase 1
+joint value-loss terms are skipped entirely when this is on — the whole
+point is a critic that never sees a BC gradient), value warm-up
+(`pretrain_value()`), and PPO (`_ppo_update()`'s value loss trains
+`value_net` via its own `value_net_optimizer`, with `d_heads` detached before
+reaching it so no gradient leaks back into `decision_net`). Meanwhile
+`execution_net.value_head`/`execution_net.value_ai_type_channel` are frozen
+and structurally unused in this mode.
+
+This is a **permanent architecture switch**, distinct from the
+`--experiment-separate-value-net` diagnostic flag (see `pretrain_value()`'s
+`experiment_separate_value_net` docstring) — that one only builds a
+throwaway comparison network inside the `--bc-dataset=None` fallback path of
+`pretrain_value()` and discards it; `--separate-value-net` is a real, saved,
+persistent second network.
+
+```bash
+uv run python -m footballcoach.ai.scripts.train \
+    --phase 1 --bc-dataset demonstrations/phase1 --latest-pretrain \
+    --total-steps 300000 --separate-value-net
+```
+
+Checkpoints from a `--separate-value-net` run store `value_net`/
+`value_net_optimizer` alongside the usual keys; loading a checkpoint that
+lacks these keys into a `separate_value_net=True` trainer logs a warning and
+keeps `value_net` at its fresh random init rather than crashing.
+
+See `tests/ai_scenario/test_separate_value_net.py` for the test coverage
+(construction, value routing, gradient isolation, checkpoint round-trip).
 
 ---
 
@@ -518,9 +563,13 @@ of total training steps (default 0.2 → 0.0 by 30%), then stays 0.0.
 - **Decision network**: all 7 Bernoulli heads (shoot, pass, move, tackle,
   get_possession_extra, mark, hold_position) via `binary_cross_entropy_with_logits`.
 - **Execution network**: `move_direction` (cosine loss; `bc.py` normalizes
-  both prediction and label before computing the loss), `sprint` (BCE from logit).
-- Kick, tackle_attempt, and kick_direction are not supervised
-  (rules-based AI doesn't kick in Phase 1; extend `BCLabel` if needed later).
+  both prediction and label before computing the loss), `sprint` (BCE from logit),
+  `kick_this_tick`/`tackle_attempt` (BCE from logit), and `kick_direction`
+  (cosine loss, gated on `kick_this_tick==1`), `kick_power` (MSE), `kick_spin`
+  (MSE, normalized by `ball_spin_norm_max_rad_s`) — all captured automatically
+  at the `Player.kick_direct()` chokepoint via `last_kick_direction`/
+  `last_kick_power_fraction`/`last_kick_spin`, so this works for any AI that
+  kicks, not just Phase1RulesAI. See `agent_plans/bc_kick_supervision_plan.md`.
 
 ### Adding BC for a new phase
 
@@ -604,30 +653,53 @@ as:
 
 ## 8. Reading the training log
 
-Each rollout (every 2048 steps) prints one line:
+Each rollout (every `ppo.rollout_steps` steps) prints one line:
 
 ```
-step=28,679 | rew=8.76 | pol=0.02 val=1.00 ent=0.25 kl=0.16  bc=2.84(x0.17) | 283sps  mv_ls=[0.01,0.00]  vs_rules(18): 65%/12%  vs_neural(16): 44%/25%
+step=28,679 | rew=8.76 | pol=0.02 val=1.00 ent=0.25 kl=0.16  bc=2.84(x0.17) | 283sps  mv_ls=[0.01,0.00]  act: mv=22 gp=78 emv=100 spr=66 kck=0 tk=0 sh=0 hld=0 ta_p=0.0012 kk_p=0.0004  vs_rules(18): 65%/12%  vs_neural(16): 44%/25%
 ```
 
 | Field | Meaning |
 |-------|---------|
 | `rew` | Mean episode return over last 20 episodes |
+| `pol` | PPO clipped surrogate policy loss (`-(min(ratio*adv, clip(ratio)*adv)).mean()`). Small and can be either sign — don't read meaning into the sign per-rollout, only into large sustained trends |
 | `val` | **Normalised MSE** of the value head: `MSE(predicted, GAE_return) / Var(returns)`.  ~1.0 = predicting the mean (no better than constant).  <0.5 = critic is useful.  0.85 after warmup is expected — it improves as returns stabilise |
 | `ent` | Policy entropy (higher = more exploration) |
 | `kl` | Approximate KL divergence from old policy.  >0.1 = large update (KL diagnostics printed separately). Repeated >1.0 = policy diverging |
-| `bc=X(xY)` | BC auxiliary loss value × current annealing coefficient.  Disappears once coeff reaches 0 |
+| `bc=X(xY)` | BC auxiliary loss value × current annealing coefficient (`bc.aux_coeff_start/end/aux_coeff_anneal_fraction`).  Disappears once coeff reaches 0 |
 | `sps` | Decision steps per second |
-| `mv_ls` | `move_direction` log-std for both output dimensions (tracks direction head confidence) |
-| `vs_rules(N): W%/L%` | Trainee win% / opponent win% in the N **rules-based opponent** episodes this rollout |
+| `mv_ls` | `move_direction` log-std for both output dimensions (tracks direction head confidence; effective σ = exp(mv_ls), clamped to `[exp(ppo.dir_log_std_min), exp(ppo.dir_log_std_max)]`) — see "Direction heads: log_std and KL" below |
+| `act: mv=XX gp=XX emv=XX spr=XX kck=XX tk=XX sh=XX hld=XX` | Per-head mean activation rate (0–100%) from stored buffer actions. Values near 0 or 100 = saturated head (collapse warning, or frozen/unused head in this phase — e.g. `kck`/`tk` near 0 in Phase 1). Zero extra compute — reads from buffer directly |
+| `ta_p` / `kk_p` | Mean predicted probability (`sigmoid(logit)`, pre-sampling) of `tackle_attempt` / `kick_this_tick` this rollout, printed to 4 decimal places. Distinct from `act: tk=`/`kck=` (post-sampling 0/1 activation rate) — `ta_p`/`kk_p` show the underlying continuous probability even when the sampled/gated action never actually fires, so they're the better signal for "is the head learning anything at all" vs. "is it ever selected" |
+| `vs_rules(N): W%/L%` | Trainee win% / opponent win% in the N **rules-based opponent** episodes this rollout (only present if `curriculum.phase1_opponent_rules_prob > 0`) |
 | `vs_neural(N): W%/L%` | Same for **neural opponent** episodes (shared-weight self-play).  Compare to `vs_rules` to see if improvement is vs the rules AI or just self-play |
-| `act: mv=XX gp=XX spr=XX ...` | Per-head mean activation rate (0–100%) from stored buffer actions. Values near 0 or 100 = saturated head (collapse warning). Zero extra compute — reads from buffer directly |
+
+When a minibatch's KL exceeds `ppo.target_kl`, the epoch loop early-stops and up to three follow-up phases may run (see `ai/knowledge.md` "KL early-stop and per-head diagnostics" for full detail):
+```
+  [early stop e0 mb5]  KL=0.06878 > target=0.06  steps_this_update=6
+  [value-only continuation] 246 extra minibatch step(s)  after policy early-stop  final_val_loss=0.1836
+  [bc-only continuation] 12 extra minibatch step(s)  after policy early-stop  final_bc_loss=2.1043
+```
+1. **Value-only continuation** (`ppo.value_only_continuation_epochs`) — trains only `value_head`/`value_ai_type_channel` (or `value_net` when `--separate-value-net` is enabled — see "Separate value network" below), always runs on early-stop.
+2. **BC-only continuation** (`bc.bc_only_continuation_epochs`, default `0` = disabled) — trains `decision_net`/`execution_net` via BC loss only, runs after value-only continuation, opt-in.
+
+If `mean_kl` for the whole rollout exceeds `KL_DIAG_THRESHOLD` (hardcoded `0.04` in `ppo_trainer.py`), a `[KL=... > ...] ratio percentiles: ...` block plus a `[per-head new lp means, n=256]` breakdown is also printed — this shows per-head log-prob contributions (`move_dir`/`kick_dir` will look "big" in magnitude, e.g. `-3.0`, purely because they're continuous Gaussian log-densities, not bounded like Bernoulli head log-probs which sit near 0 when confident — see "Direction heads: log_std and KL" below for the math). `kick_dir` is correctly gated to `0.000` whenever `kick` never fires that rollout (matches the real training-path gating in `_compute_log_prob`/`_recompute_log_prob`).
+
+### Direction heads: log_std and KL
+
+`move_direction`/`kick_direction` are modelled as an isotropic 2D Gaussian (`DirectionHead` in `action/distributions.py`) with mean = the network's (L2-normalized) output vector and learned std = `exp(move_dir_log_std)` / `exp(kick_dir_log_std)`, clamped every use to `[exp(ppo.dir_log_std_min), exp(ppo.dir_log_std_max)]`.
+
+- For small mean-shifts, `KL ≈ (Δμ)² / (2σ²)` — **larger σ directly reduces how much a given angular drift contributes to per-minibatch KL**, which is one lever for reducing `target_kl` early-stops (in addition to `target_kl` itself and `minibatch_size`).
+- `ppo.ent_dir_weight` controls how much the direction heads' entropy contributes to the entropy bonus; raising it pushes the optimizer to prefer a larger learned σ (more exploration credit for less certainty) — a widely-used indirect way to loosen the KL budget for direction drift specifically, at the cost of noisier/less confident direction output.
+- `ppo.dir_log_std_init` only sets the *initial* value of the learned `nn.Parameter` at network construction — it does not bound anything after training starts (that's `dir_log_std_min`/`dir_log_std_max`'s job). Current tuned values: `dir_log_std_init=-1.0` (σ≈0.37, ~21° angular std), `dir_log_std_min=-2.5` (σ≈0.082, ~4.7°), `dir_log_std_max=-0.3` (σ≈0.74, ~42°) — a tighter range than earlier experiments (`dir_log_std_max=0.8`, σ up to ≈2.23, ~85°+ angular std) that produced excessive KL from direction drift alone.
 
 Offline BC epoch lines (during `pretrain_combined`):
 ```
-  BC epoch 5/50: bc_loss=0.52  dir_cos=0.34
+  BC epoch 5/50: bc_loss=0.52  dir_cos=0.34  kick_dir_cos=0.12  mv_p=1.000  spr_p=0.868  kk_p=0.0004  tk_p=0.038
 ```
-`dir_cos` is the mean cosine similarity between predicted and label `move_direction` for valid steps in that epoch.  Should rise toward 1.0 across epochs.
+- `dir_cos` — mean cosine similarity between predicted and label `move_direction` for valid steps in that epoch.  Should rise toward 1.0 across epochs.
+- `kick_dir_cos` — same but for `kick_direction`, restricted to rows where `kick_this_tick==1`. Expect this to be noisy/near-NaN when kicks are rare in the dataset (e.g. Phase 1).
+- `mv_p`/`spr_p`/`kk_p`/`tk_p` — mean predicted probability (`sigmoid(logit)`) for `exec_move`/`sprint`/`kick`/`tackle_attempt` respectively, over valid BC rows. Same `BC repair epoch` log line also reports all four. Use these (not just the aggregated `exec_bce` loss term in the `[...]` breakdown) to see whether kick/tackle are learning any real signal at all versus staying pinned near their BC-label base rate.
 
 ---
 

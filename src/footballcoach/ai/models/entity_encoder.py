@@ -62,22 +62,36 @@ class EntityEncoder(nn.Module):
         self_features: torch.Tensor,   # (batch, entity_feature_dim)
         other_features: torch.Tensor,  # (batch, MAX_OTHER_PLAYERS, entity_feature_dim)
         exists_mask: torch.Tensor,     # (batch, MAX_OTHER_PLAYERS), 1.0=real 0.0=padded
-    ) -> torch.Tensor:                 # (batch, embed_dim) context vector
+        return_embeds: bool = False,
+    ):
         """
         Args:
             self_features: The observing player's own feature vector.
             other_features: All other-player slots (padded with zeros where
                 exists_mask=0).
             exists_mask: Float mask, 1.0 for a real player, 0.0 for padding.
+            return_embeds: If True, also return the pre-attention per-slot
+                embeddings (self_embed, other_embed) alongside the pooled
+                context. Callers that reuse these elsewhere (e.g. the
+                value-only ai-type side channel, see
+                ai/models/value_side_channel.py) MUST ``.detach()`` them
+                first -- these embeddings are the live policy path's
+                encoder output and are still attached to the policy's
+                autograd graph here.
 
         Returns:
-            Attention-pooled context vector (batch, embed_dim).  This
-            summarises all relevant information about the other players,
-            weighted by how relevant each is to the observing player's
-            current state.
+            Attention-pooled context vector (batch, embed_dim) summarising
+            all relevant information about the other players, weighted by
+            how relevant each is to the observing player's current state.
+            If ``return_embeds=True``, returns
+            ``(context, self_embed, other_embed)`` instead, where
+            self_embed is (batch, embed_dim) and other_embed is
+            (batch, MAX_OTHER_PLAYERS, embed_dim) -- both PRE-pooling,
+            still attached to the policy graph (caller must detach).
         """
         # Embed self: (batch, embed_dim) -> (batch, 1, embed_dim) for attention query
-        self_embed = self.per_entity_mlp(self_features).unsqueeze(1)
+        self_embed_raw = self.per_entity_mlp(self_features)
+        self_embed = self_embed_raw.unsqueeze(1)
 
         # Embed all other players: (batch, MAX_OTHER_PLAYERS, embed_dim)
         other_embed = self.per_entity_mlp(other_features)
@@ -93,4 +107,7 @@ class EntityEncoder(nn.Module):
             key_padding_mask=key_padding_mask,
         )
         # context: (batch, 1, embed_dim) -> (batch, embed_dim)
-        return context.squeeze(1)
+        context = context.squeeze(1)
+        if return_embeds:
+            return context, self_embed_raw, other_embed
+        return context

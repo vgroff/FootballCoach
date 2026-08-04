@@ -113,30 +113,30 @@
   "gk_control_time_by_height": {
     "gk_h=0.0m": 0.08,
     "gk_h=0.5m": 0.08,
-    "gk_h=1.0m": 0.0988,
-    "gk_h=1.5m": 0.1372,
-    "gk_h=1.8m": 0.191,
-    "gk_h=2.0m": 0.3102,
-    "gk_h=2.2m": 0.4377
+    "gk_h=1.0m": 0.0951,
+    "gk_h=1.5m": 0.1258,
+    "gk_h=1.8m": 0.1688,
+    "gk_h=2.0m": 0.2642,
+    "gk_h=2.2m": 0.3661
   },
   "gk_vs_outfield_control_time_by_height": {
     "gk": {
       "h=0.0m": 0.08,
       "h=0.5m": 0.08,
-      "h=1.0m": 0.0988,
-      "h=1.5m": 0.1372,
-      "h=1.8m": 0.191,
-      "h=1.9m": 0.2496,
-      "h=2.0m": 0.3102
+      "h=1.0m": 0.0951,
+      "h=1.5m": 0.1258,
+      "h=1.8m": 0.1688,
+      "h=1.9m": 0.2157,
+      "h=2.0m": 0.2642
     },
     "outfield": {
       "h=0.0m": 0.05,
       "h=0.5m": 0.05,
-      "h=1.0m": 0.1015,
-      "h=1.5m": 0.2066,
-      "h=1.8m": 0.3538,
-      "h=1.9m": 0.5141,
-      "h=2.0m": 0.68
+      "h=1.0m": 0.0912,
+      "h=1.5m": 0.1753,
+      "h=1.8m": 0.293,
+      "h=1.9m": 0.4212,
+      "h=2.0m": 0.554
     }
   },
   "early_intercept_travel_distance": {
@@ -222,12 +222,12 @@
     "score_rate_pct": 74.55
   },
   "control_time_vs_ball_control_seconds": {
-    "ball_control=0.0": 0.554,
-    "ball_control=0.2": 0.468,
-    "ball_control=0.4": 0.383,
-    "ball_control=0.6": 0.297,
-    "ball_control=0.8": 0.211,
-    "ball_control=1.0": 0.126
+    "ball_control=0.0": 0.453,
+    "ball_control=0.2": 0.385,
+    "ball_control=0.4": 0.316,
+    "ball_control=0.6": 0.248,
+    "ball_control=0.8": 0.179,
+    "ball_control=1.0": 0.11
   },
   "mark_vs_getpossession_tackle_win_rate": {
     "n_trials": 2000,
@@ -346,32 +346,32 @@
     "attacker_favoured_tackler_win_pct": 17.5
   },
   "control_time_vs_height_seconds": {
-    "ground_rolling (0.1m)": 0.122,
-    "knee (0.49m)": 0.122,
-    "waist (0.95m)": 0.194,
-    "chest (1.4m)": 0.294,
-    "head (1.8m)": 0.553,
-    "above_head (2.2m)": 1.048
+    "ground_rolling (0.1m)": 0.107,
+    "knee (0.49m)": 0.107,
+    "waist (0.95m)": 0.165,
+    "chest (1.4m)": 0.246,
+    "head (1.8m)": 0.452,
+    "above_head (2.2m)": 0.849
   },
   "control_time_vs_relative_velocity_seconds": {
-    "relative_speed=0.0mps": 0.13,
-    "relative_speed=2.0mps": 0.173,
-    "relative_speed=5.0mps": 0.238,
-    "relative_speed=10.0mps": 0.346,
-    "relative_speed=15.0mps": 0.454
+    "relative_speed=0.0mps": 0.114,
+    "relative_speed=2.0mps": 0.149,
+    "relative_speed=5.0mps": 0.2,
+    "relative_speed=10.0mps": 0.287,
+    "relative_speed=15.0mps": 0.373
   },
   "control_time_gk_vs_outfield_seconds": {
     "waist (0.95m)": {
-      "outfield_s": 0.215,
-      "goalkeeper_s": 0.201
+      "outfield_s": 0.182,
+      "goalkeeper_s": 0.177
     },
     "chest (1.4m)": {
-      "outfield_s": 0.301,
-      "goalkeeper_s": 0.233
+      "outfield_s": 0.251,
+      "goalkeeper_s": 0.202
     },
     "head (1.8m)": {
-      "outfield_s": 0.522,
-      "goalkeeper_s": 0.316
+      "outfield_s": 0.427,
+      "goalkeeper_s": 0.269
     }
   },
   "firsttime_shot_error_multiplier_table": {

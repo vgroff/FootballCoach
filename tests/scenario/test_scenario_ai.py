@@ -135,8 +135,26 @@ class TestStagedGoalkeeperAI:
             "AI should not issue SaveOrder while a MoveOrder is still active"
         )
 
-    def test_issues_save_order_when_move_completes(self):
-        """Once the GK's MoveOrder completes (order→None), AI issues SaveOrder."""
+    def test_issues_save_order_when_move_completes_and_ball_aimed_at_goal(self):
+        """Once the GK's MoveOrder completes (order→None) and the loose ball is
+        aimed at the GK's goal, AI issues SaveOrder."""
+        pitch = Pitch.standard()
+        gk = make_player("gk", Team.LEFT, position=pitch.left_goal_centre, is_goalkeeper=True)
+        ball = Ball.at_rest(Vector3(0.0, 0.0, 0.0))
+        ball.velocity = Vector3(-20.0, 0.0, 0.0)  # aimed at gk's (LEFT) goal
+        match = Match(pitch=pitch, players=[gk], ball=ball,
+                      rng_reduction=1.0, rng=random.Random(0))
+        gk.current_order = None  # MoveOrder already completed
+        ai = StagedGoalkeeperAI()
+
+        ai.act(gk, match, 0)
+        assert isinstance(gk.current_order, SaveOrder), (
+            "AI should issue SaveOrder once the GK has no active order and the ball threatens goal"
+        )
+
+    def test_issues_move_order_to_goal_centre_when_move_completes_and_ball_not_threatening(self):
+        """Once the GK's MoveOrder completes and the ball is not threatening,
+        AI re-issues a goal-centre MoveOrder rather than SaveOrder."""
         pitch = Pitch.standard()
         gk = make_player("gk", Team.LEFT, position=pitch.left_goal_centre, is_goalkeeper=True)
         ball = Ball.at_rest(Vector3(0.0, 0.0, 0.0))
@@ -146,8 +164,8 @@ class TestStagedGoalkeeperAI:
         ai = StagedGoalkeeperAI()
 
         ai.act(gk, match, 0)
-        assert isinstance(gk.current_order, SaveOrder), (
-            "AI should issue SaveOrder once the GK has no active order"
+        assert isinstance(gk.current_order, MoveOrder), (
+            "AI should jog back to goal centre when the ball is not aimed at goal"
         )
 
     def test_does_not_override_save_order(self):

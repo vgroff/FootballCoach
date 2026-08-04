@@ -23,6 +23,8 @@ Usage:
 """
 from __future__ import annotations
 
+import copy
+import dataclasses
 import logging
 import math
 import random
@@ -102,10 +104,35 @@ class PPOTrainer:
         device: Optional[torch.device] = None,
         checkpoint_dir: Optional[Path] = None,
         inference_only: bool = False,
+        separate_value_net: bool = False,
     ):
         self.decision_net = decision_net
         self.execution_net = execution_net
         self.device = device or torch.device("cpu")
+        # --- Permanent separate-trunk value network (see CLI --separate-value-net) ---
+        # A fully independent ExecutionNetwork (same class/config, own weights, zero
+        # sharing with self.execution_net) used as the ONLY critic for the entire
+        # training run whenever this is enabled -- unlike
+        # --experiment-separate-value-net (diagnostic-only, discarded after
+        # pretrain_value()), this one is the real, permanent critic: its .value
+        # output replaces execution_net.value everywhere (GAE bootstrap, PPO value
+        # loss, pretrain_value()/pretrain_combined() value warm-up, _get_value(),
+        # _sample_action()). It never receives BC gradients -- the whole point is a
+        # critic trunk that never gets BC-primed, unlike the shared trunk which is
+        # BC-pretrained before PPO. Persisted in checkpoints under "value_net"/
+        # "value_net_optimizer" so it survives resume/--latest/--from-pretrained.
+        self.separate_value_net = bool(separate_value_net)
+        self.value_net: Optional[ExecutionNetwork] = None
+        self.value_net_optimizer: Optional[torch.optim.Optimizer] = None
+        if self.separate_value_net:
+            # network.value_net_trunk_hidden (ai_config.json): optional override
+            # for value_net's trunk_hidden, independent of the main policy
+            # execution_net's trunk size. None/absent (default) = same size as
+            # the main trunk (network.trunk_hidden).
+            _value_trunk_override = cfg.get("network", {}).get("value_net_trunk_hidden")
+            self.value_net = ExecutionNetwork.from_config(
+                trunk_hidden_override=_value_trunk_override
+            )
         self.checkpoint_dir = checkpoint_dir
 
         ppo_cfg = cfg["ppo"]
@@ -120,6 +147,21 @@ class PPOTrainer:
         self.ent_coef = float(ppo_cfg.get("ent_coef", 0.01))
         self.max_grad_norm = float(ppo_cfg.get("max_grad_norm", 0.5))
         self.n_epochs = int(ppo_cfg.get("n_epochs", 4))
+        self.value_only_continuation_epochs = int(ppo_cfg.get("value_only_continuation_epochs", self.n_epochs))
+        self.bc_only_continuation_epochs = int(bc_cfg.get("bc_only_continuation_epochs", 0))
+        # Optional fixed coefficient for the BC-only continuation loop, decoupled
+        # from the annealed aux_coeff (bc.aux_coeff_start/end/anneal_fraction).
+        # None (default) = fall back to the annealed bc_coeff, matching prior
+        # behaviour (see bc-only continuation comment below). Set a float in
+        # ai_config.json's "bc.bc_only_continuation_coeff" to keep this
+        # continuation loop active with a fixed weight even when annealing has
+        # driven aux_coeff to 0.0 (e.g. to disable in-epoch BC pressure on the
+        # main policy gradient while still nudging decision_net/execution_net
+        # back toward demo behaviour with spare post-early-stop gradient budget).
+        _bc_only_coeff_raw = bc_cfg.get("bc_only_continuation_coeff", None)
+        self.bc_only_continuation_coeff = (
+            float(_bc_only_coeff_raw) if _bc_only_coeff_raw is not None else None
+        )
         self.minibatch_size = int(ppo_cfg.get("minibatch_size", 64))
         self.target_kl = float(ppo_cfg.get("target_kl", 0.02))
         self.rollout_steps = int(ppo_cfg.get("rollout_steps", 2048))
@@ -153,6 +195,8 @@ class PPOTrainer:
         self._downsample_trivial_exclude_radius_steps = int(bc_cfg.get("downsample_trivial_exclude_radius_steps", 5))
         self._secondary_weight = float(curriculum_cfg.get("secondary_weight", 1.0))
         self._value_pretrain_frozen_layers = int(bc_cfg.get("value_pretrain_frozen_layers", -1))
+        self._value_pretrain_early_stop_patience = int(bc_cfg.get("value_pretrain_early_stop_patience", 5))
+        self._value_pretrain_early_stop_min_delta = float(bc_cfg.get("value_pretrain_early_stop_min_delta", 1e-4))
         self._demo_value_pretrain_epochs = int(bc_cfg.get("demo_value_pretrain_epochs", 10))
         self._demo_value_pretrain_lr = float(bc_cfg.get("demo_value_pretrain_lr", 4e-3))
         self._demo_value_pretrain_gamma = float(bc_cfg.get("demo_value_pretrain_gamma", 0.99))
@@ -166,28 +210,133 @@ class PPOTrainer:
         self._phase0_value_coef = float(bc_cfg.get("phase0_value_coef", 1.0))
 
         lr = float(ppo_cfg.get("learning_rate", 3e-4))
+        value_lr = float(ppo_cfg.get("value_learning_rate", lr))
+        # Optional separate LR for the direction heads (move_direction, kick_direction,
+        # move_dir_log_std, kick_dir_log_std). None (default) = share the "policy"
+        # param group's LR, matching prior behaviour. Set ppo.direction_learning_rate
+        # to give these params their own (typically smaller) step size, independent
+        # of the rest of the policy — see also direction_max_grad_norm below, which
+        # is the equivalent split for gradient-norm clipping.
+        _dir_lr_raw = ppo_cfg.get("direction_learning_rate", None)
+        direction_lr = float(_dir_lr_raw) if _dir_lr_raw is not None else lr
+        # Optional separate grad-norm clip for the same direction-head params. None
+        # (default) = share max_grad_norm, matching prior behaviour (all params
+        # clipped together in one combined-norm group). Set ppo.direction_max_grad_norm
+        # to isolate direction-head gradients into their own clip_grad_norm_() call so
+        # a single outlier sample's large move_dir/kick_dir gradient can no longer
+        # force a proportional shrink of every other head's gradient in the same step
+        # (and vice versa) — see ai_trainer_knowledge.md "grad norm clipping" discussion.
+        _dir_gn_raw = ppo_cfg.get("direction_max_grad_norm", None)
+        self.direction_max_grad_norm = (
+            float(_dir_gn_raw) if _dir_gn_raw is not None else self.max_grad_norm
+        )
         if not inference_only:
-            all_params = list(decision_net.parameters()) + list(execution_net.parameters())
-            self.optimizer = torch.optim.Adam(all_params, lr=lr, eps=1e-5)
+            # Separate param group for the value head (+ its ai-type side channel)
+            # with its own (typically higher) LR. During PPO, the policy LR is kept
+            # very conservative (protects the BC-primed policy under 12x augmentation),
+            # but the shared optimizer LR was starving the critic — PPO's per-minibatch
+            # KL early-stop cuts gradient steps short based on the *policy's* KL, which
+            # also cuts off the value head's updates for that rollout. A dedicated,
+            # higher LR lets the value head keep learning at a reasonable pace even
+            # when only 1-2 minibatches get through before early-stop fires.
+            value_param_ids = set()
+            value_params = []
+            for name, p in execution_net.named_parameters():
+                if name.startswith("value_head.") or name.startswith("value_ai_type_channel."):
+                    value_params.append(p)
+                    value_param_ids.add(id(p))
+            # Separate param group for the direction heads (see direction_lr/
+            # direction_max_grad_norm comments above). Named params only (not raw
+            # nn.Parameter attributes like move_dir_log_std/kick_dir_log_std, which
+            # named_parameters() also yields with their attribute names).
+            direction_param_ids = set()
+            direction_params = []
+            for name, p in execution_net.named_parameters():
+                if id(p) in value_param_ids:
+                    continue
+                if name.startswith(("move_direction.", "kick_direction.")) or name in (
+                    "move_dir_log_std", "kick_dir_log_std",
+                ):
+                    direction_params.append(p)
+                    direction_param_ids.add(id(p))
+            self.direction_param_ids = direction_param_ids
+            policy_params = [
+                p for p in list(decision_net.parameters()) + list(execution_net.parameters())
+                if id(p) not in value_param_ids and id(p) not in direction_param_ids
+            ]
+            # When separate_value_net is enabled, execution_net's own
+            # value_head/value_ai_type_channel are dead weight (never used --
+            # self.value_net is the sole critic below), so exclude them from
+            # the main optimizer entirely rather than training an unused head.
+            if self.separate_value_net:
+                self.optimizer = torch.optim.Adam(
+                    [
+                        {"params": policy_params, "lr": lr, "name": "policy"},
+                        {"params": direction_params, "lr": direction_lr, "name": "direction"},
+                    ],
+                    eps=1e-5,
+                )
+                self.value_net_optimizer = torch.optim.Adam(
+                    self.value_net.parameters(), lr=value_lr, eps=1e-5,
+                )
+            else:
+                self.optimizer = torch.optim.Adam(
+                    [
+                        {"params": policy_params, "lr": lr, "name": "policy"},
+                        {"params": value_params, "lr": value_lr, "name": "value"},
+                        {"params": direction_params, "lr": direction_lr, "name": "direction"},
+                    ],
+                    eps=1e-5,
+                )
         else:
             self.optimizer = None  # type: ignore[assignment]  # not needed for inference
+            self.direction_param_ids = set()
 
         self.decision_net.to(self.device)
         self.execution_net.to(self.device)
+        if self.value_net is not None:
+            self.value_net.to(self.device)
 
         self._total_steps = 0
         self._checkpoint_count = 0  # sequential counter for checkpoint{N}.pt naming
 
         # --- Single value head convention ---
-        # Commit to execution_net.value_head as the ONLY trained critic.
-        # decision_net.value_head is kept (checkpoint/state_dict compat, and in
-        # case two-critic training is revisited later) but is permanently
+        # Commit to execution_net.value_head as the ONLY trained critic (or, when
+        # separate_value_net is enabled, self.value_net.value_head instead -- see
+        # above). decision_net.value_head is kept (checkpoint/state_dict compat, and
+        # in case two-critic training is revisited later) but is permanently
         # frozen and excluded from every value loss. This avoids the
         # averaging-vs-independent-fit inconsistency that existed when both
         # heads were trained (Phase 0/1 fit them independently, pretrain_value()/
         # PPO only fit their average, letting the two heads silently diverge).
         for p in self.decision_net.value_head.parameters():
             p.requires_grad_(False)
+        if self.separate_value_net:
+            # execution_net's own value_head/value_ai_type_channel are unused
+            # (self.value_net is the sole critic) -- freeze them too so any
+            # stray forward/backward through execution_net never trains them.
+            for p in self.execution_net.value_head.parameters():
+                p.requires_grad_(False)
+            for p in self.execution_net.value_ai_type_channel.parameters():
+                p.requires_grad_(False)
+
+    def _value_heads(self, sf, of, em, bf, gf, d_heads, sat, oat):
+        """Return the ExecutionHeadsRaw whose .value is THE critic estimate.
+
+        When ``separate_value_net`` is disabled (default), this is just
+        ``self.execution_net(...)`` (the normal shared-trunk forward pass,
+        already computed by the caller in nearly every call site — this
+        method exists so call sites that only need value can go through
+        one path). When enabled, forwards through the dedicated
+        ``self.value_net`` instead — a fully independent ExecutionNetwork
+        with its own trunk/encoders, never touched by BC losses. Both take
+        identical inputs (same decision_heads too), so this slots in as a
+        drop-in replacement for ``self.execution_net(...)`` wherever only
+        the returned ``.value`` field is actually used downstream.
+        """
+        if self.separate_value_net:
+            return self.value_net(sf, of, em, bf, gf, d_heads, sat, oat)
+        return self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
 
     # -----------------------------------------------------------------------
     # Curriculum helpers
@@ -422,20 +571,61 @@ class PPOTrainer:
                     episode_outcomes_vs_neural.clear()
                 outcome_str = ("  " + "  ".join(outcome_parts)) if outcome_parts else ""
                 mv_ls = metrics.get('move_log_std', [])
+                kk_ls = metrics.get('kick_log_std', [])
                 mv_ls_grad = metrics.get('mv_ls_grad', 0.0)
-                mv_ls_str = (f"  mv_ls=[{','.join(f'{v:.4f}' for v in mv_ls)}] g={mv_ls_grad:.2e}") if mv_ls else ""
+                # Effective sigma (exp(log_std)) in both raw units and approx degrees
+                # of angular std, since log_std alone isn't very human-readable and
+                # this is the number that actually controls how tightly direction
+                # samples cluster around the predicted mean (see ai_trainer_knowledge.md
+                # "Direction heads: log_std and KL"). Delta vs the previous rollout's
+                # value shows whether log_std is actually moving at all (it was
+                # observed to sit frozen at its init value across many rollouts when
+                # the policy LR is tiny and early-stop cuts gradient steps short).
+                def _sigma_deg(ls_pair):
+                    if not ls_pair:
+                        return None
+                    sig = [math.exp(v) for v in ls_pair]
+                    deg = [math.degrees(s) for s in sig]
+                    return sig, deg
+                _mv_sig = _sigma_deg(mv_ls)
+                _kk_sig = _sigma_deg(kk_ls)
+                _prev_mv_ls = self._prev_move_log_std if hasattr(self, "_prev_move_log_std") else None
+                _prev_kk_ls = self._prev_kick_log_std if hasattr(self, "_prev_kick_log_std") else None
+                _mv_delta_str = ""
+                if mv_ls and _prev_mv_ls:
+                    _d = [b - a for a, b in zip(_prev_mv_ls, mv_ls)]
+                    _mv_delta_str = f"  d_move=[{','.join(f'{v:+.4f}' for v in _d)}]"
+                _kk_delta_str = ""
+                if kk_ls and _prev_kk_ls:
+                    _d = [b - a for a, b in zip(_prev_kk_ls, kk_ls)]
+                    _kk_delta_str = f"  d_kick=[{','.join(f'{v:+.4f}' for v in _d)}]"
+                self._prev_move_log_std = list(mv_ls) if mv_ls else None
+                self._prev_kick_log_std = list(kk_ls) if kk_ls else None
+                mv_ls_str = ""
+                if mv_ls:
+                    mv_ls_str = f"  mv_ls=[{','.join(f'{v:.4f}' for v in mv_ls)}]"
+                    if _mv_sig:
+                        _sig, _deg = _mv_sig
+                        mv_ls_str += f" (\u03c3\u2248{','.join(f'{s:.2f}' for s in _sig)}, \u2248{','.join(f'{d:.0f}\u00b0' for d in _deg)})"
+                    mv_ls_str += f" g={mv_ls_grad:.2e}" + _mv_delta_str
+                if kk_ls:
+                    mv_ls_str += f"\n  kk_ls=[{','.join(f'{v:.4f}' for v in kk_ls)}]"
+                    if _kk_sig:
+                        _sig, _deg = _kk_sig
+                        mv_ls_str += f" (\u03c3\u2248{','.join(f'{s:.2f}' for s in _sig)}, \u2248{','.join(f'{d:.0f}\u00b0' for d in _deg)})"
+                    mv_ls_str += _kk_delta_str
                 ha = metrics.get("head_act", {})
                 _ta_p = ha.get('ta_p', float('nan'))
                 _kk_p = ha.get('kk_p', float('nan'))
                 _prob_str = (
-                    (f" ta_p={_ta_p:.2f}" if _ta_p == _ta_p else "")
-                    + (f" kk_p={_kk_p:.2f}" if _kk_p == _kk_p else "")
+                    (f" tackle_prob={_ta_p:.4f}" if _ta_p == _ta_p else "")
+                    + (f" kick_prob={_kk_p:.4f}" if _kk_p == _kk_p else "")
                 )
                 act_str = (
-                    f"  act: mv={ha.get('mv','?'):>3} gp={ha.get('gp','?'):>3}"
-                    f" emv={ha.get('emv','?'):>3} spr={ha.get('spr','?'):>3}"
-                    f" kck={ha.get('kck','?'):>3} tk={ha.get('tk','?'):>3}"
-                    f" sh={ha.get('sh','?'):>3} hld={ha.get('hld','?'):>3}"
+                    f"  act: move={ha.get('mv','?'):>3} get_poss={ha.get('gp','?'):>3}"
+                    f" exec_move={ha.get('emv','?'):>3} sprint={ha.get('spr','?'):>3}"
+                    f" kick={ha.get('kck','?'):>3} tackle={ha.get('tk','?'):>3}"
+                    f" shoot={ha.get('sh','?'):>3} hold={ha.get('hld','?'):>3}"
                     + _prob_str
                 ) if ha else ""
                 opp_rew_str = f"/{mean_opp_reward:.2f}" if not (mean_opp_reward != mean_opp_reward) else ""
@@ -447,25 +637,48 @@ class PPOTrainer:
                 comp_str = ("  rew: " + "  ".join(comp_parts)) if comp_parts else ""
                 rollout_components.clear()
                 _val_diag_str = (
-                    f"  [V={metrics['values_mean']:.2f}±{metrics['values_std']:.2f} "
-                    f"R={metrics['returns_mean']:.2f}±{metrics['returns_std']:.2f} "
-                    f"adv={metrics['adv_mean']:.2f}±{metrics['adv_std']:.2f}]"
+                    f"V={metrics['values_mean']:.2f}\u00b1{metrics['values_std']:.2f}  "
+                    f"R={metrics['returns_mean']:.2f}\u00b1{metrics['returns_std']:.2f}  "
+                    f"adv={metrics['adv_mean']:.2f}\u00b1{metrics['adv_std']:.2f}"
                 )
-                log.info(
-                    f"step={self._total_steps:,} | "
-                    f"rew={mean_ep_reward:.2f}{opp_rew_str} | "
-                    f"pol={metrics['policy_loss']:.4f} "
-                    f"val={metrics['value_loss']:.4f}(x{self.vf_coef})={self.vf_coef * metrics['value_loss']:.4f} "
-                    f"ent={metrics['entropy']:.4f} "
-                    f"kl={metrics['approx_kl']:.4f}"
-                    f"{bc_str} | "
-                    f"{steps_per_sec:.0f}sps"
-                    f"{mv_ls_str}"
-                    f"{_val_diag_str}"
-                    f"{act_str}"
-                    f"{outcome_str}"
-                    f"{comp_str}"
-                )
+                # Tabulated multi-line rollout summary (readability refactor only —
+                # every field present in the old single-line format is still here,
+                # just grouped/aligned, with full-word labels and long lines wrapped
+                # to avoid overflow. See
+                # agent_plans/bc_execution_label_boundary_and_followups.md Part 4.
+                _lines = [
+                    "\u2500" * 70,
+                    f"[PPO] step={self._total_steps:,}  speed={steps_per_sec:.0f}/s  "
+                    f"reward={mean_ep_reward:.2f}{opp_rew_str}",
+                    f"  loss     policy={metrics['policy_loss']:.4f}  "
+                    f"value={metrics['value_loss']:.4f}(x{self.vf_coef})={self.vf_coef * metrics['value_loss']:.4f}",
+                    f"           entropy={metrics['entropy']:.4f}  kl={metrics['approx_kl']:.4f}"
+                    + (f"  {bc_str.strip()}" if bc_str else ""),
+                    f"  value    {_val_diag_str}",
+                ]
+                if mv_ls_str:
+                    _mv_ls_sublines = mv_ls_str.strip().split("\n")
+                    _lines.append(f"  moves    {_mv_ls_sublines[0].strip()}")
+                    for _sub in _mv_ls_sublines[1:]:
+                        _lines.append(f"           {_sub.strip()}")
+                if act_str:
+                    _act_body = act_str.strip().lstrip('act:').strip()
+                    _act_parts = _act_body.split("  ")
+                    _mid = (len(_act_parts) + 1) // 2
+                    _lines.append(f"  heads    {'  '.join(_act_parts[:_mid])}")
+                    if _act_parts[_mid:]:
+                        _lines.append(f"           {'  '.join(_act_parts[_mid:])}")
+                if outcome_str:
+                    _lines.append(f"  vs       {outcome_str.strip()}")
+                if comp_str:
+                    _comp_body = comp_str.strip().lstrip('rew:').strip()
+                    _comp_parts = _comp_body.split("  ")
+                    _mid = (len(_comp_parts) + 1) // 2
+                    _lines.append(f"  reward   {'  '.join(_comp_parts[:_mid])}")
+                    if _comp_parts[_mid:]:
+                        _lines.append(f"           {'  '.join(_comp_parts[_mid:])}")
+                _lines.append("\u2500" * 70)
+                log.info("\n".join(_lines))
 
                 buffer.clear()
                 steps_this_rollout = 0
@@ -541,6 +754,7 @@ class PPOTrainer:
         rollout_steps: int,
         value_epochs: int = 5,
         repair_lr: Optional[float] = None,
+        experiment_separate_value_net: bool = False,
     ) -> None:
         """Joint BC + value pre-training in a single pass.
 
@@ -608,8 +822,14 @@ class PPOTrainer:
         # forward pass every minibatch (to produce e_heads.value from d_heads),
         # but only its value_head receives gradients from this loss. Uses
         # stored rewards/dones so no env interaction is needed. Skipped if the
-        # dataset has no reward data or demo_value_pretrain_epochs=0.
-        _demo_epochs = self._demo_value_pretrain_epochs
+        # dataset has no reward data or demo_value_pretrain_epochs=0. ALSO
+        # skipped entirely when separate_value_net is enabled: this phase only
+        # warms execution_net.value_head, which is unused/frozen in that mode
+        # (self.value_net is the sole critic and is trained purely via
+        # pretrain_value()'s MSE-only warm-up, never via BC) -- this is the
+        # whole point of separate_value_net, so decision_net gets a pure BC
+        # warm-up here instead (no value term at all).
+        _demo_epochs = 0 if self.separate_value_net else self._demo_value_pretrain_epochs
         if _demo_epochs > 0 and dataset.has_rewards:
             demo_opt = torch.optim.Adam(
                 list(self.decision_net.parameters())
@@ -691,8 +911,13 @@ class PPOTrainer:
         # --- Phase 1: BC epochs over the dataset ---
         # If dataset has reward data and demo_value_bc_coef > 0, also add a
         # value loss term (MSE against demo returns) in the same backward pass.
+        # Disabled when separate_value_net is enabled -- this term trains
+        # execution_net.value_head, which is unused/frozen in that mode (see
+        # Phase 0 comment above); self.value_net gets its warm-up purely from
+        # pretrain_value()'s MSE-only loop, never mixed with BC gradients.
         _use_joint_val = (
-            self._bc_value_coef > 0.0
+            not self.separate_value_net
+            and self._bc_value_coef > 0.0
             and dataset.has_rewards
         )
         if _use_joint_val:
@@ -715,8 +940,11 @@ class PPOTrainer:
             val_losses: list[float] = []
             val_raw_mse_losses: list[float] = []
             dir_cosines: list[float] = []
+            kick_dir_cosines: list[float] = []
             move_probs: list[float] = []
             sprint_probs: list[float] = []
+            kick_probs: list[float] = []
+            tackle_attempt_probs: list[float] = []
             _bkdn_acc: dict[str, float] = {}
             _bkdn_n: int = 0
             if self._downsample_trivial_enabled:
@@ -819,14 +1047,33 @@ class PPOTrainer:
                         pred_n = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
                         cos_vals = (pred_n * tgt_dir).sum(dim=-1)
                         dir_cosines.append(cos_vals.mean().item())
+                    kicked_mask = valid_mask & (bc_labels[:, 12] > 0.5)  # _I_KICK_THIS_TICK
+                    has_kick_dir = (bc_labels[:, 18].abs() + bc_labels[:, 19].abs()) > 1e-6  # _I_KICK_DIR_X/Y
+                    ksel = kicked_mask & has_kick_dir
+                    if ksel.any():
+                        pred_kdir = e_heads.kick_direction[ksel]
+                        tgt_kdir = bc_labels[ksel, 18:20]
+                        eps = 1e-6
+                        pred_kn = pred_kdir / (pred_kdir.norm(dim=-1, keepdim=True) + eps)
+                        kcos_vals = (pred_kn * tgt_kdir).sum(dim=-1)
+                        kick_dir_cosines.append(kcos_vals.mean().item())
                     if valid_mask.any():
                         move_probs.append(torch.sigmoid(e_heads.exec_move_logit.squeeze(-1)[valid_mask]).mean().item())
                         sprint_probs.append(torch.sigmoid(e_heads.sprint_logit.squeeze(-1)[valid_mask]).mean().item())
+                        kick_probs.append(torch.sigmoid(e_heads.kick_logit.squeeze(-1)[valid_mask]).mean().item())
+                        tackle_attempt_probs.append(torch.sigmoid(e_heads.tackle_attempt_logit.squeeze(-1)[valid_mask]).mean().item())
 
             mean_cos = float(np.mean(dir_cosines)) if dir_cosines else float('nan')
+            mean_kick_cos = float(np.mean(kick_dir_cosines)) if kick_dir_cosines else float('nan')
             mean_mv = float(np.mean(move_probs)) if move_probs else float('nan')
             mean_spr = float(np.mean(sprint_probs)) if sprint_probs else float('nan')
-            bkdn_str = "  ".join(f"{k}={v/_bkdn_n:.3f}" for k, v in _bkdn_acc.items()) if _bkdn_n else ""
+            mean_kk = float(np.mean(kick_probs)) if kick_probs else float('nan')
+            mean_tk = float(np.mean(tackle_attempt_probs)) if tackle_attempt_probs else float('nan')
+            _kick_bkdn_keys = {"kick", "kick_direction", "kick_power", "kick_spin"}
+            bkdn_str = "  ".join(
+                f"{k}={v/_bkdn_n:.5f}" if k in _kick_bkdn_keys else f"{k}={v/_bkdn_n:.3f}"
+                for k, v in _bkdn_acc.items()
+            ) if _bkdn_n else ""
             if val_losses:
                 val_rmse = float(np.sqrt(np.mean(val_raw_mse_losses))) if val_raw_mse_losses else float('nan')
                 _mean_val = np.mean(val_losses)
@@ -838,14 +1085,26 @@ class PPOTrainer:
             else:
                 val_str = ""
             _epoch_elapsed = time.monotonic() - _epoch_t0
-            log.info(
-                f"  BC epoch {epoch + 1}/{n_epochs}: bc_loss={np.mean(bc_losses):.4f}"
-                + val_str
-                + f"  dir_cos={mean_cos:.3f}  mv_p={mean_mv:.3f}  spr_p={mean_spr:.3f}"
-                + (f"  [{bkdn_str}]" if bkdn_str else "")
-                + f"  ({_epoch_elapsed:.1f}s)"
-            )
+            # Tabulated multi-line epoch summary (readability refactor only — every
+            # field from the old single-line format is preserved, just grouped, with
+            # full-word labels and long lines wrapped to avoid overflow. See
+            # agent_plans/bc_execution_label_boundary_and_followups.md Part 4.
+            _bc_lines = [
+                f"  BC epoch {epoch + 1}/{n_epochs}  ({_epoch_elapsed:.1f}s)",
+                f"    loss       bc={np.mean(bc_losses):.4f}" + (val_str.strip() and f"  {val_str.strip()}" or ""),
+                f"    heads      dir_cos={mean_cos:.3f}  kick_dir_cos={mean_kick_cos:.3f}",
+                f"               move_prob={mean_mv:.3f}  sprint_prob={mean_spr:.3f}  "
+                f"kick_prob={mean_kk:.3f}  tackle_prob={mean_tk:.3f}",
+            ]
+            if bkdn_str:
+                _bkdn_parts = bkdn_str.split("  ")
+                _mid = (len(_bkdn_parts) + 1) // 2
+                _bc_lines.append(f"    breakdown  {'  '.join(_bkdn_parts[:_mid])}")
+                if _bkdn_parts[_mid:]:
+                    _bc_lines.append(f"               {'  '.join(_bkdn_parts[_mid:])}")
+            log.info("\n".join(_bc_lines))
             dir_cosines.clear()
+            kick_dir_cosines.clear()
             move_probs.clear()
             sprint_probs.clear()
             _bkdn_acc.clear()
@@ -866,6 +1125,7 @@ class PPOTrainer:
             n_epochs=max(1, value_epochs),
             lr=value_lr,
             batch_size=batch_size,
+            experiment_separate_value_net=experiment_separate_value_net,
         )
 
         # --- BC degradation check: re-evaluate BC loss over dataset after value warm-up ---
@@ -920,8 +1180,11 @@ class PPOTrainer:
             for epoch in range(repair_epochs):
                 repair_losses = []
                 dir_cosines_r: list[float] = []
+                kick_dir_cosines_r: list[float] = []
                 move_probs_r: list[float] = []
                 sprint_probs_r: list[float] = []
+                kick_probs_r: list[float] = []
+                tackle_attempt_probs_r: list[float] = []
                 _bkdn_r_acc: dict[str, float] = {}
                 _bkdn_r_n: int = 0
                 for obs_dict, bc_labels in dataset.iterate_minibatches(
@@ -975,13 +1238,27 @@ class PPOTrainer:
                             eps = 1e-6
                             pred_n = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
                             dir_cosines_r.append((pred_n * tgt_dir).sum(dim=-1).mean().item())
+                        kicked_mask_r = valid_mask & (bc_labels[:, 12] > 0.5)  # _I_KICK_THIS_TICK
+                        has_kick_dir_r = (bc_labels[:, 18].abs() + bc_labels[:, 19].abs()) > 1e-6
+                        ksel_r = kicked_mask_r & has_kick_dir_r
+                        if ksel_r.any():
+                            pred_kdir_r = e_r.kick_direction[ksel_r]
+                            tgt_kdir_r = bc_labels[ksel_r, 18:20]
+                            eps = 1e-6
+                            pred_kn_r = pred_kdir_r / (pred_kdir_r.norm(dim=-1, keepdim=True) + eps)
+                            kick_dir_cosines_r.append((pred_kn_r * tgt_kdir_r).sum(dim=-1).mean().item())
                         if valid_mask.any():
                             move_probs_r.append(torch.sigmoid(e_r.exec_move_logit.squeeze(-1)[valid_mask]).mean().item())
                             sprint_probs_r.append(torch.sigmoid(e_r.sprint_logit.squeeze(-1)[valid_mask]).mean().item())
+                            kick_probs_r.append(torch.sigmoid(e_r.kick_logit.squeeze(-1)[valid_mask]).mean().item())
+                            tackle_attempt_probs_r.append(torch.sigmoid(e_r.tackle_attempt_logit.squeeze(-1)[valid_mask]).mean().item())
 
                 mean_cos_r = float(np.mean(dir_cosines_r)) if dir_cosines_r else float('nan')
+                mean_kick_cos_r = float(np.mean(kick_dir_cosines_r)) if kick_dir_cosines_r else float('nan')
                 mean_mv_r = float(np.mean(move_probs_r)) if move_probs_r else float('nan')
                 mean_spr_r = float(np.mean(sprint_probs_r)) if sprint_probs_r else float('nan')
+                mean_kk_r = float(np.mean(kick_probs_r)) if kick_probs_r else float('nan')
+                mean_tk_r = float(np.mean(tackle_attempt_probs_r)) if tackle_attempt_probs_r else float('nan')
                 # Also measure value loss on the stored rollout returns (no gradient)
                 with torch.no_grad():
                     val_losses_r = []
@@ -995,21 +1272,44 @@ class PPOTrainer:
                             mb_obs_r["exists_mask"], mb_obs_r["ball_feat"], mb_obs_r["global_feat"],
                             _sat_r, _oat_r,
                         )
-                        e_vr = self.execution_net(
+                        _val_net_r = self.value_net if self.separate_value_net else self.execution_net
+                        e_vr = _val_net_r(
                             mb_obs_r["self_feat"], mb_obs_r["other_feat"],
                             mb_obs_r["exists_mask"], mb_obs_r["ball_feat"], mb_obs_r["global_feat"],
                             d_vr, _sat_r, _oat_r,
                         )
-                        pred_vr = e_vr.value.squeeze(-1)  # single value head (execution_net)
+                        pred_vr = e_vr.value.squeeze(-1)  # single critic (execution_net, or self.value_net)
                         val_losses_r.append(F.mse_loss(pred_vr, mb_ret_r).item() / (ret_std ** 2).item())
-                bkdn_r_str = "  ".join(f"{k}={v/_bkdn_r_n:.3f}" for k, v in _bkdn_r_acc.items()) if _bkdn_r_n else ""
-                log.info(
-                    f"  BC repair epoch {epoch + 1}/{repair_epochs}: bc_loss={np.mean(repair_losses):.4f}"
-                    f"  dir_cos={mean_cos_r:.3f}  mv_p={mean_mv_r:.3f}  spr_p={mean_spr_r:.3f}"
-                    f"  val_loss={np.mean(val_losses_r):.4f}"
-                    + (f"  [{bkdn_r_str}]" if bkdn_r_str else "")
-                )
-            log.info(f"BC repair done ({repair_epochs} epoch(s), final bc_loss={np.mean(repair_losses):.4f}  dir_cos={mean_cos_r:.3f}  mv_p={mean_mv_r:.3f}  spr_p={mean_spr_r:.3f}  val_loss={np.mean(val_losses_r):.4f})")
+                _kick_bkdn_keys = {"kick", "kick_direction", "kick_power", "kick_spin"}
+                bkdn_r_str = "  ".join(
+                    f"{k}={v/_bkdn_r_n:.5f}" if k in _kick_bkdn_keys else f"{k}={v/_bkdn_r_n:.3f}"
+                    for k, v in _bkdn_r_acc.items()
+                ) if _bkdn_r_n else ""
+                # Tabulated multi-line epoch summary (readability refactor only — every
+                # field from the old single-line format is preserved, just grouped, with
+                # full-word labels and long lines wrapped to avoid overflow. See
+                # agent_plans/bc_execution_label_boundary_and_followups.md Part 4.
+                _bc_r_lines = [
+                    f"  BC repair epoch {epoch + 1}/{repair_epochs}",
+                    f"    loss       bc={np.mean(repair_losses):.4f}  val={np.mean(val_losses_r):.4f}",
+                    f"    heads      dir_cos={mean_cos_r:.3f}  kick_dir_cos={mean_kick_cos_r:.3f}",
+                    f"               move_prob={mean_mv_r:.3f}  sprint_prob={mean_spr_r:.3f}  "
+                    f"kick_prob={mean_kk_r:.3f}  tackle_prob={mean_tk_r:.3f}",
+                ]
+                if bkdn_r_str:
+                    _bkdn_r_parts = bkdn_r_str.split("  ")
+                    _mid_r = (len(_bkdn_r_parts) + 1) // 2
+                    _bc_r_lines.append(f"    breakdown  {'  '.join(_bkdn_r_parts[:_mid_r])}")
+                    if _bkdn_r_parts[_mid_r:]:
+                        _bc_r_lines.append(f"               {'  '.join(_bkdn_r_parts[_mid_r:])}")
+                log.info("\n".join(_bc_r_lines))
+            log.info(
+                f"BC repair done ({repair_epochs} epoch(s), final bc_loss={np.mean(repair_losses):.4f}  "
+                f"val_loss={np.mean(val_losses_r):.4f})\n"
+                f"  final heads  dir_cos={mean_cos_r:.3f}  kick_dir_cos={mean_kick_cos_r:.3f}  "
+                f"move_prob={mean_mv_r:.3f}  sprint_prob={mean_spr_r:.3f}\n"
+                f"               kick_prob={mean_kk_r:.3f}  tackle_prob={mean_tk_r:.3f}"
+            )
 
         log.info("Combined pre-training complete.")
 
@@ -1020,6 +1320,7 @@ class PPOTrainer:
         n_epochs: int,
         lr: float,
         batch_size: Optional[int] = None,
+        experiment_separate_value_net: bool = False,
     ) -> dict:
         """Warm-start the value heads to predict actual returns before PPO starts.
 
@@ -1042,6 +1343,21 @@ class PPOTrainer:
             n_epochs: Epochs to fit the value network per collected rollout
             lr: Learning rate for value pre-training (higher than PPO lr, e.g. 1e-3)
             batch_size: Minibatch size. Defaults to ``self.minibatch_size``.
+            experiment_separate_value_net: EXPERIMENTAL (see Idea2.md /
+                ai_trainer_knowledge.md "separate value network" discussion) —
+                when True, also constructs a second, completely independent
+                ``ExecutionNetwork`` (same class + config, fresh random init, NOT
+                sharing any weights with ``self.execution_net``) and trains it
+                fully unfrozen (no ``_get_value_pretrain_freeze_params()``
+                freezing) on the identical rollout data/returns as the main
+                shared-trunk value head. It still reads ``decision_heads`` from
+                the real (frozen) ``self.decision_net``, so the comparison
+                isolates "separate execution-net trunk for the value head" as
+                the only variable — same input information, same architecture,
+                same data, only the trunk-sharing differs. Logs a side-by-side
+                val_rmse comparison each epoch. Purely a read-only experiment:
+                the second network is discarded when this method returns (no
+                checkpoint save, no effect on the real value_head or PPO).
 
         Returns:
             dict with diagnostic stats from the rollout collection:
@@ -1050,14 +1366,36 @@ class PPOTrainer:
         """
         _batch_size = batch_size if batch_size is not None else self.minibatch_size
         log.info(f"Value pre-training: {n_steps} steps, {n_epochs} epochs, lr={lr}")
-        # Freeze trunk layers so BC-learned policy weights are not corrupted.
-        _freeze_params = self._get_value_pretrain_freeze_params()
-        for p in _freeze_params:
-            p.requires_grad_(False)
-        value_opt = torch.optim.Adam(
-            list(self.execution_net.value_head.parameters()),
-            lr=lr, eps=1e-5,
-        )
+        if self.separate_value_net:
+            # self.value_net is fully independent of the BC-primed policy trunk --
+            # nothing to freeze/protect, train the whole thing (this is the whole
+            # point: a critic that never saw a BC gradient, free to organise its
+            # own features purely for value prediction from step one).
+            value_opt = self.value_net_optimizer
+        else:
+            # Freeze trunk layers so BC-learned policy weights are not corrupted.
+            _freeze_params = self._get_value_pretrain_freeze_params()
+            for p in _freeze_params:
+                p.requires_grad_(False)
+            value_opt = torch.optim.Adam(
+                list(self.execution_net.value_head.parameters()),
+                lr=lr, eps=1e-5,
+            )
+
+        # --- Experimental: separate-trunk value network (see docstring) ---
+        _sep_net = None
+        _sep_opt = None
+        if experiment_separate_value_net:
+            from footballcoach.ai.models.execution_network import ExecutionNetwork
+            _sep_net = ExecutionNetwork.from_config().to(self.device)
+            # Fully unfrozen: every parameter of this fresh network trains,
+            # unlike the main value_head-only optimizer above.
+            _sep_opt = torch.optim.Adam(_sep_net.parameters(), lr=lr, eps=1e-5)
+            log.info(
+                "  [separate value net experiment] constructed a second, independent "
+                "ExecutionNetwork (fresh init, fully unfrozen) for side-by-side "
+                "value-loss comparison against the shared-trunk value_head above."
+            )
 
         env.sample_action_fn = self._sample_action
         env.reset()
@@ -1168,11 +1506,15 @@ class PPOTrainer:
         mean_loss = float("nan")
         epochs_done = 0
         _best_val_loss = float("inf")
+        _best_val_state: Optional[dict] = None
         _patience = 0
-        _EARLY_STOP_PATIENCE = 5
+        _EARLY_STOP_PATIENCE = self._value_pretrain_early_stop_patience
+        _EARLY_STOP_MIN_DELTA = self._value_pretrain_early_stop_min_delta
+        ep_losses_sep: list[float] = []  # populated only when experiment_separate_value_net
         for ep in range(n_epochs):
             indices = torch.randperm(n)
             ep_losses = []
+            ep_losses_sep = []
             for start in range(0, n, _batch_size):
                 mb_idx = indices[start:start + _batch_size]
                 mb_obs = {k.replace("obs/", ""): train_batch[k][mb_idx].to(self.device)
@@ -1186,26 +1528,74 @@ class PPOTrainer:
                 gf = mb_obs["global_feat"]
                 sat, oat = _ai_types(mb_obs)
 
-                d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
-                e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
-                new_values = e_heads.value.squeeze(-1)  # single value head (execution_net)
+                if self.separate_value_net:
+                    # decision_net stays fully frozen/detached here -- self.value_net
+                    # is completely independent, no need for its gradient to reach
+                    # decision_net at all (unlike the shared-trunk path below, where
+                    # decision_net params are included in the optimizer/clip so its
+                    # BC-pretrained-but-still-nominally-trainable params get the
+                    # gradient too under the old convention).
+                    with torch.no_grad():
+                        d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                    e_heads = self.value_net(sf, of, em, bf, gf, d_heads, sat, oat)
+                    new_values = e_heads.value.squeeze(-1)
 
-                # Normalised MSE so the loss is O(1) regardless of return scale
-                value_loss = F.mse_loss(new_values, mb_ret) / (ret_std ** 2)
+                    value_loss = F.mse_loss(new_values, mb_ret) / (ret_std ** 2)
 
-                value_opt.zero_grad()
-                value_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
-                    self.max_grad_norm,
-                )
-                value_opt.step()
-                ep_losses.append(value_loss.item())
+                    value_opt.zero_grad()
+                    value_loss.backward()
+                    nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
+                    value_opt.step()
+                    ep_losses.append(value_loss.item())
+                else:
+                    d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                    e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
+                    new_values = e_heads.value.squeeze(-1)  # single value head (execution_net)
+
+                    # Normalised MSE so the loss is O(1) regardless of return scale
+                    value_loss = F.mse_loss(new_values, mb_ret) / (ret_std ** 2)
+
+                    value_opt.zero_grad()
+                    value_loss.backward()
+                    nn.utils.clip_grad_norm_(
+                        list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+                        self.max_grad_norm,
+                    )
+                    value_opt.step()
+                    ep_losses.append(value_loss.item())
+
+                # --- Experimental separate-trunk value net: identical mb_obs/mb_ret,
+                # identical decision-head VALUES (from the same frozen decision_net) —
+                # only the execution-net trunk/encoders/value_head differ (fresh,
+                # unfrozen, zero weight sharing with self.execution_net). d_heads is
+                # detached here so this experimental path is totally independent: no
+                # gradient flows back into decision_net, and it does not try to reuse
+                # the main value path's autograd graph (already freed by the
+                # .backward() call above).
+                if _sep_net is not None:
+                    d_heads_detached = dataclasses.replace(
+                        d_heads,
+                        **{f.name: getattr(d_heads, f.name).detach()
+                           for f in dataclasses.fields(d_heads)},
+                    )
+                    e_heads_sep = _sep_net(sf, of, em, bf, gf, d_heads_detached, sat, oat)
+                    new_values_sep = e_heads_sep.value.squeeze(-1)
+                    value_loss_sep = F.mse_loss(new_values_sep, mb_ret) / (ret_std ** 2)
+
+                    _sep_opt.zero_grad()
+                    value_loss_sep.backward()
+                    nn.utils.clip_grad_norm_(_sep_net.parameters(), self.max_grad_norm)
+                    _sep_opt.step()
+                    ep_losses_sep.append(value_loss_sep.item())
 
             mean_loss = float(np.mean(ep_losses))
             epochs_done = ep + 1
             _train_rmse = float(ret_std) * math.sqrt(mean_loss)
+            _mean_loss_sep = float(np.mean(ep_losses_sep)) if ep_losses_sep else float("nan")
+            _train_rmse_sep = float(ret_std) * math.sqrt(_mean_loss_sep) if ep_losses_sep else float("nan")
 
+            _vl_sep = float("nan")
+            _val_rmse_sep = float("nan")
             if val_obs_dict is not None and val_returns_t is not None:
                 with torch.no_grad():
                     _sat_v, _oat_v = _ai_types(val_obs_dict)
@@ -1214,7 +1604,8 @@ class PPOTrainer:
                         val_obs_dict["exists_mask"], val_obs_dict["ball_feat"],
                         val_obs_dict["global_feat"], _sat_v, _oat_v,
                     )
-                    e_v = self.execution_net(
+                    _val_net = self.value_net if self.separate_value_net else self.execution_net
+                    e_v = _val_net(
                         val_obs_dict["self_feat"], val_obs_dict["other_feat"],
                         val_obs_dict["exists_mask"], val_obs_dict["ball_feat"],
                         val_obs_dict["global_feat"], d_v, _sat_v, _oat_v,
@@ -1222,16 +1613,37 @@ class PPOTrainer:
                     _vl = float(F.mse_loss(
                         e_v.value.squeeze(-1), val_returns_t
                     ) / (ret_std ** 2))
+                    if _sep_net is not None:
+                        e_v_sep = _sep_net(
+                            val_obs_dict["self_feat"], val_obs_dict["other_feat"],
+                            val_obs_dict["exists_mask"], val_obs_dict["ball_feat"],
+                            val_obs_dict["global_feat"], d_v, _sat_v, _oat_v,
+                        )
+                        _vl_sep = float(F.mse_loss(
+                            e_v_sep.value.squeeze(-1), val_returns_t
+                        ) / (ret_std ** 2))
+                        _val_rmse_sep = float(ret_std) * math.sqrt(_vl_sep)
                 _val_rmse = float(ret_std) * math.sqrt(_vl)
                 log.info(
                     f"  Value epoch {epochs_done}/{n_epochs}: "
                     f"train={mean_loss:.4f} rmse={_train_rmse:.2f}  "
                     f"val={_vl:.4f} val_rmse={_val_rmse:.2f} "
                     f"(std={float(ret_std):.1f})"
+                    + (
+                        f"\n    [separate-trunk value net] train={_mean_loss_sep:.4f} rmse={_train_rmse_sep:.2f}  "
+                        f"val={_vl_sep:.4f} val_rmse={_val_rmse_sep:.2f}"
+                        f"  (shared-trunk val_rmse={_val_rmse:.2f} \u2014 "
+                        f"{'separate is BETTER' if _val_rmse_sep < _val_rmse else 'shared is better or equal'})"
+                        if _sep_net is not None else ""
+                    )
                 )
-                if _vl < _best_val_loss - 1e-4:
+                if _vl < _best_val_loss - _EARLY_STOP_MIN_DELTA:
                     _best_val_loss = _vl
                     _patience = 0
+                    if self.separate_value_net:
+                        _best_val_state = copy.deepcopy(self.value_net.state_dict())
+                    else:
+                        _best_val_state = copy.deepcopy(self.execution_net.value_head.state_dict())
                 else:
                     _patience += 1
                     if _patience >= _EARLY_STOP_PATIENCE:
@@ -1245,10 +1657,26 @@ class PPOTrainer:
                     f"  Value epoch {epochs_done}/{n_epochs}: "
                     f"train_loss={mean_loss:.4f}  rmse={_train_rmse:.2f} "
                     f"(returns std={float(ret_std):.1f})"
+                    + (
+                        f"\n    [separate-trunk value net] train_loss={_mean_loss_sep:.4f}  rmse={_train_rmse_sep:.2f}"
+                        if _sep_net is not None else ""
+                    )
                 )
+        if _best_val_state is not None:
+            if self.separate_value_net:
+                self.value_net.load_state_dict(_best_val_state)
+            else:
+                self.execution_net.value_head.load_state_dict(_best_val_state)
+            log.info(f"  [value pretrain] restored best-val weights (val_loss={_best_val_loss:.4f})")
         log.info(f"Value pre-training done ({epochs_done} epoch(s), final train_loss={mean_loss:.4f})")
-        for p in _freeze_params:
-            p.requires_grad_(True)
+        if _sep_net is not None:
+            log.info(
+                f"  [separate value net experiment] final train_loss={_mean_loss_sep:.4f}"
+                f"  (compare against shared-trunk final train_loss={mean_loss:.4f} above)"
+            )
+        if not self.separate_value_net:
+            for p in _freeze_params:
+                p.requires_grad_(True)
 
         return {
             "episode_returns": episode_returns,
@@ -1377,8 +1805,13 @@ class PPOTrainer:
 
         # Combined log_prob
         # Single value head: execution_net only (decision_net.value_head is
-        # frozen — see __init__ note).
-        value = float(e_heads.value.mean())
+        # frozen — see __init__ note), OR self.value_net when
+        # separate_value_net is enabled (see _value_heads() docstring).
+        if self.separate_value_net:
+            with torch.no_grad():
+                value = float(self.value_net(sf, of, em, bf, gf, d_heads, sat, oat).value.mean())
+        else:
+            value = float(e_heads.value.mean())
         log_prob = self._compute_log_prob(d_heads, e_heads, {
             "shoot": shoot, "pass_": pass_, "move": move,
             "tackle": tackle, "gp_extra": gp_extra, "mark": mark, "hold": hold,
@@ -1464,8 +1897,8 @@ class PPOTrainer:
         sat = obs_dict["self_ai_type"].to(self.device) if "self_ai_type" in obs_dict else None
         oat = obs_dict["other_ai_type"].to(self.device) if "other_ai_type" in obs_dict else None
         d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
-        e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
-        return float(e_heads.value.mean())  # single value head (execution_net)
+        e_heads = self._value_heads(sf, of, em, bf, gf, d_heads, sat, oat)
+        return float(e_heads.value.mean())  # single critic (execution_net, or self.value_net)
 
     def _compute_log_prob(self, d_heads, e_heads, samples: dict, exists_mask) -> torch.Tensor:
         """Compute combined log_prob across all action heads."""
@@ -1539,9 +1972,10 @@ class PPOTrainer:
         n = len(batch["log_probs"])
         clip = self.schedules.clip(progress)
         lr = self.schedules.lr(progress)
+        value_lr = self.schedules.value_lr(progress)
         bc_coeff = self.schedules.bc(progress)
         for pg in self.optimizer.param_groups:
-            pg["lr"] = lr
+            pg["lr"] = value_lr if pg.get("name") == "value" else lr
 
         has_bc = "bc_labels" in batch and bc_coeff > 0.0
 
@@ -1562,6 +1996,15 @@ class PPOTrainer:
         all_kick_prob: list[float] = []         # mean sigmoid(kick_logit) per mb
         all_ratios: list[torch.Tensor] = []
         all_mv_log_std_grad: list[float] = []  # grad on move_dir_log_std after each backward
+        # Grad-norm clipping diagnostics: pre-clip norm for each of the two isolated
+        # groups (non-direction "main", direction) per minibatch, plus how many
+        # minibatches actually exceeded their respective limit (i.e. were clipped).
+        # Lets us see how often/hard each group is being clipped, rather than just
+        # the old single combined-group raw_grad_norm debug value.
+        all_grad_norm_main: list[float] = []
+        all_grad_norm_dir: list[float] = []
+        clip_triggered_main = 0
+        clip_triggered_dir = 0
         epoch_times = []
         KL_DIAG_THRESHOLD = 0.1  # ~5× target_kl; log detailed diagnostics above this
 
@@ -1615,8 +2058,22 @@ class PPOTrainer:
                 d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
                 e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
 
-                # Value estimate — single value head (execution_net only)
-                new_values = e_heads.value.squeeze(-1)
+                # Value estimate — single value head (execution_net only), OR the
+                # dedicated self.value_net when separate_value_net is enabled. In
+                # the latter case d_heads is detached before feeding value_net so
+                # its (separately-optimised) value loss never contributes gradient
+                # into decision_net -- the whole point of separate_value_net is a
+                # critic trunk fully independent of the (BC-primed) policy trunk.
+                if self.separate_value_net:
+                    d_heads_for_value = dataclasses.replace(
+                        d_heads,
+                        **{f.name: getattr(d_heads, f.name).detach()
+                           for f in dataclasses.fields(d_heads)},
+                    )
+                    e_heads_value = self.value_net(sf, of, em, bf, gf, d_heads_for_value, sat, oat)
+                    new_values = e_heads_value.value.squeeze(-1)
+                else:
+                    new_values = e_heads.value.squeeze(-1)
 
                 # New log_probs (sample stored actions from batch)
                 mb_actions = {k.replace("action/", ""): batch[k][mb_idx].to(self.device)
@@ -1719,7 +2176,15 @@ class PPOTrainer:
                 all_bc_loss.append(bc_loss_val.detach().item())
 
                 self.optimizer.zero_grad()
+                if self.separate_value_net:
+                    self.value_net_optimizer.zero_grad()
                 total_loss.backward()
+                # d_heads_for_value was detached above, so value_loss's gradient
+                # (folded into total_loss) only reaches self.value_net's params
+                # here -- decision_net/execution_net's policy heads never see it.
+                if self.separate_value_net:
+                    nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
+                    self.value_net_optimizer.step()
 
                 # Capture dir_log_std gradient before it is zeroed
                 _mv_ls_grad = self.execution_net.move_dir_log_std.grad
@@ -1731,10 +2196,31 @@ class PPOTrainer:
                     list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
                     float("inf"),  # don't clip yet, just measure
                 ).item()
-                nn.utils.clip_grad_norm_(
-                    list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
-                    self.max_grad_norm,
-                )
+                # Direction-head params (move_direction/kick_direction weights +
+                # move_dir_log_std/kick_dir_log_std) are clipped in their own
+                # isolated group via direction_max_grad_norm, so a single sample's
+                # large direction gradient can no longer force a proportional
+                # shrink of every other head's gradient in the same step (and a
+                # calm direction gradient no longer "borrows" clip headroom from
+                # a genuinely large gradient elsewhere). Falls back to sharing
+                # max_grad_norm when direction_max_grad_norm is unset (None).
+                _non_direction_params = [
+                    p for p in list(self.decision_net.parameters()) + list(self.execution_net.parameters())
+                    if id(p) not in self.direction_param_ids
+                ]
+                _direction_params = [
+                    p for p in self.execution_net.parameters()
+                    if id(p) in self.direction_param_ids
+                ]
+                _gn_main = nn.utils.clip_grad_norm_(_non_direction_params, self.max_grad_norm).item()
+                all_grad_norm_main.append(_gn_main)
+                if _gn_main > self.max_grad_norm:
+                    clip_triggered_main += 1
+                if _direction_params:
+                    _gn_dir = nn.utils.clip_grad_norm_(_direction_params, self.direction_max_grad_norm).item()
+                    all_grad_norm_dir.append(_gn_dir)
+                    if _gn_dir > self.direction_max_grad_norm:
+                        clip_triggered_dir += 1
                 self.optimizer.step()
 
                 # After step: measure KL and direction mean shift
@@ -1794,6 +2280,178 @@ class PPOTrainer:
             if _early_stopped:
                 break
 
+        # --- Value-only continuation: the policy's KL early-stop above cuts the
+        # combined policy+value loop short (often after just 1-3 minibatches), which
+        # was starving the critic of gradient steps regardless of its own dedicated,
+        # higher LR param group. Since policy and value are independent param groups
+        # with independent gradients, keep training the value head alone (no policy
+        # loss/backward, so no further KL risk) for the remaining epoch/minibatch
+        # budget. This directly targets the "val stuck > 1.0 for the whole rollout"
+        # symptom without touching the policy's trust region.
+        if _early_stopped:
+            value_only_steps = 0
+            for _ in range(self.value_only_continuation_epochs):
+                indices = torch.randperm(n)
+                for start in range(0, n, self.minibatch_size):
+                    mb_idx = indices[start:start + self.minibatch_size]
+                    if len(mb_idx) == 0:
+                        continue
+                    mb_obs = {k.replace("obs/", ""): batch[k][mb_idx].to(self.device)
+                              for k in batch if k.startswith("obs/")}
+                    mb_ret = returns[mb_idx].to(self.device)
+
+                    sf = mb_obs["self_feat"]
+                    of = mb_obs["other_feat"]
+                    em = mb_obs["exists_mask"]
+                    bf = mb_obs["ball_feat"]
+                    gf = mb_obs["global_feat"]
+                    sat, oat = _ai_types(mb_obs)
+
+                    with torch.no_grad():
+                        d_heads_vo = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                    if self.separate_value_net:
+                        e_heads_vo = self.value_net(sf, of, em, bf, gf, d_heads_vo, sat, oat)
+                    else:
+                        e_heads_vo = self.execution_net(sf, of, em, bf, gf, d_heads_vo, sat, oat)
+                    new_values_vo = e_heads_vo.value.squeeze(-1)
+
+                    ret_var = returns.var().clamp(min=1.0)
+                    value_loss_vo = F.mse_loss(new_values_vo, mb_ret) / ret_var
+
+                    if self.separate_value_net:
+                        self.value_net_optimizer.zero_grad()
+                        (self.vf_coef * value_loss_vo).backward()
+                        nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
+                        self.value_net_optimizer.step()
+                    else:
+                        self.optimizer.zero_grad()
+                        (self.vf_coef * value_loss_vo).backward()
+                        nn.utils.clip_grad_norm_(
+                            list(self.execution_net.value_head.parameters())
+                            + list(self.execution_net.value_ai_type_channel.parameters()),
+                            self.max_grad_norm,
+                        )
+                        self.optimizer.step()
+
+                    all_value_loss.append(value_loss_vo.item())
+                    value_only_steps += 1
+            if value_only_steps:
+                log.info(
+                    f"  [value-only continuation] {value_only_steps} extra minibatch step(s)"
+                    f"  after policy early-stop  final_val_loss={all_value_loss[-1]:.4f}"
+                )
+
+        # --- BC-only continuation: same rationale as value-only continuation
+        # above, but for the BC auxiliary loss (see bc.bc_only_continuation_epochs
+        # in ai_config.json). Early-stop cuts the combined policy+value+BC loop
+        # short, which was also silently truncating BC's intended annealed
+        # gradient budget every rollout (not just the value head). BC updates
+        # the SAME decision_net/execution_net params the policy uses (unlike
+        # the value head's isolated param group), so this runs strictly after
+        # the value-only continuation, using no policy forward/backward and
+        # computing no ratio/KL — it cannot itself trigger further early-stops.
+        #
+        # Coefficient: uses bc.bc_only_continuation_coeff if set, otherwise
+        # falls back to the same annealed bc_coeff used for the in-epoch BC aux
+        # loss (prior behaviour). This lets you decouple the two - e.g. anneal
+        # aux_coeff to 0.0 to stop BC from fighting the policy gradient during
+        # the main epoch loop, while keeping a fixed bc_only_continuation_coeff
+        # so this loop still nudges the network toward demo behaviour with
+        # otherwise-unused post-early-stop gradient budget.
+        bc_only_coeff = (
+            self.bc_only_continuation_coeff
+            if self.bc_only_continuation_coeff is not None
+            else bc_coeff
+        )
+        if has_bc and self.bc_only_continuation_epochs > 0 and bc_only_coeff > 0.0:
+            bc_only_steps = 0
+            last_bc_only_loss = 0.0
+            bc_clip_triggered_main = 0
+            bc_clip_triggered_dir = 0
+            bc_grad_norm_main: list[float] = []
+            bc_grad_norm_dir: list[float] = []
+            for _ in range(self.bc_only_continuation_epochs):
+                indices = torch.randperm(n)
+                for start in range(0, n, self.minibatch_size):
+                    mb_idx = indices[start:start + self.minibatch_size]
+                    if len(mb_idx) == 0:
+                        continue
+                    mb_obs = {k.replace("obs/", ""): batch[k][mb_idx].to(self.device)
+                              for k in batch if k.startswith("obs/")}
+                    mb_bc = batch["bc_labels"][mb_idx].to(self.device)
+
+                    sf = mb_obs["self_feat"]
+                    of = mb_obs["other_feat"]
+                    em = mb_obs["exists_mask"]
+                    bf = mb_obs["ball_feat"]
+                    gf = mb_obs["global_feat"]
+                    sat, oat = _ai_types(mb_obs)
+
+                    d_heads_bo = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                    e_heads_bo = self.execution_net(sf, of, em, bf, gf, d_heads_bo, sat, oat)
+
+                    bc_loss_bo, _ = bc_loss_from_tensor(
+                        mb_bc, d_heads_bo, e_heads_bo,
+                        direction_loss_weight=self._bc_dir_loss_w,
+                        region_loss_weight=self._bc_region_loss_w,
+                        pos_weight_kick=self._bc_pos_weight_kick,
+                        pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
+                        dec_weight=self._bc_dec_weight,
+                        exec_weight=self._bc_exec_weight,
+                        return_breakdown=True,
+                    )
+
+                    if not bc_loss_bo.requires_grad:
+                        # No valid BC rows in this minibatch (bc_loss_from_tensor's
+                        # early-return path returns a disconnected zero tensor) —
+                        # nothing to backprop, skip this minibatch rather than
+                        # crashing on .backward() with no grad_fn.
+                        continue
+
+                    self.optimizer.zero_grad()
+                    (bc_only_coeff * bc_loss_bo).backward()
+                    # Same direction-head isolation as the main policy loop above.
+                    _non_direction_params_bo = [
+                        p for p in list(self.decision_net.parameters()) + list(self.execution_net.parameters())
+                        if id(p) not in self.direction_param_ids
+                    ]
+                    _direction_params_bo = [
+                        p for p in self.execution_net.parameters()
+                        if id(p) in self.direction_param_ids
+                    ]
+                    _bc_gn_main = nn.utils.clip_grad_norm_(_non_direction_params_bo, self.max_grad_norm).item()
+                    bc_grad_norm_main.append(_bc_gn_main)
+                    if _bc_gn_main > self.max_grad_norm:
+                        bc_clip_triggered_main += 1
+                    if _direction_params_bo:
+                        _bc_gn_dir = nn.utils.clip_grad_norm_(_direction_params_bo, self.direction_max_grad_norm).item()
+                        bc_grad_norm_dir.append(_bc_gn_dir)
+                        if _bc_gn_dir > self.direction_max_grad_norm:
+                            bc_clip_triggered_dir += 1
+                    self.optimizer.step()
+
+                    all_bc_loss.append(bc_loss_bo.detach().item())
+                    last_bc_only_loss = bc_loss_bo.item()
+                    bc_only_steps += 1
+            if bc_only_steps:
+                _bc_n_main = len(bc_grad_norm_main)
+                _bc_n_dir = len(bc_grad_norm_dir)
+                _bc_clip_pct_main = (100.0 * bc_clip_triggered_main / _bc_n_main) if _bc_n_main else 0.0
+                _bc_clip_pct_dir = (100.0 * bc_clip_triggered_dir / _bc_n_dir) if _bc_n_dir else 0.0
+                log.info(
+                    f"  [bc-only continuation grad clip] main: {bc_clip_triggered_main}/{_bc_n_main}"
+                    f" steps clipped ({_bc_clip_pct_main:.0f}%)  mean_norm={np.mean(bc_grad_norm_main) if _bc_n_main else 0.0:.3f}"
+                    + (
+                        f"  |  direction: {bc_clip_triggered_dir}/{_bc_n_dir} steps clipped"
+                        f" ({_bc_clip_pct_dir:.0f}%)  mean_norm={np.mean(bc_grad_norm_dir) if _bc_n_dir else 0.0:.3f}"
+                        if _bc_n_dir else ""
+                    )
+                )
+                log.info(
+                    f"  [bc-only continuation] {bc_only_steps} extra minibatch step(s)"
+                    f"  after policy early-stop  final_bc_loss={last_bc_only_loss:.4f}"
+                )
+
         # --- KL diagnostics (fires whenever rollout KL exceeds threshold) ---
         mean_kl = float(np.mean(all_kl)) if all_kl else 0.0
         move_log_std = self.execution_net.move_dir_log_std.data.tolist()
@@ -1846,15 +2504,51 @@ class PPOTrainer:
                 _lsk = self.execution_net.kick_dir_log_std.to(self.device)
                 lp_mvdir_d  = self._dir_head(e_d.move_direction, _lsm).log_prob(diag_act["move_dir_raw"])
                 lp_kkdir_d  = self._dir_head(e_d.kick_direction, _lsk).log_prob(diag_act["kick_dir_raw"])
+                # Gate sub-parameter heads by their parent action, matching
+                # _compute_log_prob/_recompute_log_prob — otherwise kick_dir/sprint/
+                # move_dir noise from never-taken actions (e.g. kick=0 the entire
+                # rollout) pollutes diag_new_lp/diag_ratio and the printed means.
+                _exec_move_mask_d = (diag_act["exec_move"].squeeze(-1) > 0.5).float()
+                _kick_mask_d = (diag_act["kick"].squeeze(-1) > 0.5).float()
+                lp_sprint_d = lp_sprint_d * _exec_move_mask_d
+                lp_mvdir_d  = lp_mvdir_d * _exec_move_mask_d
+                lp_kkdir_d  = lp_kkdir_d * _kick_mask_d
+                # NOTE: direction heads (move_dir/kick_dir) are scaled by
+                # ent_dir_weight in the REAL training log_prob (see
+                # _compute_log_prob/_recompute_log_prob above) — apply the same
+                # scaling here so diag_new_lp/diag_ratio (and therefore worst_i)
+                # match what actually drove this rollout's KL/early-stop, and so
+                # the per-head delta table's units are consistent with the
+                # ratio used to pick the top-K worst samples. Previously this
+                # used the unweighted lp_mvdir_d/lp_kkdir_d while the per-head
+                # breakdown below applied the weight, which silently hid large
+                # direction-driven ratios from the delta table (the weighted
+                # value could be under the 0.02 display threshold while the
+                # unweighted value used for diag_ratio was large).
+                lp_mvdir_w  = self.ent_dir_weight * lp_mvdir_d
+                lp_kkdir_w  = self.ent_dir_weight * lp_kkdir_d
                 diag_new_lp = (lp_shoot_d + lp_pass_d + lp_move_d + lp_tackle_d + lp_gp_d +
                                lp_mark_d + lp_hold_d + lp_sprint_d + lp_kick_d + lp_ta_d +
-                               lp_mvdir_d + lp_kkdir_d)
+                               lp_mvdir_w + lp_kkdir_w)
                 diag_ratio  = torch.exp(diag_new_lp - diag_old_lp)
                 worst_i     = int(diag_ratio.argmax())
                 stored_mv   = diag_act["move_dir_raw"][worst_i]
                 new_mv_mean = e_d.move_direction[worst_i]
                 s_angle     = math.degrees(math.atan2(float(stored_mv[1]),   float(stored_mv[0])))
                 n_angle     = math.degrees(math.atan2(float(new_mv_mean[1]), float(new_mv_mean[0])))
+
+                # Per-sample, per-head new-lp stack for KL attribution (which
+                # head(s) drive each sample's ratio, not just the aggregate mean).
+                # Uses the SAME ent_dir_weight-scaled direction terms as diag_new_lp
+                # above so the per-head deltas sum to (approximately) the same
+                # total used to compute diag_ratio/worst_i.
+                _per_head_new_lp = torch.stack([
+                    lp_shoot_d, lp_pass_d, lp_move_d, lp_tackle_d, lp_gp_d, lp_mark_d, lp_hold_d,
+                    lp_sprint_d, lp_kick_d, lp_ta_d,
+                    lp_mvdir_w, lp_kkdir_w,
+                ], dim=-1)  # (diag_n, 12)
+                _per_head_names = ["shoot", "pass_", "move", "tackle", "gp_extra", "mark", "hold",
+                                    "sprint", "kick", "tackle_attempt", "move_dir", "kick_dir"]
             # Per-head old vs new log_probs: read stored head_log_probs from buffer
             # and compare to what the current policy assigns.  The diff shows which
             # head is driving the KL.
@@ -1871,6 +2565,7 @@ class PPOTrainer:
             ))
             from footballcoach.ai.ppo.rollout_buffer import HEAD_LP_KEYS as _HLK
             _head_lp_delta_str = ""
+            _old_per_head = None
             if "head_log_probs" in batch:
                 old_hlp = batch["head_log_probs"][:diag_n].mean(dim=0)  # (13,)
                 for _ki, _k in enumerate(_HLK):
@@ -1879,6 +2574,42 @@ class PPOTrainer:
                     _delta = _new_v - _old_v
                     if abs(_delta) > 0.05:
                         _head_lp_delta_str += f" {_k}:{_delta:+.2f}"
+                # Per-sample old per-head lp, aligned to _per_head_names order
+                # (HEAD_LP_KEYS has an extra "exec_move" column that our 12-head
+                # stack above doesn't include - drop it here to keep indices in sync).
+                _old_full = batch["head_log_probs"][:diag_n].to(self.device)  # (diag_n, 13)
+                _exec_move_col = _HLK.index("exec_move")
+                _keep_cols = [i for i in range(_old_full.shape[-1]) if i != _exec_move_col]
+                _old_per_head = _old_full[:, _keep_cols]  # (diag_n, 12)
+
+            # Top-K worst samples (highest ratio), each with EVERY head whose
+            # |delta| crosses a small threshold - not just the single largest,
+            # since a sample's inflated ratio is often the sum of several
+            # moderately-shifted heads rather than one dominant outlier.
+            _topk = min(5, diag_n)
+            _worst_idxs = diag_ratio.topk(_topk).indices.tolist()
+            _worst_lines = []
+            for _wi in _worst_idxs:
+                _delta_row = _per_head_new_lp[_wi]
+                if _old_per_head is not None:
+                    _delta_row = _delta_row - _old_per_head[_wi]
+                _contribs = sorted(
+                    ((_per_head_names[_hi], float(_delta_row[_hi])) for _hi in range(len(_per_head_names))),
+                    key=lambda kv: abs(kv[1]), reverse=True,
+                )
+                _contrib_str = "  ".join(f"{_n}:{_v:+.3f}" for _n, _v in _contribs if abs(_v) > 0.02)
+                _worst_lines.append(
+                    f"    idx={_wi:4d}  ratio={float(diag_ratio[_wi]):8.3f}  {_contrib_str}"
+                )
+
+            _worst_delta_row = _per_head_new_lp[worst_i]
+            if _old_per_head is not None:
+                _worst_delta_row = _worst_delta_row - _old_per_head[worst_i]
+            _worst_delta_str = "  ".join(
+                f"{_n}:{float(_v):+.3f}" for _n, _v in zip(_per_head_names, _worst_delta_row)
+                if abs(float(_v)) > 0.02
+            )
+
             log.info(
                 f"  [per-head new lp means, n={diag_n}]\n"
                 f"    shoot={lp_shoot_d.mean():.3f}  pass={lp_pass_d.mean():.3f}"
@@ -1892,7 +2623,10 @@ class PPOTrainer:
                 + f"  [worst sample] idx={worst_i}  ratio={diag_ratio[worst_i]:.3f}"
                 f"  old_lp={diag_old_lp[worst_i]:.3f}  new_lp={diag_new_lp[worst_i]:.3f}\n"
                 f"    stored move_dir={s_angle:.1f}°  new_mean={n_angle:.1f}°"
-                f"  angular_diff={min(abs(s_angle-n_angle), 360-abs(s_angle-n_angle)):.1f}°"
+                f"  angular_diff={min(abs(s_angle-n_angle), 360-abs(s_angle-n_angle)):.1f}°\n"
+                f"    [worst sample per-head delta, sorted by |delta|] {_worst_delta_str}\n"
+                f"  [top-{_topk} worst samples by ratio, all heads |delta|>0.02]\n"
+                + "\n".join(_worst_lines)
             )
 
         # Per-head mean activation rates from the buffer (0–100%). Zero-cost: just
@@ -1914,6 +2648,34 @@ class PPOTrainer:
             "kk_p": float(np.mean(all_kick_prob)) if all_kick_prob else float('nan'),
         }
 
+        # --- Grad-norm clipping summary (human-readable) ---
+        # Reports, for each isolated param group, how often the pre-clip gradient
+        # norm actually exceeded its limit (i.e. clipping fired) this rollout, and
+        # the mean/max pre-clip norm seen. If direction_max_grad_norm/
+        # direction_learning_rate are unset (None) in ai_config.json, the direction
+        # group still exists but shares max_grad_norm with the main group — in that
+        # case the two "limit=" values below will be identical, and the split just
+        # tells you what fraction of clipping activity is attributable to the
+        # direction heads specifically vs everything else.
+        n_main = len(all_grad_norm_main)
+        n_dir = len(all_grad_norm_dir)
+        grad_clip_pct_main = (100.0 * clip_triggered_main / n_main) if n_main else 0.0
+        grad_clip_pct_dir = (100.0 * clip_triggered_dir / n_dir) if n_dir else 0.0
+        grad_clip_mean_main = float(np.mean(all_grad_norm_main)) if n_main else 0.0
+        grad_clip_max_main = float(np.max(all_grad_norm_main)) if n_main else 0.0
+        grad_clip_mean_dir = float(np.mean(all_grad_norm_dir)) if n_dir else 0.0
+        grad_clip_max_dir = float(np.max(all_grad_norm_dir)) if n_dir else 0.0
+        log.info(
+            f"  [grad clip] main: {clip_triggered_main}/{n_main} steps clipped ({grad_clip_pct_main:.0f}%)"
+            f"  pre-clip norm mean={grad_clip_mean_main:.3f} max={grad_clip_max_main:.3f}  limit={self.max_grad_norm}"
+            + (
+                f"\n              direction: {clip_triggered_dir}/{n_dir} steps clipped ({grad_clip_pct_dir:.0f}%)"
+                f"  pre-clip norm mean={grad_clip_mean_dir:.3f} max={grad_clip_max_dir:.3f}"
+                f"  limit={self.direction_max_grad_norm}"
+                if n_dir else ""
+            )
+        )
+
         return {
             "policy_loss": float(np.mean(all_policy_loss)),
             "value_loss": float(np.mean(all_value_loss)),
@@ -1927,6 +2689,10 @@ class PPOTrainer:
             "kick_log_std": kick_log_std,
             "mv_ls_grad": mean_mv_ls_grad,
             "head_act": head_act,
+            "grad_clip_pct_main": grad_clip_pct_main,
+            "grad_clip_pct_dir": grad_clip_pct_dir,
+            "grad_clip_mean_norm_main": grad_clip_mean_main,
+            "grad_clip_mean_norm_dir": grad_clip_mean_dir,
             "values_mean": float(batch["values"].mean()),
             "values_std": float(batch["values"].std()),
             "returns_mean": float(returns.mean()),
@@ -2030,13 +2796,17 @@ class PPOTrainer:
         self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
         self._checkpoint_count += 1
         path = self.checkpoint_dir / f"checkpoint{self._checkpoint_count}.pt"
-        torch.save({
+        ckpt = {
             "step": step,
             "checkpoint_count": self._checkpoint_count,
             "decision_net": self.decision_net.state_dict(),
             "execution_net": self.execution_net.state_dict(),
             "optimizer": self.optimizer.state_dict(),
-        }, path)
+        }
+        if self.value_net is not None:
+            ckpt["value_net"] = self.value_net.state_dict()
+            ckpt["value_net_optimizer"] = self.value_net_optimizer.state_dict()
+        torch.save(ckpt, path)
         # Update latest.pt symlink
         latest = self.checkpoint_dir / "latest.pt"
         if latest.is_symlink() or latest.exists():
@@ -2047,25 +2817,60 @@ class PPOTrainer:
     def _save_checkpoint_to(self, path: Path) -> None:
         """Save a checkpoint to an explicit path (used for pre-trained snapshot)."""
         path.parent.mkdir(parents=True, exist_ok=True)
-        torch.save({
+        ckpt = {
             "step": self._total_steps,
             "decision_net": self.decision_net.state_dict(),
             "execution_net": self.execution_net.state_dict(),
             "optimizer": self.optimizer.state_dict(),
-        }, path)
+        }
+        if self.value_net is not None:
+            ckpt["value_net"] = self.value_net.state_dict()
+            ckpt["value_net_optimizer"] = self.value_net_optimizer.state_dict()
+        torch.save(ckpt, path)
 
     def load_checkpoint(self, path: Path) -> int:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
         self.decision_net.load_state_dict(ckpt["decision_net"])
         self.execution_net.load_state_dict(ckpt["execution_net"])
+        if self.value_net is not None:
+            if "value_net" in ckpt:
+                self.value_net.load_state_dict(ckpt["value_net"])
+                if self.value_net_optimizer is not None and "value_net_optimizer" in ckpt:
+                    self.value_net_optimizer.load_state_dict(ckpt["value_net_optimizer"])
+            else:
+                log.warning(
+                    f"separate_value_net enabled but {path} has no 'value_net' key "
+                    "(checkpoint predates this feature) -- value_net keeps its fresh "
+                    "random init."
+                )
         if self.optimizer is not None and "optimizer" in ckpt:
-            self.optimizer.load_state_dict(ckpt["optimizer"])
+            saved_n_groups = len(ckpt["optimizer"].get("param_groups", []))
+            current_n_groups = len(self.optimizer.param_groups)
+            if saved_n_groups == current_n_groups:
+                self.optimizer.load_state_dict(ckpt["optimizer"])
+            else:
+                # Optimizer shape changed (e.g. value-head param group added) since this
+                # checkpoint was saved. Weights still load fine above; only the optimizer's
+                # momentum/Adam state is skipped — harmless for --from-pretrained/--latest-
+                # pretrain (a fresh PPO run builds its own optimizer state from step 0
+                # anyway) but means a true PPO *resume* from an old-shape checkpoint will
+                # restart Adam's running averages rather than continuing them exactly.
+                log.warning(
+                    f"Optimizer param group count changed ({saved_n_groups} -> "
+                    f"{current_n_groups}); skipping optimizer state restore for {path} "
+                    "(network weights still loaded normally)."
+                )
         self._total_steps = ckpt["step"]
         log.info(f"Loaded checkpoint: {path} (step {self._total_steps})")
         return self._total_steps
 
     @classmethod
     def from_config(cls, **kwargs) -> "PPOTrainer":
+        """Build a PPOTrainer with freshly-initialised networks from ai_config.json.
+
+        Pass separate_value_net=True to enable the dedicated, fully independent
+        critic network (see __init__ docstring / CLI --separate-value-net).
+        """
         cfg = load_ai_config()
         decision_net = DecisionNetwork.from_config()
         execution_net = ExecutionNetwork.from_config()
@@ -2078,15 +2883,23 @@ class PPOTrainer:
         cfg = load_ai_config()
         decision_net = DecisionNetwork.from_config()
         execution_net = ExecutionNetwork.from_config()
+        # Auto-detect separate_value_net from the checkpoint itself so inference
+        # (UI/evaluate.py) doesn't need to know which mode a given checkpoint was
+        # trained with.
+        _ckpt_peek = torch.load(path, map_location="cpu", weights_only=False)
+        _separate_value_net = "value_net" in _ckpt_peek
         trainer = cls(
             decision_net=decision_net,
             execution_net=execution_net,
             cfg=cfg,
             inference_only=True,
+            separate_value_net=_separate_value_net,
         )
         trainer.load_checkpoint(path)
         trainer.decision_net.eval()
         trainer.execution_net.eval()
+        if trainer.value_net is not None:
+            trainer.value_net.eval()
         return trainer
 
 

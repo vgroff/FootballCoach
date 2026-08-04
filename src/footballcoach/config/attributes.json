@@ -32,10 +32,12 @@
   "tiers": {
     "_comment": "Per-tier (mean, sigma) overrides applied uniformly to all attributes before correlation is applied, then clipped to [0,1]. Premier League lands ~0.6-0.85, League Three ~0.2-0.3, per user spec.",
     "premier_league": { "mean": 0.72, "sigma": 0.08 },
-    "championship": { "mean": 0.55, "sigma": 0.09 },
-    "league_one": { "mean": 0.4, "sigma": 0.09 },
-    "league_two": { "mean": 0.32, "sigma": 0.08 },
-    "league_three": { "mean": 0.25, "sigma": 0.07 },
-    "generic": { "mean": 0.55, "sigma": 0.23 }
+    "championship": { "mean": 0.56, "sigma": 0.09 },
+    "league_one": { "mean": 0.44, "sigma": 0.09 },
+    "league_two": { "mean": 0.34, "sigma": 0.09 },
+    "league_three": { "mean": 0.28, "sigma": 0.09 },
+    "generic": { "mean": 0.55, "sigma": 0.23 },
+    "boosted": { "mean": 0.76, "sigma": 0.07},
+    "patsy": { "mean": 0.63, "sigma": 0.10}
   }
 }

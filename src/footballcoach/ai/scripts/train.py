@@ -43,6 +43,29 @@ def main() -> None:
                         ))
     parser.add_argument("--no-bc-aux", action="store_true",
                         help="Disable BC auxiliary loss during PPO (ignores ai_config.json bc.aux_coeff).")
+    parser.add_argument("--experiment-separate-value-net", action="store_true",
+                        help=(
+                            "EXPERIMENTAL: alongside the normal shared-trunk value_head training in "
+                            "pretrain_value() (the --bc-dataset=None fallback path only), also train a "
+                            "second, fully independent ExecutionNetwork (fresh init, fully unfrozen) on "
+                            "the exact same rollout data/returns, and log a side-by-side val_rmse "
+                            "comparison each epoch. Purely diagnostic -- the second network is discarded "
+                            "and has no effect on the real value_head or subsequent PPO training."
+                        ))
+    parser.add_argument("--separate-value-net", action="store_true",
+                        help=(
+                            "Use a permanent, fully independent ExecutionNetwork as the sole critic "
+                            "for the ENTIRE training run (BC pre-training, value warm-up, and PPO), "
+                            "instead of the default shared-trunk value_head. Unlike "
+                            "--experiment-separate-value-net (a throwaway diagnostic comparison), this "
+                            "is a real architecture switch: the dedicated critic never receives BC "
+                            "gradients (execution_net's own value_head/value_ai_type_channel are frozen "
+                            "and unused), so it is free to learn its own features purely for value "
+                            "prediction rather than reading through a BC-primed policy trunk. Persisted "
+                            "in checkpoints under 'value_net'/'value_net_optimizer'; "
+                            "PPOTrainer.load_for_inference() auto-detects this from the checkpoint, so "
+                            "no flag is needed when evaluating/running a checkpoint trained with this on."
+                        ))
     parser.add_argument("--bc-dataset", type=str, default=None,
                         help=(
                             "Path to a directory of .npz demonstration files for offline BC "
@@ -173,9 +196,13 @@ def main() -> None:
             cfg=cfg,
             device=device,
             checkpoint_dir=checkpoint_dir,
+            separate_value_net=args.separate_value_net,
         )
     else:
-        trainer = PPOTrainer.from_config(device=device, checkpoint_dir=checkpoint_dir)
+        trainer = PPOTrainer.from_config(
+            device=device, checkpoint_dir=checkpoint_dir,
+            separate_value_net=args.separate_value_net,
+        )
 
     # --latest / --latest-pretrain: auto-discover the most recent checkpoint.
     if args.latest or args.latest_pretrain:
@@ -256,6 +283,7 @@ def main() -> None:
     # Pre-training phase: BC + value jointly when a dataset is available,
     # otherwise fall back to online BC then separate value pre-training.
     value_pretrain_steps = int(bc_cfg.get("value_pretrain_steps", 0))
+    combined_pretrain_rollout_steps = int(bc_cfg.get("combined_pretrain_rollout_steps", 0))
     value_pretrain_epochs = int(bc_cfg.get("value_pretrain_epochs", 20))
     value_pretrain_lr = float(bc_cfg.get("value_pretrain_lr", 1e-3))
 
@@ -336,8 +364,9 @@ def main() -> None:
                 bc_lr=float(bc_cfg.get("bc_learning_rate", bc_cfg.get("pretrain_lr", 3e-4))),
                 value_lr=value_pretrain_lr,
                 repair_lr=float(bc_cfg.get("bc_repair_lr", bc_cfg.get("bc_learning_rate", bc_cfg.get("pretrain_lr", 3e-4)))),
-                rollout_steps=value_pretrain_steps,
+                rollout_steps=combined_pretrain_rollout_steps,
                 value_epochs=value_pretrain_epochs,
+                experiment_separate_value_net=args.experiment_separate_value_net,
             )
         else:
             # Online BC pre-training (noisy but works without a dataset)
@@ -355,6 +384,7 @@ def main() -> None:
                     n_steps=value_pretrain_steps,
                     n_epochs=value_pretrain_epochs,
                     lr=value_pretrain_lr,
+                    experiment_separate_value_net=args.experiment_separate_value_net,
                 )
 
     # Save a checkpoint of the pre-trained model before PPO starts
@@ -384,8 +414,10 @@ def main() -> None:
             max_episode_s=env.max_episode_s,
         )
         rules_stats = _run_evaluation(trainer, rules_env, args.pre_ppo_eval_trials)
+        from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS as _CL
+        _cl_map = dict(_CL)
         _comp_str = "  ".join(
-            f"{k}={v:+.2f}" for k, v in sorted(
+            f"{_cl_map.get(k, k)}={v:+.2f}" for k, v in sorted(
                 rules_stats.get("reward_components", {}).items(), key=lambda x: -abs(x[1])
             ) if abs(v) > 0.005
         )
@@ -413,7 +445,7 @@ def main() -> None:
         )
         immobile_stats = _run_evaluation(trainer, immobile_env, args.pre_ppo_eval_trials)
         _imm_comp_str = "  ".join(
-            f"{k}={v:+.2f}" for k, v in sorted(
+            f"{_cl_map.get(k, k)}={v:+.2f}" for k, v in sorted(
                 immobile_stats.get("reward_components", {}).items(), key=lambda x: -abs(x[1])
             ) if abs(v) > 0.005
         )
@@ -448,7 +480,7 @@ def main() -> None:
         )
         neural_stats = _run_evaluation(trainer, neural_env, args.pre_ppo_eval_trials)
         _nn_comp_str = "  ".join(
-            f"{k}={v:+.2f}" for k, v in sorted(
+            f"{_cl_map.get(k, k)}={v:+.2f}" for k, v in sorted(
                 neural_stats.get("reward_components", {}).items(), key=lambda x: -abs(x[1])
             ) if abs(v) > 0.005
         )

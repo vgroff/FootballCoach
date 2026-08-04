@@ -11,8 +11,24 @@ I want you to add 200-400 words of prompt for agent that will carry out more tra
 Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_plan.md, the ai_design_document.md and the ai_trainer_knowledge.md
 
 
+Extending training:
+- We have a big system in place for Phase 1 training. a bit part of this task will be generalising this in intelligent ways for multi-task training.
+- Have a look at the balance scenarios in the UI. I want to use some of these as inspiration for tasks. In particular, at first, the passing one and the close range shooting and 1v2, to teach kicking/passing/shooting/scoring. 
+- Essentially we wnat the exact same system, but with different rules-based AIs and reward systems
+- I'm thinking the reward function should be split by order. E.g. for phase 1 we have these custom rewards that are relaly just tied to Order behaviour. Instead, it should be split by order - eg some apply to GetPossession/ChaseTackle (depends on ball possession), some apply only to MoveOrder, then later some will apply only to Shoot, Pass etc… completing the order (fast) should always give a reward boost. This was we can build rules-based AIs, set the appropriate order and then query them to see what the reward should be, both for themsleves and for the neural AI. There will also certainly be custom reward termsinvolved in each case
+- Task ids are important, make sure they are set
+    - I think task ids should only be set by the decision network, the execution network shouldnt get them (remove if it already does)
+- When running these messy/random scenarios, we might need to decide (maye using a value network) whcih runs are actually good (advantage-wise and in absolute)
+
+
 Current notes:
+- " read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
 - train blockers:
+    - try just doing immobile first - can we improve?
+    - as an experiment - have a second copy of the value network, completely separate network with it's own trunk, and run it on the value pre-training and see if it can do better than the shared-trunk one
+        - we have this now, should check results use --experiment-separate-value-net
+        - consider having them have a different entity MLP that has the opponent type there instead of as a side channel (only on the value network side, of course), could even share all the weights that they have in common, and all other MLPs (frozen for the value network) just different trunks andhalf-shared entity MLPS 
+    - do we need batch norm or dropout oor other regularisation?
 - Move Order with ball kicking...
 - 2v2 goalkeepr AI should only switch to save order if the kick is aimed towards the goal, and should cease save order if the ball changes posssesion, even to another teammate of the oppoiste side, and go back to the goal centre
 
@@ -20,7 +36,6 @@ Current notes:
 Other todo
 - Reduce decision rate everywhere (0.4s?)
 - Which tests are failing and why? What are they testing?
-- The reward function for phase 1 should be split by order - eg some apply to GetPossession/ChaseTackle (depends on ball possession), some apply only to MoveOrder, then later some will apply only to Shoot, Pass etc… completing the order (fast) should always give a reward boost
 - PRobably need a small reworrk on spin, how its' affected by talent and max values
 
 
@@ -39,6 +54,7 @@ Read ai_trainer_knowledge.md, and then run a training run
 - parralelise the simulation somehow? player decision? maybe even movements/updates, though potentially dangerous
 - Is the AI completely ignoring all the kick mechanics like direction and spin and just aimming for the centre of the box when it kicks? Why on earth was this implemented???
 - Simplify match logs - only keep possession, kicks, tackles (incl. attempted), goals etc... and the positions and time of the event
+- Use von Mises distribution for direction
 - Scenarios to run for rules based tests (and later NN phases)
     - Intercepting the ball - does it work well or do we need a higher safety threshold
     - 2v3 (with GK) (or even 2v2) test for rules based marking and through ballstate

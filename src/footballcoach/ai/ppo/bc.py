@@ -51,6 +51,17 @@ Flat tensor layout for stored BC labels (17 floats per step):
                           Used to build the value-only ``other_ai_type``
                           side-channel for BC/value pretraining - see
                           ai/knowledge.md "Opponent-AI-type (value-only)".)
+  [18] kick_dir_x        (unit vector component of the kick target direction;
+                          0.0 if not applicable. Read from
+                          Player.last_kick_direction, set inside kick_direct().)
+  [19] kick_dir_y
+  [20] kick_power        (power_fraction actually used for the kick, [0, 1];
+                          0.0 if not applicable. Read from
+                          Player.last_kick_power_fraction.)
+  [21] kick_spin_x       (raw kick spin vector; 0.0 if not applicable. Read
+                          from Player.last_kick_spin.)
+  [22] kick_spin_y
+  [23] kick_spin_z
 """
 from __future__ import annotations
 
@@ -65,7 +76,7 @@ import torch.nn.functional as F
 
 log = logging.getLogger("footballcoach.ai.bc")
 
-BC_LABEL_DIM = 18  # elements in the flat label vector (see module docstring)
+BC_LABEL_DIM = 24  # elements in the flat label vector (see module docstring)
 
 # Indices into the flat label vector
 _I_SHOOT          = 0
@@ -86,6 +97,12 @@ _I_VALID          = 14
 _I_EXEC_MOVE      = 15
 _I_AI_TYPE        = 16
 _I_OPPONENT_AI_TYPE = 17
+_I_KICK_DIR_X     = 18
+_I_KICK_DIR_Y     = 19
+_I_KICK_POWER     = 20
+_I_KICK_SPIN_X    = 21
+_I_KICK_SPIN_Y    = 22
+_I_KICK_SPIN_Z    = 23
 
 # ai_type integer codes (see module docstring layout table)
 AI_TYPE_RULES    = 0.0
@@ -123,6 +140,9 @@ class BCLabel:
     valid: bool = True
     ai_type: float = AI_TYPE_RULES  # which AI produced this label (see AI_TYPE_* constants)
     opponent_ai_type: float = AI_TYPE_IMMOBILE  # which AI controls the OTHER player (see AI_TYPE_* constants)
+    kick_direction: Optional[np.ndarray] = None      # shape (2,) unit vector, ground plane
+    kick_power_fraction: Optional[float] = None       # [0, 1], None if not kicking
+    kick_spin: Optional[np.ndarray] = None            # shape (3,), None if not kicking
 
     def to_array(self) -> np.ndarray:
         """Pack into a flat float32 array of length BC_LABEL_DIM."""
@@ -147,6 +167,15 @@ class BCLabel:
         arr[_I_EXEC_MOVE]      = self.exec_move
         arr[_I_AI_TYPE]        = self.ai_type
         arr[_I_OPPONENT_AI_TYPE] = self.opponent_ai_type
+        if self.kick_direction is not None:
+            arr[_I_KICK_DIR_X] = float(self.kick_direction[0])
+            arr[_I_KICK_DIR_Y] = float(self.kick_direction[1])
+        if self.kick_power_fraction is not None:
+            arr[_I_KICK_POWER] = float(self.kick_power_fraction)
+        if self.kick_spin is not None:
+            arr[_I_KICK_SPIN_X] = float(self.kick_spin[0])
+            arr[_I_KICK_SPIN_Y] = float(self.kick_spin[1])
+            arr[_I_KICK_SPIN_Z] = float(self.kick_spin[2])
         return arr
 
     @staticmethod
@@ -167,7 +196,7 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     in sync with the rules AI behaviour, with no duplicated logic here.
     """
     from footballcoach.rules_ai import Phase1RulesAI
-    from footballcoach.orders import MoveOrder, GetPossessionOrder, ShootOrder, ChaseTackleOrder, KickOrder, PassOrder
+    from footballcoach.orders import MoveOrder, GetPossessionOrder, ChaseTackleOrder
 
     try:
         match = env.match
@@ -199,7 +228,28 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     # i.e. the current order it's executing, before any new decision is made.
     from footballcoach.orders import MoveOrder as _MoveOrder, GetPossessionOrder as _GPOrder
     current_exec = player.current_order
-    kick_this_tick = 1.0 if isinstance(current_exec, (ShootOrder, KickOrder, PassOrder)) else 0.0
+    # kick_this_tick: read Player.kicked_this_tick directly rather than
+    # inspecting order types. kick_direct() sets this flag unconditionally
+    # whenever it actually executes kick physics — including MoveOrder's
+    # push-kick path (rules_ai.py's box-run), which never creates a
+    # ShootOrder/KickOrder/PassOrder and was previously missed entirely,
+    # causing recorded demonstrations to have zero "kick" labels despite
+    # visible kicks in the UI. See Player.kicked_this_tick docstring.
+    kick_this_tick = 1.0 if player.kicked_this_tick else 0.0
+    kick_direction = None
+    kick_power_fraction = None
+    kick_spin = None
+    if player.kicked_this_tick:
+        if player.last_kick_direction is not None:
+            kick_direction = np.array(
+                [player.last_kick_direction.x, player.last_kick_direction.y], dtype=np.float32
+            )
+        kick_power_fraction = player.last_kick_power_fraction
+        if player.last_kick_spin is not None:
+            kick_spin = np.array(
+                [player.last_kick_spin.x, player.last_kick_spin.y, player.last_kick_spin.z],
+                dtype=np.float32,
+            )
     # tackle_attempt: ChaseTackleOrder always, OR GetPossessionOrder when the player
     # is currently touching the ball carrier — that's when GP behaviour resolves a tackle.
     _is_gp_tackling = False
@@ -212,8 +262,6 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         except Exception:
             pass
     tackle_attempt = 1.0 if (isinstance(current_exec, ChaseTackleOrder) or _is_gp_tackling) else 0.0
-    # exec_move: 1 if the rules AI is currently executing any movement order
-    exec_move_now = 1.0 if isinstance(current_exec, (_MoveOrder, _GPOrder)) else 0.0
 
     # Decision heads reflect what the rules AI DECIDES next.
     # Temporarily clear current_order so the AI always produces a fresh decision.
@@ -224,44 +272,114 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     finally:
         player.current_order = current_exec  # always restore
 
+    # Execution-level fields (move_direction / sprint / exec_move) must NEVER
+    # be hand-derived from Order fields (bypasses braking/repulsion/turn-
+    # limiting/push-kick logic in _compute_movement_intent()). Instead, run
+    # the decided order's execute() once (fully snapshotted/restored so it
+    # has ZERO effect on the real match) and read back what actually landed
+    # on player.desired_direction/player.desired_speed_mode. See
+    # ai/knowledge.md "Orders vs execution-network labels boundary".
+    move_direction = None
+    sprint_label = 0.0
+    exec_move_label = 0.0
+    move_region_center = None
+
+    if isinstance(order, (MoveOrder, GetPossessionOrder)):
+        # Snapshot everything execute() might mutate, so this exploratory
+        # call has ZERO effect on the real simulation.
+        _snap_pos = player.position
+        _snap_vel = player.velocity
+        _snap_heading = player.heading_rad
+        _snap_desired_dir = player.desired_direction
+        _snap_desired_speed = player.desired_speed_mode
+        _snap_kicked_this_tick = player.kicked_this_tick
+        _snap_last_kick_dir = player.last_kick_direction
+        _snap_last_kick_power = player.last_kick_power_fraction
+        _snap_last_kick_spin = player.last_kick_spin
+        _snap_current_order = player.current_order
+        _snap_on_possession_gained = player.on_possession_gained
+        _snap_on_kick = player.on_kick
+        _snap_on_tackle = player.on_tackle
+        _snap_ball_possessed_by = match.ball.possessed_by
+        _snap_ball_velocity = match.ball.velocity
+        _snap_ball_position = match.ball.position
+        _snap_last_released_by = match.ball.last_released_by
+        _snap_release_grace_s = match.ball.release_grace_s
+        # order is a FRESH object from Phase1RulesAI().act() above (not
+        # current_exec), so its own internal state starts clean.
+        player.current_order = order
+        # Prevent on_kick/on_tackle from firing real callbacks during this
+        # exploratory execute() (e.g. record_demonstrations.py wires these to
+        # _record_now(), which would otherwise recursively re-enter here).
+        player.on_kick = None
+        player.on_tackle = None
+        try:
+            _dt = env._dt_s
+            order.execute(player, match, _dt)
+            if player.desired_speed_mode is not None:
+                from footballcoach.engine.movement import SpeedMode
+                move_direction_raw = player.desired_direction
+                if move_direction_raw.length_xy() > 1e-6:
+                    _n = move_direction_raw.normalized()
+                    move_direction = np.array([_n.x, _n.y], dtype=np.float32)
+                sprint_label = 1.0 if player.desired_speed_mode is SpeedMode.SPRINT else 0.0
+                exec_move_label = 0.0 if player.desired_speed_mode is SpeedMode.STANDSTILL else 1.0
+        finally:
+            # Restore EVERYTHING — this call must be perfectly invisible to
+            # the real simulation.
+            player.position = _snap_pos
+            player.velocity = _snap_vel
+            player.heading_rad = _snap_heading
+            player.desired_direction = _snap_desired_dir
+            player.desired_speed_mode = _snap_desired_speed
+            player.kicked_this_tick = _snap_kicked_this_tick
+            player.last_kick_direction = _snap_last_kick_dir
+            player.last_kick_power_fraction = _snap_last_kick_power
+            player.last_kick_spin = _snap_last_kick_spin
+            player.current_order = _snap_current_order
+            player.on_possession_gained = _snap_on_possession_gained
+            player.on_kick = _snap_on_kick
+            player.on_tackle = _snap_on_tackle
+            match.ball.possessed_by = _snap_ball_possessed_by
+            match.ball.velocity = _snap_ball_velocity
+            match.ball.position = _snap_ball_position
+            match.ball.last_released_by = _snap_last_released_by
+            match.ball.release_grace_s = _snap_release_grace_s
+
     if isinstance(order, MoveOrder):
-        tx, ty = player.position.x, player.position.y
-        tgt = order.target_position
-        dx, dy = tgt.x - tx, tgt.y - ty
-        length = math.hypot(dx, dy)
-        if length < 1e-6:
-            return BCLabel.invalid()
-        direction = np.array([dx / length, dy / length], dtype=np.float32)
+        move_region_center = np.array(
+            [order.target_position.x, order.target_position.y], dtype=np.float32
+        )
         return BCLabel(
             move=1.0,
-            sprint=1.0 if order.sprint else 0.0,
-            move_direction=direction,
-            move_region_center_m=np.array([tgt.x, tgt.y], dtype=np.float32),
+            sprint=sprint_label,
+            move_direction=move_direction,
+            move_region_center_m=move_region_center,
             kick_this_tick=kick_this_tick,
             tackle_attempt=tackle_attempt,
-            exec_move=1.0,
+            exec_move=exec_move_label,
             ai_type=ai_type,
             opponent_ai_type=opponent_ai_type,
+            kick_direction=kick_direction,
+            kick_power_fraction=kick_power_fraction,
+            kick_spin=kick_spin,
         )
     elif isinstance(order, GetPossessionOrder):
         ball = match.ball
-        bx, by = ball.position.x, ball.position.y
-        tx, ty = player.position.x, player.position.y
-        dx, dy = bx - tx, by - ty
-        length = math.hypot(dx, dy)
-        if length < 1e-6:
-            return BCLabel.invalid()
-        direction = np.array([dx / length, dy / length], dtype=np.float32)
+        move_region_center = np.array([ball.position.x, ball.position.y], dtype=np.float32)
         return BCLabel(
             get_possession_extra=1.0,
-            sprint=1.0 if order.sprint else 0.0,
-            move_direction=direction,
-            move_region_center_m=np.array([bx, by], dtype=np.float32),
+            sprint=sprint_label,
+            move_direction=move_direction,
+            move_region_center_m=move_region_center,
             kick_this_tick=kick_this_tick,
             tackle_attempt=tackle_attempt,
-            exec_move=1.0,
+            exec_move=exec_move_label,
             ai_type=ai_type,
             opponent_ai_type=opponent_ai_type,
+            kick_direction=kick_direction,
+            kick_power_fraction=kick_power_fraction,
+            kick_spin=kick_spin,
         )
     else:
         return BCLabel.invalid()
@@ -321,7 +439,11 @@ def bc_loss_from_tensor(
     _zero = torch.zeros(1, device=labels.device)
     if not valid.any():
         if return_breakdown:
-            return _zero, {"decision": 0.0, "exec_bce": 0.0, "sprint": 0.0, "move": 0.0, "tackle_attempt": 0.0, "direction": 0.0, "region": 0.0}
+            return _zero, {
+                "decision": 0.0, "exec_bce": 0.0, "sprint": 0.0, "move": 0.0,
+                "tackle_attempt": 0.0, "direction": 0.0, "region": 0.0,
+                "kick": 0.0, "kick_direction": 0.0, "kick_power": 0.0, "kick_spin": 0.0,
+            }
         return _zero
 
     loss = torch.zeros(labels.shape[0], device=labels.device)
@@ -351,17 +473,22 @@ def bc_loss_from_tensor(
     sprint_loss = torch.zeros(labels.shape[0], device=labels.device)
     move_loss = torch.zeros(labels.shape[0], device=labels.device)
     tackle_attempt_loss = torch.zeros(labels.shape[0], device=labels.device)
+    kick_loss = torch.zeros(labels.shape[0], device=labels.device)
     dir_loss_per = torch.zeros(labels.shape[0], device=labels.device)
+    kick_dir_loss_per = torch.zeros(labels.shape[0], device=labels.device)
+    kick_power_loss_per = torch.zeros(labels.shape[0], device=labels.device)
+    kick_spin_loss_per = torch.zeros(labels.shape[0], device=labels.device)
 
     if exec_heads is not None:
         # --- Execution BCE heads: exec_move, sprint, kick, tackle_attempt ---
         sprint_loss        = _bce(exec_heads.sprint_logit,          _I_SPRINT)
         move_loss          = _bce(exec_heads.exec_move_logit,       _I_EXEC_MOVE)
         tackle_attempt_loss = _bce(exec_heads.tackle_attempt_logit, _I_TACKLE_ATTEMPT, pos_weight_tackle_attempt)
+        kick_loss           = _bce(exec_heads.kick_logit,           _I_KICK_THIS_TICK, pos_weight_kick)
         exec_bce_loss = (
             move_loss
             + sprint_loss
-            + _bce(exec_heads.kick_logit,               _I_KICK_THIS_TICK, pos_weight_kick)
+            + kick_loss
             + tackle_attempt_loss
         )
         loss += exec_weight * exec_bce_loss
@@ -379,6 +506,37 @@ def bc_loss_from_tensor(
             cos_loss = 1.0 - (pred_norm * target_dir).sum(dim=-1)
             dir_loss_per = direction_loss_weight * torch.where(has_dir, cos_loss, torch.zeros_like(cos_loss))
             loss += exec_weight * dir_loss_per
+
+        # --- Execution: kick_direction cosine loss (only meaningful on kick ticks) ---
+        has_kick_dir = (
+            (labels[:, _I_KICK_DIR_X].abs() + labels[:, _I_KICK_DIR_Y].abs()) > 1e-6
+        ) & (labels[:, _I_KICK_THIS_TICK] > 0.5)
+        if has_kick_dir.any():
+            eps = 1e-6
+            target_kdir = labels[:, _I_KICK_DIR_X:_I_KICK_DIR_Y + 1]
+            pred_kdir = exec_heads.kick_direction
+            pred_kdir_norm = pred_kdir / (pred_kdir.norm(dim=-1, keepdim=True) + eps)
+            kdir_cos_loss = 1.0 - (pred_kdir_norm * target_kdir).sum(dim=-1)
+            kick_dir_loss_per = direction_loss_weight * torch.where(
+                has_kick_dir, kdir_cos_loss, torch.zeros_like(kdir_cos_loss)
+            )
+            loss += exec_weight * kick_dir_loss_per
+
+        # --- Execution: kick_power (MSE) and kick_spin (MSE, normalized) ---
+        kicked_mask = labels[:, _I_KICK_THIS_TICK] > 0.5
+        if kicked_mask.any():
+            pred_power = torch.sigmoid(exec_heads.kick_power.squeeze(-1))
+            target_power = labels[:, _I_KICK_POWER]
+            power_mse = (pred_power - target_power) ** 2
+            kick_power_loss_per = torch.where(kicked_mask, power_mse, torch.zeros_like(power_mse))
+            loss += exec_weight * kick_power_loss_per
+
+            spin_norm_max = 30.0  # matches ai_config.json obs['ball_spin_norm_max_rad_s']
+            target_spin = labels[:, _I_KICK_SPIN_X:_I_KICK_SPIN_Z + 1] / spin_norm_max
+            pred_spin = exec_heads.kick_spin / spin_norm_max
+            spin_mse = ((pred_spin - target_spin) ** 2).sum(dim=-1)
+            kick_spin_loss_per = torch.where(kicked_mask, spin_mse, torch.zeros_like(spin_mse))
+            loss += exec_weight * kick_spin_loss_per
 
     # --- Decision: move_region_center MSE (normalised to [-1, 1]) ---
     # Weighted by region_loss_weight (default 1.0, separate from direction).
@@ -402,6 +560,22 @@ def bc_loss_from_tensor(
     total = valid_loss.mean() if len(valid_loss) > 0 else _zero
 
     if return_breakdown:
+        # kick_direction/kick_power/kick_spin are gated to zero on non-kick
+        # rows (see kicked_mask above) — averaging over ALL valid rows
+        # dilutes them ~pos_weight_kick:1 by hard zeros, making genuine loss
+        # changes invisible in logs. Report their mean over KICKED rows only
+        # (within the valid set) instead, falling back to 0.0 (not NaN) when
+        # no kicks occurred in this batch. NOTE: "kick" (the BCE for
+        # did/should-kick) has a well-defined target on EVERY row, so it
+        # keeps all-valid-rows averaging — do not change that one.
+        kicked_valid_mask = valid & (labels[:, _I_KICK_THIS_TICK] > 0.5)
+        _n_kicked_valid = int(kicked_valid_mask.sum().item())
+
+        def _kicked_mean(per_row_loss: torch.Tensor) -> float:
+            if _n_kicked_valid == 0:
+                return 0.0
+            return float(per_row_loss[kicked_valid_mask].mean())
+
         breakdown = {
             "decision":       float(dec_loss[valid].mean()),
             "exec_bce":       float(exec_bce_loss[valid].mean()),
@@ -410,6 +584,10 @@ def bc_loss_from_tensor(
             "tackle_attempt": float(tackle_attempt_loss[valid].mean()),
             "direction":      float(dir_loss_per[valid].mean()),
             "region":         float(region_loss_per[valid].mean()),
+            "kick":           float(kick_loss[valid].mean()),
+            "kick_direction": _kicked_mean(kick_dir_loss_per),
+            "kick_power":     _kicked_mean(kick_power_loss_per),
+            "kick_spin":      _kicked_mean(kick_spin_loss_per),
         }
         return total, breakdown
     return total

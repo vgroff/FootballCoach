@@ -268,6 +268,13 @@ class Match:
 
     def _process_orders(self, dt: float) -> None:
         for player in self.players:
+            # Reset before this tick's AI/order execution so kick_direct()
+            # (called from ANY order type, or directly by the neural net) can
+            # set it fresh — see Player.kicked_this_tick docstring.
+            player.kicked_this_tick = False
+            player.last_kick_direction = None
+            player.last_kick_power_fraction = None
+            player.last_kick_spin = None
             if player.ai is not None:
                 player.ai.act(player, self, 0)
             order = player.current_order

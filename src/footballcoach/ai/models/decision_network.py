@@ -28,6 +28,7 @@ import torch.nn as nn
 
 from footballcoach.ai.action.schema import DecisionHeadsRaw
 from footballcoach.ai.models.entity_encoder import EntityEncoder
+from footballcoach.ai.models.value_side_channel import ValueAiTypeSideChannel
 from footballcoach.ai.obs.schema import (
     AI_TYPE_ONE_HOT_DIM,
     BALL_FEATURE_DIM,
@@ -66,6 +67,7 @@ class DecisionNetwork(nn.Module):
         trunk_hidden: int = 256,
         latent_dim: int = 32,
         value_extra_hidden: int = 16,
+        value_hidden_dim: int = 0,
     ):
         super().__init__()
         self.entity_encoder = EntityEncoder(
@@ -128,13 +130,33 @@ class DecisionNetwork(nn.Module):
         # (value-only)" - do not route this through the shared trunk `h` or
         # any policy head; that would let the policy condition on opponent
         # identity, which is the exact thing this design avoids.
-        ai_type_flat_dim = AI_TYPE_ONE_HOT_DIM * (1 + MAX_OTHER_PLAYERS)
-        self.value_extra_mlp = nn.Sequential(
-            nn.Linear(ai_type_flat_dim, value_extra_hidden), nn.ReLU(),
+        #
+        # Uses a dedicated shared-per-slot-MLP + attention pool (own weights,
+        # zero sharing with self.entity_encoder) instead of a flatten+Linear,
+        # so it is exactly permutation-invariant like the main entity encoder
+        # (a flatten+Linear gives each slot position its own weight block --
+        # NOT permutation-invariant; see value_side_channel.py docstring).
+        # Enriched with a DETACHED copy of the main entity encoder's per-slot
+        # embeddings for richer per-opponent context than a bare one-hot type
+        # flag; detaching is what keeps this value-only (no gradient back
+        # into entity_encoder/policy from the value loss).
+        self.value_ai_type_channel = ValueAiTypeSideChannel(
+            ai_type_dim=AI_TYPE_ONE_HOT_DIM,
+            entity_embed_dim=entity_embed_dim,
+            hidden_dim=value_extra_hidden,
         )
 
-        # Shared-trunk value head (critic, Option A) + value-only ai-type side channel
-        self.value_head = nn.Linear(trunk_hidden + value_extra_hidden, 1)
+        # Shared-trunk value head (critic, Option A) + value-only ai-type side channel.
+        # value_hidden_dim=0 keeps the old single-linear-layer behaviour;
+        # >0 inserts one ReLU hidden layer before the final scalar output.
+        value_in_dim = trunk_hidden + value_extra_hidden
+        if value_hidden_dim > 0:
+            self.value_head = nn.Sequential(
+                nn.Linear(value_in_dim, value_hidden_dim), nn.ReLU(),
+                nn.Linear(value_hidden_dim, 1),
+            )
+        else:
+            self.value_head = nn.Linear(value_in_dim, 1)
 
     def forward(
         self,
@@ -146,7 +168,9 @@ class DecisionNetwork(nn.Module):
         self_ai_type: Optional[torch.Tensor] = None,   # (batch, AI_TYPE_ONE_HOT_DIM)
         other_ai_type: Optional[torch.Tensor] = None,  # (batch, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM)
     ) -> DecisionHeadsRaw:
-        entity_ctx = self.entity_encoder(self_feat, other_feat, exists_mask)
+        entity_ctx, self_embed_raw, other_embed_raw = self.entity_encoder(
+            self_feat, other_feat, exists_mask, return_embeds=True
+        )
         h = torch.cat([
             entity_ctx,
             self.self_mlp(self_feat),
@@ -164,10 +188,10 @@ class DecisionNetwork(nn.Module):
             other_ai_type = torch.zeros(
                 batch_size, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM, device=h.device, dtype=h.dtype
             )
-        ai_type_flat = torch.cat(
-            [self_ai_type, other_ai_type.reshape(batch_size, -1)], dim=-1
+        value_extra = self.value_ai_type_channel(
+            self_ai_type, other_ai_type, exists_mask,
+            self_embed=self_embed_raw.detach(), other_embed=other_embed_raw.detach(),
         )
-        value_extra = self.value_extra_mlp(ai_type_flat)
         value_input = torch.cat([h, value_extra], dim=-1)
 
         return DecisionHeadsRaw(
@@ -205,6 +229,7 @@ class DecisionNetwork(nn.Module):
             trunk_hidden=cfg["trunk_hidden"],
             latent_dim=cfg["latent_dim"],
             value_extra_hidden=cfg.get("value_extra_hidden", 16),
+            value_hidden_dim=cfg.get("value_hidden_dim", 0),
         )
 
 

@@ -121,6 +121,16 @@ def record_episodes(
     _comp_acc: dict[str, float] = {}
     _comp_acc_episodes = 0
 
+    # Kick/tackle sample counters (since last periodic log), and running
+    # totals for the whole recording run — visibility into how many of the
+    # rarest, highest-value BC rows (kicks/tackles) are actually being
+    # captured, without post-hoc .npz inspection. See
+    # agent_plans/bc_execution_label_boundary_and_followups.md Part 5.
+    _kick_count_since_log = 0
+    _tackle_count_since_log = 0
+    _kick_count_total = 0
+    _tackle_count_total = 0
+
     if total_episodes is None:
         total_episodes = n_episodes
 
@@ -149,6 +159,7 @@ def record_episodes(
         """
         ids = [env.trainee_player_id, "opponent"] if player_id is None else [player_id]
         nonlocal steps_total, steps_valid
+        nonlocal _kick_count_since_log, _tackle_count_since_log, _kick_count_total, _tackle_count_total
         if reward is None:
             reward = _pending_reward[0]
             _pending_reward[0] = 0.0
@@ -167,6 +178,12 @@ def record_episodes(
             steps_total += 1
             if label.valid:
                 steps_valid += 1
+                if label.kick_this_tick > 0.5:
+                    _kick_count_since_log += 1
+                    _kick_count_total += 1
+                if label.tackle_attempt > 0.5:
+                    _tackle_count_since_log += 1
+                    _tackle_count_total += 1
 
     for ep in range(n_episodes):
         env.reset()
@@ -271,8 +288,15 @@ def record_episodes(
                 log.info(
                     f"  reward breakdown (per ep, since last log, trainee+opponent): {_comp_str}"
                 )
+            log.info(
+                f"  kick/tackle samples (since last log): "
+                f"kicks={_kick_count_since_log}  tackles={_tackle_count_since_log}"
+                f"  (totals: kicks={_kick_count_total}  tackles={_tackle_count_total})"
+            )
             _comp_acc.clear()
             _comp_acc_episodes = 0
+            _kick_count_since_log = 0
+            _tackle_count_since_log = 0
 
     env._ticks_per_decision = orig_ticks  # restore original
 

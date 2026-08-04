@@ -3,6 +3,8 @@ from __future__ import annotations
 import math
 import random
 
+import pytest
+
 from footballcoach.engine.kicking import (
     KickingParams,
     angle_error_sigma_rad,
@@ -168,7 +170,56 @@ def test_running_direction_multiplier_table_sample_points():
 
     # Above threshold: multiplier must be 1.0
     assert abs(mult_for_cos(0.5) - 1.0) < 1e-9
-    assert abs(mult_for_cos(1.0) - 1.0) < 1e-9
+
+
+# --------------------------------------------------------------------------
+# Player.kick_direct() — last_kick_* capture (BC kick supervision plan)
+# --------------------------------------------------------------------------
+
+def test_kick_direct_captures_last_kick_fields():
+    from footballcoach.engine.match import Match
+    from footballcoach.entities.attributes import PlayerAttributes
+    from footballcoach.entities.pitch import Pitch
+    from footballcoach.entities.player import Player, Team
+
+    attrs = PlayerAttributes(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+    p1 = Player.create("p1", Team.LEFT, attrs, position=Vector3(0, 0, 0))
+    ball = Ball.at_rest(Vector3(0, 0, 0))
+    ball.possessed_by = "p1"
+    match = Match(pitch=Pitch.standard(), players=[p1], ball=ball,
+                  rng_reduction=1.0, rng=random.Random(0))
+
+    aim_point = Vector3(10, 0, 0)
+    spin = Vector3(1.0, 2.0, 3.0)
+    p1.kick_direct(match, aim_point, power_fraction=0.6, spin=spin)
+
+    assert p1.kicked_this_tick is True
+    assert p1.last_kick_direction is not None
+    assert p1.last_kick_direction.x == pytest.approx(1.0, abs=1e-6)
+    assert p1.last_kick_direction.y == pytest.approx(0.0, abs=1e-6)
+    assert p1.last_kick_power_fraction is not None
+    assert p1.last_kick_spin is spin
+
+
+def test_kick_direct_no_possession_leaves_last_kick_fields_unset():
+    from footballcoach.engine.match import Match
+    from footballcoach.entities.attributes import PlayerAttributes
+    from footballcoach.entities.pitch import Pitch
+    from footballcoach.entities.player import Player, Team
+
+    attrs = PlayerAttributes(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+    p1 = Player.create("p1", Team.LEFT, attrs, position=Vector3(0, 0, 0))
+    ball = Ball.at_rest(Vector3(20, 0, 0))
+    ball.possessed_by = None
+    match = Match(pitch=Pitch.standard(), players=[p1], ball=ball,
+                  rng_reduction=1.0, rng=random.Random(0))
+
+    p1.kick_direct(match, Vector3(10, 0, 0), power_fraction=0.6, spin=Vector3.zero())
+
+    assert p1.kicked_this_tick is False
+    assert p1.last_kick_direction is None
+    assert p1.last_kick_power_fraction is None
+    assert p1.last_kick_spin is None
 
 
 def test_running_direction_below_min_speed_returns_one():

@@ -72,12 +72,24 @@ def _make_synthetic_dataset(env: ScenarioEnv, n: int = 32) -> DemonstrationDatas
     )
 
 
+def _build_1v1_rules_opponent(rng_reduction: float = 0.3, **kwargs) -> "Match":
+    # Force a rules-based (non-immobile) opponent so this smoke test's tiny
+    # synthetic dataset always has valid_indices() rows — build_1v1_scenario
+    # defaults to opponent_immobile_prob=1.0, which made the opponent's
+    # ai_type immobile in every recorded step and left valid_indices() (and
+    # thus iterate_minibatches(valid_only=True)) empty, causing an
+    # intermittent-looking but actually deterministic-per-default failure.
+    kwargs.setdefault("opponent_rules_prob", 1.0)
+    kwargs.setdefault("opponent_immobile_prob", 0.0)
+    return build_1v1_scenario(rng_reduction, **kwargs)
+
+
 def _make_env() -> ScenarioEnv:
     defn = ScenarioDefinition(
         key="pretrain_combined_smoke_1v1",
         label="Smoke: pretrain_combined 1v1",
         description="Smoke-test env for pretrain_combined()",
-        build=build_1v1_scenario,
+        build=_build_1v1_rules_opponent,
     )
     return ScenarioEnv(
         definition=defn,

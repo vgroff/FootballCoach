@@ -70,6 +70,18 @@ The decision network's `move_region_center` / `move_arrival_speed` are
 **strategic context** for reward shaping and BC label generation — they are
 NOT used as motor control inputs.
 
+**Corollary — BC label generation must respect the same boundary in
+reverse:** code that derives BC *labels* for the execution network (see
+`ai/ppo/bc.py`'s `phase1_labels()`) must source execution-level fields
+(`move_direction`, `sprint`, `exec_move`, kick vector, `tackle_attempt`) from
+`player.desired_direction`/`player.desired_speed_mode`/`player.kicked_this_tick`/
+`player.last_kick_*` — i.e. what the ORDER MACHINERY ACTUALLY PRODUCED on the
+player that tick — never by re-deriving geometry from an Order's own fields
+(that bypasses braking/repulsion/turning/push-kick logic). See
+`ai/knowledge.md`'s "Orders vs execution-network labels boundary" section for
+the full rule and `agent_plans/bc_execution_label_boundary_and_followups.md`
+for the bug history.
+
 ## `actions.py` — thin shim (deprecated, kept for compatibility)
 
 `actions.py` functions (`move_to`, `shoot`, `pass_to`, `tackle`, `save`,

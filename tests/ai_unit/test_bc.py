@@ -33,6 +33,12 @@ from footballcoach.ai.ppo.bc import (
     _I_TACKLE,
     _I_TACKLE_ATTEMPT,
     _I_VALID,
+    _I_KICK_DIR_X,
+    _I_KICK_DIR_Y,
+    _I_KICK_POWER,
+    _I_KICK_SPIN_X,
+    _I_KICK_SPIN_Y,
+    _I_KICK_SPIN_Z,
     bc_loss_from_tensor,
     phase1_labels,
 )
@@ -96,6 +102,34 @@ class TestBCLabelArray:
         arr = label.to_array()
         assert arr[_I_VALID] == pytest.approx(0.0)
         assert label.valid is False
+
+    def test_to_array_kick_fields_round_trip(self):
+        kick_direction = np.array([0.0, 1.0], dtype=np.float32)
+        kick_spin = np.array([1.0, 2.0, 3.0], dtype=np.float32)
+        label = BCLabel(
+            kick_this_tick=1.0,
+            kick_direction=kick_direction,
+            kick_power_fraction=0.75,
+            kick_spin=kick_spin,
+            valid=True,
+        )
+        arr = label.to_array()
+        assert arr[_I_KICK_DIR_X] == pytest.approx(0.0)
+        assert arr[_I_KICK_DIR_Y] == pytest.approx(1.0)
+        assert arr[_I_KICK_POWER] == pytest.approx(0.75)
+        assert arr[_I_KICK_SPIN_X] == pytest.approx(1.0)
+        assert arr[_I_KICK_SPIN_Y] == pytest.approx(2.0)
+        assert arr[_I_KICK_SPIN_Z] == pytest.approx(3.0)
+
+    def test_to_array_kick_fields_default_zero(self):
+        label = BCLabel()
+        arr = label.to_array()
+        assert arr[_I_KICK_DIR_X] == pytest.approx(0.0)
+        assert arr[_I_KICK_DIR_Y] == pytest.approx(0.0)
+        assert arr[_I_KICK_POWER] == pytest.approx(0.0)
+        assert arr[_I_KICK_SPIN_X] == pytest.approx(0.0)
+        assert arr[_I_KICK_SPIN_Y] == pytest.approx(0.0)
+        assert arr[_I_KICK_SPIN_Z] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------
@@ -230,6 +264,71 @@ class TestBCLossFromTensor:
         loss = bc_loss_from_tensor(labels, d_heads, e_heads)
         assert loss.item() == pytest.approx(0.0, abs=1e-8)
 
+    def test_kick_direction_loss_zero_when_aligned(self):
+        n = 1
+        kick_direction = np.array([1.0, 0.0], dtype=np.float32)
+        labels = _make_labels([BCLabel(kick_this_tick=1.0, kick_direction=kick_direction, valid=True)])
+        d_heads, e_heads = _zeros_heads(n)
+        e_heads.kick_direction = torch.tensor([[1.0, 0.0]])
+        _, breakdown = bc_loss_from_tensor(labels, d_heads, e_heads, return_breakdown=True)
+        assert breakdown["kick_direction"] == pytest.approx(0.0, abs=1e-4)
+
+    def test_kick_direction_loss_max_when_opposite(self):
+        n = 1
+        kick_direction = np.array([1.0, 0.0], dtype=np.float32)
+        labels = _make_labels([BCLabel(kick_this_tick=1.0, kick_direction=kick_direction, valid=True)])
+        d_heads, e_heads = _zeros_heads(n)
+        e_heads.kick_direction = torch.tensor([[-1.0, 0.0]])
+        direction_loss_weight = 3.0
+        _, breakdown = bc_loss_from_tensor(
+            labels, d_heads, e_heads, direction_loss_weight=direction_loss_weight,
+            return_breakdown=True,
+        )
+        assert breakdown["kick_direction"] == pytest.approx(direction_loss_weight * 2.0, abs=1e-4)
+
+    def test_kick_direction_loss_gated_on_kick_this_tick(self):
+        """kick_direction present but kick_this_tick=0 -> no loss contribution."""
+        n = 1
+        kick_direction = np.array([1.0, 0.0], dtype=np.float32)
+        labels = _make_labels([BCLabel(kick_this_tick=0.0, kick_direction=kick_direction, valid=True)])
+        d_heads, e_heads = _zeros_heads(n)
+        e_heads.kick_direction = torch.tensor([[-1.0, 0.0]])
+        _, breakdown = bc_loss_from_tensor(labels, d_heads, e_heads, return_breakdown=True)
+        assert breakdown["kick_direction"] == pytest.approx(0.0, abs=1e-4)
+
+    def test_kick_power_loss_matches_mse(self):
+        n = 1
+        labels = _make_labels([BCLabel(kick_this_tick=1.0, kick_power_fraction=0.8, valid=True)])
+        d_heads, e_heads = _zeros_heads(n)  # sigmoid(0) = 0.5
+        _, breakdown = bc_loss_from_tensor(labels, d_heads, e_heads, return_breakdown=True)
+        assert breakdown["kick_power"] == pytest.approx((0.5 - 0.8) ** 2, abs=1e-4)
+
+    def test_kick_power_loss_gated_on_kick_this_tick(self):
+        n = 1
+        labels = _make_labels([BCLabel(kick_this_tick=0.0, kick_power_fraction=0.8, valid=True)])
+        d_heads, e_heads = _zeros_heads(n)
+        _, breakdown = bc_loss_from_tensor(labels, d_heads, e_heads, return_breakdown=True)
+        assert breakdown["kick_power"] == pytest.approx(0.0, abs=1e-4)
+
+    def test_kick_spin_loss_zero_for_matching_spin(self):
+        n = 1
+        kick_spin = np.array([5.0, -5.0, 0.0], dtype=np.float32)
+        labels = _make_labels([BCLabel(kick_this_tick=1.0, kick_spin=kick_spin, valid=True)])
+        d_heads, e_heads = _zeros_heads(n)
+        e_heads.kick_spin = torch.tensor([[5.0, -5.0, 0.0]])
+        _, breakdown = bc_loss_from_tensor(labels, d_heads, e_heads, return_breakdown=True)
+        assert breakdown["kick_spin"] == pytest.approx(0.0, abs=1e-4)
+
+    def test_kick_breakdown_key_present_in_zero_dict(self):
+        n = 3
+        labels = _make_labels([BCLabel.invalid() for _ in range(n)])
+        d_heads, e_heads = _zeros_heads(n)
+        _, breakdown = bc_loss_from_tensor(labels, d_heads, e_heads, return_breakdown=True)
+        assert breakdown["kick"] == pytest.approx(0.0)
+        assert breakdown["kick_direction"] == pytest.approx(0.0)
+        assert breakdown["kick_power"] == pytest.approx(0.0)
+        assert breakdown["kick_spin"] == pytest.approx(0.0)
+
 
 class TestBCLossFromTensorDecisionOnly:
     """exec_heads=None (W7 Phase 0 path): loss must equal the decision-only
@@ -291,7 +390,15 @@ class TestPhase1Labels:
         """When the trainee has no possession and is far from the ball,
         Phase1RulesAI issues a GetPossessionOrder (not MoveOrder) since it
         always chases the ball when it doesn't have possession -- verify
-        get_possession_extra fires and direction points at the ball."""
+        get_possession_extra fires and a direction is produced.
+
+        NOTE: move_direction is derived by actually running the decided
+        order's execute() and reading back player.desired_direction (see
+        ai/knowledge.md "Orders vs execution-network labels boundary") --
+        it reflects real movement logic (braking/repulsion/turn-limiting),
+        NOT a hand-derived straight-line vector toward the ball. So we only
+        assert it's a valid unit vector here, not that it exactly matches
+        raw target geometry."""
         env = _make_env()
         env.reset()
         match = env.match
@@ -302,13 +409,9 @@ class TestPhase1Labels:
         label = phase1_labels(env, env.trainee_player_id)
         assert label.valid
         assert label.get_possession_extra == pytest.approx(1.0)
-        # direction should point from player toward ball
-        dx = match.ball.position.x - player.position.x
-        dy = match.ball.position.y - player.position.y
-        length = math.hypot(dx, dy)
-        if length > 1e-6:
-            expected_dir = np.array([dx / length, dy / length])
-            np.testing.assert_allclose(label.move_direction, expected_dir, atol=1e-4)
+        if label.move_direction is not None:
+            norm = float(np.linalg.norm(label.move_direction))
+            assert norm == pytest.approx(1.0, abs=1e-3)
 
     def test_move_label_when_carrying_ball(self):
         """When the trainee has possession, Phase1RulesAI issues a MoveOrder
@@ -325,20 +428,33 @@ class TestPhase1Labels:
         assert label.move == pytest.approx(1.0)
         assert label.move_direction is not None
 
-    def test_invalid_when_player_already_at_target(self):
-        """Degenerate zero-length direction (player exactly at the ball's
-        position while chasing) must yield BCLabel.invalid()."""
+    def test_valid_when_player_already_at_target(self):
+        """Degenerate zero-length raw target vector (player exactly at the
+        ball's position while chasing) must NOT discard the whole frame.
+
+        Prior (buggy) behaviour hand-derived move_direction from
+        `target - position` and returned BCLabel.invalid() whenever that
+        vector was ~zero-length, silently dropping kick/tackle supervision
+        on exactly the ticks where a push-kick/tackle is most likely to have
+        just fired. The fix runs the decided order's execute() and reads
+        back player.desired_direction/desired_speed_mode instead, so the
+        label stays valid even when the raw target vector is degenerate --
+        move_direction may legitimately be None if execute() resolves to a
+        STANDSTILL/no-op for this tick, but the frame itself is not
+        discarded. See ai/knowledge.md "Orders vs execution-network labels
+        boundary"."""
         env = _make_env()
         env.reset()
         match = env.match
         player = match.player_by_id(env.trainee_player_id)
         match.ball.possessed_by = None
-        # Move the ball exactly onto the player so the direction vector is zero.
+        # Move the ball exactly onto the player so the raw target vector is zero.
         from footballcoach.mathutils import Vector3
         match.ball.position = Vector3(player.position.x, player.position.y, 0.0)
 
         label = phase1_labels(env, env.trainee_player_id)
-        assert not label.valid
+        assert label.valid
+        assert label.get_possession_extra == pytest.approx(1.0)
 
     def test_invalid_for_missing_match(self):
         """If env.match is None, phase1_labels must return an invalid label

@@ -70,6 +70,28 @@ class Player:
     on_tackle: object | None = field(default=None, repr=False)   # fired when a tackle attempt executes
     on_possession_gained: object | None = field(default=None, repr=False)  # fired by match._set_possession() when this player gains the ball
 
+    # Unconditional per-tick kick flag — set True inside kick_direct() every
+    # time it actually executes kick physics, regardless of on_kick being set
+    # and regardless of which Order (or no Order, e.g. MoveOrder's push-kick)
+    # triggered it. Match._process_orders() resets this to False for every
+    # player at the start of each tick, so any code that runs after order
+    # processing (e.g. BC label derivation) can check "did this player kick
+    # THIS tick" without caring about order-type bookkeeping.
+    kicked_this_tick: bool = field(default=False, repr=False, compare=False)
+
+    # Unconditional per-tick kick output capture — set inside kick_direct() every
+    # time it actually executes kick physics, regardless of on_kick being set and
+    # regardless of which Order (or no Order, e.g. MoveOrder's push-kick)
+    # triggered it. Mirrors kicked_this_tick's rationale (see its docstring) but
+    # captures the actual kick VECTOR, not just the boolean fact of kicking, so
+    # BC label derivation can supervise kick_direction/kick_power/kick_spin for
+    # ANY AI that kicks (rules-based, human, future neural variants) with no
+    # per-AI wiring. All three are None/unset when the player did not kick this
+    # tick (reset alongside kicked_this_tick in Match._process_orders()).
+    last_kick_direction: Vector3 | None = field(default=None, repr=False, compare=False)
+    last_kick_power_fraction: float | None = field(default=None, repr=False, compare=False)
+    last_kick_spin: Vector3 | None = field(default=None, repr=False, compare=False)
+
     # Display hint: set by the engine when an action fires (kick, tackle,
     # first-touch control, GK save).  The UI layer polls this each frame,
     # records the icon with a wall-clock expiry, then clears it.  Engine
@@ -169,6 +191,11 @@ class Player:
         )
         match._start_release_grace(self.player_id)
         match._log_debug(f"{self.player_id} kicked (direct)  power={power_fraction:.2f}")
+        self.kicked_this_tick = True
+        _dir_vec = (aim_point - self.position).xy()
+        self.last_kick_direction = _dir_vec.normalized() if _dir_vec.length() > 1e-6 else None
+        self.last_kick_power_fraction = float(adjusted_power)
+        self.last_kick_spin = spin
         if self.on_kick is not None:
             self.on_kick(self)
 

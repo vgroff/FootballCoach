@@ -53,6 +53,9 @@ class TrainingSchedules:
 
     def __init__(self, ppo_cfg: dict, curriculum_cfg: dict, bc_cfg: dict | None = None):
         self.learning_rate = constant(float(ppo_cfg.get("learning_rate", 3e-4)))
+        self.value_learning_rate = constant(
+            float(ppo_cfg.get("value_learning_rate", ppo_cfg.get("learning_rate", 3e-4)))
+        )
         self.clip_range = constant(float(ppo_cfg.get("clip_range", 0.2)))
         self.rng_reduction = rng_reduction_schedule(curriculum_cfg)
         bc = bc_cfg or {}
@@ -66,6 +69,9 @@ class TrainingSchedules:
 
     def lr(self, progress: float) -> float:
         return self.learning_rate(progress)
+
+    def value_lr(self, progress: float) -> float:
+        return self.value_learning_rate(progress)
 
     def clip(self, progress: float) -> float:
         return self.clip_range(progress)

@@ -101,15 +101,16 @@ class DemonstrationDataset:
         n = len(data["obs_self_feat"])
         bc_labels = data["bc_labels"]
         # Schema guard: bc_labels' last dim must match the current BC_LABEL_DIM
-        # (currently 18, after the W6 opponent_ai_type field was appended at
-        # index 17, on top of the W5 ai_type field at index 16).
-        # Older recordings (16- or 17-wide) are no longer loadable — they
-        # must be re-recorded via record_demonstrations.py.
+        # (currently 24, after kick_direction/kick_power/kick_spin fields were
+        # appended at indices 18-23, on top of the W6 opponent_ai_type field at
+        # index 17). Older recordings (16-, 17-, or 18-wide) are no longer
+        # loadable — they must be re-recorded via record_demonstrations.py.
         if bc_labels.shape[-1] != BC_LABEL_DIM:
             raise ValueError(
                 f"{path}: bc_labels has width {bc_labels.shape[-1]}, expected "
                 f"BC_LABEL_DIM={BC_LABEL_DIM}. This .npz was recorded with an "
-                f"older BC label schema (e.g. missing the ai_type/opponent_ai_type field). "
+                f"older BC label schema (e.g. missing kick_direction/kick_power/"
+                f"kick_spin fields added for full execution-head BC coverage). "
                 f"Re-record demonstrations: "
                 f"uv run python -m footballcoach.ai.scripts.record_demonstrations "
                 f"--phase 1 --n-episodes <N> --output <dir>"

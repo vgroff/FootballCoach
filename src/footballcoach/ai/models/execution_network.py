@@ -27,6 +27,7 @@ import torch.nn as nn
 
 from footballcoach.ai.action.schema import DecisionHeadsRaw, ExecutionHeadsRaw
 from footballcoach.ai.models.entity_encoder import EntityEncoder
+from footballcoach.ai.models.value_side_channel import ValueAiTypeSideChannel
 from footballcoach.ai.obs.schema import (
     AI_TYPE_ONE_HOT_DIM,
     BALL_FEATURE_DIM,
@@ -118,6 +119,7 @@ class ExecutionNetwork(nn.Module):
         trunk_hidden: int = 256,
         dir_log_std_init: float = -2.0,
         value_extra_hidden: int = 16,
+        value_hidden_dim: int = 0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -163,14 +165,28 @@ class ExecutionNetwork(nn.Module):
 
         # --- Value-only opponent-AI-type side channel (mirrors DecisionNetwork's -
         # see ai/knowledge.md "Opponent-AI-type (value-only)"). Bypasses `h`/trunk
-        # entirely for every head except value_head. ---
-        ai_type_flat_dim = AI_TYPE_ONE_HOT_DIM * (1 + MAX_OTHER_PLAYERS)
-        self.value_extra_mlp = nn.Sequential(
-            nn.Linear(ai_type_flat_dim, value_extra_hidden), nn.ReLU(),
+        # entirely for every head except value_head. Dedicated shared-per-slot-MLP
+        # + attention pool (own weights, zero sharing with self.entity_encoder) --
+        # exactly permutation-invariant, unlike the old flatten+Linear (see
+        # value_side_channel.py docstring). Enriched with a DETACHED copy of the
+        # main entity encoder's per-slot embeddings; detaching keeps this value-only. ---
+        self.value_ai_type_channel = ValueAiTypeSideChannel(
+            ai_type_dim=AI_TYPE_ONE_HOT_DIM,
+            entity_embed_dim=entity_embed_dim,
+            hidden_dim=value_extra_hidden,
         )
 
-        # Critic value head (shared trunk, Option A) + value-only ai-type side channel
-        self.value_head = nn.Linear(trunk_hidden + value_extra_hidden, 1)
+        # Critic value head (shared trunk, Option A) + value-only ai-type side channel.
+        # value_hidden_dim=0 keeps the old single-linear-layer behaviour;
+        # >0 inserts one ReLU hidden layer before the final scalar output.
+        value_in_dim = trunk_hidden + value_extra_hidden
+        if value_hidden_dim > 0:
+            self.value_head = nn.Sequential(
+                nn.Linear(value_in_dim, value_hidden_dim), nn.ReLU(),
+                nn.Linear(value_hidden_dim, 1),
+            )
+        else:
+            self.value_head = nn.Linear(value_in_dim, 1)
 
         # Learnable log_std for direction heads (move_dir, kick_dir).
         # Initialized from config (dir_log_std_init). Lower = tighter sampling
@@ -193,7 +209,9 @@ class ExecutionNetwork(nn.Module):
         self_ai_type: Optional[torch.Tensor] = None,   # (batch, AI_TYPE_ONE_HOT_DIM)
         other_ai_type: Optional[torch.Tensor] = None,  # (batch, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM)
     ) -> ExecutionHeadsRaw:
-        entity_ctx = self.entity_encoder(self_feat, other_feat, exists_mask)
+        entity_ctx, self_embed_raw, other_embed_raw = self.entity_encoder(
+            self_feat, other_feat, exists_mask, return_embeds=True
+        )
         dec_flat = flatten_decision_heads(decision_heads)
         h = torch.cat([
             entity_ctx,
@@ -211,10 +229,10 @@ class ExecutionNetwork(nn.Module):
             other_ai_type = torch.zeros(
                 batch_size, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM, device=h.device, dtype=h.dtype
             )
-        ai_type_flat = torch.cat(
-            [self_ai_type, other_ai_type.reshape(batch_size, -1)], dim=-1
+        value_extra = self.value_ai_type_channel(
+            self_ai_type, other_ai_type, exists_mask,
+            self_embed=self_embed_raw.detach(), other_embed=other_embed_raw.detach(),
         )
-        value_extra = self.value_extra_mlp(ai_type_flat)
         value_input = torch.cat([h, value_extra], dim=-1)
 
         eps = 1e-6
@@ -234,7 +252,19 @@ class ExecutionNetwork(nn.Module):
         )
 
     @classmethod
-    def from_config(cls) -> "ExecutionNetwork":
+    def from_config(cls, trunk_hidden_override: Optional[int] = None) -> "ExecutionNetwork":
+        """Build from ai_config.json (the canonical hyperparameter source).
+
+        Args:
+            trunk_hidden_override: If given, overrides ``network.trunk_hidden``
+                for this instance only. Used by PPOTrainer to size the
+                dedicated ``value_net`` trunk differently from the main
+                policy execution_net's trunk via
+                ``network.value_net_trunk_hidden`` in ai_config.json (see
+                ``PPOTrainer.__init__``'s ``separate_value_net`` handling).
+                ``None`` (default) falls back to ``network.trunk_hidden``,
+                matching the shared-trunk network's size.
+        """
         from footballcoach.ai.config import load_ai_config
         full_cfg = load_ai_config()
         cfg = full_cfg["network"]
@@ -247,7 +277,8 @@ class ExecutionNetwork(nn.Module):
             ball_mlp_hidden=cfg["ball_mlp_hidden"],
             global_mlp_hidden=cfg["global_mlp_hidden"],
             decision_mlp_hidden=cfg["decision_mlp_hidden"],
-            trunk_hidden=cfg["trunk_hidden"],
+            trunk_hidden=trunk_hidden_override if trunk_hidden_override is not None else cfg["trunk_hidden"],
             dir_log_std_init=ppo_cfg.get("dir_log_std_init", -2.0),
             value_extra_hidden=cfg.get("value_extra_hidden", 16),
+            value_hidden_dim=cfg.get("value_hidden_dim", 0),
         )

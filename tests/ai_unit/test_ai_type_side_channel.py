@@ -14,6 +14,7 @@ These tests guard the three properties that matter most:
      extra side-channel MLP output.
 """
 import torch
+from torch import nn
 
 from footballcoach.ai.obs.schema import (
     AI_TYPE_ONE_HOT_DIM,
@@ -118,10 +119,26 @@ class TestExecutionNetworkGradientIsolation:
 class TestForwardShapes:
     def test_value_head_input_dim_includes_side_channel(self):
         net = DecisionNetwork.from_config()
-        ai_type_flat_dim = AI_TYPE_ONE_HOT_DIM * (1 + MAX_OTHER_PLAYERS)
-        assert net.value_extra_mlp[0].in_features == ai_type_flat_dim
-        expected_value_in = net.trunk[-2].out_features + net.value_extra_mlp[0].out_features
-        assert net.value_head.in_features == expected_value_in
+        # Side channel is now ValueAiTypeSideChannel (shared per-slot MLP +
+        # dedicated attention pool), not a flatten+Linear -- see
+        # ai/models/value_side_channel.py. Its per-slot MLP input dim is
+        # ai_type_dim + entity_embed_dim (detached entity embeddings are
+        # concatenated in), and its output dim is hidden_dim regardless of
+        # MAX_OTHER_PLAYERS (permutation-invariant pooling, not flattening).
+        channel = net.value_ai_type_channel
+        expected_in_dim = AI_TYPE_ONE_HOT_DIM + channel.entity_embed_dim
+        assert channel.per_slot_mlp[0].in_features == expected_in_dim
+        hidden_dim = channel.per_slot_mlp[0].out_features
+        expected_value_in = net.trunk[-2].out_features + hidden_dim
+        # value_head is a bare nn.Linear when config's value_hidden_dim=0, or
+        # an nn.Sequential(Linear, ReLU, Linear) when >0 (see
+        # DecisionNetwork.__init__ / ai_config.json["network"]["value_hidden_dim"]).
+        # Grab whichever layer actually has in_features so this test doesn't
+        # depend on which mode the current config uses.
+        first_value_layer = (
+            net.value_head[0] if isinstance(net.value_head, nn.Sequential) else net.value_head
+        )
+        assert first_value_layer.in_features == expected_value_in
 
     def test_forward_runs_without_ai_type_args(self):
         """Omitting self_ai_type/other_ai_type must default to all-zero, not error."""
@@ -262,3 +279,52 @@ class TestAugmentationPermutation:
                     )
         # self_ai_type must be unchanged (pass-through, no geometric flip)
         assert torch.allclose(aug_obs["self_ai_type"], torch.tensor([[1.0, 0.0, 0.0]] * aug_obs["self_ai_type"].shape[0]))
+
+
+class TestValueSideChannelPermutationInvariance:
+    """Regression test for the bug where the ai-type side channel's old
+    flatten+Linear implementation was NOT permutation-invariant (each slot
+    position had its own weight block), unlike the main entity encoder.
+    See ai/models/value_side_channel.py docstring.
+    """
+
+    def test_value_output_unchanged_when_real_player_moved_to_different_slot(self):
+        torch.manual_seed(0)
+        net = DecisionNetwork.from_config()
+        net.eval()
+
+        batch_size = 1
+        self_feat = torch.randn(batch_size, PLAYER_FEATURE_DIM)
+        ball_feat = torch.randn(batch_size, BALL_FEATURE_DIM)
+        global_feat = torch.randn(batch_size, GLOBAL_FEATURE_DIM)
+        self_ai_type = torch.zeros(batch_size, AI_TYPE_ONE_HOT_DIM)
+        self_ai_type[:, 2] = 1.0  # self is neural
+
+        real_player_feat = torch.randn(PLAYER_FEATURE_DIM)
+        real_player_ai_type = torch.tensor([1.0, 0.0, 0.0])  # is_rules
+
+        def _build(slot: int):
+            other_feat = torch.zeros(batch_size, MAX_OTHER_PLAYERS, PLAYER_FEATURE_DIM)
+            exists_mask = torch.zeros(batch_size, MAX_OTHER_PLAYERS)
+            other_ai_type = torch.zeros(batch_size, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM)
+            other_feat[0, slot] = real_player_feat
+            exists_mask[0, slot] = 1.0
+            other_ai_type[0, slot] = real_player_ai_type
+            return other_feat, exists_mask, other_ai_type
+
+        with torch.no_grad():
+            other_feat_a, exists_mask_a, other_ai_type_a = _build(slot=0)
+            heads_a = net(
+                self_feat, other_feat_a, exists_mask_a, ball_feat, global_feat,
+                self_ai_type, other_ai_type_a,
+            )
+
+            other_feat_b, exists_mask_b, other_ai_type_b = _build(slot=17)
+            heads_b = net(
+                self_feat, other_feat_b, exists_mask_b, ball_feat, global_feat,
+                self_ai_type, other_ai_type_b,
+            )
+
+        # Moving the one real player from slot 0 to slot 17 (all else identical
+        # padding) must not change the value estimate at all.
+        assert torch.allclose(heads_a.value, heads_b.value, atol=1e-5)

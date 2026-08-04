@@ -27,6 +27,14 @@ from footballcoach.rules_ai import (
 from tests.conftest import make_player
 
 
+def _ball_aimed_at_left_goal(speed: float = 20.0) -> Ball:
+    """A loose ball moving straight toward the LEFT goal, fast enough and
+    aimed centrally enough to trigger StagedGoalkeeperAI._ball_aimed_at_goal()."""
+    ball = Ball.at_rest(Vector3(0, 0, 0))
+    ball.velocity = Vector3(-speed, 0, 0)
+    return ball
+
+
 def _make_simple_match(
     *,
     attacker_team: Team = Team.LEFT,
@@ -253,11 +261,20 @@ class TestShouldSprintToBall:
 # ---------------------------------------------------------------------------
 
 class TestStagedGoalkeeperAI:
-    def test_issues_save_order_when_no_order_and_no_ball(self):
-        match, p1, _ = _make_simple_match()
+    def test_issues_save_order_when_ball_aimed_at_goal(self):
+        match, p1, _ = _make_simple_match(ball_position=Vector3(0, 0, 0))
+        match.ball.velocity = Vector3(-20.0, 0, 0)  # aimed at p1's (LEFT) goal
         p1.ai = StagedGoalkeeperAI()
         p1.ai.act(p1, match, 0)
         assert isinstance(p1.current_order, SaveOrder)
+
+    def test_issues_move_order_to_goal_centre_when_no_order_and_ball_not_threatening(self):
+        match, p1, _ = _make_simple_match()
+        p1.ai = StagedGoalkeeperAI()
+        p1.ai.act(p1, match, 0)
+        assert isinstance(p1.current_order, MoveOrder), (
+            "AI should jog back to goal centre when the ball is loose but not aimed at goal"
+        )
 
     def test_does_not_issue_save_order_when_has_ball(self):
         match, p1, _ = _make_simple_match(ball_possessed_by="p1")
@@ -275,7 +292,8 @@ class TestStagedGoalkeeperAI:
         assert p1.current_order is existing
 
     def test_reissues_save_order_after_order_cleared(self):
-        match, p1, _ = _make_simple_match()
+        match, p1, _ = _make_simple_match(ball_position=Vector3(0, 0, 0))
+        match.ball.velocity = Vector3(-20.0, 0, 0)  # aimed at p1's (LEFT) goal
         p1.ai = StagedGoalkeeperAI()
         p1.current_order = None
         p1.ai.act(p1, match, 0)
