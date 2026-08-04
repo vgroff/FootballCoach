@@ -132,10 +132,31 @@ def main() -> None:
     # BC pre-training steps: CLI flag overrides config
     cfg = load_ai_config()
     bc_cfg = cfg.get("bc", {})
+
+    # When re-pretraining from an existing checkpoint (--pretrain-from-checkpoint or
+    # --latest-pretrain), swap in the _from_ckpt variants for pretrain epochs and
+    # aux coefficients — typically fewer epochs and a lower BC aux start since the
+    # policy is already close to the demonstrations.
+    _is_pretrain_from_ckpt = bool(args.pretrain_from_checkpoint) or bool(args.latest_pretrain)
+    if _is_pretrain_from_ckpt:
+        _from_ckpt_keys = (
+            "bc_pretrain_epochs",
+            "demo_value_pretrain_epochs",
+            "value_pretrain_epochs",
+            "aux_coeff_start",
+            "aux_coeff_end",
+            "aux_coeff_anneal_fraction",
+        )
+        for _k in _from_ckpt_keys:
+            _ckpt_k = f"{_k}_from_ckpt"
+            if _ckpt_k in bc_cfg:
+                log.info(f"_from_ckpt: overriding {_k}={bc_cfg[_k]} → {bc_cfg[_ckpt_k]}")
+                bc_cfg[_k] = bc_cfg[_ckpt_k]
+
     pretrain_steps = (
         args.bc_pretrain_steps
         if args.bc_pretrain_steps is not None
-        else int(bc_cfg.get("pretrain_steps", 0))
+        else int(bc_cfg.get("bc_online_steps", bc_cfg.get("pretrain_steps", 0)))
     )
 
     # Build trainer (--no-bc-aux zeros out the aux coeff in config)
@@ -257,16 +278,65 @@ def main() -> None:
         )
 
         if dataset is not None and label_fn is not None:
+            # Diagnostic: run 40 rules-vs-rules episodes before any training to show
+            # the baseline reward component breakdown. Helps calibrate reward shaping.
+            _diag_n = 40
+            log.info(f"Reward diagnostic: running {_diag_n} rules-vs-rules episodes...")
+            try:
+                from footballcoach.rules_ai import Phase1RulesAI
+                from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
+                from footballcoach.ai.env.scenario_env import ScenarioEnv
+                def _rr_build(*_a, **_kw):
+                    match = build_1v1_scenario(*_a, **_kw)
+                    for p in match.players:
+                        p.ai = Phase1RulesAI()
+                    match._opponent_use_rules_ai = True
+                    match._opponent_is_immobile = False
+                    return match
+                _diag_defn = ScenarioDefinition(key="diag_rr", label="diag", description="rules vs rules diagnostic", build=_rr_build)
+                _diag_env = ScenarioEnv(_diag_defn, trainee_player_id="trainee", phase=1, max_episode_s=env.max_episode_s)
+                _comp_acc: dict[str, float] = {}
+                _ep_rewards: list[float] = []
+                for _ in range(_diag_n):
+                    _diag_env.reset()
+                    _ep_r = 0.0
+                    _done = False
+                    while not _done:
+                        _, _r, _done, _ = _diag_env.step()
+                        _ep_r += _r
+                        for _k, _v in _diag_env.last_reward_components.items():
+                            _comp_acc[_k] = _comp_acc.get(_k, 0.0) + _v
+                    _ep_rewards.append(_ep_r)
+                from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS as _CL
+                _key_order = {k: i for i, (k, _) in enumerate(_CL)}
+                _comp_sorted = sorted(
+                    _comp_acc.items(),
+                    key=lambda x: _key_order.get(x[0], 999),
+                )
+                _cl_map = dict(_CL)
+                _comp_str = "  ".join(
+                    f"{_cl_map.get(k, k)}={v / _diag_n:+.2f}"
+                    for k, v in _comp_sorted
+                    if abs(v / _diag_n) > 0.005
+                )
+                log.info(
+                    f"Reward diagnostic ({_diag_n} ep, rules vs rules): "
+                    f"mean_ep_rew={sum(_ep_rewards) / _diag_n:.2f}  "
+                    f"per_episode: {_comp_str}"
+                )
+            except Exception as _diag_exc:
+                log.warning(f"Reward diagnostic failed (non-fatal): {_diag_exc}")
+
             # Combined joint pre-training (BC + value in one pass)
             trainer.pretrain_combined(
                 env=env,
                 dataset=dataset,
                 n_epochs=bc_pretrain_epochs,
                 batch_size=bc_pretrain_batch_size,
-                bc_lr=float(bc_cfg.get("pretrain_lr", 3e-4)),
+                bc_lr=float(bc_cfg.get("bc_learning_rate", bc_cfg.get("pretrain_lr", 3e-4))),
                 value_lr=value_pretrain_lr,
-                repair_lr=float(bc_cfg.get("bc_repair_lr", bc_cfg.get("pretrain_lr", 3e-4))),
-                rollout_steps=max(value_pretrain_steps, trainer.rollout_steps),
+                repair_lr=float(bc_cfg.get("bc_repair_lr", bc_cfg.get("bc_learning_rate", bc_cfg.get("pretrain_lr", 3e-4)))),
+                rollout_steps=value_pretrain_steps,
                 value_epochs=value_pretrain_epochs,
             )
         else:
@@ -314,11 +384,19 @@ def main() -> None:
             max_episode_s=env.max_episode_s,
         )
         rules_stats = _run_evaluation(trainer, rules_env, args.pre_ppo_eval_trials)
+        _comp_str = "  ".join(
+            f"{k}={v:+.2f}" for k, v in sorted(
+                rules_stats.get("reward_components", {}).items(), key=lambda x: -abs(x[1])
+            ) if abs(v) > 0.005
+        )
         log.info(
             f"Pre-PPO eval (rules opp): win={rules_stats['win_rate_pct']:.1f}%  "
             f"mean_rew={rules_stats['mean_reward']:.3f}  "
+            f"mean_val={rules_stats['mean_value_pred']:.3f}  "
             f"outcomes={rules_stats['outcomes']}"
         )
+        if _comp_str:
+            log.info(f"  rew breakdown (rules, per ep): {_comp_str}")
 
         # Evaluate against immobile opponent only
         def _immobile_build(*args, **kwargs):
@@ -334,11 +412,54 @@ def main() -> None:
             max_episode_s=env.max_episode_s,
         )
         immobile_stats = _run_evaluation(trainer, immobile_env, args.pre_ppo_eval_trials)
+        _imm_comp_str = "  ".join(
+            f"{k}={v:+.2f}" for k, v in sorted(
+                immobile_stats.get("reward_components", {}).items(), key=lambda x: -abs(x[1])
+            ) if abs(v) > 0.005
+        )
         log.info(
             f"Pre-PPO eval (immobile opp): win={immobile_stats['win_rate_pct']:.1f}%  "
             f"mean_rew={immobile_stats['mean_reward']:.3f}  "
+            f"mean_val={immobile_stats['mean_value_pred']:.3f}  "
             f"outcomes={immobile_stats['outcomes']}"
         )
+        if _imm_comp_str:
+            log.info(f"  rew breakdown (immobile, per ep): {_imm_comp_str}")
+
+        # Evaluate neural vs neural (self-play): the BC-pretrained policy plays itself.
+        # Uses secondary_player_ids so the opponent also runs NeuralPlayerAI with the
+        # same sample_action_fn — true self-play, no rules involvement.
+        def _neural_build(*args, **kwargs):
+            match = build_1v1_scenario(*args, **kwargs)
+            opp = match.player_by_id("opponent")
+            opp.ai = None
+            match._opponent_use_rules_ai = False
+            match._opponent_is_immobile = False
+            return match
+        neural_defn = ScenarioDefinition(
+            key="1v1_neural", label="1v1 self-play",
+            description="1v1 neural vs neural (self-play)",
+            build=_neural_build,
+        )
+        neural_env = ScenarioEnv(
+            neural_defn, trainee_player_id="trainee", phase=1,
+            max_episode_s=env.max_episode_s,
+            secondary_player_ids=["opponent"],
+        )
+        neural_stats = _run_evaluation(trainer, neural_env, args.pre_ppo_eval_trials)
+        _nn_comp_str = "  ".join(
+            f"{k}={v:+.2f}" for k, v in sorted(
+                neural_stats.get("reward_components", {}).items(), key=lambda x: -abs(x[1])
+            ) if abs(v) > 0.005
+        )
+        log.info(
+            f"Pre-PPO eval (self-play):   win={neural_stats['win_rate_pct']:.1f}%  "
+            f"mean_rew={neural_stats['mean_reward']:.3f}  "
+            f"mean_val={neural_stats['mean_value_pred']:.3f}  "
+            f"outcomes={neural_stats['outcomes']}"
+        )
+        if _nn_comp_str:
+            log.info(f"  rew breakdown (self-play, per ep): {_nn_comp_str}")
 
     # Rules vs rules baseline (always runs, 12 trials)
     try:

@@ -50,8 +50,8 @@ class TestPhase1Reward:
     def test_components_dict_has_all_keys(self):
         _, comps = self._call()
         assert set(comps.keys()) == {
-            "appr", "retr", "poss", "prog", "out", "ill",
-            "box", "spd", "lpos", "lterm", "tout", "prox",
+            "appr", "retr", "hdg", "poss", "prog", "out", "ill",
+            "box", "spd", "lpos", "lterm", "tout", "prox", "stam",
         }
 
     def test_total_always_equals_sum_of_components(self):
@@ -74,17 +74,33 @@ class TestPhase1Reward:
         assert comps["appr"] == pytest.approx(expected, rel=1e-5)
         assert comps["retr"] == pytest.approx(0.0, abs=1e-7)
 
-    def test_moving_away_from_ball_gives_retreat_penalty(self):
+    def test_moving_away_from_ball_positional_retreat(self):
+        # ball_retreat_penalty is 0.0 (positional retreat disabled; heading penalty used instead).
         total, comps = self._call(prev_ball_dist=5.0, curr_ball_dist=10.0)
         expected = _CFG1["ball_retreat_penalty"] * (-5.0)
-        assert total == pytest.approx(expected, rel=1e-5)
         assert comps["retr"] == pytest.approx(expected, rel=1e-5)
         assert comps["appr"] == pytest.approx(0.0, abs=1e-7)
-        assert total < 0.0
 
-    def test_retreat_penalty_larger_than_approach_bonus(self):
-        """Config asymmetry: retreat is punished harder than approach is rewarded."""
-        assert _CFG1["ball_retreat_penalty"] > _CFG1["ball_approach_bonus"]
+    def test_heading_penalty_fires_when_moving_away_fast(self):
+        """Cosine heading penalty: running directly away (cos_sim=-1) at speed > threshold."""
+        coef = _CFG1.get("heading_penalty_coef", 0.0)
+        exp = _CFG1.get("heading_penalty_exponent", 2.0)
+        if coef == 0.0:
+            pytest.skip("heading_penalty_coef is 0 — penalty disabled")
+        _, comps = self._call(heading_cos_sim=-1.0, player_speed_mps=5.0)
+        expected = -coef * (1.0 - (-1.0)) ** exp  # max penalty
+        assert comps["hdg"] == pytest.approx(expected, rel=1e-5)
+        assert comps["hdg"] < 0.0
+
+    def test_heading_penalty_zero_when_running_toward_ball(self):
+        """No heading penalty when aimed directly at the ball (cos_sim=1)."""
+        _, comps = self._call(heading_cos_sim=1.0, player_speed_mps=5.0)
+        assert comps["hdg"] == pytest.approx(0.0, abs=1e-7)
+
+    def test_heading_penalty_zero_when_stationary(self):
+        """No heading penalty when player speed is below the threshold."""
+        _, comps = self._call(heading_cos_sim=-1.0, player_speed_mps=0.1)
+        assert comps["hdg"] == pytest.approx(0.0, abs=1e-7)
 
     def test_gaining_possession_bonus(self):
         total, comps = self._call(

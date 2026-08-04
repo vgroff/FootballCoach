@@ -71,6 +71,9 @@ class PlayerFeatures:
     # --- Existence mask ---
     exists: float = 0.0          # 1.0 for a real player, 0.0 for a padded slot
 
+    # --- Immobility flag ---
+    is_immobile: float = 0.0     # 1.0 if this player has no AI and will not move
+
     # --- Absolute position (scaled by standard pitch half-dims) ---
     # Uses same axis convention as the engine: origin at pitch centre,
     # x in [-52.5, 52.5], y in [-34, 34].  Divided by standard half-dims

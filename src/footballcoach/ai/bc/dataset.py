@@ -156,9 +156,14 @@ class DemonstrationDataset:
         log.info(f"Dataset: {len(ds):,} steps loaded")
         return ds
 
-    # Only steps where bc_labels[:, _I_VALID] == 1.0 (valid flag) are useful.
+    # Only steps where bc_labels[:, _I_VALID] == 1.0 and the opponent is not
+    # immobile are used for BC training. Immobile-opponent episodes are kept in
+    # the demo files (useful for inspection/replay) but excluded from training
+    # because the trainee never faces a real adversary in those episodes.
     def valid_indices(self) -> np.ndarray:
-        return np.where(self._labels[:, _I_VALID] > 0.5)[0]
+        valid = self._labels[:, _I_VALID] > 0.5
+        not_immobile_opp = self._labels[:, _I_OPPONENT_AI_TYPE] < (AI_TYPE_IMMOBILE - 0.5)
+        return np.where(valid & not_immobile_opp)[0]
 
     def compute_pos_weights(self) -> dict[str, float]:
         """Inverse-frequency weights for rare Bernoulli BC targets.

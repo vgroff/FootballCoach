@@ -324,6 +324,12 @@ class App:
             self._auto_paused = True
         self._pause_notification = f"{player_id}: {order_name} complete — Space to resume"
 
+    def _on_human_order_issued(self, player_id: str, order_name: str, is_debug: bool) -> None:
+        """Callback fired by input.py when the human issues any order."""
+        level = LogLevel.DEBUG if is_debug else LogLevel.INFO
+        t = self.match.time_s if self.match is not None else 0.0
+        self.game_log.add(level, f"[You] {player_id}: {order_name}", t)
+
     def _on_new_order(self) -> None:
         """Callback fired by input.py whenever any new order is issued.
 
@@ -363,6 +369,7 @@ class App:
         self.input_controller.on_new_order = self._on_new_order
         self.input_controller.on_kick_ui_entered = self._on_kick_ui_entered
         self.input_controller.on_kick_issued = self._on_kick_issued
+        self.input_controller.on_order_issued = self._on_human_order_issued
         self.mode_label = label
         self.screen = Screen.MATCH
         self.is_training_mode = is_training_mode
@@ -390,6 +397,7 @@ class App:
         self.input_controller.on_new_order = self._on_new_order
         self.input_controller.on_kick_ui_entered = self._on_kick_ui_entered
         self.input_controller.on_kick_issued = self._on_kick_issued
+        self.input_controller.on_order_issued = self._on_human_order_issued
         self.mode_label = f"Balance scenario: {definition.label}"
         self.screen = Screen.MATCH
         self.is_training_mode = False
@@ -466,6 +474,7 @@ class App:
                     self.input_controller.on_new_order = self._on_new_order
                     self.input_controller.on_kick_ui_entered = self._on_kick_ui_entered
                     self.input_controller.on_kick_issued = self._on_kick_issued
+                    self.input_controller.on_order_issued = self._on_human_order_issued
                     break  # render one frame of the new trial before stepping further
                 else:
                     if self.input_controller is not None:

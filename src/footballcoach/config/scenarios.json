@@ -1,0 +1,45 @@
+{
+  "_comment": "Default parameter values for UI scenarios. Loaded by build_*_scenario functions and used as ScenarioParam defaults. Edit here to change starting values in the scenario picker.",
+
+  "2v2": {
+    "attacker_skill_min": 0.7,
+    "attacker_skill_max": 0.85,
+    "defender_skill_min": 0.55,
+    "defender_skill_max": 0.7,
+    "gk_skill_min": 0.55,
+    "gk_skill_max": 0.7,
+    "shoot_immediately_probability": 0.65,
+    "attacker_a_dist_from_goal_m": 17.0,
+    "attacker_a_y_m": -5.5,
+    "attacker_b_x_offset_m": 3.0,
+    "attacker_b_y_fraction": 1.2,
+    "attacker_b_running": true,
+    "defender_dist_from_goal_m": 9.0,
+    "defender_y_m": -5.2,
+    "pass_power_multiplier": 2.1,
+
+    "_comment_attrs": "Per-player attribute overrides. Each key overrides that attribute for the uniform skill drawn from *_skill_min/max. Omit a key to keep the uniform value. Attributes: top_speed, acceleration, stamina, kick_precision, kick_power, dribbling, ball_control, tackling.",
+    "atk_a_attrs": {
+      "top_speed": 0.85,
+      "acceleration": 0.85,
+      "stamina": 0.85,
+      "kick_precision": 0.85,
+      "kick_power": 0.85,
+      "ball_control": 0.85
+    },
+    "atk_b_attrs": {
+      "top_speed": 0.85,
+      "acceleration": 0.85,
+      "stamina": 0.85,
+      "kick_precision": 0.85,
+      "kick_power": 0.85,
+      "ball_control": 0.85
+    },
+    "defender_attrs": {
+      "the_rest": 0.8
+    },
+    "keeper_attrs": {
+      "the_rest": 0.8
+    }
+  }
+}

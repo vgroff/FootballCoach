@@ -103,7 +103,7 @@ Override the save directory with `--checkpoint-dir path/`.
 
 | File | Why it matters |
 |------|----------------|
-| `src/footballcoach/ai/obs/schema.py` | Feature vector dataclasses; defines `PLAYER_FEATURE_DIM=27`, `BALL_FEATURE_DIM=12`, `GLOBAL_FEATURE_DIM=31` (11 match-context fields + 20 `task_id_N` one-hot fields, see "Task-id" note in `ai/knowledge.md`) |
+| `src/footballcoach/ai/obs/schema.py` | Feature vector dataclasses; defines `PLAYER_FEATURE_DIM=28`, `BALL_FEATURE_DIM=12`, `GLOBAL_FEATURE_DIM=31` (11 match-context fields + 20 `task_id_N` one-hot fields, see "Task-id" note in `ai/knowledge.md`) |
 | `src/footballcoach/ai/obs/encoder.py` | `encode_observation(match, player_id, time_remaining_s, ...)` → `ObservationBatch` |
 | `src/footballcoach/ai/models/decision_network.py` | `DecisionNetwork.from_config()` |
 | `src/footballcoach/ai/models/execution_network.py` | `ExecutionNetwork.from_config()` |

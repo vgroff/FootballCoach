@@ -207,7 +207,7 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         try:
             carrier = match.ball_carrier()
             if carrier is not None and carrier.player_id != player.player_id:
-                from footballcoach.engine.geometry import are_touching
+                from footballcoach.engine.collision import are_touching
                 _is_gp_tackling = are_touching(player, carrier)
         except Exception:
             pass
@@ -280,6 +280,8 @@ def bc_loss_from_tensor(
     pos_weight_kick: float = 1.0,
     pos_weight_tackle_attempt: float = 1.0,
     return_breakdown: bool = False,
+    dec_weight: float = 1.0,
+    exec_weight: float = 1.0,
 ):
     """Compute BC loss for a minibatch, given packed label tensors.
 
@@ -343,7 +345,7 @@ def bc_loss_from_tensor(
         + _bce(decision_heads.mark_logit,          _I_MARK)
         + _bce(decision_heads.hold_position_logit, _I_HOLD)
     )
-    loss += dec_loss
+    loss += dec_weight * dec_loss
 
     exec_bce_loss = torch.zeros(labels.shape[0], device=labels.device)
     sprint_loss = torch.zeros(labels.shape[0], device=labels.device)
@@ -362,7 +364,7 @@ def bc_loss_from_tensor(
             + _bce(exec_heads.kick_logit,               _I_KICK_THIS_TICK, pos_weight_kick)
             + tackle_attempt_loss
         )
-        loss += exec_bce_loss
+        loss += exec_weight * exec_bce_loss
 
         # --- Execution: move_direction cosine loss ---
         # Upweighted by direction_loss_weight so the single continuous head gets
@@ -376,7 +378,7 @@ def bc_loss_from_tensor(
             pred_norm = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
             cos_loss = 1.0 - (pred_norm * target_dir).sum(dim=-1)
             dir_loss_per = direction_loss_weight * torch.where(has_dir, cos_loss, torch.zeros_like(cos_loss))
-            loss += dir_loss_per
+            loss += exec_weight * dir_loss_per
 
     # --- Decision: move_region_center MSE (normalised to [-1, 1]) ---
     # Weighted by region_loss_weight (default 1.0, separate from direction).
@@ -438,8 +440,8 @@ class BCPretrainer:
         self.execution_net = execution_net
         self.device = device
         bc_cfg = cfg.get("bc", {})
-        lr = float(bc_cfg.get("pretrain_lr", 1e-3))
-        self._online_batch_size = int(bc_cfg.get("pretrain_online_batch_size", 16))
+        lr = float(bc_cfg.get("bc_learning_rate", bc_cfg.get("pretrain_lr", 1e-3)))
+        self._online_batch_size = int(bc_cfg.get("bc_online_batch_size", bc_cfg.get("pretrain_online_batch_size", 16)))
         all_params = (
             list(decision_net.parameters()) + list(execution_net.parameters())
         )

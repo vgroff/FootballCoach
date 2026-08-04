@@ -116,6 +116,7 @@ class ScenarioEnv:
         self._ball_touched_by_trainee: bool = False
         self._trainee_had_possession_last_step: bool = False
         self._prev_goal_count: tuple[int, int] = (0, 0)
+        self._trainee_start_stamina: float = 1.0
 
         # Per-secondary-player state
         self._sec_last_ball_dist: dict = {}
@@ -160,6 +161,12 @@ class ScenarioEnv:
         self._start_ball_to_box_dist_m = self._ball_dist_to_opponent_box()
         self._trainee_had_possession_last_step = False
         self._sec_had_possession_last_step = {pid: False for pid in self.secondary_player_ids}
+        # Record stamina at episode start for end-of-episode stamina penalty.
+        try:
+            _trainee = self._loop.match.player_by_id(self.trainee_player_id)
+            self._trainee_start_stamina = _trainee.stamina
+        except KeyError:
+            self._trainee_start_stamina = 1.0
         self.last_trainee_transition = None
         self.last_secondary_results = []
         self.last_reward_components: dict[str, float] = {}
@@ -322,6 +329,20 @@ class ScenarioEnv:
 
         timeout = self._episode_ticks >= int(self.max_episode_s / self._dt_s)
         if self.phase == 1:
+            # Cosine similarity between player velocity direction and direction to ball.
+            # Used for heading penalty: penalises running away from the ball.
+            _vel = player.velocity
+            _to_ball = match.ball.position - player.position
+            _speed = math.sqrt(_vel.x ** 2 + _vel.y ** 2)
+            _to_ball_len = math.sqrt(_to_ball.x ** 2 + _to_ball.y ** 2)
+            if _speed > 1e-3 and _to_ball_len > 1e-3:
+                _hdg_cos = (_vel.x * _to_ball.x + _vel.y * _to_ball.y) / (_speed * _to_ball_len)
+            else:
+                _hdg_cos = 1.0  # neutral: no penalty when stationary or at ball
+
+            _episode_done = done if 'done' in dir() else False
+            _stamina_used = max(0.0, self._trainee_start_stamina - player.stamina) if (box_terminal or opponent_box_terminal or timeout) else 0.0
+
             reward, self.last_reward_components = phase1_reward(
                 prev_ball_dist=prev_ball_dist,
                 curr_ball_dist=curr_ball_dist,
@@ -338,6 +359,10 @@ class ScenarioEnv:
                 opponent_reached_trainee_box=opponent_box_terminal,
                 timed_out=timeout and not box_terminal and not opponent_box_terminal and not trial_ended_this_step,
                 ball_dist_to_opponent_box_m=self._ball_dist_to_opponent_box(),
+                heading_cos_sim=_hdg_cos,
+                player_speed_mps=_speed,
+                stamina_used=_stamina_used,
+                episode_done=box_terminal or opponent_box_terminal or timeout,
             )
         else:
             reward = phase2_reward(

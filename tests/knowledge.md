@@ -120,7 +120,7 @@ These require `torch` installed (`uv sync --group ai`), but do NOT run any
 training - just forward passes with random inputs and arithmetic checks.
 
 **Key test files:**
-- `test_obs_schema.py` — dimension constants (PLAYER_FEATURE_DIM=27,
+- `test_obs_schema.py` — dimension constants (PLAYER_FEATURE_DIM=28,
   BALL_FEATURE_DIM=12, GLOBAL_FEATURE_DIM=31 (includes the 20-wide
   task_id_N one-hot, see "Task-id" note in `ai/knowledge.md`),
   MAX_OTHER_PLAYERS=21), to_array shapes, dtypes, field ordering.

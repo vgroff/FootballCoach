@@ -1,0 +1,32 @@
+{
+  "_comment": "Order-layer and rules-based AI parameters. Not engine physics — these govern how orders (MoveOrder, MarkOrder, etc.) and the rules-based AI translate high-level intent into SpeedMode/direction requests. The neural network path bypasses all of these except where it issues orders explicitly.",
+
+  "movement": {
+    "_comment": "Brake-to-turn and close-proximity brakes applied in _compute_movement_intent (order layer only — not used by the neural network direct-drive path).",
+    "brake_turn_angle_deg": 75.0,
+    "_comment_brake_turn": "Heading change above this triggers brake-to-turn: the order forces SpeedMode.STANDSTILL so the player decelerates before pivoting. 75=current, 90=original less aggressive.",
+    "brake_min_speed_mps": 2.0,
+    "_comment_brake_min": "Brake-to-turn and close-prox checks only fire above this ground speed. Below it, turn rate is already high enough to pivot freely without braking.",
+    "close_prox_radius_m": 6.0,
+    "close_prox_cos_threshold": 0.3,
+    "_comment_close_prox": "Lateral-overshoot brake: within close_prox_radius_m of target, if velocity cos-sim < threshold, force STANDSTILL. Prevents a player arriving at pace from the wrong angle blowing past and orbiting. cos 0.3 = ~73° off-axis."
+  },
+
+  "repulsion": {
+    "_comment": "Player-repulsion steering — used ONLY in steering.py / MoveOrder handling. NOT engine physics. radius_m: distance at which repulsion begins. strength_base: peak directional weight at d=0 (m/s-equivalent, blended into heading not force). ball_carrier_repulsion_mult: extra boost when the moving player has the ball. ball_carrier_speed_penalty_max: max fractional speed penalty for ball carriers (0.45 = 45% reduction). speed_penalty_scale: converts |net_repulsion| to speed penalty fraction. alignment_dot_threshold: trigger orthogonal nudge when rel_vel . net_repulsion < this (i.e. heading nearly straight into obstacle). min_orthogonal_adjust_mps: sideways nudge magnitude (primary tuning knob). max_deflection_deg: hard cap on total direction deflection from repulsion.",
+    "radius_m": 8.0,
+    "strength_base": 0.3,
+    "ball_carrier_repulsion_mult": 2.6,
+    "ball_carrier_speed_penalty_max": 0.45,
+    "speed_penalty_scale": 0.12,
+    "alignment_dot_threshold": -0.7,
+    "min_orthogonal_adjust_mps": 0.75,
+    "max_deflection_deg": 80.0
+  },
+
+  "marking": {
+    "_comment": "MarkOrder AI behaviour: marker stands between a target opposition player and the ball, and switches to GetPossession-style chase/tackle when the target has the ball or the ball comes within mark_intercept_radius_m. mark_standoff_m: distance from the target (toward the ball) the marker tries to hold.",
+    "mark_intercept_radius_m": 4.0,
+    "mark_standoff_m": 1.5
+  }
+}

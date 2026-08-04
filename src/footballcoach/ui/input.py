@@ -114,6 +114,9 @@ class MatchInputController:
     on_new_order: Callable[[], None] | None = field(default=None, repr=False, compare=False)
     # Called when a kick is queued from the kick UI (to pre-pause before execution).
     on_kick_issued: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    # Called when a human issues any order: (player_id, order_name, is_debug).
+    # is_debug=True for MoveOrder (too common for INFO level).
+    on_order_issued: Callable[[str, str, bool], None] | None = field(default=None, repr=False, compare=False)
 
     # -- accessors -----------------------------------------------------------
 
@@ -144,6 +147,8 @@ class MatchInputController:
         if self.on_new_order is not None:
             self.on_new_order()
         player.current_order = order
+        if self.on_order_issued is not None:
+            self.on_order_issued(player.player_id, order_name, isinstance(order, MoveOrder))
 
     def _player_at_screen_pos(self, screen_pos: tuple[int, int]) -> Player | None:
         best: Player | None = None
@@ -404,7 +409,7 @@ class MatchInputController:
         """Issues a SaveOrder to the selected player if they are a goalkeeper."""
         selected = self.selected_player()
         if selected is not None and selected.is_goalkeeper:
-            selected.current_order = SaveOrder()
+            self._issue_order(selected, SaveOrder(), "Save")
 
     def issue_stop_order(self) -> None:
         """Decelerates the selected player to a standstill."""

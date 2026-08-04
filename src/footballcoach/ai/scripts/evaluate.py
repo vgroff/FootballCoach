@@ -126,9 +126,12 @@ def main() -> None:
 def _run_evaluation(trainer, env, n_trials: int) -> dict:
     """Run n_trials episodes with the neural network and collect statistics."""
     import numpy as np
+    import torch
     rewards = []
     outcomes: dict[str, int] = {}
     times = []
+    comp_acc: dict[str, float] = {}
+    value_preds: list[float] = []
 
     # Wire NeuralPlayerAI into the env (same as training)
     env.sample_action_fn = trainer._sample_action
@@ -143,6 +146,14 @@ def _run_evaluation(trainer, env, n_trials: int) -> dict:
         while not done:
             _, reward, done, info = env.step()
             ep_reward += reward
+            for _k, _v in getattr(env, "last_reward_components", {}).items():
+                comp_acc[_k] = comp_acc.get(_k, 0.0) + _v
+            _t = getattr(env, "last_trainee_transition", None)
+            if _t is not None and "value" in _t:
+                _val = _t["value"]
+                if isinstance(_val, torch.Tensor):
+                    _val = float(_val.item())
+                value_preds.append(float(_val))
 
         rewards.append(ep_reward)
         outcome = info.trial_outcome if info else "unknown"
@@ -163,6 +174,8 @@ def _run_evaluation(trainer, env, n_trials: int) -> dict:
         "max_reward": float(np.max(rewards)),
         "outcomes": outcomes,
         "mean_episode_time_s": float(np.mean(times)),
+        "reward_components": {k: v / n for k, v in comp_acc.items()},
+        "mean_value_pred": float(np.mean(value_preds)) if value_preds else float("nan"),
     }
 
 

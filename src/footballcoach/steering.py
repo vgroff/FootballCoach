@@ -16,8 +16,7 @@ import logging
 import math
 from dataclasses import dataclass
 
-from footballcoach.ai.config import load_ai_config
-from footballcoach.config import require_section
+from footballcoach.config import load_orders_config, require_section
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
 
@@ -26,7 +25,7 @@ log = logging.getLogger("footballcoach.steering")
 
 @dataclass(frozen=True)
 class RepulsionParams:
-    """Config for the repulsion steering mechanic — loaded from ai_config.json."""
+    """Config for the repulsion steering mechanic — loaded from orders.json."""
     radius_m: float
     strength_base: float
     ball_carrier_repulsion_mult: float
@@ -38,7 +37,7 @@ class RepulsionParams:
 
     @staticmethod
     def from_config() -> "RepulsionParams":
-        d = require_section(load_ai_config(), "repulsion")
+        d = require_section(load_orders_config(), "repulsion", "orders.json")
         return RepulsionParams(
             radius_m=d["radius_m"],
             strength_base=d["strength_base"],

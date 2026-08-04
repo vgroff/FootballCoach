@@ -25,17 +25,17 @@ from footballcoach.ai.obs.schema import (
 # Dimension constants
 # ---------------------------------------------------------------------------
 
-def test_player_feature_dim_is_27():
-    """PLAYER_FEATURE_DIM must stay 27 (change this test IFF you change the schema).
+def test_player_feature_dim_is_28():
+    """PLAYER_FEATURE_DIM must stay 28 (change this test IFF you change the schema).
 
     Fields: rel_dx, rel_dy, distance_m, velocity_x, velocity_y, speed_mps,
     heading_sin, heading_cos, stamina, top_speed, acceleration, kick_power,
     kick_precision, dribbling, ball_control, tackling, stamina_attr,
     is_own_team, is_self, has_possession, is_inactive_tackled,
     is_controlling_ball, is_goalkeeper, attacking_direction, exists,
-    pos_x, pos_y.
+    is_immobile, pos_x, pos_y.
     """
-    assert PLAYER_FEATURE_DIM == 27
+    assert PLAYER_FEATURE_DIM == 28
 
 
 def test_ball_feature_dim_is_12():

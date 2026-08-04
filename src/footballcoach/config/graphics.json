@@ -23,7 +23,7 @@
   },
   "speed_lines": {
     "_comment": "threshold_mps: player ground speed above which trailing speed lines are drawn behind the player. count: number of parallel lines. length_px: length of each line in pixels. gap_px: spacing between successive lines.",
-    "threshold_mps": 7.5,
+    "threshold_mps": 7.0,
     "count": 3,
     "length_px": 4.5,
     "gap_px": 2
@@ -50,9 +50,9 @@
   },
   "ball_spin_dots": {
     "_comment": "Dots on the 3D ball surface (Fibonacci sphere), always shown, rotating with ball spin. Only front-hemisphere dots (facing camera) are drawn — back hemisphere is hidden. count: number of dots. projection_scale_fraction: how wide the projected sphere appears relative to ball drawn radius (1.0 = dots reach ball edge). dot_radius_fraction: dot radius / ball drawn radius. color: RGB.",
-    "count": 9,
-    "projection_scale_fraction": 0.93,
-    "dot_radius_fraction": 0.25,
+    "count": 10,
+    "projection_scale_fraction": 0.95,
+    "dot_radius_fraction": 0.3,
     "color": [30, 30, 30]
   },
   "ball_trail": {

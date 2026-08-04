@@ -44,6 +44,10 @@ def phase1_reward(
     lost_possession_this_step: bool = False,
     timed_out: bool = False,
     ball_dist_to_opponent_box_m: float = 9999.0,
+    heading_cos_sim: float = 1.0,
+    player_speed_mps: float = 0.0,
+    stamina_used: float = 0.0,
+    episode_done: bool = False,
 ) -> tuple[float, dict[str, float]]:
     """GetPossession/Move experiment reward (curriculum phase 1).
 
@@ -66,6 +70,21 @@ def phase1_reward(
     r += appr_r + retr_r
     comps["appr"] = appr_r
     comps["retr"] = retr_r
+
+    # Cosine heading penalty: penalise moving away from the ball based on velocity direction.
+    # Only fires when the player is actually moving (speed > threshold).
+    # Formula: -coef * max(0, 1 - cos_sim) ** exp
+    #   cos_sim = 1  (toward ball): penalty = 0
+    #   cos_sim = 0  (perpendicular): penalty = -coef
+    #   cos_sim = -1 (directly away): penalty = -coef * 2^exp
+    # Set heading_penalty_coef=0.0 (default) to disable entirely.
+    _hdg_coef = float(cfg.get("heading_penalty_coef", 0.0))
+    hdg_r = 0.0
+    if _hdg_coef > 0.0 and player_speed_mps > float(cfg.get("heading_penalty_min_speed_mps", 0.5)):
+        _exp = float(cfg.get("heading_penalty_exponent", 2.0))
+        hdg_r = -_hdg_coef * max(0.0, 1.0 - heading_cos_sim) ** _exp
+    r += hdg_r
+    comps["hdg"] = hdg_r
 
     poss_r = cfg["gain_possession_bonus"] if gained_possession_this_step else 0.0
     r += poss_r
@@ -120,6 +139,14 @@ def phase1_reward(
     r += tout_r + prox_r
     comps["tout"] = tout_r
     comps["prox"] = prox_r
+
+    # Stamina usage penalty — only applied at episode end (begin-to-end stamina drain).
+    # Discourages unnecessary sprinting without punishing individual steps.
+    # stamina_used = start_stamina - final_stamina (0.0 on non-terminal steps).
+    _stam_coef = float(cfg.get("stamina_sprint_penalty", 0.0))
+    stam_r = -_stam_coef * stamina_used if (episode_done and _stam_coef > 0.0) else 0.0
+    r += stam_r
+    comps["stam"] = stam_r
 
     return r, comps
 

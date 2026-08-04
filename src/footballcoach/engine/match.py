@@ -15,8 +15,7 @@ from typing import TYPE_CHECKING, Callable
 if TYPE_CHECKING:
     from footballcoach.ui.gamelog import LogLevel
 
-from footballcoach.ai.config import load_ai_config
-from footballcoach.config import load_physics_config, require_section
+from footballcoach.config import load_orders_config, load_physics_config, require_section
 from footballcoach.engine.ball_physics import BallPhysicsParams, step_ball, resolve_goal_boundary
 from footballcoach.engine.collision import (
     CollisionParams,
@@ -49,6 +48,7 @@ from footballcoach.orders import (
     KickOrder,
     MarkOrder,
     MoveOrder,
+    OrderLayerParams,
     OrderStatus,
     PassOrder,
     SaveOrder,
@@ -60,20 +60,6 @@ from footballcoach.steering import RepulsionParams, compute_repulsion
 import logging
 log = logging.getLogger("footballcoach.match")
 
-# Brake-to-turn thresholds (order/AI layer only — no physics changes).
-# If a MoveOrder requires a heading change larger than this while the player
-# is moving above the minimum speed, downgrade to STANDSTILL for that tick so
-# the player decelerates quickly (standstill_decel_multiplier applies) and
-# pivot rate rises as speed drops (ω_max = a_lat / speed).
-_BRAKE_TO_TURN_THRESHOLD_RAD: float = 1.57   # ~90° — prevents orbiting around targets
-_BRAKE_TO_TURN_MIN_SPEED_MPS: float = 2.0    # don't bother below this; turn rate already high
-# When within this radius of the target and the velocity vector is not pointing
-# at it (cosine similarity < threshold), brake to a stop then jog in normally.
-# Catches lateral overshoots / orbiting without stopping on every normal approach.
-_CLOSE_PROXIMITY_BRAKE_M: float = 5.0
-_CLOSE_PROXIMITY_COS_THRESHOLD: float = 0.01
-
-
 @dataclass(frozen=True)
 class MarkingParams:
     """Config for the ``MarkOrder`` AI behaviour — loaded from
@@ -83,7 +69,7 @@ class MarkingParams:
 
     @staticmethod
     def from_config() -> "MarkingParams":
-        d = require_section(load_ai_config(), "marking")
+        d = require_section(load_orders_config(), "marking", "orders.json")
         return MarkingParams(
             mark_intercept_radius_m=d.get("mark_intercept_radius_m", 4.0),
             mark_standoff_m=d.get("mark_standoff_m", 1.5),
@@ -102,6 +88,7 @@ class Match:
     rng: random.Random = field(default_factory=random.Random)
 
     movement_params: MovementParams = field(default_factory=MovementParams.from_config)
+    order_params: OrderLayerParams = field(default_factory=OrderLayerParams.from_config)
     ball_physics_params: BallPhysicsParams = field(default_factory=BallPhysicsParams.from_config)
     kicking_params: KickingParams = field(default_factory=KickingParams.from_config)
     passing_params: PassingParams = field(default_factory=PassingParams.from_config)
@@ -316,26 +303,7 @@ class Match:
             # Someone else has the ball — chase and tackle.
             if are_touching(player, carrier):
                 if carrier.is_available_to_tackle():
-                    if self._gk_immune_from_tackle(carrier):
-                        self._apply_gk_immune_penalty(player)
-                    else:
-                        result = attempt_tackle(
-                            player.attributes.tackling,
-                            self._effective_dribbling(carrier),
-                            self.rng_reduction,
-                            self.rng,
-                            self.tackling_params,
-                            is_goalkeeper_tackle=player.is_goalkeeper,
-                            angle_modifier=tackle_angle_modifier(
-                                carrier.heading_rad, carrier.position, player.position,
-                                self.tackling_params,
-                            ),
-                            gk_outside_box=self._gk_outside_own_box(player),
-                        )
-                        self._log_tackle_result(player.player_id, carrier.player_id, result)
-                        if result.tackler_won and self._target_has_or_controls_ball(carrier):
-                            self._set_possession(player.player_id)
-                        apply_tackle_result(result, player, carrier, self.tackling_params)
+                    self._attempt_tackle_contact(player, carrier)
                 return True  # tackle attempted (or target not available) — terminal
             else:
                 from footballcoach.orders import _compute_movement_intent
@@ -434,7 +402,7 @@ class Match:
             self.passing_params, dist,
             self.ball_physics_params.gravity_mps2,
             self.ball_physics_params.rolling_friction_coefficient,
-        )
+        ) * getattr(order, "power_multiplier", 1.0)
         t_arrive = min(dist / max(ball_speed, 1.0), 2.0)
         predicted = order.target_position + target.velocity.xy() * t_arrive
         return predicted.with_z(0.0)
@@ -605,6 +573,40 @@ class Match:
             self.ball.possessed_by == target.player_id
             or target.state == PlayerState.CONTROLLING_BALL
         )
+
+    def _attempt_tackle_contact(self, player: Player, target: Player) -> None:
+        """Resolve one tackle attempt between *player* (tackler) and *target*
+        (ball carrier).  Caller must have already confirmed the two players are
+        touching and that ``target.is_available_to_tackle()`` is True.
+
+        Fires ``player.on_tackle`` before physics resolution so BC demonstration
+        recording captures the event regardless of which order type triggered
+        the tackle (``ChaseTackleOrder`` or ``GetPossessionOrder``).
+        """
+        if player.on_tackle is not None:
+            player.on_tackle(player)
+        if self._gk_immune_from_tackle(target):
+            self._apply_gk_immune_penalty(player)
+            self._log_info(
+                f"{player.player_id} tackle on {target.player_id} auto-failed [GK in own box]"
+            )
+        else:
+            result = attempt_tackle(
+                player.attributes.tackling,
+                self._effective_dribbling(target),
+                self.rng_reduction,
+                self.rng,
+                self.tackling_params,
+                is_goalkeeper_tackle=player.is_goalkeeper,
+                angle_modifier=tackle_angle_modifier(
+                    target.heading_rad, target.position, player.position, self.tackling_params
+                ),
+                gk_outside_box=self._gk_outside_own_box(player),
+            )
+            self._log_tackle_result(player.player_id, target.player_id, result)
+            if result.tackler_won and self._target_has_or_controls_ball(target):
+                self._set_possession(player.player_id)
+            apply_tackle_result(result, player, target, self.tackling_params)
 
     def _check_goal(self) -> None:
         side = check_goal(self.ball, self.pitch)

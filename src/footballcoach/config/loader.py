@@ -45,6 +45,18 @@ def load_gameplay_config() -> dict[str, Any]:
     return _load_json("gameplay.json")
 
 
+@lru_cache(maxsize=1)
+def load_orders_config() -> dict[str, Any]:
+    """Returns the parsed contents of orders.json (cached)."""
+    return _load_json("orders.json")
+
+
+@lru_cache(maxsize=1)
+def load_scenarios_config() -> dict[str, Any]:
+    """Returns the parsed contents of scenarios.json (cached)."""
+    return _load_json("scenarios.json")
+
+
 def clear_config_cache() -> None:
     """Clears cached config, forcing a re-read from disk on next access.
 
@@ -54,6 +66,8 @@ def clear_config_cache() -> None:
     load_attributes_config.cache_clear()
     load_graphics_config.cache_clear()
     load_gameplay_config.cache_clear()
+    load_orders_config.cache_clear()
+    load_scenarios_config.cache_clear()
 
 
 def require_section(config: dict[str, Any], section: str, file_name: str = "physics.json") -> dict[str, Any]:

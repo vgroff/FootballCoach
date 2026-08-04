@@ -1,20 +1,55 @@
-2026-08-03 22:35:56,020 INFO Checkpoint dir: checkpoints/phase1_run82
-2026-08-03 22:35:56,032 INFO Starting training: phase=phase1_get_possession, total_steps=65,000
-2026-08-03 22:35:56,033 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
-2026-08-03 22:35:57,379 INFO Loading 1500 demonstration file(s) from demonstrations/phase1
-2026-08-03 22:36:00,635 INFO Dataset: 284,450 steps loaded
-2026-08-03 22:36:00,636 INFO Offline BC dataset: 284,450 steps from demonstrations/phase1/
-2026-08-03 22:36:00,642 INFO BC pos_weight (auto-computed from dataset): kick=284450.00  tackle_attempt=284450.00
-2026-08-03 22:36:00,642 INFO Combined BC + value pre-training: 8 epoch(s), batch_size=312, dataset=284,450 steps, rollout_steps=8192
-2026-08-03 22:36:00,713 INFO Phase 0 — decision-net warm-up (BC + value, combined): 5 epoch(s), gamma=0.995, returns mean=9.17  std=7.60  lr=0.007  phase0_value_coef=1.5
-/home/vincent/Documents/not_work/repos/FootballCoach/src/footballcoach/ai/ppo/bc.py:404: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
+2026-08-04 04:20:03,644 INFO Checkpoint dir: checkpoints/phase1_run99
+2026-08-04 04:20:03,657 INFO Starting training: phase=phase1_get_possession, total_steps=75,000
+2026-08-04 04:20:03,657 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
+2026-08-04 04:20:04,873 INFO Loading 1125 demonstration file(s) from demonstrations/phase1
+2026-08-04 04:20:07,136 INFO Dataset: 204,702 steps loaded
+2026-08-04 04:20:07,137 INFO Offline BC dataset: 204,702 steps from demonstrations/phase1/
+2026-08-04 04:20:07,137 INFO Reward diagnostic: running 40 rules-vs-rules episodes...
+2026-08-04 04:20:07,578 INFO Reward diagnostic (40 ep, rules vs rules): mean_ep_rew=10.66  per_episode: approach=+0.16  retreat=-0.08  heading=-0.01  get_possession=+2.15  progress=+1.00  lose_possession=-0.17  box_possession=+5.40  speed_bonus=+2.62  opponent_box=-0.40
+2026-08-04 04:20:07,585 INFO BC pos_weight (auto-computed from dataset): kick=185225.00  tackle_attempt=202.77
+2026-08-04 04:20:07,585 INFO Combined BC + value pre-training: 10 epoch(s), batch_size=1024, dataset=204,702 steps, rollout_steps=32768
+2026-08-04 04:20:07,636 INFO Phase 0 — decision-net warm-up (BC + value, combined): 30 epoch(s), gamma=0.995, returns mean=9.93  std=5.33  lr=0.02  phase0_value_coef=0.65
+/home/vincent/Documents/not_work/repos/FootballCoach/src/footballcoach/ai/ppo/bc.py:406: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
 Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:822.)
   "decision":       float(dec_loss[valid].mean()),
-2026-08-03 22:36:12,971 INFO   Phase 0 epoch 1/5: loss=1.0147  dec_bc=0.1140  val=0.6005  rmse=5.89 (returns std=7.6)
-2026-08-03 22:36:23,737 INFO   Phase 0 epoch 2/5: loss=0.6805  dec_bc=0.0199  val=0.4404  rmse=5.04 (returns std=7.6)
-2026-08-03 22:36:34,429 INFO   Phase 0 epoch 3/5: loss=0.6278  dec_bc=0.0186  val=0.4061  rmse=4.84 (returns std=7.6)
-2026-08-03 22:36:45,299 INFO   Phase 0 epoch 4/5: loss=0.5989  dec_bc=0.0182  val=0.3871  rmse=4.73 (returns std=7.6)
-2026-08-03 22:36:55,900 INFO   Phase 0 epoch 5/5: loss=0.5807  dec_bc=0.0176  val=0.3754  rmse=4.66 (returns std=7.6)
-2026-08-03 22:36:55,900 INFO Phase 0 done (decision-net warm-up, 5 epoch(s))
-2026-08-03 22:36:55,975 INFO Phase 1 BC epochs will include joint value loss (coef=1.5, gamma=0.995, returns std=7.60)
-2026-08-03 22:36:56,009 INFO   Downsample trivial rows (epoch 1): 66,961/284,450 (23.5%) rows classified trivial, excluding ~40,177 this epoch (frac=0.60)
+2026-08-04 04:20:12,068 INFO   Phase 0 epoch 1/30: loss=1.4507  dec_bc=0.7481  val=1.0809(x0.65)=0.7026  rmse=5.54 (returns std=5.3)
+2026-08-04 04:20:16,331 INFO   Phase 0 epoch 2/30: loss=0.6076  dec_bc=0.0286  val=0.8907(x0.65)=0.5790  rmse=5.03 (returns std=5.3)
+2026-08-04 04:20:20,526 INFO   Phase 0 epoch 3/30: loss=0.5541  dec_bc=0.0217  val=0.8191(x0.65)=0.5324  rmse=4.83 (returns std=5.3)
+2026-08-04 04:20:24,696 INFO   Phase 0 epoch 4/30: loss=0.5255  dec_bc=0.0207  val=0.7767(x0.65)=0.5049  rmse=4.70 (returns std=5.3)
+2026-08-04 04:20:29,055 INFO   Phase 0 epoch 5/30: loss=0.5105  dec_bc=0.0199  val=0.7547(x0.65)=0.4905  rmse=4.63 (returns std=5.3)
+2026-08-04 04:20:33,305 INFO   Phase 0 epoch 6/30: loss=0.4984  dec_bc=0.0210  val=0.7344(x0.65)=0.4774  rmse=4.57 (returns std=5.3)
+2026-08-04 04:20:37,590 INFO   Phase 0 epoch 7/30: loss=0.4853  dec_bc=0.0183  val=0.7185(x0.65)=0.4670  rmse=4.52 (returns std=5.3)
+2026-08-04 04:20:41,933 INFO   Phase 0 epoch 8/30: loss=0.4841  dec_bc=0.0172  val=0.7183(x0.65)=0.4669  rmse=4.52 (returns std=5.3)
+2026-08-04 04:20:46,276 INFO   Phase 0 epoch 9/30: loss=0.4715  dec_bc=0.0174  val=0.6986(x0.65)=0.4541  rmse=4.46 (returns std=5.3)
+2026-08-04 04:20:50,525 INFO   Phase 0 epoch 10/30: loss=0.4678  dec_bc=0.0174  val=0.6929(x0.65)=0.4504  rmse=4.44 (returns std=5.3)
+2026-08-04 04:20:54,669 INFO   Phase 0 epoch 11/30: loss=0.4676  dec_bc=0.0182  val=0.6913(x0.65)=0.4493  rmse=4.43 (returns std=5.3)
+2026-08-04 04:20:59,018 INFO   Phase 0 epoch 12/30: loss=0.4615  dec_bc=0.0171  val=0.6838(x0.65)=0.4445  rmse=4.41 (returns std=5.3)
+2026-08-04 04:21:03,337 INFO   Phase 0 epoch 13/30: loss=0.4601  dec_bc=0.0167  val=0.6822(x0.65)=0.4434  rmse=4.40 (returns std=5.3)
+2026-08-04 04:21:07,710 INFO   Phase 0 epoch 14/30: loss=0.4566  dec_bc=0.0185  val=0.6740(x0.65)=0.4381  rmse=4.38 (returns std=5.3)
+2026-08-04 04:21:12,484 INFO   Phase 0 epoch 15/30: loss=0.4487  dec_bc=0.0173  val=0.6637(x0.65)=0.4314  rmse=4.34 (returns std=5.3)
+2026-08-04 04:21:17,317 INFO   Phase 0 epoch 16/30: loss=0.4495  dec_bc=0.0173  val=0.6649(x0.65)=0.4322  rmse=4.35 (returns std=5.3)
+2026-08-04 04:21:21,840 INFO   Phase 0 epoch 17/30: loss=0.4474  dec_bc=0.0176  val=0.6613(x0.65)=0.4299  rmse=4.34 (returns std=5.3)
+2026-08-04 04:21:26,506 INFO   Phase 0 epoch 18/30: loss=0.4439  dec_bc=0.0177  val=0.6557(x0.65)=0.4262  rmse=4.32 (returns std=5.3)
+2026-08-04 04:21:31,192 INFO   Phase 0 epoch 19/30: loss=0.4395  dec_bc=0.0175  val=0.6493(x0.65)=0.4220  rmse=4.30 (returns std=5.3)
+2026-08-04 04:21:35,777 INFO   Phase 0 epoch 20/30: loss=0.4355  dec_bc=0.0174  val=0.6431(x0.65)=0.4180  rmse=4.28 (returns std=5.3)
+2026-08-04 04:21:40,351 INFO   Phase 0 epoch 21/30: loss=0.4330  dec_bc=0.0171  val=0.6398(x0.65)=0.4159  rmse=4.27 (returns std=5.3)
+2026-08-04 04:21:44,962 INFO   Phase 0 epoch 22/30: loss=0.4356  dec_bc=0.0182  val=0.6421(x0.65)=0.4174  rmse=4.27 (returns std=5.3)
+2026-08-04 04:21:49,441 INFO   Phase 0 epoch 23/30: loss=0.4269  dec_bc=0.0180  val=0.6290(x0.65)=0.4088  rmse=4.23 (returns std=5.3)
+2026-08-04 04:21:54,052 INFO   Phase 0 epoch 24/30: loss=0.4276  dec_bc=0.0180  val=0.6303(x0.65)=0.4097  rmse=4.23 (returns std=5.3)
+2026-08-04 04:21:58,345 INFO   Phase 0 epoch 25/30: loss=0.4211  dec_bc=0.0177  val=0.6206(x0.65)=0.4034  rmse=4.20 (returns std=5.3)
+2026-08-04 04:22:02,517 INFO   Phase 0 epoch 26/30: loss=0.4226  dec_bc=0.0187  val=0.6213(x0.65)=0.4039  rmse=4.20 (returns std=5.3)
+2026-08-04 04:22:06,721 INFO   Phase 0 epoch 27/30: loss=0.4193  dec_bc=0.0178  val=0.6177(x0.65)=0.4015  rmse=4.19 (returns std=5.3)
+2026-08-04 04:22:10,920 INFO   Phase 0 epoch 28/30: loss=0.4197  dec_bc=0.0184  val=0.6175(x0.65)=0.4014  rmse=4.19 (returns std=5.3)
+2026-08-04 04:22:15,267 INFO   Phase 0 epoch 29/30: loss=0.4143  dec_bc=0.0173  val=0.6108(x0.65)=0.3970  rmse=4.17 (returns std=5.3)
+2026-08-04 04:22:20,047 INFO   Phase 0 epoch 30/30: loss=0.4131  dec_bc=0.0180  val=0.6080(x0.65)=0.3952  rmse=4.16 (returns std=5.3)
+2026-08-04 04:22:20,048 INFO Phase 0 done (decision-net warm-up, 30 epoch(s))
+2026-08-04 04:22:20,099 INFO Phase 1 BC epochs will include joint value loss (coef=0.65, gamma=0.995, returns std=5.33)
+2026-08-04 04:22:20,122 INFO   Downsample trivial rows (epoch 1): 59,869/185,225 (32.3%) rows classified trivial, excluding ~41,908 this epoch (frac=0.70)
+2026-08-04 04:23:37,659 INFO   BC epoch 1/10: bc_loss=1.2809  val_loss=0.8847(x0.65)=0.5750  rmse=5.02 (returns std=5.3)  dir_cos=0.784  mv_p=0.994  spr_p=0.853  [decision=0.000  exec_bce=0.822  sprint=0.215  move=0.008  tackle_attempt=0.592  direction=0.432  region=0.027]  (77.6s)
+2026-08-04 04:23:37,661 INFO   Downsample trivial rows (epoch 2): 59,869/185,225 (32.3%) rows classified trivial, excluding ~41,908 this epoch (frac=0.70)
+2026-08-04 04:24:52,278 INFO   BC epoch 2/10: bc_loss=0.3806  val_loss=0.7340(x0.65)=0.4771  rmse=4.57 (returns std=5.3)  dir_cos=0.970  mv_p=1.000  spr_p=0.856  [decision=0.000  exec_bce=0.303  sprint=0.066  move=0.000  tackle_attempt=0.237  direction=0.061  region=0.017]  (74.6s)
+2026-08-04 04:24:52,281 INFO   Downsample trivial rows (epoch 3): 59,869/185,225 (32.3%) rows classified trivial, excluding ~41,908 this epoch (frac=0.70)
+2026-08-04 04:26:08,603 INFO   BC epoch 3/10: bc_loss=0.2381  val_loss=0.7094(x0.65)=0.4611  rmse=4.49 (returns std=5.3)  dir_cos=0.981  mv_p=1.000  spr_p=0.856  [decision=0.000  exec_bce=0.184  sprint=0.043  move=0.000  tackle_attempt=0.141  direction=0.039  region=0.016]  (76.3s)
+2026-08-04 04:26:08,605 INFO   Downsample trivial rows (epoch 4): 59,869/185,225 (32.3%) rows classified trivial, excluding ~41,908 this epoch (frac=0.70)
+2026-08-04 04:27:28,541 INFO   BC epoch 4/10: bc_loss=0.2455  val_loss=0.7026(x0.65)=0.4567  rmse=4.47 (returns std=5.3)  dir_cos=0.984  mv_p=1.000  spr_p=0.854  [decision=0.000  exec_bce=0.200  sprint=0.049  move=0.000  tackle_attempt=0.150  direction=0.032  region=0.014]  (79.9s)
+2026-08-04 04:27:28,543 INFO   Downsample trivial rows (epoch 5): 59,869/185,225 (32.3%) rows classified trivial, excluding ~41,908 this epoch (frac=0.70)

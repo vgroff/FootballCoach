@@ -53,6 +53,24 @@ from footballcoach.ai.ppo.schedules import TrainingSchedules
 
 log = logging.getLogger("footballcoach.ai.ppo")
 
+# Reward component short-key → display label mapping (order = display order).
+# Used by both the per-rollout log and the pre-training diagnostic in train.py.
+REWARD_COMP_LABELS: list[tuple[str, str]] = [
+    ("appr",  "approach"),
+    ("retr",  "retreat"),
+    ("hdg",   "heading"),
+    ("poss",  "get_possession"),
+    ("prog",  "progress"),
+    ("lpos",  "lose_possession"),
+    ("out",   "ball_out"),
+    ("ill",   "illegal"),
+    ("box",   "box_possession"),
+    ("spd",   "speed_bonus"),
+    ("lterm", "opponent_box"),
+    ("tout",  "timeout"),
+    ("prox",  "proximity_bonus"),
+    ("stam",  "stamina_penalty"),
+]
 
 def _ai_types(obs_dict: dict) -> tuple:
     """Extract (self_ai_type, other_ai_type) tensors from an obs dict, or
@@ -115,6 +133,8 @@ class PPOTrainer:
         self._bc_cfg = bc_cfg
         self._bc_dir_loss_w = float(bc_cfg.get("direction_loss_weight", 3.0))
         self._bc_region_loss_w = float(bc_cfg.get("region_loss_weight", 1.0))
+        self._bc_dec_weight = float(bc_cfg.get("bc_dec_weight", 1.0))
+        self._bc_exec_weight = float(bc_cfg.get("bc_exec_weight", 1.0))
         # pos_weight_*: None means "auto-compute from the training dataset at
         # load time" (see DemonstrationDataset.compute_pos_weights()). Set to
         # a float in config to override. Populated once pretrain_combined()
@@ -138,6 +158,9 @@ class PPOTrainer:
         self._demo_value_pretrain_gamma = float(bc_cfg.get("demo_value_pretrain_gamma", 0.99))
         # Weight of value loss added to BC loss during BC epochs (0 = disabled)
         self._demo_value_bc_coef = float(bc_cfg.get("demo_value_bc_coef", 0.5))
+        # Weight of value loss added to full BC pre-train loss in Phase 1 (both networks).
+        # Falls back to demo_value_bc_coef for backward compatibility.
+        self._bc_value_coef = float(bc_cfg.get("bc_value_coef", self._demo_value_bc_coef))
         # Weight of value loss added to decision-heads-only BC loss in Phase 0
         # (demo value pretrain). See pretrain_combined()'s Phase 0 block.
         self._phase0_value_coef = float(bc_cfg.get("phase0_value_coef", 1.0))
@@ -391,26 +414,32 @@ class PPOTrainer:
                 mv_ls_grad = metrics.get('mv_ls_grad', 0.0)
                 mv_ls_str = (f"  mv_ls=[{','.join(f'{v:.4f}' for v in mv_ls)}] g={mv_ls_grad:.2e}") if mv_ls else ""
                 ha = metrics.get("head_act", {})
+                _ta_p = ha.get('ta_p', float('nan'))
+                _kk_p = ha.get('kk_p', float('nan'))
+                _prob_str = (
+                    (f" ta_p={_ta_p:.2f}" if _ta_p == _ta_p else "")
+                    + (f" kk_p={_kk_p:.2f}" if _kk_p == _kk_p else "")
+                )
                 act_str = (
                     f"  act: mv={ha.get('mv','?'):>3} gp={ha.get('gp','?'):>3}"
                     f" emv={ha.get('emv','?'):>3} spr={ha.get('spr','?'):>3}"
                     f" kck={ha.get('kck','?'):>3} tk={ha.get('tk','?'):>3}"
                     f" sh={ha.get('sh','?'):>3} hld={ha.get('hld','?'):>3}"
+                    + _prob_str
                 ) if ha else ""
                 opp_rew_str = f"/{mean_opp_reward:.2f}" if not (mean_opp_reward != mean_opp_reward) else ""
                 comp_parts = [
-                    f"{k}={v:+.2f}"
-                    for k in ("appr", "retr", "poss", "prog", "out", "ill", "box", "spd", "lpos", "lterm", "tout", "prox")
+                    f"{label}={rollout_components[k]:+.2f}"
+                    for k, label in REWARD_COMP_LABELS
                     if abs(rollout_components.get(k, 0.0)) > 0.01
-                    for v in (rollout_components[k],)
                 ]
-                comp_str = ("  rew_src: " + " ".join(comp_parts)) if comp_parts else ""
+                comp_str = ("  rew: " + "  ".join(comp_parts)) if comp_parts else ""
                 rollout_components.clear()
                 log.info(
                     f"step={self._total_steps:,} | "
                     f"rew={mean_ep_reward:.2f}{opp_rew_str} | "
                     f"pol={metrics['policy_loss']:.4f} "
-                    f"val={metrics['value_loss']:.4f} "
+                    f"val={metrics['value_loss']:.4f}(x{self.vf_coef})={self.vf_coef * metrics['value_loss']:.4f} "
                     f"ent={metrics['entropy']:.4f} "
                     f"kl={metrics['approx_kl']:.4f}"
                     f"{bc_str} | "
@@ -591,21 +620,24 @@ class PPOTrainer:
                         _sat, _oat,
                     )
                     v_dec = d_heads.value.squeeze(-1)
-                    ret_norm = ret_batch / ret_std
                     # NOTE: Phase 0 fits decision_net.value ALONE (execution_net
                     # is not run here), unlike Phase 2/3 (pretrain_value) which
                     # average decision_net.value and execution_net.value. This
                     # is an intentional, documented inconsistency — Phase 0 is
                     # scoped as a decision-network-only high-level warm-up.
-                    val_loss = ((v_dec - ret_norm) ** 2).mean()
+                    # Value loss uses raw targets + variance normalisation,
+                    # matching the value pretrain rollout and PPO loss convention
+                    # so the network output scale is consistent throughout.
+                    val_loss = F.mse_loss(v_dec, ret_batch) / (ret_std ** 2)
                     dec_bc_loss, _ = bc_loss_from_tensor(
                         bc_labels, d_heads, exec_heads=None,
                         direction_loss_weight=self._bc_dir_loss_w,
                         region_loss_weight=self._bc_region_loss_w,
+                        dec_weight=self._bc_dec_weight,
                         return_breakdown=True,
                     )
                     combined = dec_bc_loss + self._phase0_value_coef * val_loss
-                    raw_mse = F.mse_loss(v_dec * ret_std, ret_batch)
+                    raw_mse = F.mse_loss(v_dec, ret_batch)
                     demo_opt.zero_grad()
                     combined.backward()
                     nn.utils.clip_grad_norm_(
@@ -621,7 +653,8 @@ class PPOTrainer:
                     f"  Phase 0 epoch {epoch + 1}/{_demo_epochs}: "
                     f"loss={np.mean(epoch_losses):.4f}  "
                     f"dec_bc={np.mean(epoch_bc_losses):.4f}  "
-                    f"val={np.mean(epoch_val_losses):.4f}  "
+                    f"val={np.mean(epoch_val_losses):.4f}"
+                    f"(x{self._phase0_value_coef})={np.mean(epoch_val_losses)*self._phase0_value_coef:.4f}  "
                     f"rmse={np.sqrt(np.mean(raw_mse_losses)):.2f} "
                     f"(returns std={ret_std:.1f})"
                 )
@@ -636,7 +669,7 @@ class PPOTrainer:
         # If dataset has reward data and demo_value_bc_coef > 0, also add a
         # value loss term (MSE against demo returns) in the same backward pass.
         _use_joint_val = (
-            self._demo_value_bc_coef > 0.0
+            self._bc_value_coef > 0.0
             and dataset.has_rewards
         )
         if _use_joint_val:
@@ -644,7 +677,7 @@ class PPOTrainer:
             _joint_ret_std = float(np.std(_joint_returns).clip(1.0))
             log.info(
                 f"Phase 1 BC epochs will include joint value loss "
-                f"(coef={self._demo_value_bc_coef}, gamma={self._demo_value_pretrain_gamma}, "
+                f"(coef={self._bc_value_coef}, gamma={self._demo_value_pretrain_gamma}, "
                 f"returns std={_joint_ret_std:.2f})"
             )
         else:
@@ -654,6 +687,7 @@ class PPOTrainer:
         # Do BC first so the rollout is collected with the BC-warmed policy,
         # giving on-policy value targets instead of random-init targets.
         for epoch in range(n_epochs):
+            _epoch_t0 = time.monotonic()
             bc_losses = []
             val_losses: list[float] = []
             val_raw_mse_losses: list[float] = []
@@ -720,24 +754,27 @@ class PPOTrainer:
                     region_loss_weight=self._bc_region_loss_w,
                     pos_weight_kick=self._bc_pos_weight_kick,
                     pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
+                    dec_weight=self._bc_dec_weight,
+                    exec_weight=self._bc_exec_weight,
                     return_breakdown=True,
                 )
                 total_loss = bc_loss
                 if ret_batch is not None:
-                    ret_norm = ret_batch / _joint_ret_std
                     v_dec = d_heads.value.squeeze(-1)
                     v_exc = e_heads.value.squeeze(-1)
+                    # Raw targets + variance normalisation — consistent with
+                    # value pretrain rollout and PPO. Network outputs raw returns.
                     val_loss = 0.5 * (
-                        ((v_dec - ret_norm) ** 2).mean()
-                        + ((v_exc - ret_norm) ** 2).mean()
-                    )
-                    total_loss = bc_loss + self._demo_value_bc_coef * val_loss
+                        F.mse_loss(v_dec, ret_batch)
+                        + F.mse_loss(v_exc, ret_batch)
+                    ) / (_joint_ret_std ** 2)
+                    total_loss = bc_loss + self._bc_value_coef * val_loss
                     val_losses.append(val_loss.item())
-                    # raw unnormalised MSE for RMSE reporting
+                    # raw MSE for RMSE reporting (values already in raw space)
                     with torch.no_grad():
                         raw_mse = 0.5 * (
-                            ((v_dec * _joint_ret_std - ret_batch) ** 2).mean()
-                            + ((v_exc * _joint_ret_std - ret_batch) ** 2).mean()
+                            F.mse_loss(v_dec, ret_batch)
+                            + F.mse_loss(v_exc, ret_batch)
                         )
                         val_raw_mse_losses.append(raw_mse.item())
                 bc_opt.zero_grad()
@@ -752,9 +789,11 @@ class PPOTrainer:
                     _bkdn_acc[k] = _bkdn_acc.get(k, 0.0) + v
                 _bkdn_n += 1
 
-                # Accumulate cosine similarity between predicted and label move directions
+                # Accumulate cosine similarity between predicted and label move directions.
+                # Use _I_VALID (index 14) not -1 (_I_OPPONENT_AI_TYPE = 0.0 for rules
+                # demos, which makes valid_mask always False and causes dir_cos=nan).
                 with torch.no_grad():
-                    valid_mask = bc_labels[:, -1] > 0.5
+                    valid_mask = bc_labels[:, 14] > 0.5  # _I_VALID
                     has_dir = (bc_labels[:, 7].abs() + bc_labels[:, 8].abs()) > 1e-6
                     sel = valid_mask & has_dir
                     if sel.any():
@@ -774,14 +813,21 @@ class PPOTrainer:
             bkdn_str = "  ".join(f"{k}={v/_bkdn_n:.3f}" for k, v in _bkdn_acc.items()) if _bkdn_n else ""
             if val_losses:
                 val_rmse = float(np.sqrt(np.mean(val_raw_mse_losses))) if val_raw_mse_losses else float('nan')
-                val_str = f"  val_loss={np.mean(val_losses):.4f}  rmse={val_rmse:.2f} (returns std={_joint_ret_std:.1f})"
+                _mean_val = np.mean(val_losses)
+                val_str = (
+                    f"  val_loss={_mean_val:.4f}"
+                    f"(x{self._bc_value_coef})={_mean_val * self._bc_value_coef:.4f}"
+                    f"  rmse={val_rmse:.2f} (returns std={_joint_ret_std:.1f})"
+                )
             else:
                 val_str = ""
+            _epoch_elapsed = time.monotonic() - _epoch_t0
             log.info(
                 f"  BC epoch {epoch + 1}/{n_epochs}: bc_loss={np.mean(bc_losses):.4f}"
                 + val_str
                 + f"  dir_cos={mean_cos:.3f}  mv_p={mean_mv:.3f}  spr_p={mean_spr:.3f}"
                 + (f"  [{bkdn_str}]" if bkdn_str else "")
+                + f"  ({_epoch_elapsed:.1f}s)"
             )
             dir_cosines.clear()
             move_probs.clear()
@@ -829,6 +875,8 @@ class PPOTrainer:
                     bc_labels, d_check, e_check,
                     pos_weight_kick=self._bc_pos_weight_kick,
                     pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
+                    dec_weight=self._bc_dec_weight,
+                    exec_weight=self._bc_exec_weight,
                 ).item())
         self.decision_net.train()
         self.execution_net.train()
@@ -885,6 +933,8 @@ class PPOTrainer:
                         region_loss_weight=self._bc_region_loss_w,
                         pos_weight_kick=self._bc_pos_weight_kick,
                         pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
+                        dec_weight=self._bc_dec_weight,
+                        exec_weight=self._bc_exec_weight,
                         return_breakdown=True,
                     )
                     repair_opt.zero_grad()
@@ -900,7 +950,7 @@ class PPOTrainer:
                     _bkdn_r_n += 1
 
                     with torch.no_grad():
-                        valid_mask = bc_labels[:, -1] > 0.5
+                        valid_mask = bc_labels[:, 14] > 0.5  # _I_VALID (not -1 = _I_OPPONENT_AI_TYPE)
                         has_dir = (bc_labels[:, 7].abs() + bc_labels[:, 8].abs()) > 1e-6
                         sel = valid_mask & has_dir
                         if sel.any():
@@ -1050,26 +1100,68 @@ class PPOTrainer:
         _, returns = buffer.compute_gae(self.gamma, self.lam, last_value)
         batch = buffer.as_tensors(_, returns)
 
-        # Augment with geometric flips + slot permutations (ALWAYS applied,
-        # matching pretrain_combined()'s Phase 2/3 behaviour).
+        # --- Episode-level 85/15 train/val split (overfit detection) ---
+        # Split by complete episodes so no episode spans both sets.
+        dones_arr = np.array(buffer.dones)
+        episode_end_idxs = np.where(dones_arr > 0.5)[0]
+        n_complete_eps = len(episode_end_idxs)
+        n_val_eps = max(1, round(0.15 * n_complete_eps)) if n_complete_eps >= 2 else 0
+        n_train_eps = n_complete_eps - n_val_eps
+        n_total = len(buffer.dones)
+        val_mask = np.zeros(n_total, dtype=bool)
+        if n_val_eps > 0:
+            ep_starts = np.concatenate([[0], episode_end_idxs[:-1] + 1])
+            for _i in range(n_train_eps, n_complete_eps):
+                val_mask[ep_starts[_i]:episode_end_idxs[_i] + 1] = True
+        train_mask = ~val_mask
+
+        def _sel(b: dict, mask: np.ndarray) -> dict:
+            idx = torch.from_numpy(np.where(mask)[0]).long()
+            return {k: v[idx] for k, v in b.items()}
+
+        train_batch_raw = _sel(batch, train_mask)
+        val_batch_raw = _sel(batch, val_mask) if n_val_eps > 0 else None
+
+        log.info(
+            f"  Value pretrain split: {n_train_eps} train eps ({int(train_mask.sum())} steps)"
+            + (f"  |  {n_val_eps} val eps ({int(val_mask.sum())} steps)" if n_val_eps > 0 else "")
+        )
+
+        # Augment only the train portion (geometric flips + slot permutations).
         if self.augment_n_slot_shuffles > 0:
-            batch = augment_batch(batch, self.augment_n_slot_shuffles, self._aug_rng)
+            train_batch = augment_batch(train_batch_raw, self.augment_n_slot_shuffles, self._aug_rng)
+        else:
+            train_batch = train_batch_raw
 
-        returns_t = batch["returns"].to(self.device)
-        ret_mean = returns_t.mean()
-        ret_std = returns_t.std().clamp(min=1.0)
+        # ret_std from all returns for consistent normalisation scale.
+        all_returns_t = batch["returns"].to(self.device)
+        ret_std = all_returns_t.std().clamp(min=1.0)
+        log.debug(f"  [value pretrain] returns: mean={all_returns_t.mean():.2f}  std={ret_std:.2f}"
+                  f"  min={all_returns_t.min():.2f}  max={all_returns_t.max():.2f}")
 
-        log.debug(f"  [value pretrain] returns: mean={ret_mean:.2f}  std={ret_std:.2f}"
-                  f"  min={returns_t.min():.2f}  max={returns_t.max():.2f}")
+        returns_t = train_batch["returns"].to(self.device)
+
+        # Pre-load val tensors to device once.
+        val_returns_t = None
+        val_obs_dict = None
+        if val_batch_raw is not None:
+            val_returns_t = val_batch_raw["returns"].to(self.device)
+            val_obs_dict = {k.replace("obs/", ""): val_batch_raw[k].to(self.device)
+                            for k in val_batch_raw if k.startswith("obs/")}
 
         n = len(returns_t)
+        mean_loss = float("nan")
+        epochs_done = 0
+        _best_val_loss = float("inf")
+        _patience = 0
+        _EARLY_STOP_PATIENCE = 5
         for ep in range(n_epochs):
             indices = torch.randperm(n)
             ep_losses = []
             for start in range(0, n, _batch_size):
                 mb_idx = indices[start:start + _batch_size]
-                mb_obs = {k.replace("obs/", ""): batch[k][mb_idx].to(self.device)
-                          for k in batch if k.startswith("obs/")}
+                mb_obs = {k.replace("obs/", ""): train_batch[k][mb_idx].to(self.device)
+                          for k in train_batch if k.startswith("obs/")}
                 mb_ret = returns_t[mb_idx]
 
                 sf = mb_obs["self_feat"]
@@ -1096,22 +1188,50 @@ class PPOTrainer:
                 ep_losses.append(value_loss.item())
 
             mean_loss = float(np.mean(ep_losses))
-            # Sample predicted value vs actual return for a spot-check
-            with torch.no_grad():
-                spot_obs = {k.replace("obs/", ""): batch[k][:64].to(self.device)
-                            for k in batch if k.startswith("obs/")}
-                _sat_s, _oat_s = _ai_types(spot_obs)
-                d_s = self.decision_net(spot_obs["self_feat"], spot_obs["other_feat"],
-                                       spot_obs["exists_mask"], spot_obs["ball_feat"],
-                                       spot_obs["global_feat"], _sat_s, _oat_s)
-                e_s = self.execution_net(spot_obs["self_feat"], spot_obs["other_feat"],
-                                        spot_obs["exists_mask"], spot_obs["ball_feat"],
-                                        spot_obs["global_feat"], d_s, _sat_s, _oat_s)
-                pred_vals = ((d_s.value + e_s.value) / 2.0).squeeze(-1)
-            log.info(f"  Value epoch {ep + 1}/{n_epochs}: val_loss={mean_loss:.4f}")
-            log.debug(f"  [value pretrain epoch {ep:2d}] loss={mean_loss:.4f}"
-                      f"  pred_val mean={pred_vals.mean():.2f}  target mean={returns_t[:64].mean():.2f}")
-        log.info(f"Value pre-training done ({n_epochs} epoch(s), final val_loss={mean_loss:.4f})")
+            epochs_done = ep + 1
+            _train_rmse = float(ret_std) * math.sqrt(mean_loss)
+
+            if val_obs_dict is not None and val_returns_t is not None:
+                with torch.no_grad():
+                    _sat_v, _oat_v = _ai_types(val_obs_dict)
+                    d_v = self.decision_net(
+                        val_obs_dict["self_feat"], val_obs_dict["other_feat"],
+                        val_obs_dict["exists_mask"], val_obs_dict["ball_feat"],
+                        val_obs_dict["global_feat"], _sat_v, _oat_v,
+                    )
+                    e_v = self.execution_net(
+                        val_obs_dict["self_feat"], val_obs_dict["other_feat"],
+                        val_obs_dict["exists_mask"], val_obs_dict["ball_feat"],
+                        val_obs_dict["global_feat"], d_v, _sat_v, _oat_v,
+                    )
+                    _vl = float(F.mse_loss(
+                        ((d_v.value + e_v.value) / 2.0).squeeze(-1), val_returns_t
+                    ) / (ret_std ** 2))
+                _val_rmse = float(ret_std) * math.sqrt(_vl)
+                log.info(
+                    f"  Value epoch {epochs_done}/{n_epochs}: "
+                    f"train={mean_loss:.4f} rmse={_train_rmse:.2f}  "
+                    f"val={_vl:.4f} val_rmse={_val_rmse:.2f} "
+                    f"(std={float(ret_std):.1f})"
+                )
+                if _vl < _best_val_loss - 1e-4:
+                    _best_val_loss = _vl
+                    _patience = 0
+                else:
+                    _patience += 1
+                    if _patience >= _EARLY_STOP_PATIENCE:
+                        log.info(
+                            f"  [value pretrain] early stop at epoch {epochs_done} "
+                            f"(val stagnant for {_EARLY_STOP_PATIENCE} epochs, best={_best_val_loss:.4f})"
+                        )
+                        break
+            else:
+                log.info(
+                    f"  Value epoch {epochs_done}/{n_epochs}: "
+                    f"train_loss={mean_loss:.4f}  rmse={_train_rmse:.2f} "
+                    f"(returns std={float(ret_std):.1f})"
+                )
+        log.info(f"Value pre-training done ({epochs_done} epoch(s), final train_loss={mean_loss:.4f})")
         for p in _freeze_params:
             p.requires_grad_(True)
 
@@ -1421,6 +1541,8 @@ class PPOTrainer:
         all_kl = []
         all_bc_loss = []
         all_bc_tackle_loss: list[float] = []   # BCE on tackle_attempt head only
+        all_tackle_prob: list[float] = []       # mean sigmoid(tackle_attempt_logit) per mb
+        all_kick_prob: list[float] = []         # mean sigmoid(kick_logit) per mb
         all_ratios: list[torch.Tensor] = []
         all_mv_log_std_grad: list[float] = []  # grad on move_dir_log_std after each backward
         epoch_times = []
@@ -1563,11 +1685,17 @@ class PPOTrainer:
                         region_loss_weight=self._bc_region_loss_w,
                         pos_weight_kick=self._bc_pos_weight_kick,
                         pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
+                        dec_weight=self._bc_dec_weight,
+                        exec_weight=self._bc_exec_weight,
                         return_breakdown=True,
                     )
                     total_loss = total_loss + bc_coeff * bc_loss_val
                     # Track tackle_attempt BCE separately for diagnostics
                     all_bc_tackle_loss.append(_bkdn.get("tackle_attempt", 0.0))
+                # Track mean tackle/kick activation probability (pre-sampling) for logging.
+                with torch.no_grad():
+                    all_tackle_prob.append(torch.sigmoid(e_heads.tackle_attempt_logit).mean().item())
+                    all_kick_prob.append(torch.sigmoid(e_heads.kick_logit).mean().item())
                 all_bc_loss.append(bc_loss_val.detach().item())
 
                 self.optimizer.zero_grad()
@@ -1616,7 +1744,7 @@ class PPOTrainer:
                     f"  grad={raw_grad_norm:.1f}"
                     f"  total={total_loss.item():.3f}"
                     f"  pol={policy_loss.item():.3f}"
-                    f"  val={value_loss.item():.3f}"
+                    f"  val={value_loss.item():.3f}(x{self.vf_coef})={self.vf_coef * value_loss.item():.3f}"
                     f"  kl={kl_after_step:.4f}"
                     f"  mv_shift={movedir_mean_shift:.3f}"
                     f"  mv_kl={movedir_hyp_kl:.4f}"
@@ -1762,6 +1890,8 @@ class PPOTrainer:
             "tk":  _act("tackle_attempt"),
             "sh":  _act("shoot"),
             "hld": _act("hold_position"),
+            "ta_p": float(np.mean(all_tackle_prob)) if all_tackle_prob else float('nan'),
+            "kk_p": float(np.mean(all_kick_prob)) if all_kick_prob else float('nan'),
         }
 
         return {

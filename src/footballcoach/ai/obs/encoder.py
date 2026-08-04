@@ -113,6 +113,9 @@ def encode_observation(
     other_ai_type = np.zeros((MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM), dtype=np.float32)
 
     for slot_idx, other_player in zip(slot_indices, other_players[:MAX_OTHER_PLAYERS]):
+        # A player with no AI won't move — zero their velocity to remove noise
+        # from random initial heading/velocity, and set the is_immobile flag.
+        other_immobile = other_player.ai is None
         feat = _player_features(
             player=other_player,
             observer=self_player,
@@ -122,6 +125,7 @@ def encode_observation(
             half_wid=half_wid,
             half_diag=half_diag,
             is_self=False,
+            is_immobile=other_immobile,
         )
         other_feat[slot_idx] = feat
         exists_mask[slot_idx] = 1.0
@@ -206,13 +210,16 @@ def _player_features(
     half_wid: float,
     half_diag: float,
     is_self: bool,
+    is_immobile: bool = False,
 ) -> np.ndarray:
     """Encode one player's feature vector relative to the observer."""
     dx = player.position.x - observer.position.x
     dy = player.position.y - observer.position.y
     dist = math.hypot(dx, dy)
 
-    # Normalize this player's velocity by its own top speed (attribute-invariant)
+    # Normalize this player's velocity by its own top speed (attribute-invariant).
+    # For immobile players velocity is zeroed — their actual velocity is noise
+    # (random initial heading, no movement intent), not a useful signal.
     player_top_speed = effective_top_speed(
         mv_params,
         player.attributes.top_speed,
@@ -223,6 +230,15 @@ def _player_features(
     )
     player_top_speed = max(player_top_speed, 1e-3)
 
+    if is_immobile:
+        vel_x = 0.0
+        vel_y = 0.0
+        speed = 0.0
+    else:
+        vel_x = player.velocity.x / player_top_speed
+        vel_y = player.velocity.y / player_top_speed
+        speed = player.speed_mps / player_top_speed
+
     # Team.LEFT attacks +x, Team.RIGHT attacks -x (per engine/offside.py convention)
     attacking_dir = +1.0 if player.team == Team.LEFT else -1.0
 
@@ -230,9 +246,9 @@ def _player_features(
         rel_dx=dx / half_len,
         rel_dy=dy / half_wid,
         distance_m=dist / half_diag,
-        velocity_x=player.velocity.x / player_top_speed,
-        velocity_y=player.velocity.y / player_top_speed,
-        speed_mps=player.speed_mps / player_top_speed,
+        velocity_x=vel_x,
+        velocity_y=vel_y,
+        speed_mps=speed,
         heading_sin=math.sin(player.heading_rad),
         heading_cos=math.cos(player.heading_rad),
         stamina=player.stamina,
@@ -252,6 +268,7 @@ def _player_features(
         is_goalkeeper=1.0 if player.is_goalkeeper else 0.0,
         attacking_direction=attacking_dir,
         exists=1.0,
+        is_immobile=1.0 if is_immobile else 0.0,
         pos_x=player.position.x / 52.5,
         pos_y=player.position.y / 34.0,
     )

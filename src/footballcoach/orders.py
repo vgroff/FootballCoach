@@ -21,6 +21,9 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING, Callable
 
+import math
+
+from footballcoach.config import load_orders_config, require_section
 from footballcoach.mathutils import Vector3
 
 if TYPE_CHECKING:
@@ -35,13 +38,36 @@ class OrderStatus(Enum):
 
 
 # ---------------------------------------------------------------------------
-# Shared movement-intent helper
+# Order-layer movement parameters
 # ---------------------------------------------------------------------------
 
-# Brake-to-turn / close-proximity constants (all orders share these values).
-# brake_turn_angle_rad, close_prox_cos_threshold and close_prox_radius_m are
-# read from MovementParams (physics.json), so they update at runtime without restarting.
-_BRAKE_MIN_SPEED: float = 2.0      # don't bother below this speed
+@dataclass(frozen=True)
+class OrderLayerParams:
+    """Brake-to-turn and close-proximity parameters for the order layer.
+
+    These govern how orders translate high-level intent into SpeedMode
+    requests. The neural network direct-drive path bypasses all of these.
+    Loaded from config/orders.json["movement"].
+    """
+    brake_turn_angle_rad: float
+    brake_min_speed_mps: float
+    close_prox_radius_m: float
+    close_prox_cos_threshold: float
+
+    @staticmethod
+    def from_config() -> "OrderLayerParams":
+        d = require_section(load_orders_config(), "movement", "orders.json")
+        return OrderLayerParams(
+            brake_turn_angle_rad=math.radians(d.get("brake_turn_angle_deg", 75.0)),
+            brake_min_speed_mps=d.get("brake_min_speed_mps", 2.0),
+            close_prox_radius_m=d.get("close_prox_radius_m", 6.0),
+            close_prox_cos_threshold=d.get("close_prox_cos_threshold", 0.3),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Shared movement-intent helper
+# ---------------------------------------------------------------------------
 
 
 def _compute_movement_intent(
@@ -114,19 +140,20 @@ def _compute_movement_intent(
         speed_mult = 1.0  # noqa: F841
 
     # ── Close-proximity lateral-overshoot brake ──────────────────────────────
-    if (arrival_dist is not None and arrival_dist <= match.movement_params.close_prox_radius_m
-            and player.speed_mps > _BRAKE_MIN_SPEED):
+    op = match.order_params
+    if (arrival_dist is not None and arrival_dist <= op.close_prox_radius_m
+            and player.speed_mps > op.brake_min_speed_mps):
         vel_xy = player.velocity.xy()
         if vel_xy.length() > 1e-9 and adj_dir.length() > 1e-9:
-            if vel_xy.normalized().dot(adj_dir.normalized()) < match.movement_params.close_prox_cos_threshold:
+            if vel_xy.normalized().dot(adj_dir.normalized()) < op.close_prox_cos_threshold:
                 speed_mode = SpeedMode.STANDSTILL
 
     # ── Brake-to-turn ────────────────────────────────────────────────────────
     if (use_brake_to_turn and speed_mode is not SpeedMode.STANDSTILL
-            and adj_dir.length() > 1e-9 and player.speed_mps > _BRAKE_MIN_SPEED):
+            and adj_dir.length() > 1e-9 and player.speed_mps > op.brake_min_speed_mps):
         desired_heading = adj_dir.angle_xy()
         heading_error = abs(angle_diff(player.heading_rad, desired_heading))
-        if heading_error > match.movement_params.brake_turn_angle_rad:
+        if heading_error > op.brake_turn_angle_rad:
             speed_mode = SpeedMode.STANDSTILL
 
     return adj_dir, speed_mode
@@ -279,6 +306,7 @@ class PassOrder:
     """
     target_position: Vector3
     power_fraction: float | None = None  # None = auto-computed from distance
+    power_multiplier: float = 1.0  # scales auto-computed or explicit power_fraction
     target_player_id: str | None = None  # set for leading passes
     status: OrderStatus = OrderStatus.PENDING
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
@@ -318,6 +346,7 @@ class PassOrder:
                 kicker_top_speed_mps=top_speed,
                 kick_power_attr=player.attributes.kick_power,
                 kicking_params=match.kicking_params,
+                power_multiplier=self.power_multiplier,
             )
             match._start_release_grace(player.player_id)
             match._log_debug(f"{player.player_id} passed to {pass_target}")
@@ -342,34 +371,12 @@ class ChaseTackleOrder:
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
         """Chase target and attempt one tackle on contact.  Returns True once contact is resolved."""
         from footballcoach.engine.collision import are_touching
-        from footballcoach.engine.tackling import apply_tackle_result, attempt_tackle, tackle_angle_modifier
 
         self.status = OrderStatus.IN_PROGRESS
         target = match.player_by_id(self.target_player_id)
         if are_touching(player, target):
             if target.is_available_to_tackle():
-                if player.on_tackle is not None:
-                    player.on_tackle(player)
-                if match._gk_immune_from_tackle(target):
-                    match._apply_gk_immune_penalty(player)
-                    match._log_info(f"{player.player_id} chase-tackle on {target.player_id} auto-failed [GK in own box]")
-                else:
-                    result = attempt_tackle(
-                        player.attributes.tackling,
-                        match._effective_dribbling(target),
-                        match.rng_reduction,
-                        match.rng,
-                        match.tackling_params,
-                        is_goalkeeper_tackle=player.is_goalkeeper,
-                        angle_modifier=tackle_angle_modifier(
-                            target.heading_rad, target.position, player.position, match.tackling_params
-                        ),
-                        gk_outside_box=match._gk_outside_own_box(player),
-                    )
-                    match._log_tackle_result(player.player_id, target.player_id, result)
-                    if result.tackler_won and match._target_has_or_controls_ball(target):
-                        match._set_possession(player.player_id)
-                    apply_tackle_result(result, player, target, match.tackling_params)
+                match._attempt_tackle_contact(player, target)
             return True
         else:
             adj_dir, speed_mode = _compute_movement_intent(

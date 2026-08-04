@@ -451,6 +451,7 @@ def pass_ball(
     kicker_top_speed_mps: float = 0.0,
     kick_power_attr: float = 0.5,
     kicking_params: "KickingParams | None" = None,
+    power_multiplier: float = 1.0,
 ) -> None:
     """Applies a grounded pass to `ball`, aimed at `target_position`.
     Height component of target_position is ignored - passes travel along
@@ -480,12 +481,13 @@ def pass_ball(
     distance = kicker_position.xy().distance_to(aim_point.xy())
 
     if power_fraction is None:
-        auto_speed = pass_speed_mps(params, distance, gravity_mps2, rolling_friction_coefficient)
+        auto_speed = pass_speed_mps(params, distance, gravity_mps2, rolling_friction_coefficient) * power_multiplier
         max_kick = max_kick_speed_mps(kp, kick_power_attr)
         base_power_fraction = auto_speed / max(max_kick, 1e-6)
     else:
-        auto_speed = params.max_speed_mps * max(0.0, min(1.0, power_fraction))
-        base_power_fraction = max(0.0, min(1.0, power_fraction))
+        effective_pf = max(0.0, min(1.0, power_fraction * power_multiplier))
+        auto_speed = params.max_speed_mps * effective_pf
+        base_power_fraction = effective_pf
 
     aim_dir = aim_point - kicker_position
     run_mult = running_power_multiplier(

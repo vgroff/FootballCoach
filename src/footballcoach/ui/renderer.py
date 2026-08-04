@@ -107,6 +107,8 @@ class Renderer:
         self._ball_orientation: list = [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]]
         # Fixed dot positions on unit sphere (Fibonacci lattice)
         self._ball_dot_positions: list = self._make_fibonacci_sphere(self._spin_dot_count)
+        # Last ball position for estimating rolling velocity each frame
+        self._last_ball_pos: tuple[float, float] = (0.0, 0.0)
 
         # Ball trail
         _bt = gcfg.get("ball_trail", {})
@@ -137,15 +139,31 @@ class Renderer:
         ]
 
     def update_ball_effects(self, ball: Ball, dt_s: float) -> None:
-        """Integrate 3D ball orientation from spin and update ghost trail.
+        """Integrate 3D ball orientation from spin + rolling, update ghost trail.
         Call once per rendered frame (only when not paused)."""
-        # Integrate orientation: Rodrigues rotation by spin*dt about spin axis
-        spin_mag = ball.spin.length()
-        if spin_mag > 1e-9:
-            angle = spin_mag * dt_s
-            ax = ball.spin.x / spin_mag
-            ay = ball.spin.y / spin_mag
-            az = ball.spin.z / spin_mag
+        # Estimate XY velocity from position delta (works for both free and possessed).
+        cur_x, cur_y = ball.position.x, ball.position.y
+        est_vx = (cur_x - self._last_ball_pos[0]) / dt_s
+        est_vy = (cur_y - self._last_ball_pos[1]) / dt_s
+        self._last_ball_pos = (cur_x, cur_y)
+
+        # Rolling contribution: a ball moving in direction v rolls around the axis
+        # perpendicular to v in the horizontal plane — ẑ × v̂ — at ω = |v| / radius.
+        # Combined with actual spin (topspin, sidespin from kick) for full orientation.
+        r = max(ball.radius_m, 0.01)
+        roll_wx = -est_vy / r
+        roll_wy =  est_vx / r
+        total_wx = ball.spin.x + roll_wx
+        total_wy = ball.spin.y + roll_wy
+        total_wz = ball.spin.z
+
+        # Integrate orientation: Rodrigues rotation by ω*dt about ω axis
+        total_mag = math.sqrt(total_wx*total_wx + total_wy*total_wy + total_wz*total_wz)
+        if total_mag > 1e-9:
+            angle = total_mag * dt_s
+            ax = total_wx / total_mag
+            ay = total_wy / total_mag
+            az = total_wz / total_mag
             c, s = math.cos(angle), math.sin(angle)
             t = 1.0 - c
             dR = [
@@ -249,8 +267,8 @@ class Renderer:
             pygame.draw.circle(surface, style.BALL_STATE_ROLLING_OUTLINE, pos, radius_px + 3, 2)
 
         # --- Dots: fixed points on the 3D ball surface, projected top-down ---
-        # Always shown; rotate as the ball spins. Front hemisphere = opaque,
-        # back hemisphere = faded (depth cue).
+        # Always shown; rotate as the ball spins. Front hemisphere only.
+        # Clipped to the ball circle so dots don't bleed outside the edge.
         orbit_r = radius_px * self._spin_orbit_frac
         dot_r = max(1, int(radius_px * self._spin_dot_radius_frac))
         pad = int(orbit_r) + dot_r + 2
@@ -265,6 +283,10 @@ class Renderer:
             if wz < 0:
                 continue  # back hemisphere — hidden from top-down camera
             pygame.draw.circle(ds, (*self._spin_dot_color, 220), (sx, sy), dot_r)
+        # Mask: keep only pixels inside the ball circle (alpha-multiply with circle shape)
+        clip = pygame.Surface((pad * 2, pad * 2), pygame.SRCALPHA)
+        pygame.draw.circle(clip, (255, 255, 255, 255), (pad, pad), radius_px)
+        ds.blit(clip, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
         surface.blit(ds, (pos[0] - pad, pos[1] - pad))
 
         if ball.height_m > 0.15:

@@ -146,7 +146,8 @@ trivial-row downsampling (which is specifically about reducing redundant
   data or `demo_value_pretrain_epochs=0`.
 - **Phase 1** — BC epochs over the full dataset (all params of both
   networks), optionally with a joint value-MSE term if
-  `demo_value_bc_coef > 0`.
+  `bc_value_coef > 0` (config key `bc.bc_value_coef`; falls back to
+  `demo_value_bc_coef` for backward compat).
 - **Phase 2/3** — delegates to `self.pretrain_value(env, n_steps=rollout_steps,
   n_epochs=value_epochs, lr=value_lr, batch_size=batch_size)` instead of
   duplicating rollout-collection + GAE + value-epoch-loop logic inline (this

@@ -4,7 +4,9 @@ from footballcoach.config.loader import (
     load_attributes_config,
     load_gameplay_config,
     load_graphics_config,
+    load_orders_config,
     load_physics_config,
+    load_scenarios_config,
     require_section,
 )
 
@@ -14,6 +16,8 @@ __all__ = [
     "load_attributes_config",
     "load_gameplay_config",
     "load_graphics_config",
+    "load_orders_config",
     "load_physics_config",
+    "load_scenarios_config",
     "require_section",
 ]

@@ -24,7 +24,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Callable
 
-from footballcoach.config import load_gameplay_config
+from footballcoach.config import load_gameplay_config, load_scenarios_config
 from footballcoach.engine.ball_physics import BallPhysicsParams
 from footballcoach.engine.match import Match
 from footballcoach.engine.movement import MovementParams, effective_top_speed
@@ -418,6 +418,7 @@ def build_pass_scenario(
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
     )
     passer.current_order = PassOrder(target_position=receiver_pos)
+    receiver.ai = PassReceiverAI(get_possession_radius_m=8.0)
     return match
 
 
@@ -428,45 +429,107 @@ def build_pass_scenario(
 from footballcoach.rules_ai import (
     BallCarrierAttackerAI,
     BallReceiverThenShootAI,
+    PassReceiverAI,
     StagedGoalkeeperAI,
     Phase1RulesAI,
     SprintWaypointAI,
 )
 
 
+def _2v2_cfg() -> dict:
+    return load_scenarios_config().get("2v2", {})
+
+
 def build_2v2_scenario(
     rng_reduction: float = 0.3,
     *,
-    attacker_skill_min: float = 0.7,
-    attacker_skill_max: float = 0.85,
-    defender_skill_min: float = 0.55,
-    defender_skill_max: float = 0.7,
-    gk_skill_min: float = 0.55,
-    gk_skill_max: float = 0.7,
-    shoot_immediately_probability: float = 0.5,
+    attacker_skill_min: float | None = None,
+    attacker_skill_max: float | None = None,
+    defender_skill_min: float | None = None,
+    defender_skill_max: float | None = None,
+    gk_skill_min: float | None = None,
+    gk_skill_max: float | None = None,
+    shoot_immediately_probability: float | None = None,
+    attacker_a_dist_from_goal_m: float | None = None,
+    attacker_a_y_m: float | None = None,
+    attacker_b_x_offset_m: float | None = None,
+    attacker_b_y_fraction: float | None = None,
+    attacker_b_running: bool | None = None,
+    defender_dist_from_goal_m: float | None = None,
+    defender_y_m: float | None = None,
+    pass_power_multiplier: float | None = None,
 ) -> Match:
-    """2v2: attacker A (ball) passes to attacker B; defender + GK defend."""
+    """2v2: attacker A (ball) passes to attacker B; defender + GK defend.
+
+    Team convention: Team.LEFT attacks the right goal (+x); Team.RIGHT defends
+    the right goal.  Attackers are Team.LEFT, defender+GK are Team.RIGHT.
+
+    ``attacker_a_dist_from_goal_m`` — distance from the right goal line where attacker A starts.
+    ``attacker_a_y_m`` — lateral (y) position of attacker A.
+    ``attacker_b_x_offset_m`` — how far behind attacker A (in x) attacker B starts.
+    ``attacker_b_y_fraction`` — 1.0 = original far-side y; 0.0 = same y as attacker A.
+    ``attacker_b_running`` — if True, attacker B starts at full sprint speed.
+    ``defender_dist_from_goal_m`` — distance of the defender from the right goal line.
+    ``defender_y_m`` — lateral (y) position of the defender.
+    ``pass_power_multiplier`` — scales the auto-computed pass speed (1.0 = unmodified).
+    """
+    _cfg = _2v2_cfg()
+    if attacker_skill_min is None: attacker_skill_min = float(_cfg.get("attacker_skill_min", 0.7))
+    if attacker_skill_max is None: attacker_skill_max = float(_cfg.get("attacker_skill_max", 0.85))
+    if defender_skill_min is None: defender_skill_min = float(_cfg.get("defender_skill_min", 0.55))
+    if defender_skill_max is None: defender_skill_max = float(_cfg.get("defender_skill_max", 0.7))
+    if gk_skill_min is None: gk_skill_min = float(_cfg.get("gk_skill_min", 0.55))
+    if gk_skill_max is None: gk_skill_max = float(_cfg.get("gk_skill_max", 0.7))
+    if shoot_immediately_probability is None: shoot_immediately_probability = float(_cfg.get("shoot_immediately_probability", 0.5))
+    if attacker_a_dist_from_goal_m is None: attacker_a_dist_from_goal_m = float(_cfg.get("attacker_a_dist_from_goal_m", 18.0))
+    if attacker_a_y_m is None: attacker_a_y_m = float(_cfg.get("attacker_a_y_m", -3.16))
+    if attacker_b_x_offset_m is None: attacker_b_x_offset_m = float(_cfg.get("attacker_b_x_offset_m", 4.0))
+    if attacker_b_y_fraction is None: attacker_b_y_fraction = float(_cfg.get("attacker_b_y_fraction", 0.8))
+    if attacker_b_running is None: attacker_b_running = bool(_cfg.get("attacker_b_running", True))
+    if defender_dist_from_goal_m is None: defender_dist_from_goal_m = float(_cfg.get("defender_dist_from_goal_m", 8.0))
+    if defender_y_m is None: defender_y_m = float(_cfg.get("defender_y_m", 0.0))
+    if pass_power_multiplier is None: pass_power_multiplier = float(_cfg.get("pass_power_multiplier", 1.5))
+
+    _attr_names = ("top_speed", "acceleration", "stamina", "kick_precision",
+                   "kick_power", "dribbling", "ball_control", "tackling")
+
+    def _make_attrs(skill: float, overrides: dict) -> PlayerAttributes:
+        """Build PlayerAttributes from a uniform skill, applying per-attribute overrides.
+        If 'the_rest' key is present, it replaces the uniform skill as the default
+        for any attribute not explicitly listed."""
+        base = float(overrides.get("the_rest", skill))
+        vals = {a: float(overrides.get(a, base)) for a in _attr_names}
+        return PlayerAttributes(**vals)
+
     rng = random.Random()
     pitch = Pitch.standard()
 
     def make_player(pid: str, team: Team, skill: float, pos: Vector3, gk: bool = False) -> Player:
-        attrs = PlayerAttributes(skill, skill, skill, skill, skill, skill, skill, skill)
+        overrides = _cfg.get(f"{pid}_attrs", {})
+        attrs = _make_attrs(skill, overrides)
         return Player.create(pid, team, attrs, position=pos, is_goalkeeper=gk)
 
     half_goal_w = pitch.goal_width_m / 2.0
-    a_x = pitch.half_length - pitch.box_length_m - 2.0
-    attacker_a = make_player("atk_a", Team.RIGHT,
+    a_x = pitch.half_length - attacker_a_dist_from_goal_m
+    a_y = attacker_a_y_m
+    # attacker B: configurable offset from attacker A
+    b_y_far = half_goal_w - 0.5
+    b_y = a_y + attacker_b_y_fraction * (b_y_far - a_y)
+    b_x = a_x - attacker_b_x_offset_m
+
+    # Team.LEFT attacks right goal; Team.RIGHT defends right goal.
+    attacker_a = make_player("atk_a", Team.LEFT,
                              rng.uniform(attacker_skill_min, attacker_skill_max),
-                             Vector3(a_x, -half_goal_w + 0.5, 0))
-    attacker_b = make_player("atk_b", Team.RIGHT,
+                             Vector3(a_x, a_y, 0))
+    attacker_b = make_player("atk_b", Team.LEFT,
                              rng.uniform(attacker_skill_min, attacker_skill_max),
-                             Vector3(a_x - 8.0, half_goal_w - 0.5, 0))
-    defender = make_player("defender", Team.LEFT,
+                             Vector3(b_x, b_y, 0))
+    defender = make_player("defender", Team.RIGHT,
                            rng.uniform(defender_skill_min, defender_skill_max),
-                           Vector3(pitch.half_length - 8.0, 0.0, 0))
+                           Vector3(pitch.half_length - defender_dist_from_goal_m, defender_y_m, 0))
     gk_sk = rng.uniform(gk_skill_min, gk_skill_max)
-    gk = Player.create("keeper", Team.LEFT,
-                       PlayerAttributes(gk_sk, gk_sk, gk_sk, 0.5, 0.5, 0.5, gk_sk, 0.5),
+    gk = Player.create("keeper", Team.RIGHT,
+                       _make_attrs(gk_sk, _cfg.get("keeper_attrs", {})),
                        position=pitch.right_goal_centre, is_goalkeeper=True)
 
     ball = Ball.at_rest(attacker_a.position)
@@ -479,10 +542,22 @@ def build_2v2_scenario(
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
     )
 
-    attacker_b.current_order = MoveOrder(
-        target_position=Vector3(pitch.half_length - 5.0, attacker_b.position.y, 0), sprint=True
+    move_target = Vector3(pitch.half_length - 5.0, b_y, 0)
+    attacker_b.current_order = MoveOrder(target_position=move_target, sprint=True)
+
+    if attacker_b_running:
+        mvmt = MovementParams.from_config()
+        sprint_speed = effective_top_speed(
+            mvmt, attacker_b.attributes.top_speed, attacker_b.stamina, has_ball=False,
+        )
+        attacker_b.velocity = Vector3(sprint_speed, 0.0, 0.0)
+        attacker_b.heading_rad = 0.0  # facing +x toward right goal
+
+    attacker_a.current_order = PassOrder(
+        target_position=attacker_b.position,
+        target_player_id=attacker_b.player_id,
+        power_multiplier=pass_power_multiplier,
     )
-    attacker_a.current_order = PassOrder(target_position=attacker_b.position)
     defender.current_order = GetPossessionOrder()
     gk.current_order = MoveOrder(target_position=pitch.right_goal_centre, sprint=False,
                                   max_speed_on_arrival_mps=0.0)
@@ -1317,6 +1392,28 @@ def build_gk_far_post_scenario(
 # SCENARIOS list (Phase H: trimmed to 6, all parameterized)
 # ---------------------------------------------------------------------------
 
+def _build_2v2_params() -> list:
+    """Build ScenarioParam list for the 2v2 scenario, pulling defaults from scenarios.json."""
+    c = _2v2_cfg()
+    return [
+        ScenarioParam("attacker_skill_min", "Attacker skill min", 0.3, 1.0, 0.05, float(c.get("attacker_skill_min", 0.7))),
+        ScenarioParam("attacker_skill_max", "Attacker skill max", 0.3, 1.0, 0.05, float(c.get("attacker_skill_max", 0.85))),
+        ScenarioParam("defender_skill_min", "Defender skill min", 0.3, 1.0, 0.05, float(c.get("defender_skill_min", 0.55))),
+        ScenarioParam("defender_skill_max", "Defender skill max", 0.3, 1.0, 0.05, float(c.get("defender_skill_max", 0.7))),
+        ScenarioParam("gk_skill_min", "GK skill min", 0.3, 1.0, 0.05, float(c.get("gk_skill_min", 0.55))),
+        ScenarioParam("gk_skill_max", "GK skill max", 0.3, 1.0, 0.05, float(c.get("gk_skill_max", 0.7))),
+        ScenarioParam("shoot_immediately_probability", "Shoot immediately prob", 0.0, 1.0, 0.1, float(c.get("shoot_immediately_probability", 0.5))),
+        ScenarioParam("attacker_a_dist_from_goal_m", "Attacker A: dist from goal (m)", 1.0, 50.0, 0.5, float(c.get("attacker_a_dist_from_goal_m", 18.0))),
+        ScenarioParam("attacker_a_y_m", "Attacker A: lateral position (m)", -20.0, 20.0, 0.5, float(c.get("attacker_a_y_m", -3.16))),
+        ScenarioParam("attacker_b_x_offset_m", "Attacker B: x offset behind A (m)", 0.0, 20.0, 0.5, float(c.get("attacker_b_x_offset_m", 4.0))),
+        ScenarioParam("attacker_b_y_fraction", "Attacker B: y spread (0=same as A, 1=far side)", 0.0, 1.0, 0.1, float(c.get("attacker_b_y_fraction", 0.8))),
+        ScenarioBoolParam("attacker_b_running", "Attacker B starts at full sprint", default=bool(c.get("attacker_b_running", True))),
+        ScenarioParam("defender_dist_from_goal_m", "Defender: dist from goal (m)", 1.0, 50.0, 0.5, float(c.get("defender_dist_from_goal_m", 8.0))),
+        ScenarioParam("defender_y_m", "Defender: lateral position (m)", -20.0, 20.0, 0.5, float(c.get("defender_y_m", 0.0))),
+        ScenarioParam("pass_power_multiplier", "Pass power multiplier", 0.5, 3.0, 0.1, float(c.get("pass_power_multiplier", 1.5))),
+    ]
+
+
 SCENARIOS: list[ScenarioDefinition] = [
     # ---- AI scenarios (shown first in menu) ----
     ScenarioDefinition(
@@ -1407,15 +1504,7 @@ SCENARIOS: list[ScenarioDefinition] = [
         description="Two attackers combine with a pass before shooting; one defender + GK.",
         build=build_2v2_scenario,
         on_tick=None,
-        params=[
-            ScenarioParam("attacker_skill_min", "Attacker skill min", 0.3, 1.0, 0.05, 0.7),
-            ScenarioParam("attacker_skill_max", "Attacker skill max", 0.3, 1.0, 0.05, 0.85),
-            ScenarioParam("defender_skill_min", "Defender skill min", 0.3, 1.0, 0.05, 0.55),
-            ScenarioParam("defender_skill_max", "Defender skill max", 0.3, 1.0, 0.05, 0.7),
-            ScenarioParam("gk_skill_min", "GK skill min", 0.3, 1.0, 0.05, 0.55),
-            ScenarioParam("gk_skill_max", "GK skill max", 0.3, 1.0, 0.05, 0.7),
-            ScenarioParam("shoot_immediately_probability", "Shoot immediately prob", 0.0, 1.0, 0.1, 0.5),
-        ],
+        params=_build_2v2_params(),
     ),
     ScenarioDefinition(
         key="1v2",

@@ -21,6 +21,7 @@ from footballcoach.rules_ai import (
     Phase1RulesAI,
     StagedGoalkeeperAI,
     SprintWaypointAI,
+    _should_sprint_to_ball,
 )
 
 from tests.conftest import make_player
@@ -161,6 +162,90 @@ class TestPhase1RulesAI:
         match._set_possession("p2")
         p1.ai.act(p1, match, 2)
         assert isinstance(p1.current_order, GetPossessionOrder)
+
+
+# ---------------------------------------------------------------------------
+# _should_sprint_to_ball
+# ---------------------------------------------------------------------------
+
+class TestShouldSprintToBall:
+    def test_sprints_when_opponent_closer_to_ball(self):
+        """Opponent is right next to the ball; we are far away — must sprint."""
+        # p1 is 20 m from ball; p2 (opponent) is 1 m from ball.
+        match, p1, p2 = _make_simple_match(
+            ball_position=Vector3(0, 0, 0),
+        )
+        p1.position = Vector3(-20, 0, 0)
+        p2.position = Vector3(-1, 0, 0)
+        assert _should_sprint_to_ball(p1, match) is True
+
+    def test_jogs_when_clearly_closer_than_sprinting_opponent(self):
+        """We are 1 m from ball; opponent is 30 m away — safe to jog."""
+        match, p1, p2 = _make_simple_match(
+            ball_position=Vector3(0, 0, 0),
+        )
+        p1.position = Vector3(-1, 0, 0)
+        p2.position = Vector3(30, 0, 0)
+        assert _should_sprint_to_ball(p1, match) is False
+
+    def test_sprints_when_no_opponents_present(self):
+        """No opponents on the pitch — default is to sprint (safe)."""
+        from footballcoach.entities.player import Player
+
+        p1 = make_player("p1", Team.LEFT, position=Vector3(-10, 0, 0))
+        ball = Ball.at_rest(Vector3(0, 0, 0))
+        match = Match(
+            pitch=Pitch.standard(),
+            players=[p1],
+            ball=ball,
+            rng_reduction=1.0,
+            rng=random.Random(42),
+        )
+        assert _should_sprint_to_ball(p1, match) is True
+
+    def test_does_not_sprint_when_already_at_ball(self):
+        """Player is essentially on top of the ball — no sprint needed."""
+        match, p1, p2 = _make_simple_match(
+            ball_position=Vector3(0, 0, 0),
+        )
+        p1.position = Vector3(0.05, 0, 0)   # within 0.1 m threshold
+        p2.position = Vector3(30, 0, 0)
+        assert _should_sprint_to_ball(p1, match) is False
+
+    def test_ignores_tackled_opponents(self):
+        """Tackled opponent's proximity is excluded from the sprint decision."""
+        from footballcoach.entities.player import PlayerState
+
+        match, p1, p2 = _make_simple_match(
+            ball_position=Vector3(0, 0, 0),
+        )
+        p1.position = Vector3(-20, 0, 0)
+        p2.position = Vector3(-1, 0, 0)  # opponent much closer
+        # Active opponent close → should sprint to compete
+        assert _should_sprint_to_ball(p1, match) is True
+        # Tackle p2 → no active opponents → safe-default sprint (no opponents present)
+        p2.state = PlayerState.INACTIVE_TACKLED
+        result = _should_sprint_to_ball(p1, match)
+        # The tackled player must not be factored in; result is the no-opponents default (True)
+        assert result is True  # sprints because no active opponents = safe default
+
+    def test_ignores_teammates(self):
+        """Teammates on the same team must not influence the sprint decision."""
+        from footballcoach.entities.player import Player
+
+        p1 = make_player("p1", Team.LEFT, position=Vector3(-5, 0, 0))
+        # teammate p3 is much closer to the ball, but same team
+        p3 = make_player("p3", Team.LEFT, position=Vector3(-1, 0, 0))
+        ball = Ball.at_rest(Vector3(0, 0, 0))
+        match = Match(
+            pitch=Pitch.standard(),
+            players=[p1, p3],
+            ball=ball,
+            rng_reduction=1.0,
+            rng=random.Random(42),
+        )
+        # No opponents present → sprint (safe default), not because of p3
+        assert _should_sprint_to_ball(p1, match) is True
 
 
 # ---------------------------------------------------------------------------

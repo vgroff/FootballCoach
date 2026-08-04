@@ -12,24 +12,16 @@ Read Idea.md, and all the READMe and knowledge files, except Idea2. Read the ai_
 
 
 Current notes:
-- On ask - implementing the kicking system from design doc - but add another colour to show the ball descending
-- On ask - implementing simplified match logs that can be turned on when needed
-    - only keep - taking possession, kicks, tackles (incl. attempted), and the positions and time of the events
-- is_inactive flag after tackling etc
-    - is this passed to the engine?
-- On ask - Give the ball some dots to simulate the hexagons on a black and white ball and make them spin if it has spin, in all 3 axis. How difficult/annoying/computationally expensive is this? Any ideas for better nicer design of the ball? Or another way to show the ball spinning visually? Happy to take suggestions
-- For me
-    - Re-organise design doc+add new notes from this folder
-    - Reduce decision times to 0.5s
-    - Make sure everything is covered from this doc
-    - Find new design doc stuff to work on
+- train blockers:
+- Move Order with ball kicking...
+- 2v2 goalkeepr AI should only switch to save order if the kick is aimed towards the goal, and should cease save order if the ball changes posssesion, even to another teammate of the oppoiste side, and go back to the goal centre
 
 
 Other todo
 - Reduce decision rate everywhere (0.4s?)
 - Which tests are failing and why? What are they testing?
 - The reward function for phase 1 should be split by order - eg some apply to GetPossession/ChaseTackle (depends on ball possession), some apply only to MoveOrder, then later some will apply only to Shoot, Pass etc… completing the order (fast) should always give a reward boost
-- PRobably need a small reword on spin, how its' affected by talent and max values
+- PRobably need a small reworrk on spin, how its' affected by talent and max values
 
 
 Immedaite task!!
@@ -37,7 +29,8 @@ Read ai_trainer_knowledge.md, and then run a training run
 - can we "normalise" rewards? maybe already do
 - the value head/network may need to be more expressive/higher capacity somehow? Investigate before committing to that
 - PPO params need playing with most likely
-- the tackling and taking control/possession seems to work weirdly - check the logs in a 1v2 rules scenario
+- the tackling and taking control/possession seems to work weirdly - check the logs in a 1v2 rules scenarioj- 
+- in some cases it might make sense to feed in more "real" values, e.g. shot error or top speed or acceleration, rather than the player attributes. that way we can fuck with the physics without losong AI kowledge
 - We could super easliy remove a whole axis of symmetry by transforming all AI positions to being +x is attacking goal, -x is dending goal, remove the flag for which end youre attacking on and transform back and forth from the engine positions to the AI positions. Would probably mean a smaller/smarter AI and faster trainnig from fewer augmentations (half the training time)
     - I think all that needs changing is absolute coordinates - i.e. player position and move region (?). and then augmentation and team flags removed.
 - definitely need a phase 0 type thing where we just teach movement, with and without the ball, going between waypoints for a start, it struggle with movement a lot

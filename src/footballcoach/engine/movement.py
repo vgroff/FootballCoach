@@ -59,9 +59,6 @@ class MovementParams:
     goalkeeper_accel_multiplier: float
     goalkeeper_speed_multiplier: float
     standstill_decel_multiplier: float  # accel boost when decelerating to STANDSTILL
-    brake_turn_angle_rad: float  # heading change above this triggers brake-to-turn
-    close_prox_cos_threshold: float  # cos-sim threshold for lateral-overshoot brake
-    close_prox_radius_m: float  # radius within which lateral-overshoot brake activates
     turn_speed_penalty_max: float  # max fractional speed-cap reduction mid-turn (0.7 = up to 70%)
 
     @staticmethod
@@ -88,9 +85,6 @@ class MovementParams:
             goalkeeper_accel_multiplier=d["goalkeeper_accel_multiplier"],
             goalkeeper_speed_multiplier=d["goalkeeper_speed_multiplier"],
             standstill_decel_multiplier=d.get("standstill_decel_multiplier", 1.5),
-            brake_turn_angle_rad=math.radians(d.get("brake_turn_angle_deg", 75.0)),
-            close_prox_cos_threshold=d.get("close_prox_cos_threshold", 0.3),
-            close_prox_radius_m=d.get("close_prox_radius_m", 5.0),
             turn_speed_penalty_max=d.get("turn_speed_penalty_max", 0.7),
         )
 
