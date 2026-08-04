@@ -9,6 +9,7 @@ import random
 from footballcoach.engine.match import Match
 from footballcoach.engine.movement import MovementParams, effective_acceleration
 from footballcoach.entities import Ball, Pitch
+from footballcoach.entities.player import PlayerState, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import MoveOrder, StopOrder, OrderStatus
 from tests.conftest import make_player
@@ -250,4 +251,126 @@ def test_small_heading_change_does_not_decelerate():
     assert min_speed_in_first_half_second >= sprint_speed * 0.6, (
         f"player decelerated too much for a small heading change: "
         f"min speed {min_speed_in_first_half_second:.2f} vs sprint {sprint_speed:.2f}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# CONTROLLING_BALL movement tests
+# ---------------------------------------------------------------------------
+
+def test_controlling_ball_player_keeps_moving():
+    """A player in CONTROLLING_BALL state (mid first-touch) with an active
+    MoveOrder must continue moving toward the target — not freeze in place."""
+    pitch = Pitch.standard()
+    player = make_player("p1", position=Vector3(0.0, 0.0, 0.0), attr_value=0.5)
+    player.heading_rad = 0.0  # facing +x
+    ball = Ball.at_rest(Vector3(50.0, 0.0, 0.0))  # far away
+    match = Match(pitch=pitch, players=[player], ball=ball, rng_reduction=1.0, rng=random.Random(0))
+
+    # Force player into CONTROLLING_BALL state for 0.5s (15 ticks at 30Hz).
+    player.state = PlayerState.CONTROLLING_BALL
+    player.state_timer_s = 0.5
+    player.current_order = MoveOrder(target_position=Vector3(20.0, 0.0, 0.0), sprint=True)
+
+    for _ in range(10):  # 10 ticks well within the control window
+        match.step()
+
+    assert player.position.x > 0.1, (
+        f"Player should have moved during CONTROLLING_BALL, got x={player.position.x:.3f}"
+    )
+
+
+def test_controlling_ball_player_moves_slower_than_free_sprint():
+    """During CONTROLLING_BALL the engine applies the ball-carry speed penalty,
+    so the player moves slower than a free-sprinting player over the same ticks."""
+    pitch = Pitch.standard()
+
+    def _run_ticks(controlling: bool, n_ticks: int) -> float:
+        p = make_player("p1", position=Vector3(0.0, 0.0, 0.0), attr_value=0.5)
+        p.heading_rad = 0.0
+        ball = Ball.at_rest(Vector3(50.0, 0.0, 0.0))
+        m = Match(pitch=pitch, players=[p], ball=ball, rng_reduction=1.0, rng=random.Random(0))
+        if controlling:
+            p.state = PlayerState.CONTROLLING_BALL
+            p.state_timer_s = float(n_ticks) / 30.0 + 1.0  # keep in state the whole time
+        p.current_order = MoveOrder(target_position=Vector3(20.0, 0.0, 0.0), sprint=True)
+        for _ in range(n_ticks):
+            m.step()
+        return p.position.x
+
+    n = 20  # ticks
+    x_controlling = _run_ticks(controlling=True, n_ticks=n)
+    x_free = _run_ticks(controlling=False, n_ticks=n)
+
+    assert x_controlling > 0.5, "Controlling player should have moved"
+    assert x_free > x_controlling, (
+        f"Free sprint (x={x_free:.3f}) should be faster than controlling (x={x_controlling:.3f})"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Push-kick tests
+# ---------------------------------------------------------------------------
+
+def _ticks_to_complete_move(
+    start: Vector3,
+    target: Vector3,
+    push_kick_enabled: bool,
+    start_possessed: bool = True,
+    max_ticks: int = 30 * 30,
+) -> int:
+    """Helper: count ticks for a ball-carrying player to complete a MoveOrder."""
+    pitch = Pitch.standard()
+    player = make_player("p1", Team.LEFT, attr_value=0.6, position=start)
+    player.heading_rad = 0.0  # facing +x
+    ball = Ball.at_rest(start)
+    match = Match(pitch=pitch, players=[player], ball=ball, rng_reduction=1.0, rng=random.Random(0))
+    if start_possessed:
+        ball.possessed_by = player.player_id
+    player.current_order = MoveOrder(
+        target_position=target,
+        sprint=True,
+        push_kick_enabled=push_kick_enabled,
+    )
+    for tick in range(max_ticks):
+        match.step()
+        if player.current_order is None:
+            return tick + 1
+    return max_ticks  # didn't complete
+
+
+def test_push_kick_faster_over_40m():
+    """A player with push_kick_enabled should reach a target 40m away faster
+    than one who dribbles all the way (ball-carry speed penalty the whole time)."""
+    start = Vector3(-(40.0 / 2), 0.0, 0.0)
+    target = Vector3(40.0 / 2, 0.0, 0.0)
+
+    ticks_dribble = _ticks_to_complete_move(start, target, push_kick_enabled=False)
+    ticks_push = _ticks_to_complete_move(start, target, push_kick_enabled=True)
+
+    assert ticks_push < ticks_dribble, (
+        f"push-kick ({ticks_push} ticks) should be faster than dribbling ({ticks_dribble} ticks)"
+    )
+
+
+def test_push_kick_not_triggered_near_destination():
+    """When the remaining distance is below push_kick_min_dist_m the player
+    should NOT kick (ball stays possessed, no release-grace period starts)."""
+    pitch = Pitch.standard()
+    player = make_player("p1", Team.LEFT, attr_value=0.6, position=Vector3(0.0, 0.0, 0.0))
+    player.heading_rad = 0.0
+    # Target only 5m away — well below the default push_kick_min_dist_m (9m).
+    target = Vector3(5.0, 0.0, 0.0)
+    ball = Ball.at_rest(Vector3(0.0, 0.0, 0.0))
+    ball.possessed_by = player.player_id
+    match = Match(pitch=pitch, players=[player], ball=ball, rng_reduction=1.0, rng=random.Random(0))
+    player.current_order = MoveOrder(
+        target_position=target, sprint=True, push_kick_enabled=True
+    )
+
+    match.step()
+
+    # Ball should still be possessed (no kick was triggered).
+    assert ball.possessed_by == player.player_id, (
+        "Push-kick must not fire when the player is already close to the destination"
     )

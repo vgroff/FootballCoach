@@ -149,14 +149,9 @@ class Match:
         # enough to start controlling it. Without this ordering, a player who
         # just kicked the ball would immediately re-acquire it at distance 0.
         #
-        # A ball currently mid-control-time (some player is
-        # CONTROLLING_BALL) is NOT advanced here: the instant a player makes
-        # contact, the ball is frozen (see _update_loose_ball_pickup) rather
-        # than continuing to fly at full speed for the whole control-time
-        # window. Without this, a fast shot could sail straight through a
-        # goalkeeper who is technically "catching" it and still cross the
-        # goal line before the control-time timer completes.
-        if self.ball.possessed_by is None and not self._any_player_controlling_ball():
+        # Ball mid-control (CONTROLLING_BALL) is now possessed immediately on
+        # contact, so step_ball() is already a no-op for it (possessed_by is set).
+        if self.ball.possessed_by is None:
             pre_flight_position = self.ball.position
             step_ball(self.ball, dt, self.ball_physics_params)
             resolve_ball_block_by_inactive_players(
@@ -224,7 +219,10 @@ class Match:
         for player in self.players:
             if player.desired_speed_mode is None:
                 continue
-            has_ball = self.ball.possessed_by == player.player_id
+            has_ball = (
+                self.ball.possessed_by == player.player_id
+                or player.state == PlayerState.CONTROLLING_BALL
+            )
             speed_mode = player.desired_speed_mode
             step_player_towards(player, player.desired_direction, speed_mode, dt, self.movement_params, has_ball)
             player.stamina = _drain_if_sprinting(self.movement_params, player, speed_mode is SpeedMode.SPRINT, dt)
@@ -270,8 +268,6 @@ class Match:
 
     def _process_orders(self, dt: float) -> None:
         for player in self.players:
-            if player.state == PlayerState.CONTROLLING_BALL:
-                continue
             if player.ai is not None:
                 player.ai.act(player, self, 0)
             order = player.current_order
@@ -367,10 +363,12 @@ class Match:
 
             player.state = PlayerState.CONTROLLING_BALL
             player.state_timer_s = t_control
-            # Freeze the ball in place the instant contact is made (keeping
-            # whatever height it was caught/received at) - see the note in
-            # step() on why a ball mid-control-time must not keep flying.
-            self.ball.velocity = Vector3.zero()
+            # Grant possession immediately so the ball is glued to the player
+            # via _sync_possessed_ball each tick (rather than frozen in space).
+            # Speed is snapped down by control_speed_multiplier on contact;
+            # the player then coasts at that reduced speed until control ends.
+            self._set_possession(player.player_id)
+            player.velocity = player.velocity * self.movement_params.control_speed_multiplier
             # Display hint for the UI action-icon system (consumed by renderer, not engine logic).
             player.action_icon = "🧤" if player.is_goalkeeper else "✋"
             return  # only one player starts controlling per tick (first come)
@@ -472,6 +470,16 @@ class Match:
                 continue
 
             # Head-on: resolve as a tackle (other player is the tackler).
+            # Aerial control: if the carrier is mid first-touch on a high ball,
+            # the tackle is blocked (nothing to poke away at foot level yet).
+            if (
+                carrier.state == PlayerState.CONTROLLING_BALL
+                and self.ball.position.z > self.control_time_params.control_tackle_immune_height_m
+            ):
+                self._log_info(
+                    f"{other.player_id} head-on tackle on {carrier.player_id} blocked [aerial control]"
+                )
+                return
             if self._gk_immune_from_tackle(carrier):
                 # Phase B: GK in own box with ball is untackleable —
                 # the onrushing player is penalised; carrier is untouched.
@@ -499,9 +507,8 @@ class Match:
             return  # only one head-on tackle per tick
 
     def _complete_control(self, player: Player) -> None:
-        self._set_possession(player.player_id)
-        self.ball.velocity = Vector3.zero()
-        self._log_info(f"{player.player_id} completed first touch and took possession")
+        # Possession was already granted at the moment of contact; just log completion.
+        self._log_info(f"{player.player_id} completed first touch")
 
     def _log_tackle_result(
         self,
@@ -585,6 +592,16 @@ class Match:
         """
         if player.on_tackle is not None:
             player.on_tackle(player)
+        # A player controlling an aerial ball (above waist height) cannot be tackled —
+        # the ball isn't on the ground yet so there's nothing to poke away.
+        if (
+            target.state == PlayerState.CONTROLLING_BALL
+            and self.ball.position.z > self.control_time_params.control_tackle_immune_height_m
+        ):
+            self._log_info(
+                f"{player.player_id} tackle on {target.player_id} blocked [aerial control]"
+            )
+            return
         if self._gk_immune_from_tackle(target):
             self._apply_gk_immune_penalty(player)
             self._log_info(

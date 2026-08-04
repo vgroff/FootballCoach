@@ -54,7 +54,9 @@
     "goalkeeper_speed_multiplier": 1.23,
     "standstill_decel_multiplier": 1.5,
     "turn_speed_penalty_max": 0.7,
-    "_comment_turn_speed_penalty": "Max fractional reduction to the speed cap while mid-turn (0.7 = up to 70% reduction at a full 180° heading change)."
+    "_comment_turn_speed_penalty": "Max fractional reduction to the speed cap while mid-turn (0.7 = up to 70% reduction at a full 180° heading change).",
+    "control_speed_multiplier": 0.6,
+    "_comment_control_speed_multiplier": "Fraction of current speed retained the instant a player starts first-touch control (0.6 = 40% speed reduction on contact). The ball is immediately glued to the player and they coast at this reduced speed until control completes."
   },
   "kicking": {
     "_comment": "sigma_angle in radians = base + scale*(1 - precision^precision_exponent). power in m/s = base + scale*attr. running_power_coefficient: max run boost = coefficient (at full sprint in line with kick). power_base/scale rescaled from 15/20 so full-sprint run_mult=1.7 gives same peak speed as old coeff=0.3 (run_mult=1.3): factor=1.3/1.7=0.765. running_direction_precision_*: reduce kick precision by up to 75% when kicking against the run direction (backwards). cos_high=0.35 (~70° forward cone), cos_low=-0.2 (~102°), penalty_mid=0.25 at cos_low, penalty_max=0.75 at cos=-1. See design doc for worked tables.",
@@ -130,7 +132,7 @@
   "control_time": {
     "_comment": "Time (s) for a player to bring a ball under control on first touch. See knowledge.md in engine/ for full derivation. Jump zone (above player_height_m=1.8m): outfield_jump_scale_at_max_reach multiplies the (height_factor-1) term at outfield_max_reach_height_m; GK's height_factor_scale interpolates toward gk jump_scale_at_max_reach at gk_max_reach_height_m.",
     "t_base_s": 0.05,
-    "t_scale_s": 0.25,
+    "t_scale_s": 0.2,
     "height_factor_knee": 1.0,
     "height_factor_waist": 1.5,
     "height_factor_head": 4.0,
@@ -142,6 +144,8 @@
     "noise_sigma_fraction": 0.1,
     "outfield_jump_scale_at_max_reach": 2.0,
     "outfield_max_reach_height_m": 2.0,
+    "control_tackle_immune_height_m": 0.95,
+    "_comment_control_tackle_immune": "Ball height (m) above which a CONTROLLING_BALL player is immune to tackles. Default 0.95 = waist height: aerial/chest control is protected, ground control can still be challenged.",
     "goalkeeper": {
       "t_base_s": 0.08,
       "height_factor_scale": 0.4,

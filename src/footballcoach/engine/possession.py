@@ -39,6 +39,7 @@ class ControlTimeParams:
     # Outfield: steeper penalty, lower ceiling
     outfield_jump_scale_at_max_reach: float  # applied as multiplier on (height_factor-1) at max reach
     outfield_max_reach_height_m: float       # max height outfield can credibly jump to
+    control_tackle_immune_height_m: float    # ball must be below this height for tackles to land on a CONTROLLING_BALL player
 
     @staticmethod
     def from_config() -> "ControlTimeParams":
@@ -68,6 +69,7 @@ class ControlTimeParams:
             gk_max_reach_height_m=gk.get("max_reach_height_m", 2.2),
             outfield_jump_scale_at_max_reach=d.get("outfield_jump_scale_at_max_reach", 2.0),
             outfield_max_reach_height_m=d.get("outfield_max_reach_height_m", 2.0),
+            control_tackle_immune_height_m=d.get("control_tackle_immune_height_m", 0.95),
         )
 
 

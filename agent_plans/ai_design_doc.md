@@ -1251,6 +1251,20 @@ of abstraction; revisit if the two networks need genuinely different
 training paces (e.g. execution-network-only phases of the curriculum,
 section 4).
 
+**Resolved (implementation status): single value head, execution network
+only.** Both `DecisionNetwork.value_head` and `ExecutionNetwork.value_head`
+still exist as modules (kept for checkpoint state_dict compatibility), but
+only `ExecutionNetwork.value_head` is ever trained or read; the decision
+network's is permanently frozen (`requires_grad_(False)` in
+`PPOTrainer.__init__`) and excluded from every value loss and from
+inference (`_sample_action`/`_get_value`). This replaced an earlier
+"average the two heads" approach that had a train/inference mismatch:
+training losses fit the two heads independently or as their average
+depending on call site, while inference used their mean regardless, letting
+the two heads silently diverge from what was actually being optimized. See
+`src/footballcoach/ai/knowledge.md` "Single value head convention" for the
+full rationale.
+
 ### 9.5 Per-head log_prob combination
 
 For a single environment step, log_prob is a **sum across every head that

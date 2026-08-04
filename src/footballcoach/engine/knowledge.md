@@ -13,7 +13,11 @@ steppable `Match` with a fixed timestep. All constants come from
                              completing control (granting possession) when
                              a CONTROLLING_BALL timer expires
 2. _process_orders        - execute each player's current order (Move/Kick/
-                             Shoot/Tackle/Pass/ChaseTackle/Save) for this tick
+                             Shoot/Tackle/Pass/ChaseTackle/Save) for this tick.
+                             CONTROLLING_BALL players are NOT skipped — their
+                             order and AI run normally so they keep moving.
+                             `_apply_movement` treats them as has_ball=True
+                             (ball-carry speed penalty applies during control).
 3. _sync_possessed_ball   - snap the ball to whoever currently has
                              possession (it's "stuck to them" per Idea.md)
 4. step_ball (if loose)   - advance free-flight physics for a loose ball,

@@ -128,19 +128,24 @@ trivial-row downsampling (which is specifically about reducing redundant
 
 `PPOTrainer.pretrain_combined()` runs, in order:
 
-- **Phase 0** — decision-network-only warm-up on demo returns. ONE combined
+- **Phase 0** — decision-network warm-up on demo returns. ONE combined
   backward pass per minibatch: `decision_bc_loss + phase0_value_coef *
-  value_loss`, over ALL of `decision_net`'s parameters (encoders + trunk +
-  value_head) — **no frozen layers**. `execution_net` is not touched here;
-  it gets its BC training in Phase 1. Uses `bc_loss_from_tensor(bc_labels,
-  d_heads, exec_heads=None, ...)` — the decision-heads-only path (skips
-  exec_move/sprint/kick/tackle_attempt BCE and the move_direction cosine
-  loss; see the `bc_loss_from_tensor()` docstring in `bc.py`). Note: Phase 0
-  fits `decision_net.value` ALONE as its value target/prediction (since
-  `execution_net` isn't run), whereas Phase 2/3 average
-  `decision_net.value` and `execution_net.value` — this is an intentional,
-  documented inconsistency (Phase 0 is scoped as a decision-network-only
-  high-level warm-up), not a bug. Config: `demo_value_pretrain_epochs`,
+  value_loss`. The optimizer covers ALL of `decision_net`'s parameters
+  (encoders + trunk; `decision_net.value_head` itself stays frozen — single
+  value head convention, see "Single value head convention" below) PLUS
+  `execution_net.value_head` ONLY. `execution_net` still runs a forward pass
+  every minibatch (needed to produce `e_heads.value` from `d_heads`), but no
+  other `execution_net` output (move/sprint/kick/tackle heads etc.) is used
+  or optimized here — those get their BC training in Phase 1. Uses
+  `bc_loss_from_tensor(bc_labels, d_heads, exec_heads=None, ...)` for the
+  decision side — the decision-heads-only path (skips exec_move/sprint/
+  kick/tackle_attempt BCE and the move_direction cosine loss; see the
+  `bc_loss_from_tensor()` docstring in `bc.py`) — and a plain
+  `F.mse_loss(e_heads.value.squeeze(-1), ret_batch)` (variance-normalized)
+  for the value side, i.e. `execution_net.value_head` is the single live
+  critic trained here, consistent with the rest of the codebase (Phase 1,
+  `pretrain_value()`, PPO). Per-epoch log line reports `loss=`, `dec_bc=`,
+  and `val=` separately. Config: `demo_value_pretrain_epochs`,
   `demo_value_pretrain_lr`, `demo_value_pretrain_gamma`,
   `phase0_value_coef` (default 1.0). Skipped if the dataset has no reward
   data or `demo_value_pretrain_epochs=0`.
@@ -165,6 +170,56 @@ trivial-row downsampling (which is specifically about reducing redundant
   main PPO rollout log format.
 - BC degradation check, then optional BC repair epochs (unchanged).
 
+### Single value head convention
+
+There are two `value_head` modules in the codebase (`decision_net.value_head`
+and `execution_net.value_head`) for historical/checkpoint-compat reasons, but
+only ONE is ever trained or read: **`execution_net.value_head`**.
+`decision_net.value_head`'s parameters are permanently frozen in
+`PPOTrainer.__init__` (`requires_grad_(False)`) and excluded from every value
+loss and from `_get_value`/`_sample_action`. Previously the two heads were
+fit independently (or averaged) depending on call site while inference used
+`(d_val + e_val) / 2` — a train/inference mismatch that let the heads
+silently diverge. All call sites now use `e_heads.value.squeeze(-1)` /
+`e_heads.value.mean()`: Phase 0 (BC + `execution_net.value_head` MSE — see
+"Pre-training phases" below), Phase 1 joint BC+value, `pretrain_value()`,
+the PPO update (`_ppo_update`), `_sample_action`, `_get_value`, and the
+BC-repair diagnostic.
+
+Per-rollout PPO logging now also prints `[V=mean±std R=mean±std
+adv=mean±std]` (value/return/advantage stats), with a DEBUG-level
+per-minibatch block showing the d_val/e_val split (d_val is static now that
+it's frozen) — useful for spotting value/return miscalibration at a glance.
+
+### Possession gain/loss reward: real turnovers only
+
+`ScenarioEnv.step()` scans every engine tick within a decision interval (not
+just before/after the whole interval) to count possession transitions, via
+the shared `_possession_transition_step()` static method — this catches
+gain+loss pairs that both happen inside one interval (e.g. tackle then
+immediately re-tackled), which a simple before/after bool comparison would
+miss. `reward.py`'s `phase1_reward()` takes `gained_possession_this_step` /
+`lost_possession_this_step` as `bool | int` COUNTS and multiplies the reward
+coefficient by the count rather than gating on truthiness.
+
+Critically, a tick-level "loss" is only counted as a **real turnover** if
+possession actually settles onto a DIFFERENT player — not simply because
+`ball.possessed_by` transiently reads `None` (loose ball in flight, e.g.
+during a push-kick dribble touch) or because the SAME player re-collects it
+themselves. `_possession_transition_step()` implements this as a small state
+machine per tracked player (trainee, and each secondary player):
+- `poss_prev` — do I currently have the ball?
+- `pending_loss` — I just lost it, but no one else has grabbed it YET (ball
+  loose/in-flight); counting is deferred.
+- Only transitions `pending_loss` → a counted loss once a DIFFERENT player
+  (not me, not `None`) is confirmed to hold the ball. If I re-gain it directly
+  out of `pending_loss` with nobody else ever touching it, the pending loss is
+  cancelled silently — no lost-count AND no fresh gained-count (the trainee
+  never really lost it in the adversarial sense).
+State (`_trainee_pending_loss` / `_sec_pending_loss` dicts) persists across
+`step()` calls, not just within one, mirroring `_trainee_had_possession_last_step`
+/ `_sec_had_possession_last_step`.
+
 ### Player event callbacks
 
 `Player` has two optional callbacks set on the instance:
@@ -187,6 +242,20 @@ Sampling strategy:
   These callbacks record an extra (obs, label) sample immediately.
 - Net result: one regular sample per 0.5s + one extra sample per kick/tackle
   event. ~7k steps for 200 phase-1 episodes (~7s to record).
+- Reward wiring: kick/tackle callback samples used to hardcode `reward=0.0`,
+  silently dropping real reward (e.g. `gain_possession_bonus`) that fired on
+  exactly that tick. Fixed via a mutable `_pending_reward` cell:
+  `_record_now(reward=None, ...)` (the callback default) consumes and clears
+  `_pending_reward[0]`; the main loop accrues `_pending_reward[0] +=
+  float(_reward)` after every `env.step()`, so reward is never double-counted
+  or dropped regardless of when a kick/tackle callback fires relative to a
+  timed sample.
+- Periodic logging (every 10 episodes, or at the final episode) now also
+  prints a full reward-component breakdown line (`REWARD_COMP_LABELS` from
+  `ppo_trainer.py`, accumulated from `env.last_reward_components` after every
+  `env.step()` and reset after each log line) — mirrors `train.py`'s
+  pre-training reward diagnostic (`_comp_acc` pattern) so demo-recording
+  reward shaping can be sanity-checked the same way.
 
 ## Critical design rules
 

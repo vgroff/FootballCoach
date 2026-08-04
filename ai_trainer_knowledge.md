@@ -451,15 +451,28 @@ rules-based AI does not have.  Instead, BC is a *separate, additive* loss.
 
 ### Two modes (both configurable, composable)
 
+**Single value head convention**: only `execution_net.value_head` is ever
+trained/read as the critic; `decision_net.value_head` is permanently frozen
+(kept only for checkpoint state_dict compatibility). See
+`src/footballcoach/ai/knowledge.md` "Single value head convention" for the
+full rationale (fixes a previous train/inference mismatch where losses fit
+the two heads independently/averaged but inference used their mean).
+
 **Mode 1 — Combined offline pre-training (recommended):**
 When `--bc-dataset` is provided, `PPOTrainer.pretrain_combined()` runs:
-  0. **Phase 0** — decision-network-only warm-up on demo returns: combined
-     `decision_bc_loss + phase0_value_coef * value_loss` in ONE backward pass,
-     over ALL `decision_net` parameters (encoders + trunk + value_head —
-     **no frozen layers**, unlike Phase 3 below). `execution_net` is NOT
-     trained here. Uses the decision-heads-only `bc_loss_from_tensor(...,
-     exec_heads=None)` path (skips exec_move/sprint/kick/tackle_attempt BCE
-     and the move_direction cosine loss). Skipped if the dataset has no
+  0. **Phase 0** — decision-network warm-up on demo returns: combined
+     `decision_bc_loss + phase0_value_coef * value_loss` in ONE backward pass.
+     Optimizer covers ALL `decision_net` parameters (encoders + trunk;
+     `decision_net.value_head` itself stays frozen — single value head
+     convention) PLUS `execution_net.value_head` ONLY — no other
+     `execution_net` output (move/sprint/kick/tackle heads etc.) is trained
+     here; `execution_net` still runs a forward pass every minibatch (to
+     produce `e_heads.value` from `d_heads`). Uses the decision-heads-only
+     `bc_loss_from_tensor(..., exec_heads=None)` path (skips
+     exec_move/sprint/kick/tackle_attempt BCE and the move_direction cosine
+     loss) for the BC term, and `F.mse_loss(e_heads.value, ret_batch)`
+     (variance-normalized) for the value term. Per-epoch log line reports
+     `loss=`, `dec_bc=`, and `val=` separately. Skipped if the dataset has no
      reward data or `demo_value_pretrain_epochs=0`. Config:
      `demo_value_pretrain_epochs`, `demo_value_pretrain_lr`,
      `demo_value_pretrain_gamma`, `phase0_value_coef` (default 1.0).

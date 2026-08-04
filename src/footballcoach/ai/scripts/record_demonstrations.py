@@ -115,22 +115,43 @@ def record_episodes(
     # Outcome counters
     outcome_counts: dict[str, int] = {}
 
+    # Reward component breakdown accumulator (mirrors train.py's diagnostic
+    # "_comp_acc" pattern), reset after each periodic log line so the
+    # printed line reflects the average since the last log, not the whole run.
+    _comp_acc: dict[str, float] = {}
+    _comp_acc_episodes = 0
+
     if total_episodes is None:
         total_episodes = n_episodes
 
-    _pending_reward: list[float] = [0.0]  # mutable cell for closure
+    # Mutable cell holding the reward accrued since the last time it was
+    # consumed by a sample (timed sample or kick/tackle callback). Cleared to
+    # 0.0 every time it's read so reward is never double-counted across rows,
+    # and never silently dropped when a kick/tackle callback fires between
+    # timed samples (see the main loop below, which accrues into this cell
+    # after each env.step()).
+    _pending_reward: list[float] = [0.0]
 
-    def _record_now(reward: float = 0.0, done: bool = False, player_id: str | None = None):
+    def _record_now(reward: float | None = None, done: bool = False, player_id: str | None = None):
         """Append one (obs, label) sample per player.
 
         player_id=None (used for timed samples) records BOTH the trainee and
         the opponent in one call. A specific player_id (used for on_kick/
         on_tackle callback samples, which fire per-player) records only that
-        player. Kick/tackle callback samples always have reward=0.0 and
-        done=False — the same convention as the trainee-only version had.
+        player.
+
+        reward=None (the default, used by kick/tackle callbacks) consumes and
+        clears whatever reward has accrued since the last sample via
+        ``_pending_reward`` — previously this was hardcoded to 0.0, silently
+        dropping the actual step reward (e.g. gain_possession_bonus) that
+        fired at exactly the kick/tackle tick. Timed samples explicitly pass
+        reward=0.0 and get their real reward backfilled after env.step().
         """
         ids = [env.trainee_player_id, "opponent"] if player_id is None else [player_id]
         nonlocal steps_total, steps_valid
+        if reward is None:
+            reward = _pending_reward[0]
+            _pending_reward[0] = 0.0
         for pid in ids:
             obs = env._get_obs(player_id=pid)
             label = label_fn(env, player_id=pid)
@@ -208,6 +229,15 @@ def record_episodes(
                 rewards[-i] = np.float32(_reward)
                 if done:
                     dones[-i] = np.float32(1.0)
+            # Accrue this step's reward for the NEXT kick/tackle callback (if
+            # any) that fires before the next timed sample — see _record_now.
+            _pending_reward[0] += float(_reward)
+            # Accumulate reward component breakdown for periodic logging (see
+            # train.py's "_comp_acc" diagnostic for the analogous pattern).
+            for _k, _v in env.last_reward_components.items():
+                _comp_acc[_k] = _comp_acc.get(_k, 0.0) + _v
+
+        _comp_acc_episodes += 1
 
         # Track episode outcome
         outcome = getattr(last_info, "trial_outcome", None) or "unknown"
@@ -229,6 +259,20 @@ def record_episodes(
                 f"Ep {global_ep}/{total_episodes} | steps: {steps_total:,} ({steps_valid:,} valid) | "
                 + "  ".join(parts)
             )
+            if _comp_acc_episodes > 0:
+                from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS as _CL
+                _key_order = {k: i for i, (k, _) in enumerate(_CL)}
+                _cl_map = dict(_CL)
+                _comp_sorted = sorted(_comp_acc.items(), key=lambda x: _key_order.get(x[0], 999))
+                _comp_str = "  ".join(
+                    f"{_cl_map.get(k, k)}={v / _comp_acc_episodes:+.2f}"
+                    for k, v in _comp_sorted
+                )
+                log.info(
+                    f"  reward breakdown (per ep, since last log, trainee+opponent): {_comp_str}"
+                )
+            _comp_acc.clear()
+            _comp_acc_episodes = 0
 
     env._ticks_per_decision = orig_ticks  # restore original
 

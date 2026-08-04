@@ -1,55 +1,96 @@
-2026-08-04 04:20:03,644 INFO Checkpoint dir: checkpoints/phase1_run99
-2026-08-04 04:20:03,657 INFO Starting training: phase=phase1_get_possession, total_steps=75,000
-2026-08-04 04:20:03,657 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
-2026-08-04 04:20:04,873 INFO Loading 1125 demonstration file(s) from demonstrations/phase1
-2026-08-04 04:20:07,136 INFO Dataset: 204,702 steps loaded
-2026-08-04 04:20:07,137 INFO Offline BC dataset: 204,702 steps from demonstrations/phase1/
-2026-08-04 04:20:07,137 INFO Reward diagnostic: running 40 rules-vs-rules episodes...
-2026-08-04 04:20:07,578 INFO Reward diagnostic (40 ep, rules vs rules): mean_ep_rew=10.66  per_episode: approach=+0.16  retreat=-0.08  heading=-0.01  get_possession=+2.15  progress=+1.00  lose_possession=-0.17  box_possession=+5.40  speed_bonus=+2.62  opponent_box=-0.40
-2026-08-04 04:20:07,585 INFO BC pos_weight (auto-computed from dataset): kick=185225.00  tackle_attempt=202.77
-2026-08-04 04:20:07,585 INFO Combined BC + value pre-training: 10 epoch(s), batch_size=1024, dataset=204,702 steps, rollout_steps=32768
-2026-08-04 04:20:07,636 INFO Phase 0 — decision-net warm-up (BC + value, combined): 30 epoch(s), gamma=0.995, returns mean=9.93  std=5.33  lr=0.02  phase0_value_coef=0.65
+2026-08-04 06:06:05,169 INFO Checkpoint dir: checkpoints/phase1_run102
+2026-08-04 06:06:05,182 INFO Starting training: phase=phase1_get_possession, total_steps=75,000
+2026-08-04 06:06:05,182 INFO Phase description: 1v1 scenario: learn to get possession and bring the ball toward the opponent box.  Decision network frozen except Move/GetPossession and latent vector.
+2026-08-04 06:06:06,426 INFO Loading 875 demonstration file(s) from demonstrations/phase1
+2026-08-04 06:06:09,203 INFO Dataset: 259,682 steps loaded
+2026-08-04 06:06:09,204 INFO Offline BC dataset: 259,682 steps from demonstrations/phase1/
+2026-08-04 06:06:09,204 INFO Reward diagnostic: running 40 rules-vs-rules episodes...
+2026-08-04 06:06:09,791 INFO Reward diagnostic (40 ep, rules vs rules): mean_ep_rew=7.93  per_episode: approach=+0.17  retreat=-0.09  heading=-0.05  get_possession=+3.45  progress=+0.26  lose_possession=-0.97  box_possession=+4.50  speed_bonus=+1.66  opponent_box=-1.00
+2026-08-04 06:06:09,799 INFO BC pos_weight (auto-computed from dataset): kick=215134.00  tackle_attempt=117.40
+2026-08-04 06:06:09,799 INFO Combined BC + value pre-training: 6 epoch(s), batch_size=912, dataset=259,682 steps, rollout_steps=32768
+2026-08-04 06:06:09,860 INFO Phase 0 — decision-net warm-up (BC-only; value_head frozen, single value head convention): 15 epoch(s), gamma=0.995, returns mean=9.03  std=5.57  lr=0.03
 /home/vincent/Documents/not_work/repos/FootballCoach/src/footballcoach/ai/ppo/bc.py:406: UserWarning: Converting a tensor with requires_grad=True to a scalar may lead to unexpected behavior.
 Consider using tensor.detach() first. (Triggered internally at /__w/pytorch/pytorch/torch/csrc/autograd/generated/python_variable_methods.cpp:822.)
   "decision":       float(dec_loss[valid].mean()),
-2026-08-04 04:20:12,068 INFO   Phase 0 epoch 1/30: loss=1.4507  dec_bc=0.7481  val=1.0809(x0.65)=0.7026  rmse=5.54 (returns std=5.3)
-2026-08-04 04:20:16,331 INFO   Phase 0 epoch 2/30: loss=0.6076  dec_bc=0.0286  val=0.8907(x0.65)=0.5790  rmse=5.03 (returns std=5.3)
-2026-08-04 04:20:20,526 INFO   Phase 0 epoch 3/30: loss=0.5541  dec_bc=0.0217  val=0.8191(x0.65)=0.5324  rmse=4.83 (returns std=5.3)
-2026-08-04 04:20:24,696 INFO   Phase 0 epoch 4/30: loss=0.5255  dec_bc=0.0207  val=0.7767(x0.65)=0.5049  rmse=4.70 (returns std=5.3)
-2026-08-04 04:20:29,055 INFO   Phase 0 epoch 5/30: loss=0.5105  dec_bc=0.0199  val=0.7547(x0.65)=0.4905  rmse=4.63 (returns std=5.3)
-2026-08-04 04:20:33,305 INFO   Phase 0 epoch 6/30: loss=0.4984  dec_bc=0.0210  val=0.7344(x0.65)=0.4774  rmse=4.57 (returns std=5.3)
-2026-08-04 04:20:37,590 INFO   Phase 0 epoch 7/30: loss=0.4853  dec_bc=0.0183  val=0.7185(x0.65)=0.4670  rmse=4.52 (returns std=5.3)
-2026-08-04 04:20:41,933 INFO   Phase 0 epoch 8/30: loss=0.4841  dec_bc=0.0172  val=0.7183(x0.65)=0.4669  rmse=4.52 (returns std=5.3)
-2026-08-04 04:20:46,276 INFO   Phase 0 epoch 9/30: loss=0.4715  dec_bc=0.0174  val=0.6986(x0.65)=0.4541  rmse=4.46 (returns std=5.3)
-2026-08-04 04:20:50,525 INFO   Phase 0 epoch 10/30: loss=0.4678  dec_bc=0.0174  val=0.6929(x0.65)=0.4504  rmse=4.44 (returns std=5.3)
-2026-08-04 04:20:54,669 INFO   Phase 0 epoch 11/30: loss=0.4676  dec_bc=0.0182  val=0.6913(x0.65)=0.4493  rmse=4.43 (returns std=5.3)
-2026-08-04 04:20:59,018 INFO   Phase 0 epoch 12/30: loss=0.4615  dec_bc=0.0171  val=0.6838(x0.65)=0.4445  rmse=4.41 (returns std=5.3)
-2026-08-04 04:21:03,337 INFO   Phase 0 epoch 13/30: loss=0.4601  dec_bc=0.0167  val=0.6822(x0.65)=0.4434  rmse=4.40 (returns std=5.3)
-2026-08-04 04:21:07,710 INFO   Phase 0 epoch 14/30: loss=0.4566  dec_bc=0.0185  val=0.6740(x0.65)=0.4381  rmse=4.38 (returns std=5.3)
-2026-08-04 04:21:12,484 INFO   Phase 0 epoch 15/30: loss=0.4487  dec_bc=0.0173  val=0.6637(x0.65)=0.4314  rmse=4.34 (returns std=5.3)
-2026-08-04 04:21:17,317 INFO   Phase 0 epoch 16/30: loss=0.4495  dec_bc=0.0173  val=0.6649(x0.65)=0.4322  rmse=4.35 (returns std=5.3)
-2026-08-04 04:21:21,840 INFO   Phase 0 epoch 17/30: loss=0.4474  dec_bc=0.0176  val=0.6613(x0.65)=0.4299  rmse=4.34 (returns std=5.3)
-2026-08-04 04:21:26,506 INFO   Phase 0 epoch 18/30: loss=0.4439  dec_bc=0.0177  val=0.6557(x0.65)=0.4262  rmse=4.32 (returns std=5.3)
-2026-08-04 04:21:31,192 INFO   Phase 0 epoch 19/30: loss=0.4395  dec_bc=0.0175  val=0.6493(x0.65)=0.4220  rmse=4.30 (returns std=5.3)
-2026-08-04 04:21:35,777 INFO   Phase 0 epoch 20/30: loss=0.4355  dec_bc=0.0174  val=0.6431(x0.65)=0.4180  rmse=4.28 (returns std=5.3)
-2026-08-04 04:21:40,351 INFO   Phase 0 epoch 21/30: loss=0.4330  dec_bc=0.0171  val=0.6398(x0.65)=0.4159  rmse=4.27 (returns std=5.3)
-2026-08-04 04:21:44,962 INFO   Phase 0 epoch 22/30: loss=0.4356  dec_bc=0.0182  val=0.6421(x0.65)=0.4174  rmse=4.27 (returns std=5.3)
-2026-08-04 04:21:49,441 INFO   Phase 0 epoch 23/30: loss=0.4269  dec_bc=0.0180  val=0.6290(x0.65)=0.4088  rmse=4.23 (returns std=5.3)
-2026-08-04 04:21:54,052 INFO   Phase 0 epoch 24/30: loss=0.4276  dec_bc=0.0180  val=0.6303(x0.65)=0.4097  rmse=4.23 (returns std=5.3)
-2026-08-04 04:21:58,345 INFO   Phase 0 epoch 25/30: loss=0.4211  dec_bc=0.0177  val=0.6206(x0.65)=0.4034  rmse=4.20 (returns std=5.3)
-2026-08-04 04:22:02,517 INFO   Phase 0 epoch 26/30: loss=0.4226  dec_bc=0.0187  val=0.6213(x0.65)=0.4039  rmse=4.20 (returns std=5.3)
-2026-08-04 04:22:06,721 INFO   Phase 0 epoch 27/30: loss=0.4193  dec_bc=0.0178  val=0.6177(x0.65)=0.4015  rmse=4.19 (returns std=5.3)
-2026-08-04 04:22:10,920 INFO   Phase 0 epoch 28/30: loss=0.4197  dec_bc=0.0184  val=0.6175(x0.65)=0.4014  rmse=4.19 (returns std=5.3)
-2026-08-04 04:22:15,267 INFO   Phase 0 epoch 29/30: loss=0.4143  dec_bc=0.0173  val=0.6108(x0.65)=0.3970  rmse=4.17 (returns std=5.3)
-2026-08-04 04:22:20,047 INFO   Phase 0 epoch 30/30: loss=0.4131  dec_bc=0.0180  val=0.6080(x0.65)=0.3952  rmse=4.16 (returns std=5.3)
-2026-08-04 04:22:20,048 INFO Phase 0 done (decision-net warm-up, 30 epoch(s))
-2026-08-04 04:22:20,099 INFO Phase 1 BC epochs will include joint value loss (coef=0.65, gamma=0.995, returns std=5.33)
-2026-08-04 04:22:20,122 INFO   Downsample trivial rows (epoch 1): 59,869/185,225 (32.3%) rows classified trivial, excluding ~41,908 this epoch (frac=0.70)
-2026-08-04 04:23:37,659 INFO   BC epoch 1/10: bc_loss=1.2809  val_loss=0.8847(x0.65)=0.5750  rmse=5.02 (returns std=5.3)  dir_cos=0.784  mv_p=0.994  spr_p=0.853  [decision=0.000  exec_bce=0.822  sprint=0.215  move=0.008  tackle_attempt=0.592  direction=0.432  region=0.027]  (77.6s)
-2026-08-04 04:23:37,661 INFO   Downsample trivial rows (epoch 2): 59,869/185,225 (32.3%) rows classified trivial, excluding ~41,908 this epoch (frac=0.70)
-2026-08-04 04:24:52,278 INFO   BC epoch 2/10: bc_loss=0.3806  val_loss=0.7340(x0.65)=0.4771  rmse=4.57 (returns std=5.3)  dir_cos=0.970  mv_p=1.000  spr_p=0.856  [decision=0.000  exec_bce=0.303  sprint=0.066  move=0.000  tackle_attempt=0.237  direction=0.061  region=0.017]  (74.6s)
-2026-08-04 04:24:52,281 INFO   Downsample trivial rows (epoch 3): 59,869/185,225 (32.3%) rows classified trivial, excluding ~41,908 this epoch (frac=0.70)
-2026-08-04 04:26:08,603 INFO   BC epoch 3/10: bc_loss=0.2381  val_loss=0.7094(x0.65)=0.4611  rmse=4.49 (returns std=5.3)  dir_cos=0.981  mv_p=1.000  spr_p=0.856  [decision=0.000  exec_bce=0.184  sprint=0.043  move=0.000  tackle_attempt=0.141  direction=0.039  region=0.016]  (76.3s)
-2026-08-04 04:26:08,605 INFO   Downsample trivial rows (epoch 4): 59,869/185,225 (32.3%) rows classified trivial, excluding ~41,908 this epoch (frac=0.70)
-2026-08-04 04:27:28,541 INFO   BC epoch 4/10: bc_loss=0.2455  val_loss=0.7026(x0.65)=0.4567  rmse=4.47 (returns std=5.3)  dir_cos=0.984  mv_p=1.000  spr_p=0.854  [decision=0.000  exec_bce=0.200  sprint=0.049  move=0.000  tackle_attempt=0.150  direction=0.032  region=0.014]  (79.9s)
-2026-08-04 04:27:28,543 INFO   Downsample trivial rows (epoch 5): 59,869/185,225 (32.3%) rows classified trivial, excluding ~41,908 this epoch (frac=0.70)
+2026-08-04 06:06:15,436 INFO   Phase 0 epoch 1/15: loss=0.4548  dec_bc=0.4548
+2026-08-04 06:06:20,997 INFO   Phase 0 epoch 2/15: loss=0.0096  dec_bc=0.0096
+2026-08-04 06:06:26,818 INFO   Phase 0 epoch 3/15: loss=0.0081  dec_bc=0.0081
+2026-08-04 06:06:32,197 INFO   Phase 0 epoch 4/15: loss=0.0078  dec_bc=0.0078
+2026-08-04 06:07:59,358 INFO   Phase 0 epoch 5/15: loss=0.0147  dec_bc=0.0147
+2026-08-04 06:08:10,901 INFO   Phase 0 epoch 6/15: loss=0.0245  dec_bc=0.0245
+2026-08-04 06:08:16,707 INFO   Phase 0 epoch 7/15: loss=0.0075  dec_bc=0.0075
+2026-08-04 06:08:22,378 INFO   Phase 0 epoch 8/15: loss=0.0075  dec_bc=0.0075
+2026-08-04 06:08:27,799 INFO   Phase 0 epoch 9/15: loss=0.0072  dec_bc=0.0072
+2026-08-04 06:08:33,839 INFO   Phase 0 epoch 10/15: loss=0.0073  dec_bc=0.0073
+2026-08-04 06:08:38,785 INFO   Phase 0 epoch 11/15: loss=0.0072  dec_bc=0.0072
+2026-08-04 06:08:44,469 INFO   Phase 0 epoch 12/15: loss=0.0075  dec_bc=0.0075
+2026-08-04 06:08:50,139 INFO   Phase 0 epoch 13/15: loss=0.0070  dec_bc=0.0070
+2026-08-04 06:08:55,393 INFO   Phase 0 epoch 14/15: loss=0.0071  dec_bc=0.0071
+2026-08-04 06:09:00,617 INFO   Phase 0 epoch 15/15: loss=0.0072  dec_bc=0.0072
+2026-08-04 06:09:00,617 INFO Phase 0 done (decision-net warm-up, 15 epoch(s))
+2026-08-04 06:09:00,678 INFO Phase 1 BC epochs will include joint value loss (coef=0.65, gamma=0.995, returns std=5.57)
+2026-08-04 06:09:00,705 INFO   Downsample trivial rows (epoch 1): 76,375/215,134 (35.5%) rows classified trivial, excluding ~57,281 this epoch (frac=0.75)
+2026-08-04 06:10:26,934 INFO   BC epoch 1/6: bc_loss=1.1904  val_loss=1.2253(x0.65)=0.7964  rmse=6.17 (returns std=5.6)  dir_cos=0.809  mv_p=0.995  spr_p=0.862  [decision=0.001  exec_bce=0.789  sprint=0.242  move=0.007  tackle_attempt=0.535  direction=0.383  region=0.018]  (86.3s)
+2026-08-04 06:10:26,937 INFO   Downsample trivial rows (epoch 2): 76,375/215,134 (35.5%) rows classified trivial, excluding ~57,281 this epoch (frac=0.75)
+2026-08-04 06:11:58,560 INFO   BC epoch 2/6: bc_loss=0.3738  val_loss=1.0671(x0.65)=0.6936  rmse=5.76 (returns std=5.6)  dir_cos=0.978  mv_p=1.000  spr_p=0.869  [decision=0.000  exec_bce=0.319  sprint=0.089  move=0.000  tackle_attempt=0.230  direction=0.044  region=0.011]  (91.6s)
+2026-08-04 06:11:58,562 INFO   Downsample trivial rows (epoch 3): 76,375/215,134 (35.5%) rows classified trivial, excluding ~57,281 this epoch (frac=0.75)
+2026-08-04 06:13:28,223 INFO   BC epoch 3/6: bc_loss=0.2620  val_loss=1.0296(x0.65)=0.6692  rmse=5.65 (returns std=5.6)  dir_cos=0.988  mv_p=1.000  spr_p=0.868  [decision=0.000  exec_bce=0.228  sprint=0.062  move=0.000  tackle_attempt=0.166  direction=0.024  region=0.010]  (89.7s)
+2026-08-04 06:13:28,225 INFO   Downsample trivial rows (epoch 4): 76,375/215,134 (35.5%) rows classified trivial, excluding ~57,281 this epoch (frac=0.75)
+2026-08-04 06:16:07,802 INFO   BC epoch 4/6: bc_loss=0.2462  val_loss=0.9925(x0.65)=0.6451  rmse=5.55 (returns std=5.6)  dir_cos=0.989  mv_p=1.000  spr_p=0.868  [decision=0.000  exec_bce=0.215  sprint=0.056  move=0.000  tackle_attempt=0.160  direction=0.022  region=0.009]  (159.6s)
+2026-08-04 06:16:07,804 INFO   Downsample trivial rows (epoch 5): 76,375/215,134 (35.5%) rows classified trivial, excluding ~57,281 this epoch (frac=0.75)
+2026-08-04 06:17:41,238 INFO   BC epoch 5/6: bc_loss=0.2295  val_loss=0.9627(x0.65)=0.6258  rmse=5.47 (returns std=5.6)  dir_cos=0.990  mv_p=1.000  spr_p=0.868  [decision=0.000  exec_bce=0.200  sprint=0.049  move=0.000  tackle_attempt=0.151  direction=0.021  region=0.009]  (93.4s)
+2026-08-04 06:17:41,240 INFO   Downsample trivial rows (epoch 6): 76,375/215,134 (35.5%) rows classified trivial, excluding ~57,281 this epoch (frac=0.75)
+2026-08-04 06:19:03,852 INFO   BC epoch 6/6: bc_loss=0.2244  val_loss=0.9318(x0.65)=0.6056  rmse=5.38 (returns std=5.6)  dir_cos=0.990  mv_p=1.000  spr_p=0.869  [decision=0.000  exec_bce=0.193  sprint=0.050  move=0.000  tackle_attempt=0.143  direction=0.021  region=0.010]  (82.6s)
+2026-08-04 06:19:03,852 INFO BC pre-training done (6 epoch(s), final bc_loss=0.2244)
+2026-08-04 06:19:03,852 INFO Value pre-training: 32768 steps, 20 epochs, lr=0.003
+2026-08-04 06:21:07,694 INFO   [value pretrain rollout] mean_return=9.28 (669 episode(s))  vs_rules(0): nan%  vs_immobile(669): 84%  vs_neural(0): nan%
+2026-08-04 06:21:09,104 INFO   Value pretrain split: 569 train eps (27922 steps)  |  100 val eps (4846 steps)
+2026-08-04 06:21:12,930 INFO   Value epoch 1/20: train=0.8351 rmse=1.81  val=0.8863 val_rmse=1.86 (std=2.0)
+2026-08-04 06:21:16,569 INFO   Value epoch 2/20: train=0.7289 rmse=1.69  val=0.8823 val_rmse=1.86 (std=2.0)
+2026-08-04 06:21:20,285 INFO   Value epoch 3/20: train=0.7171 rmse=1.68  val=0.8708 val_rmse=1.85 (std=2.0)
+2026-08-04 06:21:24,097 INFO   Value epoch 4/20: train=0.7117 rmse=1.67  val=0.8792 val_rmse=1.86 (std=2.0)
+2026-08-04 06:21:28,017 INFO   Value epoch 5/20: train=0.7088 rmse=1.67  val=0.8672 val_rmse=1.84 (std=2.0)
+2026-08-04 06:21:31,878 INFO   Value epoch 6/20: train=0.7070 rmse=1.67  val=0.8790 val_rmse=1.86 (std=2.0)
+2026-08-04 06:21:35,841 INFO   Value epoch 7/20: train=0.7058 rmse=1.66  val=0.8867 val_rmse=1.87 (std=2.0)
+2026-08-04 06:21:39,751 INFO   Value epoch 8/20: train=0.7040 rmse=1.66  val=0.8949 val_rmse=1.87 (std=2.0)
+2026-08-04 06:21:43,503 INFO   Value epoch 9/20: train=0.7030 rmse=1.66  val=0.9073 val_rmse=1.89 (std=2.0)
+2026-08-04 06:21:47,254 INFO   Value epoch 10/20: train=0.7026 rmse=1.66  val=0.9172 val_rmse=1.90 (std=2.0)
+2026-08-04 06:21:47,255 INFO   [value pretrain] early stop at epoch 10 (val stagnant for 5 epochs, best=0.8672)
+2026-08-04 06:21:47,255 INFO Value pre-training done (10 epoch(s), final train_loss=0.7026)
+2026-08-04 06:21:51,091 INFO BC check after value warm-up: bc_loss=0.2636 (before=0.2244, delta=+0.0392)  OK
+2026-08-04 06:21:51,091 INFO Combined pre-training complete.
+2026-08-04 06:21:51,165 INFO Pre-trained checkpoint saved: checkpoints/phase1_run102/checkpoint_pretrained.pt
+2026-08-04 06:21:52,338 INFO   [neural] trial 10/40: outcome=opponent_box_possession, reward=-4.05
+2026-08-04 06:21:53,179 INFO   [neural] trial 20/40: outcome=opponent_box_possession, reward=-4.17
+2026-08-04 06:21:54,371 INFO   [neural] trial 30/40: outcome=opponent_box_possession, reward=-3.89
+2026-08-04 06:21:55,082 INFO   [neural] trial 40/40: outcome=opponent_box_possession, reward=-4.15
+2026-08-04 06:21:55,082 INFO Pre-PPO eval (rules opp): win=7.5%  mean_rew=-2.561  mean_val=7.628  outcomes={'box_possession': 3, 'opponent_box_possession': 35, 'miss': 2}
+2026-08-04 06:21:55,082 INFO   rew breakdown (rules, per ep): lterm=-3.50  box=+0.45  spd=+0.26  poss=+0.25  appr=+0.24  hdg=-0.20  prog=+0.13  retr=-0.13  lpos=-0.05  stam=-0.01
+2026-08-04 06:21:56,480 INFO   [neural] trial 10/40: outcome=box_possession, reward=7.54
+2026-08-04 06:21:57,918 INFO   [neural] trial 20/40: outcome=miss, reward=1.21
+2026-08-04 06:21:59,878 INFO   [neural] trial 30/40: outcome=box_possession, reward=9.81
+2026-08-04 06:22:01,053 INFO   [neural] trial 40/40: outcome=box_possession, reward=10.24
+2026-08-04 06:22:01,054 INFO Pre-PPO eval (immobile opp): win=82.5%  mean_rew=9.030  mean_val=7.190  outcomes={'box_possession': 33, 'miss': 7}
+2026-08-04 06:22:01,054 INFO   rew breakdown (immobile, per ep): box=+4.95  poss=+2.00  spd=+1.80  prog=+0.74  hdg=-0.39  appr=+0.23  out=-0.17  retr=-0.12
+2026-08-04 06:22:03,849 INFO   [neural] trial 10/40: outcome=box_possession, reward=10.67
+2026-08-04 06:22:06,906 INFO   [neural] trial 20/40: outcome=box_possession, reward=12.87
+2026-08-04 06:22:10,093 INFO   [neural] trial 30/40: outcome=box_possession, reward=9.35
+2026-08-04 06:22:15,218 INFO   [neural] trial 40/40: outcome=box_possession, reward=7.69
+2026-08-04 06:22:15,219 INFO Pre-PPO eval (self-play):   win=60.0%  mean_rew=5.792  mean_val=6.824  outcomes={'box_possession': 24, 'opponent_box_possession': 7, 'miss': 9}
+2026-08-04 06:22:15,219 INFO   rew breakdown (self-play, per ep): box=+4.65  lterm=-3.10  poss=+2.25  spd=+1.85  appr=+0.95  prog=+0.87  hdg=-0.62  retr=-0.46  out=-0.25  lpos=-0.12  stam=-0.01  ill=-0.01
+2026-08-04 06:22:15,410 INFO   [baseline] trial 10/12: outcome=opponent_box_possession
+2026-08-04 06:22:15,427 INFO Baseline (rules vs rules, 12 trials): trainee_win=83.3%  outcomes={'box_possession': 10, 'opponent_box_possession': 2}
+2026-08-04 06:22:15,427 INFO Frozen decision_net.shoot_logit
+2026-08-04 06:22:15,427 INFO Frozen decision_net.pass_logit
+2026-08-04 06:22:15,427 INFO Frozen decision_net.tackle_logit
+2026-08-04 06:22:15,427 INFO Frozen decision_net.get_possession_raw
+2026-08-04 06:22:15,427 INFO Frozen decision_net.mark_logit
+2026-08-04 06:22:15,427 INFO Frozen decision_net.hold_position_logit
+2026-08-04 06:22:15,427 INFO Frozen decision_net.pass_target_logits
+2026-08-04 06:22:15,427 INFO Frozen decision_net.tackle_target_logits
+2026-08-04 06:22:15,427 INFO Frozen decision_net.mark_target_logits
+2026-08-04 06:22:15,428 INFO PPO training started: steps_so_far=0  target=75,000  (+75,000 this run)
+2026-08-04 06:22:46,930 INFO   [early stop e0 mb0]  KL=0.05737 > target=0.03  steps_this_update=1
+2026-08-04 06:22:46,965 INFO step=8,096 | rew=10.47 | pol=0.0352 val=0.9452(x0.5)=0.4726 ent=1.5829 kl=0.0574  bc=2.2367(x0.86)[tk=0.000] | 261sps  mv_ls=[0.1000,0.1000] g=2.38e-02  [V=6.86±1.25 R=7.15±2.00 adv=0.30±1.87]  act: mv= 28 gp= 72 emv=100 spr= 55 kck=  0 tk=  0 sh=  0 hld=  0 ta_p=0.00 kk_p=0.00  vs_immobile(184): 83%  rew: approach=+56.87  retreat=-29.32  heading=-90.77  get_possession=+372.00  progress=+146.09  lose_possession=-2.00  ball_out=-31.00  box_possession=+912.00  speed_bonus=+335.39  stamina_penalty=-1.37
+2026-08-04 06:22:47,165 INFO Saved checkpoint: checkpoints/phase1_run102/checkpoint1.pt
+2026-08-04 06:22:48,044 INFO   [eval vs rules] step=8,096  win=1/10 (10%)  outcomes={'opponent_box_possession': 8, 'box_possession': 1, 'miss': 1}

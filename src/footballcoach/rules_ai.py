@@ -56,6 +56,7 @@ class Phase1RulesAI(PlayerAI):
                 player.current_order = MoveOrder(
                     target_position=Vector3(target_x, target_y, 0.0),
                     sprint=True,
+                    push_kick_enabled=True,
                 )
                 match._log_debug(f"[AI] {player.player_id}: MoveOrder (box run)")
         else:

@@ -60,6 +60,7 @@ class MovementParams:
     goalkeeper_speed_multiplier: float
     standstill_decel_multiplier: float  # accel boost when decelerating to STANDSTILL
     turn_speed_penalty_max: float  # max fractional speed-cap reduction mid-turn (0.7 = up to 70%)
+    control_speed_multiplier: float  # fraction of speed kept on first-touch contact (0.6 = 40% reduction)
 
     @staticmethod
     def from_config() -> "MovementParams":
@@ -86,6 +87,7 @@ class MovementParams:
             goalkeeper_speed_multiplier=d["goalkeeper_speed_multiplier"],
             standstill_decel_multiplier=d.get("standstill_decel_multiplier", 1.5),
             turn_speed_penalty_max=d.get("turn_speed_penalty_max", 0.7),
+            control_speed_multiplier=d.get("control_speed_multiplier", 0.6),
         )
 
 

@@ -198,6 +198,11 @@ def _gk_should_sprint(
     return t_ball < t_gk * 2.0  # sprint if GK would otherwise be beaten
 
 
+def _push_kick_params() -> dict:
+    """Return the push_kick section from orders.json (cached by load_orders_config)."""
+    return require_section(load_orders_config(), "push_kick", "orders.json")
+
+
 @dataclass
 class MoveOrder:
     target_position: Vector3
@@ -220,6 +225,15 @@ class MoveOrder:
     _overshoot_timer_s: float | None = None
     status: OrderStatus = OrderStatus.PENDING
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+    # Push-kick: if True and the player has the ball, kick it ahead and sprint
+    # to it rather than dribbling. Only activates when the remaining distance
+    # to target is >= push_kick_min_dist_m (don't kick near the destination).
+    # A clearance check prevents kicking if any opponent would reach the
+    # ball before the carrier (within the clearance_margin ETA window).
+    # Defaults loaded from orders.json["push_kick"] at first use.
+    push_kick_enabled: bool = False
+    push_kick_dist_m: float | None = None       # None → from config
+    push_kick_min_dist_m: float | None = None   # None → from config
 
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
         """Execute one tick of movement toward target_position.  Returns True when arrived."""
@@ -229,6 +243,36 @@ class MoveOrder:
         has_ball = match.ball.possessed_by == player.player_id
         direction = self.target_position - player.position
         dist = direction.length_xy()
+
+        # Push-kick: when the player has the ball and is far enough from the
+        # destination, kick ahead and sprint free rather than dribbling.
+        if has_ball and self.push_kick_enabled and direction.length_xy() > 1e-6:
+            import math as _math
+            from footballcoach.engine.movement import angle_diff as _angle_diff
+            pk = _push_kick_params()
+            pk_dist = self.push_kick_dist_m if self.push_kick_dist_m is not None else pk["dist_m"]
+            pk_min = self.push_kick_min_dist_m if self.push_kick_min_dist_m is not None else pk["min_dist_m"]
+            if dist >= pk_min:
+                push_dir = direction.xy().normalized()
+                kick_heading = push_dir.angle_xy()
+                max_heading_err = _math.radians(pk["max_heading_error_deg"])
+                heading_ok = abs(_angle_diff(player.heading_rad, kick_heading)) <= max_heading_err
+                if heading_ok:
+                    kick_dist = min(pk_dist, dist - self.arrival_tolerance_m)
+                    push_target = player.position + Vector3(
+                        push_dir.x * kick_dist, push_dir.y * kick_dist, 0.0
+                    )
+                    if self._push_kick_is_clear(player, match, push_target, kick_dist, pk["clearance_margin"]):
+                        self._do_push_kick(player, match, push_target, pk["speed_factor"])
+                        # Immediately set movement intent: sprint free (no ball this tick).
+                        adj_dir, speed_mode = _compute_movement_intent(
+                            player, direction, match,
+                            sprint=True, arrival_dist=dist, arrival_speed=None,
+                            use_repulsion=True, use_brake_to_turn=True,
+                        )
+                        player.desired_direction = adj_dir
+                        player.desired_speed_mode = speed_mode
+                        return False
 
         if dist <= self.arrival_tolerance_m:
             self.reached_target = True
@@ -271,6 +315,76 @@ class MoveOrder:
             player.desired_direction = adj_dir
             player.desired_speed_mode = speed_mode
         return False
+
+    def _push_kick_is_clear(
+        self,
+        player: "Player",
+        match: "Match",
+        push_target: "Vector3",
+        kick_dist_m: float,
+        clearance_margin: float,
+    ) -> bool:
+        """Return True if no opponent would beat the carrier to push_target."""
+        from footballcoach.engine.movement import effective_top_speed
+        from footballcoach.entities.player import PlayerState
+
+        self_sprint = max(
+            effective_top_speed(
+                match.movement_params, player.attributes.top_speed,
+                player.stamina, has_ball=False,
+            ),
+            0.1,
+        )
+        self_eta = kick_dist_m / self_sprint
+
+        for other in match.players:
+            if other.player_id == player.player_id:
+                continue
+            if other.team == player.team:
+                continue  # only opponents can steal the ball
+            if other.state == PlayerState.INACTIVE_TACKLED:
+                continue
+            dist_other = (push_target - other.position).length_xy()
+            if dist_other > kick_dist_m + 10.0:  # rough radius pre-filter
+                continue
+            their_sprint = max(
+                effective_top_speed(
+                    match.movement_params, other.attributes.top_speed,
+                    other.stamina, has_ball=False,
+                ),
+                0.1,
+            )
+            if dist_other / their_sprint < self_eta * clearance_margin:
+                return False  # opponent beats us there — don't kick
+        return True
+
+    def _do_push_kick(
+        self, player: "Player", match: "Match", push_target: "Vector3", speed_factor: float
+    ) -> None:
+        """Kick the ball toward push_target at speed_factor × the player's free-sprint speed.
+
+        Kicking faster than the player's own sprint speed ensures the ball
+        stays ahead of the runner (a slower kick is overtaken immediately,
+        which defeats the purpose of the push-kick).
+        `compensate_for_run=True` is used so the ball leaves at the intended
+        speed regardless of the kicker's current running direction.
+        """
+        from footballcoach.engine.kicking import max_kick_speed_mps
+        from footballcoach.engine.movement import effective_top_speed
+
+        sprint_speed = effective_top_speed(
+            match.movement_params, player.attributes.top_speed, player.stamina,
+            has_ball=False,
+        )
+        max_kick = max_kick_speed_mps(match.kicking_params, player.attributes.kick_power)
+        power_fraction = min(1.0, sprint_speed * speed_factor / max(max_kick, 0.1))
+
+        # kick_direct handles release-grace internally.
+        player.kick_direct(match, push_target, power_fraction, Vector3.zero(), compensate_for_run=True)
+        match._log_debug(
+            f"{player.player_id} push-kick to ({push_target.x:.1f},{push_target.y:.1f})"
+            f" power={power_fraction:.2f} speed_factor={speed_factor:.2f}"
+        )
 
 
 @dataclass

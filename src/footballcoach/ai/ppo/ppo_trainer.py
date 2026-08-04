@@ -178,6 +178,17 @@ class PPOTrainer:
         self._total_steps = 0
         self._checkpoint_count = 0  # sequential counter for checkpoint{N}.pt naming
 
+        # --- Single value head convention ---
+        # Commit to execution_net.value_head as the ONLY trained critic.
+        # decision_net.value_head is kept (checkpoint/state_dict compat, and in
+        # case two-critic training is revisited later) but is permanently
+        # frozen and excluded from every value loss. This avoids the
+        # averaging-vs-independent-fit inconsistency that existed when both
+        # heads were trained (Phase 0/1 fit them independently, pretrain_value()/
+        # PPO only fit their average, letting the two heads silently diverge).
+        for p in self.decision_net.value_head.parameters():
+            p.requires_grad_(False)
+
     # -----------------------------------------------------------------------
     # Curriculum helpers
     # -----------------------------------------------------------------------
@@ -435,6 +446,11 @@ class PPOTrainer:
                 ]
                 comp_str = ("  rew: " + "  ".join(comp_parts)) if comp_parts else ""
                 rollout_components.clear()
+                _val_diag_str = (
+                    f"  [V={metrics['values_mean']:.2f}±{metrics['values_std']:.2f} "
+                    f"R={metrics['returns_mean']:.2f}±{metrics['returns_std']:.2f} "
+                    f"adv={metrics['adv_mean']:.2f}±{metrics['adv_std']:.2f}]"
+                )
                 log.info(
                     f"step={self._total_steps:,} | "
                     f"rew={mean_ep_reward:.2f}{opp_rew_str} | "
@@ -445,6 +461,7 @@ class PPOTrainer:
                     f"{bc_str} | "
                     f"{steps_per_sec:.0f}sps"
                     f"{mv_ls_str}"
+                    f"{_val_diag_str}"
                     f"{act_str}"
                     f"{outcome_str}"
                     f"{comp_str}"
@@ -581,34 +598,39 @@ class PPOTrainer:
         # (identical param set) — see the pretrain_value() call further below.
 
         # --- Phase 0: decision-network-only warm-up on demo data (before any BC epochs) ---
-        # Combined decision-heads-only BC loss + value MSE loss, ONE backward pass,
-        # over ALL decision_net parameters (encoders + trunk + value_head) — no
-        # frozen layers here (unlike pretrain_value()'s standalone freezing; these
-        # are two different call sites with two different freezing decisions, see
-        # ai/knowledge.md "Phase 0" note). execution_net is NOT trained in this
-        # phase; it gets its BC training in Phase 1 below. Uses stored
-        # rewards/dones so no env interaction is needed. Skipped if the dataset
-        # has no reward data or demo_value_pretrain_epochs=0.
+        # Combined decision-heads-only BC loss + value MSE loss, ONE backward pass.
+        # Optimizer covers ALL decision_net parameters (encoders + trunk;
+        # decision_net.value_head itself stays frozen — single value head
+        # convention, see __init__) PLUS execution_net.value_head ONLY (the
+        # one live critic — see ai/knowledge.md "Phase 0" note). The rest of
+        # execution_net (encoders/trunk/action heads) is NOT trained here; it
+        # gets its BC training in Phase 1 below. execution_net still needs a
+        # forward pass every minibatch (to produce e_heads.value from d_heads),
+        # but only its value_head receives gradients from this loss. Uses
+        # stored rewards/dones so no env interaction is needed. Skipped if the
+        # dataset has no reward data or demo_value_pretrain_epochs=0.
         _demo_epochs = self._demo_value_pretrain_epochs
         if _demo_epochs > 0 and dataset.has_rewards:
             demo_opt = torch.optim.Adam(
-                list(self.decision_net.parameters()),
+                list(self.decision_net.parameters())
+                + list(self.execution_net.value_head.parameters()),
                 lr=self._demo_value_pretrain_lr, eps=1e-5,
             )
             demo_returns = dataset.compute_returns(gamma=self._demo_value_pretrain_gamma)
             ret_t_all = torch.from_numpy(demo_returns).to(self.device)
             ret_std = ret_t_all.std().clamp(min=1.0)
             log.info(
-                f"Phase 0 — decision-net warm-up (BC + value, combined): {_demo_epochs} epoch(s), "
+                f"Phase 0 — decision-net warm-up (BC + execution_net.value_head "
+                f"MSE; single value head convention): {_demo_epochs} epoch(s), "
                 f"gamma={self._demo_value_pretrain_gamma}, "
                 f"returns mean={ret_t_all.mean():.2f}  std={ret_std:.2f}  "
-                f"lr={self._demo_value_pretrain_lr}  phase0_value_coef={self._phase0_value_coef}"
+                f"lr={self._demo_value_pretrain_lr}  "
+                f"phase0_value_coef={self._phase0_value_coef}"
             )
             for epoch in range(_demo_epochs):
                 epoch_losses: list[float] = []
                 epoch_bc_losses: list[float] = []
                 epoch_val_losses: list[float] = []
-                raw_mse_losses: list[float] = []
                 for obs_dict, bc_labels, ret_batch in dataset.iterate_minibatches(
                     batch_size=batch_size, shuffle=True, device=self.device,
                     valid_only=True, returns=demo_returns,
@@ -619,16 +641,9 @@ class PPOTrainer:
                         obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
                         _sat, _oat,
                     )
-                    v_dec = d_heads.value.squeeze(-1)
-                    # NOTE: Phase 0 fits decision_net.value ALONE (execution_net
-                    # is not run here), unlike Phase 2/3 (pretrain_value) which
-                    # average decision_net.value and execution_net.value. This
-                    # is an intentional, documented inconsistency — Phase 0 is
-                    # scoped as a decision-network-only high-level warm-up.
-                    # Value loss uses raw targets + variance normalisation,
-                    # matching the value pretrain rollout and PPO loss convention
-                    # so the network output scale is consistent throughout.
-                    val_loss = F.mse_loss(v_dec, ret_batch) / (ret_std ** 2)
+                    # decision_net.value_head is frozen (single value head
+                    # convention — see __init__); Phase 0's decision-net BC
+                    # loss is heads-only (no value term from decision_net).
                     dec_bc_loss, _ = bc_loss_from_tensor(
                         bc_labels, d_heads, exec_heads=None,
                         direction_loss_weight=self._bc_dir_loss_w,
@@ -636,29 +651,37 @@ class PPOTrainer:
                         dec_weight=self._bc_dec_weight,
                         return_breakdown=True,
                     )
+                    # execution_net.value_head IS trained here (the single
+                    # live critic) against the same demo returns. Only
+                    # value_head's params are in demo_opt/grad-clip below — no
+                    # other execution_net output (move/kick/tackle/etc heads)
+                    # is used or optimized in this phase.
+                    e_heads = self.execution_net(
+                        obs_dict["self_feat"], obs_dict["other_feat"],
+                        obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
+                        d_heads, _sat, _oat,
+                    )
+                    val_loss = F.mse_loss(e_heads.value.squeeze(-1), ret_batch) / (ret_std ** 2)
                     combined = dec_bc_loss + self._phase0_value_coef * val_loss
-                    raw_mse = F.mse_loss(v_dec, ret_batch)
                     demo_opt.zero_grad()
                     combined.backward()
                     nn.utils.clip_grad_norm_(
-                        list(self.decision_net.parameters()),
+                        list(self.decision_net.parameters())
+                        + list(self.execution_net.value_head.parameters()),
                         self.max_grad_norm,
                     )
                     demo_opt.step()
                     epoch_losses.append(combined.item())
                     epoch_bc_losses.append(dec_bc_loss.item())
                     epoch_val_losses.append(val_loss.item())
-                    raw_mse_losses.append(raw_mse.item())
                 log.info(
                     f"  Phase 0 epoch {epoch + 1}/{_demo_epochs}: "
                     f"loss={np.mean(epoch_losses):.4f}  "
                     f"dec_bc={np.mean(epoch_bc_losses):.4f}  "
-                    f"val={np.mean(epoch_val_losses):.4f}"
-                    f"(x{self._phase0_value_coef})={np.mean(epoch_val_losses)*self._phase0_value_coef:.4f}  "
-                    f"rmse={np.sqrt(np.mean(raw_mse_losses)):.2f} "
-                    f"(returns std={ret_std:.1f})"
+                    f"val={np.mean(epoch_val_losses):.4f}(x{self._phase0_value_coef})="
+                    f"{self._phase0_value_coef * np.mean(epoch_val_losses):.4f}"
                 )
-            log.info(f"Phase 0 done (decision-net warm-up, {_demo_epochs} epoch(s))")
+            log.info(f"Phase 0 done (decision-net + execution value_head warm-up, {_demo_epochs} epoch(s))")
         elif _demo_epochs > 0 and not dataset.has_rewards:
             log.info(
                 "Phase 0 skipped — dataset has no reward data "
@@ -760,22 +783,15 @@ class PPOTrainer:
                 )
                 total_loss = bc_loss
                 if ret_batch is not None:
-                    v_dec = d_heads.value.squeeze(-1)
+                    # Single value head: execution_net only (decision_net.value
+                    # is frozen — see __init__ note).
                     v_exc = e_heads.value.squeeze(-1)
-                    # Raw targets + variance normalisation — consistent with
-                    # value pretrain rollout and PPO. Network outputs raw returns.
-                    val_loss = 0.5 * (
-                        F.mse_loss(v_dec, ret_batch)
-                        + F.mse_loss(v_exc, ret_batch)
-                    ) / (_joint_ret_std ** 2)
+                    val_loss = F.mse_loss(v_exc, ret_batch) / (_joint_ret_std ** 2)
                     total_loss = bc_loss + self._bc_value_coef * val_loss
                     val_losses.append(val_loss.item())
                     # raw MSE for RMSE reporting (values already in raw space)
                     with torch.no_grad():
-                        raw_mse = 0.5 * (
-                            F.mse_loss(v_dec, ret_batch)
-                            + F.mse_loss(v_exc, ret_batch)
-                        )
+                        raw_mse = F.mse_loss(v_exc, ret_batch)
                         val_raw_mse_losses.append(raw_mse.item())
                 bc_opt.zero_grad()
                 total_loss.backward()
@@ -984,7 +1000,7 @@ class PPOTrainer:
                             mb_obs_r["exists_mask"], mb_obs_r["ball_feat"], mb_obs_r["global_feat"],
                             d_vr, _sat_r, _oat_r,
                         )
-                        pred_vr = ((d_vr.value + e_vr.value) / 2.0).squeeze(-1)
+                        pred_vr = e_vr.value.squeeze(-1)  # single value head (execution_net)
                         val_losses_r.append(F.mse_loss(pred_vr, mb_ret_r).item() / (ret_std ** 2).item())
                 bkdn_r_str = "  ".join(f"{k}={v/_bkdn_r_n:.3f}" for k, v in _bkdn_r_acc.items()) if _bkdn_r_n else ""
                 log.info(
@@ -1039,8 +1055,7 @@ class PPOTrainer:
         for p in _freeze_params:
             p.requires_grad_(False)
         value_opt = torch.optim.Adam(
-            list(self.decision_net.value_head.parameters())
-            + list(self.execution_net.value_head.parameters()),
+            list(self.execution_net.value_head.parameters()),
             lr=lr, eps=1e-5,
         )
 
@@ -1173,7 +1188,7 @@ class PPOTrainer:
 
                 d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
                 e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
-                new_values = ((d_heads.value + e_heads.value) / 2.0).squeeze(-1)
+                new_values = e_heads.value.squeeze(-1)  # single value head (execution_net)
 
                 # Normalised MSE so the loss is O(1) regardless of return scale
                 value_loss = F.mse_loss(new_values, mb_ret) / (ret_std ** 2)
@@ -1205,7 +1220,7 @@ class PPOTrainer:
                         val_obs_dict["global_feat"], d_v, _sat_v, _oat_v,
                     )
                     _vl = float(F.mse_loss(
-                        ((d_v.value + e_v.value) / 2.0).squeeze(-1), val_returns_t
+                        e_v.value.squeeze(-1), val_returns_t
                     ) / (ret_std ** 2))
                 _val_rmse = float(ret_std) * math.sqrt(_vl)
                 log.info(
@@ -1361,7 +1376,9 @@ class PPOTrainer:
         }
 
         # Combined log_prob
-        value = float((d_heads.value + e_heads.value).mean())
+        # Single value head: execution_net only (decision_net.value_head is
+        # frozen — see __init__ note).
+        value = float(e_heads.value.mean())
         log_prob = self._compute_log_prob(d_heads, e_heads, {
             "shoot": shoot, "pass_": pass_, "move": move,
             "tackle": tackle, "gp_extra": gp_extra, "mark": mark, "hold": hold,
@@ -1448,7 +1465,7 @@ class PPOTrainer:
         oat = obs_dict["other_ai_type"].to(self.device) if "other_ai_type" in obs_dict else None
         d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
         e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
-        return float((d_heads.value + e_heads.value).mean())
+        return float(e_heads.value.mean())  # single value head (execution_net)
 
     def _compute_log_prob(self, d_heads, e_heads, samples: dict, exists_mask) -> torch.Tensor:
         """Compute combined log_prob across all action heads."""
@@ -1598,8 +1615,8 @@ class PPOTrainer:
                 d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
                 e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
 
-                # Value estimate
-                new_values = ((d_heads.value + e_heads.value) / 2.0).squeeze(-1)
+                # Value estimate — single value head (execution_net only)
+                new_values = e_heads.value.squeeze(-1)
 
                 # New log_probs (sample stored actions from batch)
                 mb_actions = {k.replace("action/", ""): batch[k][mb_idx].to(self.device)
@@ -1630,6 +1647,8 @@ class PPOTrainer:
                         lp_new_mb   = new_log_probs.mean().item()
                         lp_old_mb   = mb_old_lp.mean().item()
                         ratio_mb    = torch.exp(new_log_probs - mb_old_lp)
+                        dval_mb     = d_heads.value.squeeze(-1).mean().item()
+                        eval_mb     = e_heads.value.squeeze(-1).mean().item()
                         stored_raw   = mb_actions["move_dir_raw"]
                         stored_norm  = stored_raw.norm(dim=-1)
                         current_norm = e_heads.move_direction.norm(dim=-1)
@@ -1640,7 +1659,8 @@ class PPOTrainer:
                         f"    old_lp={lp_old_mb:.3f}  new_lp={lp_new_mb:.3f}  diff={lp_new_mb - lp_old_mb:.3f}\n"
                         f"    ratio: mean={ratio_mb.mean():.4f}  std={ratio_mb.std():.4f}"
                         f"  min={ratio_mb.min():.4f}  max={ratio_mb.max():.4f}\n"
-                        f"    new_values={new_values.mean():.3f}  ret(mb)={mb_ret.mean():.3f}\n"
+                        f"    new_values={new_values.mean():.3f}  ret(mb)={mb_ret.mean():.3f}"
+                        f"  [d_val={dval_mb:.3f} e_val={eval_mb:.3f}]\n"
                         f"    shoot={lp_shoot:.3f} pass={lp_pass:.3f} move={lp_move:.3f} tackle={lp_tackle:.3f}\n"
                         f"    gp={lp_gp:.3f} mark={lp_mark:.3f} hold={lp_hold:.3f}\n"
                         f"    exec_mv={lp_exec_mv:.3f} sprint={lp_sprint:.3f} kick={lp_kick:.3f} t_attempt={lp_tackle_a:.3f}\n"
@@ -1907,6 +1927,12 @@ class PPOTrainer:
             "kick_log_std": kick_log_std,
             "mv_ls_grad": mean_mv_ls_grad,
             "head_act": head_act,
+            "values_mean": float(batch["values"].mean()),
+            "values_std": float(batch["values"].std()),
+            "returns_mean": float(returns.mean()),
+            "returns_std": float(returns.std()),
+            "adv_mean": float(batch["advantages"].mean()),
+            "adv_std": float(batch["advantages"].std()),
         }
 
     def _recompute_log_prob(self, d_heads, e_heads, mb_actions: dict, exists_mask) -> torch.Tensor:

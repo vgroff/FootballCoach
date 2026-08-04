@@ -87,6 +87,20 @@ uv run python -m footballcoach.ai.scripts.train \
 # --total-steps 60000
 ```
 
+### Re-run BC pretraining on the LATEST checkpoint automatically, then PPO
+```bash
+uv run python -m footballcoach.ai.scripts.train \
+    --phase 1 --seed 42 \
+    --latest-pretrain \
+    --bc-dataset demonstrations/phase1/ \
+    --verbose 2>&1 --total-steps 40000 | tee -a training_runs.log
+```
+Finds the most recent checkpoint across all `checkpoints/phase{N}_run*/` dirs
+(same resolution as `--latest`), loads its weights, then runs the full BC/value
+pre-training loop again (equivalent to `--latest` + `--pretrain-from-checkpoint`
+combined). **Resets the step counter to 0** (unlike `--latest`, which continues
+it) since pretraining is being redone. Requires `--bc-dataset`.
+
 
 ### Resume a specific mid-run checkpoint (skips pretraining, continues step count)
 ```bash
@@ -122,8 +136,10 @@ uv run python -m footballcoach.ai.scripts.train \
 ```
 step=8,096 | rew=11.63/8.95 | pol=0.07 val=2.18 ent=0.52 kl=0.34 bc=2.3(x0.38) | 272sps
   act: mv=25 gp=75 emv=100 spr=80 kck=0 tk=0 sh=0 hld=0  vs_neural(148): 55%/45%
+  [V=1.2\u00b10.4 R=1.3\u00b10.5 adv=0.0\u00b11.0]
 ```
 - **rew** — mean episode reward / mean episode length in steps. Should climb over time.
+- **[V=/R=/adv=]** — per-rollout value/return/advantage mean\u00b1std, from `execution_net.value_head` (the single trained critic — see "Single value head convention" in `src/footballcoach/ai/knowledge.md`). `V` and `R` should track each other reasonably closely once the critic is calibrated; a persistently large gap means the value head needs more pretraining epochs. DEBUG-level logs also show a per-minibatch d_val/e_val split — `d_val` is static since `decision_net.value_head` is frozen.
 - **kl** — mean KL across the rollout. Should stay below `target_kl` (currently 0.4). Consistently near the ceiling = updates are too large.
 - **bc(xN)** — BC aux loss × current anneal coefficient. Should drop to 0 by `aux_coeff_anneal_fraction` of training (currently 65%).
 - **sps** — steps per second. ~280 is normal on CPU.
@@ -219,7 +235,7 @@ step=8,096 | rew=11.63/8.95 | pol=0.07 val=2.18 ent=0.52 kl=0.34 bc=2.3(x0.38) |
 | Parameter | Current | Effect |
 |-----------|---------|--------|
 | `ball_distance_shaping` | 0.05 | Small per-step bonus for closing distance to ball. Too high = agent circles the ball. |
-| `gain_possession_bonus` | 1.0 | One-off +1 when the trainee first gets the ball. Encourages ball-seeking. |
+| `gain_possession_bonus` | 1.0 | Awarded per **real turnover** gained (possession settling onto the trainee from a DIFFERENT player, e.g. a tackle or interception) within a decision interval — counted as an int, not just a one-off bool, so multiple gains in one interval each pay out. A "kick to yourself" (ball briefly loose/in-flight, e.g. during a push-kick dribble touch, then re-collected by the SAME player) does NOT count — see `src/footballcoach/ai/knowledge.md` "Possession gain/loss reward: real turnovers only". `loss_of_possession_penalty` mirrors this on the loss side. |
 | `ball_progress_scale` | 0.5 | Per-step bonus × metres advanced toward opponent goal while in possession. Main driver of forward play. |
 | `ball_out_penalty` | -1.0 | Penalises kicking out of bounds. |
 | `illegal_action_penalty` | -0.2 | Penalises actions that aren't legal (e.g. kicking without possession). |

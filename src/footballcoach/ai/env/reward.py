@@ -32,7 +32,7 @@ def phase1_reward(
     prev_ball_dist: float,
     curr_ball_dist: float,
     has_possession_now: bool,
-    gained_possession_this_step: bool,
+    gained_possession_this_step: bool | int,
     ball_progress_toward_goal_m: float,
     ball_went_out_after_touch: bool,
     illegal_action_attempted: bool,
@@ -41,7 +41,7 @@ def phase1_reward(
     time_fraction_remaining: float = 0.0,
     start_ball_to_box_dist_m: float = 1.0,
     opponent_reached_trainee_box: bool = False,
-    lost_possession_this_step: bool = False,
+    lost_possession_this_step: bool | int = False,
     timed_out: bool = False,
     ball_dist_to_opponent_box_m: float = 9999.0,
     heading_cos_sim: float = 1.0,
@@ -86,7 +86,10 @@ def phase1_reward(
     r += hdg_r
     comps["hdg"] = hdg_r
 
-    poss_r = cfg["gain_possession_bonus"] if gained_possession_this_step else 0.0
+    # gained_possession_this_step may be an int count (>1 if possession was
+    # gained more than once within a single decision interval, e.g. gain ->
+    # lose -> regain via tackles mid-tick-loop) -- multiply, don't just gate.
+    poss_r = cfg["gain_possession_bonus"] * gained_possession_this_step
     r += poss_r
     comps["poss"] = poss_r
 
@@ -118,7 +121,8 @@ def phase1_reward(
     comps["box"] = box_r
     comps["spd"] = spd_r
 
-    lpos_r = cfg.get("loss_of_possession_penalty", 0.0) if lost_possession_this_step else 0.0
+    # Same rationale as gained_possession_this_step above -- multiply by count.
+    lpos_r = cfg.get("loss_of_possession_penalty", 0.0) * lost_possession_this_step
     r += lpos_r
     comps["lpos"] = lpos_r
 
