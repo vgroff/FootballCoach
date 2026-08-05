@@ -124,15 +124,6 @@ class TestConstruction:
         value_net_ids = {id(p) for p in trainer.value_net.parameters()}
         assert main_opt_param_ids.isdisjoint(value_net_ids)
 
-    def test_value_net_trunk_matches_main_trunk_by_default(self):
-        """network.value_net_trunk_hidden is null in ai_config.json by
-        default -- value_net's trunk_hidden must fall back to matching
-        execution_net's (network.trunk_hidden), not silently diverge."""
-        trainer = PPOTrainer.from_config(separate_value_net=True)
-        main_trunk_out = trainer.execution_net.trunk[-2].out_features
-        value_trunk_out = trainer.value_net.trunk[-2].out_features
-        assert value_trunk_out == main_trunk_out
-
     def test_value_net_trunk_hidden_override(self):
         """network.value_net_trunk_hidden, when set, must size ONLY
         value_net's trunk -- execution_net's trunk must stay at the

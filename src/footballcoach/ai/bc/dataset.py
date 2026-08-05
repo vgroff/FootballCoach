@@ -166,6 +166,50 @@ class DemonstrationDataset:
         not_immobile_opp = self._labels[:, _I_OPPONENT_AI_TYPE] < (AI_TYPE_IMMOBILE - 0.5)
         return np.where(valid & not_immobile_opp)[0]
 
+    def split_train_val_indices(
+        self, val_frac: float = 0.15, valid_only: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Episode-level train/val split of this dataset's row indices.
+
+        Splits by COMPLETE episodes (using ``_dones``) so no single episode's
+        rows span both sets — mirrors the identical split already used by
+        ``PPOTrainer.pretrain_value()`` for its own train/val rollout split.
+        The LAST ``val_frac`` fraction of complete episodes (in dataset
+        order) become the val set; the rest are train.
+
+        Args:
+            val_frac: Fraction of complete episodes to hold out for
+                validation. 0.0 disables the split (val indices will be empty).
+            valid_only: If True, restrict both splits to ``valid_indices()``
+                (BC-valid, non-immobile-opponent rows) before splitting —
+                matches the row set BC training actually iterates over.
+
+        Returns:
+            (train_indices, val_indices): two disjoint index arrays into this
+            dataset's rows (NOT episode ids). val_indices is empty if there
+            are fewer than 2 complete episodes or val_frac <= 0.
+        """
+        base_indices = self.valid_indices() if valid_only else np.arange(self._n)
+        if val_frac <= 0.0 or len(base_indices) == 0:
+            return base_indices, np.array([], dtype=base_indices.dtype)
+
+        dones_subset = self._dones[base_indices]
+        episode_end_positions = np.where(dones_subset > 0.5)[0]
+        n_complete_eps = len(episode_end_positions)
+        if n_complete_eps < 2:
+            return base_indices, np.array([], dtype=base_indices.dtype)
+
+        n_val_eps = max(1, round(val_frac * n_complete_eps))
+        n_train_eps = n_complete_eps - n_val_eps
+        ep_starts = np.concatenate([[0], episode_end_positions[:-1] + 1])
+
+        val_mask = np.zeros(len(base_indices), dtype=bool)
+        for _i in range(n_train_eps, n_complete_eps):
+            val_mask[ep_starts[_i]:episode_end_positions[_i] + 1] = True
+        train_mask = ~val_mask
+
+        return base_indices[train_mask], base_indices[val_mask]
+
     def compute_pos_weights(self, max_weight: float | None = None) -> dict[str, float]:
         """Inverse-frequency weights for rare Bernoulli BC targets.
 
@@ -382,6 +426,7 @@ class DemonstrationDataset:
         downsample_trivial_cos_threshold: float = 0.98,
         downsample_trivial_exclude_radius_steps: int = 5,
         rng: np.random.Generator | None = None,
+        indices_override: np.ndarray | None = None,
     ) -> Generator:
         """Yield (obs_dict, bc_labels) or (obs_dict, bc_labels, returns) minibatches.
 
@@ -390,6 +435,7 @@ class DemonstrationDataset:
             shuffle: Whether to shuffle indices each epoch.
             device: torch device to move tensors to (default: CPU).
             valid_only: If True, only yield steps where bc_label.valid==1.
+                Ignored when ``indices_override`` is given.
             returns: Optional pre-computed return array from ``compute_returns()``.
                 When provided, yields 3-tuples ``(obs_dict, labels, returns_batch)``
                 instead of 2-tuples so callers can add a value loss in the same pass.
@@ -406,8 +452,17 @@ class DemonstrationDataset:
             rng: Optional ``numpy.random.Generator`` for reproducible
                 per-epoch re-rolling of the excluded subset. Defaults to a
                 fresh, unseeded generator each call.
+            indices_override: When given, iterate over exactly this row-index
+                array instead of ``valid_indices()``/``arange(n)`` -- used by
+                callers that pre-computed a train/val split (see
+                ``split_train_val_indices()``) so the val subset is never
+                re-derived from the full dataset. Downsampling still applies
+                on top of this subset when requested.
         """
-        indices = self.valid_indices() if valid_only else np.arange(self._n)
+        indices = (
+            indices_override if indices_override is not None
+            else (self.valid_indices() if valid_only else np.arange(self._n))
+        )
 
         if downsample_trivial_frac > 0.0:
             if self._trivial_mask_cache is None:

@@ -876,6 +876,50 @@ Resuming with `--checkpoint` restores the optimizer state (not just weights)
 so the learning-rate schedule, momentum, etc. continue exactly from where
 training stopped.  This is intentional.
 
+### Value-head overfitting (BC pretrain + value pretrain) — regularization knobs
+`pretrain_value()`'s value-only warm-up epoch loop was overfitting hard: with
+a small offline rollout reused for many epochs (e.g. ~21k steps × 35 epochs),
+train loss fell steadily (0.41→0.30) while val loss *rose* (0.46→0.57) —
+classic memorization, caught by the existing early-stop/best-weights-restore.
+Three new config knobs address this (all default to `0.0`/off, so existing
+runs are unaffected unless opted in):
+- `network.value_dropout` — dropout applied ONLY inside `value_head`
+  (`ExecutionNetwork`), never on the shared trunk that also feeds the
+  policy/motor heads, so it can't destabilise action distributions. Note:
+  `nn.Dropout` auto-disables under `.eval()`, but PPO rollout action-sampling
+  does NOT call `.eval()` on `execution_net`, so this also lightly perturbs
+  the value estimate used for GAE bootstrapping during rollout collection —
+  harmless (value isn't used to pick actions).
+- `bc.value_pretrain_weight_decay` — Adam `weight_decay` for
+  `pretrain_value()`'s optimizer(s) (offline reuse of one small rollout —
+  the main risk case).
+- `ppo.value_weight_decay` — Adam `weight_decay` for the "value" param group
+  during the main PPO loop. Each rollout is used for only `ppo.n_epochs`
+  passes and the return distribution keeps shifting under self-play, so this
+  is mainly cheap insurance for generalisation, not a fix for a specific
+  observed failure.
+
+`pretrain_value()`'s rollout-collection loop also gained the same per-episode
+reward-component mean/std/min/max table already printed by the main PPO
+rollout loop (see `REWARD_COMP_LABELS`), logged as
+`[value pretrain rollout] rew/ep (...)`.
+
+### BC pretrain train/val split + early stop (`bc.bc_pretrain_early_stop_patience`)
+`pretrain_combined()`'s main BC epoch loop (Phase 1) previously trained
+blind on the full dataset for a fixed `n_epochs`, unlike `pretrain_value()`
+which already had an episode-level 85/15 split + early stop. Setting
+`bc.bc_pretrain_early_stop_patience` > 0 (default `0` = disabled, matches
+prior behaviour exactly) now enables the same pattern for BC: an episode-level
+15% val split (via `DemonstrationDataset.split_train_val_indices()`), a
+val-only BC loss computed in `.eval()` mode after every epoch (logged as
+`val bc_val_loss=...`), and early stop + best-weights restore
+(`decision_net`+`execution_net` state dicts) using
+`bc.bc_pretrain_early_stop_min_delta` for the improvement threshold — mirrors
+`value_pretrain_early_stop_patience`/`min_delta` naming and semantics exactly.
+`DemonstrationDataset.iterate_minibatches()` gained an `indices_override`
+param so callers can iterate a pre-computed subset instead of re-deriving
+`valid_indices()` each time — used internally for the train/val split.
+
 ---
 
 ## 12. Current state and next steps

@@ -100,6 +100,47 @@ def _ai_types(obs_dict: dict) -> tuple:
     return obs_dict.get("self_ai_type"), obs_dict.get("other_ai_type")
 
 
+def _binary_confusion_counts(
+    pred_logit: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor, threshold: float = 0.5,
+) -> tuple[float, float, float]:
+    """Return (tp, fp, fn) counts for a Bernoulli head over valid rows.
+
+    ``pred_logit``/``target`` are raw (pre-sigmoid) logits and 0/1 float
+    labels respectively, shape (N,) or (N, 1) (squeezed internally).
+    ``valid_mask`` selects which rows to include (e.g. BC's _I_VALID mask).
+    Used to accumulate precision/recall/F1 diagnostics for rare-positive
+    heads (kick_this_tick, tackle_attempt), where a flat/low mean predicted
+    probability alone can't distinguish over-firing (low precision) from
+    under-firing (low recall) -- see ai_trainer_knowledge.md BC diagnostics.
+    """
+    with torch.no_grad():
+        p = torch.sigmoid(pred_logit.squeeze(-1))[valid_mask]
+        t = target[valid_mask] > 0.5
+        pred_pos = p > threshold
+        tp = float((pred_pos & t).sum())
+        fp = float((pred_pos & ~t).sum())
+        fn = float((~pred_pos & t).sum())
+    return tp, fp, fn
+
+
+def _precision_recall_f1(tp: float, fp: float, fn: float) -> tuple[float, float, float]:
+    """Precision/recall/F1 from accumulated (tp, fp, fn) counts.
+
+    NaN-safe: returns float('nan') for any ratio with a zero denominator (no
+    positive predictions this epoch / no positive labels seen this epoch)
+    rather than raising or silently returning 0.0, so it's visually distinct
+    from a genuine 0.0 score in logs.
+    """
+    precision = tp / (tp + fp) if (tp + fp) > 0 else float('nan')
+    recall = tp / (tp + fn) if (tp + fn) > 0 else float('nan')
+    f1 = (
+        2 * precision * recall / (precision + recall)
+        if (tp + fp) > 0 and (tp + fn) > 0 and (precision + recall) > 0
+        else float('nan')
+    )
+    return precision, recall, f1
+
+
 class PPOTrainer:
     """PPO trainer for the two-network (decision + execution) player AI.
 
@@ -162,7 +203,8 @@ class PPOTrainer:
         self.ent_coef = float(ppo_cfg.get("ent_coef", 0.01))
         self.max_grad_norm = float(ppo_cfg.get("max_grad_norm", 0.5))
         self.n_epochs = int(ppo_cfg.get("n_epochs", 4))
-        self.value_only_continuation_epochs = int(ppo_cfg.get("value_only_continuation_epochs", self.n_epochs))
+        _value_only_cont = ppo_cfg.get("value_only_continuation_epochs")
+        self.value_only_continuation_epochs = int(_value_only_cont) if _value_only_cont is not None else self.n_epochs
         self.bc_only_continuation_epochs = int(bc_cfg.get("bc_only_continuation_epochs", 0))
         # Optional fixed coefficient for the BC-only continuation loop, decoupled
         # from the annealed aux_coeff (bc.aux_coeff_start/end/anneal_fraction).
@@ -221,6 +263,9 @@ class PPOTrainer:
         self._value_pretrain_frozen_layers = int(bc_cfg.get("value_pretrain_frozen_layers", -1))
         self._value_pretrain_early_stop_patience = int(bc_cfg.get("value_pretrain_early_stop_patience", 5))
         self._value_pretrain_early_stop_min_delta = float(bc_cfg.get("value_pretrain_early_stop_min_delta", 1e-4))
+        self._value_pretrain_weight_decay = float(bc_cfg.get("value_pretrain_weight_decay", 0.0))
+        self._bc_pretrain_early_stop_patience = int(bc_cfg.get("bc_pretrain_early_stop_patience", 0))
+        self._bc_pretrain_early_stop_min_delta = float(bc_cfg.get("bc_pretrain_early_stop_min_delta", 1e-4))
         self._demo_value_pretrain_epochs = int(bc_cfg.get("demo_value_pretrain_epochs", 10))
         self._demo_value_pretrain_lr = float(bc_cfg.get("demo_value_pretrain_lr", 4e-3))
         self._demo_value_pretrain_gamma = float(bc_cfg.get("demo_value_pretrain_gamma", 0.99))
@@ -235,6 +280,10 @@ class PPOTrainer:
 
         lr = float(ppo_cfg.get("learning_rate", 3e-4))
         value_lr = float(ppo_cfg.get("value_learning_rate", lr))
+        # Adam weight_decay (L2) applied ONLY to the value param group during PPO
+        # (see ai_config.json's ppo.value_weight_decay comment). 0.0 (default) =
+        # disabled, matching prior behaviour.
+        value_weight_decay = float(ppo_cfg.get("value_weight_decay", 0.0))
         # Optional separate LR for the direction heads (move_direction, kick_direction,
         # move_dir_log_std, kick_dir_log_std). None (default) = share the "policy"
         # param group's LR, matching prior behaviour. Set ppo.direction_learning_rate
@@ -302,12 +351,13 @@ class PPOTrainer:
                 )
                 self.value_net_optimizer = torch.optim.Adam(
                     self.value_net.parameters(), lr=value_lr, eps=1e-5,
+                    weight_decay=value_weight_decay,
                 )
             else:
                 self.optimizer = torch.optim.Adam(
                     [
                         {"params": policy_params, "lr": lr, "name": "policy"},
-                        {"params": value_params, "lr": value_lr, "name": "value"},
+                        {"params": value_params, "lr": value_lr, "name": "value", "weight_decay": value_weight_decay},
                         {"params": direction_params, "lr": direction_lr, "name": "direction"},
                     ],
                     eps=1e-5,
@@ -323,6 +373,9 @@ class PPOTrainer:
 
         self._total_steps = 0
         self._checkpoint_count = 0  # sequential counter for checkpoint{N}.pt naming
+        self._log_file_handler: Optional[logging.FileHandler] = None  # see _rotate_log_file()
+        if self.checkpoint_dir is not None:
+            self._rotate_log_file()
         # Set of decision-head module names (matching ``decision_net`` attribute names,
         # same as the ``frozen_head_names`` argument to ``set_frozen_heads()``) that
         # are excluded from the PPO log_prob computation (both at sample time in
@@ -1056,6 +1109,60 @@ class PPOTrainer:
         # never runs and bc_losses is simply empty.
         bc_losses: list[float] = []
         bc_floors: list[float] = []
+
+        # --- Optional episode-level train/val split + early stop (see
+        # bc.bc_pretrain_early_stop_patience in ai_config.json). Disabled
+        # (patience=0, default) => train_idx covers the full valid_indices()
+        # set and val_idx is empty, matching prior "train blind" behaviour
+        # exactly (same code path as before this feature existed). ---
+        _bc_early_stop_enabled = self._bc_pretrain_early_stop_patience > 0
+        if _bc_early_stop_enabled:
+            _bc_train_idx, _bc_val_idx = dataset.split_train_val_indices(val_frac=0.15, valid_only=True)
+            log.info(
+                f"  BC pretrain split: {len(_bc_train_idx):,} train rows"
+                + (f"  |  {len(_bc_val_idx):,} val rows" if len(_bc_val_idx) > 0 else "  (val split empty -- <2 episodes, early stop inactive)")
+            )
+        else:
+            _bc_train_idx, _bc_val_idx = None, np.array([], dtype=np.int64)
+        _bc_best_val_loss = float("inf")
+        _bc_best_state: Optional[dict] = None
+        _bc_patience_ctr = 0
+        _bc_stopped_early = False
+
+        def _eval_bc_val_loss() -> float:
+            """Mean BC loss (no grad) over the held-out val rows, current weights."""
+            self.decision_net.eval()
+            self.execution_net.eval()
+            _losses: list[float] = []
+            with torch.no_grad():
+                for _obs, _labels in dataset.iterate_minibatches(
+                    batch_size=batch_size, shuffle=False, device=self.device,
+                    indices_override=_bc_val_idx,
+                ):
+                    _sat_v, _oat_v = _ai_types(_obs)
+                    _d_v = self.decision_net(
+                        _obs["self_feat"], _obs["other_feat"], _obs["exists_mask"],
+                        _obs["ball_feat"], _obs["global_feat"], _sat_v, _oat_v,
+                    )
+                    _e_v = self.execution_net(
+                        _obs["self_feat"], _obs["other_feat"], _obs["exists_mask"],
+                        _obs["ball_feat"], _obs["global_feat"], _d_v, _sat_v, _oat_v,
+                    )
+                    _losses.append(bc_loss_from_tensor(
+                        _labels, _d_v, _e_v,
+                        direction_loss_weight=self._bc_dir_loss_w,
+                        region_loss_weight=self._bc_region_loss_w,
+                        pos_weight_kick=self._bc_pos_weight_kick,
+                        pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
+                        dec_weight=self._bc_dec_weight,
+                        exec_weight=self._bc_exec_weight,
+                        dec_label_smoothing=self._bc_dec_label_smoothing,
+                        exec_label_smoothing=self._bc_exec_label_smoothing,
+                    ).item())
+            self.decision_net.train()
+            self.execution_net.train()
+            return float(np.mean(_losses)) if _losses else float("nan")
+
         for epoch in range(n_epochs):
             _epoch_t0 = time.monotonic()
             bc_losses = []
@@ -1068,6 +1175,8 @@ class PPOTrainer:
             sprint_probs: list[float] = []
             kick_probs: list[float] = []
             tackle_attempt_probs: list[float] = []
+            _kick_tp = _kick_fp = _kick_fn = 0.0
+            _tackle_tp = _tackle_fp = _tackle_fn = 0.0
             _bkdn_acc: dict[str, float] = {}
             _bkdn_n: int = 0
             if self._downsample_trivial_enabled:
@@ -1097,6 +1206,7 @@ class PPOTrainer:
                 downsample_trivial_frac=_ds_frac,
                 downsample_trivial_cos_threshold=self._downsample_trivial_cos_threshold,
                 downsample_trivial_exclude_radius_steps=self._downsample_trivial_exclude_radius_steps,
+                indices_override=_bc_train_idx,
             ):
                 if _use_joint_val:
                     obs_dict, bc_labels, ret_batch = mb
@@ -1197,6 +1307,10 @@ class PPOTrainer:
                         sprint_probs.append(torch.sigmoid(e_heads.sprint_logit.squeeze(-1)[valid_mask]).mean().item())
                         kick_probs.append(torch.sigmoid(e_heads.kick_logit.squeeze(-1)[valid_mask]).mean().item())
                         tackle_attempt_probs.append(torch.sigmoid(e_heads.tackle_attempt_logit.squeeze(-1)[valid_mask]).mean().item())
+                        _tp, _fp, _fn = _binary_confusion_counts(e_heads.kick_logit, bc_labels[:, 12], valid_mask)
+                        _kick_tp += _tp; _kick_fp += _fp; _kick_fn += _fn
+                        _tp, _fp, _fn = _binary_confusion_counts(e_heads.tackle_attempt_logit, bc_labels[:, 13], valid_mask)
+                        _tackle_tp += _tp; _tackle_fp += _fp; _tackle_fn += _fn
 
             mean_cos = float(np.mean(dir_cosines)) if dir_cosines else float('nan')
             mean_kick_cos = float(np.mean(kick_dir_cosines)) if kick_dir_cosines else float('nan')
@@ -1204,6 +1318,8 @@ class PPOTrainer:
             mean_spr = float(np.mean(sprint_probs)) if sprint_probs else float('nan')
             mean_kk = float(np.mean(kick_probs)) if kick_probs else float('nan')
             mean_tk = float(np.mean(tackle_attempt_probs)) if tackle_attempt_probs else float('nan')
+            kk_prec, kk_rec, kk_f1 = _precision_recall_f1(_kick_tp, _kick_fp, _kick_fn)
+            tk_prec, tk_rec, tk_f1 = _precision_recall_f1(_tackle_tp, _tackle_fp, _tackle_fn)
             _kick_bkdn_keys = {"kick", "kick_direction", "kick_power", "kick_spin"}
             bkdn_str = "  ".join(
                 f"{k}={v/_bkdn_n:.5f}" if k in _kick_bkdn_keys else f"{k}={v/_bkdn_n:.3f}"
@@ -1233,6 +1349,10 @@ class PPOTrainer:
                 f"    heads      dir_cos={mean_cos:.3f}  kick_dir_cos={mean_kick_cos:.3f}",
                 f"               move_prob={mean_mv:.3f}  sprint_prob={mean_spr:.3f}  "
                 f"kick_prob={mean_kk:.3f}  tackle_prob={mean_tk:.3f}",
+                f"    pr/rec     kick:   p={kk_prec:.3f}  r={kk_rec:.3f}  f1={kk_f1:.3f}  "
+                f"(tp={_kick_tp:.0f} fp={_kick_fp:.0f} fn={_kick_fn:.0f})",
+                f"               tackle: p={tk_prec:.3f}  r={tk_rec:.3f}  f1={tk_f1:.3f}  "
+                f"(tp={_tackle_tp:.0f} fp={_tackle_fp:.0f} fn={_tackle_fn:.0f})",
             ]
             if bkdn_str:
                 _bkdn_parts = bkdn_str.split("  ")
@@ -1247,6 +1367,36 @@ class PPOTrainer:
             sprint_probs.clear()
             _bkdn_acc.clear()
             _bkdn_n = 0
+
+            # --- BC pretrain val eval + early stop (see bc.bc_pretrain_early_stop_patience) ---
+            if _bc_early_stop_enabled and len(_bc_val_idx) > 0:
+                _bc_val_loss = _eval_bc_val_loss()
+                _improved = _bc_val_loss < (_bc_best_val_loss - self._bc_pretrain_early_stop_min_delta)
+                log.info(
+                    f"    val        bc_val_loss={_bc_val_loss:.4f}  best={min(_bc_best_val_loss, _bc_val_loss):.4f}"
+                    + ("  (improved)" if _improved else f"  (patience {_bc_patience_ctr + 1}/{self._bc_pretrain_early_stop_patience})")
+                )
+                if _improved:
+                    _bc_best_val_loss = _bc_val_loss
+                    _bc_best_state = {
+                        "decision_net": copy.deepcopy(self.decision_net.state_dict()),
+                        "execution_net": copy.deepcopy(self.execution_net.state_dict()),
+                    }
+                    _bc_patience_ctr = 0
+                else:
+                    _bc_patience_ctr += 1
+                    if _bc_patience_ctr >= self._bc_pretrain_early_stop_patience:
+                        log.info(
+                            f"  [BC pretrain] early stop at epoch {epoch + 1} "
+                            f"(val stagnant for {self._bc_pretrain_early_stop_patience} epochs, "
+                            f"best={_bc_best_val_loss:.4f})"
+                        )
+                        _bc_stopped_early = True
+                        break
+        if _bc_stopped_early and _bc_best_state is not None:
+            self.decision_net.load_state_dict(_bc_best_state["decision_net"])
+            self.execution_net.load_state_dict(_bc_best_state["execution_net"])
+            log.info(f"  [BC pretrain] restored best-val weights (bc_val_loss={_bc_best_val_loss:.4f})")
         if bc_losses:
             log.info(f"BC pre-training done ({n_epochs} epoch(s), final bc_loss={np.mean(bc_losses):.4f})")
         else:
@@ -1328,6 +1478,8 @@ class PPOTrainer:
                 sprint_probs_r: list[float] = []
                 kick_probs_r: list[float] = []
                 tackle_attempt_probs_r: list[float] = []
+                _kick_tp_r = _kick_fp_r = _kick_fn_r = 0.0
+                _tackle_tp_r = _tackle_fp_r = _tackle_fn_r = 0.0
                 _bkdn_r_acc: dict[str, float] = {}
                 _bkdn_r_n: int = 0
                 for obs_dict, bc_labels in dataset.iterate_minibatches(
@@ -1397,6 +1549,10 @@ class PPOTrainer:
                             sprint_probs_r.append(torch.sigmoid(e_r.sprint_logit.squeeze(-1)[valid_mask]).mean().item())
                             kick_probs_r.append(torch.sigmoid(e_r.kick_logit.squeeze(-1)[valid_mask]).mean().item())
                             tackle_attempt_probs_r.append(torch.sigmoid(e_r.tackle_attempt_logit.squeeze(-1)[valid_mask]).mean().item())
+                            _tp, _fp, _fn = _binary_confusion_counts(e_r.kick_logit, bc_labels[:, 12], valid_mask)
+                            _kick_tp_r += _tp; _kick_fp_r += _fp; _kick_fn_r += _fn
+                            _tp, _fp, _fn = _binary_confusion_counts(e_r.tackle_attempt_logit, bc_labels[:, 13], valid_mask)
+                            _tackle_tp_r += _tp; _tackle_fp_r += _fp; _tackle_fn_r += _fn
 
                 mean_cos_r = float(np.mean(dir_cosines_r)) if dir_cosines_r else float('nan')
                 mean_kick_cos_r = float(np.mean(kick_dir_cosines_r)) if kick_dir_cosines_r else float('nan')
@@ -1404,6 +1560,8 @@ class PPOTrainer:
                 mean_spr_r = float(np.mean(sprint_probs_r)) if sprint_probs_r else float('nan')
                 mean_kk_r = float(np.mean(kick_probs_r)) if kick_probs_r else float('nan')
                 mean_tk_r = float(np.mean(tackle_attempt_probs_r)) if tackle_attempt_probs_r else float('nan')
+                kk_prec_r, kk_rec_r, kk_f1_r = _precision_recall_f1(_kick_tp_r, _kick_fp_r, _kick_fn_r)
+                tk_prec_r, tk_rec_r, tk_f1_r = _precision_recall_f1(_tackle_tp_r, _tackle_fp_r, _tackle_fn_r)
                 # Also measure value loss on the stored rollout returns (no gradient)
                 with torch.no_grad():
                     val_losses_r = []
@@ -1440,6 +1598,10 @@ class PPOTrainer:
                     f"    heads      dir_cos={mean_cos_r:.3f}  kick_dir_cos={mean_kick_cos_r:.3f}",
                     f"               move_prob={mean_mv_r:.3f}  sprint_prob={mean_spr_r:.3f}  "
                     f"kick_prob={mean_kk_r:.3f}  tackle_prob={mean_tk_r:.3f}",
+                    f"    pr/rec     kick:   p={kk_prec_r:.3f}  r={kk_rec_r:.3f}  f1={kk_f1_r:.3f}  "
+                    f"(tp={_kick_tp_r:.0f} fp={_kick_fp_r:.0f} fn={_kick_fn_r:.0f})",
+                    f"               tackle: p={tk_prec_r:.3f}  r={tk_rec_r:.3f}  f1={tk_f1_r:.3f}  "
+                    f"(tp={_tackle_tp_r:.0f} fp={_tackle_fp_r:.0f} fn={_tackle_fn_r:.0f})",
                 ]
                 if bkdn_r_str:
                     _bkdn_r_parts = bkdn_r_str.split("  ")
@@ -1524,7 +1686,7 @@ class PPOTrainer:
                 p.requires_grad_(False)
             value_opt = torch.optim.Adam(
                 list(self.execution_net.value_head.parameters()),
-                lr=lr, eps=1e-5,
+                lr=lr, eps=1e-5, weight_decay=self._value_pretrain_weight_decay,
             )
 
         # --- Experimental: separate-trunk value network (see docstring) ---
@@ -1551,6 +1713,11 @@ class PPOTrainer:
         outcomes_vs_neural: list[str] = []
         episode_accum = 0.0
         next_obs = None
+        # Per-episode reward components for statistics (mean/std/min/max per
+        # type), mirroring the identical table in train()'s main PPO rollout
+        # loop (see REWARD_COMP_LABELS / episode_comp_list there).
+        episode_comp_accum: dict[str, float] = {}
+        episode_comp_list: list[dict[str, float]] = []
 
         for _ in range(n_steps):
             next_obs, reward, done, info = env.step()
@@ -1565,9 +1732,14 @@ class PPOTrainer:
                     done=1.0 if done else 0.0,
                 )
             episode_accum += reward
+            for _k, _v in getattr(env, "last_reward_components", {}).items():
+                episode_comp_accum[_k] = episode_comp_accum.get(_k, 0.0) + _v
             if done:
                 episode_returns.append(episode_accum)
                 episode_accum = 0.0
+                if episode_comp_accum:
+                    episode_comp_list.append(dict(episode_comp_accum))
+                episode_comp_accum = {}
                 if info is not None and info.trial_outcome is not None:
                     if info.is_rules_episode:
                         outcomes_vs_rules.append(info.trial_outcome)
@@ -1576,7 +1748,7 @@ class PPOTrainer:
                     else:
                         outcomes_vs_neural.append(info.trial_outcome)
                 env.reset()
-
+ 
         def _win_frac(outcomes: list[str]) -> float:
             if not outcomes:
                 return float('nan')
@@ -1589,6 +1761,33 @@ class PPOTrainer:
             f"vs_immobile({len(outcomes_vs_immobile)}): {_win_frac(outcomes_vs_immobile):.0%}  "
             f"vs_neural({len(outcomes_vs_neural)}): {_win_frac(outcomes_vs_neural):.0%}"
         )
+
+        # Per-episode reward statistics table (mean/std/min/max per type),
+        # identical formatting to the main PPO rollout loop's table.
+        if episode_comp_list:
+            _all_keys = [k for k, _ in REWARD_COMP_LABELS
+                         if any(k in ep for ep in episode_comp_list)]
+            if _all_keys:
+                _col_w = 14
+                _lbl_map = {k: lbl for k, lbl in REWARD_COMP_LABELS}
+                _rew_stats_lines = [
+                    f"  {'component':<{_col_w}}  {'mean':>8}  {'std':>7}  {'min':>8}  {'max':>8}",
+                    "  " + "-" * _col_w + "  " + "-" * 8 + "  " + "-" * 7 + "  " + "-" * 8 + "  " + "-" * 8,
+                ]
+                for _k in _all_keys:
+                    _vals = [ep[_k] for ep in episode_comp_list if _k in ep]
+                    if not _vals:
+                        continue
+                    _arr = np.array(_vals)
+                    _lbl = _lbl_map.get(_k, _k)
+                    _rew_stats_lines.append(
+                        f"  {_lbl:<{_col_w}}  {_arr.mean():>+8.3f}  {_arr.std():>7.3f}"
+                        f"  {_arr.min():>+8.3f}  {_arr.max():>+8.3f}"
+                    )
+                log.info(
+                    f"  [value pretrain rollout] rew/ep (mean/std/min/max per episode, "
+                    f"{len(episode_comp_list)} ep)\n" + "\n".join(_rew_stats_lines)
+                )
 
         with torch.no_grad():
             last_obs_dict = {k: v.unsqueeze(0).to(self.device)
@@ -3229,6 +3428,31 @@ class PPOTrainer:
     # Checkpointing
     # -----------------------------------------------------------------------
 
+    def _rotate_log_file(self) -> None:
+        """(Re)attach a FileHandler writing to
+        ``checkpoint_dir/training_log{N}.txt`` where N is one past the
+        current ``_checkpoint_count`` -- e.g. before checkpoint1 is saved,
+        logs go to ``training_log1.txt``; once checkpoint1 is saved, the
+        handler rotates so subsequent logs (up through checkpoint2) go to
+        ``training_log2.txt``, mirroring the ``checkpoint{N}.pt`` numbering.
+        Attaches to the ``"footballcoach"`` root logger so every module's
+        logs (train.py, ppo_trainer.py, bc.py, dataset.py, ...) land in the
+        same file, not just this module's own logger.
+        """
+        if self.checkpoint_dir is None:
+            return
+        self.checkpoint_dir.mkdir(parents=True, exist_ok=True)
+        root = logging.getLogger("footballcoach")
+        if self._log_file_handler is not None:
+            root.removeHandler(self._log_file_handler)
+            self._log_file_handler.close()
+        log_path = self.checkpoint_dir / f"training_log{self._checkpoint_count + 1}.txt"
+        handler = logging.FileHandler(log_path)
+        handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+        root.addHandler(handler)
+        self._log_file_handler = handler
+        log.info(f"Logging to {log_path}")
+
     def _save_checkpoint(self, step: int) -> None:
         if self.checkpoint_dir is None:
             return
@@ -3252,6 +3476,7 @@ class PPOTrainer:
             latest.unlink()
         latest.symlink_to(path.name)
         log.info(f"Saved checkpoint: {path}")
+        self._rotate_log_file()
 
     def _save_checkpoint_to(self, path: Path) -> None:
         """Save a checkpoint to an explicit path (used for pre-trained snapshot)."""

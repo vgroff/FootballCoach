@@ -120,6 +120,7 @@ class ExecutionNetwork(nn.Module):
         dir_log_std_init: float = -2.0,
         value_extra_hidden: int = 16,
         value_hidden_dim: int = 0,
+        value_dropout: float = 0.0,
     ):
         super().__init__()
         self.latent_dim = latent_dim
@@ -179,14 +180,30 @@ class ExecutionNetwork(nn.Module):
         # Critic value head (shared trunk, Option A) + value-only ai-type side channel.
         # value_hidden_dim=0 keeps the old single-linear-layer behaviour;
         # >0 inserts one ReLU hidden layer before the final scalar output.
+        # value_dropout (network.value_dropout in ai_config.json, default 0.0
+        # = disabled): applied ONLY inside value_head, never touching the
+        # shared trunk `h` that also feeds the policy/motor heads -- see
+        # ai_trainer_knowledge.md "value_head overfitting" discussion. Placed
+        # right before each Linear (dropout on the incoming activations),
+        # standard practice, and works whether or not value_hidden_dim>0.
+        # nn.Dropout auto-disables under .eval() and is active whenever this
+        # module is in .train() mode, including during PPO rollout action
+        # sampling if the caller hasn't switched to eval() -- this only adds
+        # noise to the *value* estimate (used for GAE bootstrapping), never to
+        # the action distributions, so it is harmless there.
         value_in_dim = trunk_hidden + value_extra_hidden
         if value_hidden_dim > 0:
             self.value_head = nn.Sequential(
+                nn.Dropout(value_dropout),
                 nn.Linear(value_in_dim, value_hidden_dim), nn.ReLU(),
+                nn.Dropout(value_dropout),
                 nn.Linear(value_hidden_dim, 1),
             )
         else:
-            self.value_head = nn.Linear(value_in_dim, 1)
+            self.value_head = nn.Sequential(
+                nn.Dropout(value_dropout),
+                nn.Linear(value_in_dim, 1),
+            )
 
         # Learnable log_std for direction heads (move_dir, kick_dir).
         # Single scalar (isotropic) rather than one-per-axis: the direction
@@ -287,4 +304,5 @@ class ExecutionNetwork(nn.Module):
             dir_log_std_init=ppo_cfg.get("dir_log_std_init", -2.0),
             value_extra_hidden=cfg.get("value_extra_hidden", 16),
             value_hidden_dim=cfg.get("value_hidden_dim", 0),
+            value_dropout=cfg.get("value_dropout", 0.0),
         )

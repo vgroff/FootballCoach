@@ -24,6 +24,9 @@ Extending training:
 Current notes:
 - " read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
 - train blockers:
+    - change one thing at a time - try annealing!!
+    - which moves count as illegal?
+    - now that we've fixed a bunch of bugs, I'm tempted to try running the existing models but with their value heads instead of a separate one - how easy would that be? just load in the one network instead of both, right?
     - [] one thing puzzles me - the network in BC seems to have quite a presistently high error in tackle and kick
     - [] !might no longer need the separate neural network if value is fixed now!
     - try just doing immobile first - can we improve?
