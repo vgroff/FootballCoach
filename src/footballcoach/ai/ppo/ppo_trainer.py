@@ -206,6 +206,11 @@ class PPOTrainer:
         self._bc_pos_weight_tackle_attempt = (
             1.0 if self._bc_pos_weight_tackle_attempt_cfg is None else float(self._bc_pos_weight_tackle_attempt_cfg)
         )
+        # Optional cap applied to the auto-computed (dataset-derived) pos_weight_*
+        # ratios only — has no effect when pos_weight_kick/pos_weight_tackle_attempt
+        # are set explicitly above. None = uncapped.
+        _pos_weight_max_cfg = bc_cfg.get("pos_weight_max")
+        self._bc_pos_weight_max = None if _pos_weight_max_cfg is None else float(_pos_weight_max_cfg)
         self._downsample_trivial_enabled = bool(bc_cfg.get("downsample_trivial_enabled", False))
         self._downsample_trivial_frac_default = float(bc_cfg.get("downsample_trivial_frac_default", 0.5))
         self._downsample_trivial_frac_high_epoch = float(bc_cfg.get("downsample_trivial_frac_high_epoch", 0.65))
@@ -889,12 +894,12 @@ class PPOTrainer:
             value_lr: learning rate for value heads only
             rollout_steps: steps to collect for value targets (≥ rollout_steps in config)
         """
-        from footballcoach.ai.ppo.bc import bc_loss_from_tensor
+        from footballcoach.ai.ppo.bc import bc_loss_from_tensor, compute_bc_loss_floor
         from footballcoach.ai.bc.dataset import DemonstrationDataset
 
         # pos_weight_*: auto-compute from this dataset if not overridden in config.
         if self._bc_pos_weight_kick_cfg is None or self._bc_pos_weight_tackle_attempt_cfg is None:
-            _auto_weights = dataset.compute_pos_weights()
+            _auto_weights = dataset.compute_pos_weights(max_weight=self._bc_pos_weight_max)
             if self._bc_pos_weight_kick_cfg is None:
                 self._bc_pos_weight_kick = _auto_weights["kick"]
             if self._bc_pos_weight_tackle_attempt_cfg is None:
@@ -1050,9 +1055,11 @@ class PPOTrainer:
         # --latest-pretrain/--pretrain-from-checkpoint) -- the loop body then
         # never runs and bc_losses is simply empty.
         bc_losses: list[float] = []
+        bc_floors: list[float] = []
         for epoch in range(n_epochs):
             _epoch_t0 = time.monotonic()
             bc_losses = []
+            bc_floors = []
             val_losses: list[float] = []
             val_raw_mse_losses: list[float] = []
             dir_cosines: list[float] = []
@@ -1147,6 +1154,16 @@ class PPOTrainer:
                 )
                 bc_opt.step()
                 bc_losses.append(bc_loss.item())
+                bc_floors.append(compute_bc_loss_floor(
+                    bc_labels,
+                    pos_weight_kick=self._bc_pos_weight_kick,
+                    pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
+                    dec_weight=self._bc_dec_weight,
+                    exec_weight=self._bc_exec_weight,
+                    dec_label_smoothing=self._bc_dec_label_smoothing,
+                    exec_label_smoothing=self._bc_exec_label_smoothing,
+                    has_exec=True,
+                ))
                 for k, v in bkdn.items():
                     _bkdn_acc[k] = _bkdn_acc.get(k, 0.0) + v
                 _bkdn_n += 1
@@ -1207,9 +1224,12 @@ class PPOTrainer:
             # field from the old single-line format is preserved, just grouped, with
             # full-word labels and long lines wrapped to avoid overflow. See
             # agent_plans/bc_execution_label_boundary_and_followups.md Part 4.
+            _mean_bc_loss = float(np.mean(bc_losses))
+            _mean_bc_floor = float(np.mean(bc_floors)) if bc_floors else 0.0
             _bc_lines = [
                 f"  BC epoch {epoch + 1}/{n_epochs}  ({_epoch_elapsed:.1f}s)",
-                f"    loss       bc={np.mean(bc_losses):.4f}" + (val_str.strip() and f"  {val_str.strip()}" or ""),
+                f"    loss       bc={_mean_bc_loss:.4f}  bc_adj={_mean_bc_loss - _mean_bc_floor:.4f}"
+                f"(floor={_mean_bc_floor:.4f})" + (val_str.strip() and f"  {val_str.strip()}" or ""),
                 f"    heads      dir_cos={mean_cos:.3f}  kick_dir_cos={mean_kick_cos:.3f}",
                 f"               move_prob={mean_mv:.3f}  sprint_prob={mean_spr:.3f}  "
                 f"kick_prob={mean_kk:.3f}  tackle_prob={mean_tk:.3f}",

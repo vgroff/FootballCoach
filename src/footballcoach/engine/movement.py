@@ -152,6 +152,36 @@ def effective_acceleration(
     return accel
 
 
+def sprint_eta(dist_m: float, v0_mps: float, v_top_mps: float, accel_mps2: float) -> float:
+    """Estimate time (s) to sprint ``dist_m`` from initial speed ``v0_mps``.
+
+    Uses a two-phase constant-acceleration model:
+    - Phase 1: accelerate from ``v0_mps`` to ``v_top_mps`` at ``accel_mps2``.
+    - Phase 2: cruise at ``v_top_mps``.
+
+    If the distance is covered before reaching top speed, solves the quadratic
+    ``v0*t + 0.5*a*t^2 = dist`` analytically instead.
+
+    All arguments should be non-negative.  Returns 0 for zero (or negative)
+    distance and a large sentinel (1e9) when speed and acceleration are both
+    effectively zero.
+    """
+    if dist_m <= 0.0:
+        return 0.0
+    v_top_mps = max(v_top_mps, 1e-3)
+    if accel_mps2 <= 0.0 or v0_mps >= v_top_mps:
+        return dist_m / v_top_mps
+    # Phase 1: time and distance to reach top speed
+    t1 = (v_top_mps - v0_mps) / accel_mps2
+    d1 = v0_mps * t1 + 0.5 * accel_mps2 * t1 * t1
+    if d1 >= dist_m:
+        # Distance covered entirely during acceleration phase
+        disc = v0_mps * v0_mps + 2.0 * accel_mps2 * dist_m
+        return (-v0_mps + math.sqrt(disc)) / accel_mps2
+    # Phase 2: remaining distance at cruise speed
+    return t1 + (dist_m - d1) / v_top_mps
+
+
 def lateral_accel_capability(
     params: MovementParams,
     acceleration_attr: float,

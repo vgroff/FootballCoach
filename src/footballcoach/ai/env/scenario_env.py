@@ -112,6 +112,7 @@ class ScenarioEnv:
         self._episode_ticks: int = 0
         self._last_ball_dist: float = 0.0
         self._start_ball_to_box_dist_m: float = 1.0
+        self._start_ball_dist_m: float = 1.0
         self._max_episode_ticks: int = 1
         self._ball_touched_by_trainee: bool = False
         self._trainee_had_possession_last_step: bool = False
@@ -134,6 +135,9 @@ class ScenarioEnv:
 
         # Per-secondary-player state
         self._sec_last_ball_dist: dict = {}
+        self._sec_start_ball_dist: dict = {}
+        self._sec_start_ball_to_box_dist_m: dict = {}
+        self._sec_start_stamina: dict = {}
         self._sec_ball_touched: dict = {}
         self._sec_ema: dict = {}
         self._sec_had_possession_last_step: dict = {}
@@ -174,13 +178,16 @@ class ScenarioEnv:
         )
         self._last_ball_dist = self._ball_dist_to_trainee()
         self._max_episode_ticks = max(1, int(self.max_episode_s / self._dt_s))
-        self._start_ball_to_box_dist_m = self._ball_dist_to_opponent_box()
+        self._start_ball_to_box_dist_m = self._ball_dist_to_opponent_box(self.trainee_player_id)
+        self._start_ball_dist_m = self._last_ball_dist
         self._trainee_had_possession_last_step = False
         self._trainee_pending_loss = False
         self._sec_had_possession_last_step = {pid: False for pid in self.secondary_player_ids}
         self._sec_pending_loss = {pid: False for pid in self.secondary_player_ids}
         self._last_settled_ball_owner = None
         # Record stamina at episode start for end-of-episode stamina penalty.
+        # Also recorded per-secondary-player below (same treatment — see
+        # _compute_phase1_reward_for_player()).
         try:
             _trainee = self._loop.match.player_by_id(self.trainee_player_id)
             self._trainee_start_stamina = _trainee.stamina
@@ -231,7 +238,21 @@ class ScenarioEnv:
                 self._sec_ema[pid] = EMAFilter.from_config()
             self._sec_ema[pid].reset()
             self._sec_last_ball_dist[pid] = self._ball_dist_for_player(pid)
+            self._sec_start_ball_dist[pid] = self._sec_last_ball_dist[pid]
+            # Distance from the ball to THIS player's own attacking box (not
+            # the trainee's) — secondary players often attack the opposite
+            # end, so reusing self._start_ball_to_box_dist_m here would
+            # normalize prog/spd/prox against the wrong goal. See
+            # _ball_dist_to_opponent_box()'s player_id parameter.
+            self._sec_start_ball_to_box_dist_m[pid] = self._ball_dist_to_opponent_box(pid)
             self._sec_ball_touched[pid] = False
+            # Record stamina at episode start for THIS secondary player, same
+            # treatment as the trainee above — see
+            # _compute_phase1_reward_for_player().
+            try:
+                self._sec_start_stamina[pid] = self._loop.match.player_by_id(pid).stamina
+            except KeyError:
+                self._sec_start_stamina[pid] = 1.0
         return self._get_obs()
 
     def step(self) -> tuple[ObservationBatch, float, bool, StepInfo]:
@@ -394,21 +415,16 @@ class ScenarioEnv:
 
         timeout = self._episode_ticks >= int(self.max_episode_s / self._dt_s)
         if self.phase == 1:
-            # Cosine similarity between player velocity direction and direction to ball.
-            # Used for heading penalty: penalises running away from the ball.
-            _vel = player.velocity
-            _to_ball = match.ball.position - player.position
-            _speed = math.sqrt(_vel.x ** 2 + _vel.y ** 2)
-            _to_ball_len = math.sqrt(_to_ball.x ** 2 + _to_ball.y ** 2)
-            if _speed > 1e-3 and _to_ball_len > 1e-3:
-                _hdg_cos = (_vel.x * _to_ball.x + _vel.y * _to_ball.y) / (_speed * _to_ball_len)
-            else:
-                _hdg_cos = 1.0  # neutral: no penalty when stationary or at ball
-
-            _episode_done = done if 'done' in dir() else False
-            _stamina_used = max(0.0, self._trainee_start_stamina - player.stamina) if (box_terminal or opponent_box_terminal or timeout) else 0.0
-
-            reward, self.last_reward_components = phase1_reward(
+            # Routes through the SINGLE shared _compute_phase1_reward_for_player()
+            # method (see its docstring) — trainee and every secondary player
+            # call the exact same code path, so per-player inputs (speed,
+            # heading cosine, stamina used) can never silently diverge between
+            # the two again.
+            reward, self.last_reward_components = self._compute_phase1_reward_for_player(
+                player_id=self.trainee_player_id,
+                player_obj=player,
+                ball_pos=match.ball.position,
+                start_stamina=self._trainee_start_stamina,
                 prev_ball_dist=prev_ball_dist,
                 curr_ball_dist=curr_ball_dist,
                 has_possession_now=trainee_has_possession_now,
@@ -418,15 +434,10 @@ class ScenarioEnv:
                 ball_went_out_after_touch=ball_went_out,
                 illegal_action_attempted=info.illegal_action,
                 reached_opponent_box_with_possession=box_terminal,
-                cfg=self._reward_cfg["phase1"],
-                time_fraction_remaining=1.0 - self._episode_ticks / self._max_episode_ticks,
+                start_ball_dist_m=self._start_ball_dist_m,
                 start_ball_to_box_dist_m=self._start_ball_to_box_dist_m,
                 opponent_reached_trainee_box=opponent_box_terminal,
                 timed_out=timeout and not box_terminal and not opponent_box_terminal and not trial_ended_this_step,
-                ball_dist_to_opponent_box_m=self._ball_dist_to_opponent_box(),
-                heading_cos_sim=_hdg_cos,
-                player_speed_mps=_speed,
-                stamina_used=_stamina_used,
                 episode_done=box_terminal or opponent_box_terminal or timeout,
             )
         else:
@@ -507,7 +518,17 @@ class ScenarioEnv:
             sec_box_terminal = sec_in_atk_box and match.ball.possessed_by == pid
 
             if self.phase == 1:
-                sec_reward, _sec_comps = phase1_reward(
+                # Routes through the SAME shared _compute_phase1_reward_for_player()
+                # method used by the trainee above — see its docstring. This
+                # is what guarantees secondary players get identical
+                # heading/appr_sq/stamina treatment to the trainee; do not
+                # revert to calling phase1_reward() directly here.
+                sec_episode_done = sec_box_terminal or box_terminal or timeout
+                sec_reward, _sec_comps = self._compute_phase1_reward_for_player(
+                    player_id=pid,
+                    player_obj=sec_player,
+                    ball_pos=match.ball.position,
+                    start_stamina=self._sec_start_stamina.get(pid, 1.0),
                     prev_ball_dist=pre["prev_ball_dist"],
                     curr_ball_dist=sec_curr_ball_dist,
                     has_possession_now=sec_has_poss_now,
@@ -517,12 +538,11 @@ class ScenarioEnv:
                     ball_went_out_after_touch=sec_ball_went_out,
                     illegal_action_attempted=sec_player.ai.last_transition.get("illegal_action", False),
                     reached_opponent_box_with_possession=sec_box_terminal,
-                    cfg=self._reward_cfg["phase1"],
-                    time_fraction_remaining=1.0 - self._episode_ticks / self._max_episode_ticks,
-                    start_ball_to_box_dist_m=self._start_ball_to_box_dist_m,
+                    start_ball_dist_m=self._sec_start_ball_dist.get(pid, 1.0),
+                    start_ball_to_box_dist_m=self._sec_start_ball_to_box_dist_m.get(pid, 1.0),
                     opponent_reached_trainee_box=box_terminal,  # from sec's POV, trainee winning = sec losing
                     timed_out=timeout and not sec_box_terminal and not box_terminal and not trial_ended_this_step,
-                    ball_dist_to_opponent_box_m=self._ball_dist_to_opponent_box(),
+                    episode_done=sec_episode_done,
                 )
             else:
                 sec_reward = 0.0
@@ -567,12 +587,101 @@ class ScenarioEnv:
     def _ball_dist_to_trainee(self) -> float:
         return self._ball_dist_for_player(self.trainee_player_id)
 
-    def _ball_dist_to_opponent_box(self) -> float:
-        """Distance from the ball to the near edge of the opponent's box at call time."""
+    @staticmethod
+    def _player_speed_and_heading_cos(player_obj, ball_pos) -> tuple[float, float]:
+        """Player speed (m/s) and cos-sim of velocity vs direction-to-ball.
+
+        Shared by ALL phase-1 reward computations (trainee AND every
+        secondary player) via _compute_phase1_reward_for_player() below —
+        do not inline this logic at a second call site. Having two separate
+        inline copies of this is exactly how the heading/appr_sq/stamina
+        terms silently went missing for secondary players previously (see
+        ai/knowledge.md "Reward parity" note) — a single shared helper makes
+        that class of bug structurally impossible to reintroduce.
+        """
+        _vel = player_obj.velocity
+        _to_ball = ball_pos - player_obj.position
+        _speed = math.sqrt(_vel.x ** 2 + _vel.y ** 2)
+        _to_ball_len = math.sqrt(_to_ball.x ** 2 + _to_ball.y ** 2)
+        if _speed > 1e-3 and _to_ball_len > 1e-3:
+            _cos = (_vel.x * _to_ball.x + _vel.y * _to_ball.y) / (_speed * _to_ball_len)
+        else:
+            _cos = 1.0  # neutral: no penalty when stationary or at ball
+        return _speed, _cos
+
+    def _compute_phase1_reward_for_player(
+        self,
+        *,
+        player_id: str,
+        player_obj,
+        ball_pos,
+        start_stamina: float,
+        prev_ball_dist: float,
+        curr_ball_dist: float,
+        has_possession_now: bool,
+        gained_possession_this_step,
+        lost_possession_this_step,
+        ball_progress_toward_goal_m: float,
+        ball_went_out_after_touch: bool,
+        illegal_action_attempted: bool,
+        reached_opponent_box_with_possession: bool,
+        start_ball_dist_m: float,
+        start_ball_to_box_dist_m: float,
+        opponent_reached_trainee_box: bool,
+        timed_out: bool,
+        episode_done: bool,
+    ) -> tuple[float, dict[str, float]]:
+        """SINGLE call site for phase1_reward(), used for the trainee AND
+        every secondary player. All per-player-derived inputs (speed,
+        heading cosine, stamina used, box-distance) are computed HERE, once,
+        so trainee and secondary players are structurally guaranteed to
+        receive identical treatment — see ai/knowledge.md "Reward parity"
+        note. Do not call phase1_reward() directly from anywhere else in
+        this file; route through this method instead, even if it means
+        passing a few extra already-known values as kwargs. In particular,
+        every caller MUST pass player_id/start_ball_to_box_dist_m explicitly
+        — the trainee's own attacking box and a secondary player's own
+        attacking box are generally on OPPOSITE ends of the pitch, so
+        reusing one player's box-distance for another silently normalizes
+        their prog/spd/prox terms against the wrong goal.
+        """
+        _speed, _hdg_cos = self._player_speed_and_heading_cos(player_obj, ball_pos)
+        _stamina_used = max(0.0, start_stamina - player_obj.stamina) if episode_done else 0.0
+        return phase1_reward(
+            prev_ball_dist=prev_ball_dist,
+            curr_ball_dist=curr_ball_dist,
+            has_possession_now=has_possession_now,
+            gained_possession_this_step=gained_possession_this_step,
+            lost_possession_this_step=lost_possession_this_step,
+            ball_progress_toward_goal_m=ball_progress_toward_goal_m,
+            ball_went_out_after_touch=ball_went_out_after_touch,
+            illegal_action_attempted=illegal_action_attempted,
+            reached_opponent_box_with_possession=reached_opponent_box_with_possession,
+            cfg=self._reward_cfg["phase1"],
+            time_fraction_remaining=1.0 - self._episode_ticks / self._max_episode_ticks,
+            start_ball_to_box_dist_m=start_ball_to_box_dist_m,
+            start_ball_dist_m=start_ball_dist_m,
+            opponent_reached_trainee_box=opponent_reached_trainee_box,
+            timed_out=timed_out,
+            ball_dist_to_opponent_box_m=self._ball_dist_to_opponent_box(player_id),
+            episode_done=episode_done,
+        )
+
+    def _ball_dist_to_opponent_box(self, player_id: Optional[str] = None) -> float:
+        """Distance from the ball to the near edge of *player_id*'s OWN
+        opponent's box at call time (i.e. the box *player_id* is attacking).
+
+        Defaults to the trainee for convenience at call sites that only ever
+        care about the trainee, but _compute_phase1_reward_for_player() ALWAYS
+        passes an explicit player_id — secondary players frequently attack
+        the opposite end of the pitch from the trainee, so silently reusing
+        the trainee's box-distance here would normalize a secondary player's
+        prog/spd/prox reward terms against the wrong goal entirely.
+        """
         try:
             match = self._loop.match
             ball = match.ball.position
-            player = match.player_by_id(self.trainee_player_id)
+            player = match.player_by_id(player_id if player_id is not None else self.trainee_player_id)
             pitch = match.pitch
             # Opponent box near edge: half_length - box_length_m from centre
             box_edge_x = pitch.half_length - pitch.box_length_m

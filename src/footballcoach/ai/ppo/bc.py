@@ -386,6 +386,92 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
 
 
 # ---------------------------------------------------------------------------
+# BC loss floor (analytic minimum achievable loss under label smoothing)
+# ---------------------------------------------------------------------------
+
+def compute_bc_loss_floor(
+    labels: torch.Tensor,
+    pos_weight_kick: float = 1.0,
+    pos_weight_tackle_attempt: float = 1.0,
+    dec_weight: float = 1.0,
+    exec_weight: float = 1.0,
+    dec_label_smoothing: float = 0.0,
+    exec_label_smoothing: float = 0.0,
+    has_exec: bool = True,
+) -> float:
+    """Analytic minimum achievable ``bc_loss_from_tensor`` value for this batch.
+
+    Label smoothing (and, for positive rows, ``pos_weight``) makes the
+    BCE-optimal prediction ``p* = y'`` (the smoothed target) rather than the
+    hard 0/1 label, so the achievable minimum loss is no longer 0 — it's the
+    (weighted) binary entropy of each smoothed target:
+    ``H(y') = -y'*ln(y') - (1-y')*ln(1-y')``, scaled by ``pos_weight`` on
+    positive-labelled rows (matching ``F.binary_cross_entropy_with_logits``'s
+    ``pos_weight`` semantics, which multiplies the WHOLE per-sample loss on
+    positive rows, not just the ``-log(p)`` term).
+
+    Only the smoothed Bernoulli BCE heads have a nonzero floor — the cosine
+    (direction) and MSE (region/kick_power/kick_spin) terms have a true
+    floor of 0 regardless of smoothing, since they aren't binary-target BCE.
+    This is therefore a lower bound on ``bc_loss_from_tensor``'s return value
+    for the same batch/config, useful as ``bc_adj = bc_loss - floor`` so
+    epoch-to-epoch / config-to-config loss comparisons aren't confounded by
+    a smoothing-only additive offset (see ai_trainer_knowledge.md discussion
+    on BC loss and label smoothing).
+
+    Args:
+        labels: (N, BC_LABEL_DIM) float32 tensor, same batch passed to
+            ``bc_loss_from_tensor``.
+        has_exec: whether the caller passed a real ``exec_heads`` (i.e.
+            Phase 1/2/3, not Phase 0's decision-only path) — mirrors
+            ``bc_loss_from_tensor``'s ``exec_heads is None`` branch.
+
+    Returns:
+        Scalar float floor value, or 0.0 if no valid rows.
+    """
+    valid = labels[:, _I_VALID] > 0.5
+    if not valid.any():
+        return 0.0
+
+    def _floor_bce(col: int, pos_weight: float = 1.0, smoothing: float = 0.0) -> torch.Tensor:
+        y = labels[:, col]
+        if smoothing <= 0.0:
+            return torch.zeros_like(y)
+        y_prime = y * (1.0 - smoothing) + 0.5 * smoothing
+        eps = 1e-12
+        h = -(
+            y_prime * torch.log(y_prime.clamp_min(eps))
+            + (1.0 - y_prime) * torch.log((1.0 - y_prime).clamp_min(eps))
+        )
+        if pos_weight != 1.0:
+            w = torch.where(y > 0.5, torch.full_like(y, pos_weight), torch.ones_like(y))
+            h = h * w
+        return h
+
+    dec_floor = (
+        _floor_bce(_I_SHOOT,    smoothing=dec_label_smoothing)
+        + _floor_bce(_I_PASS,    smoothing=dec_label_smoothing)
+        + _floor_bce(_I_MOVE,    smoothing=dec_label_smoothing)
+        + _floor_bce(_I_TACKLE,  smoothing=dec_label_smoothing)
+        + _floor_bce(_I_GP_EXTRA, smoothing=dec_label_smoothing)
+        + _floor_bce(_I_MARK,    smoothing=dec_label_smoothing)
+        + _floor_bce(_I_HOLD,    smoothing=dec_label_smoothing)
+    )
+    total_floor = dec_weight * dec_floor
+
+    if has_exec:
+        exec_floor = (
+            _floor_bce(_I_EXEC_MOVE,      smoothing=exec_label_smoothing)
+            + _floor_bce(_I_SPRINT,         smoothing=exec_label_smoothing)
+            + _floor_bce(_I_KICK_THIS_TICK, pos_weight_kick, smoothing=exec_label_smoothing)
+            + _floor_bce(_I_TACKLE_ATTEMPT, pos_weight_tackle_attempt, smoothing=exec_label_smoothing)
+        )
+        total_floor = total_floor + exec_weight * exec_floor
+
+    return float(total_floor[valid].mean())
+
+
+# ---------------------------------------------------------------------------
 # BC loss computation
 # ---------------------------------------------------------------------------
 

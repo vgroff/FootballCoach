@@ -15,19 +15,42 @@ phase1_reward() returns a (float, dict[str, float]) tuple where the dict
 breaks the total down by source key:
   appr  — linear ball approach bonus (potential-based; telescopes over an
           episode to net distance closed, NOT sensitive to how fast — see
-          appr_sq below for a term that actually rewards speed)
-  retr  — linear ball retreat penalty (symmetric to appr)
-  appr_sq — squared closing/retreating speed bonus/penalty (asymmetric
-          coefficients: ball_approach_speed_bonus / ball_retreat_speed_penalty).
-          Unlike appr/retr, this is NOT a linear potential-based term, so it
-          does NOT telescope: closing the same net distance in fewer/faster
-          steps yields strictly more total reward than doing it slowly,
-          because sum(x_i^2) >= (sum(x_i))^2 / n with equality only when
-          every step closes the same amount. Use this (not appr) when you
-          want to reward genuine speed rather than just final position.
+          appr_sq below for a term that actually rewards speed). Normalized
+          by start_ball_dist_m (the ball-to-player distance at episode
+          start) so total achievable reward from this term is ~coef
+          regardless of how far the ball happened to spawn — otherwise a
+          scenario with a larger spawn distance hands out more "free"
+          closing-distance reward purely from randomness, not skill.
+  retr  — linear ball retreat penalty (symmetric formula to appr, but
+          DELIBERATELY NOT normalized — a penalty's absolute weight should
+          be scenario-independent: normalizing it would make a wasted/wrong-
+          direction metre cheaper in large-spawn-distance episodes than in
+          small ones, which is backwards for a deterrent).
+  appr_sq — squared bonus/penalty for the PLAYER's own speed toward/away
+          from the ball (asymmetric coefficients: ball_approach_speed_bonus /
+          ball_retreat_speed_penalty). Uses player_speed_mps * heading_cos_sim
+          (the scalar projection of the player's own velocity onto the
+          direction-to-ball axis) — NOT prev_ball_dist - curr_ball_dist (the
+          gap-closing rate), which is contaminated by the ball's own motion
+          (e.g. a hard clearance kick moves the ball away fast independent of
+          anything the player did, producing large uncontrollable swings that
+          have nothing to do with player skill). Unlike appr/retr, this is
+          NOT a linear potential-based term, so it does NOT telescope:
+          closing the same net distance in fewer/faster steps yields
+          strictly more total reward than doing it slowly, because
+          sum(x_i^2) >= (sum(x_i))^2 / n with equality only when every step
+          closes the same amount. Use this (not appr) when you want to
+          reward genuine speed rather than just final position. Same
+          normalization asymmetry as appr/retr above: the approach
+          (closing-fast) side is normalized by start_ball_dist_m before
+          squaring, the retreat (retreating-fast) side is not.
   hdg   — heading penalty (moving away from the ball)
   poss  — gain possession bonus
-  prog  — ball progress while in possession
+  prog  — ball progress while in possession (normalized by
+          start_ball_to_box_dist_m — same reference distance already used by
+          spd/prox below; NOT split into an asymmetric forward/backward pair
+          like appr/retr, since progress is a single signed quantity with
+          one coefficient, not two)
   out   — ball out of bounds penalty
   ill   — illegal action penalty
   box   — box possession terminal
@@ -35,7 +58,9 @@ breaks the total down by source key:
   lpos  — loss of possession penalty
   lterm — loss terminal (opponent reaches trainee box)
   tout  — timeout penalty
-  prox  — proximity bonus on timeout
+  prox  — proximity bonus on timeout. Normalized by start_ball_to_box_dist_m
+          (previously a fixed 30m constant, inconsistent with spd's use of
+          the actual per-episode start distance)
   stam  — stamina usage penalty (episode-end only)
 """
 from __future__ import annotations
@@ -53,6 +78,7 @@ def phase1_reward(
     cfg: dict,
     time_fraction_remaining: float = 0.0,
     start_ball_to_box_dist_m: float = 1.0,
+    start_ball_dist_m: float = 1.0,
     opponent_reached_trainee_box: bool = False,
     lost_possession_this_step: bool | int = False,
     timed_out: bool = False,
@@ -73,12 +99,21 @@ def phase1_reward(
     r = 0.0
     comps: dict[str, float] = {}
 
+    # Floor the normalizing distance so a ball spawning ~on top of the player
+    # doesn't create a divide-by-near-zero blow-up in the normalized terms.
+    _norm_ball_dist = max(start_ball_dist_m, 1.0)
+
     _delta = prev_ball_dist - curr_ball_dist  # positive = closing, negative = retreating
     if _delta >= 0:
-        appr_r = cfg.get("ball_approach_bonus", cfg.get("ball_distance_shaping", 0.002)) * _delta
+        # Approach (reward): normalized by start_ball_dist_m so the total
+        # achievable reward from closing distance is ~coef regardless of the
+        # episode's spawn distance (see module docstring).
+        appr_r = cfg.get("ball_approach_bonus", cfg.get("ball_distance_shaping", 0.002)) * (_delta / _norm_ball_dist)
         retr_r = 0.0
     else:
         appr_r = 0.0
+        # Retreat (penalty): deliberately NOT normalized — a deterrent's
+        # absolute weight should be scenario-independent (see module docstring).
         retr_r = cfg.get("ball_retreat_penalty", cfg.get("ball_distance_shaping", 0.002)) * _delta
     r += appr_r + retr_r
     comps["appr"] = appr_r
@@ -87,24 +122,37 @@ def phase1_reward(
     # Squared closing-speed bonus/penalty: rewards CLOSING FAST, penalises
     # RETREATING FAST — symmetric in shape but with independently tunable
     # coefficients (mirrors the appr/retr asymmetric-coefficient pattern
-    # above). appr/retr are linear in _delta and are potential-based (their
-    # sum over an episode telescopes to coef * (start_dist - end_dist)) — a
-    # player who closes 10m in 2 fast steps and one who closes the same 10m
-    # in 20 slow steps earn IDENTICAL total appr/retr reward. Squaring the
-    # per-step delta breaks that telescoping: concentrating the same net
-    # distance into fewer/faster steps yields strictly more total reward
+    # above). Unlike appr/retr (linear in _delta, potential-based, telescopes
+    # over an episode to coef * (start_dist - end_dist) — a player who
+    # closes 10m in 2 fast steps and one who closes the same 10m in 20 slow
+    # steps earn IDENTICAL total appr/retr reward), squaring breaks that
+    # telescoping: concentrating the same net distance into fewer/faster
+    # steps yields strictly more total reward
     # (sum(x_i^2) >= (sum(x_i))^2/n, equality only when every step is equal).
-    # _delta = prev_ball_dist - curr_ball_dist is already the ball-relative
-    # closing speed (distance closed this step, i.e. player speed projected
-    # onto the direction to the ball) — not raw player speed — so this term
-    # only ever fires along the ball axis, never on lateral/perpendicular
-    # motion. Coefficients 0.0 (default) disable each side independently.
+    #
+    # IMPORTANT: uses the PLAYER's own speed toward the ball
+    # (player_speed_mps * heading_cos_sim — the scalar projection of the
+    # player's velocity onto the direction-to-ball axis), NOT _delta
+    # (prev_ball_dist - curr_ball_dist). _delta measures the closing rate of
+    # the GAP, i.e. the *relative* velocity between player and ball, and is
+    # contaminated by the ball's own motion (e.g. a hard clearance kick moves
+    # the ball away fast independent of anything the player did, producing
+    # large uncontrollable _delta swings — and once squared, huge outlier
+    # penalties — that have nothing to do with player skill).
+    # player_speed_mps * heading_cos_sim depends only on the player's own
+    # velocity, so ball motion no longer affects this term. Coefficients 0.0
+    # (default) disable each side independently. Approach side normalizes by
+    # start_ball_dist_m BEFORE squaring (dividing first then squaring gives
+    # the dimensionally-correct v^2/start_dist^2 scaling, not v^2/start_dist).
+    # Retreat side is deliberately left unnormalized — same asymmetric
+    # rationale as appr/retr above.
+    _player_speed_toward_ball = player_speed_mps * heading_cos_sim
     _appr_sq_coef = float(cfg.get("ball_approach_speed_bonus", 0.0))
     _retr_sq_coef = float(cfg.get("ball_retreat_speed_penalty", _appr_sq_coef))
-    if _delta > 0.0:
-        appr_sq_r = _appr_sq_coef * (_delta ** 2)
-    elif _delta < 0.0:
-        appr_sq_r = -_retr_sq_coef * (_delta ** 2)
+    if _player_speed_toward_ball > 0.0:
+        appr_sq_r = _appr_sq_coef * ((_player_speed_toward_ball / _norm_ball_dist) ** 2)
+    elif _player_speed_toward_ball < 0.0:
+        appr_sq_r = -_retr_sq_coef * (_player_speed_toward_ball ** 2)
     else:
         appr_sq_r = 0.0
     r += appr_sq_r
@@ -132,7 +180,13 @@ def phase1_reward(
     r += poss_r
     comps["poss"] = poss_r
 
-    prog_r = cfg["ball_progress_scale"] * ball_progress_toward_goal_m if has_possession_now else 0.0
+    # Normalized by start_ball_to_box_dist_m (same reference distance used
+    # by spd/prox below) so total achievable progress reward over an episode
+    # is ~ball_progress_scale regardless of how far the ball started from
+    # the opponent box. Single symmetric term (forward and backward progress
+    # share one coefficient) — not split into an asymmetric pair like appr/retr.
+    _norm_box_dist = max(start_ball_to_box_dist_m, 1.0)
+    prog_r = cfg["ball_progress_scale"] * (ball_progress_toward_goal_m / _norm_box_dist) if has_possession_now else 0.0
     r += prog_r
     comps["prog"] = prog_r
 
@@ -173,11 +227,18 @@ def phase1_reward(
     prox_r = 0.0
     if timed_out:
         tout_r = cfg.get("timeout_penalty", 0.0)
-        # Proximity bonus on timeout: consolation for how close you got with the ball.
-        # scale * max(0, 1 - dist_to_box / 30m)  → 0 if 30m+ away, scale if at box edge.
+        # Proximity bonus on timeout: consolation for how close you got with
+        # the ball. Normalized by start_ball_to_box_dist_m (the episode's own
+        # ball-to-box distance at the start) rather than a fixed 30m constant
+        # — consistent with spd's dist_weight above, which already
+        # self-references the same per-episode start distance. A fixed 30m
+        # denominator would always read a large-spawn-distance episode as
+        # "far" even relative to its own start.
+        # scale * max(0, 1 - dist_to_box / start_ball_to_box_dist_m) → 0 at
+        # start distance or farther, scale at the box edge.
         prox_scale = float(cfg.get("proximity_bonus_scale", 0.0))
         if prox_scale > 0.0:
-            prox = max(0.0, 1.0 - ball_dist_to_opponent_box_m / 30.0)
+            prox = max(0.0, 1.0 - ball_dist_to_opponent_box_m / _norm_box_dist)
             prox_r = prox_scale * prox
     r += tout_r + prox_r
     comps["tout"] = tout_r

@@ -9,7 +9,11 @@
     "_comment_brake_min": "Brake-to-turn and close-prox checks only fire above this ground speed. Below it, turn rate is already high enough to pivot freely without braking.",
     "close_prox_radius_m": 6.0,
     "close_prox_cos_threshold": 0.3,
-    "_comment_close_prox": "Lateral-overshoot brake: within close_prox_radius_m of target, if velocity cos-sim < threshold, force STANDSTILL. Prevents a player arriving at pace from the wrong angle blowing past and orbiting. cos 0.3 = ~73° off-axis."
+    "_comment_close_prox": "Lateral-overshoot brake: within close_prox_radius_m of target, if velocity cos-sim < threshold, force STANDSTILL. Prevents a player arriving at pace from the wrong angle blowing past and orbiting. cos 0.3 = ~73° off-axis.",
+    "sprint_to_ball_clearance_margin": 0.65,
+    "_comment_sprint_to_ball": "Rules-AI sprint decision: sprint if opponent_sprint_ETA * margin < self_jog_ETA. <1.0 = aggressive (sprint even when comfortably ahead); 1.0 = sprint only when opponent wins the exact race; >1.0 = conservative (only sprint when clearly losing — opponent must be that much faster).",
+    "intercept_overshoot_frac": 0.1,
+    "_comment_intercept_overshoot": "Loose-ball intercept margin: player aims this fraction of their distance-to-intercept past the intercept point, in the direction of ball travel. 0.0 = run exactly to the intercept (player and ball arrive simultaneously); 0.15 = player aims 15% further so they arrive before the ball and have time to set their feet. Only applied when the ball is moving (velocity > 0.1 m/s)."
   },
 
   "repulsion": {
@@ -27,17 +31,18 @@
   "marking": {
     "_comment": "MarkOrder AI behaviour: marker stands between a target opposition player and the ball, and switches to GetPossession-style chase/tackle when the target has the ball or the ball comes within mark_intercept_radius_m. mark_standoff_m: distance from the target (toward the ball) the marker tries to hold.",
     "mark_intercept_radius_m": 4.0,
-    "mark_standoff_m": 1.5  },
+    "mark_standoff_m": 1.5  
+  },
 
   "push_kick": {
     "_comment": "MoveOrder push-kick: when push_kick_enabled=True the ball carrier kicks the ball ahead rather than dribbling, then sprints to it. Only fires when the remaining distance exceeds min_dist_m (so the player doesn't kick near the destination). The ball is kicked at speed_factor x the player's free-sprint speed. Opponents whose ETA to the landing spot is less than the carrier's ETA x clearance_margin are considered a threat — the kick is skipped if any such opponent exists.",
-    "dist_m": 6.5,
+    "dist_m": 15.0,
     "_comment_dist": "How far ahead (m) to kick the ball.",
-    "min_dist_m": 13.0,
+    "min_dist_m": 30.0,
     "_comment_min_dist": "Don't push-kick when this close to the destination.",
-    "speed_factor": 1.2,
+    "speed_factor": 1.1,
     "_comment_speed_factor": "Ball is kicked at speed_factor x carrier's free-sprint speed, ensuring it stays ahead of the running player.",
-    "clearance_margin": 2.1,
+    "clearance_margin": 2.5,
     "_comment_clearance": "ETA safety margin: if any opponent's ETA to landing spot < carrier's ETA x clearance_margin, skip the kick. 0.95 = 5% margin.",
     "max_heading_error_deg": 30.0,
     "_comment_heading": "Don't push-kick if the player's current heading differs from the kick direction by more than this many degrees. Prevents kicking sideways or backwards."

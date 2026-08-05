@@ -322,6 +322,17 @@ class Match:
         else:
             # Ball is loose — run to intercept; pickup via _update_loose_ball_pickup.
             intercept = self._intercept_target(player, self.ball.position, self.ball.velocity)
+            # Overshoot margin: aim past the intercept in the direction of ball travel so
+            # the player arrives slightly before the ball and has time to set their feet.
+            # Proportional to the player's current distance to intercept so the offset
+            # shrinks naturally as they close in (no overshoot on the final approach).
+            overshoot_frac = self.order_params.intercept_overshoot_frac
+            if overshoot_frac > 0.0:
+                ball_vel_xy = self.ball.velocity.xy()
+                ball_speed_xy = ball_vel_xy.length()
+                if ball_speed_xy > 0.1:
+                    dist_to_intercept = (intercept - player.position).length_xy()
+                    intercept = intercept + ball_vel_xy * (dist_to_intercept * overshoot_frac / ball_speed_xy)
             direction = intercept - player.position
             if direction.length_xy() <= self.pickup_radius_m:
                 return True  # at the ball — pickup will complete next tick

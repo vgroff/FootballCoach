@@ -53,6 +53,8 @@ class OrderLayerParams:
     brake_min_speed_mps: float
     close_prox_radius_m: float
     close_prox_cos_threshold: float
+    sprint_to_ball_clearance_margin: float
+    intercept_overshoot_frac: float
 
     @staticmethod
     def from_config() -> "OrderLayerParams":
@@ -62,6 +64,8 @@ class OrderLayerParams:
             brake_min_speed_mps=d.get("brake_min_speed_mps", 2.0),
             close_prox_radius_m=d.get("close_prox_radius_m", 6.0),
             close_prox_cos_threshold=d.get("close_prox_cos_threshold", 0.3),
+            sprint_to_ball_clearance_margin=d.get("sprint_to_ball_clearance_margin", 1.0),
+            intercept_overshoot_frac=d.get("intercept_overshoot_frac", 0.0),
         )
 
 
@@ -194,7 +198,12 @@ def _gk_should_sprint(
         dist_ball_to_goal = abs(match.pitch.half_length - match.ball.position.x)
 
     t_ball = dist_ball_to_goal / vel_toward_goal
-    t_gk = dist_to_save / gk_top_speed if gk_top_speed > 0.1 else float("inf")
+    from footballcoach.engine.movement import effective_acceleration, sprint_eta
+    gk_accel = effective_acceleration(
+        match.movement_params, player.attributes.acceleration, player.stamina,
+        is_goalkeeper=True,
+    )
+    t_gk = sprint_eta(dist_to_save, player.speed_mps, gk_top_speed, gk_accel)
     return t_ball < t_gk * 2.0  # sprint if GK would otherwise be beaten
 
 
@@ -258,12 +267,14 @@ class MoveOrder:
                 max_heading_err = _math.radians(pk["max_heading_error_deg"])
                 heading_ok = abs(_angle_diff(player.heading_rad, kick_heading)) <= max_heading_err
                 if heading_ok:
-                    kick_dist = min(pk_dist, dist - self.arrival_tolerance_m)
+                    dist_jitter = match.rng.uniform(0.85, 1.15)
+                    speed_jitter = match.rng.uniform(0.85, 1.15)
+                    kick_dist = min(pk_dist * dist_jitter, dist - self.arrival_tolerance_m)
                     push_target = player.position + Vector3(
                         push_dir.x * kick_dist, push_dir.y * kick_dist, 0.0
                     )
                     if self._push_kick_is_clear(player, match, push_target, kick_dist, pk["clearance_margin"]):
-                        self._do_push_kick(player, match, push_target, pk["speed_factor"])
+                        self._do_push_kick(player, match, push_target, pk["speed_factor"] * speed_jitter)
                         # Immediately set movement intent: sprint free (no ball this tick).
                         adj_dir, speed_mode = _compute_movement_intent(
                             player, direction, match,
@@ -325,17 +336,22 @@ class MoveOrder:
         clearance_margin: float,
     ) -> bool:
         """Return True if no opponent would beat the carrier to push_target."""
-        from footballcoach.engine.movement import effective_top_speed
+        from footballcoach.engine.movement import (
+            effective_acceleration, effective_top_speed, sprint_eta,
+        )
         from footballcoach.entities.player import PlayerState
 
-        self_sprint = max(
+        self_v_top = max(
             effective_top_speed(
                 match.movement_params, player.attributes.top_speed,
                 player.stamina, has_ball=False,
             ),
             0.1,
         )
-        self_eta = kick_dist_m / self_sprint
+        self_accel = effective_acceleration(
+            match.movement_params, player.attributes.acceleration, player.stamina,
+        )
+        self_eta = sprint_eta(kick_dist_m, player.speed_mps, self_v_top, self_accel)
 
         for other in match.players:
             if other.player_id == player.player_id:
@@ -347,14 +363,20 @@ class MoveOrder:
             dist_other = (push_target - other.position).length_xy()
             if dist_other > kick_dist_m + 10.0:  # rough radius pre-filter
                 continue
-            their_sprint = max(
+            their_v_top = max(
                 effective_top_speed(
                     match.movement_params, other.attributes.top_speed,
                     other.stamina, has_ball=False,
                 ),
                 0.1,
             )
-            if dist_other / their_sprint < self_eta * clearance_margin:
+            their_accel = effective_acceleration(
+                match.movement_params, other.attributes.acceleration, other.stamina,
+            )
+            # Opponents start from standstill (v0=0) — conservative: assumes they
+            # react instantly and run the optimal line toward the landing spot.
+            their_eta = sprint_eta(dist_other, 0.0, their_v_top, their_accel)
+            if their_eta < self_eta * clearance_margin:
                 return False  # opponent beats us there — don't kick
         return True
 

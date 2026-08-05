@@ -23,7 +23,7 @@ import random
 
 from footballcoach.entities.player import Player, PlayerAI, PlayerState, Team
 from footballcoach.engine.match import Match
-from footballcoach.engine.movement import effective_top_speed
+from footballcoach.engine.movement import effective_acceleration, effective_top_speed, sprint_eta
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import (
     GetPossessionOrder,
@@ -93,7 +93,13 @@ def _should_sprint_to_ball(player: Player, match: Match) -> bool:
         has_ball=False,
     ) * 0.5
     jog_speed = max(jog_speed, 0.1)
-    eta_self_jog = dist_self / jog_speed
+    # Self ETA at jog: already moving (use current speed, capped to jog target)
+    self_v0 = min(player.speed_mps, jog_speed)
+    # No accel shortcut for jog — treat as cruising at jog_speed from v0
+    eta_self_jog = dist_self / jog_speed if self_v0 >= jog_speed else sprint_eta(
+        dist_self, self_v0, jog_speed,
+        effective_acceleration(match.movement_params, player.attributes.acceleration, player.stamina),
+    )
 
     has_opponents = False
     for opp in match.players:
@@ -105,7 +111,7 @@ def _should_sprint_to_ball(player: Player, match: Match) -> bool:
             continue
         has_opponents = True
         dist_opp = (ball_pos - opp.position).length()
-        opp_sprint_speed = max(
+        opp_v_top = max(
             effective_top_speed(
                 match.movement_params,
                 opp.attributes.top_speed,
@@ -114,7 +120,11 @@ def _should_sprint_to_ball(player: Player, match: Match) -> bool:
             ),
             0.1,
         )
-        if dist_opp / opp_sprint_speed < eta_self_jog:
+        opp_accel = effective_acceleration(
+            match.movement_params, opp.attributes.acceleration, opp.stamina,
+        )
+        opp_eta = sprint_eta(dist_opp, opp.speed_mps, opp_v_top, opp_accel)
+        if opp_eta * match.order_params.sprint_to_ball_clearance_margin < eta_self_jog:
             return True  # opponent wins the race if we jog
 
     # No opponents present — default to sprinting.

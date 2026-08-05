@@ -131,8 +131,8 @@
   },
   "control_time": {
     "_comment": "Time (s) for a player to bring a ball under control on first touch. See knowledge.md in engine/ for full derivation. Jump zone (above player_height_m=1.8m): outfield_jump_scale_at_max_reach multiplies the (height_factor-1) term at outfield_max_reach_height_m; GK's height_factor_scale interpolates toward gk jump_scale_at_max_reach at gk_max_reach_height_m.",
-    "t_base_s": 0.05,
-    "t_scale_s": 0.2,
+    "t_base_s": 0.04,
+    "t_scale_s": 0.17,
     "height_factor_knee": 1.0,
     "height_factor_waist": 1.5,
     "height_factor_head": 4.0,

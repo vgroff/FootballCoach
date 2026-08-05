@@ -166,13 +166,21 @@ class DemonstrationDataset:
         not_immobile_opp = self._labels[:, _I_OPPONENT_AI_TYPE] < (AI_TYPE_IMMOBILE - 0.5)
         return np.where(valid & not_immobile_opp)[0]
 
-    def compute_pos_weights(self) -> dict[str, float]:
+    def compute_pos_weights(self, max_weight: float | None = None) -> dict[str, float]:
         """Inverse-frequency weights for rare Bernoulli BC targets.
 
         weight = n_negative / max(n_positive, 1), matching
         ``torch.nn.functional.binary_cross_entropy_with_logits``'s
         ``pos_weight`` argument semantics (weight applied to the positive
         class term). Computed once over all valid rows in this dataset.
+
+        Args:
+            max_weight: optional cap on the raw inverse-frequency ratio.
+                ``None`` (default) = uncapped. Extreme class imbalance (e.g.
+                tackle_attempt at ~1:130) can push the auto-computed weight
+                high enough that a single positive example dominates the BC
+                gradient and drives the Bernoulli logit toward saturation —
+                see ai_config.json ``bc.pos_weight_max``.
         """
         valid = self.valid_indices()
         labels = self._labels[valid]
@@ -183,7 +191,10 @@ class DemonstrationDataset:
         ]:
             n_pos = float((labels[:, col] > 0.5).sum())
             n_neg = float(len(labels)) - n_pos
-            out[name] = n_neg / max(n_pos, 1.0)
+            weight = n_neg / max(n_pos, 1.0)
+            if max_weight is not None:
+                weight = min(weight, max_weight)
+            out[name] = weight
         return out
 
     def _compute_trivial_mask(

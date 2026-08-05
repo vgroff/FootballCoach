@@ -24,11 +24,14 @@ Extending training:
 Current notes:
 - " read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
 - train blockers:
+    - [] one thing puzzles me - the network in BC seems to have quite a presistently high error in tackle and kick
+    - [] !might no longer need the separate neural network if value is fixed now!
     - try just doing immobile first - can we improve?
     - [] make approach speed go both ways, reduce heading penalty (or change it?)
     - Evalulations both pre and during training should be seeded so that they're deterministically setup (with still a random match seed each time), and possibly should run more than once. There are some notes about seeding in agent_plans/ppo_scenario_seedppo.md, so read that first, but you'd only need it on the evaluations for now, just make it extensible/generalisable if possible. We might also want multiple runs of the same seeded trial, sinec matches and PPO are random
     - Do the seeding thing somehow, or have pre-built scenarios, or something like that. Or maybe use the same exact scenario(s) but add a bit of noise to everything
         - [?] Could already do this by just having very tight params? Maybe add some more bounds first?
+            - e.g. starting player dist from centre
     - [Y] can we get more of the direction-based logs output angles and the like rather than [x,y]? or at least have both? e.g. exec log std and mean delta in degrees too, the d_move/d_kick, all that kind of stuff
         - can we get some measure of delta over the whole epoch too? instead of op step?
     - [Y] can we get the advanatge on the worst performance logs?
@@ -144,7 +147,9 @@ NB:
 - footballer height should vary - and therefore jump height
 - At some point ask an AI to: "read through everything - except for now, the ai folder (but do read rules_ai.py) and offer suggestions for refactors or cleanups, duplicate code/logic, string literals, inconsistent documentation/knowledge files, comments and criticisms on structure, easy wins, possible bugs and edge cases, test cases etc... Even if you see something is already explained/documented, if you're not convinced by the explanation or if it still seems dodgy/potentially wrong, bring it up". Do this before extending the game too much beyond the pitch
     - WE DID THIS! It's in code_analysis, a buch of it is implemented but not all
-    - Once, and we should again, with the ai stuff, and also a non-code one on the football side of things
+    - Once, and we should again, with the ai stuff, and also a non-code/physics one on the football side of things, one on the UI side etc..
+        - also get them to check knowledge doc correctness
+    - check knolwedge doc agreement (between themselves)
 - certain things in physics.json should probably be in attributes.json or a differently names config file, we should probably hve an entire audit of these and figure out how best to organise the files/config params
 
 

@@ -68,7 +68,15 @@ class TestPhase1Reward:
         assert total == pytest.approx(0.0, abs=1e-7)
 
     def test_closing_distance_gives_approach_reward(self):
-        total, comps = self._call(prev_ball_dist=10.0, curr_ball_dist=5.0)
+        """appr is driven by ball-distance delta; appr_sq is driven
+        SEPARATELY by the player's own speed toward the ball
+        (player_speed_mps * heading_cos_sim), not by the distance delta —
+        pass a matching player_speed_mps/heading_cos_sim to exercise it.
+        """
+        total, comps = self._call(
+            prev_ball_dist=10.0, curr_ball_dist=5.0,
+            player_speed_mps=5.0, heading_cos_sim=1.0,
+        )
         expected_appr = _CFG1["ball_approach_bonus"] * 5.0
         expected_appr_sq = _CFG1.get("ball_approach_speed_bonus", 0.0) * (5.0 ** 2)
         expected = expected_appr + expected_appr_sq
@@ -184,31 +192,48 @@ class TestPhase1Reward:
         assert total < 0.0
 
     def test_proximity_bonus_on_timeout_increases_with_closeness(self):
-        """Ball near the box on timeout earns a larger prox bonus than ball far away."""
+        """Ball near the box on timeout earns a larger prox bonus than ball far away.
+
+        prox is normalized by start_ball_to_box_dist_m (the episode's own
+        ball-to-box distance at the start), so this must be passed as a
+        realistic value — leaving it at the 1.0 default would make "near"
+        (dist=1.0) and "far" (dist=9999.0) both saturate to comps["prox"]=0.0.
+        proximity_bonus_scale is 0.0 in the live config (disabled), so this
+        test overrides it locally to a non-zero value to exercise the formula.
+        """
+        _cfg_prox = {**_CFG1, "proximity_bonus_scale": 0.65}
         _, comps_near = phase1_reward(
             prev_ball_dist=1.0, curr_ball_dist=1.0,
             has_possession_now=False, gained_possession_this_step=False,
             ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
             illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1, timed_out=True, ball_dist_to_opponent_box_m=1.0,
+            cfg=_cfg_prox, timed_out=True, ball_dist_to_opponent_box_m=1.0,
+            start_ball_to_box_dist_m=30.0,
         )
         _, comps_far = phase1_reward(
             prev_ball_dist=1.0, curr_ball_dist=1.0,
             has_possession_now=False, gained_possession_this_step=False,
             ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
             illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1, timed_out=True, ball_dist_to_opponent_box_m=9999.0,
+            cfg=_cfg_prox, timed_out=True, ball_dist_to_opponent_box_m=9999.0,
+            start_ball_to_box_dist_m=30.0,
         )
         assert comps_near["prox"] > comps_far["prox"]
 
     def test_reward_is_additive(self):
-        """Total matches sum of components and matches expected arithmetic."""
+        """Total matches sum of components and matches expected arithmetic.
+
+        appr_sq is driven by the player's own speed toward the ball
+        (player_speed_mps * heading_cos_sim), independent of the ball-gap
+        delta — pass player_speed_mps=5.0, heading_cos_sim=1.0 to exercise it
+        with the same 5.0 magnitude the old _delta-based test used.
+        """
         total, comps = phase1_reward(
             prev_ball_dist=10.0, curr_ball_dist=5.0,
             has_possession_now=True, gained_possession_this_step=True,
             ball_progress_toward_goal_m=2.0, ball_went_out_after_touch=False,
             illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1,
+            cfg=_CFG1, player_speed_mps=5.0, heading_cos_sim=1.0,
         )
         assert total == pytest.approx(sum(comps.values()), rel=1e-5)
         expected = (

@@ -387,8 +387,11 @@ def main() -> None:
                     experiment_separate_value_net=args.experiment_separate_value_net,
                 )
 
-    # Save a checkpoint of the pre-trained model before PPO starts
-    if not args.checkpoint and not args.from_pretrained and not args.pretrain_from_checkpoint and checkpoint_dir is not None:
+    # Save a checkpoint of the pre-trained model before PPO starts.
+    # --checkpoint/--from-pretrained skip pretraining entirely (nothing new to save),
+    # but --pretrain-from-checkpoint/--latest-pretrain DO run a fresh BC/value
+    # pretraining pass on top of loaded weights, so they must still save here.
+    if not args.checkpoint and not args.from_pretrained and checkpoint_dir is not None:
         pretrain_ckpt = checkpoint_dir / "checkpoint_pretrained.pt"
         trainer._save_checkpoint_to(pretrain_ckpt)
         log.info(f"Pre-trained checkpoint saved: {pretrain_ckpt}")
