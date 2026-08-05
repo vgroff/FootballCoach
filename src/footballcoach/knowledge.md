@@ -56,6 +56,14 @@ from outside the `Player` class.
 - **High-level decision head fires** — when the neural network's shoot/pass/
   tackle/get_possession/mark Bernoulli heads fire, `to_orders.py` calls the
   corresponding player method, which sets the Order
+- **`HybridPlayerAI`'s order-override channel** (`rules_ai.py`) — a sanctioned
+  third case: a human (via the UI) or a rules-based caller can assign a real
+  `Order` directly to a normally neural-controlled player, bypassing the
+  neural network entirely for as long as that order is in progress. See
+  `ai/knowledge.md`'s "HybridPlayerAI" section — this is orthogonal to (and
+  takes priority over) that same class's decision-neuron override channel,
+  which instead forces decision-head *probabilities* before gating while
+  keeping the execution network in control of physical motor output.
 
 The **execution neural network drives movement** via `move_direction` (a unit
 vector) + `sprint` (Bernoulli), NOT via `move_region_center` from the decision

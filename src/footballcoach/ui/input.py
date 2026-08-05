@@ -138,7 +138,14 @@ class MatchInputController:
     # -- order helpers -------------------------------------------------------
 
     def _issue_order(self, player: Player, order, order_name: str) -> None:
-        """Assign *order* to *player* and attach the on_complete callback."""
+        """Assign *order* to *player* and attach the on_complete callback.
+
+        If the player is under ``HybridPlayerAI`` control, route the order
+        through ``HybridPlayerAI.issue_order()`` (the order-override channel)
+        instead of writing ``player.current_order`` directly, so a human
+        click "takes over" a neural-controlled player for exactly one order
+        before control reverts to the network automatically.
+        """
         if self.on_order_complete is not None:
             pid = player.player_id
             cb = self.on_order_complete
@@ -146,7 +153,11 @@ class MatchInputController:
             order.on_complete = lambda: cb(pid, name)
         if self.on_new_order is not None:
             self.on_new_order()
-        player.current_order = order
+        from footballcoach.rules_ai import HybridPlayerAI
+        if isinstance(player.ai, HybridPlayerAI):
+            player.ai.issue_order(order)
+        else:
+            player.current_order = order
         if self.on_order_issued is not None:
             self.on_order_issued(player.player_id, order_name, isinstance(order, MoveOrder))
 
@@ -215,7 +226,11 @@ class MatchInputController:
         # decelerates on the next tick instead of continuing their move.
         if self.on_new_order is not None:
             self.on_new_order()
-        player.current_order = StopOrder()
+        from footballcoach.rules_ai import HybridPlayerAI
+        if isinstance(player.ai, HybridPlayerAI):
+            player.ai.issue_order(StopOrder())
+        else:
+            player.current_order = StopOrder()
         self._kick_ui = KickUIState(phase=KickPhase.AIM_XY, player_id=player.player_id)
         # Seed aim direction from current mouse position (already set).
         self._update_kick_ui_from_mouse(*self._last_mouse_world)
@@ -323,7 +338,12 @@ class MatchInputController:
         # Game is already paused (from _enter_kick_ui). Set the kick order
         # directly (no on_complete — one Space executes, no second pause).
         # Update the notification so the user knows to press Space.
-        player.current_order = KickOrder(aim_point=aim_point, power_fraction=ku.power_fraction, spin=ku.spin)
+        kick_order = KickOrder(aim_point=aim_point, power_fraction=ku.power_fraction, spin=ku.spin)
+        from footballcoach.rules_ai import HybridPlayerAI
+        if isinstance(player.ai, HybridPlayerAI):
+            player.ai.issue_order(kick_order)
+        else:
+            player.current_order = kick_order
         if self.on_kick_issued is not None:
             self.on_kick_issued()
         self._kick_ui = None

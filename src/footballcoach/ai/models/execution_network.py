@@ -189,12 +189,18 @@ class ExecutionNetwork(nn.Module):
             self.value_head = nn.Linear(value_in_dim, 1)
 
         # Learnable log_std for direction heads (move_dir, kick_dir).
+        # Single scalar (isotropic) rather than one-per-axis: the direction
+        # heads output a unit vector, so the x/y Gaussian error is really a
+        # proxy for angular error, and there is no principled reason for the
+        # x and y axes to have independently-tunable spreads. A single log_std
+        # broadcasts against both dims in DirectionHead's Normal(...) — see
+        # ai_trainer_knowledge.md "Direction heads: log_std and KL".
         # Initialized from config (dir_log_std_init). Lower = tighter sampling
         # (σ≈0.13 at -2.0, σ≈0.22 at -1.5, σ≈0.37 at -1.0).
         # KL spikes if too tight: a 4° mean shift at σ=0.13 → ratio~50×.
         # Clamped during forward() to [dir_log_std_min, dir_log_std_max].
-        self.move_dir_log_std = nn.Parameter(torch.full((2,), dir_log_std_init))
-        self.kick_dir_log_std = nn.Parameter(torch.full((2,), dir_log_std_init))
+        self.move_dir_log_std = nn.Parameter(torch.full((1,), dir_log_std_init))
+        self.kick_dir_log_std = nn.Parameter(torch.full((1,), dir_log_std_init))
         self.kick_power_log_std = nn.Parameter(torch.zeros(1))
         self.kick_spin_log_std = nn.Parameter(torch.zeros(3))
 

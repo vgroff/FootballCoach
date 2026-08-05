@@ -50,7 +50,7 @@ from footballcoach.ai.config import load_ai_config
 from footballcoach.ai.models.decision_network import DecisionNetwork, derive_get_possession_prob
 from footballcoach.ai.models.execution_network import ExecutionNetwork, flatten_decision_heads
 from footballcoach.ai.obs.augment import augment_batch, augment_obs_bc
-from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
+from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer, HEAD_LP_KEYS
 from footballcoach.ai.ppo.schedules import TrainingSchedules
 
 log = logging.getLogger("footballcoach.ai.ppo")
@@ -60,6 +60,7 @@ log = logging.getLogger("footballcoach.ai.ppo")
 REWARD_COMP_LABELS: list[tuple[str, str]] = [
     ("appr",  "approach"),
     ("retr",  "retreat"),
+    ("appr_sq", "approach_speed"),
     ("hdg",   "heading"),
     ("poss",  "get_possession"),
     ("prog",  "progress"),
@@ -73,6 +74,20 @@ REWARD_COMP_LABELS: list[tuple[str, str]] = [
     ("prox",  "proximity_bonus"),
     ("stam",  "stamina_penalty"),
 ]
+
+# Execution-network head name -> nn.Module attribute name, used for the
+# per-head gradient-norm / logit-drift diagnostics in _ppo_update().
+EXEC_HEAD_MODULES: list[tuple[str, str]] = [
+    ("move_direction", "move_direction"),
+    ("exec_move", "exec_move_logit"),
+    ("sprint", "sprint_logit"),
+    ("kick", "kick_logit"),
+    ("kick_direction", "kick_direction"),
+    ("kick_power", "kick_power"),
+    ("kick_spin", "kick_spin"),
+    ("tackle_attempt", "tackle_attempt_logit"),
+]
+
 
 def _ai_types(obs_dict: dict) -> tuple:
     """Extract (self_ai_type, other_ai_type) tensors from an obs dict, or
@@ -168,6 +183,8 @@ class PPOTrainer:
         self.dir_l2_coef = float(ppo_cfg.get("dir_l2_coef", 0.01))
         self.dir_log_std_min = float(ppo_cfg.get("dir_log_std_min", -5.0))
         self.dir_log_std_max = float(ppo_cfg.get("dir_log_std_max", 2.0))
+        self.dir_log_std_target = float(ppo_cfg.get("dir_log_std_target", self.dir_log_std_min))
+        self.dir_log_std_reg_coef = float(ppo_cfg.get("dir_log_std_reg_coef", 0.0))
         self.ent_dir_weight = float(ppo_cfg.get("ent_dir_weight", 1.0))
         self.augment_n_slot_shuffles = int(ppo_cfg.get("augment_n_slot_shuffles", 0))
         self.rollout_eval_trials = int(ppo_cfg.get("rollout_eval_trials", 10))
@@ -175,6 +192,8 @@ class PPOTrainer:
         self._bc_cfg = bc_cfg
         self._bc_dir_loss_w = float(bc_cfg.get("direction_loss_weight", 3.0))
         self._bc_region_loss_w = float(bc_cfg.get("region_loss_weight", 1.0))
+        self._bc_dec_label_smoothing = float(bc_cfg.get("dec_label_smoothing", 0.0))
+        self._bc_exec_label_smoothing = float(bc_cfg.get("exec_label_smoothing", 0.0))
         self._bc_dec_weight = float(bc_cfg.get("bc_dec_weight", 1.0))
         self._bc_exec_weight = float(bc_cfg.get("bc_exec_weight", 1.0))
         # pos_weight_*: None means "auto-compute from the training dataset at
@@ -299,6 +318,16 @@ class PPOTrainer:
 
         self._total_steps = 0
         self._checkpoint_count = 0  # sequential counter for checkpoint{N}.pt naming
+        # Set of decision-head module names (matching ``decision_net`` attribute names,
+        # same as the ``frozen_head_names`` argument to ``set_frozen_heads()``) that
+        # are excluded from the PPO log_prob computation (both at sample time in
+        # ``_compute_log_prob`` and at update time in ``_recompute_log_prob``).
+        # Empty = no masking (default).  Populated by ``set_frozen_heads()`` so that
+        # any head frozen for a curriculum phase is also silently dropped from the
+        # importance ratio — they cancel exactly when frozen, but explicit masking
+        # removes the noise when they are NOT frozen and avoids misleading KL
+        # diagnostics from heads that carry no reward signal for the current phase.
+        self._ppo_lp_masked_heads: frozenset[str] = frozenset()
 
         # --- Single value head convention ---
         # Commit to execution_net.value_head as the ONLY trained critic (or, when
@@ -383,10 +412,26 @@ class PPOTrainer:
         BC pre-training runs its own optimizer over all parameters and is
         unaffected — freezing only applies during the PPO update loop.
 
+        Also updates ``_ppo_lp_masked_heads`` so these heads are excluded
+        from the PPO importance-ratio log_prob (both at sample time and at
+        update time).  Frozen heads cancel exactly in the ratio when their
+        parameters are fixed, but explicit masking removes noisy log_prob
+        contributions from heads that carry no reward signal for this phase
+        and avoids misleading per-head KL diagnostics.
+
         Args:
             frozen_head_names: Names of ``nn.Module`` attributes on
                 ``decision_net``, e.g. ``["shoot_logit", "pass_logit"]``.
         """
+        # Decision-head Bernoulli names that participate in _compute_log_prob /
+        # _recompute_log_prob.  Only these need log_prob masking; target
+        # categoricals (pass_target_logits etc.) are already gated by their
+        # parent Bernoulli so they are implicitly handled.
+        _LP_HEADS = {
+            "shoot_logit", "pass_logit", "move_logit", "tackle_logit",
+            "get_possession_raw", "mark_logit", "hold_position_logit",
+        }
+        newly_masked = []
         for name in frozen_head_names:
             module = getattr(self.decision_net, name, None)
             if module is None:
@@ -395,6 +440,16 @@ class PPOTrainer:
             for p in module.parameters():
                 p.requires_grad_(False)
             log.info(f"Frozen decision_net.{name}")
+            if name in _LP_HEADS:
+                newly_masked.append(name)
+        if newly_masked:
+            self._ppo_lp_masked_heads = frozenset(newly_masked)
+            log.warning(
+                "PPO log_prob masking ACTIVE — the following decision heads are excluded "
+                "from the importance ratio (frozen for this curriculum phase, no reward "
+                "signal): %s.  Their BC aux loss is still computed normally.",
+                ", ".join(sorted(newly_masked)),
+            )
 
     # -----------------------------------------------------------------------
     # Main training entry point
@@ -431,6 +486,9 @@ class PPOTrainer:
         episode_outcomes_vs_neural: list[str] = []
         episode_outcomes_vs_immobile: list[str] = []
         rollout_components: dict[str, float] = {}
+        # Per-episode reward components for statistics (mean/std/min/max per type).
+        episode_comp_accum: dict[str, float] = {}   # accumulates within current episode
+        episode_comp_list: list[dict[str, float]] = []  # one entry per completed episode
 
         log.info(f"PPO training started: steps_so_far={self._total_steps:,}  target={self._total_steps + total_steps:,}  (+{total_steps:,} this run)")
 
@@ -501,12 +559,16 @@ class PPOTrainer:
             episode_reward_accum += reward
             for _k, _v in getattr(env, "last_reward_components", {}).items():
                 rollout_components[_k] = rollout_components.get(_k, 0.0) + _v
+                episode_comp_accum[_k] = episode_comp_accum.get(_k, 0.0) + _v
             self._total_steps += 1
             steps_this_rollout += 1
 
             if done:
                 episode_rewards.append(episode_reward_accum)
                 episode_reward_accum = 0.0
+                if episode_comp_accum:
+                    episode_comp_list.append(dict(episode_comp_accum))
+                episode_comp_accum = {}
                 if info is not None and info.trial_outcome is not None:
                     if info.is_rules_episode:
                         episode_outcomes_vs_rules.append(info.trial_outcome)
@@ -594,11 +656,26 @@ class PPOTrainer:
                 _mv_delta_str = ""
                 if mv_ls and _prev_mv_ls:
                     _d = [b - a for a, b in zip(_prev_mv_ls, mv_ls)]
-                    _mv_delta_str = f"  d_move=[{','.join(f'{v:+.4f}' for v in _d)}]"
+                    # Show Δlog_std and the resulting change in σ expressed in degrees
+                    _mv_dstd_deg = [
+                        abs(math.degrees(math.exp(b)) - math.degrees(math.exp(a)))
+                        for a, b in zip(_prev_mv_ls, mv_ls)
+                    ]
+                    _mv_delta_str = (
+                        f"  d_move=[{','.join(f'{v:+.4f}' for v in _d)}]"
+                        f" (Δσ≈{','.join(f'{v:.3f}°' for v in _mv_dstd_deg)})"
+                    )
                 _kk_delta_str = ""
                 if kk_ls and _prev_kk_ls:
                     _d = [b - a for a, b in zip(_prev_kk_ls, kk_ls)]
-                    _kk_delta_str = f"  d_kick=[{','.join(f'{v:+.4f}' for v in _d)}]"
+                    _kk_dstd_deg = [
+                        abs(math.degrees(math.exp(b)) - math.degrees(math.exp(a)))
+                        for a, b in zip(_prev_kk_ls, kk_ls)
+                    ]
+                    _kk_delta_str = (
+                        f"  d_kick=[{','.join(f'{v:+.4f}' for v in _d)}]"
+                        f" (Δσ≈{','.join(f'{v:.3f}°' for v in _kk_dstd_deg)})"
+                    )
                 self._prev_move_log_std = list(mv_ls) if mv_ls else None
                 self._prev_kick_log_std = list(kk_ls) if kk_ls else None
                 mv_ls_str = ""
@@ -636,6 +713,34 @@ class PPOTrainer:
                 ]
                 comp_str = ("  rew: " + "  ".join(comp_parts)) if comp_parts else ""
                 rollout_components.clear()
+
+                # Per-episode reward statistics table (mean/std/min/max per type).
+                # Collect all keys that appeared in any episode this rollout,
+                # then emit a compact aligned table.
+                _rew_stats_lines: list[str] = []
+                _n_ep_for_stats = len(episode_comp_list)
+                if episode_comp_list:
+                    _all_keys = [k for k, _ in REWARD_COMP_LABELS
+                                 if any(k in ep for ep in episode_comp_list)]
+                    if _all_keys:
+                        _col_w = 14  # display-label column width
+                        _hdr = f"  {'component':<{_col_w}}  {'mean':>8}  {'std':>7}  {'min':>8}  {'max':>8}"
+                        _sep = "  " + "-" * _col_w + "  " + "-" * 8 + "  " + "-" * 7 + "  " + "-" * 8 + "  " + "-" * 8
+                        _rew_stats_lines.append(_hdr)
+                        _rew_stats_lines.append(_sep)
+                        _lbl_map = {k: lbl for k, lbl in REWARD_COMP_LABELS}
+                        for _k in _all_keys:
+                            _vals = [ep[_k] for ep in episode_comp_list if _k in ep]
+                            if not _vals:
+                                continue
+                            _arr = np.array(_vals)
+                            _lbl = _lbl_map.get(_k, _k)
+                            _rew_stats_lines.append(
+                                f"  {_lbl:<{_col_w}}  {_arr.mean():>+8.3f}  {_arr.std():>7.3f}"
+                                f"  {_arr.min():>+8.3f}  {_arr.max():>+8.3f}"
+                            )
+                    episode_comp_list.clear()
+
                 _val_diag_str = (
                     f"V={metrics['values_mean']:.2f}\u00b1{metrics['values_std']:.2f}  "
                     f"R={metrics['returns_mean']:.2f}\u00b1{metrics['returns_std']:.2f}  "
@@ -677,6 +782,10 @@ class PPOTrainer:
                     _lines.append(f"  reward   {'  '.join(_comp_parts[:_mid])}")
                     if _comp_parts[_mid:]:
                         _lines.append(f"           {'  '.join(_comp_parts[_mid:])}")
+                if _rew_stats_lines:
+                    _lines.append(f"  rew/ep   (mean/std/min/max per episode, {_n_ep_for_stats} ep)")
+                    for _sl in _rew_stats_lines:
+                        _lines.append(_sl)
                 _lines.append("\u2500" * 70)
                 log.info("\n".join(_lines))
 
@@ -869,6 +978,7 @@ class PPOTrainer:
                         direction_loss_weight=self._bc_dir_loss_w,
                         region_loss_weight=self._bc_region_loss_w,
                         dec_weight=self._bc_dec_weight,
+                        dec_label_smoothing=self._bc_dec_label_smoothing,
                         return_breakdown=True,
                     )
                     # execution_net.value_head IS trained here (the single
@@ -934,6 +1044,12 @@ class PPOTrainer:
 
         # Do BC first so the rollout is collected with the BC-warmed policy,
         # giving on-policy value targets instead of random-init targets.
+        # bc_losses is declared here (not just inside the loop) so the
+        # "BC pre-training done" log line below stays well-defined even when
+        # n_epochs=0 (e.g. bc.bc_pretrain_epochs_from_ckpt=0 with
+        # --latest-pretrain/--pretrain-from-checkpoint) -- the loop body then
+        # never runs and bc_losses is simply empty.
+        bc_losses: list[float] = []
         for epoch in range(n_epochs):
             _epoch_t0 = time.monotonic()
             bc_losses = []
@@ -1007,6 +1123,8 @@ class PPOTrainer:
                     pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
                     dec_weight=self._bc_dec_weight,
                     exec_weight=self._bc_exec_weight,
+                    dec_label_smoothing=self._bc_dec_label_smoothing,
+                    exec_label_smoothing=self._bc_exec_label_smoothing,
                     return_breakdown=True,
                 )
                 total_loss = bc_loss
@@ -1109,7 +1227,10 @@ class PPOTrainer:
             sprint_probs.clear()
             _bkdn_acc.clear()
             _bkdn_n = 0
-        log.info(f"BC pre-training done ({n_epochs} epoch(s), final bc_loss={np.mean(bc_losses):.4f})")
+        if bc_losses:
+            log.info(f"BC pre-training done ({n_epochs} epoch(s), final bc_loss={np.mean(bc_losses):.4f})")
+        else:
+            log.info(f"BC pre-training done ({n_epochs} epoch(s) -- no BC epochs ran, dataset/pretrain skipped)")
 
         # --- Phase 2/3: collect on-policy rollout + value head warm-up ---
         # Delegates to pretrain_value(), which collects rollout_steps of
@@ -1153,6 +1274,8 @@ class PPOTrainer:
                     pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
                     dec_weight=self._bc_dec_weight,
                     exec_weight=self._bc_exec_weight,
+                    dec_label_smoothing=self._bc_dec_label_smoothing,
+                    exec_label_smoothing=self._bc_exec_label_smoothing,
                 ).item())
         self.decision_net.train()
         self.execution_net.train()
@@ -1214,6 +1337,8 @@ class PPOTrainer:
                         pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
                         dec_weight=self._bc_dec_weight,
                         exec_weight=self._bc_exec_weight,
+                        dec_label_smoothing=self._bc_dec_label_smoothing,
+                        exec_label_smoothing=self._bc_exec_label_smoothing,
                         return_breakdown=True,
                     )
                     repair_opt.zero_grad()
@@ -1695,6 +1820,55 @@ class PPOTrainer:
                              log_std_min=self.dir_log_std_min,
                              log_std_max=self.dir_log_std_max)
 
+    def _per_head_new_log_probs(self, d_heads, e_heads, mb_actions: dict, exists_mask) -> torch.Tensor:
+        """Per-sample, per-head log_prob under the CURRENT policy for stored
+        actions, stacked in ``HEAD_LP_KEYS`` order (shape ``(batch, 13)``).
+
+        Mirrors the gating in ``_recompute_log_prob`` (sprint/move_dir gated
+        by exec_move; kick_dir gated by kick) so summing this over heads
+        matches the scalar log_prob used for the PPO ratio/KL. Used for the
+        per-head KL diagnostic: ``batch["head_log_probs"][mb_idx] - this``,
+        averaged over the batch dim, gives a per-head KL breakdown instead
+        of just the scalar total.
+        """
+        def _b(logit, key):
+            return IndependentBernoulli(logit).log_prob(mb_actions[key]).squeeze(-1)
+
+        log_std_move = self.execution_net.move_dir_log_std.to(self.device)
+        log_std_kick = self.execution_net.kick_dir_log_std.to(self.device)
+        exec_move_mask = (mb_actions["exec_move"].squeeze(-1) > 0.5).float()
+        kick_mask = (mb_actions["kick"].squeeze(-1) > 0.5).float()
+
+        lp_move_dir = exec_move_mask * (
+            self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).log_prob(
+                mb_actions["move_dir_raw"]
+            )
+        )
+        lp_kick_dir = kick_mask * (
+            self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+                mb_actions["kick_dir_raw"]
+            )
+        )
+        lp_sprint = exec_move_mask * _b(e_heads.sprint_logit, "sprint")
+
+        masked = self._ppo_lp_masked_heads
+        _zero = torch.zeros(exists_mask.shape[0], device=self.device)
+        return torch.stack([
+            _zero if "shoot_logit" in masked else _b(d_heads.shoot_logit, "shoot"),
+            _zero if "pass_logit" in masked else _b(d_heads.pass_logit, "pass_"),
+            _zero if "move_logit" in masked else _b(d_heads.move_logit, "move"),
+            _zero if "tackle_logit" in masked else _b(d_heads.tackle_logit, "tackle"),
+            _zero if "get_possession_raw" in masked else _b(d_heads.get_possession_raw, "get_possession_extra"),
+            _zero if "mark_logit" in masked else _b(d_heads.mark_logit, "mark"),
+            _zero if "hold_position_logit" in masked else _b(d_heads.hold_position_logit, "hold_position"),
+            _b(e_heads.exec_move_logit, "exec_move"),
+            lp_sprint,
+            _b(e_heads.kick_logit, "kick"),
+            _b(e_heads.tackle_attempt_logit, "tackle_attempt"),
+            lp_move_dir,
+            lp_kick_dir,
+        ], dim=-1)
+
     @torch.no_grad()
     def _sample_action(self, obs_dict: dict) -> tuple:
         """Forward pass + sample from all distributions.
@@ -1903,26 +2077,34 @@ class PPOTrainer:
     def _compute_log_prob(self, d_heads, e_heads, samples: dict, exists_mask) -> torch.Tensor:
         """Compute combined log_prob across all action heads."""
         lp = torch.zeros(1, device=self.device)
+        masked = self._ppo_lp_masked_heads
 
-        # Bernoulli decision heads
-        lp += IndependentBernoulli(d_heads.shoot_logit).log_prob(samples["shoot"]).sum()
-        lp += IndependentBernoulli(d_heads.pass_logit).log_prob(samples["pass_"]).sum()
-        lp += IndependentBernoulli(d_heads.move_logit).log_prob(samples["move"]).sum()
-        lp += IndependentBernoulli(d_heads.tackle_logit).log_prob(samples["tackle"]).sum()
-        lp += IndependentBernoulli(d_heads.get_possession_raw).log_prob(samples["gp_extra"]).sum()
-        lp += IndependentBernoulli(d_heads.mark_logit).log_prob(samples["mark"]).sum()
-        lp += IndependentBernoulli(d_heads.hold_position_logit).log_prob(samples["hold"]).sum()
+        # Bernoulli decision heads (skip heads masked for current phase)
+        if "shoot_logit" not in masked:
+            lp += IndependentBernoulli(d_heads.shoot_logit).log_prob(samples["shoot"]).sum()
+        if "pass_logit" not in masked:
+            lp += IndependentBernoulli(d_heads.pass_logit).log_prob(samples["pass_"]).sum()
+        if "move_logit" not in masked:
+            lp += IndependentBernoulli(d_heads.move_logit).log_prob(samples["move"]).sum()
+        if "tackle_logit" not in masked:
+            lp += IndependentBernoulli(d_heads.tackle_logit).log_prob(samples["tackle"]).sum()
+        if "get_possession_raw" not in masked:
+            lp += IndependentBernoulli(d_heads.get_possession_raw).log_prob(samples["gp_extra"]).sum()
+        if "mark_logit" not in masked:
+            lp += IndependentBernoulli(d_heads.mark_logit).log_prob(samples["mark"]).sum()
+        if "hold_position_logit" not in masked:
+            lp += IndependentBernoulli(d_heads.hold_position_logit).log_prob(samples["hold"]).sum()
 
-        # Categorical target heads (gated by intent)
-        if samples["pass_"] > 0.5:
+        # Categorical target heads (gated by intent; also skip when parent is masked)
+        if "pass_logit" not in masked and samples["pass_"] > 0.5:
             lp += MaskedCategorical(d_heads.pass_target_logits, exists_mask).log_prob(
                 samples["pass_tgt"]
             )
-        if samples["tackle"] > 0.5:
+        if "tackle_logit" not in masked and samples["tackle"] > 0.5:
             lp += MaskedCategorical(d_heads.tackle_target_logits, exists_mask).log_prob(
                 samples["tackle_tgt"]
             )
-        if samples["mark"] > 0.5:
+        if "mark_logit" not in masked and samples["mark"] > 0.5:
             lp += MaskedCategorical(d_heads.mark_target_logits, exists_mask).log_prob(
                 samples["mark_tgt"]
             )
@@ -1996,6 +2178,22 @@ class PPOTrainer:
         all_kick_prob: list[float] = []         # mean sigmoid(kick_logit) per mb
         all_ratios: list[torch.Tensor] = []
         all_mv_log_std_grad: list[float] = []  # grad on move_dir_log_std after each backward
+        # --- Extra diagnostics: advantage stats, ratio stats, per-execution-head
+        # grad norm, continuous/discrete head drift, per-head KL. All aggregated
+        # over the rollout and printed once at the end (see below, near the
+        # existing [grad clip] log line). ---
+        all_adv_mean: list[float] = []
+        all_adv_std: list[float] = []
+        all_adv_min: list[float] = []
+        all_adv_max: list[float] = []
+        all_ratio_clipped_frac: list[float] = []
+        all_head_grad_norm: dict[str, list[float]] = {name: [] for name, _ in EXEC_HEAD_MODULES}
+        all_head_kl: list[torch.Tensor] = []  # per-mb (13,) per-head KL, after step
+        all_continuous_mean_shift: dict[str, list[float]] = {"move_direction": [], "kick_direction": []}
+        all_continuous_log_std_shift: dict[str, list[float]] = {"move_direction": [], "kick_direction": []}
+        all_discrete_logit_shift: dict[str, list[float]] = {
+            name: [] for name in ("exec_move", "sprint", "kick", "tackle_attempt")
+        }
         # Grad-norm clipping diagnostics: pre-clip norm for each of the two isolated
         # groups (non-direction "main", direction) per minibatch, plus how many
         # minibatches actually exceeded their respective limit (i.e. were clipped).
@@ -2029,6 +2227,11 @@ class PPOTrainer:
 
         _diag_done = False  # print per-head breakdown only once
         _early_stopped = False
+        # Snapshot the continuous-head log_std at the very start of this update
+        # ("before the optimiser step", rollout-wide) so the final summary can
+        # report start -> end drift across the whole rollout, not just per-mb.
+        _move_ls_start = float(self.execution_net.move_dir_log_std.mean().item())
+        _kick_ls_start = float(self.execution_net.kick_dir_log_std.mean().item())
 
         for epoch_i in range(self.n_epochs):
             epoch_start = time.perf_counter()
@@ -2041,6 +2244,11 @@ class PPOTrainer:
                 mb_obs = {k.replace("obs/", ""): batch[k][mb_idx].to(self.device)
                           for k in batch if k.startswith("obs/")}
                 mb_adv = adv[mb_idx].to(self.device)
+                # Advantage stats, BEFORE the optimiser step (this minibatch's slice).
+                all_adv_mean.append(mb_adv.mean().item())
+                all_adv_std.append(mb_adv.std().item())
+                all_adv_min.append(mb_adv.min().item())
+                all_adv_max.append(mb_adv.max().item())
                 mb_ret = returns[mb_idx].to(self.device)
                 mb_old_lp = old_log_probs[mb_idx].to(self.device)
                 # Normalised per-sample weights: sum to minibatch size so loss scale is stable
@@ -2057,6 +2265,15 @@ class PPOTrainer:
 
                 d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
                 e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
+
+                # Snapshot BEFORE the optimiser step, for the drift diagnostics
+                # printed once at the end of _ppo_update (see EXEC_HEAD_MODULES).
+                _log_std_move_before = self.execution_net.move_dir_log_std.detach().clone()
+                _log_std_kick_before = self.execution_net.kick_dir_log_std.detach().clone()
+                _exec_move_logit_before = e_heads.exec_move_logit.detach().clone()
+                _sprint_logit_before = e_heads.sprint_logit.detach().clone()
+                _kick_logit_before = e_heads.kick_logit.detach().clone()
+                _tackle_attempt_logit_before = e_heads.tackle_attempt_logit.detach().clone()
 
                 # Value estimate — single value head (execution_net only), OR the
                 # dedicated self.value_net when separate_value_net is enabled. In
@@ -2132,6 +2349,9 @@ class PPOTrainer:
                 # PPO clipped objective (weighted by per-sample importance weights)
                 ratio = torch.exp(new_log_probs - mb_old_lp)
                 all_ratios.append(ratio.detach().cpu())
+                all_ratio_clipped_frac.append(
+                    ((ratio < 1.0 - clip) | (ratio > 1.0 + clip)).float().mean().item()
+                )
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * mb_adv
                 policy_loss = -(torch.min(surr1, surr2) * mb_w).mean()
@@ -2148,9 +2368,29 @@ class PPOTrainer:
                 # No dir_l2 penalty needed: direction means are unit-normalized in
                 # forward() so their magnitude is always 1 — penalizing it is a no-op.
 
+                # log_std restoring force: without this, ent_dir_weight * entropy
+                # is a one-directional force that only ever inflates move_dir_log_std/
+                # kick_dir_log_std (entropy is monotonic increasing in log_std), and
+                # nothing in the PPO/BC losses pulls it back down (the mean is
+                # unit-normalized so dir_l2 above is a no-op on log_std too). This
+                # term adds an explicit L2 pull toward dir_log_std_target, independent
+                # of clamp (which only caps the value fed into the distribution and
+                # zeroes the gradient once the raw parameter drifts past the bound —
+                # see ai_trainer_knowledge.md / DirectionHead for the clamp mechanism).
+                # Coefficient 0.0 (default) fully disables this — opt-in.
+                dir_log_std_reg = torch.zeros(1, device=self.device)
+                if self.dir_log_std_reg_coef > 0.0:
+                    _lsm_raw = self.execution_net.move_dir_log_std
+                    _lsk_raw = self.execution_net.kick_dir_log_std
+                    dir_log_std_reg = (
+                        ((_lsm_raw - self.dir_log_std_target) ** 2).mean()
+                        + ((_lsk_raw - self.dir_log_std_target) ** 2).mean()
+                    )
+
                 total_loss = (policy_loss
                               + self.vf_coef * value_loss
-                              - self.ent_coef * entropy)
+                              - self.ent_coef * entropy
+                              + self.dir_log_std_reg_coef * dir_log_std_reg)
 
                 # BC auxiliary loss (decision + execution, annealed to 0)
                 bc_loss_val = torch.zeros(1, device=self.device)
@@ -2164,6 +2404,8 @@ class PPOTrainer:
                         pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
                         dec_weight=self._bc_dec_weight,
                         exec_weight=self._bc_exec_weight,
+                        dec_label_smoothing=self._bc_dec_label_smoothing,
+                        exec_label_smoothing=self._bc_exec_label_smoothing,
                         return_breakdown=True,
                     )
                     total_loss = total_loss + bc_coeff * bc_loss_val
@@ -2185,6 +2427,16 @@ class PPOTrainer:
                 if self.separate_value_net:
                     nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
                     self.value_net_optimizer.step()
+
+                # Per-execution-head gradient norm, BEFORE the optimiser step
+                # (measurement only — max_norm=inf never rescales, same trick as
+                # raw_grad_norm below).
+                for _head_name, _attr in EXEC_HEAD_MODULES:
+                    _head_params = list(getattr(self.execution_net, _attr).parameters())
+                    if _head_params:
+                        all_head_grad_norm[_head_name].append(
+                            torch.nn.utils.clip_grad_norm_(_head_params, float("inf")).item()
+                        )
 
                 # Capture dir_log_std gradient before it is zeroed
                 _mv_ls_grad = self.execution_net.move_dir_log_std.grad
@@ -2237,6 +2489,40 @@ class PPOTrainer:
                     _lp_movedir_after  = self._dir_head(e_after.move_direction, _log_std_move).log_prob(_stored_raw_mb)
                     movedir_hyp_kl = (_lp_movedir_before - _lp_movedir_after).mean().item()
 
+                    # --- AFTER the optimiser step: per-head KL, continuous head
+                    # mean/log_std drift, discrete head logit drift. Guarded on
+                    # "head_log_probs" presence -- always populated by
+                    # RolloutBuffer.add()/as_tensors() and propagated through
+                    # augment_batch(), but stay defensive against any future
+                    # caller that builds a batch dict by hand without it.
+                    per_head_kl_mb = None
+                    if "head_log_probs" in batch:
+                        mb_old_head_lp = batch["head_log_probs"][mb_idx].to(self.device)
+                        per_head_new_lp_after = self._per_head_new_log_probs(d_after, e_after, mb_actions, em)
+                        per_head_kl_mb = (mb_old_head_lp - per_head_new_lp_after).mean(dim=0)  # (13,)
+                        all_head_kl.append(per_head_kl_mb.detach().cpu())
+
+                    all_continuous_mean_shift["move_direction"].append(movedir_mean_shift)
+                    all_continuous_mean_shift["kick_direction"].append(kickdir_mean_shift)
+                    all_continuous_log_std_shift["move_direction"].append(
+                        (self.execution_net.move_dir_log_std.detach() - _log_std_move_before).abs().mean().item()
+                    )
+                    all_continuous_log_std_shift["kick_direction"].append(
+                        (self.execution_net.kick_dir_log_std.detach() - _log_std_kick_before).abs().mean().item()
+                    )
+                    all_discrete_logit_shift["exec_move"].append(
+                        (e_after.exec_move_logit - _exec_move_logit_before).abs().mean().item()
+                    )
+                    all_discrete_logit_shift["sprint"].append(
+                        (e_after.sprint_logit - _sprint_logit_before).abs().mean().item()
+                    )
+                    all_discrete_logit_shift["kick"].append(
+                        (e_after.kick_logit - _kick_logit_before).abs().mean().item()
+                    )
+                    all_discrete_logit_shift["tackle_attempt"].append(
+                        (e_after.tackle_attempt_logit - _tackle_attempt_logit_before).abs().mean().item()
+                    )
+
                 # Clamp to finite floor before KL to avoid inf from near-zero-probability
                 # samples in the current policy (log_prob = -inf → KL = +inf).
                 _lp_clamped = new_log_probs.clamp(min=-1e6)
@@ -2266,10 +2552,18 @@ class PPOTrainer:
                 # past the trust region boundary rather than O(n_minibatches).
                 if kl_after_step > self.target_kl:
                     mb_i_stop = start // self.minibatch_size
+                    _stop_head_kl_str = (
+                        "  ".join(
+                            f"{k}={v:+.4f}" for k, v in zip(HEAD_LP_KEYS, per_head_kl_mb.tolist())
+                            if abs(v) > 0.001
+                        )
+                        if per_head_kl_mb is not None else "(head_log_probs unavailable)"
+                    )
                     log.info(
                         f"  [early stop e{epoch_i} mb{mb_i_stop}]"
                         f"  KL={kl_after_step:.5f} > target={self.target_kl}"
-                        f"  steps_this_update={len(all_kl)}"
+                        f"  steps_this_update={len(all_kl)}\n"
+                        f"    [per-head KL] {_stop_head_kl_str}"
                     )
                     _early_stopped = True
                     break
@@ -2398,6 +2692,8 @@ class PPOTrainer:
                         pos_weight_tackle_attempt=self._bc_pos_weight_tackle_attempt,
                         dec_weight=self._bc_dec_weight,
                         exec_weight=self._bc_exec_weight,
+                        dec_label_smoothing=self._bc_dec_label_smoothing,
+                        exec_label_smoothing=self._bc_exec_label_smoothing,
                         return_breakdown=True,
                     )
 
@@ -2476,6 +2772,11 @@ class PPOTrainer:
             diag_act = {k.replace("action/", ""): batch[k][:diag_n].to(self.device)
                         for k in batch if k.startswith("action/")}
             diag_old_lp = old_log_probs[:diag_n].to(self.device)
+            # Raw (pre-normalisation) advantages for the diag slice — used to
+            # annotate worst/best samples. Note: adv = batch["advantages"] has
+            # already been normalised above (mean 0, std 1); use the raw returns
+            # indirectly via batch["advantages"] which IS the normalised version.
+            diag_adv = batch["advantages"][:diag_n]
             with torch.no_grad():
                 _sat_d, _oat_d = _ai_types(diag_obs)
                 d_d = self.decision_net(
@@ -2598,8 +2899,9 @@ class PPOTrainer:
                     key=lambda kv: abs(kv[1]), reverse=True,
                 )
                 _contrib_str = "  ".join(f"{_n}:{_v:+.3f}" for _n, _v in _contribs if abs(_v) > 0.02)
+                _adv_wi = float(diag_adv[_wi]) if _wi < len(diag_adv) else float("nan")
                 _worst_lines.append(
-                    f"    idx={_wi:4d}  ratio={float(diag_ratio[_wi]):8.3f}  {_contrib_str}"
+                    f"    idx={_wi:4d}  ratio={float(diag_ratio[_wi]):8.3f}  adv={_adv_wi:+.3f}  {_contrib_str}"
                 )
 
             _worst_delta_row = _per_head_new_lp[worst_i]
@@ -2609,6 +2911,28 @@ class PPOTrainer:
                 f"{_n}:{float(_v):+.3f}" for _n, _v in zip(_per_head_names, _worst_delta_row)
                 if abs(float(_v)) > 0.02
             )
+
+            # Best sample: highest new log_prob (most "on-distribution" for
+            # current policy). Shows what the policy is most confident about
+            # and which heads drive that high probability.
+            best_i = int(diag_new_lp.argmax())
+            _best_mv  = diag_act["move_dir_raw"][best_i]
+            _best_mv_mean = e_d.move_direction[best_i]
+            _best_s_angle = math.degrees(math.atan2(float(_best_mv[1]),        float(_best_mv[0])))
+            _best_n_angle = math.degrees(math.atan2(float(_best_mv_mean[1]),   float(_best_mv_mean[0])))
+            _best_per_head = _per_head_new_lp[best_i]
+            if _old_per_head is not None:
+                _best_per_head_delta = _best_per_head - _old_per_head[best_i]
+            else:
+                _best_per_head_delta = _best_per_head
+            _best_contribs_sorted = sorted(
+                ((_per_head_names[_hi], float(_best_per_head[_hi])) for _hi in range(len(_per_head_names))),
+                key=lambda kv: kv[1], reverse=True,
+            )
+            _best_contrib_str = "  ".join(
+                f"{_n}:{_v:.3f}" for _n, _v in _best_contribs_sorted if abs(_v) > 0.02
+            )
+            _best_adv = float(diag_adv[best_i]) if best_i < len(diag_adv) else float("nan")
 
             log.info(
                 f"  [per-head new lp means, n={diag_n}]\n"
@@ -2621,13 +2945,95 @@ class PPOTrainer:
                 f"  kick_dir={lp_kkdir_d.mean():.3f} (min={lp_kkdir_d.min():.3f} max={lp_kkdir_d.max():.3f})\n"
                 + (f"  [head lp deltas (new-old, |d|>0.05)]{_head_lp_delta_str}\n" if _head_lp_delta_str else "")
                 + f"  [worst sample] idx={worst_i}  ratio={diag_ratio[worst_i]:.3f}"
+                f"  adv={float(diag_adv[worst_i]):+.3f}"
                 f"  old_lp={diag_old_lp[worst_i]:.3f}  new_lp={diag_new_lp[worst_i]:.3f}\n"
                 f"    stored move_dir={s_angle:.1f}°  new_mean={n_angle:.1f}°"
                 f"  angular_diff={min(abs(s_angle-n_angle), 360-abs(s_angle-n_angle)):.1f}°\n"
                 f"    [worst sample per-head delta, sorted by |delta|] {_worst_delta_str}\n"
                 f"  [top-{_topk} worst samples by ratio, all heads |delta|>0.02]\n"
                 + "\n".join(_worst_lines)
+                + f"\n  [best sample (highest new_lp)] idx={best_i}  new_lp={diag_new_lp[best_i]:.3f}"
+                f"  adv={_best_adv:+.3f}"
+                f"  stored move_dir={_best_s_angle:.1f}°  new_mean={_best_n_angle:.1f}°\n"
+                f"    per-head contributions: {_best_contrib_str}"
             )
+
+        # --- New diagnostics block (advantage / ratio / per-head grad-norm /
+        # continuous+discrete head drift / per-head KL) — same style as the
+        # [grad clip] log line below, printed once per rollout. ---
+        if all_adv_mean:
+            log.info(
+                f"  [advantage] mean={float(np.mean(all_adv_mean)):.3f}"
+                f"  std={float(np.mean(all_adv_std)):.3f}"
+                f"  min={float(np.min(all_adv_min)):.3f}"
+                f"  max={float(np.max(all_adv_max)):.3f}"
+            )
+        if all_ratios:
+            _ratios_all = torch.cat(all_ratios)
+            _ratio_clip_frac = float(np.mean(all_ratio_clipped_frac)) if all_ratio_clipped_frac else 0.0
+            log.info(
+                f"  [ratio] mean={_ratios_all.mean():.4f}"
+                f"  std={_ratios_all.std():.4f}"
+                f"  min={_ratios_all.min():.4f}"
+                f"  max={_ratios_all.max():.4f}"
+                f"  clipped={_ratio_clip_frac * 100:.1f}%"
+            )
+        _head_grad_norm_str = "  ".join(
+            f"{name}={np.mean(vals):.3f}" for name, vals in all_head_grad_norm.items() if vals
+        )
+        if _head_grad_norm_str:
+            log.info(f"  [exec head grad norm] {_head_grad_norm_str}")
+        _move_ls_end = float(self.execution_net.move_dir_log_std.mean().item())
+        _kick_ls_end = float(self.execution_net.kick_dir_log_std.mean().item())
+        log.info(
+            f"  [exec continuous log_std] move_direction: start={_move_ls_start:.4f} end={_move_ls_end:.4f}"
+            f"   kick_direction: start={_kick_ls_start:.4f} end={_kick_ls_end:.4f}"
+        )
+        # Build per-step and per-epoch Δ strings, with angular interpretations.
+        # dmean is the per-step L2 shift of the unit-vector mean; for unit vectors
+        # |u-v|=d → angle θ = arccos(1 - d²/2). dlog_std is the mean absolute
+        # per-step log_std change; angular effect = dσ° = degrees(exp(ls)) change.
+        def _angular_dmean_deg(dmean: float) -> float:
+            """L2 shift of unit-vector mean → approx angular shift in degrees."""
+            cos_theta = max(-1.0, min(1.0, 1.0 - dmean ** 2 / 2.0))
+            return math.degrees(math.acos(cos_theta))
+
+        def _angular_dlog_std_deg(dlog_std: float, ls_end: float) -> float:
+            """Change in log_std → change in σ expressed in degrees."""
+            return abs(math.degrees(math.exp(ls_end)) - math.degrees(math.exp(ls_end - dlog_std)))
+
+        _ls_end_by_name = {"move_direction": _move_ls_end, "kick_direction": _kick_ls_end}
+        _cont_shift_parts = []
+        for name, vals in all_continuous_mean_shift.items():
+            if not vals:
+                continue
+            n_steps = len(vals)
+            mean_dmean = float(np.mean(vals))
+            mean_dlog_std = float(np.mean(all_continuous_log_std_shift[name]))
+            epoch_dmean = float(np.sum(vals))   # cumulative shift over whole rollout
+            epoch_dlog_std = float(np.sum(all_continuous_log_std_shift[name]))
+            ls_end = _ls_end_by_name.get(name, 0.0)
+            mean_deg = _angular_dmean_deg(mean_dmean)
+            epoch_deg = _angular_dmean_deg(epoch_dmean / max(n_steps, 1)) * n_steps  # rough epoch total
+            mean_dstd_deg = _angular_dlog_std_deg(mean_dlog_std, ls_end)
+            _cont_shift_parts.append(
+                f"{name}("
+                f"dmean={mean_dmean:.4f}≈{mean_deg:.2f}°/step  epoch≈{epoch_deg:.1f}°  "
+                f"dlog_std={mean_dlog_std:.5f}  Δσ°={mean_dstd_deg:.3f}/step)"
+            )
+        if _cont_shift_parts:
+            log.info(f"  [exec continuous \u0394 per opt step] {'  '.join(_cont_shift_parts)}")
+        _disc_shift_str = "  ".join(
+            f"{name}={np.mean(vals):.4f}" for name, vals in all_discrete_logit_shift.items() if vals
+        )
+        if _disc_shift_str:
+            log.info(f"  [exec discrete \u0394logit per opt step] {_disc_shift_str}")
+        if all_head_kl:
+            _mean_head_kl = torch.stack(all_head_kl).mean(dim=0)
+            _head_kl_str = "  ".join(
+                f"{k}={v:+.4f}" for k, v in zip(HEAD_LP_KEYS, _mean_head_kl.tolist())
+            )
+            log.info(f"  [per-head KL] {_head_kl_str}")
 
         # Per-head mean activation rates from the buffer (0–100%). Zero-cost: just
         # averages the stored 0/1 action arrays — no extra forward pass needed.
@@ -2704,31 +3110,44 @@ class PPOTrainer:
     def _recompute_log_prob(self, d_heads, e_heads, mb_actions: dict, exists_mask) -> torch.Tensor:
         """Recompute log_probs for stored actions under the current policy."""
         lp = torch.zeros(exists_mask.shape[0], device=self.device)
+        masked = self._ppo_lp_masked_heads
 
         def _b(logit, key):
             return IndependentBernoulli(logit).log_prob(mb_actions[key]).squeeze(-1)
 
-        lp += _b(d_heads.shoot_logit, "shoot")
-        lp += _b(d_heads.pass_logit, "pass_")
-        lp += _b(d_heads.move_logit, "move")
-        lp += _b(d_heads.tackle_logit, "tackle")
-        lp += _b(d_heads.get_possession_raw, "get_possession_extra")
-        lp += _b(d_heads.mark_logit, "mark")
-        lp += _b(d_heads.hold_position_logit, "hold_position")
+        if "shoot_logit" not in masked:
+            lp += _b(d_heads.shoot_logit, "shoot")
+        if "pass_logit" not in masked:
+            lp += _b(d_heads.pass_logit, "pass_")
+        if "move_logit" not in masked:
+            lp += _b(d_heads.move_logit, "move")
+        if "tackle_logit" not in masked:
+            lp += _b(d_heads.tackle_logit, "tackle")
+        if "get_possession_raw" not in masked:
+            lp += _b(d_heads.get_possession_raw, "get_possession_extra")
+        if "mark_logit" not in masked:
+            lp += _b(d_heads.mark_logit, "mark")
+        if "hold_position_logit" not in masked:
+            lp += _b(d_heads.hold_position_logit, "hold_position")
         lp += _b(e_heads.exec_move_logit, "exec_move")
         lp += _b(e_heads.kick_logit, "kick")
         lp += _b(e_heads.tackle_attempt_logit, "tackle_attempt")
 
-        # Target categorical log_probs (gated by parent intent)
+        # Target categorical log_probs (gated by parent intent).
+        # Automatically skipped when the parent Bernoulli is masked — if pass_logit
+        # is masked then pass_ samples are excluded from the ratio and the categorical
+        # target contribution would be spurious noise too.
         pass_mask = mb_actions["pass_"].squeeze(-1) > 0.5
         tackle_mask = mb_actions["tackle"].squeeze(-1) > 0.5
         mark_mask = mb_actions["mark"].squeeze(-1) > 0.5
 
-        for mask, logits, key in [
-            (pass_mask, d_heads.pass_target_logits, "pass_target"),
-            (tackle_mask, d_heads.tackle_target_logits, "tackle_target"),
-            (mark_mask, d_heads.mark_target_logits, "mark_target"),
+        for parent_name, mask, logits, key in [
+            ("pass_logit",   pass_mask,   d_heads.pass_target_logits,   "pass_target"),
+            ("tackle_logit", tackle_mask, d_heads.tackle_target_logits, "tackle_target"),
+            ("mark_logit",   mark_mask,   d_heads.mark_target_logits,   "mark_target"),
         ]:
+            if parent_name in masked:
+                continue
             if mask.any():
                 cat_lp = MaskedCategorical(logits, exists_mask).log_prob(
                     mb_actions[key].long().squeeze(-1)

@@ -100,6 +100,22 @@ class EntityEncoder(nn.Module):
         # i.e. the INVERSE of exists_mask.
         key_padding_mask = exists_mask < 0.5  # (batch, MAX_OTHER_PLAYERS), True = padded
 
+        # Edge case (see module docstring): a batch row with ZERO real other
+        # players (all slots padded, e.g. UI training mode's 1-player-only
+        # match) makes that row's key_padding_mask all True -> softmax over
+        # an all -inf row -> NaN, which then poisons every downstream head
+        # (even ones unrelated to other-player info) since NaN propagates
+        # through the shared trunk. Since other_embed is all zeros for a
+        # fully-padded row anyway (per_entity_mlp applied to zero-padded
+        # other_features -- not exactly zero after the MLP bias/ReLU, but
+        # harmless either way), unmask those rows entirely so attention
+        # degrades to "attend to the zero-padded slots" (a fixed, finite,
+        # uninformative context) instead of NaN.
+        fully_padded_rows = key_padding_mask.all(dim=1)  # (batch,)
+        if fully_padded_rows.any():
+            key_padding_mask = key_padding_mask.clone()
+            key_padding_mask[fully_padded_rows] = False
+
         context, _ = self.attention(
             query=self_embed,
             key=other_embed,

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from enum import Enum, auto
+from pathlib import Path
 
 import pygame
 
@@ -127,6 +128,16 @@ class App:
         self._sim_speed: int = 1
         self._SIM_SPEED_OPTIONS: tuple[int, ...] = (1, 2, 4, 8)
 
+        # Training mode: neural control toggle for the trainee (see `N` hotkey
+        # in _handle_keydown / _toggle_training_ai_mode). None = human control
+        # (default); a loaded PPOTrainer = HybridPlayerAI-driven neural control
+        # with the human click/kick UI still able to issue one-shot order
+        # overrides. Cached by checkpoint path so repeated toggles don't
+        # reload the network.
+        self._training_trainer_cache: dict[str, object] = {}
+        self._training_checkpoints: list[str] = []
+        self._training_checkpoint_idx: int = -1  # -1 = human control
+
     @staticmethod
     def _temp_pitch():
         from footballcoach.entities import Pitch
@@ -207,6 +218,8 @@ class App:
             self.input_controller.issue_save_order()
         elif key == pygame.K_x:
             self.input_controller.issue_stop_order()
+        elif key == pygame.K_n and self.is_training_mode:
+            self._toggle_training_ai_mode()
         elif key == pygame.K_RIGHTBRACKET:
             idx = self._SIM_SPEED_OPTIONS.index(self._sim_speed)
             self._sim_speed = self._SIM_SPEED_OPTIONS[(idx + 1) % len(self._SIM_SPEED_OPTIONS)]
@@ -379,6 +392,7 @@ class App:
         self._auto_paused = False
         if is_training_mode and match.players:
             self.input_controller.selected_player_id = match.players[0].player_id
+            self._training_checkpoint_idx = -1  # always start in human control
 
     def _start_scenario(
         self, definition: scenarios.ScenarioDefinition, kwargs: dict | None = None,
@@ -464,7 +478,8 @@ class App:
                     self.input_controller = None
                     self._scenario_loop = None
                     return
-                elif trial_ended:
+                self.renderer.record_trail(self.match.ball)
+                if trial_ended:
                     # New trial started — wire log and icon callbacks to the fresh match.
                     self._wire_match_log(loop.match)
                     self._wire_player_icon_callbacks(loop.match)
@@ -484,6 +499,7 @@ class App:
 
         for _ in range(steps):
             self.match.step()
+            self.renderer.record_trail(self.match.ball)
         self._poll_action_icons(self.match)
         if self.is_training_mode:
             current_tally = (self.match.scoreboard.left_goals, self.match.scoreboard.right_goals)
@@ -492,6 +508,54 @@ class App:
             if current_tally != self._last_goal_tally and self.match._goal_linger_remaining_s <= 0.0:
                 self._reset_training_positions()
                 self._last_goal_tally = current_tally
+
+    def _toggle_training_ai_mode(self) -> None:
+        """`N` hotkey in training mode: cycle the trainee through
+        Human -> Neural (checkpoint 1) -> Neural (checkpoint 2) -> ... -> Human.
+
+        Neural control is implemented by assigning ``HybridPlayerAI`` to
+        ``player.ai`` — ``Match.step()`` then drives it automatically every
+        tick like any other ``PlayerAI``, no extra per-frame wiring needed.
+        The human click/kick-UI input path keeps working unchanged in either
+        mode: ``MatchInputController._issue_order`` already detects
+        ``HybridPlayerAI`` and routes clicks through its order-override
+        channel instead of writing ``player.current_order`` directly, so a
+        click on a neural-controlled trainee "takes over" for one order
+        before control reverts to the network automatically.
+        """
+        if self.match is None or not self.match.players:
+            return
+        if not self._training_checkpoints:
+            self._training_checkpoints = scenarios.discover_all_phase1_checkpoints()
+        player = self.match.players[0]
+
+        if not self._training_checkpoints:
+            self._log(LogLevel.INFO, "Training mode: no checkpoints found — staying in human control")
+            return
+
+        self._training_checkpoint_idx += 1
+        if self._training_checkpoint_idx >= len(self._training_checkpoints):
+            self._training_checkpoint_idx = -1
+
+        if self._training_checkpoint_idx == -1:
+            player.ai = None
+            self._log(LogLevel.INFO, "Training mode: trainee -> human control")
+            return
+
+        ckpt_path = self._training_checkpoints[self._training_checkpoint_idx]
+        trainer = self._training_trainer_cache.get(ckpt_path)
+        if trainer is None:
+            trainer, err = scenarios.load_trainer_for_ui(ckpt_path)
+            if err:
+                self._log(LogLevel.INFO, f"Training mode: failed to load {ckpt_path} ({err}) — staying human")
+                self._training_checkpoint_idx = -1
+                player.ai = None
+                return
+            self._training_trainer_cache[ckpt_path] = trainer
+
+        from footballcoach.rules_ai import HybridPlayerAI
+        player.ai = HybridPlayerAI(trainer._sample_action, max_episode_s=1e9)
+        self._log(LogLevel.INFO, f"Training mode: trainee -> neural ({Path(ckpt_path).name})")
 
     def _reset_training_positions(self) -> None:
         """Training mode: reposition the player to start after a goal."""
@@ -720,6 +784,8 @@ class App:
             "K                        - shoot mode: next click sets the aim point for a full-power shot",
             "S                        - issue a Save order (goalkeeper only): tracks and blocks shots",
             "X                        - stop: decelerate selected player to a standstill",
+            "N (training mode only)   - cycle trainee: human -> neural (checkpoint 1) -> ... -> human.",
+            "                           While neural, clicks/kicks still take over for one order.",
             "Space                    - pause/resume the simulation",
             "] / [                    - increase / decrease simulation speed (1x / 2x / 4x / 8x)",
             "H or Help button         - toggle this help overlay",
@@ -761,7 +827,7 @@ class App:
         is_gk = selected is not None and selected.is_goalkeeper
         is_selected = selected is not None
         mode = ic.order_mode
-        return [
+        entries = [
             ("[Spc]", "Pause" if not match.paused else "Resume", True, False),
             ("[P]",   "Pass",   has_ball,    mode == OrderMode.PASS),
             ("[K]",   "Shoot",  has_ball,    mode == OrderMode.SHOOT),
@@ -770,6 +836,10 @@ class App:
             ("[H]",   "Help",   True,        self.show_help),
             ("[Esc]", "Menu",   True,        False),
         ]
+        if self.is_training_mode:
+            is_neural = self._training_checkpoint_idx != -1
+            entries.insert(5, ("[N]", "Neural AI" if not is_neural else "Human", True, is_neural))
+        return entries
 
 
 def run_app() -> None:

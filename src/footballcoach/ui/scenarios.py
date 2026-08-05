@@ -108,6 +108,33 @@ def make_training_match(rng_reduction: float = 0.3) -> Match:
     )
 
 
+def discover_all_phase1_checkpoints() -> list[str]:
+    """Scan every ``checkpoints/phase1_run*/`` dir for .pt checkpoints.
+
+    Thin wrapper around ``_discover_checkpoints`` used by both the Phase 1
+    UI scenario picker and Training mode's neural-control checkpoint picker
+    (see ``App._toggle_training_ai_mode`` in ``ui/app.py``), so the two stay
+    in sync without duplicating the discovery/sorting logic.
+    """
+    import glob as _glob
+    import re as _re
+    all_run_dirs = sorted(
+        _glob.glob("checkpoints/phase1_run*/"),
+        key=lambda d: int(m.group(1)) if (m := _re.search(r"phase1_run(\d+)", d)) else -1,
+    )
+    checkpoints: list[str] = []
+    for d in all_run_dirs:
+        checkpoints.extend(_discover_checkpoints(d.rstrip("/")))
+    return checkpoints
+
+
+def load_trainer_for_ui(checkpoint_path: str):
+    """Public wrapper around ``_load_trainer`` for use outside this module
+    (e.g. training-mode neural control in ``ui/app.py``). Returns
+    ``(trainer_or_None, error_message_or_None)``."""
+    return _load_trainer(checkpoint_path)
+
+
 AnyScenarioParam = ScenarioParam | ScenarioChoiceParam | ScenarioBoolParam
 
 # Universal params appended to every scenario's params screen by the UI.
@@ -901,7 +928,8 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
     import logging
     log_ui = logging.getLogger("footballcoach.ui.scenarios")
 
-    DECISION_INTERVAL_TICKS = 15  # 0.5 s at 30 Hz
+    DECISION_INTERVAL_MS_DEFAULT = 500.0  # 0.5 s at 30 Hz — matches old hardcoded 15-tick default
+    UI_TICK_HZ = 30.0  # UI always ticks the engine at 30Hz regardless of ai_config.json's sim_dt_s
 
     _trainer_cache: dict[str, object] = {}
 
@@ -920,6 +948,7 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         "opponent_trainer": None,
         "ticks_trainee": 0,
         "ticks_opponent": 0,
+        "decision_interval_ticks": max(1, round(DECISION_INTERVAL_MS_DEFAULT / 1000.0 * UI_TICK_HZ)),
     }
 
     # Build the params list: scan ALL phase1_run* dirs so checkpoints from every
@@ -943,8 +972,10 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
     params_list: list = [
         ScenarioChoiceParam("trainee_checkpoint", "Trainee checkpoint", ckpt_labels, ckpt_default),
         ScenarioBoolParam("trainee_rules", "Trainee: rules-based override", False),
+        ScenarioBoolParam("trainee_immobile", "Trainee: immobile override", False),
         ScenarioChoiceParam("opponent_checkpoint", "Opponent checkpoint", ckpt_labels, ckpt_default),
         ScenarioBoolParam("opponent_rules", "Opponent: rules-based override", True),
+        ScenarioBoolParam("opponent_immobile", "Opponent: immobile override", False),
         ScenarioChoiceParam("trainee_tier", "Trainee tier", ("generic", "amateur", "semi_pro", "premier_league"), str(_cfg.get("trainee_tier", "generic"))),
         ScenarioChoiceParam("opponent_tier", "Opponent tier", ("generic", "amateur", "semi_pro", "premier_league"), str(_cfg.get("opponent_tier", "generic"))),
         ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 60.0, 0.5, float(_cfg.get("ball_max_speed_mps", 10.0))),
@@ -952,6 +983,7 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         ScenarioParam("stamina_min", "Stamina min", 0.0, 1.0, 0.05, float(_cfg.get("stamina_min", 0.3))),
         ScenarioParam("stamina_max", "Stamina max", 0.0, 1.0, 0.05, float(_cfg.get("stamina_max", 1.0))),
         ScenarioParam("restitution_sigma", "Restitution σ", 0.0, 1.0, 0.01, float(_cfg.get("restitution_sigma", 0.08))),
+        ScenarioParam("decision_interval_ms", "Decision interval (ms)", 50.0, 2000.0, 50.0, DECISION_INTERVAL_MS_DEFAULT),
     ]
 
     def _resolve_trainer_from_name(ckpt_name: str, use_rules: bool):
@@ -972,8 +1004,10 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         *,
         trainee_checkpoint: str = ckpt_default,
         trainee_rules: bool = False,
+        trainee_immobile: bool = False,
         opponent_checkpoint: str = ckpt_default,
         opponent_rules: bool = True,
+        opponent_immobile: bool = False,
         trainee_tier: str = str(_cfg.get("trainee_tier", "generic")),
         opponent_tier: str = str(_cfg.get("opponent_tier", "generic")),
         ball_max_speed_mps: float = float(_cfg.get("ball_max_speed_mps", 10.0)),
@@ -981,14 +1015,19 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         stamina_min: float = float(_cfg.get("stamina_min", 0.3)),
         stamina_max: float = float(_cfg.get("stamina_max", 1.0)),
         restitution_sigma: float = float(_cfg.get("restitution_sigma", 0.08)),
+        decision_interval_ms: float = DECISION_INTERVAL_MS_DEFAULT,
         **_ignored,  # absorb sim_dt_s etc injected by ScenarioEnv
     ) -> Match:
-        trainee_trainer = _resolve_trainer_from_name(trainee_checkpoint, trainee_rules)
-        opponent_trainer = _resolve_trainer_from_name(opponent_checkpoint, opponent_rules)
+        # immobile takes priority over both the checkpoint and rules-based
+        # override — an immobile player never gets a trainer (no neural
+        # driving in on_tick) and never gets Phase1RulesAI (ai stays None).
+        trainee_trainer = None if trainee_immobile else _resolve_trainer_from_name(trainee_checkpoint, trainee_rules)
+        opponent_trainer = None if opponent_immobile else _resolve_trainer_from_name(opponent_checkpoint, opponent_rules)
         state["trainee_trainer"] = trainee_trainer
         state["opponent_trainer"] = opponent_trainer
         state["ticks_trainee"] = 0
         state["ticks_opponent"] = 0
+        state["decision_interval_ticks"] = max(1, round(decision_interval_ms / 1000.0 * UI_TICK_HZ))
 
         match = build_1v1_scenario(
             rng_reduction,
@@ -1002,26 +1041,33 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         )
 
         try:
-            match.player_by_id("trainee").ai = None if trainee_trainer is not None else Phase1RulesAI()
+            if trainee_immobile:
+                match.player_by_id("trainee").ai = None
+            else:
+                match.player_by_id("trainee").ai = None if trainee_trainer is not None else Phase1RulesAI()
         except KeyError:
             pass
         try:
-            match.player_by_id("opponent").ai = None if opponent_trainer is not None else Phase1RulesAI()
+            if opponent_immobile:
+                match.player_by_id("opponent").ai = None
+            else:
+                match.player_by_id("opponent").ai = None if opponent_trainer is not None else Phase1RulesAI()
         except KeyError:
             pass
 
-        tr_label = trainee_checkpoint if not trainee_rules else "rules"
-        op_label = opponent_checkpoint if not opponent_rules else "rules"
+        tr_label = "immobile" if trainee_immobile else (trainee_checkpoint if not trainee_rules else "rules")
+        op_label = "immobile" if opponent_immobile else (opponent_checkpoint if not opponent_rules else "rules")
         log_ui.info(f"Phase 1 UI: trainee={tr_label}  opponent={op_label}")
         return match
 
     def on_tick(match: Match, trial_tick: int) -> None:
         trainee_trainer = state["trainee_trainer"]
         opponent_trainer = state["opponent_trainer"]
+        decision_interval_ticks = state["decision_interval_ticks"]
 
         if trainee_trainer is not None:
             state["ticks_trainee"] += 1
-            if state["ticks_trainee"] >= DECISION_INTERVAL_TICKS:
+            if state["ticks_trainee"] >= decision_interval_ticks:
                 state["ticks_trainee"] = 0
                 _apply_neural_action(trainee_trainer, match, "trainee", trial_tick)
             else:
@@ -1029,7 +1075,7 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
 
         if opponent_trainer is not None:
             state["ticks_opponent"] += 1
-            if state["ticks_opponent"] >= DECISION_INTERVAL_TICKS:
+            if state["ticks_opponent"] >= decision_interval_ticks:
                 state["ticks_opponent"] = 0
                 _apply_neural_action(opponent_trainer, match, "opponent", trial_tick)
             else:

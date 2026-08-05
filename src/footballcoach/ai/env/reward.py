@@ -13,7 +13,19 @@ ticks within one decision interval and returned as one scalar per step.
 
 phase1_reward() returns a (float, dict[str, float]) tuple where the dict
 breaks the total down by source key:
-  dist  — ball distance shaping
+  appr  — linear ball approach bonus (potential-based; telescopes over an
+          episode to net distance closed, NOT sensitive to how fast — see
+          appr_sq below for a term that actually rewards speed)
+  retr  — linear ball retreat penalty (symmetric to appr)
+  appr_sq — squared closing/retreating speed bonus/penalty (asymmetric
+          coefficients: ball_approach_speed_bonus / ball_retreat_speed_penalty).
+          Unlike appr/retr, this is NOT a linear potential-based term, so it
+          does NOT telescope: closing the same net distance in fewer/faster
+          steps yields strictly more total reward than doing it slowly,
+          because sum(x_i^2) >= (sum(x_i))^2 / n with equality only when
+          every step closes the same amount. Use this (not appr) when you
+          want to reward genuine speed rather than just final position.
+  hdg   — heading penalty (moving away from the ball)
   poss  — gain possession bonus
   prog  — ball progress while in possession
   out   — ball out of bounds penalty
@@ -24,6 +36,7 @@ breaks the total down by source key:
   lterm — loss terminal (opponent reaches trainee box)
   tout  — timeout penalty
   prox  — proximity bonus on timeout
+  stam  — stamina usage penalty (episode-end only)
 """
 from __future__ import annotations
 
@@ -70,6 +83,32 @@ def phase1_reward(
     r += appr_r + retr_r
     comps["appr"] = appr_r
     comps["retr"] = retr_r
+
+    # Squared closing-speed bonus/penalty: rewards CLOSING FAST, penalises
+    # RETREATING FAST — symmetric in shape but with independently tunable
+    # coefficients (mirrors the appr/retr asymmetric-coefficient pattern
+    # above). appr/retr are linear in _delta and are potential-based (their
+    # sum over an episode telescopes to coef * (start_dist - end_dist)) — a
+    # player who closes 10m in 2 fast steps and one who closes the same 10m
+    # in 20 slow steps earn IDENTICAL total appr/retr reward. Squaring the
+    # per-step delta breaks that telescoping: concentrating the same net
+    # distance into fewer/faster steps yields strictly more total reward
+    # (sum(x_i^2) >= (sum(x_i))^2/n, equality only when every step is equal).
+    # _delta = prev_ball_dist - curr_ball_dist is already the ball-relative
+    # closing speed (distance closed this step, i.e. player speed projected
+    # onto the direction to the ball) — not raw player speed — so this term
+    # only ever fires along the ball axis, never on lateral/perpendicular
+    # motion. Coefficients 0.0 (default) disable each side independently.
+    _appr_sq_coef = float(cfg.get("ball_approach_speed_bonus", 0.0))
+    _retr_sq_coef = float(cfg.get("ball_retreat_speed_penalty", _appr_sq_coef))
+    if _delta > 0.0:
+        appr_sq_r = _appr_sq_coef * (_delta ** 2)
+    elif _delta < 0.0:
+        appr_sq_r = -_retr_sq_coef * (_delta ** 2)
+    else:
+        appr_sq_r = 0.0
+    r += appr_sq_r
+    comps["appr_sq"] = appr_sq_r
 
     # Cosine heading penalty: penalise moving away from the ball based on velocity direction.
     # Only fires when the player is actually moving (speed > threshold).

@@ -9,12 +9,14 @@
     "_comment": "min_radius_px: smallest on-screen circle radius drawn for a player. Physical world positions are unaffected — only the rendered dot size is boosted for visibility. possession_outline_thickness: pixel width of the white ring drawn around the ball carrier (1=thin, 3=bold). inactive_alpha: opacity (0-255) of a player drawn translucent after being tackled (0=invisible, 255=fully opaque).",
     "min_radius_px": 7,
     "possession_outline_thickness": 1,
-    "inactive_alpha": 165
+    "inactive_alpha": 190
   },
   "ball": {
-    "_comment": "min_radius_px: smallest on-screen circle radius drawn for the ball. outline: whether to draw a thin dark outline around the ball circle.",
+    "_comment": "min_radius_px: smallest on-screen circle radius drawn for the ball. outline: whether to draw a dark border around the ball circle. outline_width_px: pixel width of that border (1=thin, 3=bold). height_boost_per_metre: how much the drawn ball radius grows per metre of height (0=no growth, 0.35=original exaggerated, 0.1=subtle).",
     "min_radius_px": 5,
-    "outline": false
+    "outline": true,
+    "outline_width_px": 0.5,
+    "height_boost_per_metre": 0.5
   },
   "action_icons": {
     "_comment": "linger_s: wall-clock seconds an action icon stays visible above a player after the action fires. font_size_px: point size of the icon font — keep small (10-14) or they'll dominate the screen.",
@@ -51,15 +53,28 @@
   "ball_spin_dots": {
     "_comment": "Dots on the 3D ball surface (Fibonacci sphere), always shown, rotating with ball spin. Only front-hemisphere dots (facing camera) are drawn — back hemisphere is hidden. count: number of dots. projection_scale_fraction: how wide the projected sphere appears relative to ball drawn radius (1.0 = dots reach ball edge). dot_radius_fraction: dot radius / ball drawn radius. color: RGB.",
     "count": 10,
-    "projection_scale_fraction": 0.95,
-    "dot_radius_fraction": 0.3,
+    "projection_scale_fraction": 0.98,
+    "dot_radius_fraction": 0.33,
     "color": [30, 30, 30]
   },
+  "ball_state_rings": {
+    "_comment": "Coloured indicator rings drawn around the ball to show its state. offset_px: how far outside the ball circle the ring sits. width_px: ring line width. Set show_flying/show_rolling/show_bounced to false to hide individual rings. Colors are [R,G,B]. bounce_duration_s: how long the amber bounce ring stays visible after a bounce (also controls physics.json just_bounced_display_duration_s if you want them in sync — but this one only affects the renderer display; to change the underlying timer duration edit physics.json).",
+    "show_flying": true,
+    "show_rolling": true,
+    "show_bounced": true,
+    "offset_px": 2,
+    "width_px": 1,
+    "color_flying": [180, 230, 255],
+    "color_rolling": [180, 255, 180],
+    "color_bounced": [255, 210, 80]
+  },
   "ball_trail": {
-    "_comment": "Fading ghost trail behind moving ball. length: number of ghost positions stored. min_speed_mps: no trail below this ground speed. max_alpha: alpha of the newest ghost position. radius_fraction: ghost circle radius relative to ball drawn radius.",
-    "length": 8,
-    "min_speed_mps": 3.0,
-    "max_alpha": 150,
-    "radius_fraction": 0.7
+    "_comment": "Fading ghost trail behind moving ball. length: number of ghost positions stored (sampled at physics rate). min_speed_mps: no trail below this ground speed. max_alpha: alpha of the newest ghost position. radius_fraction: ghost circle radius relative to ball drawn radius. radius_taper: how much the radius shrinks toward the oldest ghost (0=no shrink, 0.35=oldest is 35% smaller than newest, 1.0=oldest shrinks to nothing). interp_steps: sub-samples inserted between each stored position when drawing (1=no interpolation, 3=two extra sub-points per gap).",
+    "length": 7,
+    "min_speed_mps": 2.0,
+    "max_alpha": 80,
+    "radius_fraction": 0.9,
+    "radius_taper": 0.85,
+    "interp_steps": 2
   }
 }

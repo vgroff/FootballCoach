@@ -292,6 +292,43 @@ or `Trial N/max_trials` when a finite count was specified.
 the lone trainee's ID immediately when `is_training_mode=True`, so the
 player is controllable from the first frame without an initial click.
 
+## Training mode neural control (`N` hotkey)
+
+Training mode's trainee can be switched between human control and
+neural-network control at any time via the `N` hotkey
+(`App._toggle_training_ai_mode`), which cycles
+`human -> neural(checkpoint 1) -> neural(checkpoint 2) -> ... -> human`.
+Checkpoints are discovered via `scenarios.discover_all_phase1_checkpoints()`
+(scans every `checkpoints/phase1_run*/` dir, same discovery/sort logic as
+the Phase 1 scenario's checkpoint dropdown) and loaded on demand via
+`scenarios.load_trainer_for_ui()` (thin wrapper around the private
+`_load_trainer()`, itself a thin wrapper around
+`PPOTrainer.load_for_inference()`), cached per-path in
+`App._training_trainer_cache` so repeated toggles don't reload the network.
+
+Neural control is implemented by assigning `rules_ai.HybridPlayerAI` to
+`player.ai` — nothing else in the UI's per-frame loop needs to know the
+mode; `Match.step()` calls `player.ai.act()` automatically like any other
+`PlayerAI`, same as the rules-based scenarios. `HybridPlayerAI` extends
+`NeuralPlayerAI` with two override channels (order override + decision-
+neuron override) so the human click/kick-UI input path keeps working
+identically in either mode: `MatchInputController._issue_order()` and the
+kick UI (`ui/input.py`) both detect `isinstance(player.ai, HybridPlayerAI)`
+and route clicks through `HybridPlayerAI.issue_order()` (the order-override
+channel) instead of writing `player.current_order` directly — a click on a
+neural-controlled trainee "takes over" for exactly one order (Move/Shoot/
+Pass/Kick/Save/Stop), after which control reverts to the network
+automatically once the engine clears `player.current_order` back to `None`.
+See `ai/knowledge.md`'s "HybridPlayerAI" section for the full design
+(including the decision-neuron override channel, not yet wired to any UI
+control but usable programmatically/from tests).
+
+The hotkey bar shows `[N] Neural AI` / `[N] Human` (highlighted when
+neural) only while in training mode (`App._hotkey_entries`); the help
+overlay (`H`) documents the hotkey too. `App._start_match` resets
+`_training_checkpoint_idx = -1` whenever a new training match is built, so
+every fresh training session always starts in human control.
+
 ## Coordinate convention — critical pitfall
 
 All x-coordinates are measured from the **pitch centre** (origin), not from

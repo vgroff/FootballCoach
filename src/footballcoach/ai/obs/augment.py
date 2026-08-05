@@ -190,6 +190,7 @@ def augment_batch(
     n_slots: int = batch["obs/other_feat"].shape[1]
     has_bc: bool = "bc_labels" in batch
     has_ai_type: bool = "obs/self_ai_type" in batch and "obs/other_ai_type" in batch
+    has_head_log_probs: bool = "head_log_probs" in batch
 
     # Pre-build index tensors once (avoids repeated Python list → tensor conv)
     _px = torch.tensor(PLAYER_FLIP_X_IDX, dtype=torch.long)
@@ -298,6 +299,14 @@ def augment_batch(
                 "dones":          batch["dones"],
                 "sample_weights": batch["sample_weights"],
             }
+            if has_head_log_probs:
+                # Per-head log_probs are not geometric (they're scalars per
+                # head, not positional/directional) — pass through unchanged,
+                # same as log_probs/values/rewards above. Without this,
+                # augment_batch() silently dropped the key and any downstream
+                # per-head KL diagnostic keyed on batch["head_log_probs"]
+                # would KeyError once augmentation is enabled.
+                part["head_log_probs"] = batch["head_log_probs"]
             if has_ai_type:
                 # self_ai_type: pass-through (no geometric or slot content).
                 # other_ai_type: SAME slot permutation as other_feat, so a

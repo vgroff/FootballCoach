@@ -400,6 +400,8 @@ def bc_loss_from_tensor(
     return_breakdown: bool = False,
     dec_weight: float = 1.0,
     exec_weight: float = 1.0,
+    dec_label_smoothing: float = 0.0,
+    exec_label_smoothing: float = 0.0,
 ):
     """Compute BC loss for a minibatch, given packed label tensors.
 
@@ -427,6 +429,21 @@ def bc_loss_from_tensor(
             Ignored when exec_heads is None.
         pos_weight_tackle_attempt: Same as ``pos_weight_kick`` but for the
             ``tackle_attempt`` BCE term. Ignored when exec_heads is None.
+        dec_label_smoothing: Label smoothing applied to the 7 decision Bernoulli
+            targets (shoot/pass/move/tackle/gp_extra/mark/hold) before BCE:
+            target = target*(1-eps) + 0.5*eps. 0.0 (default) = no smoothing.
+            From ai_config.json['bc']['dec_label_smoothing']. Softens
+            overconfident BC-primed decision probabilities.
+        exec_label_smoothing: Same, applied to the 4 execution Bernoulli
+            targets (exec_move, sprint, kick_this_tick, tackle_attempt).
+            Ignored when exec_heads is None. From
+            ai_config.json['bc']['exec_label_smoothing']. Motivated by PPO's
+            per-minibatch KL early-stop firing on minibatch 0 of the very
+            first rollout — exec_move/sprint sit at confident (~0.68-0.79)
+            post-BC probabilities where Bernoulli KL is highly nonlinear, so
+            even a small logit shift from the first gradient step overshoots
+            target_kl. Smoothing these targets toward 0.5 pre-PPO reduces
+            that initial overconfidence.
         return_breakdown: If True, also return a dict of per-group mean losses
             {decision, exec_bce, sprint, move, direction, region} for diagnostics.
             When exec_heads is None, the exec-dependent entries are all 0.0.
@@ -449,8 +466,10 @@ def bc_loss_from_tensor(
     loss = torch.zeros(labels.shape[0], device=labels.device)
 
     # --- Bernoulli decision heads (BCE from logits) ---
-    def _bce(logit: torch.Tensor, col: int, pos_weight: float = 1.0) -> torch.Tensor:
+    def _bce(logit: torch.Tensor, col: int, pos_weight: float = 1.0, smoothing: float = 0.0) -> torch.Tensor:
         target = labels[:, col]
+        if smoothing > 0.0:
+            target = target * (1.0 - smoothing) + 0.5 * smoothing
         pw = None
         if pos_weight != 1.0:
             pw = torch.tensor(pos_weight, device=labels.device, dtype=logit.dtype)
@@ -459,13 +478,13 @@ def bc_loss_from_tensor(
         )
 
     dec_loss = (
-        _bce(decision_heads.shoot_logit,          _I_SHOOT)
-        + _bce(decision_heads.pass_logit,          _I_PASS)
-        + _bce(decision_heads.move_logit,          _I_MOVE)
-        + _bce(decision_heads.tackle_logit,        _I_TACKLE)
-        + _bce(decision_heads.get_possession_raw,  _I_GP_EXTRA)
-        + _bce(decision_heads.mark_logit,          _I_MARK)
-        + _bce(decision_heads.hold_position_logit, _I_HOLD)
+        _bce(decision_heads.shoot_logit,          _I_SHOOT,   smoothing=dec_label_smoothing)
+        + _bce(decision_heads.pass_logit,          _I_PASS,    smoothing=dec_label_smoothing)
+        + _bce(decision_heads.move_logit,          _I_MOVE,    smoothing=dec_label_smoothing)
+        + _bce(decision_heads.tackle_logit,        _I_TACKLE,  smoothing=dec_label_smoothing)
+        + _bce(decision_heads.get_possession_raw,  _I_GP_EXTRA, smoothing=dec_label_smoothing)
+        + _bce(decision_heads.mark_logit,          _I_MARK,    smoothing=dec_label_smoothing)
+        + _bce(decision_heads.hold_position_logit, _I_HOLD,    smoothing=dec_label_smoothing)
     )
     loss += dec_weight * dec_loss
 
@@ -481,10 +500,10 @@ def bc_loss_from_tensor(
 
     if exec_heads is not None:
         # --- Execution BCE heads: exec_move, sprint, kick, tackle_attempt ---
-        sprint_loss        = _bce(exec_heads.sprint_logit,          _I_SPRINT)
-        move_loss          = _bce(exec_heads.exec_move_logit,       _I_EXEC_MOVE)
-        tackle_attempt_loss = _bce(exec_heads.tackle_attempt_logit, _I_TACKLE_ATTEMPT, pos_weight_tackle_attempt)
-        kick_loss           = _bce(exec_heads.kick_logit,           _I_KICK_THIS_TICK, pos_weight_kick)
+        sprint_loss        = _bce(exec_heads.sprint_logit,          _I_SPRINT,          smoothing=exec_label_smoothing)
+        move_loss          = _bce(exec_heads.exec_move_logit,       _I_EXEC_MOVE,       smoothing=exec_label_smoothing)
+        tackle_attempt_loss = _bce(exec_heads.tackle_attempt_logit, _I_TACKLE_ATTEMPT, pos_weight_tackle_attempt, smoothing=exec_label_smoothing)
+        kick_loss           = _bce(exec_heads.kick_logit,           _I_KICK_THIS_TICK, pos_weight_kick, smoothing=exec_label_smoothing)
         exec_bce_loss = (
             move_loss
             + sprint_loss

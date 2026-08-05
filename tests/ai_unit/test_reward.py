@@ -50,7 +50,7 @@ class TestPhase1Reward:
     def test_components_dict_has_all_keys(self):
         _, comps = self._call()
         assert set(comps.keys()) == {
-            "appr", "retr", "hdg", "poss", "prog", "out", "ill",
+            "appr", "retr", "appr_sq", "hdg", "poss", "prog", "out", "ill",
             "box", "spd", "lpos", "lterm", "tout", "prox", "stam",
         }
 
@@ -69,9 +69,12 @@ class TestPhase1Reward:
 
     def test_closing_distance_gives_approach_reward(self):
         total, comps = self._call(prev_ball_dist=10.0, curr_ball_dist=5.0)
-        expected = _CFG1["ball_approach_bonus"] * 5.0
+        expected_appr = _CFG1["ball_approach_bonus"] * 5.0
+        expected_appr_sq = _CFG1.get("ball_approach_speed_bonus", 0.0) * (5.0 ** 2)
+        expected = expected_appr + expected_appr_sq
         assert total == pytest.approx(expected, rel=1e-5)
-        assert comps["appr"] == pytest.approx(expected, rel=1e-5)
+        assert comps["appr"] == pytest.approx(expected_appr, rel=1e-5)
+        assert comps["appr_sq"] == pytest.approx(expected_appr_sq, rel=1e-5)
         assert comps["retr"] == pytest.approx(0.0, abs=1e-7)
 
     def test_moving_away_from_ball_positional_retreat(self):
@@ -210,6 +213,7 @@ class TestPhase1Reward:
         assert total == pytest.approx(sum(comps.values()), rel=1e-5)
         expected = (
             _CFG1["ball_approach_bonus"] * 5.0
+            + _CFG1.get("ball_approach_speed_bonus", 0.0) * (5.0 ** 2)
             + _CFG1["gain_possession_bonus"]
             + _CFG1["ball_progress_scale"] * 2.0
         )

@@ -12,6 +12,8 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Optional
 
+from footballcoach.ai.config import load_ai_config
+
 
 @dataclass
 class CurriculumPhase:
@@ -41,12 +43,16 @@ class CurriculumPhase:
 # Phase definitions
 # ---------------------------------------------------------------------------
 
+def _phase1_max_episode_s() -> float:
+    return float(load_ai_config().get("curriculum", {}).get("phase1_max_episode_s", 240.0))
+
+
 PHASE_1_GET_POSSESSION = CurriculumPhase(
     name="phase1_get_possession",
     phase_id=1,
     scenario_key="1v1",
     env_kwargs={
-        "max_episode_s": 240.0,
+        "max_episode_s": _phase1_max_episode_s(),
     },
     # Freeze all decision heads except the latent vector in early training.
     # Gradually unfreeze as per the curriculum (this is done manually by the

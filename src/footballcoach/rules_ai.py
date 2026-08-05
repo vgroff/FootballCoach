@@ -13,6 +13,9 @@ Classes:
   SprintWaypointAI        — issue sequential MoveOrders along a waypoint list
   NeuralPlayerAI          — wraps a PPO network; samples every N ticks, exposes
                             last_transition for the rollout buffer
+  HybridPlayerAI          — NeuralPlayerAI + two independent human-override
+                            channels: order override (issue_order) and
+                            decision-neuron override (set_decision_override)
 """
 from __future__ import annotations
 
@@ -431,6 +434,192 @@ class NeuralPlayerAI(PlayerAI):
         slot_player_ids = [None] * MAX_OTHER_PLAYERS  # safe default; NeuralPlayerAI does not need target resolution
         gating = select_action(decision_probs, exec_phys, target_slots)
         self._last_gating = gating  # cache so between-decision ticks can re-apply direction/speed
+        translation = apply_action_to_player(
+            gating=gating,
+            player=player,
+            match=match,
+            slot_player_ids=slot_player_ids,
+            decision_physical=dec_phys,
+        )
+
+        self.last_transition = {
+            "obs": {k: v.numpy() for k, v in obs_dict.items()},
+            "action": action,
+            "log_prob": float(log_prob),
+            "value": float(value),
+            "raw_exec": raw_exec,
+            "head_log_probs": head_log_probs,
+            "illegal_action": translation.illegal_action,
+        }
+
+
+class HybridPlayerAI(NeuralPlayerAI):
+    """``NeuralPlayerAI`` plus two independent human/rules-based override
+    channels, so a single player can be a mix of neural network control and
+    direct human/rules intervention.  Both channels are opt-in and orthogonal
+    — using one does not disable the other::
+
+        player.ai = HybridPlayerAI(trainer._sample_action)
+
+        # Channel 1 — order override: bypass the neural net entirely and run
+        # a real Order (MoveOrder, ShootOrder, ...) through the normal engine
+        # order machinery, exactly like a rules-based AI would.  Useful for
+        # "take direct control" style human intervention.
+        player.ai.issue_order(MoveOrder(target_position=..., sprint=True))
+
+        # Channel 2 — decision-neuron override: force one or more decision
+        # heads' probabilities before the winner-take-all gating rule runs,
+        # while the execution network still supplies the physical motor
+        # output (move_direction, sprint, kick, tackle).  This is "give the
+        # neural net an order via its own decision neurons" rather than
+        # bypassing it — e.g. force the 'move' head to fire this tick:
+        player.ai.set_decision_override("move", 1.0)
+        # Clear a single override, or all of them:
+        player.ai.set_decision_override("move", None)
+        player.ai.clear_decision_overrides()
+
+    **Order override** (channel 1) takes priority over the decision-neuron
+    override and over the network's own decision sampling for as long as the
+    override order is in progress — ``act()`` assigns it to
+    ``player.current_order`` and returns without touching the network at all
+    that tick (mirrors how ``Phase1RulesAI``/other rules AIs work — the
+    engine's own ``_process_orders`` then calls ``order.execute()`` right
+    after ``act()`` returns).  Once the order completes (engine clears
+    ``player.current_order`` back to ``None``), control reverts to the
+    neural network automatically on the following tick — no manual
+    "hand back control" step needed.
+
+    **Decision-neuron override** (channel 2) only affects ticks where the
+    network actually samples a fresh decision (every
+    ``decision_interval_ticks`` ticks) and only when no order override is
+    in progress.  Forcing a head's probability to ``1.0`` guarantees it wins
+    ``select_action``'s winner-take-all rule (barring another forced head
+    with higher `_HEAD_ORDER` priority); forcing to ``0.0`` guarantees it
+    cannot fire.  Valid head names: ``shoot``, ``pass_``, ``move``,
+    ``tackle``, ``get_possession``, ``mark``, ``hold_position`` — see
+    ``ai/action/gating.py``'s ``_HEAD_ORDER``.
+
+    This class is deliberately generic/extensible: it does not know or care
+    whether the override values come from a human clicking in the UI, from a
+    rules-based `PlayerAI`, or from a scripted test — anything that can call
+    ``issue_order``/``set_decision_override`` can drive it.  See
+    ``ai/knowledge.md``'s "HybridPlayerAI" section for the full design
+    rationale and the Orders-vs-execution-network boundary this respects.
+    """
+
+    def __init__(self, *args, **kwargs) -> None:
+        super().__init__(*args, **kwargs)
+        self._order_override: object | None = None
+        self._order_override_assigned: bool = False
+        self._decision_overrides: dict[str, float] = {}
+
+    def reset(self) -> None:
+        super().reset()
+        self._order_override = None
+        self._order_override_assigned = False
+        self._decision_overrides = {}
+
+    # -- channel 1: order override -------------------------------------------
+
+    def issue_order(self, order) -> None:
+        """Take direct control this tick: assign *order* and let the engine's
+        normal order machinery execute it, bypassing the neural network
+        entirely until the order completes."""
+        self._order_override = order
+        self._order_override_assigned = False
+
+    def clear_order_override(self) -> None:
+        """Cancel any in-progress order override and return control to the
+        neural network immediately (the player's current order, if any, is
+        left as-is; it will simply no longer be refreshed by this AI)."""
+        self._order_override = None
+        self._order_override_assigned = False
+
+    @property
+    def order_override_active(self) -> bool:
+        return self._order_override is not None
+
+    # -- channel 2: decision-neuron override ---------------------------------
+
+    def set_decision_override(self, head_name: str, value: float | None) -> None:
+        """Force decision head *head_name*'s probability to *value* (e.g. 1.0
+        to guarantee it fires, 0.0 to suppress it) on the next decision tick.
+        Pass ``value=None`` to clear the override for that head."""
+        if value is None:
+            self._decision_overrides.pop(head_name, None)
+        else:
+            self._decision_overrides[head_name] = float(value)
+
+    def clear_decision_overrides(self) -> None:
+        self._decision_overrides = {}
+
+    # -- act() ----------------------------------------------------------------
+
+    def act(self, player: "Player", match: "Match", trial_tick: int) -> None:
+        # Channel 1 takes priority: while an order override is active, skip
+        # the neural network entirely (no sampling, no last_transition) and
+        # let the engine's normal order-execution machinery run it.
+        if self._order_override is not None:
+            if not self._order_override_assigned:
+                player.current_order = self._order_override
+                self._order_override_assigned = True
+                return
+            if player.current_order is None:
+                # The override order completed (or was cleared externally) —
+                # hand control back to the neural network from here on.
+                self._order_override = None
+                self._order_override_assigned = False
+            else:
+                return  # still in progress; do nothing further this tick
+
+        if not self._decision_overrides:
+            super().act(player, match, trial_tick)
+            return
+
+        # Channel 2: sample normally, but patch decision_probs before gating
+        # on decision ticks only (between-decision ticks just re-apply the
+        # last cached gating, same as NeuralPlayerAI).
+        from footballcoach.ai.obs.encoder import encode_observation, MAX_OTHER_PLAYERS
+        from footballcoach.ai.action.apply_nn_action import apply_action_to_player
+        from footballcoach.ai.action.gating import select_action
+
+        self._episode_ticks += 1
+        self._ticks_since_decision += 1
+
+        if self._ticks_since_decision < self.decision_interval_ticks:
+            if self._last_gating is not None:
+                apply_action_to_player(
+                    gating=self._last_gating,
+                    player=player,
+                    match=match,
+                    slot_player_ids=[None] * 21,
+                    decision_physical={},
+                )
+            return
+
+        self.last_transition = None
+        self._ticks_since_decision = 0
+
+        time_remaining = max(0.0, self.max_episode_s - self._episode_ticks / 30.0)
+        obs = encode_observation(
+            match=match,
+            player_id=player.player_id,
+            time_remaining_s=time_remaining,
+            attack_defence_smoothed=self.ema_smoothed,
+            rng=self._rng,
+        )
+        obs_dict = obs.to_torch_dict()
+
+        result = self.sample_action_fn(obs_dict)
+        (action, log_prob, value, decision_probs, exec_phys,
+         dec_phys, target_slots, raw_exec, head_log_probs) = result
+
+        decision_probs = dict(decision_probs)
+        decision_probs.update(self._decision_overrides)
+
+        slot_player_ids = [None] * MAX_OTHER_PLAYERS
+        gating = select_action(decision_probs, exec_phys, target_slots)
+        self._last_gating = gating
         translation = apply_action_to_player(
             gating=gating,
             player=player,

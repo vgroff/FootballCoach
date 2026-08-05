@@ -541,7 +541,50 @@ to the trainee (and secondary players).  `Match.step()` calls
 stores the result in `player.ai.last_transition`.  `env.step()` reads this
 into `env.last_trainee_transition` for the rollout buffer.
 
-`_sample_action(obs_dict)` still returns an 8-tuple internally:
+### `HybridPlayerAI` — human/rules override on top of `NeuralPlayerAI` (UI training mode)
+
+`rules_ai.HybridPlayerAI(sample_action_fn, ...)` subclasses `NeuralPlayerAI`
+and adds two independent, opt-in override channels so a single player can be
+driven by a mix of neural network control and direct human/rules
+intervention — the intended general pattern for "some players neural, some
+human, some rules-based, mixed per-player" going forward (see the UI's
+training-mode `N` hotkey in `ui/app.py::_toggle_training_ai_mode` for the
+current live consumer).
+
+- **Channel 1 — order override** (`issue_order(order)` /
+  `clear_order_override()`): assigns a real `Order` (`MoveOrder`,
+  `ShootOrder`, `KickOrder`, ...) to `player.current_order` and skips the
+  neural network entirely — no sampling, no `last_transition` — for as long
+  as that order is in progress, exactly like a rules-based `PlayerAI` would.
+  Control reverts to the network automatically the tick after the engine
+  clears `player.current_order` back to `None` (order completed). This is
+  "take direct control," bypassing the execution network's learned motor
+  skill for that action — used by `MatchInputController._issue_order()` /
+  the kick UI (`ui/input.py`), which detect `isinstance(player.ai,
+  HybridPlayerAI)` and route every click/kick through this channel instead
+  of writing `player.current_order` directly, so a human click on a
+  neural-controlled trainee "takes over" for exactly one order.
+- **Channel 2 — decision-neuron override**
+  (`set_decision_override(head_name, value)` / `clear_decision_overrides()`):
+  patches `decision_probs[head_name] = value` **after** the network samples
+  but **before** `select_action()`'s winner-take-all gating runs — i.e. "give
+  the neural net an order via its own decision neurons" (e.g. force
+  `move`'s probability to `1.0` to guarantee the MOVE head wins gating this
+  decision tick) while the execution network still supplies all the
+  physical motor output (`move_direction`, `sprint`, kick physics, tackle).
+  Valid head names match `ai/action/gating.py`'s `_HEAD_ORDER`: `shoot`,
+  `pass_`, `move`, `tackle`, `get_possession`, `mark`, `hold_position`. Only
+  takes effect on ticks where the network actually samples a fresh decision
+  (every `decision_interval_ticks` ticks) and only when channel 1 isn't
+  active.
+
+Channel 1 always takes priority over channel 2 and over the network's own
+sampling. Both channels are independent of *who* drives them — a human click,
+a rules-based `PlayerAI`, or a scripted test can all call
+`issue_order`/`set_decision_override` on the same `HybridPlayerAI` instance,
+which is what makes this pattern reusable beyond the training-mode UI.
+
+### `_sample_action(obs_dict)` still returns an 8-tuple internally:
 ```
 (action, log_prob, value, decision_probs, execution_physical,
  decision_physical, target_slots, raw_exec_samples)

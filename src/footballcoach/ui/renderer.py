@@ -82,6 +82,11 @@ class Renderer:
         self._inactive_alpha: int = int(gcfg["player"].get("inactive_alpha", style.INACTIVE_ALPHA))
         self.min_ball_radius_px: int = gcfg["ball"]["min_radius_px"]
         self._ball_outline: bool = gcfg["ball"].get("outline", False)
+        # outline_width_px may be a float: values >= 1 → integer pixel width at full
+        # opacity; values in (0, 1) → 1px outline drawn at that fraction of full opacity
+        # (e.g. 0.5 → alpha 128), giving a visually softer/thinner border.
+        self._ball_outline_width: float = max(0.0, float(gcfg["ball"].get("outline_width_px", 1)))
+        self._ball_height_boost_per_m: float = float(gcfg["ball"].get("height_boost_per_metre", 0.35))
         sl = gcfg["speed_lines"]
         self._speed_line_threshold: float = sl["threshold_mps"]
         self._speed_line_count: int = sl["count"]
@@ -110,12 +115,30 @@ class Renderer:
         # Last ball position for estimating rolling velocity each frame
         self._last_ball_pos: tuple[float, float] = (0.0, 0.0)
 
+        # Ball state rings
+        _bsr = gcfg.get("ball_state_rings", {})
+        self._ring_show_flying: bool = bool(_bsr.get("show_flying", True))
+        self._ring_show_rolling: bool = bool(_bsr.get("show_rolling", True))
+        self._ring_show_bounced: bool = bool(_bsr.get("show_bounced", True))
+        self._ring_offset_px: int = int(_bsr.get("offset_px", 3))
+        self._ring_width_px: int = max(1, int(_bsr.get("width_px", 2)))
+        def _rgb(key: str, default: tuple) -> tuple:
+            v = _bsr.get(key, list(default))
+            return (int(v[0]), int(v[1]), int(v[2]))
+        self._ring_color_flying: tuple = _rgb("color_flying", style.BALL_STATE_FLYING_OUTLINE)
+        self._ring_color_rolling: tuple = _rgb("color_rolling", style.BALL_STATE_ROLLING_OUTLINE)
+        self._ring_color_bounced: tuple = _rgb("color_bounced", style.BALL_STATE_BOUNCED_OUTLINE)
+
         # Ball trail
         _bt = gcfg.get("ball_trail", {})
         self._trail_length: int = _bt.get("length", 10)
         self._trail_min_speed: float = _bt.get("min_speed_mps", 2.0)
         self._trail_max_alpha: int = _bt.get("max_alpha", 150)
         self._trail_radius_frac: float = _bt.get("radius_fraction", 0.75)
+        # interp_steps: how many sub-samples to insert between each stored position
+        # when drawing (1 = no interpolation, 3 = two extra points per gap).
+        self._trail_radius_taper: float = max(0.0, min(1.0, float(_bt.get("radius_taper", 0.35))))
+        self._trail_interp_steps: int = max(1, int(_bt.get("interp_steps", 1)))
         self._ball_trail: collections.deque = collections.deque(maxlen=self._trail_length)
 
     @staticmethod
@@ -138,8 +161,17 @@ class Renderer:
             for i in range(3)
         ]
 
+    def record_trail(self, ball: Ball) -> None:
+        """Append or trim the ball ghost trail. Call once per physics tick."""
+        speed = ball.velocity.length_xy()
+        if speed >= self._trail_min_speed and ball.possessed_by is None:
+            self._ball_trail.append((ball.position.x, ball.position.y, ball.position.z))
+        elif speed < self._trail_min_speed * 0.5 or ball.possessed_by is not None:
+            if self._ball_trail:
+                self._ball_trail.popleft()
+
     def update_ball_effects(self, ball: Ball, dt_s: float) -> None:
-        """Integrate 3D ball orientation from spin + rolling, update ghost trail.
+        """Integrate 3D ball orientation from spin + rolling.
         Call once per rendered frame (only when not paused)."""
         # Estimate XY velocity from position delta (works for both free and possessed).
         cur_x, cur_y = ball.position.x, ball.position.y
@@ -172,13 +204,6 @@ class Renderer:
                 [t*ax*az - s*ay,  t*ay*az + s*ax, t*az*az + c   ],
             ]
             self._ball_orientation = self._mat_mul3(dR, self._ball_orientation)
-
-        speed = ball.velocity.length_xy()
-        if speed >= self._trail_min_speed and ball.possessed_by is None:
-            self._ball_trail.append((ball.position.x, ball.position.y))
-        elif speed < self._trail_min_speed * 0.5 or ball.possessed_by is not None:
-            if self._ball_trail:
-                self._ball_trail.popleft()
 
     def draw_pitch(self, surface: pygame.Surface, pitch: Pitch) -> None:
         surface.fill(style.PITCH_GREEN)
@@ -235,36 +260,68 @@ class Renderer:
         # boosted. The height effect is then exaggerated on top of that
         # minimum, and a small height label is shown, per the design spec.
         base_radius_px = max(self.min_ball_radius_px, cam.scale_length(ball.radius_m))
-        height_boost = 1.0 + min(ball.height_m, 5.0) * 0.35  # exaggerated
+        height_boost = 1.0 + min(ball.height_m, 5.0) * self._ball_height_boost_per_m
         radius_px = max(2, int(base_radius_px * height_boost))
 
         # --- Ghost trail: drawn before the ball so it's underneath ---
-        n = len(self._ball_trail)
+        samples = list(self._ball_trail)
+        n = len(samples)
         if n >= 1:
-            for i, (wx, wy) in enumerate(self._ball_trail):
-                # Oldest = index 0 = most faded; newest = index n-1 = brightest
-                age_frac = (n - 1 - i) / max(n - 1, 1)  # 0=newest, 1=oldest
+            # Build interpolated point list (x, y, z).
+            # The newest sample is always coincident with the live ball and would be
+            # hidden underneath it, so we exclude it from drawing — but keep it in
+            # samples for interpolation so the last visible ghost blends smoothly
+            # toward the ball position.
+            if n >= 2 and self._trail_interp_steps > 1:
+                pts: list[tuple[float, float, float]] = []
+                for i in range(n - 1):
+                    pts.append(samples[i])
+                    x0, y0, z0 = samples[i]
+                    x1, y1, z1 = samples[i + 1]
+                    for s in range(1, self._trail_interp_steps):
+                        t = s / self._trail_interp_steps
+                        pts.append((x0 + t * (x1 - x0), y0 + t * (y1 - y0), z0 + t * (z1 - z0)))
+                # omit the final sample (coincident with live ball)
+            elif n >= 2:
+                pts = samples[:-1]
+            else:
+                pts = []  # only one sample — it's the live ball position, nothing to draw
+
+            total = len(pts)
+            for i, (wx, wy, wz) in enumerate(pts):
+                # Oldest = index 0 = most faded; newest = index total-1 = brightest
+                age_frac = (total - 1 - i) / max(total - 1, 1)  # 0=newest, 1=oldest
                 alpha = int(self._trail_max_alpha * (1.0 - age_frac))
                 if alpha < 6:
                     continue
-                gr = max(1, int(radius_px * self._trail_radius_frac * (1.0 - age_frac * 0.35)))
+                ghost_boost = 1.0 + min(wz, 5.0) * self._ball_height_boost_per_m
+                ghost_base_r = max(1, int(base_radius_px * self._trail_radius_frac * (1.0 - age_frac * self._trail_radius_taper)))
+                gr = max(1, int(ghost_base_r * ghost_boost))
                 tp = self.camera.world_to_screen(wx, wy)
                 ts = pygame.Surface((gr * 2 + 2, gr * 2 + 2), pygame.SRCALPHA)
                 pygame.draw.circle(ts, (*style.BALL_COLOUR, alpha), (gr + 1, gr + 1), gr)
                 surface.blit(ts, (tp[0] - gr - 1, tp[1] - gr - 1))
 
         pygame.draw.circle(surface, style.BALL_COLOUR, pos, radius_px)
-        if self._ball_outline:
-            pygame.draw.circle(surface, style.BALL_OUTLINE, pos, radius_px, 1)
+        if self._ball_outline and self._ball_outline_width > 0.0:
+            if self._ball_outline_width >= 1.0:
+                pygame.draw.circle(surface, style.BALL_OUTLINE, pos, radius_px, int(self._ball_outline_width))
+            else:
+                # Sub-pixel: draw 1px outline at reduced alpha for a softer border
+                _oa = int(self._ball_outline_width * 255)
+                _ots = pygame.Surface((radius_px * 2 + 2, radius_px * 2 + 2), pygame.SRCALPHA)
+                pygame.draw.circle(_ots, (*style.BALL_OUTLINE, _oa), (radius_px + 1, radius_px + 1), radius_px, 1)
+                surface.blit(_ots, (pos[0] - radius_px - 1, pos[1] - radius_px - 1))
 
         # Ball state indicator rings (drawn on top of the ball circle).
         # Priority: just_bounced > flying > rolling (mutually exclusive for display).
-        if ball.just_bounced_timer_s > 0.0:
-            pygame.draw.circle(surface, style.BALL_STATE_BOUNCED_OUTLINE, pos, radius_px + 3, 2)
-        elif ball.position.z > 0.05 and ball.possessed_by is None:
-            pygame.draw.circle(surface, style.BALL_STATE_FLYING_OUTLINE, pos, radius_px + 3, 2)
-        elif ball.velocity.length_xy() > 0.05 and ball.possessed_by is None:
-            pygame.draw.circle(surface, style.BALL_STATE_ROLLING_OUTLINE, pos, radius_px + 3, 2)
+        _ring_r = radius_px + self._ring_offset_px
+        if self._ring_show_bounced and ball.just_bounced_timer_s > 0.0:
+            pygame.draw.circle(surface, self._ring_color_bounced, pos, _ring_r, self._ring_width_px)
+        elif self._ring_show_flying and ball.position.z > 0.05 and ball.possessed_by is None:
+            pygame.draw.circle(surface, self._ring_color_flying, pos, _ring_r, self._ring_width_px)
+        elif self._ring_show_rolling and ball.velocity.length_xy() > 0.05 and ball.possessed_by is None:
+            pygame.draw.circle(surface, self._ring_color_rolling, pos, _ring_r, self._ring_width_px)
 
         # --- Dots: fixed points on the 3D ball surface, projected top-down ---
         # Always shown; rotate as the ball spins. Front hemisphere only.

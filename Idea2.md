@@ -15,7 +15,7 @@ Extending training:
 - We have a big system in place for Phase 1 training. a bit part of this task will be generalising this in intelligent ways for multi-task training.
 - Have a look at the balance scenarios in the UI. I want to use some of these as inspiration for tasks. In particular, at first, the passing one and the close range shooting and 1v2, to teach kicking/passing/shooting/scoring. 
 - Essentially we wnat the exact same system, but with different rules-based AIs and reward systems
-- I'm thinking the reward function should be split by order. E.g. for phase 1 we have these custom rewards that are relaly just tied to Order behaviour. Instead, it should be split by order - eg some apply to GetPossession/ChaseTackle (depends on ball possession), some apply only to MoveOrder, then later some will apply only to Shoot, Pass etc… completing the order (fast) should always give a reward boost. This was we can build rules-based AIs, set the appropriate order and then query them to see what the reward should be, both for themsleves and for the neural AI. There will also certainly be custom reward termsinvolved in each case
+- I'm thinking the reward function should be split by order. E.g. for phase 1 we have these custom rewards that are relaly just tied to Order behaviour. Instead, it should be split by order - eg some apply to GetPossession/ChaseTackle (depends on ball possession), some apply only to MoveOrder, then later some will apply only to Shoot, Pass etc… completing the order (fast) should always give a reward boost. This was we can build rules-based AIs, set the appropriate order and then query them to see what the reward should be, both for themsleves and for the neural AI. There will also certainly be custom reward termsinvolved in each case, some we cna make always be there (e.g. stamina)
 - Task ids are important, make sure they are set
     - I think task ids should only be set by the decision network, the execution network shouldnt get them (remove if it already does)
 - When running these messy/random scenarios, we might need to decide (maye using a value network) whcih runs are actually good (advantage-wise and in absolute)
@@ -25,11 +25,47 @@ Current notes:
 - " read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
 - train blockers:
     - try just doing immobile first - can we improve?
-    - as an experiment - have a second copy of the value network, completely separate network with it's own trunk, and run it on the value pre-training and see if it can do better than the shared-trunk one
-        - we have this now, should check results use --experiment-separate-value-net
-        - consider having them have a different entity MLP that has the opponent type there instead of as a side channel (only on the value network side, of course), could even share all the weights that they have in common, and all other MLPs (frozen for the value network) just different trunks andhalf-shared entity MLPS 
+    - [] make approach speed go both ways, reduce heading penalty (or change it?)
+    - Evalulations both pre and during training should be seeded so that they're deterministically setup (with still a random match seed each time), and possibly should run more than once. There are some notes about seeding in agent_plans/ppo_scenario_seedppo.md, so read that first, but you'd only need it on the evaluations for now, just make it extensible/generalisable if possible. We might also want multiple runs of the same seeded trial, sinec matches and PPO are random
+    - Do the seeding thing somehow, or have pre-built scenarios, or something like that. Or maybe use the same exact scenario(s) but add a bit of noise to everything
+        - [?] Could already do this by just having very tight params? Maybe add some more bounds first?
+    - [Y] can we get more of the direction-based logs output angles and the like rather than [x,y]? or at least have both? e.g. exec log std and mean delta in degrees too, the d_move/d_kick, all that kind of stuff
+        - can we get some measure of delta over the whole epoch too? instead of op step?
+    - [Y] can we get the advanatge on the worst performance logs?
+    - [Y] can we get breakdown on highest policy log and what the contribution is?
+    - [?] measure of exploration vs exploitation for each execution head?
+    - Advantage is sus - has extreme values
+        - understand why
+        - [Y] print reward statistics - mean, std, min/max - by type
+        - larger minibatch?
+        - consider "advantage clipping"
+    - Policy ratios are "insane". Investigate, very possible from sigma being small
+    - !decisions like hold and pass are in the logs with losses - shouldnt they be frozen?
+    - check on illegal moves?
+    - run an inline script, with seeded scenarios and multi-runs, to check effect of decision interval on performace (use neural net)
+    - "close miss" type penalty - distance to ball increasing while small while ball not possessed
+=====================
+    - We have a plan for the implementation of seeding scenarios for less noise
+        - The evaluation steps should also use seeds so that they're always the same!
+            - might need multiple runs of each trial to reduce noise better?
+        - For now, only implement on the evaluations during training and before training, make them all the same (might need to harmonise number of trials param)
+    - "Value only continuation" should use a test set with early stopping (generate new ones, 10% size comparison)
+    - give the football a black border/outline in the UI - expose the thickness
+    - Does neural AI kick power adjust for running speed or not?
+    - rules-based AI kicking behaviour seems weird, both doing it when it shouldnt and not doing it when it should it seems - is it calculating speed vs top speed correctly?
+        - Prove rules-AI performs better with it
+    - Reward shaping rewards should anneal to 0 over training - only leave speed and victory and timeout/ballout type ones
+    - can rules-based AI run at 2Hz? I.e. only make move/actions changes on decision tick. Does it perform similarly well?
+    - have better/more varied move/kick/tackle data, it seems to confuse them - kicks and tackles are random, as are player attriutes, so we should run have the same game scanerio multiple times in the BC to show the difference!!!!! Should we do this during PPO also?
+        - Should we even just have like 1 scenario? or a small selection? use a set of random seeds? E.g. seed 1-10, always the same 10 scenarios
+        - Different ones for positions vs attributes vs match seed etc? One set of seed for position, another for attributed (or randomise it)
+    - do we/should we punish the network for kicking/tackling when it cant or just ignore it?
+    - what are the illegal decisions in the reward function?
+    - why is the BC network unable to relialy learn tackling? It seems sus, we should inspect it's inputs when it does and doesn't predict a tackle correctly
+    - getting 70% against immobile - check in the UI maybe
+        - Much worse performance again immobile than self-play - it just runs in ncircles in the UI -  why??
     - do we need batch norm or dropout oor other regularisation?
-- Move Order with ball kicking...
+- what would happen if the correlations in the attriute matrix made them an invalid gaussian type thing?
 - 2v2 goalkeepr AI should only switch to save order if the kick is aimed towards the goal, and should cease save order if the ball changes posssesion, even to another teammate of the oppoiste side, and go back to the goal centre
 
 
@@ -49,6 +85,7 @@ Read ai_trainer_knowledge.md, and then run a training run
 - We could super easliy remove a whole axis of symmetry by transforming all AI positions to being +x is attacking goal, -x is dending goal, remove the flag for which end youre attacking on and transform back and forth from the engine positions to the AI positions. Would probably mean a smaller/smarter AI and faster trainnig from fewer augmentations (half the training time)
     - I think all that needs changing is absolute coordinates - i.e. player position and move region (?). and then augmentation and team flags removed.
 - definitely need a phase 0 type thing where we just teach movement, with and without the ball, going between waypoints for a start, it struggle with movement a lot
+- do we need a von mises on angle stds? or is the gaussian good enough?
 - how could I speed up training? parrallelise the engine itself? increase the tick time when nothing much is going on (e.g. ball controlled and nobody near controller?) what is most likely taking up time in this?
 - can i forcesome smart exploration by e.g. making the neural net tackle when it's legal and making it learn to do? This is called DAgger, but we already kinda do it with BC annealing, it's just online instead of saved data - but we cna do it later
 - parralelise the simulation somehow? player decision? maybe even movements/updates, though potentially dangerous

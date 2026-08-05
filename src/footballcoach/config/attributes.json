@@ -37,7 +37,7 @@
     "league_two": { "mean": 0.34, "sigma": 0.09 },
     "league_three": { "mean": 0.28, "sigma": 0.09 },
     "generic": { "mean": 0.55, "sigma": 0.23 },
-    "boosted": { "mean": 0.76, "sigma": 0.07},
-    "patsy": { "mean": 0.63, "sigma": 0.10}
+    "boosted": { "mean": 0.76, "sigma": 0.04},
+    "patsy": { "mean": 0.65, "sigma": 0.04}
   }
 }

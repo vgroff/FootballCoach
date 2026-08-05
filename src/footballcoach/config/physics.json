@@ -26,7 +26,7 @@
   "world": {
     "gravity_mps2": 9.81,
     "air_density_kgpm3": 1.225,
-    "dt_s": 0.03333333333333333
+    "dt_s": 0.0333333333333333
   },
   "rng": {
     "default_rng_reduction": 0.3
@@ -124,7 +124,7 @@
     "rolling_friction_coefficient": 0.05,
     "spin_decay_per_s": 0.15,
     "block_restitution": 0.35,
-    "just_bounced_display_duration_s": 0.3,
+    "just_bounced_display_duration_s": 0.45,
     "goal_net_restitution": 0.1,
     "bounce_threshold_mps": 0.5,
     "_comment_bounce_threshold": "Min incoming vertical speed to count as a real bounce (apply restitution) vs. resting/rolling ground contact. Prevents a resting ball's per-tick gravity integration from being misread as a full bounce and repeatedly damping horizontal speed. See engine/knowledge.md 'ground contact' note."

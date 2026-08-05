@@ -71,7 +71,17 @@ class MaskedCategorical:
 
     def __init__(self, logits: torch.Tensor, exists_mask: torch.Tensor):
         # exists_mask: (batch, MAX_OTHER_PLAYERS) or (MAX_OTHER_PLAYERS,)
-        masked_logits = logits.masked_fill(exists_mask < 0.5, float("-inf"))
+        invalid = exists_mask < 0.5
+        # Guard the "zero valid targets" edge case (e.g. UI training mode's
+        # 1-player-only match, no other players at all): softmax over an
+        # all -inf row is NaN. Leave those rows fully unmasked instead -- the
+        # resulting sample is meaningless but finite; callers must not act on
+        # a target slot when there were zero real other players to begin with
+        # (see class docstring / apply_nn_action.py's slot_player_ids=None
+        # guard, which already makes such a slot resolve to no-op).
+        fully_masked_rows = invalid.all(dim=-1, keepdim=True)
+        invalid = invalid & ~fully_masked_rows
+        masked_logits = logits.masked_fill(invalid, float("-inf"))
         self.dist = torch.distributions.Categorical(logits=masked_logits)
 
     def sample(self) -> torch.Tensor:
