@@ -8,13 +8,124 @@ behaviour under normal play vs. post-goal windows.
 """
 import pytest
 
-from footballcoach.ai.env.reward import EMAFilter, phase1_reward, phase2_reward
+from footballcoach.ai.env.reward import (
+    EMAFilter,
+    cumulative_clamped_delta,
+    phase1_reward,
+    phase2_reward,
+    symmetric_clamp,
+)
 
 # Load the actual coefficients from config so the tests stay in sync
 from footballcoach.ai.config import load_ai_config
 
 _CFG1 = load_ai_config()["reward"]["phase1"]
 _CFG2 = load_ai_config()["reward"]["phase2"]
+
+
+# ---------------------------------------------------------------------------
+# cumulative_clamped_delta / symmetric_clamp
+# ---------------------------------------------------------------------------
+
+class TestSymmetricClamp:
+
+    def test_none_passthrough(self):
+        assert symmetric_clamp(None) == (None, None)
+
+    def test_returns_max_then_min_order(self):
+        """Must match cumulative_clamped_delta()'s (clamp_max, clamp_min)
+        param order — regression test for a bug where this returned
+        (-clamp, +clamp) i.e. (min, max), which made clamp_max < clamp_min
+        and silently collapsed every clamped term (e.g. 'prog') to 0."""
+        clamp_max, clamp_min = symmetric_clamp(0.5)
+        assert clamp_max == pytest.approx(0.5)
+        assert clamp_min == pytest.approx(-0.5)
+        assert clamp_max > clamp_min
+
+
+class TestCumulativeClampedDelta:
+
+    def test_no_clamp_returns_raw_delta_unchanged(self):
+        payout, cum_after = cumulative_clamped_delta(0.37, 1.0)
+        assert payout == pytest.approx(0.37)
+        assert cum_after == pytest.approx(1.37)
+
+    def test_within_bounds_payout_equals_raw_delta(self):
+        payout, cum_after = cumulative_clamped_delta(0.1, 0.0, clamp_max=1.0, clamp_min=-1.0)
+        assert payout == pytest.approx(0.1)
+        assert cum_after == pytest.approx(0.1)
+
+    def test_saturates_at_upper_bound(self):
+        """Once the running total exceeds clamp_max, further positive
+        deltas pay out only the remaining headroom, then 0 once saturated."""
+        payout1, cum1 = cumulative_clamped_delta(0.6, 0.0, clamp_max=1.0, clamp_min=-1.0)
+        assert payout1 == pytest.approx(0.6)
+        # unclamped running total 0.6 -> 1.2, but clamped total can only move 0.6 -> 1.0
+        payout2, cum2 = cumulative_clamped_delta(0.6, cum1, clamp_max=1.0, clamp_min=-1.0)
+        assert payout2 == pytest.approx(0.4)
+        assert cum2 == pytest.approx(1.2)
+        # now fully saturated -- further positive deltas pay out 0
+        payout3, cum3 = cumulative_clamped_delta(0.6, cum2, clamp_max=1.0, clamp_min=-1.0)
+        assert payout3 == pytest.approx(0.0, abs=1e-9)
+        assert cum3 == pytest.approx(1.8)
+
+    def test_saturates_at_lower_bound(self):
+        payout1, cum1 = cumulative_clamped_delta(-0.6, 0.0, clamp_max=1.0, clamp_min=-1.0)
+        assert payout1 == pytest.approx(-0.6)
+        payout2, cum2 = cumulative_clamped_delta(-0.6, cum1, clamp_max=1.0, clamp_min=-1.0)
+        assert payout2 == pytest.approx(-0.4)
+        assert cum2 == pytest.approx(-1.2)
+        payout3, cum3 = cumulative_clamped_delta(-0.6, cum2, clamp_max=1.0, clamp_min=-1.0)
+        assert payout3 == pytest.approx(0.0, abs=1e-9)
+        assert cum3 == pytest.approx(-1.8)
+
+    def test_reversal_after_saturation_pays_out_again(self):
+        """After saturating at the upper bound, moving back the other way
+        (past the bound) should resume paying out (episode total still
+        bounded)."""
+        _, cum1 = cumulative_clamped_delta(2.0, 0.0, clamp_max=1.0, clamp_min=-1.0)  # unclamped=2.0, clamped total saturated at +1.0
+        # unclamped total moves from 2.0 -> 0.5 (below the +1.0 clamp), so the
+        # clamped total moves from 1.0 -> 0.5 -> payout is the full delta
+        payout2, cum2 = cumulative_clamped_delta(-1.5, cum1, clamp_max=1.0, clamp_min=-1.0)
+        assert payout2 == pytest.approx(-0.5)
+        assert cum2 == pytest.approx(0.5)
+
+    def test_episode_sum_of_payouts_never_exceeds_clamp_max(self):
+        """Many small positive deltas over a long 'episode' must never sum
+        past clamp_max — the exact scenario this primitive exists for."""
+        cum = 0.0
+        total_payout = 0.0
+        for _ in range(1000):
+            payout, cum = cumulative_clamped_delta(0.01, cum, clamp_max=0.5, clamp_min=-0.5)
+            total_payout += payout
+        assert total_payout <= 0.5 + 1e-9
+        assert total_payout == pytest.approx(0.5, rel=1e-3)
+
+    def test_asymmetric_bounds_independent(self):
+        """clamp_max/clamp_min can differ (e.g. appr_sq's independently
+        tunable approach/retreat coefficients)."""
+        cum = 0.0
+        total_payout = 0.0
+        for _ in range(1000):
+            payout, cum = cumulative_clamped_delta(0.01, cum, clamp_max=0.2, clamp_min=-0.9)
+            total_payout += payout
+        assert total_payout == pytest.approx(0.2, rel=1e-3)
+
+        cum = 0.0
+        total_payout = 0.0
+        for _ in range(1000):
+            payout, cum = cumulative_clamped_delta(-0.01, cum, clamp_max=0.2, clamp_min=-0.9)
+            total_payout += payout
+        assert total_payout == pytest.approx(-0.9, rel=1e-3)
+
+    def test_only_clamp_max_set(self):
+        cum = 0.0
+        total_payout = 0.0
+        for _ in range(1000):
+            payout, cum = cumulative_clamped_delta(-0.01, cum, clamp_max=0.2, clamp_min=None)
+            total_payout += payout
+        # No lower bound -> unbounded negative accumulation, all raw deltas pass through
+        assert total_payout == pytest.approx(-10.0, rel=1e-3)
 
 
 # ---------------------------------------------------------------------------
@@ -30,7 +141,13 @@ class TestPhase1Reward:
     """
 
     def _call(self, **kwargs) -> tuple[float, dict]:
-        """Call phase1_reward with no-op defaults; kwargs override specific fields."""
+        """Call phase1_reward with no-op defaults; kwargs override specific fields.
+
+        Drops the 3rd return value (prog_cumulative_after) so existing
+        callers below can keep unpacking (total, comps) — see
+        cumulative_clamped_delta()/phase1_reward's docstring for why prog
+        clamping is now episode-cumulative, not per-step.
+        """
         defaults = dict(
             prev_ball_dist=5.0, curr_ball_dist=5.0,
             has_possession_now=False, gained_possession_this_step=False,
@@ -39,7 +156,8 @@ class TestPhase1Reward:
             cfg=_CFG1,
         )
         defaults.update(kwargs)
-        return phase1_reward(**defaults)
+        total, comps, _prog_cum_after = phase1_reward(**defaults)
+        return total, comps
 
     def test_returns_tuple_of_float_and_dict(self):
         result = self._call()
@@ -202,7 +320,7 @@ class TestPhase1Reward:
         test overrides it locally to a non-zero value to exercise the formula.
         """
         _cfg_prox = {**_CFG1, "proximity_bonus_scale": 0.65}
-        _, comps_near = phase1_reward(
+        _, comps_near, _ = phase1_reward(
             prev_ball_dist=1.0, curr_ball_dist=1.0,
             has_possession_now=False, gained_possession_this_step=False,
             ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
@@ -210,7 +328,7 @@ class TestPhase1Reward:
             cfg=_cfg_prox, timed_out=True, ball_dist_to_opponent_box_m=1.0,
             start_ball_to_box_dist_m=30.0,
         )
-        _, comps_far = phase1_reward(
+        _, comps_far, _ = phase1_reward(
             prev_ball_dist=1.0, curr_ball_dist=1.0,
             has_possession_now=False, gained_possession_this_step=False,
             ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
@@ -228,7 +346,7 @@ class TestPhase1Reward:
         delta — pass player_speed_mps=5.0, heading_cos_sim=1.0 to exercise it
         with the same 5.0 magnitude the old _delta-based test used.
         """
-        total, comps = phase1_reward(
+        total, comps, _ = phase1_reward(
             prev_ball_dist=10.0, curr_ball_dist=5.0,
             has_possession_now=True, gained_possession_this_step=True,
             ball_progress_toward_goal_m=2.0, ball_went_out_after_touch=False,
@@ -243,6 +361,81 @@ class TestPhase1Reward:
             + _CFG1["ball_progress_scale"] * 2.0
         )
         assert total == pytest.approx(expected, rel=1e-5)
+
+    def test_prog_reward_clamp_bounds_episode_total(self):
+        """Regression test: prog_reward_clamp must actually bound the
+        episode-cumulative 'prog' payout over many steps, and must NOT
+        collapse it to 0 (see symmetric_clamp() param-order bug)."""
+        cum_state: dict = {}
+        total_prog_payout = 0.0
+        for _ in range(500):
+            _, comps, cum_state = phase1_reward(
+                prev_ball_dist=1.0, curr_ball_dist=1.0,
+                has_possession_now=True, gained_possession_this_step=False,
+                ball_progress_toward_goal_m=1.0, ball_went_out_after_touch=False,
+                illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+                cfg={**_CFG1, "ball_progress_scale": 1.0},
+                start_ball_to_box_dist_m=1.0,
+                prog_reward_clamp=0.5,
+                cumulative_state=cum_state,
+            )
+            total_prog_payout += comps["prog"]
+        assert total_prog_payout > 0.0, "prog reward clamp must not zero out the reward entirely"
+        assert total_prog_payout <= 0.5 + 1e-6
+        assert total_prog_payout == pytest.approx(0.5, rel=1e-3)
+
+    def test_appr_sq_clamps_bound_episode_total_independently(self):
+        """appr_sq_approach_reward_clamp/appr_sq_retreat_reward_clamp bound
+        the positive/negative cumulative appr_sq totals independently."""
+        cum_state: dict = {}
+        total_approach_payout = 0.0
+        for _ in range(500):
+            _, comps, cum_state = phase1_reward(
+                prev_ball_dist=1.0, curr_ball_dist=1.0,
+                has_possession_now=False, gained_possession_this_step=False,
+                ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+                illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+                cfg={**_CFG1, "ball_approach_speed_bonus": 1.0},
+                start_ball_dist_m=1.0, player_speed_mps=1.0, heading_cos_sim=1.0,
+                appr_sq_approach_reward_clamp=0.3,
+                cumulative_state=cum_state,
+            )
+            total_approach_payout += comps["appr_sq"]
+        assert total_approach_payout > 0.0
+        assert total_approach_payout <= 0.3 + 1e-6
+        assert total_approach_payout == pytest.approx(0.3, rel=1e-3)
+
+        cum_state = {}
+        total_retreat_payout = 0.0
+        for _ in range(500):
+            _, comps, cum_state = phase1_reward(
+                prev_ball_dist=1.0, curr_ball_dist=1.0,
+                has_possession_now=False, gained_possession_this_step=False,
+                ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+                illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+                cfg={**_CFG1, "ball_retreat_speed_penalty": 1.0},
+                start_ball_dist_m=1.0, player_speed_mps=1.0, heading_cos_sim=-1.0,
+                appr_sq_retreat_reward_clamp=0.3,
+                cumulative_state=cum_state,
+            )
+            total_retreat_payout += comps["appr_sq"]
+        assert total_retreat_payout < 0.0
+        assert total_retreat_payout >= -0.3 - 1e-6
+        assert total_retreat_payout == pytest.approx(-0.3, rel=1e-3)
+
+    def test_cumulative_state_missing_keys_default_to_zero(self):
+        """Passing an empty/partial cumulative_state dict must not crash and
+        must treat missing terms as starting from 0.0."""
+        total, comps, cum_after = phase1_reward(
+            prev_ball_dist=1.0, curr_ball_dist=1.0,
+            has_possession_now=True, gained_possession_this_step=False,
+            ball_progress_toward_goal_m=1.0, ball_went_out_after_touch=False,
+            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+            cfg=_CFG1, cumulative_state={},
+        )
+        assert isinstance(cum_after, dict)
+        assert "prog" in cum_after
+        assert "appr_sq" in cum_after
 
 
 # ---------------------------------------------------------------------------

@@ -253,6 +253,17 @@ class PPOTrainer:
         # are set explicitly above. None = uncapped.
         _pos_weight_max_cfg = bc_cfg.get("pos_weight_max")
         self._bc_pos_weight_max = None if _pos_weight_max_cfg is None else float(_pos_weight_max_cfg)
+        # Grad-norm clip for BC pretrain optimizers (bc_opt/demo_opt/repair_opt).
+        # None (default) = fall back to ppo.max_grad_norm (prior behaviour).
+        # Set bc.max_grad_norm to a float to use a BC-specific cap instead, or
+        # explicitly null in config to disable clipping entirely during BC.
+        _bc_max_grad_norm_cfg = bc_cfg.get("max_grad_norm", "__unset__")
+        if _bc_max_grad_norm_cfg == "__unset__":
+            self._bc_max_grad_norm: Optional[float] = self.max_grad_norm
+        elif _bc_max_grad_norm_cfg is None:
+            self._bc_max_grad_norm = None
+        else:
+            self._bc_max_grad_norm = float(_bc_max_grad_norm_cfg)
         self._downsample_trivial_enabled = bool(bc_cfg.get("downsample_trivial_enabled", False))
         self._downsample_trivial_frac_default = float(bc_cfg.get("downsample_trivial_frac_default", 0.5))
         self._downsample_trivial_frac_high_epoch = float(bc_cfg.get("downsample_trivial_frac_high_epoch", 0.65))
@@ -552,8 +563,18 @@ class PPOTrainer:
 
         rollout_start = time.perf_counter()
 
-        while self._total_steps < total_steps:
-            progress = self._total_steps / total_steps
+        # progress is relative to THIS call's step budget (0.0 at the start of
+        # this train() invocation, 1.0 once total_steps more decision-steps
+        # have been collected) -- NOT self._total_steps / total_steps, which
+        # would desync every schedule (bc.aux_coeff anneal in particular) on
+        # any resumed run (--latest/--checkpoint/--pretrain-from-checkpoint)
+        # since self._total_steps starts wherever the loaded checkpoint left
+        # off instead of 0. See ai_trainer_knowledge.md "resume progress bug".
+        _steps_at_call_start = self._total_steps
+        target_steps = _steps_at_call_start + total_steps
+
+        while self._total_steps < target_steps:
+            progress = (self._total_steps - _steps_at_call_start) / total_steps
 
             # --- Collect one decision step ---
             # NeuralPlayerAI fires inside env.step() — no pre-sampling needed here.
@@ -1053,11 +1074,12 @@ class PPOTrainer:
                     combined = dec_bc_loss + self._phase0_value_coef * val_loss
                     demo_opt.zero_grad()
                     combined.backward()
-                    nn.utils.clip_grad_norm_(
-                        list(self.decision_net.parameters())
-                        + list(self.execution_net.value_head.parameters()),
-                        self.max_grad_norm,
-                    )
+                    if self._bc_max_grad_norm is not None:
+                        nn.utils.clip_grad_norm_(
+                            list(self.decision_net.parameters())
+                            + list(self.execution_net.value_head.parameters()),
+                            self._bc_max_grad_norm,
+                        )
                     demo_opt.step()
                     epoch_losses.append(combined.item())
                     epoch_bc_losses.append(dec_bc_loss.item())
@@ -1110,20 +1132,20 @@ class PPOTrainer:
         bc_losses: list[float] = []
         bc_floors: list[float] = []
 
-        # --- Optional episode-level train/val split + early stop (see
-        # bc.bc_pretrain_early_stop_patience in ai_config.json). Disabled
-        # (patience=0, default) => train_idx covers the full valid_indices()
-        # set and val_idx is empty, matching prior "train blind" behaviour
-        # exactly (same code path as before this feature existed). ---
+        # --- Episode-level train/val split, reported every epoch (see
+        # bc.bc_pretrain_early_stop_patience in ai_config.json for the
+        # OPTIONAL early-stop behaviour layered on top). The split itself
+        # (and the per-epoch "val bc_val_loss=" log line below) is always
+        # computed whenever the dataset has >=2 episodes, regardless of
+        # whether early stop is enabled (patience=0 = report-only, no
+        # stopping/best-weight-restore -- matches prior "train blind"
+        # behaviour for the actual training, just with visibility added). ---
         _bc_early_stop_enabled = self._bc_pretrain_early_stop_patience > 0
-        if _bc_early_stop_enabled:
-            _bc_train_idx, _bc_val_idx = dataset.split_train_val_indices(val_frac=0.15, valid_only=True)
-            log.info(
-                f"  BC pretrain split: {len(_bc_train_idx):,} train rows"
-                + (f"  |  {len(_bc_val_idx):,} val rows" if len(_bc_val_idx) > 0 else "  (val split empty -- <2 episodes, early stop inactive)")
-            )
-        else:
-            _bc_train_idx, _bc_val_idx = None, np.array([], dtype=np.int64)
+        _bc_train_idx, _bc_val_idx = dataset.split_train_val_indices(val_frac=0.15, valid_only=True)
+        log.info(
+            f"  BC pretrain split: {len(_bc_train_idx):,} train rows"
+            + (f"  |  {len(_bc_val_idx):,} val rows" if len(_bc_val_idx) > 0 else "  (val split empty -- <2 episodes, val loss unavailable)")
+        )
         _bc_best_val_loss = float("inf")
         _bc_best_state: Optional[dict] = None
         _bc_patience_ctr = 0
@@ -1258,10 +1280,11 @@ class PPOTrainer:
                         val_raw_mse_losses.append(raw_mse.item())
                 bc_opt.zero_grad()
                 total_loss.backward()
-                nn.utils.clip_grad_norm_(
-                    list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
-                    self.max_grad_norm,
-                )
+                if self._bc_max_grad_norm is not None:
+                    nn.utils.clip_grad_norm_(
+                        list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+                        self._bc_max_grad_norm,
+                    )
                 bc_opt.step()
                 bc_losses.append(bc_loss.item())
                 bc_floors.append(compute_bc_loss_floor(
@@ -1368,22 +1391,26 @@ class PPOTrainer:
             _bkdn_acc.clear()
             _bkdn_n = 0
 
-            # --- BC pretrain val eval + early stop (see bc.bc_pretrain_early_stop_patience) ---
-            if _bc_early_stop_enabled and len(_bc_val_idx) > 0:
+            # --- BC pretrain val loss, reported every epoch; early stop is opt-in
+            # (see bc.bc_pretrain_early_stop_patience) ---
+            if len(_bc_val_idx) > 0:
                 _bc_val_loss = _eval_bc_val_loss()
                 _improved = _bc_val_loss < (_bc_best_val_loss - self._bc_pretrain_early_stop_min_delta)
-                log.info(
-                    f"    val        bc_val_loss={_bc_val_loss:.4f}  best={min(_bc_best_val_loss, _bc_val_loss):.4f}"
-                    + ("  (improved)" if _improved else f"  (patience {_bc_patience_ctr + 1}/{self._bc_pretrain_early_stop_patience})")
-                )
-                if _improved:
+                if _bc_early_stop_enabled:
+                    log.info(
+                        f"    val        bc_val_loss={_bc_val_loss:.4f}  best={min(_bc_best_val_loss, _bc_val_loss):.4f}"
+                        + ("  (improved)" if _improved else f"  (patience {_bc_patience_ctr + 1}/{self._bc_pretrain_early_stop_patience})")
+                    )
+                else:
+                    log.info(f"    val        bc_val_loss={_bc_val_loss:.4f}")
+                if _bc_early_stop_enabled and _improved:
                     _bc_best_val_loss = _bc_val_loss
                     _bc_best_state = {
                         "decision_net": copy.deepcopy(self.decision_net.state_dict()),
                         "execution_net": copy.deepcopy(self.execution_net.state_dict()),
                     }
                     _bc_patience_ctr = 0
-                else:
+                elif _bc_early_stop_enabled:
                     _bc_patience_ctr += 1
                     if _bc_patience_ctr >= self._bc_pretrain_early_stop_patience:
                         log.info(
@@ -1515,10 +1542,11 @@ class PPOTrainer:
                     )
                     repair_opt.zero_grad()
                     loss_r.backward()
-                    nn.utils.clip_grad_norm_(
-                        list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
-                        self.max_grad_norm,
-                    )
+                    if self._bc_max_grad_norm is not None:
+                        nn.utils.clip_grad_norm_(
+                            list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
+                            self._bc_max_grad_norm,
+                        )
                     repair_opt.step()
                     repair_losses.append(loss_r.item())
                     for k, v in bkdn_r.items():
@@ -2220,16 +2248,26 @@ class PPOTrainer:
         _lsk = self.execution_net.kick_dir_log_std
         # Debug per-head log_probs: apply same masking as _compute_log_prob
         # so these values match what went into the stored total log_prob.
+        # Frozen/masked decision heads (self._ppo_lp_masked_heads, set via
+        # set_frozen_heads() for the current curriculum phase) are zeroed
+        # here too -- _per_head_new_log_probs() (used at update time to
+        # recompute the "after" side of the per-head KL diagnostic) already
+        # zeroes these same heads, so without masking here the stored
+        # "before" side was nonzero while "after" was zero, producing a
+        # spurious per-head KL (= the raw sampled log_prob, not a real KL)
+        # for every frozen head -- see ai_trainer_knowledge.md "per-head KL
+        # masking" note.
         _exec_move_active = float(exec_move) > 0.5
         _kick_active = float(kick) > 0.5
+        _masked = self._ppo_lp_masked_heads
         head_log_probs = np.array([
-            float(IndependentBernoulli(d_heads.shoot_logit).log_prob(shoot).sum()),
-            float(IndependentBernoulli(d_heads.pass_logit).log_prob(pass_).sum()),
-            float(IndependentBernoulli(d_heads.move_logit).log_prob(move).sum()),
-            float(IndependentBernoulli(d_heads.tackle_logit).log_prob(tackle).sum()),
-            float(IndependentBernoulli(d_heads.get_possession_raw).log_prob(gp_extra).sum()),
-            float(IndependentBernoulli(d_heads.mark_logit).log_prob(mark).sum()),
-            float(IndependentBernoulli(d_heads.hold_position_logit).log_prob(hold).sum()),
+            0.0 if "shoot_logit" in _masked else float(IndependentBernoulli(d_heads.shoot_logit).log_prob(shoot).sum()),
+            0.0 if "pass_logit" in _masked else float(IndependentBernoulli(d_heads.pass_logit).log_prob(pass_).sum()),
+            0.0 if "move_logit" in _masked else float(IndependentBernoulli(d_heads.move_logit).log_prob(move).sum()),
+            0.0 if "tackle_logit" in _masked else float(IndependentBernoulli(d_heads.tackle_logit).log_prob(tackle).sum()),
+            0.0 if "get_possession_raw" in _masked else float(IndependentBernoulli(d_heads.get_possession_raw).log_prob(gp_extra).sum()),
+            0.0 if "mark_logit" in _masked else float(IndependentBernoulli(d_heads.mark_logit).log_prob(mark).sum()),
+            0.0 if "hold_position_logit" in _masked else float(IndependentBernoulli(d_heads.hold_position_logit).log_prob(hold).sum()),
             float(IndependentBernoulli(e_heads.exec_move_logit).log_prob(exec_move).sum()),
             # sprint: only when exec_move=True
             float(IndependentBernoulli(e_heads.sprint_logit).log_prob(sprint).sum()) if _exec_move_active else 0.0,
@@ -2423,7 +2461,7 @@ class PPOTrainer:
         clip_triggered_main = 0
         clip_triggered_dir = 0
         epoch_times = []
-        KL_DIAG_THRESHOLD = 0.1  # ~5× target_kl; log detailed diagnostics above this
+        KL_DIAG_THRESHOLD = 0.05  # ~5× target_kl; log detailed diagnostics above this
 
         # Debug-level rollout stats (hidden by default)
         if log.isEnabledFor(logging.DEBUG):

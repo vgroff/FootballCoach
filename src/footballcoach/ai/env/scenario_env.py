@@ -139,6 +139,10 @@ class ScenarioEnv:
         self._sec_start_ball_to_box_dist_m: dict = {}
         self._sec_start_stamina: dict = {}
         self._sec_ball_touched: dict = {}
+        # Per-secondary-player running UNCLAMPED cumulative-term state, see
+        # reward.cumulative_clamped_delta() / self._trainee_cumulative_state.
+        # dict[pid] -> dict[term_name] -> running unclamped sum (e.g. "prog", "appr_sq").
+        self._sec_cumulative_state: dict = {}
         self._sec_ema: dict = {}
         self._sec_had_possession_last_step: dict = {}
         # Per-secondary-player pending-loss state, mirrors _trainee_pending_loss.
@@ -193,6 +197,10 @@ class ScenarioEnv:
             self._trainee_start_stamina = _trainee.stamina
         except KeyError:
             self._trainee_start_stamina = 1.0
+        # Running UNCLAMPED cumulative-term state for this episode (see
+        # reward.cumulative_clamped_delta()) — reset every episode. Maps
+        # term name (e.g. "prog", "appr_sq") to its running unclamped sum.
+        self._trainee_cumulative_state: dict[str, float] = {}
         self.last_trainee_transition = None
         self.last_secondary_results = []
         self.last_reward_components: dict[str, float] = {}
@@ -253,6 +261,9 @@ class ScenarioEnv:
                 self._sec_start_stamina[pid] = self._loop.match.player_by_id(pid).stamina
             except KeyError:
                 self._sec_start_stamina[pid] = 1.0
+            # Running UNCLAMPED cumulative-term state for this secondary
+            # player's episode, same treatment as self._trainee_cumulative_state above.
+            self._sec_cumulative_state[pid] = {}
         return self._get_obs()
 
     def step(self) -> tuple[ObservationBatch, float, bool, StepInfo]:
@@ -279,11 +290,13 @@ class ScenarioEnv:
             sec_pre[pid] = {
                 "prev_ball_dist": self._sec_last_ball_dist.get(pid, 0.0),
                 "prev_ball_x": match.ball.position.x,
+                "prev_box_dist": self._ball_dist_to_opponent_box(pid),
             }
 
         # --- Snapshot state before ticking ---
         prev_ball_dist = self._last_ball_dist
         prev_ball_x = match.ball.position.x
+        prev_box_dist = self._ball_dist_to_opponent_box(self.trainee_player_id)
         prev_goal_count = self._prev_goal_count
         initial_scoreboard = (match.scoreboard.left_goals, match.scoreboard.right_goals)
 
@@ -380,11 +393,9 @@ class ScenarioEnv:
         # Ball went out after trainee touched it
         ball_went_out = trial_ended_this_step and outcome_this_step == "miss" and self._ball_touched_by_trainee
 
-        # Ball progress toward opponent goal
-        if player.team == Team.LEFT:
-            ball_progress = match.ball.position.x - prev_ball_x
-        else:
-            ball_progress = prev_ball_x - match.ball.position.x
+        # Ball progress toward opponent BOX (not raw goal-line x) — counts
+        # lateral movement into the box, consistent with start_ball_to_box_dist_m.
+        ball_progress = prev_box_dist - self._ball_dist_to_opponent_box(self.trainee_player_id)
 
         # Reached opponent box with possession (phase 1 terminal — trainee wins)
         in_opponent_box = match.pitch.is_in_box(
@@ -420,7 +431,7 @@ class ScenarioEnv:
             # call the exact same code path, so per-player inputs (speed,
             # heading cosine, stamina used) can never silently diverge between
             # the two again.
-            reward, self.last_reward_components = self._compute_phase1_reward_for_player(
+            reward, self.last_reward_components, self._trainee_cumulative_state = self._compute_phase1_reward_for_player(
                 player_id=self.trainee_player_id,
                 player_obj=player,
                 ball_pos=match.ball.position,
@@ -439,6 +450,7 @@ class ScenarioEnv:
                 opponent_reached_trainee_box=opponent_box_terminal,
                 timed_out=timeout and not box_terminal and not opponent_box_terminal and not trial_ended_this_step,
                 episode_done=box_terminal or opponent_box_terminal or timeout,
+                cumulative_state=self._trainee_cumulative_state,
             )
         else:
             reward = phase2_reward(
@@ -494,10 +506,9 @@ class ScenarioEnv:
             sec_curr_ball_dist = self._ball_dist_for_player(pid)
             self._sec_last_ball_dist[pid] = sec_curr_ball_dist
 
-            if sec_player.team == Team.LEFT:
-                sec_ball_prog = match.ball.position.x - pre["prev_ball_x"]
-            else:
-                sec_ball_prog = pre["prev_ball_x"] - match.ball.position.x
+            # Box-distance closed this step (own attacking box), matching the
+            # trainee's ball_progress above — not raw goal-line x movement.
+            sec_ball_prog = pre["prev_box_dist"] - self._ball_dist_to_opponent_box(pid)
 
             sec_ball_went_out = (
                 trial_ended_this_step
@@ -524,7 +535,7 @@ class ScenarioEnv:
                 # heading/appr_sq/stamina treatment to the trainee; do not
                 # revert to calling phase1_reward() directly here.
                 sec_episode_done = sec_box_terminal or box_terminal or timeout
-                sec_reward, _sec_comps = self._compute_phase1_reward_for_player(
+                sec_reward, _sec_comps, self._sec_cumulative_state[pid] = self._compute_phase1_reward_for_player(
                     player_id=pid,
                     player_obj=sec_player,
                     ball_pos=match.ball.position,
@@ -543,6 +554,7 @@ class ScenarioEnv:
                     opponent_reached_trainee_box=box_terminal,  # from sec's POV, trainee winning = sec losing
                     timed_out=timeout and not sec_box_terminal and not box_terminal and not trial_ended_this_step,
                     episode_done=sec_episode_done,
+                    cumulative_state=self._sec_cumulative_state.get(pid, {}),
                 )
             else:
                 sec_reward = 0.0
@@ -630,7 +642,8 @@ class ScenarioEnv:
         opponent_reached_trainee_box: bool,
         timed_out: bool,
         episode_done: bool,
-    ) -> tuple[float, dict[str, float]]:
+        cumulative_state: dict[str, float] | None = None,
+    ) -> tuple[float, dict[str, float], dict[str, float]]:
         """SINGLE call site for phase1_reward(), used for the trainee AND
         every secondary player. All per-player-derived inputs (speed,
         heading cosine, stamina used, box-distance) are computed HERE, once,
@@ -644,6 +657,12 @@ class ScenarioEnv:
         attacking box are generally on OPPOSITE ends of the pitch, so
         reusing one player's box-distance for another silently normalizes
         their prog/spd/prox terms against the wrong goal.
+
+        Returns (reward, components, cumulative_state_after) — callers must
+        store cumulative_state_after (per player) and pass it back in as
+        cumulative_state on the next call for that same player, so the
+        per-term cumulative clamps (see phase1_reward/cumulative_clamped_delta)
+        track correctly across the whole episode.
         """
         _speed, _hdg_cos = self._player_speed_and_heading_cos(player_obj, ball_pos)
         _stamina_used = max(0.0, start_stamina - player_obj.stamina) if episode_done else 0.0
@@ -665,6 +684,13 @@ class ScenarioEnv:
             timed_out=timed_out,
             ball_dist_to_opponent_box_m=self._ball_dist_to_opponent_box(player_id),
             episode_done=episode_done,
+            heading_cos_sim=_hdg_cos,
+            player_speed_mps=_speed,
+            stamina_used=_stamina_used,
+            prog_reward_clamp=self._reward_cfg["phase1"].get("ball_progress_reward_clamp"),
+            appr_sq_approach_reward_clamp=self._reward_cfg["phase1"].get("ball_approach_speed_reward_clamp"),
+            appr_sq_retreat_reward_clamp=self._reward_cfg["phase1"].get("ball_retreat_speed_reward_clamp"),
+            cumulative_state=cumulative_state,
         )
 
     def _ball_dist_to_opponent_box(self, player_id: Optional[str] = None) -> float:

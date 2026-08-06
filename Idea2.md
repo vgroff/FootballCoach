@@ -21,14 +21,15 @@ Extending training:
 - When running these messy/random scenarios, we might need to decide (maye using a value network) whcih runs are actually good (advantage-wise and in absolute)
 
 
+
 Current notes:
 - " read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
 - train blockers:
-    - change one thing at a time - try annealing!!
-    - which moves count as illegal?
-    - now that we've fixed a bunch of bugs, I'm tempted to try running the existing models but with their value heads instead of a separate one - how easy would that be? just load in the one network instead of both, right?
-    - [] one thing puzzles me - the network in BC seems to have quite a presistently high error in tackle and kick
-    - [] !might no longer need the separate neural network if value is fixed now!
+    - reward funciton kinda sucks ass
+    - try annealing!!
+        - doesnt work!!
+    - [] !progress is always 0 now - probably the agent that did the approach speed norm broke it
+    - [] better breakdown of win/loss/timeout/ball out in "vs" log line and evaluations during training
     - try just doing immobile first - can we improve?
     - [] make approach speed go both ways, reduce heading penalty (or change it?)
     - Evalulations both pre and during training should be seeded so that they're deterministically setup (with still a random match seed each time), and possibly should run more than once. There are some notes about seeding in agent_plans/ppo_scenario_seedppo.md, so read that first, but you'd only need it on the evaluations for now, just make it extensible/generalisable if possible. We might also want multiple runs of the same seeded trial, sinec matches and PPO are random

@@ -251,14 +251,15 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
                 dtype=np.float32,
             )
     # tackle_attempt: ChaseTackleOrder always, OR GetPossessionOrder when the player
-    # is currently touching the ball carrier — that's when GP behaviour resolves a tackle.
+    # can legally tackle the ball carrier right now — see engine/collision.py::can_tackle
+    # (single source of truth shared with the engine's own tackle-eligibility checks).
     _is_gp_tackling = False
     if isinstance(current_exec, _GPOrder):
         try:
             carrier = match.ball_carrier()
             if carrier is not None and carrier.player_id != player.player_id:
-                from footballcoach.engine.collision import are_touching
-                _is_gp_tackling = are_touching(player, carrier)
+                from footballcoach.engine.collision import can_tackle
+                _is_gp_tackling = can_tackle(player, carrier)
         except Exception:
             pass
     tackle_attempt = 1.0 if (isinstance(current_exec, ChaseTackleOrder) or _is_gp_tackling) else 0.0
@@ -554,14 +555,19 @@ def bc_loss_from_tensor(
     # --- Bernoulli decision heads (BCE from logits) ---
     def _bce(logit: torch.Tensor, col: int, pos_weight: float = 1.0, smoothing: float = 0.0) -> torch.Tensor:
         target = labels[:, col]
-        if smoothing > 0.0:
-            target = target * (1.0 - smoothing) + 0.5 * smoothing
-        pw = None
-        if pos_weight != 1.0:
-            pw = torch.tensor(pos_weight, device=labels.device, dtype=logit.dtype)
-        return F.binary_cross_entropy_with_logits(
-            logit.squeeze(-1), target, reduction="none", pos_weight=pw
+        smoothed_target = target * (1.0 - smoothing) + 0.5 * smoothing if smoothing > 0.0 else target
+        loss = F.binary_cross_entropy_with_logits(
+            logit.squeeze(-1), smoothed_target, reduction="none"
         )
+        # pos_weight scales loss on HARD-positive rows only (target > 0.5, pre-smoothing) —
+        # torch's built-in pos_weight= multiplies the (possibly smoothed) target itself,
+        # so raising pos_weight also inflates the optimal sigmoid for true negatives
+        # (their smoothed target has a nonzero residual y=0.5*smoothing) and destroys
+        # precision. Weighting by the hard label avoids that leak.
+        if pos_weight != 1.0:
+            w = torch.where(target > 0.5, torch.full_like(target, pos_weight), torch.ones_like(target))
+            loss = loss * w
+        return loss
 
     dec_loss = (
         _bce(decision_heads.shoot_logit,          _I_SHOOT,   smoothing=dec_label_smoothing)

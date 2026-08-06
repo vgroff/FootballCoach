@@ -206,7 +206,7 @@ class Player:
         Returns True if contact was made and a tackle attempt was resolved,
         False if out of range (network should keep moving toward target).
         """
-        from footballcoach.engine.collision import are_touching
+        from footballcoach.engine.collision import are_touching, can_tackle
         from footballcoach.engine.tackling import apply_tackle_result, attempt_tackle, tackle_angle_modifier
         try:
             target = match.player_by_id(target_player_id)
@@ -214,7 +214,7 @@ class Player:
             return False
         if not are_touching(self, target):
             return False
-        if not target.is_available_to_tackle():
+        if not can_tackle(self, target):
             return True
         if self.on_tackle is not None:
             self.on_tackle(self)

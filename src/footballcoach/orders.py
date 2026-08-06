@@ -511,7 +511,8 @@ class ChaseTackleOrder:
         self.status = OrderStatus.IN_PROGRESS
         target = match.player_by_id(self.target_player_id)
         if are_touching(player, target):
-            if target.is_available_to_tackle():
+            from footballcoach.engine.collision import can_tackle
+            if can_tackle(player, target):
                 match._attempt_tackle_contact(player, target)
             return True
         else:

@@ -10,7 +10,7 @@ function, scenario config, or rules AI behaviour changes significantly.
 # Delete existing demos and record fresh ones (adjust --n-episodes as needed)
 rm -f demonstrations/phase1/*.npz && \
 uv run python -m footballcoach.ai.scripts.record_demonstrations \
-    --phase 1 --n-episodes 12000 --episodes-per-file 8 \
+    --phase 1 --n-episodes 6000 --episodes-per-file 8 \
     --output demonstrations/phase1/ --seed 42 >> /tmp/record_demos.log 2>&1
 # tail -f /tmp/record_demos.log  # in another terminal to watch progress
 ```
@@ -27,7 +27,7 @@ uv run python -m footballcoach.ai.scripts.record_demonstrations \
 ### Inspect existing demonstrations
 ```bash
 uv run python -m footballcoach.ai.scripts.record_demonstrations \
-    --phase 1 --n-episodes 0 --output demonstrations/phase1/ --info
+    --phase 1 --n-episodes 5000 --output demonstrations/phase1/ --info
 ```
 
 ---
@@ -55,7 +55,7 @@ you must pass the checkpoint path explicitly.
 uv run python -m footballcoach.ai.scripts.train \
     --phase 1 --seed 42 \
     --bc-dataset demonstrations/phase1/ \
-    --verbose --total-steps 40000 >> training_runs.log 2>&1
+    --verbose --total-steps 40000 2>&1 | tee -a training_runs.md
 ```
 
 ### Resume from the latest checkpoint automatically
@@ -63,7 +63,7 @@ uv run python -m footballcoach.ai.scripts.train \
 uv run python -m footballcoach.ai.scripts.train \
     --phase 1 --seed 42 \
     --latest \
-    --verbose --total-steps 100000 >> training_runs.log 2>&1
+    --verbose --total-steps 100000 2>&1 | tee -a training_runs.md
 ```
 Finds the most recent `latest.pt` (or highest-numbered checkpoint) across all
 `checkpoints/phase1_run*/` dirs. Skips pretraining and continues the step counter.
@@ -75,7 +75,7 @@ Equivalent to `--checkpoint <that file>` but without needing to know the path.
 uv run python -m footballcoach.ai.scripts.train \
     --phase 1 --seed 42 \
     --from-pretrained checkpoints/phase1_run35/checkpoint_pretrained.pt \
-    --verbose --total-steps 40000 >> training_runs.log 2>&1
+    --verbose --total-steps 40000 2>&1 | tee -a training_runs.md
 # --total-steps 40000
 ```
 
@@ -85,7 +85,7 @@ uv run python -m footballcoach.ai.scripts.train \
     --phase 1 --seed 42 \
     --pretrain-from-checkpoint checkpoints/phase1_run41/checkpoint_00065000.pt \
     --bc-dataset demonstrations/phase1/ \
-    --verbose --total-steps 40000 >> training_runs.log 2>&1
+    --verbose --total-steps 40000 2>&1 | tee -a training_runs.md
 # --total-steps 60000
 ```
 
@@ -95,7 +95,7 @@ uv run python -m footballcoach.ai.scripts.train \
     --phase 1 --seed 42 \
     --latest-pretrain \
     --bc-dataset demonstrations/phase1/ \
-    --verbose --total-steps 40000 >> training_runs.log 2>&1
+    --verbose --total-steps 40000 2>&1 | tee -a training_runs.md
 ```
 Finds the most recent checkpoint across all `checkpoints/phase{N}_run*/` dirs
 (same resolution as `--latest`), loads its weights, then runs the full BC/value

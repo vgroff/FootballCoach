@@ -20,6 +20,7 @@ from footballcoach.engine.ball_physics import BallPhysicsParams, step_ball, reso
 from footballcoach.engine.collision import (
     CollisionParams,
     are_touching,
+    can_tackle,
     resolve_all_overlaps,
     resolve_ball_block_by_inactive_players,
 )
@@ -305,9 +306,9 @@ class Match:
         if carrier is not None and carrier.player_id != player.player_id:
             # Someone else has the ball — chase and tackle.
             if are_touching(player, carrier):
-                if carrier.is_available_to_tackle():
+                if can_tackle(player, carrier):
                     self._attempt_tackle_contact(player, carrier)
-                return True  # tackle attempted (or target not available) — terminal
+                return True  # tackle attempted (or either side not available) — terminal
             else:
                 from footballcoach.orders import _compute_movement_intent
                 intercept = self._intercept_target(player, carrier.position, carrier.velocity)

@@ -192,6 +192,22 @@ def are_touching(player_a: Player, player_b: Player, tolerance_m: float = 0.05) 
     return distance <= player_a.radius_m + player_b.radius_m + tolerance_m
 
 
+def can_tackle(tackler: Player, tacklee: Player) -> bool:
+    """True iff *tackler* may attempt a tackle on *tacklee* right now:
+    they're touching (see `are_touching`) and NEITHER player is currently
+    `INACTIVE_TACKLED` (e.g. mid tackle-cooldown from a previous contest).
+
+    Single source of truth for tackle eligibility -- use this everywhere a
+    tackle attempt is gated (engine order execution, `tackle_direct()`, and
+    BC label generation) so they can never drift apart.
+    """
+    return (
+        are_touching(tackler, tacklee)
+        and tackler.is_available_to_tackle()
+        and tacklee.is_available_to_tackle()
+    )
+
+
 def resolve_ball_block_by_inactive_players(
     ball: Ball,
     players: list[Player],

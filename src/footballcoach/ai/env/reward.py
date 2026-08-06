@@ -44,13 +44,26 @@ breaks the total down by source key:
           normalization asymmetry as appr/retr above: the approach
           (closing-fast) side is normalized by start_ball_dist_m before
           squaring, the retreat (retreating-fast) side is not.
+          appr_sq_approach_reward_clamp/appr_sq_retreat_reward_clamp (both
+          null = uncapped) independently bound the EPISODE-CUMULATIVE total
+          of each side via cumulative_clamped_delta() -- two separate bounds
+          (not one symmetric clamp) to match the independently-tunable
+          bonus/penalty coefficients above.
   hdg   — heading penalty (moving away from the ball)
   poss  — gain possession bonus
-  prog  — ball progress while in possession (normalized by
-          start_ball_to_box_dist_m — same reference distance already used by
-          spd/prox below; NOT split into an asymmetric forward/backward pair
-          like appr/retr, since progress is a single signed quantity with
-          one coefficient, not two)
+  prog  — ball progress toward the opponent BOX while in possession (delta
+          of _ball_dist_to_opponent_box(), i.e. box-distance closed this
+          step — NOT raw goal-line x movement, so lateral movement into the
+          box counts). Normalized by start_ball_to_box_dist_m — same
+          reference distance already used by spd/prox below; NOT split into
+          an asymmetric forward/backward pair like appr/retr, since progress
+          is a single signed quantity with one coefficient, not two.
+          prog_reward_clamp (when set) bounds the EPISODE-CUMULATIVE total
+          of this term to +/-prog_reward_clamp via cumulative_clamped_delta()
+          — NOT each step independently, since that alone wouldn't stop many
+          small steps from summing past the clamp over a long/wandering
+          episode. Caller must track and pass back prog_cumulative_before/
+          prog_cumulative_after across steps for the same player/episode.
   out   — ball out of bounds penalty
   ill   — illegal action penalty
   box   — box possession terminal
@@ -64,6 +77,63 @@ breaks the total down by source key:
   stam  — stamina usage penalty (episode-end only)
 """
 from __future__ import annotations
+
+
+def cumulative_clamped_delta(
+    raw_delta: float,
+    cumulative_before: float,
+    clamp_max: float | None = None,
+    clamp_min: float | None = None,
+) -> tuple[float, float]:
+    """Clamp a running EPISODE TOTAL to [clamp_min, clamp_max], returning this
+    step's payout.
+
+    Clamping each step's raw value independently only bounds that one step —
+    many small steps under the per-step clamp can still sum to an unbounded
+    episode total (e.g. a wandering trajectory). This instead tracks the
+    UNCLAMPED running sum, clamps it to [clamp_min, clamp_max], and returns
+    the marginal change vs the previous step's clamped value as the actual
+    payout — so the episode-wide sum of payouts can never exceed those
+    bounds, regardless of how many steps it takes. Once the running total
+    saturates at a bound, further movement in the same direction pays 0
+    until the total reverses back inside the bound.
+
+    clamp_max/clamp_min are independent so asymmetric terms (e.g. appr_sq's
+    separately-tunable approach/retreat coefficients) can bound each side by
+    a different amount. Use symmetric_clamp() for the common single-bound
+    case (e.g. "prog").
+
+    Args:
+        raw_delta: This step's unclamped contribution (e.g. a reward term
+            before clamping).
+        cumulative_before: The running UNCLAMPED sum from all previous steps
+            this episode (0.0 at episode start).
+        clamp_max: Upper bound on the cumulative CLAMPED total. None = no
+            upper bound.
+        clamp_min: Lower bound on the cumulative CLAMPED total. None = no
+            lower bound.
+
+    Returns:
+        (payout, cumulative_after) — payout is this step's actual (possibly
+        clamped) contribution; cumulative_after is the new unclamped running
+        sum to pass back in as cumulative_before on the next step.
+    """
+    cumulative_after = cumulative_before + raw_delta
+    if clamp_max is None and clamp_min is None:
+        return raw_delta, cumulative_after
+    lo = clamp_min if clamp_min is not None else float("-inf")
+    hi = clamp_max if clamp_max is not None else float("inf")
+    clamped_before = max(lo, min(hi, cumulative_before))
+    clamped_after = max(lo, min(hi, cumulative_after))
+    return clamped_after - clamped_before, cumulative_after
+
+
+def symmetric_clamp(clamp: float | None) -> tuple[float | None, float | None]:
+    """Convenience for the common single-bound case: clamp -> (clamp_max, clamp_min)
+    i.e. (+clamp, -clamp), matching cumulative_clamped_delta()'s param order."""
+    if clamp is None:
+        return None, None
+    return clamp, -clamp
 
 
 def phase1_reward(
@@ -87,17 +157,29 @@ def phase1_reward(
     player_speed_mps: float = 0.0,
     stamina_used: float = 0.0,
     episode_done: bool = False,
-) -> tuple[float, dict[str, float]]:
+    prog_reward_clamp: float | None = None,
+    appr_sq_approach_reward_clamp: float | None = None,
+    appr_sq_retreat_reward_clamp: float | None = None,
+    cumulative_state: dict[str, float] | None = None,
+) -> tuple[float, dict[str, float], dict[str, float]]:
     """GetPossession/Move experiment reward (curriculum phase 1).
 
-    Returns a (total_reward, components) tuple where components maps short
-    source keys to their individual contributions for this step.
-    See module docstring for key definitions.
+    Returns a (total_reward, components, cumulative_state_after) tuple where
+    components maps short source keys to their individual contributions for
+    this step, and cumulative_state_after maps term name (e.g. "prog",
+    "appr_sq") to that term's running UNCLAMPED sum for this episode -- pass
+    it back in as cumulative_state on the next call for the SAME
+    player/episode (see cumulative_clamped_delta() and the "prog"/"appr_sq"
+    entries in the module docstring). Missing keys in cumulative_state
+    default to 0.0, so adding a newly-clamped term never requires updating
+    existing callers' dict contents.
 
     See ai_design_doc.md section 10.1.
     """
     r = 0.0
     comps: dict[str, float] = {}
+    cumulative_state = cumulative_state or {}
+    cumulative_state_after: dict[str, float] = {}
 
     # Floor the normalizing distance so a ball spawning ~on top of the player
     # doesn't create a divide-by-near-zero blow-up in the normalized terms.
@@ -150,11 +232,19 @@ def phase1_reward(
     _appr_sq_coef = float(cfg.get("ball_approach_speed_bonus", 0.0))
     _retr_sq_coef = float(cfg.get("ball_retreat_speed_penalty", _appr_sq_coef))
     if _player_speed_toward_ball > 0.0:
-        appr_sq_r = _appr_sq_coef * ((_player_speed_toward_ball / _norm_ball_dist) ** 2)
+        _appr_sq_raw = _appr_sq_coef * ((_player_speed_toward_ball / _norm_ball_dist) ** 2)
     elif _player_speed_toward_ball < 0.0:
-        appr_sq_r = -_retr_sq_coef * (_player_speed_toward_ball ** 2)
+        _appr_sq_raw = -_retr_sq_coef * (_player_speed_toward_ball ** 2)
     else:
-        appr_sq_r = 0.0
+        _appr_sq_raw = 0.0
+    # Independent per-side clamps (not symmetric_clamp()) since approach/
+    # retreat already have independently tunable coefficients above.
+    appr_sq_r, cumulative_state_after["appr_sq"] = cumulative_clamped_delta(
+        _appr_sq_raw,
+        cumulative_state.get("appr_sq", 0.0),
+        clamp_max=appr_sq_approach_reward_clamp,
+        clamp_min=-appr_sq_retreat_reward_clamp if appr_sq_retreat_reward_clamp is not None else None,
+    )
     r += appr_sq_r
     comps["appr_sq"] = appr_sq_r
 
@@ -185,8 +275,15 @@ def phase1_reward(
     # is ~ball_progress_scale regardless of how far the ball started from
     # the opponent box. Single symmetric term (forward and backward progress
     # share one coefficient) — not split into an asymmetric pair like appr/retr.
+    # prog_reward_clamp bounds the EPISODE-CUMULATIVE total (via
+    # cumulative_clamped_delta()), not this single step's value — a per-step
+    # clamp alone doesn't stop many small steps from summing past the clamp
+    # over a long/wandering episode.
     _norm_box_dist = max(start_ball_to_box_dist_m, 1.0)
-    prog_r = cfg["ball_progress_scale"] * (ball_progress_toward_goal_m / _norm_box_dist) if has_possession_now else 0.0
+    _prog_raw = cfg["ball_progress_scale"] * (ball_progress_toward_goal_m / _norm_box_dist) if has_possession_now else 0.0
+    prog_r, cumulative_state_after["prog"] = cumulative_clamped_delta(
+        _prog_raw, cumulative_state.get("prog", 0.0), *symmetric_clamp(prog_reward_clamp)
+    )
     r += prog_r
     comps["prog"] = prog_r
 
@@ -252,7 +349,7 @@ def phase1_reward(
     r += stam_r
     comps["stam"] = stam_r
 
-    return r, comps
+    return r, comps, cumulative_state_after
 
 
 def phase2_reward(

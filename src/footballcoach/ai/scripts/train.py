@@ -107,6 +107,12 @@ def main() -> None:
                              "pre-training loop (equivalent to combining --latest resolution "
                              "with --pretrain-from-checkpoint). Resets the step counter. "
                              "Requires --bc-dataset for combined pre-training.")
+    parser.add_argument("--reset-dir-log-std", action="store_true",
+                        help="Reset move_dir_log_std/kick_dir_log_std to ppo.dir_log_std_init "
+                             "from ai_config.json after loading any checkpoint (--checkpoint, "
+                             "--pretrain-from-checkpoint, --from-pretrained, --latest[-pretrain]). "
+                             "Useful when a loaded policy's log_std has drifted/collapsed and is "
+                             "causing move_dir KL to dominate early-stop.")
     args = parser.parse_args()
 
     if args.verbose:
@@ -244,9 +250,18 @@ def main() -> None:
                 log.warning("--latest overrides --checkpoint")
             args.checkpoint = str(_latest_path)
 
+    def _reset_dir_log_std() -> None:
+        init = float(cfg.get("ppo", {}).get("dir_log_std_init", -2.0))
+        with torch.no_grad():
+            trainer.execution_net.move_dir_log_std.fill_(init)
+            trainer.execution_net.kick_dir_log_std.fill_(init)
+        log.info(f"--reset-dir-log-std: move/kick dir_log_std reset to {init}")
+
     # Optionally resume from checkpoint
     if args.checkpoint:
         trainer.load_checkpoint(Path(args.checkpoint))
+        if args.reset_dir_log_std:
+            _reset_dir_log_std()
 
     # --pretrain-from-checkpoint: load weights but still run pretraining
     if args.pretrain_from_checkpoint:
@@ -257,6 +272,8 @@ def main() -> None:
         trainer.load_checkpoint(ptrain_path)
         trainer._total_steps = 0  # reset step counter so pretraining + full PPO run from scratch
         log.info(f"Loaded checkpoint for re-pretraining: {ptrain_path} — will still run BC/value pre-training")
+        if args.reset_dir_log_std:
+            _reset_dir_log_std()
         if not args.bc_dataset:
             log.warning(
                 "--pretrain-from-checkpoint used without --bc-dataset: "
@@ -278,6 +295,8 @@ def main() -> None:
             log.error(f"--from-pretrained: file not found: {pretrained_path}")
             return
         trainer.load_checkpoint(pretrained_path)
+        if args.reset_dir_log_std:
+            _reset_dir_log_std()
         log.info(f"Loaded pre-trained checkpoint: {pretrained_path} — skipping BC/value pre-training")
 
     # Pre-training phase: BC + value jointly when a dataset is available,
