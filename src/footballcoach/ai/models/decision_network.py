@@ -68,12 +68,16 @@ class DecisionNetwork(nn.Module):
         latent_dim: int = 32,
         value_extra_hidden: int = 16,
         value_hidden_dim: int = 0,
+        inter_player_num_heads: int = 0,
     ):
         super().__init__()
         self.entity_encoder = EntityEncoder(
             entity_feature_dim=self_dim,
             embed_dim=entity_embed_dim,
             num_heads=num_attention_heads,
+            ball_feat_dim=ball_dim,
+            global_feat_dim=global_dim,
+            inter_player_num_heads=inter_player_num_heads,
         )
         self.self_mlp = nn.Sequential(
             nn.Linear(self_dim, self_mlp_hidden), nn.ReLU()
@@ -169,7 +173,9 @@ class DecisionNetwork(nn.Module):
         other_ai_type: Optional[torch.Tensor] = None,  # (batch, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM)
     ) -> DecisionHeadsRaw:
         entity_ctx, self_embed_raw, other_embed_raw = self.entity_encoder(
-            self_feat, other_feat, exists_mask, return_embeds=True
+            self_feat, other_feat, exists_mask, return_embeds=True,
+            ball_feat=ball_feat, global_feat=global_feat,
+            # No extra_query_bias for decision network — ball+global already cover it.
         )
         h = torch.cat([
             entity_ctx,
@@ -230,6 +236,7 @@ class DecisionNetwork(nn.Module):
             latent_dim=cfg["latent_dim"],
             value_extra_hidden=cfg.get("value_extra_hidden", 16),
             value_hidden_dim=cfg.get("value_hidden_dim", 0),
+            inter_player_num_heads=cfg.get("inter_player_attn_heads", 0),
         )
 
 

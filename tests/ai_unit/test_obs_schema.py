@@ -25,21 +25,22 @@ from footballcoach.ai.obs.schema import (
 # Dimension constants
 # ---------------------------------------------------------------------------
 
-def test_player_feature_dim_is_28():
-    """PLAYER_FEATURE_DIM must stay 28 (change this test IFF you change the schema).
+def test_player_feature_dim_is_32():
+    """PLAYER_FEATURE_DIM must stay 32 (change this test IFF you change the schema).
 
-    Fields: rel_dx, rel_dy, distance_m, velocity_x, velocity_y, speed_mps,
-    heading_sin, heading_cos, stamina, top_speed, acceleration, kick_power,
-    kick_precision, dribbling, ball_control, tackling, stamina_attr,
-    is_own_team, is_self, has_possession, is_inactive_tackled,
-    is_controlling_ball, is_goalkeeper, attacking_direction, exists,
-    is_immobile, pos_x, pos_y.
+    Fields: rel_dx, rel_dy, distance_m, ball_rel_dx, ball_rel_dy,
+    ball_distance_m, ball_vel_rel_x, ball_vel_rel_y, ball_closing_speed,
+    velocity_x, velocity_y, speed_mps, stamina,
+    top_speed, acceleration, kick_power, kick_precision, dribbling,
+    ball_control, tackling, stamina_attr, is_own_team, is_self, has_possession,
+    is_inactive_tackled, is_controlling_ball, is_goalkeeper, attacking_direction,
+    exists, is_immobile, pos_x, pos_y.
     """
-    assert PLAYER_FEATURE_DIM == 28
+    assert PLAYER_FEATURE_DIM == 32
 
 
-def test_ball_feature_dim_is_12():
-    assert BALL_FEATURE_DIM == 12
+def test_ball_feature_dim_is_11():
+    assert BALL_FEATURE_DIM == 11
 
 
 def test_global_feature_dim_is_31():

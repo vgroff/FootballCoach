@@ -250,13 +250,16 @@ class TestPhase1Reward:
 
     def test_no_ball_progress_reward_without_possession(self):
         """ball_progress is only rewarded when has_possession_now is True."""
+        # ball_progress_scale may be 0.0 in the live config; force a nonzero
+        # value locally so this test still exercises the with/without-possession gate.
+        _cfg_prog = {**_CFG1, "ball_progress_scale": 0.1}
         r_with, _ = self._call(
             has_possession_now=True, ball_progress_toward_goal_m=5.0,
-            prev_ball_dist=0.5, curr_ball_dist=0.5,
+            prev_ball_dist=0.5, curr_ball_dist=0.5, cfg=_cfg_prog,
         )
         r_without, _ = self._call(
             has_possession_now=False, ball_progress_toward_goal_m=5.0,
-            prev_ball_dist=0.5, curr_ball_dist=0.5,
+            prev_ball_dist=0.5, curr_ball_dist=0.5, cfg=_cfg_prog,
         )
         assert r_with > r_without
 
@@ -267,9 +270,18 @@ class TestPhase1Reward:
         assert total < 0.0
 
     def test_illegal_action_penalty(self):
-        total, comps = self._call(illegal_action_attempted=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
-        assert comps["ill"] == pytest.approx(_CFG1["illegal_action_penalty"], rel=1e-5)
-        assert total == pytest.approx(_CFG1["illegal_action_penalty"], rel=1e-5)
+        # illegal_action_penalty is 0.0 in the live config (disabled); override
+        # locally so this test still exercises the penalty formula.
+        _cfg_ill = {**_CFG1, "illegal_action_penalty": -0.4}
+        total, comps, _ = phase1_reward(
+            prev_ball_dist=1.0, curr_ball_dist=1.0,
+            has_possession_now=False, gained_possession_this_step=False,
+            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+            illegal_action_attempted=True, reached_opponent_box_with_possession=False,
+            cfg=_cfg_ill,
+        )
+        assert comps["ill"] == pytest.approx(_cfg_ill["illegal_action_penalty"], rel=1e-5)
+        assert total == pytest.approx(_cfg_ill["illegal_action_penalty"], rel=1e-5)
         assert total < 0.0
 
     def test_box_possession_terminal_large_bonus(self):
@@ -282,12 +294,28 @@ class TestPhase1Reward:
 
     def test_all_penalties_stack(self):
         """ball_out + illegal action together should be worse than either alone."""
-        r_both, _ = self._call(
+        # illegal_action_penalty is 0.0 in the live config (disabled); override
+        # locally so illegal-action alone is distinguishable from "both".
+        _cfg_ill = {**_CFG1, "illegal_action_penalty": -0.4}
+
+        def _call_ill(**kwargs) -> tuple[float, dict]:
+            defaults = dict(
+                prev_ball_dist=5.0, curr_ball_dist=5.0,
+                has_possession_now=False, gained_possession_this_step=False,
+                ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+                illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+                cfg=_cfg_ill,
+            )
+            defaults.update(kwargs)
+            total, comps, _ = phase1_reward(**defaults)
+            return total, comps
+
+        r_both, _ = _call_ill(
             ball_went_out_after_touch=True, illegal_action_attempted=True,
             prev_ball_dist=1.0, curr_ball_dist=1.0,
         )
-        r_out, _ = self._call(ball_went_out_after_touch=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
-        r_ill, _ = self._call(illegal_action_attempted=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
+        r_out, _ = _call_ill(ball_went_out_after_touch=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
+        r_ill, _ = _call_ill(illegal_action_attempted=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
         assert r_both < r_out
         assert r_both < r_ill
 

@@ -16,6 +16,7 @@ import logging
 import random
 import time
 from pathlib import Path
+from typing import Optional
 
 logging.basicConfig(
     level=logging.INFO,
@@ -30,8 +31,10 @@ def main() -> None:
                         help="Path to checkpoint .pt file (omit with --baseline-only)")
     parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 3, 4],
                         help="Curriculum phase to evaluate (default: 1)")
-    parser.add_argument("--n-trials", type=int, default=100,
-                        help="Number of episodes to evaluate (default: 100)")
+    parser.add_argument("--n-trials", type=int, default=None,
+                        help="Number of distinct eval seeds (default: ai_config.json eval.eval_n_seeds).")
+    parser.add_argument("--repeats-per-seed", type=int, default=None,
+                        help="Episodes run per seed, averaged into the same stats (default: ai_config.json eval.eval_repeats_per_seed).")
     parser.add_argument("--output", type=str, default="results/eval_latest.json",
                         help="Output JSON file for results")
     parser.add_argument("--device", type=str, default="cpu")
@@ -42,6 +45,8 @@ def main() -> None:
                         help="Number of episodes for the rules-vs-rules baseline (default: 40).")
     parser.add_argument("--baseline-only", action="store_true",
                         help="Run only the rules-vs-rules baseline (no checkpoint required).")
+    parser.add_argument("--n-parallel-workers", type=int, default=None,
+                        help="Subprocess workers for eval (default: ai_config.json eval.eval_n_parallel_workers). 1 = sequential.")
     args = parser.parse_args()
 
     if not args.baseline_only and args.checkpoint is None:
@@ -64,7 +69,7 @@ def main() -> None:
     # Baseline-only mode: no checkpoint needed
     if args.baseline_only:
         log.info(f"Running rules-vs-rules baseline ({args.baseline_trials} episodes, phase={args.phase})...")
-        baseline_stats = _run_baseline_evaluation(None, args.baseline_trials)
+        baseline_stats = _run_baseline_evaluation(None, args.baseline_trials, args.repeats_per_seed, args.n_parallel_workers)
         combined = {
             "checkpoint": None,
             "checkpoint_step": 0,
@@ -74,7 +79,8 @@ def main() -> None:
             "baseline_rules_vs_rules": baseline_stats,
         }
         bl = baseline_stats
-        log.info(f"  Rules baseline: win={bl['win_rate_pct']:.1f}%  outcomes={bl['outcomes']}")
+        log.info(f"  Rules baseline: win={bl['win_rate_pct']:.1f}%  outcomes={bl['outcomes']}"
+                 f"  (win/loss/tout/miss: {bl['outcome_breakdown']})")
         out_path = Path(args.output)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as f:
@@ -92,21 +98,26 @@ def main() -> None:
     env = build_env(phase)
 
     # Run neural-net evaluation
-    log.info(f"Evaluating {args.n_trials} episodes (phase={phase.name}, step={step:,})")
-    neural_stats = _run_evaluation(trainer, env, args.n_trials)
+    log.info(f"Evaluating checkpoint (phase={phase.name}, step={step:,})...")
+    neural_stats = _run_evaluation(
+        trainer, env, args.n_trials, args.repeats_per_seed, args.checkpoint, args.n_parallel_workers,
+    )
+    log.info(f"  Neural net eval done: {neural_stats['n_trials']} episodes, "
+             f"win={neural_stats['win_rate_pct']:.1f}%")
 
     # Run rules-vs-rules baseline (unless suppressed)
     baseline_stats: dict | None = None
     if not args.no_baseline and args.phase == 1:
         log.info(f"Running rules-vs-rules baseline ({args.baseline_trials} episodes)...")
-        baseline_stats = _run_baseline_evaluation(env, args.baseline_trials)
+        baseline_stats = _run_baseline_evaluation(env, args.baseline_trials, args.repeats_per_seed, args.n_parallel_workers)
+        log.info(f"  Baseline eval done: win={baseline_stats['win_rate_pct']:.1f}%")
 
     # Combine results
     combined = {
         "checkpoint": args.checkpoint,
         "checkpoint_step": step,
         "phase": args.phase,
-        "n_trials": args.n_trials,
+        "n_trials": neural_stats["n_trials"],
         "neural_net": neural_stats,
     }
     if baseline_stats is not None:
@@ -123,80 +134,94 @@ def main() -> None:
     log.info(f"Results written to {out_path}")
 
 
-def _run_evaluation(trainer, env, n_trials: int) -> dict:
-    """Run n_trials episodes with the neural network and collect statistics."""
-    import numpy as np
+def _checkpoint_eval_env_factory(checkpoint_path: str, device: str, definition_kwargs: dict) -> tuple:
+    """Module-level (picklable) worker factory for parallel evaluate.py runs
+    -- each subprocess reloads the checkpoint fresh from disk (live
+    nn.Module/optimizer objects aren't picklable across the process
+    boundary), mirroring ai/ppo/rollout_worker.py's pattern."""
     import torch
-    rewards = []
-    outcomes: dict[str, int] = {}
-    times = []
-    comp_acc: dict[str, float] = {}
-    value_preds: list[float] = []
+    from footballcoach.ai.env.scenario_env import ScenarioEnv
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
 
-    # Wire NeuralPlayerAI into the env (same as training)
-    env.sample_action_fn = trainer._sample_action
+    trainer = PPOTrainer.load_for_inference(checkpoint_path)
 
-    for trial in range(n_trials):
-        t0 = time.time()
-        env.reset()
-        ep_reward = 0.0
-        done = False
-        info = None
+    def _env_factory(seed: int) -> ScenarioEnv:
+        return ScenarioEnv(**definition_kwargs, seed=seed)
 
-        while not done:
-            _, reward, done, info = env.step()
-            ep_reward += reward
-            for _k, _v in getattr(env, "last_reward_components", {}).items():
-                comp_acc[_k] = comp_acc.get(_k, 0.0) + _v
-            _t = getattr(env, "last_trainee_transition", None)
-            if _t is not None and "value" in _t:
-                _val = _t["value"]
-                if isinstance(_val, torch.Tensor):
-                    _val = float(_val.item())
-                value_preds.append(float(_val))
-
-        rewards.append(ep_reward)
-        outcome = info.trial_outcome if info else "unknown"
-        outcomes[outcome] = outcomes.get(outcome, 0) + 1
-        times.append(time.time() - t0)
-
-        if (trial + 1) % 10 == 0:
-            log.info(f"  [neural] trial {trial+1}/{n_trials}: outcome={outcome}, reward={ep_reward:.2f}")
-
-    n = len(rewards)
-    win_count = outcomes.get("box_possession", 0)
-    return {
-        "n_trials": n,
-        "win_rate_pct": 100.0 * win_count / n,
-        "mean_reward": float(np.mean(rewards)),
-        "std_reward": float(np.std(rewards)),
-        "min_reward": float(np.min(rewards)),
-        "max_reward": float(np.max(rewards)),
-        "outcomes": outcomes,
-        "mean_episode_time_s": float(np.mean(times)),
-        "reward_components": {k: v / n for k, v in comp_acc.items()},
-        "mean_value_pred": float(np.mean(value_preds)) if value_preds else float("nan"),
-    }
+    return _env_factory, trainer._sample_action
 
 
-def _run_baseline_evaluation(env, n_trials: int) -> dict:  # env unused, kept for API compat
-    """Run n_trials episodes with rules-based AI on BOTH sides.
+def _run_evaluation(
+    trainer, env, n_trials: Optional[int] = None, repeats_per_seed: Optional[int] = None,
+    checkpoint_path: Optional[str] = None, n_parallel_workers: Optional[int] = None,
+) -> dict:
+    """Run the shared seeded evaluation (ai/eval/seeded_eval.py) against the
+    checkpoint's own env/definition, reusing the SAME fixed seed list as
+    PPOTrainer._eval_vs_rules() so numbers are comparable across training
+    runs and standalone evaluate.py calls. n_trials/repeats_per_seed override
+    ai_config.json's eval.eval_n_seeds/eval_repeats_per_seed when given.
+    n_parallel_workers>1 requires checkpoint_path (each subprocess reloads
+    the checkpoint itself -- see _checkpoint_eval_env_factory)."""
+    from footballcoach.ai.config import load_ai_config
+    from footballcoach.ai.env.scenario_env import ScenarioEnv
+    from footballcoach.ai.eval.seeded_eval import (
+        default_eval_seeds, run_seeded_evaluation, run_seeded_evaluation_parallel,
+    )
 
-    build_1v1_scenario now assigns Phase1RulesAI to both trainee and opponent
-    via player.ai; Match.step() fires them automatically.  We use ScenarioEnv
-    with a noop action — ScenarioEnv's apply_action_to_player still fires, but
-    since player.ai runs first (inside _process_orders) and overwrites the order
-    every tick the noop StopOrder is immediately replaced.
-    """
-    import numpy as np
-    import functools
+    cfg = load_ai_config()
+    seeds = default_eval_seeds(cfg)
+    if n_trials is not None:
+        seeds = seeds[:n_trials] if n_trials <= len(seeds) else seeds + list(
+            range(seeds[-1] + 1, seeds[-1] + 1 + (n_trials - len(seeds)))
+        )
+    repeats = repeats_per_seed if repeats_per_seed is not None else int(
+        cfg.get("eval", {}).get("eval_repeats_per_seed", 2)
+    )
+    n_workers = n_parallel_workers if n_parallel_workers is not None else int(
+        cfg.get("eval", {}).get("eval_n_parallel_workers", 1)
+    )
+
+    if n_workers > 1 and checkpoint_path is not None:
+        import functools
+        _def_kwargs = dict(
+            definition=env.definition,
+            trainee_player_id=env.trainee_player_id,
+            phase=env.phase,
+            secondary_player_ids=env.secondary_player_ids,
+            max_episode_s=env.max_episode_s,
+        )
+        worker_factory = functools.partial(
+            _checkpoint_eval_env_factory, checkpoint_path, "cpu", _def_kwargs,
+        )
+        result = run_seeded_evaluation_parallel(worker_factory, seeds, repeats, n_workers=n_workers)
+    else:
+        def _env_factory(seed: int) -> ScenarioEnv:
+            return ScenarioEnv(
+                definition=env.definition,
+                trainee_player_id=env.trainee_player_id,
+                phase=env.phase,
+                secondary_player_ids=env.secondary_player_ids,
+                max_episode_s=env.max_episode_s,
+                seed=seed,
+            )
+
+        result = run_seeded_evaluation(_env_factory, trainer._sample_action, seeds, repeats)
+
+    d = result.as_dict()
+    d["min_reward"] = float(min(result.rewards)) if result.rewards else float("nan")
+    d["max_reward"] = float(max(result.rewards)) if result.rewards else float("nan")
+    return d
+
+
+def _baseline_env_worker_factory() -> tuple:
+    """Module-level (picklable) worker factory for the rules-vs-rules
+    baseline -- no checkpoint/network involved, so sample_action_fn is None."""
     from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
     from footballcoach.rules_ai import Phase1RulesAI
     from footballcoach.ai.env.scenario_env import ScenarioEnv
 
     def _baseline_build(*args, **kwargs):
         match = build_1v1_scenario(*args, **kwargs)
-        # Force both players to rules-based regardless of the 50/50 flag.
         for pid in ("trainee", "opponent"):
             try:
                 match.player_by_id(pid).ai = Phase1RulesAI()
@@ -204,46 +229,53 @@ def _run_baseline_evaluation(env, n_trials: int) -> dict:  # env unused, kept fo
                 pass
         return match
 
-    defn = ScenarioDefinition(
-        key="baseline_1v1",
-        label="Baseline: rules vs rules",
-        description="Rules-based AI on both sides for win-rate baseline",
-        build=functools.partial(_baseline_build, ball_max_speed_mps=4.0),
-        on_tick=None,
+    def _env_factory(seed: int) -> ScenarioEnv:
+        def _build(*_a, **_kw):
+            return _baseline_build(*_a, ball_max_speed_mps=4.0, seed=seed, **_kw)
+
+        defn = ScenarioDefinition(
+            key="baseline_1v1",
+            label="Baseline: rules vs rules",
+            description="Rules-based AI on both sides for win-rate baseline",
+            build=_build,
+            on_tick=None,
+        )
+        return ScenarioEnv(definition=defn, trainee_player_id="trainee", phase=1, secondary_player_ids=[])
+
+    return _env_factory, None
+
+
+def _run_baseline_evaluation(
+    env, n_trials: int, repeats_per_seed: Optional[int] = None, n_parallel_workers: Optional[int] = None,
+) -> dict:  # env unused, kept for API compat
+    """Run the shared seeded evaluation with rules-based AI on BOTH sides.
+
+    build_1v1_scenario assigns Phase1RulesAI to both trainee and opponent via
+    player.ai; Match.step() fires them automatically.
+    """
+    from footballcoach.ai.config import load_ai_config
+    from footballcoach.ai.eval.seeded_eval import run_seeded_evaluation, run_seeded_evaluation_parallel
+
+    cfg = load_ai_config()
+    seeds = list(range(2_000_000, 2_000_000 + n_trials))
+    repeats = repeats_per_seed if repeats_per_seed is not None else int(
+        cfg.get("eval", {}).get("eval_repeats_per_seed", 2)
     )
-    baseline_env = ScenarioEnv(
-        definition=defn,
-        trainee_player_id="trainee",
-        phase=1,
-        secondary_player_ids=[],
+    n_workers = n_parallel_workers if n_parallel_workers is not None else int(
+        cfg.get("eval", {}).get("eval_n_parallel_workers", 1)
     )
 
-    outcomes: dict[str, int] = {}
-    times = []
+    if n_workers > 1:
+        result = run_seeded_evaluation_parallel(
+            _baseline_env_worker_factory, seeds, repeats, n_workers=n_workers,
+        )
+    else:
+        env_factory, sample_action_fn = _baseline_env_worker_factory()
+        result = run_seeded_evaluation(env_factory, sample_action_fn, seeds, repeats)
 
-    for trial in range(n_trials):
-        t0 = time.time()
-        baseline_env.reset()
-        done = False
-        info = None
-        while not done:
-            _, _, done, info = baseline_env.step()
-
-        outcome = info.trial_outcome if info else "unknown"
-        outcomes[outcome] = outcomes.get(outcome, 0) + 1
-        times.append(time.time() - t0)
-
-        if (trial + 1) % 10 == 0:
-            log.info(f"  [baseline] trial {trial+1}/{n_trials}: outcome={outcome}")
-
-    n = len(times)
-    win_count = outcomes.get("box_possession", 0)
-    return {
-        "n_trials": n,
-        "win_rate_pct": 100.0 * win_count / n,
-        "outcomes": outcomes,
-        "mean_episode_time_s": float(np.mean(times)),
-    }
+    d = result.as_dict()
+    del d["mean_value_pred"]  # no neural player in this scenario
+    return d
 
 
 def _print_combined_stats(combined: dict) -> None:
@@ -256,11 +288,12 @@ def _print_combined_stats(combined: dict) -> None:
     nn = combined["neural_net"]
     log.info(f"  Neural net:  win={nn['win_rate_pct']:.1f}%  "
              f"reward={nn['mean_reward']:.2f}±{nn['std_reward']:.2f}  "
-             f"outcomes={nn['outcomes']}")
+             f"outcomes={nn['outcomes']}  (win/loss/tout/miss: {nn['outcome_breakdown']})")
 
     bl = combined.get("baseline_rules_vs_rules")
     if bl:
-        log.info(f"  Rules base:  win={bl['win_rate_pct']:.1f}%  outcomes={bl['outcomes']}")
+        log.info(f"  Rules base:  win={bl['win_rate_pct']:.1f}%  outcomes={bl['outcomes']}"
+                 f"  (win/loss/tout/miss: {bl['outcome_breakdown']})")
         diff = nn["win_rate_pct"] - bl["win_rate_pct"]
         log.info(f"  Delta vs baseline: {diff:+.1f}pp")
 

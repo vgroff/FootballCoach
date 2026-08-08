@@ -91,9 +91,11 @@ def main() -> None:
                             "pre-training loop. Unlike --checkpoint (which skips pre-training), "
                             "this lets you re-pretrain an existing policy with new config or demos."
                         ))
-    parser.add_argument("--pre-ppo-eval-trials", type=int, default=40,
-                        help="Episodes to evaluate vs rules-based AI after pre-training, before "
-                             "PPO starts. Set to 0 to skip (default: 40).")
+    parser.add_argument("--pre-ppo-eval-trials", type=int, default=None,
+                        help="Number of distinct eval seeds to evaluate vs rules-based AI after "
+                             "pre-training, before PPO starts (default: ai_config.json "
+                             "eval.eval_n_seeds; each seed is repeated eval.eval_repeats_per_seed "
+                             "times). Set to 0 to skip.")
     parser.add_argument("--no-head-freeze", action="store_true",
                         help="Skip frozen_heads from the curriculum phase definition — all "
                              "decision-network heads are trained during PPO. Default: the "
@@ -386,6 +388,7 @@ def main() -> None:
                 rollout_steps=combined_pretrain_rollout_steps,
                 value_epochs=value_pretrain_epochs,
                 experiment_separate_value_net=args.experiment_separate_value_net,
+                phase_id=args.phase,
             )
         else:
             # Online BC pre-training (noisy but works without a dataset)
@@ -404,19 +407,11 @@ def main() -> None:
                     n_epochs=value_pretrain_epochs,
                     lr=value_pretrain_lr,
                     experiment_separate_value_net=args.experiment_separate_value_net,
+                    phase_id=args.phase,
                 )
 
-    # Save a checkpoint of the pre-trained model before PPO starts.
-    # --checkpoint/--from-pretrained skip pretraining entirely (nothing new to save),
-    # but --pretrain-from-checkpoint/--latest-pretrain DO run a fresh BC/value
-    # pretraining pass on top of loaded weights, so they must still save here.
-    if not args.checkpoint and not args.from_pretrained and checkpoint_dir is not None:
-        pretrain_ckpt = checkpoint_dir / "checkpoint_pretrained.pt"
-        trainer._save_checkpoint_to(pretrain_ckpt)
-        log.info(f"Pre-trained checkpoint saved: {pretrain_ckpt}")
-
-    # Quick pre-PPO evaluation: neural vs rules-based AND vs immobile opponent
-    if args.pre_ppo_eval_trials > 0:
+    if args.pre_ppo_eval_trials != 0:
+        _pre_ppo_n_seeds = args.pre_ppo_eval_trials  # None = fall back to ai_config.json eval.eval_n_seeds
         from footballcoach.ai.scripts.evaluate import _run_evaluation
         from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
         from footballcoach.ai.env.scenario_env import ScenarioEnv
@@ -435,7 +430,7 @@ def main() -> None:
             rules_defn, trainee_player_id="trainee", phase=1,
             max_episode_s=env.max_episode_s,
         )
-        rules_stats = _run_evaluation(trainer, rules_env, args.pre_ppo_eval_trials)
+        rules_stats = _run_evaluation(trainer, rules_env, _pre_ppo_n_seeds)
         from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS as _CL
         _cl_map = dict(_CL)
         _comp_str = "  ".join(
@@ -446,7 +441,8 @@ def main() -> None:
         log.info(
             f"Pre-PPO eval (rules opp): win={rules_stats['win_rate_pct']:.1f}%  "
             f"mean_rew={rules_stats['mean_reward']:.3f}  "
-            f"mean_val={rules_stats['mean_value_pred']:.3f}  "
+            f"V={rules_stats['mean_step_v']:.3f}  R={rules_stats['mean_step_r']:.3f}  "
+            f"gap={rules_stats['mean_step_v'] - rules_stats['mean_step_r']:+.3f}  "
             f"outcomes={rules_stats['outcomes']}"
         )
         if _comp_str:
@@ -465,7 +461,7 @@ def main() -> None:
             immobile_defn, trainee_player_id="trainee", phase=1,
             max_episode_s=env.max_episode_s,
         )
-        immobile_stats = _run_evaluation(trainer, immobile_env, args.pre_ppo_eval_trials)
+        immobile_stats = _run_evaluation(trainer, immobile_env, _pre_ppo_n_seeds)
         _imm_comp_str = "  ".join(
             f"{_cl_map.get(k, k)}={v:+.2f}" for k, v in sorted(
                 immobile_stats.get("reward_components", {}).items(), key=lambda x: -abs(x[1])
@@ -474,7 +470,8 @@ def main() -> None:
         log.info(
             f"Pre-PPO eval (immobile opp): win={immobile_stats['win_rate_pct']:.1f}%  "
             f"mean_rew={immobile_stats['mean_reward']:.3f}  "
-            f"mean_val={immobile_stats['mean_value_pred']:.3f}  "
+            f"V={immobile_stats['mean_step_v']:.3f}  R={immobile_stats['mean_step_r']:.3f}  "
+            f"gap={immobile_stats['mean_step_v'] - immobile_stats['mean_step_r']:+.3f}  "
             f"outcomes={immobile_stats['outcomes']}"
         )
         if _imm_comp_str:
@@ -500,7 +497,7 @@ def main() -> None:
             max_episode_s=env.max_episode_s,
             secondary_player_ids=["opponent"],
         )
-        neural_stats = _run_evaluation(trainer, neural_env, args.pre_ppo_eval_trials)
+        neural_stats = _run_evaluation(trainer, neural_env, _pre_ppo_n_seeds)
         _nn_comp_str = "  ".join(
             f"{_cl_map.get(k, k)}={v:+.2f}" for k, v in sorted(
                 neural_stats.get("reward_components", {}).items(), key=lambda x: -abs(x[1])
@@ -509,7 +506,8 @@ def main() -> None:
         log.info(
             f"Pre-PPO eval (self-play):   win={neural_stats['win_rate_pct']:.1f}%  "
             f"mean_rew={neural_stats['mean_reward']:.3f}  "
-            f"mean_val={neural_stats['mean_value_pred']:.3f}  "
+            f"V={neural_stats['mean_step_v']:.3f}  R={neural_stats['mean_step_r']:.3f}  "
+            f"gap={neural_stats['mean_step_v'] - neural_stats['mean_step_r']:+.3f}  "
             f"outcomes={neural_stats['outcomes']}"
         )
         if _nn_comp_str:
@@ -532,7 +530,7 @@ def main() -> None:
 
     # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0)
     aux_label_fn = None if (args.no_bc_aux or label_fn is None) else label_fn
-    trainer.train(env, total_steps=args.total_steps, bc_label_fn=aux_label_fn)
+    trainer.train(env, total_steps=args.total_steps, bc_label_fn=aux_label_fn, phase_id=args.phase)
 
 
 # env building and label functions live in curriculum.envs — no duplication here.

@@ -46,10 +46,11 @@ class TestPhase1RewardWiring:
         fix, both were always exactly 0.0 regardless of this setup because
         heading_cos_sim/player_speed_mps were never forwarded.
         """
-        coef = _CFG1.get("heading_penalty_coef", 0.0)
-        assert coef > 0.0, "heading_penalty_coef is 0 in live config -- test needs it enabled"
-
+        # heading_penalty_coef is 0.0 in the live config (disabled); override
+        # locally on the env's own reward-cfg dict so the wiring under test
+        # still exercises the penalty formula.
         env = _make_env()
+        env._reward_cfg["phase1"] = {**env._reward_cfg["phase1"], "heading_penalty_coef": 0.15}
         env.reset()
         match = env._loop.match
         player = match.player_by_id("trainee")

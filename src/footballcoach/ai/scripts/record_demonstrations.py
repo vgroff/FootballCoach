@@ -315,6 +315,72 @@ def record_episodes(
 
 
 # ---------------------------------------------------------------------------
+# Batch-loop worker (shared by single-process main() and each subprocess)
+# ---------------------------------------------------------------------------
+
+def _run_recording_job(job: dict) -> dict:
+    """Record ``job['n_episodes']`` episodes in ``episodes_per_file``-sized
+    .npz files, starting from ``job['file_idx_start']``.
+
+    Must stay top-level/picklable -- used both directly (single-process path)
+    and as the target of a ``multiprocessing`` worker (see
+    ``--n-processes``/``bc.demo_recording_n_processes``). Independent of any
+    neural network, so unlike ai/ppo/rollout_worker.py there is no weight
+    sync needed -- each job is fully self-contained and just needs its own
+    RNG seed (to avoid identical episodes across workers) and its own
+    disjoint file_idx range (to avoid filename collisions).
+    """
+    import random as _random
+    np.random.seed(job["seed"])
+    _random.seed(job["seed"])
+
+    env, label_fn, scenario_key = _build_env_and_label_fn(job["phase_id"])
+
+    n_eps = job["n_episodes"]
+    eps_per_file = job["episodes_per_file"]
+    file_idx = job["file_idx_start"]
+    remaining = n_eps
+    episodes_done = 0
+    total_steps = 0
+    n_files_written = 0
+
+    while remaining > 0:
+        batch = min(eps_per_file, remaining)
+        t0 = time.time()
+        data = record_episodes(
+            env=env,
+            label_fn=label_fn,
+            n_episodes=batch,
+            scenario_key=scenario_key,
+            phase_id=job["phase_id"],
+            episode_offset=episodes_done,
+            total_episodes=n_eps,
+            sample_interval_s=job["sample_interval_s"],
+            opponent_rules_prob=job["opponent_rules_prob"],
+            opponent_immobile_prob=job["opponent_immobile_prob"],
+        )
+        elapsed = time.time() - t0
+
+        n_steps = len(data["bc_labels"])
+        total_steps += n_steps
+
+        fname = Path(job["output_dir"]) / f"phase{job['phase_id']}_{file_idx:04d}.npz"
+        np.savez_compressed(fname, **data)
+
+        log.info(
+            f"[worker {job.get('worker_idx', 0)}] Saved {fname.name} | "
+            f"{batch} episodes, {n_steps} steps | {elapsed:.1f}s"
+        )
+
+        file_idx += 1
+        n_files_written += 1
+        remaining -= batch
+        episodes_done += batch
+
+    return {"total_steps": total_steps, "n_files": n_files_written}
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -347,6 +413,14 @@ def main() -> None:
                              "0.0 (default) preserves old behaviour: remainder after rules-prob is immobile.")
     parser.add_argument("--info", action="store_true",
                         help="Print info about existing files and exit")
+    _default_n_processes = int(_cfg.get("bc", {}).get("demo_recording_n_processes", 1))
+    parser.add_argument("--n-processes", type=int, default=_default_n_processes,
+                        help=f"Number of worker processes to split --n-episodes across "
+                             f"(default: {_default_n_processes} from config). 1 = current "
+                             "single-process behaviour. No neural network is involved in "
+                             "recording, so unlike PPO's --n-parallel-envs there's no weight "
+                             "sync -- each worker just records its own share of episodes into "
+                             "its own disjoint .npz file range.")
     args = parser.parse_args()
 
     import random
@@ -364,56 +438,77 @@ def main() -> None:
         return
 
     output_dir.mkdir(parents=True, exist_ok=True)
-    env, label_fn, scenario_key = _build_env_and_label_fn(args.phase)
 
     n_eps = args.n_episodes
     eps_per_file = args.episodes_per_file
     n_files = (n_eps + eps_per_file - 1) // eps_per_file
+    n_processes = max(1, args.n_processes)
+
+    if n_processes == 1:
+        _, _, scenario_key = _build_env_and_label_fn(args.phase)
+        log.info(
+            f"Recording {n_eps} episodes of phase {args.phase} ({scenario_key}) "
+            f"→ {n_files} file(s) in {output_dir} "
+            f"[sample_interval={args.sample_interval}s, opponent_rules_prob={args.opponent_rules_prob:.0%}]"
+        )
+        result = _run_recording_job({
+            "phase_id": args.phase,
+            "n_episodes": n_eps,
+            "episodes_per_file": eps_per_file,
+            "output_dir": str(output_dir),
+            "file_idx_start": 0,
+            "seed": args.seed,
+            "sample_interval_s": args.sample_interval,
+            "opponent_rules_prob": args.opponent_rules_prob,
+            "opponent_immobile_prob": args.opponent_immobile_prob,
+        })
+        log.info(
+            f"Done. {result['n_files']} file(s), {result['total_steps']:,} total steps → {output_dir}"
+        )
+        return
+
+    # --- Multi-process path: split n_episodes evenly, each worker gets its
+    # own disjoint file_idx range (via cumulative n_files-per-worker) and its
+    # own RNG seed so workers don't record identical episodes. ---
+    import multiprocessing as mp
+
+    _, _, scenario_key = _build_env_and_label_fn(args.phase)
+    base_eps = n_eps // n_processes
+    remainder = n_eps % n_processes
+    jobs: list[dict] = []
+    file_idx_cursor = 0
+    for i in range(n_processes):
+        worker_eps = base_eps + (1 if i < remainder else 0)
+        if worker_eps == 0:
+            continue
+        jobs.append({
+            "phase_id": args.phase,
+            "n_episodes": worker_eps,
+            "episodes_per_file": eps_per_file,
+            "output_dir": str(output_dir),
+            "file_idx_start": file_idx_cursor,
+            "seed": args.seed + i,
+            "sample_interval_s": args.sample_interval,
+            "opponent_rules_prob": args.opponent_rules_prob,
+            "opponent_immobile_prob": args.opponent_immobile_prob,
+            "worker_idx": i,
+        })
+        file_idx_cursor += (worker_eps + eps_per_file - 1) // eps_per_file
 
     log.info(
         f"Recording {n_eps} episodes of phase {args.phase} ({scenario_key}) "
-        f"→ {n_files} file(s) in {output_dir} "
+        f"across {len(jobs)} process(es) → {n_files} file(s) in {output_dir} "
         f"[sample_interval={args.sample_interval}s, opponent_rules_prob={args.opponent_rules_prob:.0%}]"
     )
 
-    total_steps = 0
-    file_idx = 0
-    remaining = n_eps
-    episodes_done = 0
+    ctx = mp.get_context("spawn")
+    with ctx.Pool(processes=len(jobs)) as pool:
+        results = pool.map(_run_recording_job, jobs)
 
-    while remaining > 0:
-        batch = min(eps_per_file, remaining)
-        t0 = time.time()
-        data = record_episodes(
-            env=env,
-            label_fn=label_fn,
-            n_episodes=batch,
-            scenario_key=scenario_key,
-            phase_id=args.phase,
-            episode_offset=episodes_done,
-            total_episodes=n_eps,
-            sample_interval_s=args.sample_interval,
-            opponent_rules_prob=args.opponent_rules_prob,
-            opponent_immobile_prob=args.opponent_immobile_prob,
-        )
-        elapsed = time.time() - t0
-
-        n_steps = len(data["bc_labels"])
-        total_steps += n_steps
-
-        fname = output_dir / f"phase{args.phase}_{file_idx:04d}.npz"
-        np.savez_compressed(fname, **data)
-
-        log.info(
-            f"Saved {fname.name} | {batch} episodes, {n_steps} steps | {elapsed:.1f}s"
-        )
-
-        file_idx += 1
-        remaining -= batch
-        episodes_done += batch
-
+    total_steps = sum(r["total_steps"] for r in results)
+    total_files = sum(r["n_files"] for r in results)
     log.info(
-        f"Done. {file_idx} file(s), {total_steps:,} total steps → {output_dir}"
+        f"Done. {total_files} file(s), {total_steps:,} total steps → {output_dir}"
     )
 
 

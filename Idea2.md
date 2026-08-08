@@ -18,39 +18,39 @@ Extending training:
 - I'm thinking the reward function should be split by order. E.g. for phase 1 we have these custom rewards that are relaly just tied to Order behaviour. Instead, it should be split by order - eg some apply to GetPossession/ChaseTackle (depends on ball possession), some apply only to MoveOrder, then later some will apply only to Shoot, Pass etc… completing the order (fast) should always give a reward boost. This was we can build rules-based AIs, set the appropriate order and then query them to see what the reward should be, both for themsleves and for the neural AI. There will also certainly be custom reward termsinvolved in each case, some we cna make always be there (e.g. stamina)
 - Task ids are important, make sure they are set
     - I think task ids should only be set by the decision network, the execution network shouldnt get them (remove if it already does)
+Notes to self:
+- GK needs fixing - he saves no shots in the close rnage scenario
 - When running these messy/random scenarios, we might need to decide (maye using a value network) whcih runs are actually good (advantage-wise and in absolute)
 
 
 
 Current notes:
 - " read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
+- " read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md "
 - train blockers:
-    - reward funciton kinda sucks ass
-    - try annealing!!
-        - doesnt work!!
-    - [] !progress is always 0 now - probably the agent that did the approach speed norm broke it
-    - [] better breakdown of win/loss/timeout/ball out in "vs" log line and evaluations during training
-    - try just doing immobile first - can we improve?
-    - [] make approach speed go both ways, reduce heading penalty (or change it?)
-    - Evalulations both pre and during training should be seeded so that they're deterministically setup (with still a random match seed each time), and possibly should run more than once. There are some notes about seeding in agent_plans/ppo_scenario_seedppo.md, so read that first, but you'd only need it on the evaluations for now, just make it extensible/generalisable if possible. We might also want multiple runs of the same seeded trial, sinec matches and PPO are random
+    - for a proper training run:
+        - include neural opponents
+        - (small) pretrain
+    - [] Why do they keep loosing the ball!!
+    - [] value netowrk fixed - can we switch back to not having a separate value network?
+    - [] still getting very large policy ratios sometimes - check what is the contributing factor (Dont we already see this?)
+    - [] get match logs for best performing (by reward) and "smartest" (most adv, idk) runs each epoch
+        - [] make a match log viewer (static image with lines)
+        - [] anytime a rewards gets clamped - output the match log and examine why
+    - [] check speed bonus works correctly
+    - [] some useful stuff from chatgpt
+    - make a giant BC training set (background task)
+    - [] no illegal move penalty - sus
     - Do the seeding thing somehow, or have pre-built scenarios, or something like that. Or maybe use the same exact scenario(s) but add a bit of noise to everything
         - [?] Could already do this by just having very tight params? Maybe add some more bounds first?
-            - e.g. starting player dist from centre
-    - [Y] can we get more of the direction-based logs output angles and the like rather than [x,y]? or at least have both? e.g. exec log std and mean delta in degrees too, the d_move/d_kick, all that kind of stuff
-        - can we get some measure of delta over the whole epoch too? instead of op step?
-    - [Y] can we get the advanatge on the worst performance logs?
-    - [Y] can we get breakdown on highest policy log and what the contribution is?
-    - [?] measure of exploration vs exploitation for each execution head?
-    - Advantage is sus - has extreme values
-        - understand why
-        - [Y] print reward statistics - mean, std, min/max - by type
-        - larger minibatch?
-        - consider "advantage clipping"
     - Policy ratios are "insane". Investigate, very possible from sigma being small
-    - !decisions like hold and pass are in the logs with losses - shouldnt they be frozen?
-    - check on illegal moves?
-    - run an inline script, with seeded scenarios and multi-runs, to check effect of decision interval on performace (use neural net)
     - "close miss" type penalty - distance to ball increasing while small while ball not possessed
+    - Think about NN inputs a bit more - Should we give relative velocity/speeds to players/ball or similar? Giving relative speed might be a compromise
+        - Self/other distinction - feed self through the entity MLP + attention, but give it a separate MLP just for the querying on the second order, and then no self_mlp feeds into the trunk
+        - Keys and values use the same embedding (other_embed feeds both). nn.MultiheadAttention does have internal separate W_K and W_V projections, so it's not as bad as it sounds — but giving keys and values explicitly different upstream MLP branches would let keys be tuned purely for relevance scoring while values carry richer information.
+        - Single attention layer is the biggest limitation. You can't model player-player interactions — e.g. "player A is relevant because they're near player B who has the ball". Stacking two transformer layers would give second-order interactions but is a meaningful architecture change.
+        - Consider adding the intermediate attention to the trunk?
+        - The shared per_entity_mlp for self (query input) and others (key/value input) forces both to live in the same embedding space. Separate MLPs for self vs others is common in entity-based architectures and would give more freedom.
 =====================
     - We have a plan for the implementation of seeding scenarios for less noise
         - The evaluation steps should also use seeds so that they're always the same!
@@ -110,15 +110,19 @@ Immediate AI stuff
 - Think about how GetPossesion, Tackle and Move orders are going to interact - they could work together. The Orders would need to break down into AI suggestions maybe
 
 Next immediate training:
-- I've made some small changes to ai_plan regarding the movement orders neurons (region of play and importance etc...), can we update the code and documents to reflect this change
 - Have Phase 0 training - just teach to follow MoveOrders and RegionOfPlay Order and also both simultaneously with the various HoldPosition/RegionOfPlayImportance values randomised at the start of each run and using varying size and position of regions for both. Start at a random position with random velocity. Only train the execution network on this, but set the order correctly in the input. Use a rules-based AI with MoveOrders to pre-train, have it evaluate the optimal reward function to aim for, and then just select a random point in the target region, then let the AI see if it can do better. Do waypoint chains of 5 waypoints like in the UI scenario, all waypoints within 15m, and pretrain with the WayPointSprint rules AI
 - In Phase 1, we can start giving the AI negative examples, by giving it move orders instead of GetPossession orders - in these scenarios, it is only rewarded for getting close to the move point. We can also chain the two, GetPossession first, follow by a move order do a differnt location - with a different reward function as a result. Or MoveOrder first, then GetPossession. I guess we should build some kind of modular/OOP thing where we can chain the rules based Orders and get their respective reward function if theyve been completed succesfully and loss if not, that way we cna make scenarios easily. Things won't always map nicely, we might want behaviours that are more custom, but its a good start. In later cases we might want to have ORders that don't have a rules-based AI
 - Passing training - first fix passing by adding a Pass power multiplier and trying it out in the UI passing scenario
 
 NB Immediate Immediate:
-- 2V2 scenario is completely broken, I think GK is on the wrong team, and probbaly other shit. Fix it. Also, the through ball pass is doing an awful job of predicting where the player will be, can we hit the pass harder? Maybe for the scenario, make the second attacker move slower, also, is he running GetPossession during the pass?
+- At some point ask an AI to: "read through everything - except for now, the ai folder (but do read rules_ai.py) and offer suggestions for refactors or cleanups, duplicate code/logic, string literals, inconsistent documentation/knowledge files, comments and criticisms on structure, easy wins, possible bugs and edge cases, test cases etc... Even if you see something is already explained/documented, if you're not convinced by the explanation or if it still seems dodgy/potentially wrong, bring it up". Do this before extending the game too much beyond the pitch
+    - WE DID THIS! It's in code_analysis, a buch of it is implemented but not all
+    - Once, and we should again, with the ai stuff, and also a non-code/physics one on the football side of things, one on the UI side etc..
+        - ai stuff - ppo_trainer is massive, does it really need to do all that stuff, is some of it not duplicate code? Can some of it be refactored elsewhere?
+        - also get them to check knowledge doc correctness
+    - check knolwedge doc agreement (between themselves)
 - The goalkeeper clearly teleports after saving the ball sometimes, wtf is that about??
-- Controlling the ball also makes players static I think probably change that, same as with tackling
+- Football loses its black border/outline when possessed by a player - looks weird/ugly
 - Why is the ball.possessed_by still using a player_id?? Do we enforce unique player_ids?? It seems so much easier to use just use the possesed_by field be player type rather than string, ball.possessed_by = kicker, instead of kicker.player_id. Is there an issue with circular references or something? If so, can't it be solved gracefully by refactoring or something? If not, it's okay, it just seems ugly
 - Maybe slightly reduce the size of the player spheres?
 - Is the game log permanent and can I copy/paste from it?
@@ -149,11 +153,6 @@ NB:
 - Show player attributes somewhere on select
 - Could do grid search on the goalie intercept maneuver and clever positioning - ask that AI how the intercepting is chosen, but really we should calculate distance/speed for both options, and make a weighted choice based on those, no? throw in some params and re-tune the goalie bonuses probably
 - footballer height should vary - and therefore jump height
-- At some point ask an AI to: "read through everything - except for now, the ai folder (but do read rules_ai.py) and offer suggestions for refactors or cleanups, duplicate code/logic, string literals, inconsistent documentation/knowledge files, comments and criticisms on structure, easy wins, possible bugs and edge cases, test cases etc... Even if you see something is already explained/documented, if you're not convinced by the explanation or if it still seems dodgy/potentially wrong, bring it up". Do this before extending the game too much beyond the pitch
-    - WE DID THIS! It's in code_analysis, a buch of it is implemented but not all
-    - Once, and we should again, with the ai stuff, and also a non-code/physics one on the football side of things, one on the UI side etc..
-        - also get them to check knowledge doc correctness
-    - check knolwedge doc agreement (between themselves)
 - certain things in physics.json should probably be in attributes.json or a differently names config file, we should probably hve an entire audit of these and figure out how best to organise the files/config params
 
 

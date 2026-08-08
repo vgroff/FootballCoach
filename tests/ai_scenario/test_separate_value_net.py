@@ -126,16 +126,18 @@ class TestConstruction:
 
     def test_value_net_trunk_hidden_override(self):
         """network.value_net_trunk_hidden, when set, must size ONLY
-        value_net's trunk -- execution_net's trunk must stay at the
-        unmodified network.trunk_hidden."""
+        value_net's trunk -- execution_net's trunk must stay at whatever
+        exec_trunk_hidden (falling back to trunk_hidden) already resolves to."""
         import copy
         from footballcoach.ai.config import load_ai_config
         from footballcoach.ai.models.decision_network import DecisionNetwork
         from footballcoach.ai.models.execution_network import ExecutionNetwork
 
         cfg = copy.deepcopy(load_ai_config())
-        main_trunk_hidden = cfg["network"]["trunk_hidden"]
-        override_trunk_hidden = main_trunk_hidden + 37  # deliberately different
+        # execution_net's own trunk sizing: exec_trunk_hidden falls back to
+        # trunk_hidden when absent/null -- see ExecutionNetwork.from_config().
+        expected_exec_trunk_hidden = cfg["network"].get("exec_trunk_hidden") or cfg["network"]["trunk_hidden"]
+        override_trunk_hidden = expected_exec_trunk_hidden + 37  # deliberately different
         cfg["network"]["value_net_trunk_hidden"] = override_trunk_hidden
 
         trainer = PPOTrainer(
@@ -144,7 +146,7 @@ class TestConstruction:
             cfg=cfg,
             separate_value_net=True,
         )
-        assert trainer.execution_net.trunk[-2].out_features == main_trunk_hidden
+        assert trainer.execution_net.trunk[-2].out_features == expected_exec_trunk_hidden
         assert trainer.value_net.trunk[-2].out_features == override_trunk_hidden
 
     def test_no_effect_when_separate_value_net_disabled(self):
@@ -156,8 +158,8 @@ class TestConstruction:
         from footballcoach.ai.models.execution_network import ExecutionNetwork
 
         cfg = copy.deepcopy(load_ai_config())
-        main_trunk_hidden = cfg["network"]["trunk_hidden"]
-        cfg["network"]["value_net_trunk_hidden"] = main_trunk_hidden + 37
+        expected_exec_trunk_hidden = cfg["network"].get("exec_trunk_hidden") or cfg["network"]["trunk_hidden"]
+        cfg["network"]["value_net_trunk_hidden"] = expected_exec_trunk_hidden + 37
 
         trainer = PPOTrainer(
             decision_net=DecisionNetwork.from_config(),
@@ -166,7 +168,7 @@ class TestConstruction:
             separate_value_net=False,
         )
         assert trainer.value_net is None
-        assert trainer.execution_net.trunk[-2].out_features == main_trunk_hidden
+        assert trainer.execution_net.trunk[-2].out_features == expected_exec_trunk_hidden
 
 
 class TestValueRouting:

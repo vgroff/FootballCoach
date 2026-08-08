@@ -121,28 +121,42 @@ class ExecutionNetwork(nn.Module):
         value_extra_hidden: int = 16,
         value_hidden_dim: int = 0,
         value_dropout: float = 0.0,
+        inter_player_num_heads: int = 0,
+        shared_entity_encoder: Optional[nn.Module] = None,
+        shared_ball_mlp: Optional[nn.Module] = None,
+        shared_global_mlp: Optional[nn.Module] = None,
     ):
         super().__init__()
         self.latent_dim = latent_dim
 
-        self.entity_encoder = EntityEncoder(
-            entity_feature_dim=self_dim,
-            embed_dim=entity_embed_dim,
-            num_heads=num_attention_heads,
-        )
+        dec_dim = _decision_output_dim(latent_dim)
+
+        # Use shared modules from DecisionNetwork when provided; own copies otherwise.
+        if shared_entity_encoder is not None:
+            self.entity_encoder = shared_entity_encoder
+        else:
+            self.entity_encoder = EntityEncoder(
+                entity_feature_dim=self_dim,
+                embed_dim=entity_embed_dim,
+                num_heads=num_attention_heads,
+                ball_feat_dim=ball_dim,
+                global_feat_dim=global_dim,
+                inter_player_num_heads=inter_player_num_heads,
+            )
         self.self_mlp = nn.Sequential(
             nn.Linear(self_dim, self_mlp_hidden), nn.ReLU()
         )
-        self.ball_mlp = nn.Sequential(
+        self.ball_mlp = shared_ball_mlp if shared_ball_mlp is not None else nn.Sequential(
             nn.Linear(ball_dim, ball_mlp_hidden), nn.ReLU()
         )
-        self.global_mlp = nn.Sequential(
+        self.global_mlp = shared_global_mlp if shared_global_mlp is not None else nn.Sequential(
             nn.Linear(global_dim, global_mlp_hidden), nn.ReLU()
         )
-        dec_dim = _decision_output_dim(latent_dim)
         self.decision_mlp = nn.Sequential(
             nn.Linear(dec_dim, decision_mlp_hidden), nn.ReLU()
         )
+        # Decision heads projected into the attention query — own weights even when sharing.
+        self.decision_query_proj = nn.Linear(dec_dim, entity_embed_dim)
 
         trunk_input_dim = (
             entity_embed_dim + self_mlp_hidden +
@@ -159,7 +173,7 @@ class ExecutionNetwork(nn.Module):
         self.exec_move_logit = nn.Linear(trunk_hidden, 1)   # Bernoulli: move vs standstill
         self.sprint_logit = nn.Linear(trunk_hidden, 1)       # Bernoulli: sprint vs jog
         self.kick_logit = nn.Linear(trunk_hidden, 1)          # Bernoulli
-        self.kick_direction = nn.Linear(trunk_hidden, 2)       # L2-normalized to unit vector in forward()
+        self.kick_direction = nn.Linear(trunk_hidden, 3)       # L2-normalized to 3D unit vector in forward()
         self.kick_power = nn.Linear(trunk_hidden, 1)            # raw; sigmoid -> [0,1]
         self.kick_spin = nn.Linear(trunk_hidden, 3)             # raw spin vector
         self.tackle_attempt_logit = nn.Linear(trunk_hidden, 1)  # Bernoulli
@@ -232,10 +246,12 @@ class ExecutionNetwork(nn.Module):
         self_ai_type: Optional[torch.Tensor] = None,   # (batch, AI_TYPE_ONE_HOT_DIM)
         other_ai_type: Optional[torch.Tensor] = None,  # (batch, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM)
     ) -> ExecutionHeadsRaw:
-        entity_ctx, self_embed_raw, other_embed_raw = self.entity_encoder(
-            self_feat, other_feat, exists_mask, return_embeds=True
-        )
         dec_flat = flatten_decision_heads(decision_heads)
+        entity_ctx, self_embed_raw, other_embed_raw = self.entity_encoder(
+            self_feat, other_feat, exists_mask, return_embeds=True,
+            ball_feat=ball_feat, global_feat=global_feat,
+            extra_query_bias=self.decision_query_proj(dec_flat),
+        )
         h = torch.cat([
             entity_ctx,
             self.self_mlp(self_feat),
@@ -275,23 +291,26 @@ class ExecutionNetwork(nn.Module):
         )
 
     @classmethod
-    def from_config(cls, trunk_hidden_override: Optional[int] = None) -> "ExecutionNetwork":
-        """Build from ai_config.json (the canonical hyperparameter source).
+    def from_config(
+        cls,
+        trunk_hidden_override: Optional[int] = None,
+        shared_entity_encoder: Optional[nn.Module] = None,
+        shared_ball_mlp: Optional[nn.Module] = None,
+        shared_global_mlp: Optional[nn.Module] = None,
+    ) -> "ExecutionNetwork":
+        """Build from ai_config.json.
 
-        Args:
-            trunk_hidden_override: If given, overrides ``network.trunk_hidden``
-                for this instance only. Used by PPOTrainer to size the
-                dedicated ``value_net`` trunk differently from the main
-                policy execution_net's trunk via
-                ``network.value_net_trunk_hidden`` in ai_config.json (see
-                ``PPOTrainer.__init__``'s ``separate_value_net`` handling).
-                ``None`` (default) falls back to ``network.trunk_hidden``,
-                matching the shared-trunk network's size.
+        trunk_hidden_override: overrides trunk_hidden (used for value_net sizing).
+        shared_*: pass DecisionNetwork modules to share weights (see PPOTrainer.from_config).
         """
         from footballcoach.ai.config import load_ai_config
         full_cfg = load_ai_config()
         cfg = full_cfg["network"]
         ppo_cfg = full_cfg["ppo"]
+        # exec_trunk_hidden: independent trunk capacity for execution network.
+        # Falls back to trunk_hidden when absent or null.
+        exec_trunk = cfg.get("exec_trunk_hidden") or cfg["trunk_hidden"]
+        trunk = trunk_hidden_override if trunk_hidden_override is not None else exec_trunk
         return cls(
             latent_dim=cfg["latent_dim"],
             entity_embed_dim=cfg["entity_embed_dim"],
@@ -300,9 +319,13 @@ class ExecutionNetwork(nn.Module):
             ball_mlp_hidden=cfg["ball_mlp_hidden"],
             global_mlp_hidden=cfg["global_mlp_hidden"],
             decision_mlp_hidden=cfg["decision_mlp_hidden"],
-            trunk_hidden=trunk_hidden_override if trunk_hidden_override is not None else cfg["trunk_hidden"],
+            trunk_hidden=trunk,
             dir_log_std_init=ppo_cfg.get("dir_log_std_init", -2.0),
             value_extra_hidden=cfg.get("value_extra_hidden", 16),
             value_hidden_dim=cfg.get("value_hidden_dim", 0),
             value_dropout=cfg.get("value_dropout", 0.0),
+            inter_player_num_heads=cfg.get("inter_player_attn_heads", 0),
+            shared_entity_encoder=shared_entity_encoder,
+            shared_ball_mlp=shared_ball_mlp,
+            shared_global_mlp=shared_global_mlp,
         )

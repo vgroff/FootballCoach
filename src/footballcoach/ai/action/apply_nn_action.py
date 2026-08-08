@@ -2,12 +2,15 @@
 
 This module is the ONLY point where neural network outputs touch engine state.
 It sets player.desired_direction, player.desired_speed_mode, calls
-player.kick_direct(), and player.tackle_direct() directly.
+player.kick_direct(), and sets player.tackle_armed.
 
 No Orders are created here. Orders exist for the rules-based AI only.
 The only connection between Orders and the neural network is that BC labels
 read what order a rules AI would issue and translate that into equivalent
 physical targets for imitation.
+
+Tackle intent is communicated via player.tackle_armed — the engine resolves
+it on contact in _check_armed_tackles, firing on_tackle for BC recording.
 
 Slot-index -> player_id mapping: the ``slot_player_ids`` list (produced by
 the obs encoder during the same tick - same random shuffle) maps the
@@ -44,7 +47,7 @@ def apply_action_to_player(
 
     Movement: set player.desired_direction and player.desired_speed_mode.
     Kick: call player.kick_direct() if kick_this_tick is True.
-    Tackle: call player.tackle_direct() if tackle_attempt is True.
+    Tackle: set player.tackle_armed if tackle_attempt is True.
 
     The decision network heads (shoot/pass/move/etc.) are INPUTS to the
     execution network and are used for BC label generation only. They do
@@ -64,36 +67,31 @@ def apply_action_to_player(
         player.desired_direction = Vector3.zero()
         player.desired_speed_mode = SpeedMode.STANDSTILL
 
-    # --- Kick: immediate physics, no KickOrder ---
+    # --- Kick: immediate physics via 3D direction, no ballistic solve ---
     if gating.kick_this_tick:
         if match.ball.possessed_by == player.player_id:
             kick_dir = gating.kick_direction
             if kick_dir is not None and np.linalg.norm(kick_dir) > 1e-6:
-                goal_half_w = match.pitch.goal_width_m / 2.0
-                goal_x = match.pitch.half_length if player.team.name == "LEFT" else -match.pitch.half_length
-                aim_pt = Vector3(goal_x, float(kick_dir[1]) * goal_half_w, 1.1)
+                direction_3d = Vector3(float(kick_dir[0]), float(kick_dir[1]), float(kick_dir[2]))
             else:
-                from footballcoach.actions import opponent_goal_centre
-                aim_pt = opponent_goal_centre(match.pitch, player.team).with_z(1.1)
-            player.kick_direct(
+                direction_3d = Vector3(1.0, 0.0, 0.0)  # safe fallback, should not occur
+            player.kick_with_direction(
                 match,
-                aim_pt,
+                direction_3d,
                 float(gating.kick_power_fraction) if gating.kick_power_fraction > 0 else 0.85,
                 Vector3(*gating.kick_spin) if gating.kick_spin is not None else Vector3.zero(),
             )
         else:
             return OrderTranslationResult(illegal_action=True, illegal_reason="kick_without_possession")
 
-    # --- Tackle: immediate physics if in contact range, no ChaseTackleOrder ---
+    # --- Tackle: arm intent; _check_armed_tackles resolves on contact ---
+    # Target slot is not used — the engine finds the ball carrier directly.
     if gating.tackle_attempt:
         if not player.is_available_to_tackle():
             return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_while_inactive")
-        target_player = _resolve_target_player(gating.target_slot, slot_player_ids, match)
-        if target_player is None:
-            return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_no_valid_target")
-        if target_player.team == player.team:
-            return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_own_teammate")
-        player.tackle_direct(match, target_player.player_id)
+        if match.ball_carrier() is None or match.ball_carrier().team == player.team:
+            return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_no_carrier")
+        player.tackle_armed = True
 
     return OrderTranslationResult()
 

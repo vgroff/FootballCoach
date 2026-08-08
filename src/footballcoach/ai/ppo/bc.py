@@ -76,7 +76,7 @@ import torch.nn.functional as F
 
 log = logging.getLogger("footballcoach.ai.bc")
 
-BC_LABEL_DIM = 24  # elements in the flat label vector (see module docstring)
+BC_LABEL_DIM = 25  # elements in the flat label vector (see module docstring)
 
 # Indices into the flat label vector
 _I_SHOOT          = 0
@@ -103,6 +103,7 @@ _I_KICK_POWER     = 20
 _I_KICK_SPIN_X    = 21
 _I_KICK_SPIN_Y    = 22
 _I_KICK_SPIN_Z    = 23
+_I_KICK_DIR_Z     = 24  # kick_direction z component (3D unit vector with indices 18, 19, 24)
 
 # ai_type integer codes (see module docstring layout table)
 AI_TYPE_RULES    = 0.0
@@ -140,7 +141,7 @@ class BCLabel:
     valid: bool = True
     ai_type: float = AI_TYPE_RULES  # which AI produced this label (see AI_TYPE_* constants)
     opponent_ai_type: float = AI_TYPE_IMMOBILE  # which AI controls the OTHER player (see AI_TYPE_* constants)
-    kick_direction: Optional[np.ndarray] = None      # shape (2,) unit vector, ground plane
+    kick_direction: Optional[np.ndarray] = None      # shape (3,) 3D unit vector of actual launch direction
     kick_power_fraction: Optional[float] = None       # [0, 1], None if not kicking
     kick_spin: Optional[np.ndarray] = None            # shape (3,), None if not kicking
 
@@ -170,6 +171,7 @@ class BCLabel:
         if self.kick_direction is not None:
             arr[_I_KICK_DIR_X] = float(self.kick_direction[0])
             arr[_I_KICK_DIR_Y] = float(self.kick_direction[1])
+            arr[_I_KICK_DIR_Z] = float(self.kick_direction[2]) if len(self.kick_direction) > 2 else 0.0
         if self.kick_power_fraction is not None:
             arr[_I_KICK_POWER] = float(self.kick_power_fraction)
         if self.kick_spin is not None:
@@ -242,7 +244,8 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     if player.kicked_this_tick:
         if player.last_kick_direction is not None:
             kick_direction = np.array(
-                [player.last_kick_direction.x, player.last_kick_direction.y], dtype=np.float32
+                [player.last_kick_direction.x, player.last_kick_direction.y, player.last_kick_direction.z],
+                dtype=np.float32,
             )
         kick_power_fraction = player.last_kick_power_fraction
         if player.last_kick_spin is not None:
@@ -250,18 +253,10 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
                 [player.last_kick_spin.x, player.last_kick_spin.y, player.last_kick_spin.z],
                 dtype=np.float32,
             )
-    # tackle_attempt: ChaseTackleOrder always, OR GetPossessionOrder when the player
-    # can legally tackle the ball carrier right now — see engine/collision.py::can_tackle
-    # (single source of truth shared with the engine's own tackle-eligibility checks).
-    _is_gp_tackling = False
-    if isinstance(current_exec, _GPOrder):
-        try:
-            carrier = match.ball_carrier()
-            if carrier is not None and carrier.player_id != player.player_id:
-                from footballcoach.engine.collision import can_tackle
-                _is_gp_tackling = can_tackle(player, carrier)
-        except Exception:
-            pass
+    # tackle_attempt: ChaseTackleOrder always, OR GetPossessionOrder when tackle_armed
+    # is True — set every tick during the approach by _run_get_possession_behaviour,
+    # so BC sees tackle intent across the full approach, not only at contact range.
+    _is_gp_tackling = isinstance(current_exec, _GPOrder) and player.tackle_armed
     tackle_attempt = 1.0 if (isinstance(current_exec, ChaseTackleOrder) or _is_gp_tackling) else 0.0
 
     # Decision heads reflect what the rules AI DECIDES next.
@@ -546,7 +541,7 @@ def bc_loss_from_tensor(
             return _zero, {
                 "decision": 0.0, "exec_bce": 0.0, "sprint": 0.0, "move": 0.0,
                 "tackle_attempt": 0.0, "direction": 0.0, "region": 0.0,
-                "kick": 0.0, "kick_direction": 0.0, "kick_power": 0.0, "kick_spin": 0.0,
+            "kick": 0.0, "kick_direction": 0.0, "kick_power": 0.0, "kick_spin": 0.0,
             }
         return _zero
 
@@ -618,14 +613,16 @@ def bc_loss_from_tensor(
             dir_loss_per = direction_loss_weight * torch.where(has_dir, cos_loss, torch.zeros_like(cos_loss))
             loss += exec_weight * dir_loss_per
 
-        # --- Execution: kick_direction cosine loss (only meaningful on kick ticks) ---
+        # --- Execution: kick_direction cosine loss (3D, only on kick ticks) ---
         has_kick_dir = (
-            (labels[:, _I_KICK_DIR_X].abs() + labels[:, _I_KICK_DIR_Y].abs()) > 1e-6
+            (labels[:, _I_KICK_DIR_X].abs() + labels[:, _I_KICK_DIR_Y].abs() + labels[:, _I_KICK_DIR_Z].abs()) > 1e-6
         ) & (labels[:, _I_KICK_THIS_TICK] > 0.5)
         if has_kick_dir.any():
             eps = 1e-6
-            target_kdir = labels[:, _I_KICK_DIR_X:_I_KICK_DIR_Y + 1]
-            pred_kdir = exec_heads.kick_direction
+            target_kdir = torch.stack(
+                [labels[:, _I_KICK_DIR_X], labels[:, _I_KICK_DIR_Y], labels[:, _I_KICK_DIR_Z]], dim=-1
+            )  # (N, 3)
+            pred_kdir = exec_heads.kick_direction  # (N, 3) raw
             pred_kdir_norm = pred_kdir / (pred_kdir.norm(dim=-1, keepdim=True) + eps)
             kdir_cos_loss = 1.0 - (pred_kdir_norm * target_kdir).sum(dim=-1)
             kick_dir_loss_per = direction_loss_weight * torch.where(

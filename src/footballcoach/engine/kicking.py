@@ -509,6 +509,56 @@ def pass_ball(
 
     _launch_ball(ball, kicker_position, aim_point, speed, sigma, Vector3.zero(), r, gravity_mps2)
 
+def kick_ball_from_direction(
+    ball: Ball,
+    kicker_position: Vector3,
+    direction_unit3: Vector3,
+    power_fraction: float,
+    kick_precision: float,
+    kick_power_attr: float,
+    spin: Vector3,
+    rng_reduction: float,
+    rng: random.Random | None = None,
+    params: KickingParams | None = None,
+    kicker_velocity: Vector3 = Vector3.zero(),
+    kicker_top_speed_mps: float = 0.0,
+) -> None:
+    """Apply a kick from a 3D unit direction vector directly — no ballistic solve.
+
+    Used by the neural network. Rules-based AI uses kick_ball() instead.
+    """
+    params = params or KickingParams.from_config()
+    r = rng or random
+
+    run_mult = running_power_multiplier(
+        params.running_power_coefficient, kicker_velocity, direction_unit3, kicker_top_speed_mps
+    )
+    dir_precision_mult = running_direction_precision_multiplier(kicker_velocity, direction_unit3, params)
+    effective_precision = kick_precision * dir_precision_mult
+    effective_power = max(0.0, min(1.0, power_fraction)) * run_mult
+    sigma = kick_sigma_rad(params, effective_precision, effective_power, rng_reduction)
+    speed = max_kick_speed_mps(params, kick_power_attr) * max(0.0, min(1.0, power_fraction)) * run_mult
+
+    horiz_len = direction_unit3.xy().length()
+    yaw = direction_unit3.xy().angle_xy() if horiz_len > 1e-9 else 0.0
+    pitch = math.atan2(direction_unit3.z, max(horiz_len, 1e-9))
+
+    final_yaw = r.gauss(yaw, sigma)
+    final_pitch = r.gauss(pitch, sigma)
+
+    horizontal_speed = speed * math.cos(final_pitch)
+    vertical_speed = speed * math.sin(final_pitch)
+
+    ball.possessed_by = None
+    ball.position = kicker_position.with_z(ball.position.z)
+    ball.velocity = Vector3(
+        math.cos(final_yaw) * horizontal_speed,
+        math.sin(final_yaw) * horizontal_speed,
+        vertical_speed,
+    )
+    ball.spin = spin
+
+
 # ShootOrder blocker detection: perpendicular-distance threshold from the shot
 # line within which an opposition player is considered to be blocking the shot.
 SHOT_BLOCKER_THRESHOLD_M: float = 1.0

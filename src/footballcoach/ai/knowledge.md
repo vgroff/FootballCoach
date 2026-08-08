@@ -72,7 +72,9 @@ ai/
   ppo/
     rollout_buffer.py  # RolloutBuffer.add() / compute_gae() / as_tensors() / clear()
     schedules.py       # LR, clip-range, rng_reduction schedules (progress 0→1)
-    ppo_trainer.py     # PPOTrainer.from_config() + .train(env, total_steps)
+    ppo_trainer.py     # PPOTrainer.from_config() + .train(env, total_steps, phase_id=...)
+    rollout_worker.py  # subprocess worker for ppo.n_parallel_envs > 1 -- see
+                       # ai_trainer_knowledge.md "Parallel rollout collection"
   env/
     reward.py          # phase1_reward(), phase2_reward(), EMAFilter (attack/defence)
     scenario_env.py    # ScenarioEnv: Gym-like wrapper over ScenarioDefinition + ScenarioLoop

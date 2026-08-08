@@ -61,6 +61,8 @@ from footballcoach.steering import RepulsionParams, compute_repulsion
 import logging
 log = logging.getLogger("footballcoach.match")
 
+from footballcoach.engine.match_logger import MatchLogger
+
 @dataclass(frozen=True)
 class MarkingParams:
     """Config for the ``MarkOrder`` AI behaviour — loaded from
@@ -123,6 +125,10 @@ class Match:
     # None by default so tests / headless use incur zero cost.
     log_callback: Callable[["LogLevel", str], None] | None = field(default=None, repr=False)
 
+    # Optional match event logger for post-hoc inspection.  None by default
+    # so training/tests incur zero cost when logging is not needed.
+    match_logger: MatchLogger | None = field(default=None, repr=False)
+
     def player_by_id(self, player_id: str) -> Player:
         for p in self.players:
             if p.player_id == player_id:
@@ -143,6 +149,8 @@ class Match:
         self._process_orders(dt)
         self._apply_movement(dt)
         self._sync_possessed_ball()
+        if self.match_logger is not None:
+            self.match_logger.check_consistency(self.time_s, self.ball.position, self.ball.possessed_by)
 
         # Advance a loose ball's free-flight physics *before* checking for
         # pickup, so a ball that was just kicked this tick has already moved
@@ -162,6 +170,7 @@ class Match:
 
         self._update_loose_ball_pickup(dt)
 
+        self._check_armed_tackles()
         self._check_head_on_tackles()
         resolve_all_overlaps(self.players, collision_params=self.collision_params)
 
@@ -242,6 +251,10 @@ class Match:
             p = self.player_by_id(player_id)
             if p.on_possession_gained is not None:
                 p.on_possession_gained(p)
+            if self.match_logger is not None:
+                self.match_logger.notify_possession_change(
+                    self.time_s, self.ball.position, p, old
+                )
 
     # -------------------------------------------------------------------------
 
@@ -273,6 +286,7 @@ class Match:
             # (called from ANY order type, or directly by the neural net) can
             # set it fresh — see Player.kicked_this_tick docstring.
             player.kicked_this_tick = False
+            player.tackle_armed = False
             player.last_kick_direction = None
             player.last_kick_power_fraction = None
             player.last_kick_spin = None
@@ -280,10 +294,19 @@ class Match:
                 player.ai.act(player, self, 0)
             order = player.current_order
             if order is None:
+                # Neural players kick directly (no Order), so log here before skipping.
+                if player.kicked_this_tick:
+                    self._log_info(f"{player.player_id} kicked the ball at {self.ball.velocity.length():.1f} m/s")
+                if self.match_logger is not None and player.kicked_this_tick:
+                    self.match_logger.notify_kick(self.time_s, self.ball.position, player)
                 continue
             if order.execute(player, self, dt):
                 self._complete_order(order)
                 player.current_order = None
+            if player.kicked_this_tick:
+                self._log_info(f"{player.player_id} kicked the ball at {self.ball.velocity.length():.1f} m/s")
+            if self.match_logger is not None and player.kicked_this_tick:
+                self.match_logger.notify_kick(self.time_s, self.ball.position, player)
 
     def _run_get_possession_behaviour(self, player: Player, dt: float) -> bool:
         """Runs one tick of 'acquire the ball' behaviour, shared by
@@ -304,11 +327,10 @@ class Match:
         speed_mode = SpeedMode.SPRINT if sprint else SpeedMode.JOG
 
         if carrier is not None and carrier.player_id != player.player_id:
-            # Someone else has the ball — chase and tackle.
+            # Arm the tackle; _check_armed_tackles resolves it when in contact range.
+            player.tackle_armed = True
             if are_touching(player, carrier):
-                if can_tackle(player, carrier):
-                    self._attempt_tackle_contact(player, carrier)
-                return True  # tackle attempted (or either side not available) — terminal
+                return True  # contact will be resolved this tick by _check_armed_tackles
             else:
                 from footballcoach.orders import _compute_movement_intent
                 intercept = self._intercept_target(player, carrier.position, carrier.velocity)
@@ -439,6 +461,30 @@ class Match:
         )
         return intercept_target(player.position, v_p, target_pos, target_vel)
 
+    def _check_armed_tackles(self) -> None:
+        """Resolve tackles for any player who armed tackle_armed this tick
+        and is now in contact range.  Fires on_tackle so BC records the event.
+        Runs after movement so players that sprinted into range are caught here
+        before _check_head_on_tackles (the collision-only fallback) can fire."""
+        carrier = self.ball_carrier()
+        if carrier is None or carrier.is_inactive:
+            return
+        for player in self.players:
+            if not player.tackle_armed:
+                continue
+            if player.player_id == carrier.player_id:
+                continue
+            if player.team == carrier.team:
+                continue
+            # Use the same overlap radius as auto-tackle so tunnelled approaches
+            # are caught here; skip can_tackle's are_touching to avoid re-checking
+            # the tighter 0.65m threshold that was already passed during movement.
+            dist = player.position.xy().distance_to(carrier.position.xy())
+            overlap_threshold = self.tackling_params.auto_tackle_overlap_factor * (player.radius_m + carrier.radius_m)
+            if dist < overlap_threshold and player.is_available_to_tackle() and carrier.is_available_to_tackle():
+                self._attempt_tackle_contact(player, carrier)
+                return  # one tackle per tick
+
     def _check_head_on_tackles(self) -> None:
         """Automatically triggers a tackle when two players from opposite teams
         are in serious overlap (distance < auto_tackle_overlap_factor * combined_radius)
@@ -506,6 +552,8 @@ class Match:
                 other.state = PlayerState.INACTIVE_TACKLED
                 other.state_timer_s = self.tackling_params.tackle_cooldown_s
                 self._log_info(f"{other.player_id} head-on tackle on {carrier.player_id} auto-failed [GK in own box]")
+                if self.match_logger is not None:
+                    self.match_logger.notify_tackle_attempt(self.time_s, self.ball.position, other, carrier)
                 return
             result = attempt_tackle(
                 other.attributes.tackling,
@@ -527,7 +575,7 @@ class Match:
 
     def _complete_control(self, player: Player) -> None:
         # Possession was already granted at the moment of contact; just log completion.
-        self._log_info(f"{player.player_id} completed first touch")
+        self._log_info(f"{player.player_id} controlled the ball")
 
     def _log_tackle_result(
         self,
@@ -611,6 +659,8 @@ class Match:
         """
         if player.on_tackle is not None:
             player.on_tackle(player)
+        if self.match_logger is not None:
+            self.match_logger.notify_tackle_attempt(self.time_s, self.ball.position, player, target)
         # A player controlling an aerial ball (above waist height) cannot be tackled —
         # the ball isn't on the ground yet so there's nothing to poke away.
         if (
@@ -649,6 +699,8 @@ class Match:
         if side is not None:
             self.scoreboard.score_for(side)
             self._log_info(f"GOAL for {'LEFT' if side == 'left' else 'RIGHT'} — score {self.scoreboard.left_goals}:{self.scoreboard.right_goals}")
+            if self.match_logger is not None:
+                self.match_logger.notify_goal(self.time_s, self.ball.position, side)
             if self.goal_linger_s > 0.0:
                 self._goal_linger_remaining_s = self.goal_linger_s
             else:
@@ -659,6 +711,12 @@ class Match:
         self.ball.velocity = Vector3.zero()
         self.ball.spin = Vector3.zero()
         self._set_possession(None)
+
+    def notify_ball_out(self) -> None:
+        """Called by the scenario loop when the ball goes out of play.
+        Forwards to the match logger if one is attached."""
+        if self.match_logger is not None:
+            self.match_logger.notify_ball_out(self.time_s, self.ball.position)
 
 
 def _drain_if_sprinting(params: MovementParams, player: Player, sprinting: bool, dt: float) -> float:

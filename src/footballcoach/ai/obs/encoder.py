@@ -7,7 +7,7 @@ engine's entities and the neural networks.
 Key design choices (from ai_design_doc.md section 7):
 - Positions encoded as (dx, dy) relative to the observing player, normalized
   by pitch half-dimensions.
-- Velocities normalized by each player's own effective_top_speed.
+- Velocities normalized by pitch half-diagonal (absolute pitch-scale units).
 - Other-player slots are shuffled randomly each call so the network learns
   permutation invariance (slot index carries no semantic meaning).
 - Unused slots are zero-filled with exists=0.0.
@@ -37,7 +37,6 @@ from footballcoach.ai.obs.schema import (
     PlayerFeatures,
 )
 from footballcoach.engine.match import Match
-from footballcoach.engine.movement import effective_top_speed
 from footballcoach.entities.player import Player, PlayerState, Team
 
 MAX_OTHER_PLAYERS: int = 21  # full 11v11 minus self
@@ -88,14 +87,11 @@ def encode_observation(
     half_wid = pitch.width_m / 2.0
     half_diag = math.hypot(half_len, half_wid)
 
-    mv_params = match.movement_params
-
     # Build self features
     self_feat = _player_features(
         player=self_player,
         observer=self_player,
         match=match,
-        mv_params=mv_params,
         half_len=half_len,
         half_wid=half_wid,
         half_diag=half_diag,
@@ -120,7 +116,6 @@ def encode_observation(
             player=other_player,
             observer=self_player,
             match=match,
-            mv_params=mv_params,
             half_len=half_len,
             half_wid=half_wid,
             half_diag=half_diag,
@@ -139,10 +134,6 @@ def encode_observation(
     # Ball features
     ball_feat = _ball_features(
         match=match,
-        observer=self_player,
-        half_len=half_len,
-        half_wid=half_wid,
-        half_diag=half_diag,
         spin_norm=spin_norm,
         height_norm_m=height_norm_m,
     )
@@ -205,7 +196,6 @@ def _player_features(
     player: Player,
     observer: Player,
     match: Match,
-    mv_params,
     half_len: float,
     half_wid: float,
     half_diag: float,
@@ -217,27 +207,36 @@ def _player_features(
     dy = player.position.y - observer.position.y
     dist = math.hypot(dx, dy)
 
-    # Normalize this player's velocity by its own top speed (attribute-invariant).
+    # Normalize velocity by pitch half-diagonal (absolute pitch-scale units).
     # For immobile players velocity is zeroed — their actual velocity is noise
     # (random initial heading, no movement intent), not a useful signal.
-    player_top_speed = effective_top_speed(
-        mv_params,
-        player.attributes.top_speed,
-        player.stamina,
-        has_ball=(match.ball.possessed_by == player.player_id),
-        ball_control_attr=player.attributes.ball_control,
-        is_goalkeeper=player.is_goalkeeper,
-    )
-    player_top_speed = max(player_top_speed, 1e-3)
-
+    vel_norm = max(half_diag, 1.0)
     if is_immobile:
         vel_x = 0.0
         vel_y = 0.0
         speed = 0.0
     else:
-        vel_x = player.velocity.x / player_top_speed
-        vel_y = player.velocity.y / player_top_speed
-        speed = player.speed_mps / player_top_speed
+        vel_x = player.velocity.x / vel_norm
+        vel_y = player.velocity.y / vel_norm
+        speed = player.speed_mps / vel_norm
+
+    ball = match.ball
+    ball_dx = ball.position.x - player.position.x
+    ball_dy = ball.position.y - player.position.y
+    ball_dist = math.hypot(ball_dx, ball_dy)
+
+    # Ball relative velocity and closing speed.
+    # For immobile players player velocity is zero, so ball_vel_rel equals ball velocity.
+    ball_vel_rel_x = (ball.velocity.x - player.velocity.x) / vel_norm
+    ball_vel_rel_y = (ball.velocity.y - player.velocity.y) / vel_norm
+    if ball_dist > 1e-6:
+        # Positive = ball moving toward player; both numerator and direction flip together
+        # under geometric augmentation so this scalar is flip-invariant.
+        ball_closing_speed = -(ball.velocity.x - player.velocity.x) * (ball_dx / ball_dist) \
+                             -(ball.velocity.y - player.velocity.y) * (ball_dy / ball_dist)
+        ball_closing_speed /= vel_norm
+    else:
+        ball_closing_speed = 0.0
 
     # Team.LEFT attacks +x, Team.RIGHT attacks -x (per engine/offside.py convention)
     attacking_dir = +1.0 if player.team == Team.LEFT else -1.0
@@ -246,11 +245,15 @@ def _player_features(
         rel_dx=dx / half_len,
         rel_dy=dy / half_wid,
         distance_m=dist / half_diag,
+        ball_rel_dx=ball_dx / half_len,
+        ball_rel_dy=ball_dy / half_wid,
+        ball_distance_m=ball_dist / half_diag,
+        ball_vel_rel_x=ball_vel_rel_x,
+        ball_vel_rel_y=ball_vel_rel_y,
+        ball_closing_speed=ball_closing_speed,
         velocity_x=vel_x,
         velocity_y=vel_y,
         speed_mps=speed,
-        heading_sin=math.sin(player.heading_rad),
-        heading_cos=math.cos(player.heading_rad),
         stamina=player.stamina,
         top_speed=player.attributes.top_speed,
         acceleration=player.attributes.acceleration,
@@ -277,26 +280,17 @@ def _player_features(
 
 def _ball_features(
     match: Match,
-    observer: Player,
-    half_len: float,
-    half_wid: float,
-    half_diag: float,
     spin_norm: float,
     height_norm_m: float,
 ) -> np.ndarray:
     ball = match.ball
-    dx = ball.position.x - observer.position.x
-    dy = ball.position.y - observer.position.y
-    dist = math.hypot(dx, dy)
-
-    # Velocity: normalize by half_diag (rough "pitch scale" per second)
+    half_diag = math.hypot(match.pitch.length_m / 2.0, match.pitch.width_m / 2.0)
     vel_norm = max(half_diag, 1.0)
 
     is_possessed = 1.0 if ball.possessed_by is not None else 0.0
     feat = BallFeatures(
-        rel_dx=dx / half_len,
-        rel_dy=dy / half_wid,
-        distance_m=dist / half_diag,
+        pos_x=ball.position.x / 52.5,
+        pos_y=ball.position.y / 34.0,
         height_m=ball.position.z / height_norm_m,
         velocity_x=ball.velocity.x / vel_norm,
         velocity_y=ball.velocity.y / vel_norm,

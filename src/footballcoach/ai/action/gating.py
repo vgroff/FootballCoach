@@ -59,7 +59,7 @@ class GatingResult:
     move_direction: Optional["np.ndarray"] = None   # 2D unit vector, (2,)
     sprint: bool = False
     kick_this_tick: bool = False
-    kick_direction: Optional["np.ndarray"] = None   # 2D unit vector, (2,)
+    kick_direction: Optional["np.ndarray"] = None   # 3D unit vector, (3,)
     kick_power_fraction: float = 0.0
     kick_spin: Optional["np.ndarray"] = None         # (3,)
     tackle_attempt: bool = False

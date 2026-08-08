@@ -109,7 +109,8 @@ def make_training_match(rng_reduction: float = 0.3) -> Match:
 
 
 def discover_all_phase1_checkpoints() -> list[str]:
-    """Scan every ``checkpoints/phase1_run*/`` dir for .pt checkpoints.
+    """Scan every ``checkpoints/phase1_run*/`` and ``checkpoints/longterm/``
+    dir for .pt checkpoints.
 
     Thin wrapper around ``_discover_checkpoints`` used by both the Phase 1
     UI scenario picker and Training mode's neural-control checkpoint picker
@@ -125,6 +126,7 @@ def discover_all_phase1_checkpoints() -> list[str]:
     checkpoints: list[str] = []
     for d in all_run_dirs:
         checkpoints.extend(_discover_checkpoints(d.rstrip("/")))
+    checkpoints.extend(_discover_checkpoints("checkpoints/longterm"))
     return checkpoints
 
 
@@ -806,25 +808,19 @@ def _load_trainer(checkpoint_path: str):
 def _discover_checkpoints(checkpoint_dir: str) -> list[str]:
     """Return sorted list of .pt checkpoint paths in checkpoint_dir.
 
-    Matches both old-style checkpoint_NNNNNNNN.pt and new-style checkpointN.pt,
-    plus latest.pt if it exists (always placed last, as the most recent).
-    Excludes checkpoint_pretrained.pt to avoid duplicates.
+    Matches any *.pt file, including checkpoint_pretrained.pt and
+    arbitrarily-named snapshots (e.g. competent_pretrain.pt).
+    latest.pt is always placed last as the most recent.
 
-    Sorting is by numeric suffix so checkpoint14.pt > checkpoint9.pt.
+    Sorting is by numeric suffix so checkpoint14.pt > checkpoint9.pt;
+    files with no numeric suffix sort before numbered ones.
     """
     import glob
     import os
     import re
     if not checkpoint_dir or not os.path.isdir(checkpoint_dir):
         return []
-    old_style = glob.glob(os.path.join(checkpoint_dir, "checkpoint_*.pt"))
-    new_style = glob.glob(os.path.join(checkpoint_dir, "checkpoint[0-9]*.pt"))
-    all_paths = set(old_style) | set(new_style)
-    # Exclude pretrained snapshot; keep symlinks (latest.pt is a symlink)
-    all_paths = {
-        p for p in all_paths
-        if not os.path.basename(p).startswith("checkpoint_pretrained")
-    }
+    all_paths = set(glob.glob(os.path.join(checkpoint_dir, "*.pt")))
 
     def _sort_key(p: str) -> tuple[int, str]:
         name = os.path.basename(p)
@@ -951,8 +947,8 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         "decision_interval_ticks": max(1, round(DECISION_INTERVAL_MS_DEFAULT / 1000.0 * UI_TICK_HZ)),
     }
 
-    # Build the params list: scan ALL phase1_run* dirs so checkpoints from every
-    # run are visible, not just the one dir passed in.
+    # Build the params list: scan ALL phase1_run* dirs and longterm/ so
+    # checkpoints from every run are visible, not just the one dir passed in.
     import glob as _glob, re as _re
     _all_run_dirs = sorted(
         _glob.glob("checkpoints/phase1_run*/"),
@@ -961,6 +957,7 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
     checkpoints = []
     for _d in _all_run_dirs:
         checkpoints.extend(_discover_checkpoints(_d.rstrip("/")))
+    checkpoints.extend(_discover_checkpoints("checkpoints/longterm"))
     # Friendly display names: run{N}/filename
     def _ckpt_label(p: str) -> str:
         parts = Path(p).parts
@@ -1118,12 +1115,23 @@ def build_1v1_scenario(
     opponent_immobile_prob: float = 1.0,
     opponent_min_dist_m: float | None = None,
     opponent_max_dist_m: float | None = None,
+    seed: int | None = None,
 ) -> Match:
     """Phase 1 curriculum: 1v1 get-possession/move-toward-goal.
 
     Both players and the ball are placed randomly across the full pitch with
     randomised attributes, stamina, headings, and (for the ball) velocity,
     spin, and restitution coefficient.
+
+    ``seed``: when given, the ENTIRE scenario (trainee/opponent team choice,
+    positions, attributes, stamina, headings, ball placement/velocity/spin/
+    restitution, and the opponent-type roll) is fully deterministic for that
+    seed value -- every draw below goes through the single ``rng`` instance.
+    Used by the shared seeded-eval helper (ai/eval/seeded_eval.py) to replay
+    a fixed set of scenarios for pre-training and every rollout's periodic
+    eval. ``None`` (default) = fully random, matching prior behaviour;
+    PPO training itself is NOT seeded by this -- only evaluation call sites
+    pass a seed.
 
     Trainee (random team each episode by default, player_id='trainee') has no
     initial order so the AI can drive it.  Opponent gets the opposite team and
@@ -1160,7 +1168,7 @@ def build_1v1_scenario(
     if opponent_max_dist_m is None:
         opponent_max_dist_m = float(_cfg.get("opponent_max_dist_m", 9999.0))
 
-    rng = random.Random()
+    rng = random.Random(seed)
     pitch = Pitch.standard()
 
     def _rand_pos() -> Vector3:
@@ -1757,8 +1765,10 @@ class ScenarioLoop:
         scoreboard = self._match.scoreboard
 
         if abs(ball.position.x) > pitch.half_length + 1.0:
+            self._match.notify_ball_out()
             return "miss", self.linger_s * 0.5
         if abs(ball.position.y) > pitch.half_width + 0.5:
+            self._match.notify_ball_out()
             return "miss", self.linger_s * 0.5
 
         if (scoreboard.left_goals, scoreboard.right_goals) != self._initial_scoreboard:

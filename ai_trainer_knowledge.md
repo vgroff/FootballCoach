@@ -103,7 +103,7 @@ Override the save directory with `--checkpoint-dir path/`.
 
 | File | Why it matters |
 |------|----------------|
-| `src/footballcoach/ai/obs/schema.py` | Feature vector dataclasses; defines `PLAYER_FEATURE_DIM=28`, `BALL_FEATURE_DIM=12`, `GLOBAL_FEATURE_DIM=31` (11 match-context fields + 20 `task_id_N` one-hot fields, see "Task-id" note in `ai/knowledge.md`) |
+| `src/footballcoach/ai/obs/schema.py` | Feature vector dataclasses; defines `PLAYER_FEATURE_DIM=32`, `BALL_FEATURE_DIM=11`, `GLOBAL_FEATURE_DIM=31` (11 match-context fields + 20 `task_id_N` one-hot fields, see "Task-id" note in `ai/knowledge.md`) |
 | `src/footballcoach/ai/obs/encoder.py` | `encode_observation(match, player_id, time_remaining_s, ...)` → `ObservationBatch` |
 | `src/footballcoach/ai/models/decision_network.py` | `DecisionNetwork.from_config()` |
 | `src/footballcoach/ai/models/execution_network.py` | `ExecutionNetwork.from_config()` |
@@ -310,6 +310,66 @@ keeps `value_net` at its fresh random init rather than crashing.
 
 See `tests/ai_scenario/test_separate_value_net.py` for the test coverage
 (construction, value routing, gradient isolation, checkpoint round-trip).
+
+### 3.7 Parallel rollout collection (`ppo.n_parallel_envs`)
+
+`ppo.n_parallel_envs` in `ai_config.json` (default `1` = current
+single-process behaviour, no change) spawns that many subprocesses to
+collect a PPO rollout in parallel. Each worker (`ai/ppo/rollout_worker.py`)
+runs its own full `ScenarioEnv` AND its own local copy of the policy
+networks — there is no batched/shared-memory inference across workers.
+This deliberately sidesteps the fact that action sampling happens
+synchronously deep inside `Match.step()` (via `NeuralPlayerAI.act()`
+calling `sample_action_fn` and blocking for the result): since each worker
+just runs the existing single-env sampling code unmodified, that call
+pattern doesn't need to change at all.
+
+**Why this helps at all**: physics stepping (`Match.step()`) is pure-Python
+and CPU-bound, so it's fully serialized by the GIL within one process —
+threads would not help. Real OS processes each get their own interpreter/GIL
+and can run on separate cores, so N workers → close to Nx physics
+throughput up to the physical core count. It does NOT speed up BC
+pre-training (a supervised loop over a fixed `.npz` dataset, unrelated to
+env rollout) or the PPO gradient update itself (small network, stays
+single-process).
+
+**Enable via CLI**: pass `--phase N` as usual; `train.py` now always
+forwards `phase_id=args.phase` to `PPOTrainer.train()`, which is required
+(and validated — raises `ValueError` otherwise) whenever
+`ppo.n_parallel_envs > 1`, since each worker rebuilds its OWN env from the
+phase id via `curriculum.envs.build_env()` rather than reusing the
+caller's `env` object (which, in this mode, is not even touched — the env
+argument to `train()` may be `None`).
+
+**Correctness-critical detail — per-worker GAE**: each worker computes
+`RolloutBuffer.compute_gae()` **independently**, bootstrapping from its own
+trailing value estimate, before the resulting flat tensor batches are
+concatenated (`PPOTrainer._merge_worker_batches()` in `ppo_trainer.py`).
+Concatenating raw transitions across worker boundaries BEFORE running GAE
+would corrupt advantage estimates by treating unrelated episodes/workers as
+one continuous trajectory — never do that.
+
+**Weight staleness**: workers are synced with the latest policy weights
+right before each `collect()` call, then run untouched for the whole
+rollout — so a worker's policy is always exactly "one PPO update behind"
+the main process, same as standard single-env PPO already tolerates via
+the importance-sampling ratio (old vs new policy).
+
+**What's NOT parallelized**: BC pre-training, the PPO gradient update
+(`_ppo_update()`), checkpoint saving, and the periodic eval-vs-rules pass
+(`PPOTrainer._eval_vs_rules()`) all still run single-process in the main
+trainer after workers return their rollout batches.
+
+**Logging**: the parallel path uses a shorter one-line-per-rollout log
+format (`[PPO/parallel] step=... speed=.../s ...`) rather than the
+single-process path's full multi-line breakdown table — the detailed
+reward-component/direction-log-std diagnostics were not worth duplicating
+for this path; extend `PPOTrainer._train_parallel()` if you need them.
+
+See `tests/ai_scenario/test_parallel_rollout.py` for coverage: batch-merge
+correctness, the `phase_id` validation, and a real end-to-end 2-worker
+smoke test (spawns actual subprocesses — slower than the rest of the AI
+suite, keep any new tests here using a tiny `rollout_steps`).
 
 ---
 
@@ -656,7 +716,7 @@ as:
 Each rollout (every `ppo.rollout_steps` steps) prints one line:
 
 ```
-step=28,679 | rew=8.76 | pol=0.02 val=1.00 ent=0.25 kl=0.16  bc=2.84(x0.17) | 283sps  mv_ls=[0.01,0.00]  act: mv=22 gp=78 emv=100 spr=66 kck=0 tk=0 sh=0 hld=0 ta_p=0.0012 kk_p=0.0004  vs_rules(18): 65%/12%  vs_neural(16): 44%/25%
+step=28,679 | rew=8.76 | pol=0.02 val=1.00 ent=0.25 kl=0.16  bc=2.84(x0.17) | 283sps  mv_ls=[0.01,0.00]  act: mv=22 gp=78 emv=100 spr=66 kck=0 tk=0 sh=0 hld=0 ta_p=0.0012 kk_p=0.0004  vs_rules(18): 65%/12%/17%/6%  vs_neural(16): 44%/25%/25%/6%
 ```
 
 | Field | Meaning |
@@ -671,8 +731,8 @@ step=28,679 | rew=8.76 | pol=0.02 val=1.00 ent=0.25 kl=0.16  bc=2.84(x0.17) | 28
 | `mv_ls` | `move_direction` log-std for both output dimensions (tracks direction head confidence; effective σ = exp(mv_ls), clamped to `[exp(ppo.dir_log_std_min), exp(ppo.dir_log_std_max)]`) — see "Direction heads: log_std and KL" below |
 | `act: mv=XX gp=XX emv=XX spr=XX kck=XX tk=XX sh=XX hld=XX` | Per-head mean activation rate (0–100%) from stored buffer actions. Values near 0 or 100 = saturated head (collapse warning, or frozen/unused head in this phase — e.g. `kck`/`tk` near 0 in Phase 1). Zero extra compute — reads from buffer directly |
 | `ta_p` / `kk_p` | Mean predicted probability (`sigmoid(logit)`, pre-sampling) of `tackle_attempt` / `kick_this_tick` this rollout, printed to 4 decimal places. Distinct from `act: tk=`/`kck=` (post-sampling 0/1 activation rate) — `ta_p`/`kk_p` show the underlying continuous probability even when the sampled/gated action never actually fires, so they're the better signal for "is the head learning anything at all" vs. "is it ever selected" |
-| `vs_rules(N): W%/L%` | Trainee win% / opponent win% in the N **rules-based opponent** episodes this rollout (only present if `curriculum.phase1_opponent_rules_prob > 0`) |
-| `vs_neural(N): W%/L%` | Same for **neural opponent** episodes (shared-weight self-play).  Compare to `vs_rules` to see if improvement is vs the rules AI or just self-play |
+| `vs_rules(N): W%/L%/T%/M%[/O%]` | Full outcome breakdown (`outcome_breakdown()` in `ppo_trainer.py`) over the N **rules-based opponent** episodes this rollout: trainee win% / opponent win% / timeout% / ball-out(miss)% (only present if `curriculum.phase1_opponent_rules_prob > 0`). A trailing `/O%` ("other") appears only if some outcome isn't one of those four known keys. Previously this only showed W%/L%, silently lumping timeouts and ball-out-of-play into an invisible remainder — use the fuller breakdown to tell whether a win% swing is from more losses vs. more timeouts vs. more ball-out |
+| `vs_neural(N): W%/L%/T%/M%[/O%]` | Same breakdown for **neural opponent** episodes (shared-weight self-play).  Compare to `vs_rules` to see if improvement is vs the rules AI or just self-play |
 
 When a minibatch's KL exceeds `ppo.target_kl`, the epoch loop early-stops and up to three follow-up phases may run (see `ai/knowledge.md` "KL early-stop and per-head diagnostics" for full detail):
 ```

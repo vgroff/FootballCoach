@@ -76,6 +76,14 @@ class RolloutBuffer:
     # player transitions via curriculum.secondary_weight in ai_config.json.
     weights: list[float] = field(default_factory=list)
 
+    # Per-step reward component breakdown (e.g. {"appr": 0.05, "poss": 1.0}).
+    # Empty dict for steps where components weren't tracked (secondary players).
+    reward_comps: list[dict] = field(default_factory=list)
+
+    # Per-step episode outcome string.  Non-empty only on terminal steps;
+    # empty string for mid-episode steps.
+    step_outcomes: list[str] = field(default_factory=list)
+
     def add(
         self,
         obs: dict[str, np.ndarray],
@@ -87,6 +95,8 @@ class RolloutBuffer:
         bc_label: Optional[np.ndarray] = None,
         head_log_probs: Optional[np.ndarray] = None,
         weight: float = 1.0,
+        reward_comps: Optional[dict] = None,
+        step_outcome: str = "",
     ) -> None:
         from footballcoach.ai.ppo.bc import BC_LABEL_DIM
         self.obs.append(obs)
@@ -104,6 +114,8 @@ class RolloutBuffer:
             else np.zeros(len(HEAD_LP_KEYS), dtype=np.float32)
         )
         self.weights.append(weight)
+        self.reward_comps.append(reward_comps if reward_comps is not None else {})
+        self.step_outcomes.append(step_outcome)
 
     def __len__(self) -> int:
         return len(self.rewards)
@@ -153,6 +165,66 @@ class RolloutBuffer:
         returns = [adv + val for adv, val in zip(advantages, self.values)]
         return advantages, returns
 
+    def compute_mc_returns(self, gamma: float) -> list[float]:
+        """Pure Monte-Carlo discounted returns — no value-net bootstrap at all.
+
+        Unlike ``compute_gae`` (which blends in ``self.values`` at every step
+        via the lambda-weighted TD residual), this only ever uses observed
+        ``rewards``, resetting the running sum at every episode boundary.
+        Use this instead of ``compute_gae`` when the value net itself is
+        untrained/stale (e.g. value pre-training) — bootstrapping off an
+        unvalidated critic there makes the "return" target circularly depend
+        on the very net being fit to it. Requires the buffer to contain only
+        complete episodes (see ``last_complete_episode_end``); an unterminated
+        trailing episode would otherwise get an incorrectly zero-bootstrapped
+        tail return.
+        """
+        n = len(self.rewards)
+        returns = [0.0] * n
+        g = 0.0
+        for t in reversed(range(n)):
+            if self.dones[t] > 0.5:
+                g = 0.0
+            g = self.rewards[t] + gamma * g
+            returns[t] = g
+        return returns
+
+    def last_complete_episode_end(self) -> int:
+        """Index of the last step with ``dones[t] == 1``, or -1 if none."""
+        for t in reversed(range(len(self.dones))):
+            if self.dones[t] > 0.5:
+                return t
+        return -1
+
+    def truncate_to_last_episode_end(self) -> int:
+        """Drop any trailing steps after the last completed episode in-place.
+
+        Returns the number of steps dropped. Needed before ``compute_mc_returns``
+        since a fixed-step rollout collection almost always ends mid-episode.
+        No-op (returns 0, buffer left untouched) if the buffer contains no
+        completed episode at all — truncating would otherwise empty it.
+        """
+        last_end = self.last_complete_episode_end()
+        if last_end < 0:
+            return 0
+        n = len(self.dones)
+        n_dropped = n - (last_end + 1)
+        if n_dropped <= 0:
+            return 0
+        keep = last_end + 1
+        self.obs = self.obs[:keep]
+        self.actions = self.actions[:keep]
+        self.log_probs = self.log_probs[:keep]
+        self.values = self.values[:keep]
+        self.rewards = self.rewards[:keep]
+        self.dones = self.dones[:keep]
+        self.bc_labels = self.bc_labels[:keep]
+        self.head_log_probs = self.head_log_probs[:keep]
+        self.weights = self.weights[:keep]
+        self.reward_comps = self.reward_comps[:keep]
+        self.step_outcomes = self.step_outcomes[:keep]
+        return n_dropped
+
     def as_tensors(
         self, advantages: list[float], returns: list[float]
     ) -> dict[str, torch.Tensor]:
@@ -199,6 +271,8 @@ class RolloutBuffer:
             )
 
         result["sample_weights"] = torch.tensor(self.weights, dtype=torch.float32)
+        result["reward_comps_raw"] = list(self.reward_comps)
+        result["step_outcomes"] = list(self.step_outcomes)
 
         return result
 
@@ -212,3 +286,5 @@ class RolloutBuffer:
         self.bc_labels.clear()
         self.head_log_probs.clear()
         self.weights.clear()
+        self.reward_comps.clear()
+        self.step_outcomes.clear()

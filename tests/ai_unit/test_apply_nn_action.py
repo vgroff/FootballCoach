@@ -1,12 +1,12 @@
 """Unit tests for action/apply_nn_action.py - neural network execution outputs -> direct player state.
 
 The neural network NEVER issues Orders. It sets player.desired_direction,
-player.desired_speed_mode, and calls player.kick_direct() / player.tackle_direct().
+player.desired_speed_mode, and sets player.tackle_armed.
 
 These tests verify:
   - Movement sets desired_direction and desired_speed_mode directly (no Orders).
   - Kick calls player.kick_direct() when player has possession; illegal otherwise.
-  - Tackle calls player.tackle_direct() with correct precondition checks.
+  - Tackle sets player.tackle_armed when an opposing carrier exists; illegal otherwise.
   - Decision head selections (SHOOT/PASS/MOVE/etc.) do NOT cause Orders.
 """
 import random
@@ -93,34 +93,29 @@ class TestKick:
 # ---------------------------------------------------------------------------
 
 class TestTackle:
-    def _slot_ids_with_opponent(self, slot=2):
-        ids = [None] * 21
-        ids[slot] = "p2"
-        return ids
-
     def test_tackle_active_player_legal(self, duel_match):
-        """tackle_attempt=True + valid target -> no illegal (out-of-range is fine)."""
-        slot_ids = self._slot_ids_with_opponent()
+        """tackle_attempt=True when opponent has ball -> arms tackle, no illegal."""
+        # duel_match: p1 (LEFT) has ball, p2 (RIGHT) does not.
+        # p2 arming against p1 (opposing carrier) is legal.
+        p2 = duel_match.player_by_id("p2")
         result = _apply(
-            _gating(SelectedAction.NONE, tackle_attempt=True, target_slot=2),
-            duel_match, "p1",
-            slot_player_ids=slot_ids,
+            _gating(SelectedAction.NONE, tackle_attempt=True),
+            duel_match, "p2",
         )
         assert not result.illegal_action
+        assert p2.tackle_armed
 
     def test_tackle_while_inactive_illegal(self, duel_match):
-        duel_match.player_by_id("p1").state = PlayerState.INACTIVE_TACKLED
-        slot_ids = self._slot_ids_with_opponent()
+        duel_match.player_by_id("p2").state = PlayerState.INACTIVE_TACKLED
         result = _apply(
-            _gating(SelectedAction.NONE, tackle_attempt=True, target_slot=2),
-            duel_match, "p1",
-            slot_player_ids=slot_ids,
+            _gating(SelectedAction.NONE, tackle_attempt=True),
+            duel_match, "p2",
         )
         assert result.illegal_action
         assert "inactive" in result.illegal_reason
 
-    def test_tackle_own_teammate_illegal(self, standard_pitch):
-        """Tackle targeting own teammate -> illegal."""
+    def test_tackle_no_carrier_illegal(self, standard_pitch):
+        """tackle_attempt=True when no opposing carrier exists -> illegal."""
         import random as _r
         from footballcoach.engine.match import Match
         from footballcoach.entities.player import Player, Team
@@ -129,27 +124,38 @@ class TestTackle:
 
         attrs = PlayerAttributes(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
         p1 = Player.create("p1", Team.LEFT, attrs, position=Vector3(0, 0, 0))
-        p2 = Player.create("p2", Team.LEFT, attrs, position=Vector3(5, 0, 0))  # same team!
-        ball = Ball.at_rest(Vector3(0, 0, 0))
+        p2 = Player.create("p2", Team.RIGHT, attrs, position=Vector3(5, 0, 0))
+        ball = Ball.at_rest(Vector3(20, 0, 0))  # loose — no carrier
         match = Match(pitch=standard_pitch, players=[p1, p2], ball=ball,
                       rng_reduction=1.0, rng=_r.Random(0))
-        slot_ids = [None] * 21
-        slot_ids[0] = "p2"
         result = _apply(
-            _gating(SelectedAction.NONE, tackle_attempt=True, target_slot=0),
+            _gating(SelectedAction.NONE, tackle_attempt=True),
             match, "p1",
-            slot_player_ids=slot_ids,
         )
         assert result.illegal_action
-        assert "teammate" in result.illegal_reason
+        assert "carrier" in result.illegal_reason
 
-    def test_tackle_no_valid_target_illegal(self, duel_match):
+    def test_tackle_own_team_carrier_illegal(self, standard_pitch):
+        """tackle_attempt=True when only a same-team carrier exists -> illegal."""
+        import random as _r
+        from footballcoach.engine.match import Match
+        from footballcoach.entities.player import Player, Team
+        from footballcoach.entities.attributes import PlayerAttributes
+        from footballcoach.entities.ball import Ball
+
+        attrs = PlayerAttributes(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+        p1 = Player.create("p1", Team.LEFT, attrs, position=Vector3(0, 0, 0))
+        p2 = Player.create("p2", Team.LEFT, attrs, position=Vector3(5, 0, 0))  # same team carries
+        ball = Ball.at_rest(Vector3(5, 0, 0))
+        ball.possessed_by = "p2"
+        match = Match(pitch=standard_pitch, players=[p1, p2], ball=ball,
+                      rng_reduction=1.0, rng=_r.Random(0))
         result = _apply(
-            _gating(SelectedAction.NONE, tackle_attempt=True, target_slot=10),
-            duel_match, "p1",
-            slot_player_ids=[None] * 21,
+            _gating(SelectedAction.NONE, tackle_attempt=True),
+            match, "p1",
         )
         assert result.illegal_action
+        assert "carrier" in result.illegal_reason
 
 
 # GET_POSSESSION and MARK are decision-context inputs — the neural network

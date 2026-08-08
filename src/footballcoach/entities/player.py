@@ -78,6 +78,8 @@ class Player:
     # processing (e.g. BC label derivation) can check "did this player kick
     # THIS tick" without caring about order-type bookkeeping.
     kicked_this_tick: bool = field(default=False, repr=False, compare=False)
+    # Set by GetPossessionOrder / neural AI; engine fires on_tackle on next contact.
+    tackle_armed: bool = field(default=False, repr=False, compare=False)
 
     # Unconditional per-tick kick output capture — set inside kick_direct() every
     # time it actually executes kick physics, regardless of on_kick being set and
@@ -88,7 +90,7 @@ class Player:
     # ANY AI that kicks (rules-based, human, future neural variants) with no
     # per-AI wiring. All three are None/unset when the player did not kick this
     # tick (reset alongside kicked_this_tick in Match._process_orders()).
-    last_kick_direction: Vector3 | None = field(default=None, repr=False, compare=False)
+    last_kick_direction: Vector3 | None = field(default=None, repr=False, compare=False)  # 3D unit vector of actual ball velocity
     last_kick_power_fraction: float | None = field(default=None, repr=False, compare=False)
     last_kick_spin: Vector3 | None = field(default=None, repr=False, compare=False)
 
@@ -192,53 +194,48 @@ class Player:
         match._start_release_grace(self.player_id)
         match._log_debug(f"{self.player_id} kicked (direct)  power={power_fraction:.2f}")
         self.kicked_this_tick = True
-        _dir_vec = (aim_point - self.position).xy()
-        self.last_kick_direction = _dir_vec.normalized() if _dir_vec.length() > 1e-6 else None
-        self.last_kick_power_fraction = float(adjusted_power)
+        _vel = match.ball.velocity
+        _vel_len = _vel.length()
+        self.last_kick_direction = (_vel * (1.0 / _vel_len)) if _vel_len > 1e-6 else None
+        self.last_kick_power_fraction = float(power_fraction)  # raw, before run compensation
         self.last_kick_spin = spin
         if self.on_kick is not None:
             self.on_kick(self)
 
-    def tackle_direct(self, match: "Match", target_player_id: str) -> bool:
-        """Attempt an immediate tackle against target if in contact range.
-
-        THE NEURAL NETWORK CALLS THIS DIRECTLY — no Order is created.
-        Returns True if contact was made and a tackle attempt was resolved,
-        False if out of range (network should keep moving toward target).
-        """
-        from footballcoach.engine.collision import are_touching, can_tackle
-        from footballcoach.engine.tackling import apply_tackle_result, attempt_tackle, tackle_angle_modifier
-        try:
-            target = match.player_by_id(target_player_id)
-        except KeyError:
-            return False
-        if not are_touching(self, target):
-            return False
-        if not can_tackle(self, target):
-            return True
-        if self.on_tackle is not None:
-            self.on_tackle(self)
-        if match._gk_immune_from_tackle(target):
-            match._apply_gk_immune_penalty(self)
-            match._log_info(f"{self.player_id} direct-tackle on {target.player_id} auto-failed [GK in own box]")
-        else:
-            result = attempt_tackle(
-                self.attributes.tackling,
-                match._effective_dribbling(target),
-                match.rng_reduction,
-                match.rng,
-                match.tackling_params,
-                is_goalkeeper_tackle=self.is_goalkeeper,
-                angle_modifier=tackle_angle_modifier(
-                    target.heading_rad, target.position, self.position, match.tackling_params
-                ),
-                gk_outside_box=match._gk_outside_own_box(self),
-            )
-            match._log_tackle_result(self.player_id, target.player_id, result)
-            if result.tackler_won and match._target_has_or_controls_ball(target):
-                match._set_possession(self.player_id)
-            apply_tackle_result(result, self, target, match.tackling_params)
-        return True
+    def kick_with_direction(self, match: "Match", direction_3d: "Vector3", power_fraction: float, spin: "Vector3") -> None:
+        """Execute a kick with an explicit 3D unit direction vector (no ballistic solve). Neural network only."""
+        from footballcoach.engine.kicking import kick_ball_from_direction
+        from footballcoach.engine.movement import effective_top_speed
+        if match.ball.possessed_by != self.player_id:
+            return
+        top_speed = effective_top_speed(
+            match.movement_params, self.attributes.top_speed, self.stamina,
+            has_ball=True, ball_control_attr=self.attributes.ball_control,
+        )
+        kick_ball_from_direction(
+            match.ball,
+            self.position,
+            direction_3d,
+            power_fraction,
+            self.attributes.kick_precision,
+            self.attributes.kick_power,
+            spin,
+            match.rng_reduction,
+            match.rng,
+            match.kicking_params,
+            kicker_velocity=self.velocity,
+            kicker_top_speed_mps=top_speed,
+        )
+        match._start_release_grace(self.player_id)
+        match._log_debug(f"{self.player_id} kicked (direct 3D)  power={power_fraction:.2f}")
+        self.kicked_this_tick = True
+        _vel = match.ball.velocity
+        _vel_len = _vel.length()
+        self.last_kick_direction = (_vel * (1.0 / _vel_len)) if _vel_len > 1e-6 else None
+        self.last_kick_power_fraction = float(power_fraction)
+        self.last_kick_spin = spin
+        if self.on_kick is not None:
+            self.on_kick(self)
 
     def pass_ball(
         self,

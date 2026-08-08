@@ -181,8 +181,9 @@ def phase1_reward(
     cumulative_state = cumulative_state or {}
     cumulative_state_after: dict[str, float] = {}
 
-    # Floor the normalizing distance so a ball spawning ~on top of the player
-    # doesn't create a divide-by-near-zero blow-up in the normalized terms.
+    # Floor-only: a ball spawning ~on top of the player would otherwise create
+    # a divide-by-near-zero blow-up in the normalized terms. No ceiling -- a
+    # larger real spawn distance must normalize by its own true distance.
     _norm_ball_dist = max(start_ball_dist_m, 1.0)
 
     _delta = prev_ball_dist - curr_ball_dist  # positive = closing, negative = retreating
@@ -279,7 +280,7 @@ def phase1_reward(
     # cumulative_clamped_delta()), not this single step's value — a per-step
     # clamp alone doesn't stop many small steps from summing past the clamp
     # over a long/wandering episode.
-    _norm_box_dist = max(start_ball_to_box_dist_m, 1.0)
+    _norm_box_dist = max(start_ball_to_box_dist_m, 10.0)
     _prog_raw = cfg["ball_progress_scale"] * (ball_progress_toward_goal_m / _norm_box_dist) if has_possession_now else 0.0
     prog_r, cumulative_state_after["prog"] = cumulative_clamped_delta(
         _prog_raw, cumulative_state.get("prog", 0.0), *symmetric_clamp(prog_reward_clamp)

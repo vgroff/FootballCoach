@@ -36,36 +36,15 @@ Line numbers are approximate (code may have shifted slightly since review).
   gone`). This will get worse as player counts grow toward full 11v11. If the
   string-id-as-source-of-truth is kept for serialization/observation-encoding
   reasons, at minimum add a per-tick `dict[str, Player]` cache in `Match`
-  rather than repeated linear scans. Developer Note: We tried fixing this and it's a pain because circular references, so we will leave it for now but come back to it
+  rather than repeated linear scans. Developer Note: We tried fixing this before and it's a pain because circular references, does it seem easy actually? I agree that it should be done
 
 - **`engine/match.py` is a "does everything" file** — tick loop, order
   processing, possession syncing, ball pickup, head-on-tackle detection, GK
   immunity/box logic, pass leading, and interception math all live in one
   `Match` class. Worth splitting interception math out (see above) and
   possibly the GK-box/immunity logic into its own module, since
-  `goalkeeping.py` already exists as a natural home for GK-specific logic.
-
-- **`orders.py` is a large (700+ line) file mixing ~9 Order dataclasses with
-  substantial shared movement-intent logic** (`_compute_movement_intent`,
-  `_gk_should_sprint`) that conceptually belongs in `engine/movement.py`
-  rather than the order-definition layer. Consider splitting into
-  `orders/move.py`, `orders/kick.py`, `orders/tackle.py`, etc. Developer Note: sound sensible
-
-- **Config-file/architecture-boundary mismatch for `steering.py`** —
-  `steering.py`'s own docstring insists player repulsion/marking is
-  deliberately an AI/order-layer decision, *not* engine physics ("repulsion
-  is deliberately NOT under engine/"), yet its tunables
-  (`physics.json["repulsion"]`, `["marking"]`) live inside `physics.json`
-  alongside genuine engine physics constants. The code-level architecture
-  boundary and the config-file layout disagree with each other.
-
-- **`physics.json` mixes at least three different classes of value** under
-  one flat file with only `_comment_*` keys for documentation: (1) pure
-  physical constants (gravity, air density), (2) tuned game-balance
-  coefficients (kick error sigma, tackle boosts), and (3) AI/order-layer-only
-  steering constants (repulsion, marking — see above). Splitting these (e.g.
-  a separate `ai_layer.json` for steering-only values) would make the
-  config's scope match its name.
+  `goalkeeping.py` already exists as a natural home for GK-specific logic. 
+  Developer Note: Sounds good. Anything else that could be split out from match without too much hassle?
 
 - **Anthropometric constants live in `physics.json["player"]`** rather than
   `attributes.json` — `knee_height_m`, `waist_height_m`, `height_m`,
@@ -73,19 +52,19 @@ Line numbers are approximate (code may have shifted slightly since review).
   "attributes/generation" in spirit than "physics," even though these
   particular values are universal rather than per-player. At minimum, a
   comment in `attributes.json` cross-referencing where body-shape constants
-  actually live would help.
+  actually live would help. Developer Note: yeah, better in attributes
 
 - **`Scoreboard.score_for()` / `Pitch.is_goal()` use raw `"left"`/`"right"`
   strings** rather than the `Team` enum that already exists elsewhere in the
   codebase — this stringly-typed convention flows from `Pitch.is_goal()`
   through `check_goal()` to `Scoreboard.score_for()`, and exists purely to
   justify a runtime `ValueError(f"unknown goal side: {side}")` guard that a
-  real enum would make unnecessary (caught statically instead).
+  real enum would make unnecessary (caught statically instead). Developer Note: fix it
 
 - **`Player.current_order: object | None` and `desired_speed_mode: object |
   None` are untyped** to dodge circular imports with `orders.py` — a
   `TYPE_CHECKING`-guarded type alias (the codebase already does this for
-  `Match` elsewhere) would restore type-checking value cheaply.
+  `Match` elsewhere) would restore type-checking value cheaply. Developer Note: do it
 
 - **`Ball`'s `position`/`velocity`/`spin` use `= None  # type:
   ignore[assignment]` plus a `__post_init__`** to work around dataclass
@@ -93,19 +72,20 @@ Line numbers are approximate (code may have shifted slightly since review).
   uses the more idiomatic `field(default_factory=Vector3.zero)` for the same
   purpose. Inconsistent pattern between two entity classes for the exact same
   problem — worth aligning `Ball` to `Player`'s approach and dropping the
-  `type: ignore`.
+  `type: ignore`. Developer Note: sounds like a straightforward fix?
 
 - **No single canonical epsilon constant** — `1e-6`, `1e-9`, `1e-12` all
   appear scattered across modules (e.g. `Pitch.is_goal()`,
   `Ball.is_grounded()`) for conceptually similar "avoid divide-by-zero /
   treat as touching" checks, with no shared name explaining which tolerance
-  to use where.
+  to use where. Developer note: yeah fix that, make it a constant somewhere
 
 - **`Vector3`'s module docstring calls it "a tiny, fast 3D vector wrapper
   around numpy,"** but internally all arithmetic is plain Python floats;
   numpy is only used by the rarely-called `from_array`/`as_array` conversion
   helpers. The docstring's framing overstates numpy's role and could mislead
-  readers about performance characteristics.
+  readers about performance characteristics. Developer Note: why isn't it numpy? 
+  Could it be changed easily for better performance?
 
 ---
 

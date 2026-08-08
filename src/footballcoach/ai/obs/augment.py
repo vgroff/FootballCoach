@@ -88,23 +88,27 @@ def _field_index(dataclass_type, name: str) -> int:
 #: PlayerFeatures indices negated by flip_x
 PLAYER_FLIP_X_IDX: list[int] = [
     _field_index(PlayerFeatures, "rel_dx"),
+    _field_index(PlayerFeatures, "ball_rel_dx"),
+    _field_index(PlayerFeatures, "ball_vel_rel_x"),
     _field_index(PlayerFeatures, "velocity_x"),
-    _field_index(PlayerFeatures, "heading_cos"),       # cos(π-θ) = -cos(θ)
     _field_index(PlayerFeatures, "attacking_direction"),  # +x → -x
     _field_index(PlayerFeatures, "pos_x"),             # absolute x negated under flip_x
 ]
+# ball_closing_speed is flip-invariant: both rel-velocity and direction components
+# negate under a flip, so their dot product (= closing speed) is unchanged.
 
 #: PlayerFeatures indices negated by flip_y
 PLAYER_FLIP_Y_IDX: list[int] = [
     _field_index(PlayerFeatures, "rel_dy"),
+    _field_index(PlayerFeatures, "ball_rel_dy"),
+    _field_index(PlayerFeatures, "ball_vel_rel_y"),
     _field_index(PlayerFeatures, "velocity_y"),
-    _field_index(PlayerFeatures, "heading_sin"),       # sin(-θ) = -sin(θ)
     _field_index(PlayerFeatures, "pos_y"),             # absolute y negated under flip_y
 ]
 
 #: BallFeatures indices negated by flip_x (includes pseudovector spin)
 BALL_FLIP_X_IDX: list[int] = [
-    _field_index(BallFeatures, "rel_dx"),
+    _field_index(BallFeatures, "pos_x"),   # absolute x negated under flip_x
     _field_index(BallFeatures, "velocity_x"),
     _field_index(BallFeatures, "spin_y"),  # pseudovector flip_x: -ω_y
     _field_index(BallFeatures, "spin_z"),  # pseudovector flip_x: -ω_z
@@ -112,7 +116,7 @@ BALL_FLIP_X_IDX: list[int] = [
 
 #: BallFeatures indices negated by flip_y (includes pseudovector spin)
 BALL_FLIP_Y_IDX: list[int] = [
-    _field_index(BallFeatures, "rel_dy"),
+    _field_index(BallFeatures, "pos_y"),   # absolute y negated under flip_y
     _field_index(BallFeatures, "velocity_y"),
     _field_index(BallFeatures, "spin_x"),  # pseudovector flip_y: -ω_x
     _field_index(BallFeatures, "spin_z"),  # pseudovector flip_y: -ω_z
@@ -132,6 +136,7 @@ _BC_REGION_X_COL: int = 10  # move_region_center x (absolute pitch metres — ne
 _BC_REGION_Y_COL: int = 11  # move_region_center y (absolute pitch metres — negate on flip_y)
 _BC_KICK_DIR_X_COL: int = 18  # kick_direction x component
 _BC_KICK_DIR_Y_COL: int = 19  # kick_direction y component
+_BC_KICK_DIR_Z_COL: int = 24  # kick_direction z component (non-contiguous with x/y; unaffected by x/y pitch flips)
 # kick_spin (indices 21-23) is a pseudovector, same transform rules as
 # BALL_FLIP_X_IDX/BALL_FLIP_Y_IDX above: flip_x negates spin_y/spin_z,
 # flip_y negates spin_x/spin_z. kick_power (index 20) is a scalar and is
@@ -191,6 +196,8 @@ def augment_batch(
     has_bc: bool = "bc_labels" in batch
     has_ai_type: bool = "obs/self_ai_type" in batch and "obs/other_ai_type" in batch
     has_head_log_probs: bool = "head_log_probs" in batch
+    has_reward_comps: bool = "reward_comps_raw" in batch
+    has_step_outcomes: bool = "step_outcomes" in batch
 
     # Pre-build index tensors once (avoids repeated Python list → tensor conv)
     _px = torch.tensor(PLAYER_FLIP_X_IDX, dtype=torch.long)
@@ -317,13 +324,25 @@ def augment_batch(
             part.update(remapped_actions)
             if bc_labels_flipped is not None:
                 part["bc_labels"] = bc_labels_flipped
+            if has_reward_comps:
+                part["reward_comps_raw"] = batch["reward_comps_raw"]
+            if has_step_outcomes:
+                part["step_outcomes"] = batch["step_outcomes"]
 
             parts.append(part)
 
     # Concatenate all variants along the batch dimension
+    # List fields (reward_comps_raw, step_outcomes) are extended, not torch.cat'd.
+    _list_keys = {"reward_comps_raw", "step_outcomes"}
     result: dict = {}
     for key in parts[0]:
-        result[key] = torch.cat([p[key] for p in parts], dim=0)
+        if key in _list_keys:
+            combined: list = []
+            for p in parts:
+                combined.extend(p[key])
+            result[key] = combined
+        else:
+            result[key] = torch.cat([p[key] for p in parts], dim=0)
     return result
 
 

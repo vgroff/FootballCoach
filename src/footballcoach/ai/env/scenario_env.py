@@ -20,6 +20,7 @@ from __future__ import annotations
 import math
 import random
 from dataclasses import dataclass, field
+from pathlib import Path
 from typing import Optional
 
 import numpy as np
@@ -35,6 +36,7 @@ from footballcoach.ai.env.reward import EMAFilter, phase1_reward, phase2_reward
 from footballcoach.ai.obs.encoder import MAX_OTHER_PLAYERS, encode_observation
 from footballcoach.ai.obs.schema import ObservationBatch
 from footballcoach.engine.match import Match
+from footballcoach.engine.match_logger import MatchLogger
 from footballcoach.entities.player import Team
 from footballcoach.ui.scenarios import ScenarioDefinition, ScenarioLoop
 
@@ -154,6 +156,18 @@ class ScenarioEnv:
         self.last_secondary_results: list = []
         self.last_reward_components: dict[str, float] = {}
 
+        # Set by the trainer to enable saving match logs on bad episodes.
+        # e.g. env.match_log_dir = trainer.checkpoint_dir / "match_logs"
+        self.match_log_dir: Optional[Path] = None
+        _log_cfg = cfg.get("logging", {})
+        self._match_logger: MatchLogger = MatchLogger(
+            consistency_interval_s=float(_log_cfg.get("consistency_interval_s", 2.5))
+        )
+        # Monotonically increasing episode counter used for log file naming.
+        self._episode_index: int = 0
+        # Dict of named trigger flags; each fires at most once per env lifetime.
+        self._match_log_triggers_fired: dict[str, bool] = {}
+
     # -----------------------------------------------------------------------
     # Gym-like API
     # -----------------------------------------------------------------------
@@ -264,6 +278,11 @@ class ScenarioEnv:
             # Running UNCLAMPED cumulative-term state for this secondary
             # player's episode, same treatment as self._trainee_cumulative_state above.
             self._sec_cumulative_state[pid] = {}
+        # Attach fresh logger to the match and record initial state.
+        self._episode_index += 1
+        self._match_logger.reset()
+        self._loop.match.match_logger = self._match_logger
+        self._match_logger.record_start(self._loop.match)
         return self._get_obs()
 
     def step(self) -> tuple[ObservationBatch, float, bool, StepInfo]:
@@ -322,6 +341,18 @@ class ScenarioEnv:
         sec_gained_count = {pid: 0 for pid in sec_pre}
         sec_lost_count = {pid: 0 for pid in sec_pre}
 
+        # Per-tick box-distance progress accumulators. Must be gated on
+        # possession at the SAME tick the box-distance moved, not possession
+        # at the end of the whole (multi-tick) decision interval -- otherwise
+        # a mid-interval tackle attributes the OPPONENT's prior ball-carrying
+        # movement (typically away from the trainee's target box) to the
+        # trainee's "progress" the instant it steals the ball, producing
+        # large spurious negative progress on winning steps.
+        _trainee_box_dist_prev = prev_box_dist
+        trainee_prog_accum = 0.0
+        _sec_box_dist_prev = {pid: pre["prev_box_dist"] for pid, pre in sec_pre.items()}
+        sec_prog_accum = {pid: 0.0 for pid in sec_pre}
+
         for _ in range(self._ticks_per_decision):
             # Track ball touches by trainee
             if match.ball.possessed_by == self.trainee_player_id:
@@ -339,10 +370,42 @@ class ScenarioEnv:
             tick_done = self._loop.step()
             self._episode_ticks += 1
 
-            # Detect possession gain/loss transitions THIS tick (trainee).
-            # Uses the shared state machine so a "kick to yourself" / brief
-            # loose-ball self-repossession is NOT counted as a turnover (only
-            # a possession settling onto a DIFFERENT player counts).
+            if tick_done:
+                # Break BEFORE reading any match state. When linger_s=0
+                # (training), _loop.step() rebuilds the match before returning
+                # True — self._loop.match is already the next episode here.
+                outcome_this_step = self._latest_outcome()
+                if outcome_this_step == "goal":
+                    goal_scored = True
+                    if self.phase != 1:
+                        self._ema.on_goal()
+                trial_ended_this_step = True
+                break
+
+            # Early-exit when the trainee is already in the opponent box with possession —
+            # any further ticks only accumulate spurious negative progress as box_dist=0.
+            if (_trainee_poss_prev and match.pitch.is_in_box(
+                match.ball.position, left=(player.team == Team.RIGHT)
+            )):
+                break
+
+            # Accumulate progress using PRE-tick possession (before transition
+            # below). Only ticks where the player already held the ball count;
+            # the gain tick itself is excluded so the ball's pre-possession
+            # trajectory doesn't pollute the player's progress reward.
+            # Pass local `match` to all distance helpers — never self._loop.match.
+            _curr_trainee_box_dist = self._ball_dist_to_opponent_box(self.trainee_player_id, match)
+            if _trainee_poss_prev:
+                trainee_prog_accum += _trainee_box_dist_prev - _curr_trainee_box_dist
+            _trainee_box_dist_prev = _curr_trainee_box_dist
+            for pid in sec_pre:
+                _curr_sec_box_dist = self._ball_dist_to_opponent_box(pid, match)
+                if _sec_poss_prev[pid]:
+                    sec_prog_accum[pid] += _sec_box_dist_prev[pid] - _curr_sec_box_dist
+                _sec_box_dist_prev[pid] = _curr_sec_box_dist
+
+            # Update possession transitions AFTER progress, so gain-tick
+            # motion counts on the NEXT tick, not the tick possession is taken.
             _possessed_by = match.ball.possessed_by
             (
                 _trainee_poss_prev,
@@ -354,7 +417,6 @@ class ScenarioEnv:
                 _trainee_pending_loss, trainee_gained_count, trainee_lost_count,
             )
 
-            # Same for secondary players sharing this tick loop.
             for pid in sec_pre:
                 (
                     _sec_poss_prev[pid],
@@ -366,16 +428,6 @@ class ScenarioEnv:
                     _sec_pending_loss[pid], sec_gained_count[pid], sec_lost_count[pid],
                 )
 
-            if tick_done:
-                outcome_this_step = self._latest_outcome()
-                if outcome_this_step == "goal":
-                    goal_scored = True
-                    # Phase 1 doesn't reward/track goals; only box possession matters.
-                    if self.phase != 1:
-                        self._ema.on_goal()
-                trial_ended_this_step = True
-                break
-
         # Update EMA with the trainee's attack/defence output (from NeuralPlayerAI transition)
         if self.last_trainee_transition is not None:
             decision = self.last_trainee_transition.get("action")
@@ -384,8 +436,10 @@ class ScenarioEnv:
             info.illegal_action = self.last_trainee_transition.get("illegal_action", False)
 
         # --- Compute reward ---
-        curr_ball_dist = self._ball_dist_to_trainee()
+        # All geometry reads use local `match` (captured at step() entry).
+        curr_ball_dist = self._ball_dist_to_trainee(match)
         self._last_ball_dist = curr_ball_dist
+        _trainee_box_dist_now = self._ball_dist_to_opponent_box(self.trainee_player_id, match)
 
         new_goal_count = (match.scoreboard.left_goals, match.scoreboard.right_goals)
         self._prev_goal_count = new_goal_count
@@ -395,7 +449,9 @@ class ScenarioEnv:
 
         # Ball progress toward opponent BOX (not raw goal-line x) — counts
         # lateral movement into the box, consistent with start_ball_to_box_dist_m.
-        ball_progress = prev_box_dist - self._ball_dist_to_opponent_box(self.trainee_player_id)
+        # Per-tick accumulated (see trainee_prog_accum init comment above),
+        # NOT a single start-vs-end-of-interval delta.
+        ball_progress = trainee_prog_accum
 
         # Reached opponent box with possession (phase 1 terminal — trainee wins)
         in_opponent_box = match.pitch.is_in_box(
@@ -448,9 +504,10 @@ class ScenarioEnv:
                 start_ball_dist_m=self._start_ball_dist_m,
                 start_ball_to_box_dist_m=self._start_ball_to_box_dist_m,
                 opponent_reached_trainee_box=opponent_box_terminal,
-                timed_out=timeout and not box_terminal and not opponent_box_terminal and not trial_ended_this_step,
+                timed_out=timeout and not box_terminal and not opponent_box_terminal,
                 episode_done=box_terminal or opponent_box_terminal or timeout,
                 cumulative_state=self._trainee_cumulative_state,
+                ball_dist_to_opponent_box_m=_trainee_box_dist_now,
             )
         else:
             reward = phase2_reward(
@@ -503,12 +560,15 @@ class ScenarioEnv:
                     and sec_player.ai.last_transition is not None):
                 continue
 
-            sec_curr_ball_dist = self._ball_dist_for_player(pid)
+            sec_curr_ball_dist = self._ball_dist_for_player(pid, match)
             self._sec_last_ball_dist[pid] = sec_curr_ball_dist
+            _sec_box_dist_now = self._ball_dist_to_opponent_box(pid, match)
 
             # Box-distance closed this step (own attacking box), matching the
-            # trainee's ball_progress above — not raw goal-line x movement.
-            sec_ball_prog = pre["prev_box_dist"] - self._ball_dist_to_opponent_box(pid)
+            # trainee's ball_progress above — not raw goal-line x movement,
+            # and per-tick accumulated/possession-gated (see sec_prog_accum
+            # init comment above), not a single start-vs-end-of-interval delta.
+            sec_ball_prog = sec_prog_accum.get(pid, 0.0)
 
             sec_ball_went_out = (
                 trial_ended_this_step
@@ -552,9 +612,10 @@ class ScenarioEnv:
                     start_ball_dist_m=self._sec_start_ball_dist.get(pid, 1.0),
                     start_ball_to_box_dist_m=self._sec_start_ball_to_box_dist_m.get(pid, 1.0),
                     opponent_reached_trainee_box=box_terminal,  # from sec's POV, trainee winning = sec losing
-                    timed_out=timeout and not sec_box_terminal and not box_terminal and not trial_ended_this_step,
+                    timed_out=timeout and not sec_box_terminal and not box_terminal,
                     episode_done=sec_episode_done,
                     cumulative_state=self._sec_cumulative_state.get(pid, {}),
+                    ball_dist_to_opponent_box_m=_sec_box_dist_now,
                 )
             else:
                 sec_reward = 0.0
@@ -568,12 +629,38 @@ class ScenarioEnv:
             # Accumulate secondary components into last_reward_components
             for _k, _v in _sec_comps.items():
                 self.last_reward_components[_k] = self.last_reward_components.get(_k, 0.0) + _v
-
+        _match_time_s = match.time_s
+        _ball_pos = match.ball.position
+        if done:
+            self._match_logger.notify_episode_end(
+                _match_time_s, _ball_pos,
+                info.trial_outcome or "unknown",
+                reward, self.last_reward_components,
+            )
+        else:
+            self._match_logger.accumulate_reward(reward, self.last_reward_components)
+        if self.phase == 1 and self.match_log_dir is not None:
+            self._check_match_log_triggers()
         return self._get_obs(), reward, done, info
 
     # -----------------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------------
+
+    def _check_match_log_triggers(self) -> None:
+        """Save a named log file the first time each trigger condition fires."""
+        triggers: dict[str, bool] = {
+            "prog_negative_clamp": (
+                (clamp := self._reward_cfg["phase1"].get("ball_progress_reward_clamp")) is not None
+                and self._trainee_cumulative_state.get("prog", 0.0) <= -clamp
+            ),
+        }
+        for name, fired in triggers.items():
+            if fired and not self._match_log_triggers_fired.get(name):
+                self._match_log_triggers_fired[name] = True
+                self._match_logger.save(
+                    self.match_log_dir / f"episode_{self._episode_index:06d}_{name}.json"
+                )
 
     def _get_obs(self, player_id: str | None = None) -> ObservationBatch:
         """Encode the observation for *player_id* (default: the trainee).
@@ -596,8 +683,8 @@ class ScenarioEnv:
             phase=self.phase,
         )
 
-    def _ball_dist_to_trainee(self) -> float:
-        return self._ball_dist_for_player(self.trainee_player_id)
+    def _ball_dist_to_trainee(self, match=None) -> float:
+        return self._ball_dist_for_player(self.trainee_player_id, match)
 
     @staticmethod
     def _player_speed_and_heading_cos(player_obj, ball_pos) -> tuple[float, float]:
@@ -643,6 +730,7 @@ class ScenarioEnv:
         timed_out: bool,
         episode_done: bool,
         cumulative_state: dict[str, float] | None = None,
+        ball_dist_to_opponent_box_m: float | None = None,
     ) -> tuple[float, dict[str, float], dict[str, float]]:
         """SINGLE call site for phase1_reward(), used for the trainee AND
         every secondary player. All per-player-derived inputs (speed,
@@ -682,7 +770,11 @@ class ScenarioEnv:
             start_ball_dist_m=start_ball_dist_m,
             opponent_reached_trainee_box=opponent_reached_trainee_box,
             timed_out=timed_out,
-            ball_dist_to_opponent_box_m=self._ball_dist_to_opponent_box(player_id),
+            ball_dist_to_opponent_box_m=(
+                ball_dist_to_opponent_box_m
+                if ball_dist_to_opponent_box_m is not None
+                else self._ball_dist_to_opponent_box(player_id)
+            ),
             episode_done=episode_done,
             heading_cos_sim=_hdg_cos,
             player_speed_mps=_speed,
@@ -693,36 +785,42 @@ class ScenarioEnv:
             cumulative_state=cumulative_state,
         )
 
-    def _ball_dist_to_opponent_box(self, player_id: Optional[str] = None) -> float:
-        """Distance from the ball to the near edge of *player_id*'s OWN
-        opponent's box at call time (i.e. the box *player_id* is attacking).
+    def _ball_dist_to_opponent_box(self, player_id: Optional[str] = None, match=None) -> float:
+        """2D shortest distance from the ball to *player_id*'s attacking box.
 
-        Defaults to the trainee for convenience at call sites that only ever
-        care about the trainee, but _compute_phase1_reward_for_player() ALWAYS
-        passes an explicit player_id — secondary players frequently attack
-        the opposite end of the pitch from the trainee, so silently reusing
-        the trainee's box-distance here would normalize a secondary player's
-        prog/spd/prox reward terms against the wrong goal entirely.
+        Returns 0.0 when the ball is inside the box. On the wings the
+        distance to the nearest box corner/edge is used rather than x-only,
+        so the normalization constant and progress reward are consistent with
+        the actual path the player needs to travel.
+
+        Always pass `match` explicitly inside step() — self._loop.match is
+        replaced by the next episode before step() returns on terminal ticks.
         """
         try:
-            match = self._loop.match
-            ball = match.ball.position
-            player = match.player_by_id(player_id if player_id is not None else self.trainee_player_id)
-            pitch = match.pitch
-            # Opponent box near edge: half_length - box_length_m from centre
-            box_edge_x = pitch.half_length - pitch.box_length_m
+            m = match if match is not None else self._loop.match
+            ball = m.ball.position
+            player = m.player_by_id(player_id if player_id is not None else self.trainee_player_id)
+            pitch = m.pitch
+            half_box_w = pitch.box_width_m / 2.0
+            # Box x-range depends on which goal the player is attacking.
             if player.team == Team.LEFT:
-                dist_x = max(0.0, box_edge_x - ball.x)
+                rx_min = pitch.half_length - pitch.box_length_m
+                rx_max = pitch.half_length
             else:
-                dist_x = max(0.0, box_edge_x - (-ball.x))
-            return float(dist_x)
+                rx_min = -pitch.half_length
+                rx_max = -pitch.half_length + pitch.box_length_m
+            # Shortest distance from ball to axis-aligned rectangle.
+            dx = max(rx_min - ball.x, 0.0, ball.x - rx_max)
+            dy = max(-half_box_w - ball.y, 0.0, ball.y - half_box_w)
+            return float(math.hypot(dx, dy))
         except (KeyError, AttributeError):
             return 1.0
 
-    def _ball_dist_for_player(self, player_id: str) -> float:
+    def _ball_dist_for_player(self, player_id: str, match=None) -> float:
         try:
-            player = self._loop.match.player_by_id(player_id)
-            ball = self._loop.match.ball
+            m = match if match is not None else self._loop.match
+            player = m.player_by_id(player_id)
+            ball = m.ball
             return math.hypot(
                 ball.position.x - player.position.x,
                 ball.position.y - player.position.y,

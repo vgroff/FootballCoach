@@ -114,7 +114,7 @@ class ExecutionHeadsRaw:
     exec_move_logit: "torch.Tensor"        # (batch, 1) Bernoulli: move vs standstill
     sprint_logit: "torch.Tensor"           # (batch, 1) Bernoulli: sprint vs jog (only when moving)
     kick_logit: "torch.Tensor"             # (batch, 1) Bernoulli: kick this tick?
-    kick_direction: "torch.Tensor"         # (batch, 2) unit vector (L2-normalized in forward())
+    kick_direction: "torch.Tensor"         # (batch, 3) 3D unit vector (L2-normalized in forward())
     kick_power: "torch.Tensor"             # (batch, 1) raw; sigmoid -> 0-1 power_fraction
     kick_spin: "torch.Tensor"              # (batch, 3) raw spin vector
     tackle_attempt_logit: "torch.Tensor"   # (batch, 1) Bernoulli
@@ -129,7 +129,7 @@ class ExecutionAction:
     exec_move: float = 0.0                 # 0 = standstill, 1 = move
     sprint: float = 0.0                    # 0 = jog, 1 = sprint (only relevant when moving)
     kick: float = 0.0                      # 0 = no kick, 1 = kick this tick
-    kick_direction_raw: np.ndarray = None  # shape (2,) pre-normalization
+    kick_direction_raw: np.ndarray = None  # shape (3,) pre-normalization 3D vector
     kick_power_raw: float = 0.0            # pre-sigmoid raw
     kick_spin_raw: np.ndarray = None       # shape (3,) raw spin vector
     tackle_attempt: float = 0.0            # 0 = no, 1 = yes
@@ -138,7 +138,7 @@ class ExecutionAction:
         if self.move_direction_raw is None:
             self.move_direction_raw = np.array([1.0, 0.0], dtype=np.float32)
         if self.kick_direction_raw is None:
-            self.kick_direction_raw = np.array([1.0, 0.0], dtype=np.float32)
+            self.kick_direction_raw = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         if self.kick_spin_raw is None:
             self.kick_spin_raw = np.zeros(3, dtype=np.float32)
 

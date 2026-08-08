@@ -27,24 +27,30 @@ class PlayerFeatures:
     is 0 (including ``exists=0``, which distinguishes a padded slot from
     a real player standing at the same position as the observer).
 
-    Velocity normalization: per-player ``effective_top_speed`` (not a
-    global constant) so the feature is attribute-invariant across the full
-    skill range.  Position normalization: relative offset divided by pitch
-    half-dimensions so values stay ≈[-1, 1] across varied pitch sizes.
+    Velocity normalization: pitch half-diagonal (``sqrt((L/2)²+(W/2)²)``)
+    so values represent absolute speed in pitch-scale units per second,
+    matching ball velocity normalization.  Position normalization: relative
+    offset divided by pitch half-dimensions so values stay ≈[-1, 1].
     """
     # --- Position (relative to observing player) ---
     rel_dx: float = 0.0          # (other.x - self.x) / (pitch.length_m / 2)
     rel_dy: float = 0.0          # (other.y - self.y) / (pitch.width_m / 2)
     distance_m: float = 0.0      # Euclidean 2D distance / pitch_half_diagonal, redundant but aids learning
 
-    # --- Velocity ---
-    velocity_x: float = 0.0      # world-frame vx / own_effective_top_speed
-    velocity_y: float = 0.0      # world-frame vy / own_effective_top_speed
-    speed_mps: float = 0.0       # |v_xy| / own_effective_top_speed, redundant
+    # --- Ball position and relative velocity (relative to this player) ---
+    ball_rel_dx: float = 0.0        # (ball.x - player.x) / (pitch.length_m / 2)
+    ball_rel_dy: float = 0.0        # (ball.y - player.y) / (pitch.width_m / 2)
+    ball_distance_m: float = 0.0    # 2D distance to ball / pitch_half_diagonal
+    ball_vel_rel_x: float = 0.0     # (ball.vx - player.vx) / pitch_half_diagonal
+    ball_vel_rel_y: float = 0.0     # (ball.vy - player.vy) / pitch_half_diagonal
+    ball_closing_speed: float = 0.0 # speed at which ball approaches player (flip-invariant)
 
-    # --- Heading (sin/cos avoids angle-wraparound discontinuity) ---
-    heading_sin: float = 0.0
-    heading_cos: float = 1.0
+    # --- Velocity ---
+    velocity_x: float = 0.0      # world-frame vx / pitch_half_diagonal
+    velocity_y: float = 0.0      # world-frame vy / pitch_half_diagonal
+    speed_mps: float = 0.0       # |v_xy| / pitch_half_diagonal, redundant
+    # heading dropped: velocity = (cos(heading)*speed, sin(heading)*speed) so
+    # heading is fully recoverable from velocity when speed > 0, irrelevant when speed = 0.
 
     # --- Stamina ---
     stamina: float = 1.0         # current stamina fraction [0, 1]
@@ -88,16 +94,15 @@ class PlayerFeatures:
 
 @dataclass
 class BallFeatures:
-    """Ball feature vector (12 floats).
+    """Ball feature vector (11 floats).
 
-    Position relative to the observing player, normalized by pitch dimensions
-    (same convention as PlayerFeatures).  Height uses a fixed divisor
-    (``height_norm_m`` from ai_config.json, default 3.0m) since height
-    does not scale with pitch size.
+    Absolute pitch position normalized by standard half-dimensions (52.5m ×
+    34.0m), so values are ≈[-1, 1].  Height uses a fixed divisor
+    (``height_norm_m`` from ai_config.json, default 3.0m).  Ball-to-player
+    relative position is encoded per-player in ``PlayerFeatures.ball_rel_*``.
     """
-    rel_dx: float = 0.0
-    rel_dy: float = 0.0
-    distance_m: float = 0.0      # 2D distance / pitch_half_diagonal
+    pos_x: float = 0.0           # ball.position.x / 52.5
+    pos_y: float = 0.0           # ball.position.y / 34.0
     height_m: float = 0.0        # ball.position.z / height_norm_m
 
     velocity_x: float = 0.0      # world-frame, normalized by pitch_half_diagonal / s (rough physical scale)

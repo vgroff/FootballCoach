@@ -16,6 +16,8 @@ NaN (softmax over all -inf).  This won't occur in the current curriculum
 """
 from __future__ import annotations
 
+from typing import Optional
+
 import torch
 import torch.nn as nn
 
@@ -28,7 +30,13 @@ class EntityEncoder(nn.Module):
             (PLAYER_FEATURE_DIM from obs/schema.py).
         embed_dim: Output embedding dimension per entity (and the attention
             query/key/value dimension).
-        num_heads: Number of attention heads.
+        num_heads: Number of attention heads for the main (self→others) attention.
+        ball_feat_dim: If > 0, adds a ball-features projection onto the query.
+        global_feat_dim: If > 0, adds a global/match-context projection onto
+            the query (score diff, time remaining, task id, etc.).
+        inter_player_num_heads: If > 0, runs a self-attention pass over the
+            other-player embeddings BEFORE the main query step, letting
+            players exchange relational context. No-op for 1v1. 0 = disabled.
     """
 
     def __init__(
@@ -36,6 +44,9 @@ class EntityEncoder(nn.Module):
         entity_feature_dim: int,
         embed_dim: int = 64,
         num_heads: int = 4,
+        ball_feat_dim: int = 0,
+        global_feat_dim: int = 0,
+        inter_player_num_heads: int = 0,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -57,12 +68,34 @@ class EntityEncoder(nn.Module):
             batch_first=True,
         )
 
+        # Additive query projections: each biases the self-player query so that
+        # attention weights reflect relevance w.r.t. ball and match context.
+        self.ball_query_proj = nn.Linear(ball_feat_dim, embed_dim) if ball_feat_dim > 0 else None
+        self.global_query_proj = nn.Linear(global_feat_dim, embed_dim) if global_feat_dim > 0 else None
+
+        # Inter-player self-attention (runs BEFORE the main query step).
+        # Enriches other-player embeddings with relational context — e.g. which
+        # other players are close to the ball-carrier. No-op for 1v1.
+        self.inter_player_attn = nn.MultiheadAttention(
+            embed_dim=embed_dim,
+            num_heads=inter_player_num_heads,
+            batch_first=True,
+        ) if inter_player_num_heads > 0 else None
+
+        # Pre-LayerNorm for each attention step (Pre-LN: normalise before attention).
+        self.ln_inter = nn.LayerNorm(embed_dim) if inter_player_num_heads > 0 else None
+        self.ln_query = nn.LayerNorm(embed_dim)   # normalises the query before main attn
+        self.ln_kv = nn.LayerNorm(embed_dim)       # normalises keys/values before main attn
+
     def forward(
         self,
-        self_features: torch.Tensor,   # (batch, entity_feature_dim)
-        other_features: torch.Tensor,  # (batch, MAX_OTHER_PLAYERS, entity_feature_dim)
-        exists_mask: torch.Tensor,     # (batch, MAX_OTHER_PLAYERS), 1.0=real 0.0=padded
+        self_features: torch.Tensor,    # (batch, entity_feature_dim)
+        other_features: torch.Tensor,   # (batch, MAX_OTHER_PLAYERS, entity_feature_dim)
+        exists_mask: torch.Tensor,      # (batch, MAX_OTHER_PLAYERS), 1.0=real 0.0=padded
         return_embeds: bool = False,
+        ball_feat: Optional[torch.Tensor] = None,         # (batch, ball_feat_dim)
+        global_feat: Optional[torch.Tensor] = None,       # (batch, global_feat_dim)
+        extra_query_bias: Optional[torch.Tensor] = None,  # (batch, embed_dim), added to query
     ):
         """
         Args:
@@ -89,9 +122,16 @@ class EntityEncoder(nn.Module):
             (batch, MAX_OTHER_PLAYERS, embed_dim) -- both PRE-pooling,
             still attached to the policy graph (caller must detach).
         """
-        # Embed self: (batch, embed_dim) -> (batch, 1, embed_dim) for attention query
+        # Embed self: (batch, embed_dim); additively bias with all available context.
         self_embed_raw = self.per_entity_mlp(self_features)
-        self_embed = self_embed_raw.unsqueeze(1)
+        query = self_embed_raw
+        if ball_feat is not None and self.ball_query_proj is not None:
+            query = query + self.ball_query_proj(ball_feat)
+        if global_feat is not None and self.global_query_proj is not None:
+            query = query + self.global_query_proj(global_feat)
+        if extra_query_bias is not None:
+            query = query + extra_query_bias
+        self_embed = query.unsqueeze(1)  # (batch, 1, embed_dim)
 
         # Embed all other players: (batch, MAX_OTHER_PLAYERS, embed_dim)
         other_embed = self.per_entity_mlp(other_features)
@@ -116,14 +156,28 @@ class EntityEncoder(nn.Module):
             key_padding_mask = key_padding_mask.clone()
             key_padding_mask[fully_padded_rows] = False
 
-        context, _ = self.attention(
-            query=self_embed,
-            key=other_embed,
-            value=other_embed,
+        # Inter-player self-attention with Pre-LN + residual.
+        if self.inter_player_attn is not None:
+            other_embed_normed = self.ln_inter(other_embed)
+            attn_out, _ = self.inter_player_attn(
+                query=other_embed_normed,
+                key=other_embed_normed,
+                value=other_embed_normed,
+                key_padding_mask=key_padding_mask,
+            )
+            other_embed = other_embed + attn_out  # residual
+
+        # Main cross-attention with Pre-LN + residual on query side.
+        query_normed = self.ln_query(self_embed)
+        kv_normed = self.ln_kv(other_embed)
+        attn_out, _ = self.attention(
+            query=query_normed,
+            key=kv_normed,
+            value=kv_normed,
             key_padding_mask=key_padding_mask,
         )
         # context: (batch, 1, embed_dim) -> (batch, embed_dim)
-        context = context.squeeze(1)
+        context = (self_embed + attn_out).squeeze(1)  # residual on query
         if return_embeds:
             return context, self_embed_raw, other_embed
         return context

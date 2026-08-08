@@ -197,8 +197,10 @@ class DirectionHead:
         self._raw = normalized
 
     def sample_raw(self) -> torch.Tensor:
-        """Sample from the 2D Gaussian (pre-normalization)."""
-        return self.dist.rsample()
+        """Sample from the 2D Gaussian, normalized so log_prob is angle-only."""
+        raw = self.dist.rsample()
+        eps = 1e-6
+        return raw / (raw.norm(dim=-1, keepdim=True) + eps)
 
     def log_prob(self, raw_action: torch.Tensor) -> torch.Tensor:
         """Sum log_prob over the 2 components."""
