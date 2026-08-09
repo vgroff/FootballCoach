@@ -42,7 +42,15 @@ from dataclasses import fields
 import numpy as np
 import torch
 
-from footballcoach.ai.obs.augment import BALL_FLIP_X_IDX, PLAYER_FLIP_X_IDX
+from footballcoach.ai.obs.augment import (
+    BALL_FLIP_X_IDX,
+    PLAYER_FLIP_X_IDX,
+    _BC_DIR_X_COL,
+    _BC_KICK_DIR_X_COL,
+    _BC_KICK_SPIN_Y_COL,
+    _BC_KICK_SPIN_Z_COL,
+    _BC_REGION_X_COL,
+)
 from footballcoach.ai.obs.schema import PlayerFeatures
 
 #: Index of PlayerFeatures.attacking_direction within a self_feat/other_feat
@@ -125,6 +133,93 @@ def canonicalize_obs(
     other_c = _mirror_columns(other_feat, PLAYER_FLIP_X_IDX, x_sign)
     ball_c = _mirror_columns(ball_feat, BALL_FLIP_X_IDX, x_sign)
     return self_c, other_c, ball_c, x_sign
+
+
+class CanonicalNetworkWrapper(torch.nn.Module):
+    """Transparent wrapper: canonicalizes ``self_feat``/``other_feat``/
+    ``ball_feat`` before delegating to the wrapped network's real
+    ``forward()``. Every existing call site
+    (``self.decision_net(sf, of, em, bf, gf, ...)`` etc.) keeps working
+    completely unchanged — this is the ONLY place the canonical-AI-frame
+    transform is applied on the input side.
+
+    Network OUTPUTS (``DecisionHeadsRaw``/``ExecutionHeadsRaw``) are
+    returned AS-IS, i.e. still in canonical frame — this is intentional:
+    log_prob/loss computations that compare network output against other
+    canonical-frame quantities (BC labels via ``canonicalize_bc_labels()``,
+    stored raw action samples) must stay self-consistent in canonical
+    frame. Only the final physical action that actually touches engine
+    state gets decanonicalized, at the one boundary in
+    ``PPOTrainer._sample_action()`` (via ``mirror_x()``).
+
+    Transparently forwards attribute access (``.value_head``,
+    ``.move_dir_log_std``, etc.) and ``state_dict()``/``parameters()`` to
+    the wrapped module via ``__getattr__``, so existing code that reaches
+    through ``self.execution_net.value_head`` or similar continues to work
+    without modification.
+    """
+
+    def __init__(self, wrapped: torch.nn.Module):
+        super().__init__()
+        # Registered as a real submodule (not just an attribute) so
+        # .parameters()/.state_dict()/.to(device)/.train()/.eval() on the
+        # wrapper correctly recurse into the wrapped network.
+        self._wrapped = wrapped
+
+    def forward(self, self_feat, other_feat, *rest, **kwargs):
+        # rest[0] may be exists_mask (decision/value net) — ball_feat is
+        # always rest[1] for DecisionNetwork/ExecutionNetwork's shared
+        # (self_feat, other_feat, exists_mask, ball_feat, global_feat, ...)
+        # signature. Canonicalizing only self_feat/other_feat/ball_feat
+        # (exists_mask/global_feat/decision_heads have no geometric content).
+        ball_feat = rest[1]
+        self_feat_c, other_feat_c, ball_feat_c, _ = canonicalize_obs(self_feat, other_feat, ball_feat)
+        new_rest = (rest[0], ball_feat_c) + rest[2:]
+        return self._wrapped(self_feat_c, other_feat_c, *new_rest, **kwargs)
+
+    def __getattr__(self, name):
+        # nn.Module.__getattr__ already checks self._modules (where
+        # self._wrapped lives) before raising — this override only adds a
+        # SECOND fallback onto the wrapped module's own non-module attrs
+        # (e.g. execution_net.move_dir_log_std, a plain nn.Parameter, IS
+        # found via the first fallback already; this covers plain python
+        # attributes some call sites might reach for).
+        try:
+            return super().__getattr__(name)
+        except AttributeError:
+            wrapped = super().__getattr__("_wrapped")
+            return getattr(wrapped, name)
+
+    def state_dict(self, *args, **kwargs):
+        # Delegate directly to the wrapped module so checkpoint keys are
+        # IDENTICAL to pre-wrapper checkpoints (no "_wrapped." prefix) —
+        # critical for load/save compatibility with every existing .pt file.
+        return self._wrapped.state_dict(*args, **kwargs)
+
+    def load_state_dict(self, *args, **kwargs):
+        return self._wrapped.load_state_dict(*args, **kwargs)
+
+
+def canonicalize_bc_labels(bc_labels: torch.Tensor, x_sign) -> torch.Tensor:
+    """Mirror a batch of world-frame BC label rows (see ``ai/ppo/bc.py``'s
+    ``BC_LABEL_DIM`` layout) into the canonical AI frame, matching
+    ``canonicalize_obs()``'s treatment of the corresponding observation.
+
+    Must be applied to labels whenever they're compared against network
+    outputs produced from a canonicalized observation (BC loss computation)
+    — labels themselves are generated/stored in world frame (see
+    ``ai/ppo/bc.py`` module docstring), same as ``obs/encoder.py``.
+
+    ``x_sign``: scalar or ``(N,)`` tensor, one entry per row of ``bc_labels``.
+    """
+    out = bc_labels.clone()
+    xs = x_sign if torch.is_tensor(x_sign) and x_sign.dim() > 0 else x_sign
+    out[:, _BC_DIR_X_COL] = out[:, _BC_DIR_X_COL] * xs
+    out[:, _BC_REGION_X_COL] = out[:, _BC_REGION_X_COL] * xs
+    out[:, _BC_KICK_DIR_X_COL] = out[:, _BC_KICK_DIR_X_COL] * xs
+    out[:, _BC_KICK_SPIN_Y_COL] = out[:, _BC_KICK_SPIN_Y_COL] * xs
+    out[:, _BC_KICK_SPIN_Z_COL] = out[:, _BC_KICK_SPIN_Z_COL] * xs
+    return out
 
 
 def mirror_x(vec, x_sign):

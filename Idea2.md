@@ -34,7 +34,7 @@ Current notes:
         - check evaulations/compare with determinstic ones
         - do we need more data?
         - try with non-separate value net
-    - 
+    - [] !get the real clause
     - what happens with kick spin in the neural network atm? in phase 1 and evals?
     - Do some tests with inline code and small rollout to see which many envs/worker combinastions are fastest, and how much capacity matters
     - Can value network predict with only immobiles? Should be easy AF

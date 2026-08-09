@@ -181,6 +181,12 @@ _FLIP_VARIANTS: list[tuple[bool, bool]] = [
     (False, True),   # flip_y
 ]
 
+#: Number of geometric flip variants produced per call — callers that need to
+#: repeat/tile a parallel array (e.g. returns) to match augment_batch()'s/
+#: augment_obs_bc()'s output batch size must multiply by this, NOT a
+#: hardcoded 4 (stale from when flip_x was still a random augmentation here).
+N_FLIP_VARIANTS: int = len(_FLIP_VARIANTS)
+
 
 # ---------------------------------------------------------------------------
 # Main API
@@ -193,8 +199,9 @@ def augment_batch(
 ) -> dict:
     """Expand a PPO batch with geometric flips and opponent-slot permutations.
 
-    Produces 4 × n_slot_shuffles augmented copies of every sample, including
-    the original (identity flip, identity slot order) as one of the copies.
+    Produces N_FLIP_VARIANTS × n_slot_shuffles augmented copies of every
+    sample (N_FLIP_VARIANTS=2: identity, flip_y — see module docstring),
+    including the original (identity flip, identity slot order) as one.
 
     All non-geometric fields (rewards, advantages, returns, dones, log_probs,
     values) are tiled unchanged.  Geometric obs/action fields are sign-flipped.
@@ -205,11 +212,11 @@ def augment_batch(
     Args:
         batch:          CPU tensor dict from ``RolloutBuffer.as_tensors()``.
         n_slot_shuffles: Number of slot permutations per geometric variant.
-                        Use ≥1 (1 = identity slot order only, giving 4× total).
+                        Use ≥1 (1 = identity slot order only, giving N_FLIP_VARIANTS× total).
         rng:            Random instance for reproducible slot permutations.
 
     Returns:
-        New dict with batch dimension multiplied by (4 × n_slot_shuffles).
+        New dict with batch dimension multiplied by (N_FLIP_VARIANTS × n_slot_shuffles).
     """
     n_slot_shuffles = max(1, n_slot_shuffles)
     n_slots: int = batch["obs/other_feat"].shape[1]
@@ -386,7 +393,7 @@ def augment_obs_bc(
         rng:             Random for slot permutations.
 
     Returns:
-        (augmented_obs_dict, augmented_bc_labels) with batch dimension × (4 * n_slot_shuffles).
+        (augmented_obs_dict, augmented_bc_labels) with batch dimension × (N_FLIP_VARIANTS * n_slot_shuffles).
     """
     n_slot_shuffles = max(1, n_slot_shuffles)
     n_slots: int = obs_dict["other_feat"].shape[1]

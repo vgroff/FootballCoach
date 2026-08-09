@@ -54,8 +54,13 @@ from footballcoach.ai.eval.seeded_eval import (
 )
 from footballcoach.ai.models.decision_network import DecisionNetwork, derive_get_possession_prob
 from footballcoach.ai.models.execution_network import ExecutionNetwork, flatten_decision_heads
-from footballcoach.ai.obs.augment import augment_batch, augment_obs_bc
-from footballcoach.ai.obs.canonical import canonicalize_obs, mirror_x
+from footballcoach.ai.obs.augment import N_FLIP_VARIANTS, augment_batch, augment_obs_bc
+from footballcoach.ai.obs.canonical import (
+    CanonicalNetworkWrapper,
+    canonicalize_bc_labels,
+    mirror_x,
+    x_sign_of,
+)
 from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer, HEAD_LP_KEYS
 from footballcoach.ai.ppo.schedules import TrainingSchedules
 
@@ -162,6 +167,7 @@ def _ai_types(obs_dict: dict) -> tuple:
     return obs_dict.get("self_ai_type"), obs_dict.get("other_ai_type")
 
 
+
 # All phase-1 StepInfo.trial_outcome values (see ScenarioEnv.step()) that
 # outcome_breakdown() below always reports a percentage for, even when a
 # given rollout/eval happens to have zero of them (0% rather than silently
@@ -264,8 +270,14 @@ class PPOTrainer:
         inference_only: bool = False,
         separate_value_net: bool = False,
     ):
-        self.decision_net = decision_net
-        self.execution_net = execution_net
+        # Wrapped so every forward call automatically canonicalizes
+        # self_feat/other_feat/ball_feat into the canonical AI frame (see
+        # ai/obs/canonical.py "CanonicalNetworkWrapper") — existing call
+        # sites throughout this file need NO changes; state_dict()/
+        # load_state_dict() are transparently delegated so checkpoints stay
+        # unaffected.
+        self.decision_net = CanonicalNetworkWrapper(decision_net)
+        self.execution_net = CanonicalNetworkWrapper(execution_net)
         self.device = device or torch.device("cpu")
         # --- Permanent separate-trunk value network (see CLI --separate-value-net) ---
         # A fully independent ExecutionNetwork (same class/config, own weights, zero
@@ -288,9 +300,9 @@ class PPOTrainer:
             # execution_net's trunk size. None/absent (default) = same size as
             # the main trunk (network.trunk_hidden).
             _value_trunk_override = cfg.get("network", {}).get("value_net_trunk_hidden")
-            self.value_net = ExecutionNetwork.from_config(
+            self.value_net = CanonicalNetworkWrapper(ExecutionNetwork.from_config(
                 trunk_hidden_override=_value_trunk_override
-            )
+            ))
         self.checkpoint_dir = checkpoint_dir
 
         ppo_cfg = cfg["ppo"]
@@ -1508,8 +1520,9 @@ class PPOTrainer:
                             _obs_v["exists_mask"], _obs_v["ball_feat"], _obs_v["global_feat"],
                             _sat_v, _oat_v,
                         )
+                        _lbl_v_c = canonicalize_bc_labels(_lbl_v, x_sign_of(_obs_v["self_feat"]))
                         _bc_v, _ = bc_loss_from_tensor(
-                            _lbl_v, _d_v, exec_heads=None,
+                            _lbl_v_c, _d_v, exec_heads=None,
                             direction_loss_weight=self._bc_dir_loss_w,
                             region_loss_weight=self._bc_region_loss_w,
                             dec_weight=self._bc_dec_weight,
@@ -1559,6 +1572,7 @@ class PPOTrainer:
                         obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
                         _sat, _oat,
                     )
+                    bc_labels = canonicalize_bc_labels(bc_labels, x_sign_of(obs_dict["self_feat"]))
                     # decision_net.value_head is frozen (single value head
                     # convention — see __init__); Phase 0's decision-net BC
                     # loss is heads-only (no value term from decision_net).
@@ -1734,6 +1748,7 @@ class PPOTrainer:
                         _obs["self_feat"], _obs["other_feat"], _obs["exists_mask"],
                         _obs["ball_feat"], _obs["global_feat"], _d_v, _sat_v, _oat_v,
                     )
+                    _labels = canonicalize_bc_labels(_labels, x_sign_of(_obs["self_feat"]))
                     _losses.append(bc_loss_from_tensor(
                         _labels, _d_v, _e_v,
                         direction_loss_weight=self._bc_dir_loss_w,
@@ -1805,7 +1820,7 @@ class PPOTrainer:
                         obs_dict, bc_labels, self.augment_n_slot_shuffles, self._aug_rng
                     )
                     if ret_batch is not None:
-                        n_aug = 4 * max(1, self.augment_n_slot_shuffles)
+                        n_aug = N_FLIP_VARIANTS * max(1, self.augment_n_slot_shuffles)
                         ret_batch = ret_batch.repeat(n_aug)
                 _sat, _oat = _ai_types(obs_dict)
                 d_heads = self.decision_net(
@@ -1818,6 +1833,7 @@ class PPOTrainer:
                     obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
                     d_heads, _sat, _oat,
                 )
+                bc_labels = canonicalize_bc_labels(bc_labels, x_sign_of(obs_dict["self_feat"]))
                 bc_loss, bkdn = bc_loss_from_tensor(
                     bc_labels, d_heads, e_heads,
                     direction_loss_weight=self._bc_dir_loss_w,
@@ -2033,6 +2049,7 @@ class PPOTrainer:
                     obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
                     d_check, _sat, _oat,
                 )
+                bc_labels = canonicalize_bc_labels(bc_labels, x_sign_of(obs_dict["self_feat"]))
                 post_bc_losses.append(bc_loss_from_tensor(
                     bc_labels, d_check, e_check,
                     pos_weight_kick=self._bc_pos_weight_kick,
@@ -2096,6 +2113,7 @@ class PPOTrainer:
                         obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
                         d_r, _sat, _oat,
                     )
+                    bc_labels = canonicalize_bc_labels(bc_labels, x_sign_of(obs_dict["self_feat"]))
                     loss_r, bkdn_r = bc_loss_from_tensor(
                         bc_labels, d_r, e_r,
                         direction_loss_weight=self._bc_dir_loss_w,
@@ -2478,7 +2496,7 @@ class PPOTrainer:
         _sep_opt = None
         if experiment_separate_value_net:
             from footballcoach.ai.models.execution_network import ExecutionNetwork
-            _sep_net = ExecutionNetwork.from_config().to(self.device)
+            _sep_net = CanonicalNetworkWrapper(ExecutionNetwork.from_config()).to(self.device)
             # Fully unfrozen: every parameter of this fresh network trains,
             # unlike the main value_head-only optimizer above.
             _sep_opt = torch.optim.Adam(_sep_net.parameters(), lr=lr, eps=1e-5)
@@ -2836,9 +2854,9 @@ class PPOTrainer:
         # Canonical AI frame: mirror world-frame obs so self always attacks
         # +x (see ai/obs/canonical.py). x_sign is reused below to decanonicalize
         # move_direction/kick_direction before they're returned to the caller.
-        # N=1 here (single-player action sampling), so reduce to a python float.
-        sf, of, bf, x_sign = canonicalize_obs(sf, of, bf)
-        x_sign = float(x_sign.item())
+        # (decision_net/execution_net wrap-canonicalize sf/of/bf automatically —
+        # see CanonicalNetworkWrapper — so only x_sign itself is needed here.)
+        x_sign = float(x_sign_of(sf).item())
 
         # Decision network forward
         d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
