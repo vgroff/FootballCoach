@@ -80,6 +80,9 @@ class Player:
     kicked_this_tick: bool = field(default=False, repr=False, compare=False)
     # Set by GetPossessionOrder / neural AI; engine fires on_tackle on next contact.
     tackle_armed: bool = field(default=False, repr=False, compare=False)
+    # Set by _update_loose_ball_pickup when CONTROLLING_BALL begins; read by kick_direct/
+    # kick_with_direction to inflate first-touch error automatically. 0.0 when not controlling.
+    firsttime_difficulty: float = field(default=0.0, repr=False, compare=False)
 
     # Unconditional per-tick kick output capture — set inside kick_direct() every
     # time it actually executes kick physics, regardless of on_kick being set and
@@ -160,10 +163,15 @@ class Player:
         compensate_for_run=False: power_fraction is used raw, so sprinting in
         line with the kick adds the full running boost to ball speed.
         """
-        from footballcoach.engine.kicking import kick_ball, compensate_power_for_run_mult, running_power_multiplier
+        from footballcoach.engine.kicking import kick_ball, compensate_power_for_run_mult, firsttime_difficulty_multiplier, running_power_multiplier
         from footballcoach.engine.movement import effective_top_speed
         if match.ball.possessed_by != self.player_id:
             return
+        is_first_touch = self.state == PlayerState.CONTROLLING_BALL
+        diff_mult = (
+            firsttime_difficulty_multiplier(match.kicking_params, self.attributes.kick_precision, self.firsttime_difficulty)
+            if is_first_touch else 1.0
+        )
         top_speed = effective_top_speed(
             match.movement_params, self.attributes.top_speed, self.stamina,
             has_ball=True, ball_control_attr=self.attributes.ball_control,
@@ -188,26 +196,35 @@ class Player:
             match.rng_reduction,
             match.rng,
             match.kicking_params,
+            difficulty_multiplier=diff_mult,
             kicker_velocity=self.velocity,
             kicker_top_speed_mps=top_speed,
         )
+        if is_first_touch:
+            self.state = PlayerState.ACTIVE
+            self.state_timer_s = 0.0
         match._start_release_grace(self.player_id)
         match._log_debug(f"{self.player_id} kicked (direct)  power={power_fraction:.2f}")
         self.kicked_this_tick = True
         _vel = match.ball.velocity
         _vel_len = _vel.length()
         self.last_kick_direction = (_vel * (1.0 / _vel_len)) if _vel_len > 1e-6 else None
-        self.last_kick_power_fraction = float(power_fraction)  # raw, before run compensation
+        self.last_kick_power_fraction = float(adjusted_power)  # what was actually passed to kick_ball
         self.last_kick_spin = spin
         if self.on_kick is not None:
             self.on_kick(self)
 
     def kick_with_direction(self, match: "Match", direction_3d: "Vector3", power_fraction: float, spin: "Vector3") -> None:
         """Execute a kick with an explicit 3D unit direction vector (no ballistic solve). Neural network only."""
-        from footballcoach.engine.kicking import kick_ball_from_direction
+        from footballcoach.engine.kicking import kick_ball_from_direction, firsttime_difficulty_multiplier
         from footballcoach.engine.movement import effective_top_speed
         if match.ball.possessed_by != self.player_id:
             return
+        is_first_touch = self.state == PlayerState.CONTROLLING_BALL
+        diff_mult = (
+            firsttime_difficulty_multiplier(match.kicking_params, self.attributes.kick_precision, self.firsttime_difficulty)
+            if is_first_touch else 1.0
+        )
         top_speed = effective_top_speed(
             match.movement_params, self.attributes.top_speed, self.stamina,
             has_ball=True, ball_control_attr=self.attributes.ball_control,
@@ -223,9 +240,13 @@ class Player:
             match.rng_reduction,
             match.rng,
             match.kicking_params,
+            difficulty_multiplier=diff_mult,
             kicker_velocity=self.velocity,
             kicker_top_speed_mps=top_speed,
         )
+        if is_first_touch:
+            self.state = PlayerState.ACTIVE
+            self.state_timer_s = 0.0
         match._start_release_grace(self.player_id)
         match._log_debug(f"{self.player_id} kicked (direct 3D)  power={power_fraction:.2f}")
         self.kicked_this_tick = True

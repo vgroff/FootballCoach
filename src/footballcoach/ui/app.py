@@ -727,8 +727,10 @@ class App:
             loop = self._scenario_loop
             total = loop.linger_s if loop._pending_outcome in ("goal", "saved", "dispossessed", "other") else loop.linger_s * 0.5
             self.game_log.linger_frac = loop._linger_remaining_s / max(total, 0.001)
+            self.game_log.linger_outcome = loop._pending_outcome
         else:
             self.game_log.linger_frac = 0.0
+            self.game_log.linger_outcome = None
         self.renderer.draw_game_log(self.surface, self.game_log, self.log_min_level)
         if self._pause_notification:
             self.renderer.draw_pause_notification(self.surface, self._pause_notification)

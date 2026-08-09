@@ -253,11 +253,13 @@ def main() -> None:
             args.checkpoint = str(_latest_path)
 
     def _reset_dir_log_std() -> None:
-        init = float(cfg.get("ppo", {}).get("dir_log_std_init", -2.0))
+        ppo_cfg_r = cfg.get("ppo", {})
+        move_init = float(ppo_cfg_r.get("dir_log_std_init", -2.0))
+        kick_init = float(ppo_cfg_r.get("kick_dir_log_std_init", move_init))
         with torch.no_grad():
-            trainer.execution_net.move_dir_log_std.fill_(init)
-            trainer.execution_net.kick_dir_log_std.fill_(init)
-        log.info(f"--reset-dir-log-std: move/kick dir_log_std reset to {init}")
+            trainer.execution_net.move_dir_log_std.fill_(move_init)
+            trainer.execution_net.kick_dir_log_std.fill_(kick_init)
+        log.info(f"--reset-dir-log-std: move_dir_log_std={move_init}  kick_dir_log_std={kick_init}")
 
     # Optionally resume from checkpoint
     if args.checkpoint:

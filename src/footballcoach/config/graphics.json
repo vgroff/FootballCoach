@@ -2,7 +2,7 @@
   "_comment": "Visual display constants. Edit freely to tune the look without touching code. See ui/knowledge.md for details on how each value is used.",
   "camera": {
     "_comment": "pixels_per_metre: zoom level. 9=1025x692 window, 12=1340x896, 14=1570x1032. margin_px: empty border around pitch.",
-    "pixels_per_metre": 12.0,
+    "pixels_per_metre": 12.5,
     "margin_px": 40
   },
   "player": {
@@ -13,9 +13,9 @@
   },
   "ball": {
     "_comment": "min_radius_px: smallest on-screen circle radius drawn for the ball. outline: whether to draw a dark border around the ball circle. outline_width_px: pixel width of that border (1=thin, 3=bold). height_boost_per_metre: how much the drawn ball radius grows per metre of height (0=no growth, 0.35=original exaggerated, 0.1=subtle).",
-    "min_radius_px": 5,
+    "min_radius_px": 5.5,
     "outline": true,
-    "outline_width_px": 0.5,
+    "outline_width_px": 0.66,
     "height_boost_per_metre": 0.5
   },
   "action_icons": {
@@ -63,7 +63,7 @@
     "show_rolling": true,
     "show_bounced": true,
     "offset_px": 2,
-    "width_px": 1,
+    "width_px": 2,
     "color_flying": [180, 230, 255],
     "color_rolling": [180, 255, 180],
     "color_bounced": [255, 210, 80]

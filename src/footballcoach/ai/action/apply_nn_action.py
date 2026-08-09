@@ -2,7 +2,7 @@
 
 This module is the ONLY point where neural network outputs touch engine state.
 It sets player.desired_direction, player.desired_speed_mode, calls
-player.kick_direct(), and sets player.tackle_armed.
+player.kick_with_direction(), and sets player.tackle_armed.
 
 No Orders are created here. Orders exist for the rules-based AI only.
 The only connection between Orders and the neural network is that BC labels
@@ -68,21 +68,22 @@ def apply_action_to_player(
         player.desired_speed_mode = SpeedMode.STANDSTILL
 
     # --- Kick: immediate physics via 3D direction, no ballistic solve ---
+    # Fires only when the player actually has the ball; if not (e.g. cached gating
+    # while chasing), the call is a silent no-op — kick_with_direction checks
+    # possessed_by internally. First-touch difficulty is applied automatically
+    # by kick_with_direction when the player is in CONTROLLING_BALL state.
     if gating.kick_this_tick:
-        if match.ball.possessed_by == player.player_id:
-            kick_dir = gating.kick_direction
-            if kick_dir is not None and np.linalg.norm(kick_dir) > 1e-6:
-                direction_3d = Vector3(float(kick_dir[0]), float(kick_dir[1]), float(kick_dir[2]))
-            else:
-                direction_3d = Vector3(1.0, 0.0, 0.0)  # safe fallback, should not occur
-            player.kick_with_direction(
-                match,
-                direction_3d,
-                float(gating.kick_power_fraction) if gating.kick_power_fraction > 0 else 0.85,
-                Vector3(*gating.kick_spin) if gating.kick_spin is not None else Vector3.zero(),
-            )
+        kick_dir = gating.kick_direction
+        if kick_dir is not None and np.linalg.norm(kick_dir) > 1e-6:
+            direction_3d = Vector3(float(kick_dir[0]), float(kick_dir[1]), float(kick_dir[2]) if len(kick_dir) > 2 else 0.0)
         else:
-            return OrderTranslationResult(illegal_action=True, illegal_reason="kick_without_possession")
+            direction_3d = Vector3(1.0, 0.0, 0.0)  # safe fallback, should not occur
+        player.kick_with_direction(
+            match,
+            direction_3d,
+            float(gating.kick_power_fraction) if gating.kick_power_fraction > 0 else 0.85,
+            Vector3(*gating.kick_spin) if gating.kick_spin is not None else Vector3.zero(),
+        )
 
     # --- Tackle: arm intent; _check_armed_tackles resolves on contact ---
     # Target slot is not used — the engine finds the ball carrier directly.

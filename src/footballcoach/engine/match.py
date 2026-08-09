@@ -36,7 +36,7 @@ from footballcoach.engine.movement import (
     regen_stamina,
     step_player_towards,
 )
-from footballcoach.engine.possession import ControlTimeParams, control_time_s
+from footballcoach.engine.possession import ControlTimeParams, control_time_s, compute_difficulty
 from footballcoach.engine.scoring import Scoreboard, check_goal
 from footballcoach.engine.tackling import TacklingParams, apply_tackle_result, attempt_tackle, tackle_angle_modifier
 from footballcoach.entities.ball import Ball
@@ -391,6 +391,9 @@ class Match:
                 continue
 
             relative_speed = (self.ball.velocity - player.velocity).length()
+            player.firsttime_difficulty = compute_difficulty(
+                self.control_time_params, self.ball.height_m, relative_speed, player.speed_mps
+            )
             t_control = control_time_s(
                 self.control_time_params,
                 self.ball.height_m,

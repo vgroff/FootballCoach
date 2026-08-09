@@ -309,10 +309,14 @@ class PPOTrainer:
         self.target_kl = float(ppo_cfg.get("target_kl", 0.02))
         self.rollout_steps = int(ppo_cfg.get("rollout_steps", 2048))
         self.dir_l2_coef = float(ppo_cfg.get("dir_l2_coef", 0.01))
-        self.dir_log_std_min = float(ppo_cfg.get("dir_log_std_min", -5.0))
-        self.dir_log_std_max = float(ppo_cfg.get("dir_log_std_max", 2.0))
-        self.dir_log_std_target = float(ppo_cfg.get("dir_log_std_target", self.dir_log_std_min))
-        self.dir_log_std_reg_coef = float(ppo_cfg.get("dir_log_std_reg_coef", 0.0))
+        self.move_dir_log_std_min = float(ppo_cfg.get("move_dir_log_std_min", ppo_cfg.get("dir_log_std_min", -5.0)))
+        self.move_dir_log_std_max = float(ppo_cfg.get("move_dir_log_std_max", ppo_cfg.get("dir_log_std_max", 2.0)))
+        self.move_dir_log_std_target = float(ppo_cfg.get("move_dir_log_std_target", ppo_cfg.get("dir_log_std_target", self.move_dir_log_std_min)))
+        self.move_dir_log_std_reg_coef = float(ppo_cfg.get("move_dir_log_std_reg_coef", ppo_cfg.get("dir_log_std_reg_coef", 0.0)))
+        self.kick_dir_log_std_min = float(ppo_cfg.get("kick_dir_log_std_min", ppo_cfg.get("dir_log_std_min", -5.0)))
+        self.kick_dir_log_std_max = float(ppo_cfg.get("kick_dir_log_std_max", ppo_cfg.get("dir_log_std_max", 2.0)))
+        self.kick_dir_log_std_target = float(ppo_cfg.get("kick_dir_log_std_target", ppo_cfg.get("dir_log_std_target", self.kick_dir_log_std_min)))
+        self.kick_dir_log_std_reg_coef = float(ppo_cfg.get("kick_dir_log_std_reg_coef", ppo_cfg.get("dir_log_std_reg_coef", 0.0)))
         self.ent_dir_weight = float(ppo_cfg.get("ent_dir_weight", 1.0))
         self.augment_n_slot_shuffles = int(ppo_cfg.get("augment_n_slot_shuffles", 0))
         self.rollout_eval_trials = int(ppo_cfg.get("rollout_eval_trials", 10))
@@ -431,14 +435,20 @@ class PPOTrainer:
             # named_parameters() also yields with their attribute names).
             direction_param_ids = set()
             direction_params = []
+            move_dir_param_ids = set()
+            move_dir_params = []
+            kick_dir_param_ids = set()
+            kick_dir_params = []
             for name, p in execution_net.named_parameters():
                 if id(p) in value_param_ids:
                     continue
-                if name.startswith(("move_direction.", "kick_direction.")) or name in (
-                    "move_dir_log_std", "kick_dir_log_std",
-                ):
-                    direction_params.append(p)
-                    direction_param_ids.add(id(p))
+                if name.startswith("move_direction.") or name == "move_dir_log_std":
+                    move_dir_params.append(p)
+                    move_dir_param_ids.add(id(p))
+                elif name.startswith("kick_direction.") or name == "kick_dir_log_std":
+                    kick_dir_params.append(p)
+                    kick_dir_param_ids.add(id(p))
+            direction_param_ids = move_dir_param_ids | kick_dir_param_ids
             self.direction_param_ids = direction_param_ids
             policy_params = [
                 p for p in list(decision_net.parameters()) + list(execution_net.parameters())
@@ -448,11 +458,14 @@ class PPOTrainer:
             # value_head/value_ai_type_channel are dead weight (never used --
             # self.value_net is the sole critic below), so exclude them from
             # the main optimizer entirely rather than training an unused head.
+            _kick_dir_lr_raw = ppo_cfg.get("kick_direction_learning_rate", None)
+            kick_dir_lr = float(_kick_dir_lr_raw) if _kick_dir_lr_raw is not None else direction_lr
             if self.separate_value_net:
                 self.optimizer = torch.optim.Adam(
                     [
                         {"params": policy_params, "lr": lr, "name": "policy"},
-                        {"params": direction_params, "lr": direction_lr, "name": "direction"},
+                        {"params": move_dir_params, "lr": direction_lr, "name": "move_direction"},
+                        {"params": kick_dir_params, "lr": kick_dir_lr, "name": "kick_direction"},
                     ],
                     eps=1e-5,
                 )
@@ -465,7 +478,8 @@ class PPOTrainer:
                     [
                         {"params": policy_params, "lr": lr, "name": "policy"},
                         {"params": value_params, "lr": value_lr, "name": "value", "weight_decay": value_weight_decay},
-                        {"params": direction_params, "lr": direction_lr, "name": "direction"},
+                        {"params": move_dir_params, "lr": direction_lr, "name": "move_direction"},
+                        {"params": kick_dir_params, "lr": kick_dir_lr, "name": "kick_direction"},
                     ],
                     eps=1e-5,
                 )
@@ -1734,11 +1748,11 @@ class PPOTrainer:
                         cos_vals = (pred_n * tgt_dir).sum(dim=-1)
                         dir_cosines.append(cos_vals.mean().item())
                     kicked_mask = valid_mask & (bc_labels[:, 12] > 0.5)  # _I_KICK_THIS_TICK
-                    has_kick_dir = (bc_labels[:, 18].abs() + bc_labels[:, 19].abs()) > 1e-6  # _I_KICK_DIR_X/Y
+                    has_kick_dir = (bc_labels[:, 18].abs() + bc_labels[:, 19].abs() + bc_labels[:, 24].abs()) > 1e-6  # _I_KICK_DIR_X/Y/Z
                     ksel = kicked_mask & has_kick_dir
                     if ksel.any():
                         pred_kdir = e_heads.kick_direction[ksel]
-                        tgt_kdir = bc_labels[ksel, 18:20]
+                        tgt_kdir = torch.stack([bc_labels[ksel, 18], bc_labels[ksel, 19], bc_labels[ksel, 24]], dim=-1)
                         eps = 1e-6
                         pred_kn = pred_kdir / (pred_kdir.norm(dim=-1, keepdim=True) + eps)
                         kcos_vals = (pred_kn * tgt_kdir).sum(dim=-1)
@@ -1983,11 +1997,11 @@ class PPOTrainer:
                             pred_n = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
                             dir_cosines_r.append((pred_n * tgt_dir).sum(dim=-1).mean().item())
                         kicked_mask_r = valid_mask & (bc_labels[:, 12] > 0.5)  # _I_KICK_THIS_TICK
-                        has_kick_dir_r = (bc_labels[:, 18].abs() + bc_labels[:, 19].abs()) > 1e-6
+                        has_kick_dir_r = (bc_labels[:, 18].abs() + bc_labels[:, 19].abs() + bc_labels[:, 24].abs()) > 1e-6
                         ksel_r = kicked_mask_r & has_kick_dir_r
                         if ksel_r.any():
                             pred_kdir_r = e_r.kick_direction[ksel_r]
-                            tgt_kdir_r = bc_labels[ksel_r, 18:20]
+                            tgt_kdir_r = torch.stack([bc_labels[ksel_r, 18], bc_labels[ksel_r, 19], bc_labels[ksel_r, 24]], dim=-1)
                             eps = 1e-6
                             pred_kn_r = pred_kdir_r / (pred_kdir_r.norm(dim=-1, keepdim=True) + eps)
                             kick_dir_cosines_r.append((pred_kn_r * tgt_kdir_r).sum(dim=-1).mean().item())
@@ -2588,11 +2602,15 @@ class PPOTrainer:
     # Policy sampling
     # -----------------------------------------------------------------------
 
-    def _dir_head(self, raw_vec: torch.Tensor, log_std_param: torch.Tensor) -> "DirectionHead":
-        """Construct a DirectionHead with config-driven log_std clamp bounds."""
+    def _move_dir_head(self, raw_vec: torch.Tensor, log_std_param: torch.Tensor) -> "DirectionHead":
         return DirectionHead(raw_vec, log_std_param,
-                             log_std_min=self.dir_log_std_min,
-                             log_std_max=self.dir_log_std_max)
+                             log_std_min=self.move_dir_log_std_min,
+                             log_std_max=self.move_dir_log_std_max)
+
+    def _kick_dir_head(self, raw_vec: torch.Tensor, log_std_param: torch.Tensor) -> "DirectionHead":
+        return DirectionHead(raw_vec, log_std_param,
+                             log_std_min=self.kick_dir_log_std_min,
+                             log_std_max=self.kick_dir_log_std_max)
 
     def _per_head_new_log_probs(self, d_heads, e_heads, mb_actions: dict, exists_mask) -> torch.Tensor:
         """Per-sample, per-head log_prob under the CURRENT policy for stored
@@ -2614,12 +2632,12 @@ class PPOTrainer:
         kick_mask = (mb_actions["kick"].squeeze(-1) > 0.5).float()
 
         lp_move_dir = exec_move_mask * (
-            self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).log_prob(
+            self.ent_dir_weight * self._move_dir_head(e_heads.move_direction, log_std_move).log_prob(
                 mb_actions["move_dir_raw"]
             )
         )
         lp_kick_dir = kick_mask * (
-            self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+            self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_std_kick).log_prob(
                 mb_actions["kick_dir_raw"]
             )
         )
@@ -2732,8 +2750,8 @@ class PPOTrainer:
         eps = 1e-6
         log_std_move = self.execution_net.move_dir_log_std
         log_std_kick = self.execution_net.kick_dir_log_std
-        move_dir_raw = self._dir_head(e_heads.move_direction, log_std_move).sample_raw()  # (1, 2)
-        kick_dir_raw = self._dir_head(e_heads.kick_direction, log_std_kick).sample_raw()   # (1, 3)
+        move_dir_raw = self._move_dir_head(e_heads.move_direction, log_std_move).sample_raw()  # (1, 2)
+        kick_dir_raw = self._kick_dir_head(e_heads.kick_direction, log_std_kick).sample_raw()   # (1, 3)
         move_dir_phys = (move_dir_raw / (move_dir_raw.norm(dim=-1, keepdim=True) + eps)).squeeze(0)
         kick_dir_phys = (kick_dir_raw / (kick_dir_raw.norm(dim=-1, keepdim=True) + eps)).squeeze(0)
 
@@ -2801,9 +2819,9 @@ class PPOTrainer:
             float(IndependentBernoulli(e_heads.kick_logit).log_prob(kick).sum()),
             float(IndependentBernoulli(e_heads.tackle_attempt_logit).log_prob(tackle_attempt).sum()),
             # move_dir: only when exec_move=True
-            float(self.ent_dir_weight * self._dir_head(e_heads.move_direction, _lsm).log_prob(move_dir_raw)) if _exec_move_active else 0.0,
+            float(self.ent_dir_weight * self._move_dir_head(e_heads.move_direction, _lsm).log_prob(move_dir_raw)) if _exec_move_active else 0.0,
             # kick_dir: only when kick=True
-            float(self.ent_dir_weight * self._dir_head(e_heads.kick_direction, _lsk).log_prob(kick_dir_raw)) if _kick_active else 0.0,
+            float(self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, _lsk).log_prob(kick_dir_raw)) if _kick_active else 0.0,
         ], dtype=np.float32)
 
         # Build DecisionAction for storage
@@ -2908,12 +2926,12 @@ class PPOTrainer:
         # sprint + move_dir: only when exec_move=True (player was moving)
         if float(samples["exec_move"]) > 0.5:
             lp += IndependentBernoulli(e_heads.sprint_logit).log_prob(samples["sprint"]).sum()
-            lp += self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).log_prob(
+            lp += self.ent_dir_weight * self._move_dir_head(e_heads.move_direction, log_std_move).log_prob(
                 samples["move_dir_raw"]
             )
         # kick_dir: only when kick=True (a kick was taken)
         if float(samples["kick"]) > 0.5:
-            lp += self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+            lp += self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_std_kick).log_prob(
                 samples["kick_dir_raw"]
             )
 
@@ -3100,8 +3118,8 @@ class PPOTrainer:
                         lp_tackle_a = _blp(e_heads.tackle_attempt_logit, "tackle_attempt")
                         log_std_move = self.execution_net.move_dir_log_std.to(self.device)
                         log_std_kick = self.execution_net.kick_dir_log_std.to(self.device)
-                        lp_movedir  = self._dir_head(e_heads.move_direction, log_std_move).log_prob(mb_actions["move_dir_raw"]).mean().item()
-                        lp_kickdir  = self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(mb_actions["kick_dir_raw"]).mean().item()
+                        lp_movedir  = self._move_dir_head(e_heads.move_direction, log_std_move).log_prob(mb_actions["move_dir_raw"]).mean().item()
+                        lp_kickdir  = self._kick_dir_head(e_heads.kick_direction, log_std_kick).log_prob(mb_actions["kick_dir_raw"]).mean().item()
                         lp_new_mb   = new_log_probs.mean().item()
                         lp_old_mb   = mb_old_lp.mean().item()
                         ratio_mb    = torch.exp(new_log_probs - mb_old_lp)
@@ -3163,18 +3181,17 @@ class PPOTrainer:
                 # see ai_trainer_knowledge.md / DirectionHead for the clamp mechanism).
                 # Coefficient 0.0 (default) fully disables this — opt-in.
                 dir_log_std_reg = torch.zeros(1, device=self.device)
-                if self.dir_log_std_reg_coef > 0.0:
-                    _lsm_raw = self.execution_net.move_dir_log_std
-                    _lsk_raw = self.execution_net.kick_dir_log_std
-                    dir_log_std_reg = (
-                        ((_lsm_raw - self.dir_log_std_target) ** 2).mean()
-                        + ((_lsk_raw - self.dir_log_std_target) ** 2).mean()
-                    )
+                _lsm_raw = self.execution_net.move_dir_log_std
+                _lsk_raw = self.execution_net.kick_dir_log_std
+                if self.move_dir_log_std_reg_coef > 0.0:
+                    dir_log_std_reg = dir_log_std_reg + self.move_dir_log_std_reg_coef * ((_lsm_raw - self.move_dir_log_std_target) ** 2).mean()
+                if self.kick_dir_log_std_reg_coef > 0.0:
+                    dir_log_std_reg = dir_log_std_reg + self.kick_dir_log_std_reg_coef * ((_lsk_raw - self.kick_dir_log_std_target) ** 2).mean()
 
                 total_loss = (policy_loss
                               + self.vf_coef * value_loss
                               - self.ent_coef * entropy
-                              + self.dir_log_std_reg_coef * dir_log_std_reg)
+                              + dir_log_std_reg)
 
                 # BC auxiliary loss (decision + execution, annealed to 0)
                 bc_loss_val = torch.zeros(1, device=self.device)
@@ -3269,8 +3286,8 @@ class PPOTrainer:
                     # Actual KL contribution from move_direction (now included in ratio).
                     _stored_raw_mb = mb_actions["move_dir_raw"]
                     _log_std_move  = self.execution_net.move_dir_log_std.to(self.device)
-                    _lp_movedir_before = self._dir_head(e_heads.move_direction, _log_std_move).log_prob(_stored_raw_mb)
-                    _lp_movedir_after  = self._dir_head(e_after.move_direction, _log_std_move).log_prob(_stored_raw_mb)
+                    _lp_movedir_before = self._move_dir_head(e_heads.move_direction, _log_std_move).log_prob(_stored_raw_mb)
+                    _lp_movedir_after  = self._move_dir_head(e_after.move_direction, _log_std_move).log_prob(_stored_raw_mb)
                     movedir_hyp_kl = (_lp_movedir_before - _lp_movedir_after).mean().item()
 
                     # --- AFTER the optimiser step: per-head KL, continuous head
@@ -3612,8 +3629,8 @@ class PPOTrainer:
                     lp_hold_d = torch.zeros_like(lp_hold_d)
                 _lsm = self.execution_net.move_dir_log_std.to(self.device)
                 _lsk = self.execution_net.kick_dir_log_std.to(self.device)
-                lp_mvdir_d  = self._dir_head(e_d.move_direction, _lsm).log_prob(diag_act["move_dir_raw"])
-                lp_kkdir_d  = self._dir_head(e_d.kick_direction, _lsk).log_prob(diag_act["kick_dir_raw"])
+                lp_mvdir_d  = self._move_dir_head(e_d.move_direction, _lsm).log_prob(diag_act["move_dir_raw"])
+                lp_kkdir_d  = self._kick_dir_head(e_d.kick_direction, _lsk).log_prob(diag_act["kick_dir_raw"])
                 # Gate sub-parameter heads by their parent action, matching
                 # _compute_log_prob/_recompute_log_prob — otherwise kick_dir/sprint/
                 # move_dir noise from never-taken actions (e.g. kick=0 the entire
@@ -4008,12 +4025,12 @@ class PPOTrainer:
         kick_mask = (mb_actions["kick"].squeeze(-1) > 0.5).float()
         lp += exec_move_mask * _b(e_heads.sprint_logit, "sprint")
         lp += exec_move_mask * (
-            self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).log_prob(
+            self.ent_dir_weight * self._move_dir_head(e_heads.move_direction, log_std_move).log_prob(
                 mb_actions["move_dir_raw"]
             )
         )
         lp += kick_mask * (
-            self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+            self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_std_kick).log_prob(
                 mb_actions["kick_dir_raw"]
             )
         )
@@ -4044,8 +4061,8 @@ class PPOTrainer:
         p_exec_move = torch.sigmoid(e_heads.exec_move_logit).mean()
         p_kick = torch.sigmoid(e_heads.kick_logit).mean()
         ent += p_exec_move * IndependentBernoulli(e_heads.sprint_logit).entropy().mean()
-        ent += p_exec_move * self.ent_dir_weight * self._dir_head(e_heads.move_direction, log_std_move).entropy().mean()
-        ent += p_kick * self.ent_dir_weight * self._dir_head(e_heads.kick_direction, log_std_kick).entropy().mean()
+        ent += p_exec_move * self.ent_dir_weight * self._move_dir_head(e_heads.move_direction, log_std_move).entropy().mean()
+        ent += p_kick * self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_std_kick).entropy().mean()
         return ent
 
     # -----------------------------------------------------------------------

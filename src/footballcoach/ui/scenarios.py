@@ -1660,6 +1660,14 @@ class ScenarioLoop:
     linger_s: float = field(
         default_factory=lambda: load_gameplay_config().get("ui", {}).get("scenario_linger_s", 3.0)
     )
+    terminal_outcomes: frozenset | None = None
+    """Allowlist of outcome keys that may actually end a trial.  Any outcome
+    returned by ``_trial_outcome`` that is *not* in this set is silently
+    suppressed — the episode continues until a permitted outcome fires or the
+    env's own timeout triggers.  ``None`` (default) permits all outcomes,
+    which is the correct behaviour for UI scenarios.  Phase-1 training passes
+    ``frozenset({"miss", "goal"})`` so that dispossessed/saved/stalemate/other
+    never terminate the loop; the env catches box-possession itself."""
 
     _trial_count: int = field(default=0, init=False, repr=False)
     _trial_tick: int = field(default=0, init=False, repr=False)
@@ -1740,6 +1748,10 @@ class ScenarioLoop:
                 self._ball_released = True
 
         outcome, linger = self._trial_outcome()
+        if (outcome is not None
+                and self.terminal_outcomes is not None
+                and outcome not in self.terminal_outcomes):
+            outcome = None
         if outcome is not None:
             if linger > 0.0:
                 self._pending_outcome = outcome

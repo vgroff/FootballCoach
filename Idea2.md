@@ -28,10 +28,12 @@ Current notes:
 - " read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
 - " read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md "
 - train blockers:
+    - Can it perfectly replicate a run it was trained on?
     - for a proper training run:
         - include neural opponents
         - (small) pretrain
-    - [] Why do they keep loosing the ball!!
+    - [] Need to be able to arm a kick! for first touch stuff
+        - [] examine the first touch params at some point
     - [] value netowrk fixed - can we switch back to not having a separate value network?
     - [] still getting very large policy ratios sometimes - check what is the contributing factor (Dont we already see this?)
     - [] get match logs for best performing (by reward) and "smartest" (most adv, idk) runs each epoch

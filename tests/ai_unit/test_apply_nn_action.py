@@ -70,11 +70,12 @@ class TestKick:
         result = _apply(_gating(SelectedAction.NONE, kick=True), duel_match, "p1")
         assert not result.illegal_action
 
-    def test_kick_without_possession_illegal(self, duel_match):
-        """kick_this_tick=True but no possession -> illegal."""
+    def test_kick_without_possession_is_silent_noop(self, duel_match):
+        """kick_this_tick=True but no possession -> silent no-op, not illegal."""
+        p2 = duel_match.player_by_id("p2")
         result = _apply(_gating(SelectedAction.NONE, kick=True), duel_match, "p2")
-        assert result.illegal_action
-        assert "possession" in result.illegal_reason
+        assert not result.illegal_action
+        assert not p2.kicked_this_tick
 
     def test_no_kick_no_order_set(self, duel_match):
         """kick_this_tick=False -> current_order not touched by kick path."""

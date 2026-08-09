@@ -178,13 +178,20 @@ class ScenarioEnv:
         # Inject sim_dt_s so build functions can pass it to Match.
         # This has no effect on builds that don't accept it (e.g. phase 2).
         build_kwargs = {**self.scenario_kwargs, "sim_dt_s": self._dt_s}
+        # terminal_outcomes: phase 1 only allows "miss"/"goal" to terminate
+        # the loop; everything else (dispossessed, saved, stalemate, "other")
+        # is suppressed so the episode runs until the env's own timeout or
+        # box-possession check fires. timeout_ticks=10**9 so the loop's
+        # internal timeout never races the env's authoritative one.
+        _terminal = frozenset({"miss", "goal"}) if self.phase == 1 else None
         self._loop = ScenarioLoop(
             definition=self.definition,
             max_trials=0,
             rng_reduction=self.rng_reduction,
             linger_s=self.linger_s,
             kwargs=build_kwargs,
-            timeout_ticks=int(self.max_episode_s / self._dt_s),
+            timeout_ticks=10**9,
+            terminal_outcomes=_terminal,
         )
         self._ema.reset()
         self._episode_ticks = 0

@@ -520,6 +520,7 @@ def kick_ball_from_direction(
     rng_reduction: float,
     rng: random.Random | None = None,
     params: KickingParams | None = None,
+    difficulty_multiplier: float = 1.0,
     kicker_velocity: Vector3 = Vector3.zero(),
     kicker_top_speed_mps: float = 0.0,
 ) -> None:
@@ -536,7 +537,7 @@ def kick_ball_from_direction(
     dir_precision_mult = running_direction_precision_multiplier(kicker_velocity, direction_unit3, params)
     effective_precision = kick_precision * dir_precision_mult
     effective_power = max(0.0, min(1.0, power_fraction)) * run_mult
-    sigma = kick_sigma_rad(params, effective_precision, effective_power, rng_reduction)
+    sigma = kick_sigma_rad(params, effective_precision, effective_power, rng_reduction) * difficulty_multiplier
     speed = max_kick_speed_mps(params, kick_power_attr) * max(0.0, min(1.0, power_fraction)) * run_mult
 
     horiz_len = direction_unit3.xy().length()

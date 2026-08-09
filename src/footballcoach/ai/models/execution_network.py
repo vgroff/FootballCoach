@@ -118,6 +118,7 @@ class ExecutionNetwork(nn.Module):
         decision_mlp_hidden: int = 64,
         trunk_hidden: int = 256,
         dir_log_std_init: float = -2.0,
+        kick_dir_log_std_init: Optional[float] = None,
         value_extra_hidden: int = 16,
         value_hidden_dim: int = 0,
         value_dropout: float = 0.0,
@@ -231,7 +232,8 @@ class ExecutionNetwork(nn.Module):
         # KL spikes if too tight: a 4° mean shift at σ=0.13 → ratio~50×.
         # Clamped during forward() to [dir_log_std_min, dir_log_std_max].
         self.move_dir_log_std = nn.Parameter(torch.full((1,), dir_log_std_init))
-        self.kick_dir_log_std = nn.Parameter(torch.full((1,), dir_log_std_init))
+        _kick_ls_init = kick_dir_log_std_init if kick_dir_log_std_init is not None else dir_log_std_init
+        self.kick_dir_log_std = nn.Parameter(torch.full((1,), _kick_ls_init))
         self.kick_power_log_std = nn.Parameter(torch.zeros(1))
         self.kick_spin_log_std = nn.Parameter(torch.zeros(3))
 
@@ -321,6 +323,7 @@ class ExecutionNetwork(nn.Module):
             decision_mlp_hidden=cfg["decision_mlp_hidden"],
             trunk_hidden=trunk,
             dir_log_std_init=ppo_cfg.get("dir_log_std_init", -2.0),
+            kick_dir_log_std_init=ppo_cfg.get("kick_dir_log_std_init", None),
             value_extra_hidden=cfg.get("value_extra_hidden", 16),
             value_hidden_dim=cfg.get("value_hidden_dim", 0),
             value_dropout=cfg.get("value_dropout", 0.0),

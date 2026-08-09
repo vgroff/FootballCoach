@@ -320,7 +320,7 @@ class Renderer:
             pygame.draw.circle(surface, self._ring_color_bounced, pos, _ring_r, self._ring_width_px)
         elif self._ring_show_flying and ball.position.z > 0.05 and ball.possessed_by is None:
             pygame.draw.circle(surface, self._ring_color_flying, pos, _ring_r, self._ring_width_px)
-        elif self._ring_show_rolling and ball.velocity.length_xy() > 0.05 and ball.possessed_by is None:
+        elif self._ring_show_rolling and ball.velocity.length_xy() > 0.05:
             pygame.draw.circle(surface, self._ring_color_rolling, pos, _ring_r, self._ring_width_px)
 
         # --- Dots: fixed points on the 3D ball surface, projected top-down ---
@@ -717,12 +717,12 @@ class Renderer:
             surface.blit(text, (box_x + 4, box_y + 3 + i * line_h))
 
         if show_linger:
-            # Hourglass / sand-timer progress bar above the bottom of the log box.
             bar_y = box_y + box_h - linger_h
             filled_w = max(2, int((box_w - 8) * linger_frac))
             pygame.draw.rect(surface, (40, 40, 60), (box_x + 4, bar_y + 3, box_w - 8, line_h - 4), border_radius=3)
             pygame.draw.rect(surface, style.HUD_ACCENT, (box_x + 4, bar_y + 3, filled_w, line_h - 4), border_radius=3)
-            label = self.hud_font.render("⏳ resetting…", True, style.HUD_TEXT)
+            outcome_str = getattr(game_log, "linger_outcome", None) or "resetting"
+            label = self.hud_font.render(f"⏳ {outcome_str}", True, style.HUD_TEXT)
             surface.blit(label, (box_x + 8, bar_y + 3))
 
     def draw_pause_notification(self, surface: pygame.Surface, message: str) -> None:
