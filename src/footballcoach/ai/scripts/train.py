@@ -530,6 +530,12 @@ def main() -> None:
     if not args.no_head_freeze and phase.frozen_heads:
         trainer.set_frozen_heads(phase.frozen_heads)
 
+    # Save pre-trained checkpoint so --from-pretrained can skip pretraining next time.
+    if not args.checkpoint and not args.from_pretrained:
+        _pretrained_path = checkpoint_dir / "checkpoint_pretrained.pt"
+        trainer._save_checkpoint_to(_pretrained_path)
+        log.info(f"Pre-trained checkpoint saved: {_pretrained_path}")
+
     # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0)
     aux_label_fn = None if (args.no_bc_aux or label_fn is None) else label_fn
     trainer.train(env, total_steps=args.total_steps, bc_label_fn=aux_label_fn, phase_id=args.phase)

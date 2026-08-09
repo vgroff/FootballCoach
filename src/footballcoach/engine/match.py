@@ -287,6 +287,8 @@ class Match:
             # set it fresh — see Player.kicked_this_tick docstring.
             player.kicked_this_tick = False
             player.tackle_armed = False
+            player.kick_armed = False
+            player.kick_armed_aim_point = None
             player.last_kick_direction = None
             player.last_kick_power_fraction = None
             player.last_kick_spin = None
@@ -415,10 +417,7 @@ class Match:
             player.velocity = player.velocity * self.movement_params.control_speed_multiplier
             # Display hint for the UI action-icon system (consumed by renderer, not engine logic).
             player.action_icon = "🧤" if player.is_goalkeeper else "✋"
-            return  # only one player starts controlling per tick (first come)
 
-    def _any_player_controlling_ball(self) -> bool:
-        return any(p.state == PlayerState.CONTROLLING_BALL for p in self.players)
 
     def _leading_pass_target(self, passer: Player, order: "PassOrder") -> Vector3:
         """If the PassOrder has a ``target_player_id``, leads the pass to

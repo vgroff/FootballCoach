@@ -28,12 +28,12 @@ Current notes:
 - " read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
 - " read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md "
 - train blockers:
-    - Can it perfectly replicate a run it was trained on?
-    - for a proper training run:
-        - include neural opponents
-        - (small) pretrain
-    - [] Need to be able to arm a kick! for first touch stuff
-        - [] examine the first touch params at some point
+    - Do a trianing run with no kicking?
+    - value loss kinda sucks - maybe because of kicking? maybe because it should be one network?
+        - Go back to separate value network?d
+        - Get the match logs of the worst predictions in the val set
+        - to a train/test set for val loss on rules-based demonstrations and see how it does
+    - always have the option of doing a small set to scenarios each time, say 100, so that we can really track progression?
     - [] value netowrk fixed - can we switch back to not having a separate value network?
     - [] still getting very large policy ratios sometimes - check what is the contributing factor (Dont we already see this?)
     - [] get match logs for best performing (by reward) and "smartest" (most adv, idk) runs each epoch

@@ -237,11 +237,12 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     # ShootOrder/KickOrder/PassOrder and was previously missed entirely,
     # causing recorded demonstrations to have zero "kick" labels despite
     # visible kicks in the UI. See Player.kicked_this_tick docstring.
-    kick_this_tick = 1.0 if player.kicked_this_tick else 0.0
+    kick_this_tick = 1.0 if (player.kicked_this_tick or player.kick_armed) else 0.0
     kick_direction = None
     kick_power_fraction = None
     kick_spin = None
     if player.kicked_this_tick:
+        # Actual kick this tick — use real post-physics values.
         if player.last_kick_direction is not None:
             kick_direction = np.array(
                 [player.last_kick_direction.x, player.last_kick_direction.y, player.last_kick_direction.z],
@@ -253,6 +254,14 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
                 [player.last_kick_spin.x, player.last_kick_spin.y, player.last_kick_spin.z],
                 dtype=np.float32,
             )
+    elif player.kick_armed and player.kick_armed_aim_point is not None:
+        # Approach tick: arm intent with estimated direction/power toward the pre-computed target.
+        _d = player.kick_armed_aim_point - player.position
+        _d_len = (_d.x**2 + _d.y**2 + _d.z**2) ** 0.5
+        if _d_len > 1e-6:
+            kick_direction = np.array([_d.x / _d_len, _d.y / _d_len, _d.z / _d_len], dtype=np.float32)
+        kick_power_fraction = player.kick_armed_power_fraction
+        kick_spin = np.zeros(3, dtype=np.float32)
     # tackle_attempt: ChaseTackleOrder always, OR GetPossessionOrder when tackle_armed
     # is True — set every tick during the approach by _run_get_possession_behaviour,
     # so BC sees tackle intent across the full approach, not only at contact range.

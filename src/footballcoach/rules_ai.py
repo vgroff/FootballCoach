@@ -72,6 +72,39 @@ class Phase1RulesAI(PlayerAI):
                 match._log_info(f"[AI] {player.player_id}: GetPossession")
             elif player.current_order.sprint != should_sprint:
                 player.current_order = GetPossessionOrder(sprint=should_sprint)
+            _arm_box_kick(player, match)
+
+
+def _arm_box_kick(player: Player, match: Match) -> None:
+    """Arm a push-kick toward the near box, as if possessing the ball right now.
+
+    Called every chase tick so BC sees kick intent throughout the approach.
+    """
+    from footballcoach.engine.kicking import max_kick_speed_mps
+    from footballcoach.engine.movement import effective_top_speed
+    from footballcoach.orders import _push_kick_params
+    pitch = match.pitch
+    if player.team == Team.LEFT:
+        aim_x = pitch.half_length - pitch.box_length_m / 2.0
+    else:
+        aim_x = -(pitch.half_length - pitch.box_length_m / 2.0)
+    aim_point = Vector3(aim_x, 0.0, 0.0)
+    push_dir = aim_point - player.position
+    if push_dir.length_xy() < 1e-6:
+        return
+    pk = _push_kick_params()
+    kick_dist = pk["dist_m"]
+    push_unit = push_dir.xy().normalized()
+    armed_aim = player.position + Vector3(push_unit.x * kick_dist, push_unit.y * kick_dist, 0.0)
+    sprint_speed = effective_top_speed(
+        match.movement_params, player.attributes.top_speed, player.stamina, has_ball=False,
+    )
+    max_kick = max_kick_speed_mps(match.kicking_params, player.attributes.kick_power)
+    power = min(1.0, sprint_speed * pk["speed_factor"] / max(max_kick, 0.1))
+    player.kick_armed = True
+    player.kick_armed_aim_point = armed_aim
+    player.kick_armed_power_fraction = power
+    player.kick_armed_spin = Vector3.zero()
 
 
 def _should_sprint_to_ball(player: Player, match: Match) -> bool:
@@ -126,6 +159,25 @@ def _should_sprint_to_ball(player: Player, match: Match) -> bool:
         opp_eta = sprint_eta(dist_opp, opp.speed_mps, opp_v_top, opp_accel)
         if opp_eta * match.order_params.sprint_to_ball_clearance_margin < eta_self_jog:
             return True  # opponent wins the race if we jog
+
+    # Sprint if the ball is heading out of bounds before we can jog there.
+    ball_vel_xy = match.ball.velocity.xy()
+    ball_speed_xy = ball_vel_xy.length()
+    if ball_speed_xy > 0.5 and match.ball.possessed_by is None:
+        pitch = match.pitch
+        t_out = float("inf")
+        bx, by = match.ball.position.x, match.ball.position.y
+        vx, vy = ball_vel_xy.x, ball_vel_xy.y
+        if abs(vx) > 1e-6:
+            tx = ((pitch.half_length if vx > 0 else -pitch.half_length) - bx) / vx
+            if tx > 0:
+                t_out = min(t_out, tx)
+        if abs(vy) > 1e-6:
+            ty = ((pitch.half_width if vy > 0 else -pitch.half_width) - by) / vy
+            if ty > 0:
+                t_out = min(t_out, ty)
+        if t_out * match.order_params.sprint_to_ball_clearance_margin < eta_self_jog:
+            return True  # ball leaves play before we can jog there
 
     # No opponents present — default to sprinting.
     return has_opponents is False

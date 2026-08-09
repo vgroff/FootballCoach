@@ -117,6 +117,7 @@ class Renderer:
 
         # Ball state rings
         _bsr = gcfg.get("ball_state_rings", {})
+        self._flying_min_height_m: float = float(_bsr.get("flying_min_height_above_ground_m", 0.01))
         self._ring_show_flying: bool = bool(_bsr.get("show_flying", True))
         self._ring_show_rolling: bool = bool(_bsr.get("show_rolling", True))
         self._ring_show_bounced: bool = bool(_bsr.get("show_bounced", True))
@@ -318,9 +319,9 @@ class Renderer:
         _ring_r = radius_px + self._ring_offset_px
         if self._ring_show_bounced and ball.just_bounced_timer_s > 0.0:
             pygame.draw.circle(surface, self._ring_color_bounced, pos, _ring_r, self._ring_width_px)
-        elif self._ring_show_flying and ball.position.z > 0.05 and ball.possessed_by is None:
+        elif self._ring_show_flying and ball.position.z > ball.radius_m + self._flying_min_height_m and ball.possessed_by is None:
             pygame.draw.circle(surface, self._ring_color_flying, pos, _ring_r, self._ring_width_px)
-        elif self._ring_show_rolling and ball.velocity.length_xy() > 0.05:
+        elif self._ring_show_rolling:
             pygame.draw.circle(surface, self._ring_color_rolling, pos, _ring_r, self._ring_width_px)
 
         # --- Dots: fixed points on the 3D ball surface, projected top-down ---
@@ -340,9 +341,10 @@ class Renderer:
             if wz < 0:
                 continue  # back hemisphere — hidden from top-down camera
             pygame.draw.circle(ds, (*self._spin_dot_color, 220), (sx, sy), dot_r)
-        # Mask: keep only pixels inside the ball circle (alpha-multiply with circle shape)
+        # Clip dots inside the outline so they don't bleed over the alpha border
         clip = pygame.Surface((pad * 2, pad * 2), pygame.SRCALPHA)
-        pygame.draw.circle(clip, (255, 255, 255, 255), (pad, pad), radius_px)
+        clip_r = max(1, radius_px - int(max(1, self._ball_outline_width)))
+        pygame.draw.circle(clip, (255, 255, 255, 255), (pad, pad), clip_r)
         ds.blit(clip, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
         surface.blit(ds, (pos[0] - pad, pos[1] - pad))
 

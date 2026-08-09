@@ -195,8 +195,13 @@ def test_kick_direct_captures_last_kick_fields():
 
     assert p1.kicked_this_tick is True
     assert p1.last_kick_direction is not None
-    assert p1.last_kick_direction.x == pytest.approx(1.0, abs=1e-6)
+    # last_kick_direction is the actual ball velocity direction (includes ballistic loft), not the aim vector.
+    # Aim is (+x, 0, 0) so x > 0, y ≈ 0, z > 0 (lofted arc), and vector is unit-length.
+    assert p1.last_kick_direction.x > 0.5
     assert p1.last_kick_direction.y == pytest.approx(0.0, abs=1e-6)
+    assert p1.last_kick_direction.z > 0.0
+    norm = (p1.last_kick_direction.x**2 + p1.last_kick_direction.y**2 + p1.last_kick_direction.z**2) ** 0.5
+    assert norm == pytest.approx(1.0, abs=1e-6)
     assert p1.last_kick_power_fraction is not None
     assert p1.last_kick_spin is spin
 

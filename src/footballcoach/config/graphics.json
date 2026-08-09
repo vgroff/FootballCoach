@@ -16,7 +16,7 @@
     "min_radius_px": 5.5,
     "outline": true,
     "outline_width_px": 0.66,
-    "height_boost_per_metre": 0.5
+    "height_boost_per_metre": 0.25
   },
   "action_icons": {
     "_comment": "linger_s: wall-clock seconds an action icon stays visible above a player after the action fires. font_size_px: point size of the icon font — keep small (10-14) or they'll dominate the screen.",
@@ -58,10 +58,11 @@
     "color": [30, 30, 30]
   },
   "ball_state_rings": {
-    "_comment": "Coloured indicator rings drawn around the ball to show its state. offset_px: how far outside the ball circle the ring sits. width_px: ring line width. Set show_flying/show_rolling/show_bounced to false to hide individual rings. Colors are [R,G,B]. bounce_duration_s: how long the amber bounce ring stays visible after a bounce (also controls physics.json just_bounced_display_duration_s if you want them in sync — but this one only affects the renderer display; to change the underlying timer duration edit physics.json).",
+    "_comment": "Coloured indicator rings drawn around the ball to show its state. offset_px: how far outside the ball circle the ring sits. width_px: ring line width. Set show_flying/show_rolling/show_bounced to false to hide individual rings. Colors are [R,G,B]. bounce_duration_s: how long the amber bounce ring stays visible after a bounce (also controls physics.json just_bounced_display_duration_s if you want them in sync — but this one only affects the renderer display; to change the underlying timer duration edit physics.json). flying_min_height_above_ground_m: margin above ball.radius_m at which the flying ring activates (0.01 = only genuinely airborne).",
     "show_flying": true,
     "show_rolling": true,
     "show_bounced": true,
+    "flying_min_height_above_ground_m": 0.01,
     "offset_px": 2,
     "width_px": 2,
     "color_flying": [180, 230, 255],

@@ -266,19 +266,19 @@ class TestBCLossFromTensor:
 
     def test_kick_direction_loss_zero_when_aligned(self):
         n = 1
-        kick_direction = np.array([1.0, 0.0], dtype=np.float32)
+        kick_direction = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         labels = _make_labels([BCLabel(kick_this_tick=1.0, kick_direction=kick_direction, valid=True)])
         d_heads, e_heads = _zeros_heads(n)
-        e_heads.kick_direction = torch.tensor([[1.0, 0.0]])
+        e_heads.kick_direction = torch.tensor([[1.0, 0.0, 0.0]])
         _, breakdown = bc_loss_from_tensor(labels, d_heads, e_heads, return_breakdown=True)
         assert breakdown["kick_direction"] == pytest.approx(0.0, abs=1e-4)
 
     def test_kick_direction_loss_max_when_opposite(self):
         n = 1
-        kick_direction = np.array([1.0, 0.0], dtype=np.float32)
+        kick_direction = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         labels = _make_labels([BCLabel(kick_this_tick=1.0, kick_direction=kick_direction, valid=True)])
         d_heads, e_heads = _zeros_heads(n)
-        e_heads.kick_direction = torch.tensor([[-1.0, 0.0]])
+        e_heads.kick_direction = torch.tensor([[-1.0, 0.0, 0.0]])
         direction_loss_weight = 3.0
         _, breakdown = bc_loss_from_tensor(
             labels, d_heads, e_heads, direction_loss_weight=direction_loss_weight,
@@ -289,10 +289,10 @@ class TestBCLossFromTensor:
     def test_kick_direction_loss_gated_on_kick_this_tick(self):
         """kick_direction present but kick_this_tick=0 -> no loss contribution."""
         n = 1
-        kick_direction = np.array([1.0, 0.0], dtype=np.float32)
+        kick_direction = np.array([1.0, 0.0, 0.0], dtype=np.float32)
         labels = _make_labels([BCLabel(kick_this_tick=0.0, kick_direction=kick_direction, valid=True)])
         d_heads, e_heads = _zeros_heads(n)
-        e_heads.kick_direction = torch.tensor([[-1.0, 0.0]])
+        e_heads.kick_direction = torch.tensor([[-1.0, 0.0, 0.0]])
         _, breakdown = bc_loss_from_tensor(labels, d_heads, e_heads, return_breakdown=True)
         assert breakdown["kick_direction"] == pytest.approx(0.0, abs=1e-4)
 

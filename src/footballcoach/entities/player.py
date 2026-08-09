@@ -80,6 +80,12 @@ class Player:
     kicked_this_tick: bool = field(default=False, repr=False, compare=False)
     # Set by GetPossessionOrder / neural AI; engine fires on_tackle on next contact.
     tackle_armed: bool = field(default=False, repr=False, compare=False)
+    # Set by rules AI / neural AI during approach; engine fires kick_direct on first-touch.
+    # Analogous to tackle_armed. Reset each tick in _process_orders.
+    kick_armed: bool = field(default=False, repr=False, compare=False)
+    kick_armed_aim_point: "Vector3 | None" = field(default=None, repr=False, compare=False)
+    kick_armed_power_fraction: float = field(default=0.85, repr=False, compare=False)
+    kick_armed_spin: "Vector3 | None" = field(default=None, repr=False, compare=False)
     # Set by _update_loose_ball_pickup when CONTROLLING_BALL begins; read by kick_direct/
     # kick_with_direction to inflate first-touch error automatically. 0.0 when not controlling.
     firsttime_difficulty: float = field(default=0.0, repr=False, compare=False)
