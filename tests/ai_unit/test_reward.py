@@ -153,7 +153,7 @@ class TestPhase1Reward:
             has_possession_now=False, gained_possession_this_step=False,
             ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
             illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1,
+            cfg={**_CFG1, "step_penalty": 0.0},
         )
         defaults.update(kwargs)
         total, comps, _prog_cum_after = phase1_reward(**defaults)
@@ -169,7 +169,7 @@ class TestPhase1Reward:
         _, comps = self._call()
         assert set(comps.keys()) == {
             "appr", "retr", "appr_sq", "hdg", "poss", "prog", "out", "ill",
-            "box", "spd", "lpos", "lterm", "tout", "prox", "stam",
+            "box", "spd", "lpos", "lterm", "tout", "prox", "stam", "step",
         }
 
     def test_total_always_equals_sum_of_components(self):
@@ -272,7 +272,7 @@ class TestPhase1Reward:
     def test_illegal_action_penalty(self):
         # illegal_action_penalty is 0.0 in the live config (disabled); override
         # locally so this test still exercises the penalty formula.
-        _cfg_ill = {**_CFG1, "illegal_action_penalty": -0.4}
+        _cfg_ill = {**_CFG1, "illegal_action_penalty": -0.4, "step_penalty": 0.0}
         total, comps, _ = phase1_reward(
             prev_ball_dist=1.0, curr_ball_dist=1.0,
             has_possession_now=False, gained_possession_this_step=False,
@@ -374,12 +374,13 @@ class TestPhase1Reward:
         delta — pass player_speed_mps=5.0, heading_cos_sim=1.0 to exercise it
         with the same 5.0 magnitude the old _delta-based test used.
         """
+        _cfg_additive = {**_CFG1, "step_penalty": 0.0}
         total, comps, _ = phase1_reward(
             prev_ball_dist=10.0, curr_ball_dist=5.0,
             has_possession_now=True, gained_possession_this_step=True,
             ball_progress_toward_goal_m=2.0, ball_went_out_after_touch=False,
             illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1, player_speed_mps=5.0, heading_cos_sim=1.0,
+            cfg=_cfg_additive, player_speed_mps=5.0, heading_cos_sim=1.0,
         )
         assert total == pytest.approx(sum(comps.values()), rel=1e-5)
         expected = (
@@ -450,6 +451,46 @@ class TestPhase1Reward:
         assert total_retreat_payout < 0.0
         assert total_retreat_payout >= -0.3 - 1e-6
         assert total_retreat_payout == pytest.approx(-0.3, rel=1e-3)
+
+    def test_step_penalty_fires_every_step(self):
+        """step_penalty is subtracted on every call including no-op steps."""
+        _cfg_step = {**_CFG1, "step_penalty": 0.05}
+        total, comps, _ = phase1_reward(
+            prev_ball_dist=5.0, curr_ball_dist=5.0,
+            has_possession_now=False, gained_possession_this_step=False,
+            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+            cfg=_cfg_step,
+        )
+        assert comps["step"] == pytest.approx(-0.05, rel=1e-5)
+        assert total == pytest.approx(-0.05, rel=1e-5)
+
+    def test_step_penalty_zero_when_disabled(self):
+        _cfg_no_step = {**_CFG1, "step_penalty": 0.0}
+        _, comps, _ = phase1_reward(
+            prev_ball_dist=5.0, curr_ball_dist=5.0,
+            has_possession_now=False, gained_possession_this_step=False,
+            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+            cfg=_cfg_no_step,
+        )
+        assert comps["step"] == pytest.approx(0.0, abs=1e-9)
+
+    def test_step_penalty_accumulates_over_episode(self):
+        """Over N steps the sum of step payouts equals -step_penalty * N."""
+        _cfg_step = {**_CFG1, "step_penalty": 0.01}
+        total_step = 0.0
+        cum_state: dict = {}
+        for _ in range(50):
+            _, comps, cum_state = phase1_reward(
+                prev_ball_dist=5.0, curr_ball_dist=5.0,
+                has_possession_now=False, gained_possession_this_step=False,
+                ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+                illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+                cfg=_cfg_step, cumulative_state=cum_state,
+            )
+            total_step += comps["step"]
+        assert total_step == pytest.approx(-0.5, rel=1e-5)
 
     def test_cumulative_state_missing_keys_default_to_zero(self):
         """Passing an empty/partial cumulative_state dict must not crash and

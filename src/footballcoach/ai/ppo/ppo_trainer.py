@@ -45,7 +45,7 @@ from footballcoach.ai.action.distributions import (
     SquashedNormalHead,
 )
 from footballcoach.ai.action.gating import select_action
-from footballcoach.ai.action.schema import DecisionAction, ExecutionAction
+from footballcoach.ai.action.schema import DecisionAction, DecisionHeadsRaw, ExecutionAction
 from footballcoach.ai.config import load_ai_config
 from footballcoach.ai.eval.seeded_eval import (
     default_eval_seeds,
@@ -59,6 +59,19 @@ from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer, HEAD_LP_KEYS
 from footballcoach.ai.ppo.schedules import TrainingSchedules
 
 log = logging.getLogger("footballcoach.ai.ppo")
+
+# DecisionHeadsRaw's field set is fixed at class-definition time -- caching this
+# once avoids a dataclasses.fields() reflection call every PPO/pretrain minibatch
+# (see the detach-for-separate-value-net call sites below).
+_DECISION_HEADS_FIELD_NAMES: tuple[str, ...] = tuple(f.name for f in dataclasses.fields(DecisionHeadsRaw))
+
+
+def _detach_decision_heads(d_heads: DecisionHeadsRaw) -> DecisionHeadsRaw:
+    """Return a copy of d_heads with every field detached (see separate_value_net)."""
+    return dataclasses.replace(
+        d_heads, **{name: getattr(d_heads, name).detach() for name in _DECISION_HEADS_FIELD_NAMES}
+    )
+
 
 # Reward component short-key → display label mapping (order = display order).
 # Used by both the per-rollout log and the pre-training diagnostic in train.py.
@@ -2585,11 +2598,7 @@ class PPOTrainer:
                 # the main value path's autograd graph (already freed by the
                 # .backward() call above).
                 if _sep_net is not None:
-                    d_heads_detached = dataclasses.replace(
-                        d_heads,
-                        **{f.name: getattr(d_heads, f.name).detach()
-                           for f in dataclasses.fields(d_heads)},
-                    )
+                    d_heads_detached = _detach_decision_heads(d_heads)
                     e_heads_sep = _sep_net(sf, of, em, bf, gf, d_heads_detached, sat, oat)
                     new_values_sep = e_heads_sep.value.squeeze(-1)
                     value_loss_sep = F.mse_loss(new_values_sep, mb_ret) / (ret_std ** 2)
@@ -3175,10 +3184,12 @@ class PPOTrainer:
                           for k in batch if k.startswith("obs/")}
                 mb_adv = adv[mb_idx].to(self.device)
                 # Advantage stats, BEFORE the optimiser step (this minibatch's slice).
-                all_adv_mean.append(mb_adv.mean().item())
-                all_adv_std.append(mb_adv.std().item())
-                all_adv_min.append(mb_adv.min().item())
-                all_adv_max.append(mb_adv.max().item())
+                # Single 4-element sync instead of 4 separate .item() calls (each forces one).
+                _adv_stats = torch.stack([mb_adv.mean(), mb_adv.std(), mb_adv.min(), mb_adv.max()]).tolist()
+                all_adv_mean.append(_adv_stats[0])
+                all_adv_std.append(_adv_stats[1])
+                all_adv_min.append(_adv_stats[2])
+                all_adv_max.append(_adv_stats[3])
                 mb_ret = returns[mb_idx].to(self.device)
                 mb_old_lp = old_log_probs[mb_idx].to(self.device)
                 # Normalised per-sample weights: sum to minibatch size so loss scale is stable
@@ -3212,11 +3223,7 @@ class PPOTrainer:
                 # into decision_net -- the whole point of separate_value_net is a
                 # critic trunk fully independent of the (BC-primed) policy trunk.
                 if self.separate_value_net:
-                    d_heads_for_value = dataclasses.replace(
-                        d_heads,
-                        **{f.name: getattr(d_heads, f.name).detach()
-                           for f in dataclasses.fields(d_heads)},
-                    )
+                    d_heads_for_value = _detach_decision_heads(d_heads)
                     e_heads_value = self.value_net(sf, of, em, bf, gf, d_heads_for_value, sat, oat)
                     new_values = e_heads_value.value.squeeze(-1)
                 else:

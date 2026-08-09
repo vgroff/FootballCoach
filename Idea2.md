@@ -28,6 +28,10 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md "
 - train blockers:
+    - !! [] !!
+        - okay, I'd still like you to fix those tsts. What 
+        - check the collision code - can it be made smarter somehow?
+        - once you're done, re-run the profiling
     - Plan: try with non-separate value net
     - lose possesion 0 in the debug value script is sus
     - Can value network predict with only immobiles? Should be easy AF
@@ -172,6 +176,11 @@ Mechanics
 
 Matches:
 - Could add some commentary kinda easily - e.g. pass happens, say a phrase like "X passes over to Y"
+
+Network architectures to try:
+- Try to fuck with attention - more heads and dims, more , different architectures, different things going into
+- try adding residual layers on the trunk layers (like layer 1 -> layer 2 and then have a layer 1 + layer 2 block)
+- Not sure I understand
 
 Coaching
 - Your players train their neural networks over time on actual data

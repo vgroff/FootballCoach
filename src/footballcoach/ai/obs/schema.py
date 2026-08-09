@@ -11,7 +11,7 @@ one source of truth.  Use ``PLAYER_FEATURE_DIM``, ``BALL_FEATURE_DIM``, and
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass, fields, astuple
+from dataclasses import dataclass, fields
 
 import numpy as np
 
@@ -89,7 +89,12 @@ class PlayerFeatures:
     pos_y: float = 0.0           # player.position.y / 34.0
 
     def to_array(self) -> np.ndarray:
-        return np.array(astuple(self), dtype=np.float32)
+        # vars(self).values() preserves field-declaration order (Python 3.7+ dict
+        # ordering) same as astuple(), but skips its recursive nested-tuple-copy
+        # machinery -- all fields here are plain floats, so that overhead is pure
+        # waste (astuple() showed up as a major hot spot in match-step profiling).
+        _vals = vars(self)
+        return np.fromiter(_vals.values(), dtype=np.float32, count=len(_vals))
 
 
 @dataclass
@@ -117,7 +122,9 @@ class BallFeatures:
     is_loose: float = 1.0        # 1 - is_possessed (redundant but explicit)
 
     def to_array(self) -> np.ndarray:
-        return np.array(astuple(self), dtype=np.float32)
+        # See PlayerFeatures.to_array() -- same astuple() -> vars().values() swap.
+        _vals = vars(self)
+        return np.fromiter(_vals.values(), dtype=np.float32, count=len(_vals))
 
 
 MAX_TASK_IDS: int = 20  # curriculum phase/task one-hot width (see ai_config.json observation.max_task_ids)
@@ -190,7 +197,9 @@ class GlobalFeatures:
     task_id_19: float = 0.0
 
     def to_array(self) -> np.ndarray:
-        return np.array(astuple(self), dtype=np.float32)
+        # See PlayerFeatures.to_array() -- same astuple() -> vars().values() swap.
+        _vals = vars(self)
+        return np.fromiter(_vals.values(), dtype=np.float32, count=len(_vals))
 
 
 # ---------------------------------------------------------------------------

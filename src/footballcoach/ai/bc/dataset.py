@@ -459,10 +459,10 @@ class DemonstrationDataset:
         """
         indices = self.valid_indices() if valid_only else np.arange(self._n)
         # Shuffle BLOCK order, not row order: indices is sorted, so shuffling
-        # rows would make every gather below (self._self_feat[idx], etc.)
-        # touch random, far-apart rows -- shuffling which contiguous block
-        # goes in which minibatch slot preserves random batch composition
-        # across epochs while keeping each gather a near-contiguous slice.
+        # rows BEFORE gathering would make every gather below (self._self_feat[idx],
+        # etc.) touch random, far-apart rows -- shuffling which contiguous block
+        # goes in which minibatch slot preserves random batch composition across
+        # epochs while keeping each gather a near-contiguous slice.
         block_starts = list(range(0, len(indices), batch_size))
         if shuffle:
             np.random.shuffle(block_starts)
@@ -473,17 +473,36 @@ class DemonstrationDataset:
             self_ai_type, other_ai_type = _build_ai_type_arrays(
                 self._labels[idx], self._exists_mask[idx]
             )
+            self_feat_t   = _to_tensor(self._self_feat[idx],   device)
+            other_feat_t  = _to_tensor(self._other_feat[idx],  device)
+            exists_mask_t = _to_tensor(self._exists_mask[idx], device)
+            ball_feat_t   = _to_tensor(self._ball_feat[idx],   device)
+            global_feat_t = _to_tensor(self._global_feat[idx], device)
+            self_ai_type_t  = _to_tensor(self_ai_type,  device)
+            other_ai_type_t = _to_tensor(other_ai_type, device)
+            ret_batch_t = _to_tensor(returns[idx], device)
+            if shuffle:
+                # Row order WITHIN the block is shuffled AFTER gathering (cheap,
+                # tensor-only permutation) so a dataset small enough to fit in one
+                # block (n <= batch_size) still randomizes row order every epoch --
+                # block-order shuffling alone is a no-op with only 1 block.
+                perm = torch.randperm(len(idx))
+                self_feat_t, other_feat_t, exists_mask_t, ball_feat_t, global_feat_t = (
+                    self_feat_t[perm], other_feat_t[perm], exists_mask_t[perm],
+                    ball_feat_t[perm], global_feat_t[perm],
+                )
+                self_ai_type_t, other_ai_type_t = self_ai_type_t[perm], other_ai_type_t[perm]
+                ret_batch_t = ret_batch_t[perm]
             obs_dict = {
-                "self_feat":   _to_tensor(self._self_feat[idx],   device),
-                "other_feat":  _to_tensor(self._other_feat[idx],  device),
-                "exists_mask": _to_tensor(self._exists_mask[idx], device),
-                "ball_feat":   _to_tensor(self._ball_feat[idx],   device),
-                "global_feat": _to_tensor(self._global_feat[idx], device),
-                "self_ai_type":  _to_tensor(self_ai_type,  device),
-                "other_ai_type": _to_tensor(other_ai_type, device),
+                "self_feat":   self_feat_t,
+                "other_feat":  other_feat_t,
+                "exists_mask": exists_mask_t,
+                "ball_feat":   ball_feat_t,
+                "global_feat": global_feat_t,
+                "self_ai_type":  self_ai_type_t,
+                "other_ai_type": other_ai_type_t,
             }
-            ret_batch = _to_tensor(returns[idx], device)
-            yield obs_dict, ret_batch
+            yield obs_dict, ret_batch_t
 
     def iterate_minibatches(
         self,
@@ -565,20 +584,42 @@ class DemonstrationDataset:
             self_ai_type, other_ai_type = _build_ai_type_arrays(
                 self._labels[idx], self._exists_mask[idx]
             )
+            self_feat_t   = _to_tensor(self._self_feat[idx],   device)
+            other_feat_t  = _to_tensor(self._other_feat[idx],  device)
+            exists_mask_t = _to_tensor(self._exists_mask[idx], device)
+            ball_feat_t   = _to_tensor(self._ball_feat[idx],   device)
+            global_feat_t = _to_tensor(self._global_feat[idx], device)
+            self_ai_type_t  = _to_tensor(self_ai_type,  device)
+            other_ai_type_t = _to_tensor(other_ai_type, device)
+            labels_t = _to_tensor(self._labels[idx], device)
+            returns_t = _to_tensor(returns[idx], device) if returns is not None else None
+            if shuffle:
+                # Row order WITHIN the block, shuffled AFTER gathering -- see
+                # iterate_minibatches_with_returns() above for why this is needed
+                # even with block-order shuffling (single-block datasets otherwise
+                # never randomize row order at all).
+                perm = torch.randperm(len(idx))
+                self_feat_t, other_feat_t, exists_mask_t, ball_feat_t, global_feat_t = (
+                    self_feat_t[perm], other_feat_t[perm], exists_mask_t[perm],
+                    ball_feat_t[perm], global_feat_t[perm],
+                )
+                self_ai_type_t, other_ai_type_t = self_ai_type_t[perm], other_ai_type_t[perm]
+                labels_t = labels_t[perm]
+                if returns_t is not None:
+                    returns_t = returns_t[perm]
             obs_dict = {
-                "self_feat":   _to_tensor(self._self_feat[idx],   device),
-                "other_feat":  _to_tensor(self._other_feat[idx],  device),
-                "exists_mask": _to_tensor(self._exists_mask[idx], device),
-                "ball_feat":   _to_tensor(self._ball_feat[idx],   device),
-                "global_feat": _to_tensor(self._global_feat[idx], device),
-                "self_ai_type":  _to_tensor(self_ai_type,  device),
-                "other_ai_type": _to_tensor(other_ai_type, device),
+                "self_feat":   self_feat_t,
+                "other_feat":  other_feat_t,
+                "exists_mask": exists_mask_t,
+                "ball_feat":   ball_feat_t,
+                "global_feat": global_feat_t,
+                "self_ai_type":  self_ai_type_t,
+                "other_ai_type": other_ai_type_t,
             }
-            labels = _to_tensor(self._labels[idx], device)
-            if returns is not None:
-                yield obs_dict, labels, _to_tensor(returns[idx], device)
+            if returns_t is not None:
+                yield obs_dict, labels_t, returns_t
             else:
-                yield obs_dict, labels
+                yield obs_dict, labels_t
 
     def sample_batch(
         self,

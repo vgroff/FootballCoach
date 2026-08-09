@@ -95,14 +95,19 @@ def _damp_overlap_velocity(
         player_b.velocity = player_b.velocity + direction * reduction_b
 
 
-def resolve_player_overlap(player_a: Player, player_b: Player) -> None:
-    """Mutates both players' positions to resolve any overlap between them."""
+def resolve_player_overlap(player_a: Player, player_b: Player) -> bool:
+    """Mutates both players' positions to resolve any overlap between them.
+
+    Returns True if the pair was overlapping (and was pushed apart), False
+    if they were already clear -- lets resolve_all_overlaps() skip further
+    iterations once a full pass finds nothing left to resolve.
+    """
     delta = player_b.position.xy() - player_a.position.xy()
     distance = delta.length()
     min_distance = player_a.radius_m + player_b.radius_m
 
     if distance >= min_distance:
-        return
+        return False
 
     if distance < 1e-9:
         # Degenerate case: identical positions, push apart along an arbitrary axis.
@@ -144,6 +149,7 @@ def resolve_player_overlap(player_a: Player, player_b: Player) -> None:
 
     player_a.position = player_a.position + push_a
     player_b.position = player_b.position + push_b
+    return True
 
 
 def resolve_all_overlaps(
@@ -166,13 +172,24 @@ def resolve_all_overlaps(
     params = collision_params or CollisionParams.from_config()
 
     for _ in range(iterations):
+        # Track whether this pass actually pushed anyone apart -- most ticks
+        # have zero overlapping pairs (players spread across the pitch), so
+        # running every configured iteration unconditionally wastes an O(n^2)
+        # pass for nothing. resolve_player_overlap() returning early on
+        # non-overlapping pairs is cheap, but skipping the whole 2nd+
+        # iteration when the 1st already found nothing to resolve avoids that
+        # cost entirely instead of merely making each individual check cheap.
+        any_overlap = False
         for i in range(len(players)):
             if players[i].is_inactive:
                 continue
             for j in range(i + 1, len(players)):
                 if players[j].is_inactive:
                     continue
-                resolve_player_overlap(players[i], players[j])
+                if resolve_player_overlap(players[i], players[j]):
+                    any_overlap = True
+        if not any_overlap:
+            break
 
     # Velocity damping — single pass over ALL pairs (active and inactive).
     # This is intentionally separate from the position push-apart loop above:
