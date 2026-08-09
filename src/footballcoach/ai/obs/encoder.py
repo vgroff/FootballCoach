@@ -15,6 +15,15 @@ Key design choices (from ai_design_doc.md section 7):
 
 ``time_remaining_s`` must be passed in by the caller (the env wrapper tracks
 the episode's remaining time; the engine only tracks elapsed ``time_s``).
+
+This module ALWAYS encodes in raw world/engine-frame coordinates — it does
+NOT apply the canonical-AI-frame mirror (observer's team always attacks
++x). That mirror is a thin wrapper applied at the network-forward boundary
+instead — see ``ai/obs/canonical.py`` — so recorded/returned observations
+stay in the same frame as the engine, match logs, and UI replays. Live
+rollout code and BC dataset consumers both call ``canonical.py``'s
+helpers immediately before/after using this encoder's output; this module
+itself must never be changed to bake in team-conditioned mirroring.
 """
 from __future__ import annotations
 
@@ -202,7 +211,10 @@ def _player_features(
     is_self: bool,
     is_immobile: bool = False,
 ) -> np.ndarray:
-    """Encode one player's feature vector relative to the observer."""
+    """Encode one player's feature vector relative to the observer, in raw
+    world/engine-frame coordinates (no canonical-frame mirroring — see
+    module docstring).
+    """
     dx = player.position.x - observer.position.x
     dy = player.position.y - observer.position.y
     dist = math.hypot(dx, dy)

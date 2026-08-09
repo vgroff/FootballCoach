@@ -143,18 +143,20 @@ AnyScenarioParam = ScenarioParam | ScenarioChoiceParam | ScenarioBoolParam
 # They are NOT forwarded to build(); app.py pops them before calling build().
 UNIVERSAL_PARAMS: list[AnyScenarioParam] = [
     ScenarioParam(
-        name="timeout_ticks",
-        label="Timeout (ticks, 30/s)",
-        min_value=50,
-        max_value=18000,
-        step=50,
-        default=800,
+        name="timeout_s",
+        label="Timeout (sim-seconds)",
+        min_value=1.0,
+        max_value=300.0,
+        step=1.0,
+        default=float(load_gameplay_config().get("ui", {}).get("scenario_timeout_s", 30.0)),
     ),
-    ScenarioChoiceParam(
+    ScenarioParam(
         name="sim_speed",
-        label="Sim speed",
-        choices=("1x", "2x", "4x", "8x"),
-        default="1x",
+        label="Sim speed (match-sec/real-sec)",
+        min_value=0.1,
+        max_value=32.0,
+        step=0.5,
+        default=1.0,
     ),
 ]
 
@@ -299,6 +301,33 @@ def build_sprint_scenario(
     )
     player.current_order = MoveOrder(target_position=waypoints[0], sprint=True)
     player.ai = SprintWaypointAI(waypoints, start_idx=1)
+    return match
+
+
+def build_goal_to_goal_sprint_scenario(
+    rng_reduction: float = 0.3,
+    *,
+    top_speed: float = 1.0,
+    acceleration: float = 1.0,
+) -> Match:
+    """Max-stat player sprints from one goal line to the other."""
+    pitch = Pitch.standard()
+    attrs = PlayerAttributes(
+        top_speed=top_speed, acceleration=acceleration, stamina=1.0,
+        kick_precision=0.5, kick_power=0.5, dribbling=0.5,
+        ball_control=0.5, tackling=0.5,
+    )
+    start = Vector3(-pitch.half_length, 0.0, 0.0)
+    target = Vector3(pitch.half_length, 0.0, 0.0)
+    player = Player.create("sprinter", Team.LEFT, attrs, position=start)
+    ball = Ball.at_rest(Vector3(0.0, pitch.half_width - 3.0, 0.0))
+    ui_cfg = load_gameplay_config().get("ui", {})
+    match = Match(
+        pitch=pitch, players=[player], ball=ball,
+        rng_reduction=rng_reduction, rng=random.Random(),
+        goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
+    )
+    player.current_order = MoveOrder(target_position=target, sprint=True, arrival_tolerance_m=1.0)
     return match
 
 
@@ -1537,6 +1566,17 @@ SCENARIOS: list[ScenarioDefinition] = [
             ScenarioParam("tackler_tackling_max", "Tackler tackling max", 0.0, 1.0, 0.05, 0.8),
             ScenarioParam("dribbler_dribbling_min", "Dribbler dribbling min", 0.0, 1.0, 0.05, 0.6),
             ScenarioParam("dribbler_dribbling_max", "Dribbler dribbling max", 0.0, 1.0, 0.05, 0.6),
+        ],
+    ),
+    ScenarioDefinition(
+        key="goal_to_goal_sprint",
+        label="Sprint: goal-to-goal (max stats)",
+        description="Max-stat player sprints from one goal line to the other (~105 m). Use to verify game speed.",
+        build=build_goal_to_goal_sprint_scenario,
+        on_tick=_sprint_on_tick,
+        params=[
+            ScenarioParam("top_speed", "Top speed attr", 0.0, 1.0, 0.05, 1.0),
+            ScenarioParam("acceleration", "Acceleration attr", 0.0, 1.0, 0.05, 1.0),
         ],
     ),
     ScenarioDefinition(

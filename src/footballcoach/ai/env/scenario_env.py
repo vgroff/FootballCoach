@@ -113,8 +113,12 @@ class ScenarioEnv:
         self._trial_done: bool = False
         self._episode_ticks: int = 0
         self._last_ball_dist: float = 0.0
-        self._start_ball_to_box_dist_m: float = 1.0
-        self._start_ball_dist_m: float = 1.0
+        # Cache of per-team attacking-box bounds (rx_min, rx_max, half_box_w) for
+        # _ball_dist_to_opponent_box() -- these depend only on pitch dims + team,
+        # both fixed for the lifetime of one episode's Match, but that function is
+        # called several times per step() for both trainee and secondary players.
+        # Cleared in reset() since a fresh Match/pitch is built each episode.
+        self._box_bounds_cache: dict = {}
         self._max_episode_ticks: int = 1
         self._ball_touched_by_trainee: bool = False
         self._trainee_had_possession_last_step: bool = False
@@ -137,8 +141,6 @@ class ScenarioEnv:
 
         # Per-secondary-player state
         self._sec_last_ball_dist: dict = {}
-        self._sec_start_ball_dist: dict = {}
-        self._sec_start_ball_to_box_dist_m: dict = {}
         self._sec_start_stamina: dict = {}
         self._sec_ball_touched: dict = {}
         # Per-secondary-player running UNCLAMPED cumulative-term state, see
@@ -197,14 +199,13 @@ class ScenarioEnv:
         self._episode_ticks = 0
         self._trial_done = False
         self._ball_touched_by_trainee = False
+        self._box_bounds_cache = {}
         self._prev_goal_count = (
             self._loop.match.scoreboard.left_goals,
             self._loop.match.scoreboard.right_goals,
         )
         self._last_ball_dist = self._ball_dist_to_trainee()
         self._max_episode_ticks = max(1, int(self.max_episode_s / self._dt_s))
-        self._start_ball_to_box_dist_m = self._ball_dist_to_opponent_box(self.trainee_player_id)
-        self._start_ball_dist_m = self._last_ball_dist
         self._trainee_had_possession_last_step = False
         self._trainee_pending_loss = False
         self._sec_had_possession_last_step = {pid: False for pid in self.secondary_player_ids}
@@ -267,13 +268,6 @@ class ScenarioEnv:
                 self._sec_ema[pid] = EMAFilter.from_config()
             self._sec_ema[pid].reset()
             self._sec_last_ball_dist[pid] = self._ball_dist_for_player(pid)
-            self._sec_start_ball_dist[pid] = self._sec_last_ball_dist[pid]
-            # Distance from the ball to THIS player's own attacking box (not
-            # the trainee's) — secondary players often attack the opposite
-            # end, so reusing self._start_ball_to_box_dist_m here would
-            # normalize prog/spd/prox against the wrong goal. See
-            # _ball_dist_to_opponent_box()'s player_id parameter.
-            self._sec_start_ball_to_box_dist_m[pid] = self._ball_dist_to_opponent_box(pid)
             self._sec_ball_touched[pid] = False
             # Record stamina at episode start for THIS secondary player, same
             # treatment as the trainee above — see
@@ -455,9 +449,9 @@ class ScenarioEnv:
         ball_went_out = trial_ended_this_step and outcome_this_step == "miss" and self._ball_touched_by_trainee
 
         # Ball progress toward opponent BOX (not raw goal-line x) — counts
-        # lateral movement into the box, consistent with start_ball_to_box_dist_m.
-        # Per-tick accumulated (see trainee_prog_accum init comment above),
-        # NOT a single start-vs-end-of-interval delta.
+        # lateral movement into the box. Per-tick accumulated (see
+        # trainee_prog_accum init comment above), NOT a single
+        # start-vs-end-of-interval delta.
         ball_progress = trainee_prog_accum
 
         # Reached opponent box with possession (phase 1 terminal — trainee wins)
@@ -508,8 +502,6 @@ class ScenarioEnv:
                 ball_went_out_after_touch=ball_went_out,
                 illegal_action_attempted=info.illegal_action,
                 reached_opponent_box_with_possession=box_terminal,
-                start_ball_dist_m=self._start_ball_dist_m,
-                start_ball_to_box_dist_m=self._start_ball_to_box_dist_m,
                 opponent_reached_trainee_box=opponent_box_terminal,
                 timed_out=timeout and not box_terminal and not opponent_box_terminal,
                 episode_done=box_terminal or opponent_box_terminal or timeout,
@@ -620,8 +612,6 @@ class ScenarioEnv:
                     ball_went_out_after_touch=sec_ball_went_out,
                     illegal_action_attempted=sec_player.ai.last_transition.get("illegal_action", False),
                     reached_opponent_box_with_possession=sec_box_terminal,
-                    start_ball_dist_m=self._sec_start_ball_dist.get(pid, 1.0),
-                    start_ball_to_box_dist_m=self._sec_start_ball_to_box_dist_m.get(pid, 1.0),
                     opponent_reached_trainee_box=box_terminal,  # from sec's POV, trainee winning = sec losing
                     timed_out=timeout and not sec_box_terminal and not box_terminal,
                     episode_done=sec_episode_done,
@@ -735,8 +725,6 @@ class ScenarioEnv:
         ball_went_out_after_touch: bool,
         illegal_action_attempted: bool,
         reached_opponent_box_with_possession: bool,
-        start_ball_dist_m: float,
-        start_ball_to_box_dist_m: float,
         opponent_reached_trainee_box: bool,
         timed_out: bool,
         episode_done: bool,
@@ -751,11 +739,11 @@ class ScenarioEnv:
         note. Do not call phase1_reward() directly from anywhere else in
         this file; route through this method instead, even if it means
         passing a few extra already-known values as kwargs. In particular,
-        every caller MUST pass player_id/start_ball_to_box_dist_m explicitly
-        — the trainee's own attacking box and a secondary player's own
-        attacking box are generally on OPPOSITE ends of the pitch, so
-        reusing one player's box-distance for another silently normalizes
-        their prog/spd/prox terms against the wrong goal.
+        every caller MUST pass player_id explicitly — the trainee's own
+        attacking box and a secondary player's own attacking box are
+        generally on OPPOSITE ends of the pitch, so reusing one player's
+        box-distance for another would compute prog/prox against the wrong
+        goal (see ball_dist_to_opponent_box_m below, resolved per player_id).
 
         Returns (reward, components, cumulative_state_after) — callers must
         store cumulative_state_after (per player) and pass it back in as
@@ -777,8 +765,6 @@ class ScenarioEnv:
             reached_opponent_box_with_possession=reached_opponent_box_with_possession,
             cfg=self._reward_cfg["phase1"],
             time_fraction_remaining=1.0 - self._episode_ticks / self._max_episode_ticks,
-            start_ball_to_box_dist_m=start_ball_to_box_dist_m,
-            start_ball_dist_m=start_ball_dist_m,
             opponent_reached_trainee_box=opponent_reached_trainee_box,
             timed_out=timed_out,
             ball_dist_to_opponent_box_m=(
@@ -811,15 +797,21 @@ class ScenarioEnv:
             m = match if match is not None else self._loop.match
             ball = m.ball.position
             player = m.player_by_id(player_id if player_id is not None else self.trainee_player_id)
-            pitch = m.pitch
-            half_box_w = pitch.box_width_m / 2.0
-            # Box x-range depends on which goal the player is attacking.
-            if player.team == Team.LEFT:
-                rx_min = pitch.half_length - pitch.box_length_m
-                rx_max = pitch.half_length
-            else:
-                rx_min = -pitch.half_length
-                rx_max = -pitch.half_length + pitch.box_length_m
+            bounds = self._box_bounds_cache.get(player.team)
+            if bounds is None:
+                # Depends only on pitch dims + team, both fixed for this episode's
+                # Match -- computed once per team per episode, not once per call.
+                pitch = m.pitch
+                half_box_w = pitch.box_width_m / 2.0
+                if player.team == Team.LEFT:
+                    rx_min = pitch.half_length - pitch.box_length_m
+                    rx_max = pitch.half_length
+                else:
+                    rx_min = -pitch.half_length
+                    rx_max = -pitch.half_length + pitch.box_length_m
+                bounds = (rx_min, rx_max, half_box_w)
+                self._box_bounds_cache[player.team] = bounds
+            rx_min, rx_max, half_box_w = bounds
             # Shortest distance from ball to axis-aligned rectangle.
             dx = max(rx_min - ball.x, 0.0, ball.x - rx_max)
             dy = max(-half_box_w - ball.y, 0.0, ball.y - half_box_w)

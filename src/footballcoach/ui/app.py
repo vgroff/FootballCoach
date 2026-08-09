@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pygame
 
-from footballcoach.config import load_graphics_config
+from footballcoach.config import load_graphics_config, load_gameplay_config
 from footballcoach.engine.match import Match
 from footballcoach.ui import scenarios, style
 from footballcoach.ui.camera import Camera
@@ -18,8 +18,6 @@ from footballcoach.ui.gamelog import GameLog, LogLevel
 from footballcoach.ui.input import MatchInputController, OrderMode
 from footballcoach.ui.renderer import Renderer
 from footballcoach.ui.scenarios import ScenarioBoolParam, ScenarioChoiceParam, ScenarioParam
-
-FPS = 60
 
 
 class Screen(Enum):
@@ -88,7 +86,21 @@ class App:
             pixels_per_metre=_cam_cfg.get("pixels_per_metre", 9.0),
             margin_px=int(_cam_cfg.get("margin_px", 40)),
         )
-        self.surface = pygame.display.set_mode((self.camera.screen_width, self.camera.screen_height))
+        self._target_fps: int = int(_gcfg.get("target_fps", 60))
+        _gpcfg = load_gameplay_config().get("ui", {})
+        self._physics_tick_hz: float = float(_gpcfg.get("physics_tick_hz", 30))
+        self._physics_acc_s: float = 0.0
+        self._fps_smooth: float = float(self._target_fps)
+
+        # SCALED lets SDL2 handle DPI/upscaling at hardware level instead of the OS compositor.
+        self.surface = pygame.display.set_mode((self.camera.screen_width, self.camera.screen_height), pygame.SCALED)
+        try:
+            desktop_sizes = pygame.display.get_desktop_sizes()
+            window_size = pygame.display.get_window_size()
+            ppm = _cam_cfg.get('pixels_per_metre', 9.0)
+            print(f"[UI] Desktop monitors: {desktop_sizes}  window size: {window_size}  logical surface: {self.camera.screen_width}x{self.camera.screen_height}  pixels_per_metre: {ppm}  physics_hz: {self._physics_tick_hz}  target_fps: {self._target_fps}")
+        except Exception as _e:
+            print(f"[UI] Display info unavailable: {_e}")
         self.clock = pygame.time.Clock()
         self.renderer = Renderer(self.camera)
 
@@ -123,10 +135,11 @@ class App:
         # Pending scenario params (Screen.SCENARIO_PARAMS state)
         self._scenario_params_ui = ScenarioParamsUIState()
 
-        # Simulation speed multiplier: physics steps per visual frame.
-        # Cycle with ] (faster) and [ (slower).
-        self._sim_speed: int = 1
-        self._SIM_SPEED_OPTIONS: tuple[int, ...] = (1, 2, 4, 8)
+        # Simulation speed in match-seconds per real-second (1.0 = real-time, 2.0 = 2x speed).
+        # Cycle with ] (faster) and [ (slower). Steps/frame = round(physics_tick_hz * speed / target_fps).
+        _default_sim_speed = float(load_gameplay_config().get("ui", {}).get("default_sim_speed", 2.0))
+        self._sim_speed: float = _default_sim_speed
+        self._SIM_SPEED_OPTIONS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
 
         # Training mode: neural control toggle for the trainee (see `N` hotkey
         # in _handle_keydown / _toggle_training_ai_mode). None = human control
@@ -146,10 +159,13 @@ class App:
 
     def run(self) -> None:
         while self.running:
-            dt_ms = self.clock.tick(FPS)
+            dt_ms = self.clock.tick(self._target_fps)
+            if dt_ms > 0:
+                # EMA smoothing (alpha≈0.05 gives ~20-frame lag, stable readout).
+                self._fps_smooth = 0.95 * self._fps_smooth + 0.05 * (1000.0 / dt_ms)
             self._handle_events()
             if self.screen == Screen.MATCH and self.match is not None:
-                self._step_match()
+                self._step_match(dt_ms / 1000.0)
             self._draw()
             pygame.display.flip()
         pygame.quit()
@@ -221,11 +237,14 @@ class App:
         elif key == pygame.K_n and self.is_training_mode:
             self._toggle_training_ai_mode()
         elif key == pygame.K_RIGHTBRACKET:
-            idx = self._SIM_SPEED_OPTIONS.index(self._sim_speed)
-            self._sim_speed = self._SIM_SPEED_OPTIONS[(idx + 1) % len(self._SIM_SPEED_OPTIONS)]
+            # Snap to nearest option then advance.
+            opts = self._SIM_SPEED_OPTIONS
+            idx = min(range(len(opts)), key=lambda i: abs(opts[i] - self._sim_speed))
+            self._sim_speed = opts[(idx + 1) % len(opts)]
         elif key == pygame.K_LEFTBRACKET:
-            idx = self._SIM_SPEED_OPTIONS.index(self._sim_speed)
-            self._sim_speed = self._SIM_SPEED_OPTIONS[(idx - 1) % len(self._SIM_SPEED_OPTIONS)]
+            opts = self._SIM_SPEED_OPTIONS
+            idx = min(range(len(opts)), key=lambda i: abs(opts[i] - self._sim_speed))
+            self._sim_speed = opts[(idx - 1) % len(opts)]
 
     def _handle_match_mouse_event(self, event: pygame.event.Event) -> None:
         if self.input_controller is None:
@@ -240,6 +259,8 @@ class App:
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
             if self.input_controller.kick_ui_state() is not None:
                 self.input_controller.regress_kick_ui()
+        elif event.type == pygame.MOUSEWHEEL:
+            self.input_controller.handle_mouse_wheel(event.y)
 
     def _handle_menu_click(self, pos: tuple[int, int]) -> None:
         item = self._menu_item_at(pos)
@@ -319,9 +340,9 @@ class App:
         if ui.definition is None:
             return
         kwargs = dict(ui.values)
-        timeout_ticks = int(kwargs.pop("timeout_ticks", 800))
-        sim_speed_str = kwargs.pop("sim_speed", "1x")
-        sim_speed = int(sim_speed_str.rstrip("x"))
+        timeout_s = float(kwargs.pop("timeout_s", 30.0))
+        timeout_ticks = max(1, round(timeout_s * self._physics_tick_hz))
+        sim_speed = float(kwargs.pop("sim_speed", 1.0))
         self._start_scenario(
             ui.definition,
             kwargs=kwargs,
@@ -366,13 +387,12 @@ class App:
         self._pause_notification = "Aiming kick — click to advance phases  ·  Esc/RClick cancel"
 
     def _on_kick_issued(self) -> None:
-        """Callback fired when the kick order is queued (after phase 3 click).
-
-        Game is already paused; just update the notification message.
-        """
-        self._pause_notification = "Kick queued — Space to execute"
+        """Callback fired immediately after the kick fires (phase 3 click)."""
+        self._pause_notification = "Kick fired — Space to resume"
 
     def _start_match(self, match: Match, label: str, is_training_mode: bool = False) -> None:
+        match.dt_s = 1.0 / self._physics_tick_hz
+        self._physics_acc_s = 0.0
         self.match = match
         self._wire_match_log(match)
         self._wire_player_icon_callbacks(match)
@@ -396,12 +416,14 @@ class App:
 
     def _start_scenario(
         self, definition: scenarios.ScenarioDefinition, kwargs: dict | None = None,
-        timeout_ticks: int = 800, sim_speed: int = 1,
+        timeout_ticks: int = 800, sim_speed: float = 1.0,
     ) -> None:
         """Builds a ScenarioLoop and begins the first trial."""
         self._sim_speed = sim_speed
         loop = scenarios.ScenarioLoop(definition=definition, kwargs=kwargs or {}, timeout_ticks=timeout_ticks)
         self._scenario_loop = loop
+        loop.match.dt_s = 1.0 / self._physics_tick_hz
+        self._physics_acc_s = 0.0
         self.match = loop.match
         self._wire_match_log(loop.match)
         self._wire_player_icon_callbacks(loop.match)
@@ -460,12 +482,14 @@ class App:
                 self._action_icons.record(player.player_id, player.action_icon, now_s)
                 player.action_icon = None
 
-    def _step_match(self) -> None:
+    def _step_match(self, dt_s: float) -> None:
         assert self.match is not None
-        # Run 0 steps when paused so orders (e.g. a queued kick) don't execute
-        # until the user presses Space.  The HUD renders from match state and
-        # doesn't need a physics tick to stay up to date.
-        steps = self._sim_speed if not self.match.paused else 0
+        # steps/frame = round(physics_tick_hz × sim_speed / target_fps), clamped ≥1.
+        # physics_tick_hz changes dt_s only (resolution); sim_speed controls actual game speed.
+        if self.match.paused:
+            return
+
+        steps = max(1, round(self._physics_tick_hz * self._sim_speed / self._target_fps))
 
         if self._scenario_loop is not None:
             loop = self._scenario_loop
@@ -480,7 +504,8 @@ class App:
                     return
                 self.renderer.record_trail(self.match.ball)
                 if trial_ended:
-                    # New trial started — wire log and icon callbacks to the fresh match.
+                    # New trial started — patch dt_s and wire log/icon callbacks to the fresh match.
+                    loop.match.dt_s = 1.0 / self._physics_tick_hz
                     self._wire_match_log(loop.match)
                     self._wire_player_icon_callbacks(loop.match)
                     self._action_icons.clear()
@@ -674,7 +699,7 @@ class App:
                 action_icon=action_icon,
             )
         if not self.match.paused:
-            self.renderer.update_ball_effects(self.match.ball, 1.0 / FPS)
+            self.renderer.update_ball_effects(self.match.ball, 1.0 / self._target_fps)
         self.renderer.draw_ball(self.surface, self.match.ball)
 
         kick_state = self.input_controller.kick_ui_state()
@@ -689,8 +714,8 @@ class App:
                     bottom_reserve_px=70 if self._pause_notification else 0,
                 )
 
-        hud_lines = [self.mode_label]
-        speed_str = f"  ⚡{self._sim_speed}x" if self._sim_speed > 1 else ""
+        hud_lines = [f"{self.mode_label}  [{self._fps_smooth:.0f} fps]"]
+        speed_str = f"  ⚡{self._sim_speed:g}x" if self._sim_speed != 1.0 else ""
         paused_str = "PAUSED" if self.match.paused else f"Playing{speed_str}"
         if self._scenario_loop is not None:
             loop = self._scenario_loop

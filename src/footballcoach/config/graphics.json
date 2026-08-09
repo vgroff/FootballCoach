@@ -1,9 +1,11 @@
 {
   "_comment": "Visual display constants. Edit freely to tune the look without touching code. See ui/knowledge.md for details on how each value is used.",
+  "target_fps": 60,
+  "_comment_target_fps": "Render frame rate cap. Physics ticks are governed separately by gameplay.json ui.physics_tick_hz.",
   "camera": {
     "_comment": "pixels_per_metre: zoom level. 9=1025x692 window, 12=1340x896, 14=1570x1032. margin_px: empty border around pitch.",
-    "pixels_per_metre": 12.5,
-    "margin_px": 40
+    "pixels_per_metre": 13.0,
+    "margin_px": 50
   },
   "player": {
     "_comment": "min_radius_px: smallest on-screen circle radius drawn for a player. Physical world positions are unaffected — only the rendered dot size is boosted for visibility. possession_outline_thickness: pixel width of the white ring drawn around the ball carrier (1=thin, 3=bold). inactive_alpha: opacity (0-255) of a player drawn translucent after being tackled (0=invisible, 255=fully opaque).",
@@ -16,7 +18,7 @@
     "min_radius_px": 5.5,
     "outline": true,
     "outline_width_px": 0.66,
-    "height_boost_per_metre": 0.25
+    "height_boost_per_metre": 0.1
   },
   "action_icons": {
     "_comment": "linger_s: wall-clock seconds an action icon stays visible above a player after the action fires. font_size_px: point size of the icon font — keep small (10-14) or they'll dominate the screen.",
@@ -43,7 +45,7 @@
   "kick_ui": {
     "_comment": "Kick trajectory preview and spin input constants. max_drag_m: mouse distance (metres) for full power — also scales elevation and spin sensitivity. trajectory_duration_s: seconds of trajectory shown. max_loft_angle_deg: elevation at closest mouse position. max_spin_magnitude_rads: spin at furthest mouse position.",
     "max_drag_m": 10.0,
-    "trajectory_duration_s": 1.5,
+    "trajectory_duration_s": 0.8,
     "max_loft_angle_deg": 70.0,
     "max_spin_magnitude_rads": 15.0
   },

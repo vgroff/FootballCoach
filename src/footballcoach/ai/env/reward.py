@@ -12,11 +12,12 @@ Convention: reward is always a Python float, accumulated over the engine
 ticks within one decision interval and returned as one scalar per step.
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-!! CRITICAL: DO NOT NORMALISE REWARDS BY INITIAL-EPISODE STATE.        !!
+!! CRITICAL, STANDING INVARIANT: NO REWARD TERM MAY DEPEND ON            !!
+!! INITIAL-EPISODE STATE. NOT EVEN AS A NORMALISATION DIVISOR.           !!
 !!                                                                      !!
-!! Normalising a reward term by a quantity measured at episode start    !!
-!! (e.g. start_ball_dist_m, start_ball_to_box_dist_m, start_stamina)   !!
-!! is a MISTAKE in PPO.  Reason:                                        !!
+!! Normalising or scaling a reward term by a quantity measured at        !!
+!! episode start (e.g. start_ball_dist_m, start_ball_to_box_dist_m,     !!
+!! start_stamina) is a MISTAKE in PPO.  Reason:                          !!
 !!                                                                      !!
 !!  1. The value network does NOT observe the initial-state normaliser. !!
 !!     It sees only the current observation. So the same observed state !!
@@ -32,32 +33,26 @@ ticks within one decision interval and returned as one scalar per step.
 !! is to tighten the spawn distribution, add episode-cumulative clamps  !!
 !! (see cumulative_clamped_delta()), or tune the coefficient — NOT to   !!
 !! divide by an unobservable initial quantity.                          !!
+!!                                                                      !!
+!! Every term below is written against this invariant: appr/appr_sq use !!
+!! raw per-step deltas, prog uses raw ball_progress_toward_goal_m, prox  !!
+!! uses a FIXED 40m pitch-scale reference (not a per-episode start       !!
+!! distance), spd is speed_scale * time_remaining_fraction only, and     !!
+!! stam uses (1 - final_stamina), never (start_stamina - final_stamina). !!
+!! When adding a new term or reviewing a PR, check it against this list  !!
+!! — do not reintroduce a start_*_m / start_stamina style parameter.     !!
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
-
-FIXED (2026-08-09): all initial-state dependencies removed.
-  appr        — now raw _delta (m/step)
-  appr_sq     — now raw player_speed_toward_ball^2 (m²/s²)
-  prog        — now raw ball_progress_toward_goal_m (m/step)
-  prox        — now uses fixed 40m pitch-scale reference
-  spd         — now speed_scale * time_remaining_fraction only
-  stam        — scenario_env now passes 1 - final_stamina instead of start - final
-Coefficients may need re-tuning: raw scales are larger than the old normalised values.
 
 phase1_reward() returns a (float, dict[str, float]) tuple where the dict
 breaks the total down by source key:
   appr  — linear ball approach bonus (potential-based; telescopes over an
           episode to net distance closed, NOT sensitive to how fast — see
-          appr_sq below for a term that actually rewards speed). Normalized
-          by start_ball_dist_m (the ball-to-player distance at episode
-          start) so total achievable reward from this term is ~coef
-          regardless of how far the ball happened to spawn — otherwise a
-          scenario with a larger spawn distance hands out more "free"
-          closing-distance reward purely from randomness, not skill.
-  retr  — linear ball retreat penalty (symmetric formula to appr, but
-          DELIBERATELY NOT normalized — a penalty's absolute weight should
-          be scenario-independent: normalizing it would make a wasted/wrong-
-          direction metre cheaper in large-spawn-distance episodes than in
-          small ones, which is backwards for a deterrent).
+          appr_sq below for a term that actually rewards speed). Raw
+          per-step distance delta, no initial-state normalisation (see
+          module invariant above).
+  retr  — linear ball retreat penalty (symmetric formula to appr). Also raw,
+          also not normalized — a penalty's absolute weight should be
+          scenario-independent regardless of spawn distance.
   appr_sq — squared bonus/penalty for the PLAYER's own speed toward/away
           from the ball (asymmetric coefficients: ball_approach_speed_bonus /
           ball_retreat_speed_penalty). Uses player_speed_mps * heading_cos_sim
@@ -72,10 +67,8 @@ breaks the total down by source key:
           strictly more total reward than doing it slowly, because
           sum(x_i^2) >= (sum(x_i))^2 / n with equality only when every step
           closes the same amount. Use this (not appr) when you want to
-          reward genuine speed rather than just final position. Same
-          normalization asymmetry as appr/retr above: the approach
-          (closing-fast) side is normalized by start_ball_dist_m before
-          squaring, the retreat (retreating-fast) side is not.
+          reward genuine speed rather than just final position. Raw
+          player_speed_toward_ball^2, no initial-state normalisation.
           appr_sq_approach_reward_clamp/appr_sq_retreat_reward_clamp (both
           null = uncapped) independently bound the EPISODE-CUMULATIVE total
           of each side via cumulative_clamped_delta() -- two separate bounds
@@ -86,10 +79,10 @@ breaks the total down by source key:
   prog  — ball progress toward the opponent BOX while in possession (delta
           of _ball_dist_to_opponent_box(), i.e. box-distance closed this
           step — NOT raw goal-line x movement, so lateral movement into the
-          box counts). Normalized by start_ball_to_box_dist_m — same
-          reference distance already used by spd/prox below; NOT split into
-          an asymmetric forward/backward pair like appr/retr, since progress
-          is a single signed quantity with one coefficient, not two.
+          box counts). Raw ball_progress_toward_goal_m (m/step), no
+          initial-state normalisation; NOT split into an asymmetric
+          forward/backward pair like appr/retr, since progress is a single
+          signed quantity with one coefficient, not two.
           prog_reward_clamp (when set) bounds the EPISODE-CUMULATIVE total
           of this term to +/-prog_reward_clamp via cumulative_clamped_delta()
           — NOT each step independently, since that alone wouldn't stop many
@@ -99,15 +92,16 @@ breaks the total down by source key:
   out   — ball out of bounds penalty
   ill   — illegal action penalty
   box   — box possession terminal
-  spd   — speed bonus (fast finish)
+  spd   — speed bonus (fast finish). speed_scale * time_remaining_fraction only.
   lpos  — loss of possession penalty
   lterm — loss terminal (opponent reaches trainee box)
   tout  — timeout penalty
-  prox  — proximity bonus on timeout. Normalized by start_ball_to_box_dist_m
-          (previously a fixed 30m constant, inconsistent with spd's use of
-          the actual per-episode start distance)
+  prox  — proximity bonus on timeout. Uses a FIXED 40m pitch-scale reference
+          (scale * max(0, 1 - dist_to_box / 40m)), NOT a per-episode start
+          distance — see module invariant above.
   step  — flat per-step penalty (encourages finishing faster; every step incl. terminal)
-  stam  — stamina usage penalty (episode-end only)
+  stam  — stamina usage penalty (episode-end only). (1 - final_stamina), never
+          (start_stamina - final_stamina) — see module invariant above.
 """
 from __future__ import annotations
 
@@ -180,8 +174,6 @@ def phase1_reward(
     reached_opponent_box_with_possession: bool,
     cfg: dict,
     time_fraction_remaining: float = 0.0,
-    start_ball_to_box_dist_m: float = 1.0,
-    start_ball_dist_m: float = 1.0,
     opponent_reached_trainee_box: bool = False,
     lost_possession_this_step: bool | int = False,
     timed_out: bool = False,

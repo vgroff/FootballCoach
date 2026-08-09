@@ -73,7 +73,9 @@
     "running_direction_precision_cos_low": -0.2,
     "running_direction_precision_penalty_mid": 0.25,
     "running_direction_precision_penalty_max": 0.75,
-    "running_direction_min_speed_mps": 1.0
+    "running_direction_min_speed_mps": 1.0,
+    "max_spin_base_rad_s": 12.0,
+    "max_spin_precision_scale": 25.0
   },
   "passing": {
     "_comment": "Auto-pace for a grounded pass: v = overshoot_factor * sqrt(2*mu_roll*g*distance), clamped to [min,max]. Error model is now unified with kicking (KickingParams) - sigma scales with both precision and effective power.",
@@ -122,7 +124,7 @@
     "bounce_restitution_horizontal": 0.8,
     "bounce_spin_retention": 0.5,
     "rolling_friction_coefficient": 0.05,
-    "spin_decay_per_s": 0.15,
+    "spin_decay_per_s": 0.12,
     "block_restitution": 0.35,
     "just_bounced_display_duration_s": 0.45,
     "goal_net_restitution": 0.1,

@@ -196,6 +196,13 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     Instantiates a temporary Phase1RulesAI, calls act() on the current match
     state, and reads back the order it sets — so the labels are always exactly
     in sync with the rules AI behaviour, with no duplicated logic here.
+
+    All quantities returned here (``move_direction``, ``move_region_center_m``,
+    ``kick_direction``, ``kick_spin``, ...) are in raw WORLD/ENGINE-FRAME
+    coordinates, matching the world-frame observations from ``obs/encoder.py``.
+    No canonical-AI-frame mirroring happens here — that transform is applied
+    later, as a thin wrapper around network forward calls (see
+    ``ai/obs/canonical.py``), not baked into recorded/generated labels.
     """
     from footballcoach.rules_ai import Phase1RulesAI
     from footballcoach.orders import MoveOrder, GetPossessionOrder, ChaseTackleOrder

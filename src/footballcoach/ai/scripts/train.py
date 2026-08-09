@@ -21,6 +21,21 @@ logging.basicConfig(
 log = logging.getLogger("footballcoach.ai.train")
 
 
+def _rules_1v1_build(*args, **kwargs):
+    """Module-level (picklable) scenario builder for pre-PPO rules-based eval --
+    parallel eval workers pickle this via ScenarioDefinition.build, so it can't
+    be a closure defined inside main()."""
+    from footballcoach.rules_ai import Phase1RulesAI
+    from footballcoach.ui.scenarios import build_1v1_scenario
+
+    match = build_1v1_scenario(*args, **kwargs)
+    opp = match.player_by_id("opponent")
+    opp.ai = Phase1RulesAI()
+    match._opponent_use_rules_ai = True
+    match._opponent_is_immobile = False
+    return match
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the football AI with PPO")
     parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 3, 4],
@@ -415,27 +430,33 @@ def main() -> None:
                     phase_id=args.phase,
                 )
 
+    # Save pre-trained checkpoint NOW so parallel pre-PPO eval workers can reload it from disk.
+    # (parallel eval requires a file path — live nn.Modules aren't picklable across subprocesses)
+    _eval_ckpt_path: str | None = None
+    if not args.checkpoint and not args.from_pretrained:
+        _pretrained_path = checkpoint_dir / "checkpoint_pretrained.pt"
+        trainer._save_checkpoint_to(_pretrained_path)
+        log.info(f"Pre-trained checkpoint saved: {_pretrained_path}")
+        _eval_ckpt_path = str(_pretrained_path)
+    elif args.checkpoint:
+        _eval_ckpt_path = args.checkpoint
+    elif args.from_pretrained:
+        _fp = Path(args.from_pretrained)
+        _eval_ckpt_path = str(_fp / "checkpoint_pretrained.pt" if _fp.is_dir() else _fp)
+
     if args.pre_ppo_eval_trials != 0:
         _pre_ppo_n_seeds = args.pre_ppo_eval_trials  # None = fall back to ai_config.json eval.eval_n_seeds
         from footballcoach.ai.scripts.evaluate import _run_evaluation
-        from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
+        from footballcoach.ui.scenarios import ScenarioDefinition
         from footballcoach.ai.env.scenario_env import ScenarioEnv
 
         # Evaluate against rules-based opponent only
-        def _rules_build(*args, **kwargs):
-            from footballcoach.rules_ai import Phase1RulesAI
-            match = build_1v1_scenario(*args, **kwargs)
-            opp = match.player_by_id("opponent")
-            opp.ai = Phase1RulesAI()
-            match._opponent_use_rules_ai = True
-            match._opponent_is_immobile = False
-            return match
-        rules_defn = ScenarioDefinition(key="1v1_rules", label="1v1 rules", description="1v1 vs rules-based opponent", build=_rules_build)
+        rules_defn = ScenarioDefinition(key="1v1_rules", label="1v1 rules", description="1v1 vs rules-based opponent", build=_rules_1v1_build)
         rules_env = ScenarioEnv(
             rules_defn, trainee_player_id="trainee", phase=1,
             max_episode_s=env.max_episode_s,
         )
-        rules_stats = _run_evaluation(trainer, rules_env, _pre_ppo_n_seeds)
+        rules_stats = _run_evaluation(trainer, rules_env, _pre_ppo_n_seeds, checkpoint_path=_eval_ckpt_path)
         from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS as _CL
         _cl_map = dict(_CL)
         _comp_str = "  ".join(
@@ -466,7 +487,7 @@ def main() -> None:
             immobile_defn, trainee_player_id="trainee", phase=1,
             max_episode_s=env.max_episode_s,
         )
-        immobile_stats = _run_evaluation(trainer, immobile_env, _pre_ppo_n_seeds)
+        immobile_stats = _run_evaluation(trainer, immobile_env, _pre_ppo_n_seeds, checkpoint_path=_eval_ckpt_path)
         _imm_comp_str = "  ".join(
             f"{_cl_map.get(k, k)}={v:+.2f}" for k, v in sorted(
                 immobile_stats.get("reward_components", {}).items(), key=lambda x: -abs(x[1])
@@ -502,7 +523,7 @@ def main() -> None:
             max_episode_s=env.max_episode_s,
             secondary_player_ids=["opponent"],
         )
-        neural_stats = _run_evaluation(trainer, neural_env, _pre_ppo_n_seeds)
+        neural_stats = _run_evaluation(trainer, neural_env, _pre_ppo_n_seeds, checkpoint_path=_eval_ckpt_path)
         _nn_comp_str = "  ".join(
             f"{_cl_map.get(k, k)}={v:+.2f}" for k, v in sorted(
                 neural_stats.get("reward_components", {}).items(), key=lambda x: -abs(x[1])
@@ -532,12 +553,6 @@ def main() -> None:
     # Apply curriculum head freezing (after pre-training, before PPO)
     if not args.no_head_freeze and phase.frozen_heads:
         trainer.set_frozen_heads(phase.frozen_heads)
-
-    # Save pre-trained checkpoint so --from-pretrained can skip pretraining next time.
-    if not args.checkpoint and not args.from_pretrained:
-        _pretrained_path = checkpoint_dir / "checkpoint_pretrained.pt"
-        trainer._save_checkpoint_to(_pretrained_path)
-        log.info(f"Pre-trained checkpoint saved: {_pretrained_path}")
 
     # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0)
     aux_label_fn = None if (args.no_bc_aux or label_fn is None) else label_fn

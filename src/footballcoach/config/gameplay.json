@@ -6,8 +6,11 @@
   },
 
   "ui": {
-    "_comment": "UI-level timing constants (applies to UI matches/scenarios only). scenario_linger_s: how long (sim-seconds) a scenario trial keeps running after its outcome is determined before the next trial starts. goal_linger_s: how long (sim-seconds) the ball stays in place after a goal before the engine resets it to centre.",
+    "_comment": "physics_tick_hz: physics integration frequency (sets dt_s = 1/hz). Higher = finer physics resolution, does NOT change game speed. default_sim_speed: match-seconds per real-second (1.0=real-time, 2.0=2x speed). steps_per_frame = round(physics_tick_hz * sim_speed / target_fps).",
     "scenario_linger_s": 1.8,
-    "goal_linger_s": 1.8
+    "goal_linger_s": 1.8,
+    "physics_tick_hz": 60,
+    "default_sim_speed": 2.0,
+    "scenario_timeout_s": 30.0
   }
 }

@@ -40,11 +40,10 @@ from typing import Callable
 from footballcoach.engine.match import Match
 from footballcoach.entities.player import Player, Team
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import GetPossessionOrder, KickOrder, MoveOrder, PassOrder, SaveOrder, ShootOrder, StopOrder
+from footballcoach.orders import GetPossessionOrder, MoveOrder, PassOrder, SaveOrder, ShootOrder, StopOrder
 from footballcoach.ui.camera import Camera
 
 CLICK_DRAG_THRESHOLD_PX = 6
-GROUND_AIM_HEIGHT_M = 0.3
 SELECT_TOLERANCE_PX = 6
 
 
@@ -283,7 +282,14 @@ class MatchInputController:
             if dist_m > 1e-6:
                 self._kick_ui.aim_dir_x = dx / dist_m
                 self._kick_ui.aim_dir_y = dy / dist_m
-            self._kick_ui.power_fraction = min(1.0, dist_m / max_drag_m)
+            # Scale power range to distance to nearest goal, clamped [10, 20] m.
+            pitch = self.match.pitch
+            dist_to_goal = min(
+                math.hypot(player.position.x + pitch.half_length, player.position.y),
+                math.hypot(player.position.x - pitch.half_length, player.position.y),
+            )
+            power_max_drag_m = max(10.0, min(20.0, dist_to_goal))
+            self._kick_ui.power_fraction = min(1.0, dist_m / power_max_drag_m)
             self._kick_ui.aim_distance_m = min(dist_m * 2.0, 60.0)
 
         elif phase == KickPhase.AIM_Z:
@@ -294,12 +300,14 @@ class MatchInputController:
 
         elif phase == KickPhase.SPIN:
             from footballcoach.ui.kick_trajectory import spin_from_mouse
+            from footballcoach.engine.kicking import KickingParams, max_spin_rad_s
+            _spin_max = max_spin_rad_s(KickingParams.from_config(), player.attributes.kick_precision)
             self._kick_ui.spin = spin_from_mouse(
                 self._kick_ui.aim_dir_x,
                 self._kick_ui.aim_dir_y,
                 dx,
                 dy,
-                cfg["max_spin_magnitude_rads"],
+                _spin_max,
                 max_drag_m,
             )
 
@@ -317,7 +325,7 @@ class MatchInputController:
             self._fire_kick()
 
     def _fire_kick(self) -> None:
-        """Construct and issue the KickOrder from committed kick UI state."""
+        """Fire the kick directly using the 3D direction from committed kick UI state."""
         if self._kick_ui is None:
             return
         player = self.selected_player()
@@ -326,24 +334,15 @@ class MatchInputController:
             return
 
         ku = self._kick_ui
-        # Reconstruct aim_point: project along aim_dir at aim_distance_m with
-        # z derived from elevation angle so that solve_launch_pitch_rad yields
-        # the intended launch angle.
-        aim_z = GROUND_AIM_HEIGHT_M + math.tan(ku.elevation_angle_rad) * ku.aim_distance_m
-        aim_point = Vector3(
-            player.position.x + ku.aim_dir_x * ku.aim_distance_m,
-            player.position.y + ku.aim_dir_y * ku.aim_distance_m,
-            aim_z,
-        )
-        # Game is already paused (from _enter_kick_ui). Set the kick order
-        # directly (no on_complete — one Space executes, no second pause).
-        # Update the notification so the user knows to press Space.
-        kick_order = KickOrder(aim_point=aim_point, power_fraction=ku.power_fraction, spin=ku.spin)
-        from footballcoach.rules_ai import HybridPlayerAI
-        if isinstance(player.ai, HybridPlayerAI):
-            player.ai.issue_order(kick_order)
-        else:
-            player.current_order = kick_order
+        # Build a 3D unit direction from the dialled elevation angle — same
+        # vector that compute_launch_velocity() uses for the preview, so the
+        # actual kick matches the trajectory shown.
+        cos_e = math.cos(ku.elevation_angle_rad)
+        sin_e = math.sin(ku.elevation_angle_rad)
+        direction_3d = Vector3(ku.aim_dir_x * cos_e, ku.aim_dir_y * cos_e, sin_e)
+        # Apply kick immediately while game is paused; ball is released this
+        # tick, user presses Space to unpause and watch it fly.
+        player.kick_with_direction(self.match, direction_3d, ku.power_fraction, ku.spin)
         if self.on_kick_issued is not None:
             self.on_kick_issued()
         self._kick_ui = None
@@ -412,6 +411,29 @@ class MatchInputController:
             self._enter_kick_ui(selected)
             return True
         return False
+
+    def handle_mouse_wheel(self, y: int) -> None:
+        """Fine-tune the active kick phase by ±1 scroll notch."""
+        if self._kick_ui is None or y == 0:
+            return
+        from footballcoach.config import load_graphics_config
+        cfg = load_graphics_config()["kick_ui"]
+        ku = self._kick_ui
+        if ku.phase == KickPhase.AIM_XY:
+            ku.power_fraction = max(0.0, min(1.0, ku.power_fraction + y * 0.00225))
+        elif ku.phase == KickPhase.AIM_Z:
+            max_loft_rad = math.radians(cfg["max_loft_angle_deg"])
+            ku.elevation_angle_rad = max(0.0, min(max_loft_rad, ku.elevation_angle_rad + y * math.radians(0.125)))
+        elif ku.phase == KickPhase.SPIN:
+            from footballcoach.engine.kicking import KickingParams, max_spin_rad_s
+            _player = self.selected_player()
+            _prec = _player.attributes.kick_precision if _player is not None else 0.5
+            max_spin = max_spin_rad_s(KickingParams.from_config(), _prec)
+            cur_mag = ku.spin.length()
+            new_mag = max(0.0, min(max_spin, cur_mag + y * 0.5))
+            if cur_mag > 1e-6:
+                ku.spin = ku.spin * (new_mag / cur_mag)
+            # If spin was zero, scroll does nothing (no direction to scale into).
 
     def enter_pass_mode(self) -> None:
         self.order_mode = OrderMode.PASS

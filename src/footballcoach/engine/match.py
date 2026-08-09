@@ -415,6 +415,11 @@ class Match:
             # the player then coasts at that reduced speed until control ends.
             self._set_possession(player.player_id)
             player.velocity = player.velocity * self.movement_params.control_speed_multiplier
+            # Only one player may pick up a loose ball per tick -- without this,
+            # a second player also within pickup_radius_m (e.g. a tackler
+            # standing right next to the receiver) would unconditionally
+            # overwrite the possession just granted above.
+            return
             # Display hint for the UI action-icon system (consumed by renderer, not engine logic).
             player.action_icon = "🧤" if player.is_goalkeeper else "✋"
 

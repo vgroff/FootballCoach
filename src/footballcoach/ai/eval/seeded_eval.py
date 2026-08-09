@@ -74,6 +74,12 @@ class SeededEvalResult:
     def mean_step_r(self) -> float:
         return float(np.mean(self.step_r)) if self.step_r else float("nan")
 
+    @property
+    def sem_reward(self) -> float:
+        """Standard error of mean_reward across the n_episodes trials (std_reward / sqrt(n))."""
+        n = self.n_episodes
+        return float(self.std_reward / np.sqrt(n)) if n > 0 else float("nan")
+
     def as_dict(self) -> dict:
         return {
             "n_trials": self.n_episodes,
@@ -82,6 +88,7 @@ class SeededEvalResult:
             "win_rate_pct": self.win_rate_pct,
             "mean_reward": self.mean_reward,
             "std_reward": self.std_reward,
+            "sem_reward": self.sem_reward,
             "outcomes": self.outcomes,
             "outcome_breakdown": self.outcome_breakdown,
             "mean_value_pred": self.mean_value_pred,

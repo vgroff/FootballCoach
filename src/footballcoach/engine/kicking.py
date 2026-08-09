@@ -39,6 +39,8 @@ class KickingParams:
     running_direction_precision_penalty_mid: float   # penalty at cos_low boundary (default 0.25 = -25%)
     running_direction_precision_penalty_max: float   # penalty at cos=-1 (default 0.75 = -75%)
     running_direction_min_speed_mps: float           # min kicker speed to apply penalty (default 1.0)
+    max_spin_base_rad_s: float = 8.0
+    max_spin_precision_scale: float = 0.2
 
     @staticmethod
     def from_config() -> "KickingParams":
@@ -58,7 +60,14 @@ class KickingParams:
             running_direction_precision_penalty_mid=d.get("running_direction_precision_penalty_mid", 0.25),
             running_direction_precision_penalty_max=d.get("running_direction_precision_penalty_max", 0.75),
             running_direction_min_speed_mps=d.get("running_direction_min_speed_mps", 1.0),
+            max_spin_base_rad_s=d.get("max_spin_base_rad_s", 8.0),
+            max_spin_precision_scale=d.get("max_spin_precision_scale", 0.2),
         )
+
+
+def max_spin_rad_s(params: KickingParams, kick_precision: float) -> float:
+    """Maximum spin magnitude a player can impart, scaling with kick_precision."""
+    return params.max_spin_base_rad_s + kick_precision * params.max_spin_precision_scale
 
 
 @dataclass(frozen=True)

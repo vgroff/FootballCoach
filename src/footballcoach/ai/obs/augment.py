@@ -7,19 +7,27 @@ for free because augmentation is applied inside _ppo_update().
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 WHY THIS WORKS
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-The football environment has two exact symmetries:
+A separate wrapper, ``ai/obs/canonical.py``, applies a CANONICAL AI FRAME
+transform immediately around every network forward call: every observation
+is mirrored so the observing player's own team always attacks +x,
+regardless of which engine-frame team (LEFT/RIGHT) they actually are (the
+raw encoder in obs/encoder.py and recorded BC data stay in plain
+world/engine-frame coordinates — only the network's input/output boundary
+sees the canonical frame). This removes flip_x as a remaining
+training-time symmetry to augment over here — it's now a fixed, permanent
+transform rather than a random augmentation choice.
 
-  flip_x  — reflect the pitch about the x-axis (negate all x-direction
-             quantities: positions, velocities, headings, spin components,
-             attacking directions, action direction vectors).
+The one exact symmetry left to augment over is:
+
   flip_y  — reflect the pitch about the y-axis (negate all y-direction
-             quantities).
-
-Combined they give flip_xy (180° rotation), so four variants in total.
+             quantities: positions, velocities, spin components, action
+             direction vectors). Still valid post-canonicalization since
+             "attack +x" says nothing about which side of the y-axis a
+             player is on.
 
 The observation encoding (relative positions, normalised velocities, etc.)
 and reward function (possession bonus, ball-progress shaping, box-terminal)
-are all invariant under these reflections.  Augmenting with flipped copies
+are all invariant under this reflection.  Augmenting with flipped copies
 teaches the network this invariance without changing environment dynamics.
 
 Additionally, the other-player slots are randomly ordered (permutation
@@ -29,9 +37,11 @@ per step gives the attention mechanism more diverse training signal.
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 BATCH EXPANSION FACTOR
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-  total multiplier = 4 (flips) × n_slot_shuffles
+  total multiplier = 2 (flip_y variants) × n_slot_shuffles
 
-Default n_slot_shuffles = 3  →  12× augmentation per rollout step.
+Default n_slot_shuffles = 3  →  6× augmentation per rollout step (halved
+from 12× now that flip_x is a fixed canonical-frame transform, see
+ai/obs/canonical.py, instead of a random augmentation).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CORRECTNESS OF REUSING old_log_probs
@@ -53,12 +63,18 @@ FIELD INDICES
 Indices are computed at import time from the dataclass field order so they
 automatically stay correct if new fields are added to the schema.
 
-Angular velocity (spin) transforms as a pseudovector under reflections:
-    flip_x (R=diag(-1,1,1), det=-1):  ω → det·R·ω  = (ω_x, -ω_y, -ω_z)
+Angular velocity (spin) transforms as a pseudovector under reflection:
     flip_y (R=diag(1,-1,1), det=-1):  ω → det·R·ω  = (-ω_x, ω_y, -ω_z)
 
-Heading angle θ under flip_x → π-θ:  sin unchanged, cos negated.
 Heading angle θ under flip_y → -θ:   sin negated,   cos unchanged.
+
+NOTE: PLAYER_FLIP_X_IDX / BALL_FLIP_X_IDX / the `_BC_*_X_COL` constants and
+every `if flip_x:` branch below are KEPT even though `_FLIP_VARIANTS` no
+longer includes any flip_x=True entry here — they are correct, inert dead
+code in THIS module (the `if flip_x:` branches simply never execute), but
+are NOT dead in general: ``ai/obs/canonical.py`` imports and reuses these
+same index lists to implement its permanent x-mirror, so removing them
+would break that module too.
 """
 from __future__ import annotations
 
@@ -153,12 +169,16 @@ _DIR_ACTION_KEYS: frozenset[str] = frozenset({
     "move_region_center_raw",
 })
 
-# Geometric flip variants: (flip_x, flip_y)
+# Geometric flip variants: (flip_x, flip_y).
+# flip_x is DELIBERATELY EXCLUDED here: the canonical AI frame (see
+# obs/encoder.py "Canonical AI frame") already mirrors every observation so
+# the observing player's team always attacks +x, so flip_x is no longer a
+# training-time augmentation choice — it is baked into the encoding itself.
+# Only flip_y (still an exact, independent pitch symmetry once the attacking
+# axis is fixed) remains as a real augmentation.
 _FLIP_VARIANTS: list[tuple[bool, bool]] = [
     (False, False),  # identity
-    (True,  False),  # flip_x
     (False, True),   # flip_y
-    (True,  True),   # flip_xy  (180° rotation)
 ]
 
 

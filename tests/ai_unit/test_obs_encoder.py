@@ -454,9 +454,11 @@ class TestGlobalFeatures:
 # pos_x / pos_y negation under geometric flip augmentation
 # ---------------------------------------------------------------------------
 #
-# Confirmed by direct read of obs/augment.py: PLAYER_FLIP_X_IDX includes
-# pos_x and PLAYER_FLIP_Y_IDX includes pos_y, so this is a regression guard
-# for behaviour that is already correct, not a bug hunt.
+# flip_x is DELIBERATELY EXCLUDED from _FLIP_VARIANTS (see obs/augment.py
+# module docstring "Canonical AI frame") — it's now a fixed, permanent
+# transform applied by ai/obs/canonical.py rather than a random training-time
+# augmentation. So pos_x negation is tested against canonical.py directly
+# below; only flip_y remains a real _FLIP_VARIANTS entry to test here.
 
 class TestFlipAugmentationPosXY:
     def _build_obs_dict(self, duel_match):
@@ -471,7 +473,7 @@ class TestFlipAugmentationPosXY:
             "global_feat": torch.from_numpy(obs.global_feat).unsqueeze(0),
         }, obs
 
-    def test_pos_x_negated_under_flip_x_pos_y_unchanged(self, duel_match):
+    def test_pos_y_negated_under_flip_y_pos_x_unchanged(self, duel_match):
         from footballcoach.ai.obs.augment import augment_obs_bc, _FLIP_VARIANTS
         from footballcoach.ai.ppo.bc import BC_LABEL_DIM
         import torch
@@ -487,19 +489,35 @@ class TestFlipAugmentationPosXY:
         pos_y_idx = _pf_idx("pos_y")
 
         original_self = obs_dict["self_feat"][0]
-        # _FLIP_VARIANTS = [identity, flip_x, flip_y, flip_xy], one slot-shuffle
-        # each -> rows 0,1,2,3 of the augmented batch.
-        flip_x_self = aug_obs["self_feat"][1]
-        flip_y_self = aug_obs["self_feat"][2]
-
-        assert _FLIP_VARIANTS[1] == (True, False)
-        assert _FLIP_VARIANTS[2] == (False, True)
-
-        assert flip_x_self[pos_x_idx] == pytest.approx(-original_self[pos_x_idx].item(), abs=1e-6)
-        assert flip_x_self[pos_y_idx] == pytest.approx(original_self[pos_y_idx].item(), abs=1e-6)
+        # _FLIP_VARIANTS = [identity, flip_y] (flip_x removed — see above),
+        # one slot-shuffle each -> rows 0,1 of the augmented batch.
+        assert _FLIP_VARIANTS[0] == (False, False)
+        assert _FLIP_VARIANTS[1] == (False, True)
+        flip_y_self = aug_obs["self_feat"][1]
 
         assert flip_y_self[pos_y_idx] == pytest.approx(-original_self[pos_y_idx].item(), abs=1e-6)
         assert flip_y_self[pos_x_idx] == pytest.approx(original_self[pos_x_idx].item(), abs=1e-6)
+
+    def test_pos_x_negated_under_canonical_frame_for_right_team(self, duel_match):
+        """flip_x is now the CANONICAL AI FRAME transform (ai/obs/canonical.py),
+        applied per-observer-team rather than randomly — verify it still
+        negates pos_x (and leaves pos_y untouched) for a Team.RIGHT observer.
+        """
+        from footballcoach.ai.obs.canonical import canonicalize_obs
+        import torch
+
+        obs_dict, obs = self._build_obs_dict(duel_match)
+        pos_x_idx = _pf_idx("pos_x")
+        pos_y_idx = _pf_idx("pos_y")
+
+        original_self = obs_dict["self_feat"][0]
+        sf_c, _, _, x_sign = canonicalize_obs(
+            obs_dict["self_feat"], obs_dict["other_feat"], obs_dict["ball_feat"],
+            x_sign=torch.tensor([-1.0]),  # force as if observer were Team.RIGHT
+        )
+        canon_self = sf_c[0]
+        assert canon_self[pos_x_idx] == pytest.approx(-original_self[pos_x_idx].item(), abs=1e-6)
+        assert canon_self[pos_y_idx] == pytest.approx(original_self[pos_y_idx].item(), abs=1e-6)
 
     def test_pitch_dimensions_in_global(self, solo_match):
         pitch = solo_match.pitch

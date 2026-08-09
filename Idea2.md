@@ -26,14 +26,17 @@ Notes to self:
 
 Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
-- " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md "
+- " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. "
 - train blockers:
-    - !! [] !!
-        - okay, I'd still like you to fix those tsts. What 
-        - check the collision code - can it be made smarter somehow?
-        - once you're done, re-run the profiling
-    - Plan: try with non-separate value net
-    - lose possesion 0 in the debug value script is sus
+    - Plan: 
+        - need to re-run with the reset log dir std
+        - check timeouts, see if we can reduce them
+        - check evaulations/compare with determinstic ones
+        - do we need more data?
+        - try with non-separate value net
+    - 
+    - what happens with kick spin in the neural network atm? in phase 1 and evals?
+    - Do some tests with inline code and small rollout to see which many envs/worker combinastions are fastest, and how much capacity matters
     - Can value network predict with only immobiles? Should be easy AF
     - rules-based AI should reposition between enemy and the goal if they are slower and it's possible
     - !Use the debug script to check how the torch threads affects training and change the defaults correspondingly if needed (including for PPO!) - I get the sense it helps, but not 100% sure
@@ -44,7 +47,6 @@ Current notes:
     - The UI Phase 1 (and maybe all?) should use the same scenario thingy code as training, and it should use that to output rewards in the game logs when they trigger (e.g. get_possesion +1 for trainee) when showing scenarios. Makes debugging easier
     - BC train, then do deterministic vs immobile and see how we do compared with PPO
     - always have the option of doing a small set to scenarios each time, say 100, so that we can really track progression?
-    - [] ! do we have 2 values of max spin, in UI and engine? BAD. Max spin determined by kick precision and kick power together maybe? We should try to model it sensibly
     - [] value netowrk fixed - can we switch back to not having a separate value network?
     - [] still getting very large policy ratios sometimes - check what is the contributing factor (Dont we already see this?)
     - [] get match logs for best performing (by reward) and "smartest" (most adv, idk) runs each epoch
@@ -93,14 +95,11 @@ Other todo
 - Reduce decision rate everywhere (0.4s?)
 - Which tests are failing and why? What are they testing?
 - PRobably need a small reworrk on spin, how its' affected by talent and max values
+    -have an agent plan on this
 
 
 Immedaite task!!
 Read ai_trainer_knowledge.md, and then run a training run
-- can we "normalise" rewards? maybe already do
-- the value head/network may need to be more expressive/higher capacity somehow? Investigate before committing to that
-- PPO params need playing with most likely
-- the tackling and taking control/possession seems to work weirdly - check the logs in a 1v2 rules scenarioj- 
 - in some cases it might make sense to feed in more "real" values, e.g. shot error or top speed or acceleration, rather than the player attributes. that way we can fuck with the physics without losong AI kowledge
 - We could super easliy remove a whole axis of symmetry by transforming all AI positions to being +x is attacking goal, -x is dending goal, remove the flag for which end youre attacking on and transform back and forth from the engine positions to the AI positions. Would probably mean a smaller/smarter AI and faster trainnig from fewer augmentations (half the training time)
     - I think all that needs changing is absolute coordinates - i.e. player position and move region (?). and then augmentation and team flags removed.
@@ -109,7 +108,6 @@ Read ai_trainer_knowledge.md, and then run a training run
 - how could I speed up training? parrallelise the engine itself? increase the tick time when nothing much is going on (e.g. ball controlled and nobody near controller?) what is most likely taking up time in this?
 - can i forcesome smart exploration by e.g. making the neural net tackle when it's legal and making it learn to do? This is called DAgger, but we already kinda do it with BC annealing, it's just online instead of saved data - but we cna do it later
 - parralelise the simulation somehow? player decision? maybe even movements/updates, though potentially dangerous
-- Is the AI completely ignoring all the kick mechanics like direction and spin and just aimming for the centre of the box when it kicks? Why on earth was this implemented???
 - Simplify match logs - only keep possession, kicks, tackles (incl. attempted), goals etc... and the positions and time of the event
 - Use von Mises distribution for direction
 - Scenarios to run for rules based tests (and later NN phases)
@@ -135,7 +133,10 @@ NB Immediate Immediate:
         - also get them to check knowledge doc correctness
     - check knolwedge doc agreement (between themselves)
 - The goalkeeper clearly teleports after saving the ball sometimes, wtf is that about??
-- Football loses its black border/outline when possessed by a player - looks weird/ugly
+- Manual kick-order
+    - secondly, we need a better way of showing the z trajectory, I'm thinking 2 little views somewhere showing the z trajectory, especially compared with the goal
+- We need neural network spin, plus implement spin error (including for the trajectoris displayed in the ui for the human player during kick order)
+    - we have an agent plan for spin
 - Why is the ball.possessed_by still using a player_id?? Do we enforce unique player_ids?? It seems so much easier to use just use the possesed_by field be player type rather than string, ball.possessed_by = kicker, instead of kicker.player_id. Is there an issue with circular references or something? If so, can't it be solved gracefully by refactoring or something? If not, it's okay, it just seems ugly
 - Maybe slightly reduce the size of the player spheres?
 - Is the game log permanent and can I copy/paste from it?
@@ -172,7 +173,7 @@ NB:
 Past MVP - Late Stage Plans
 
 Mechanics
-- Think about introducing non-linearities in kick power, stamina etc... stuff that maybe less spearated in effect than theye are in rarity (gaussian), or the reverse (e.g. dribbling, maybe gets extra good at 80+)
+- Think about introducing non-linearities in kick power, stamina etc... stuff that maybe less spearated in effect than theye are in rarity (gaussian), or the reverse (e.g. dribbling, maybe gets extra good at 80+)j - [Late thing] - Implement a foot choice when kicking, and foot preference and degree of ambitextricity etc... foot choice affects power/precisions depending on direction of kicking vs velocity heading, it affects spin in the same way 
 
 Matches:
 - Could add some commentary kinda easily - e.g. pass happens, say a phrase like "X passes over to Y"

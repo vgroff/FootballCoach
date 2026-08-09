@@ -15,6 +15,11 @@ it on contact in _check_armed_tackles, firing on_tackle for BC recording.
 Slot-index -> player_id mapping: the ``slot_player_ids`` list (produced by
 the obs encoder during the same tick - same random shuffle) maps the
 categorical target slot index back to a concrete player_id.
+
+Gating's ``move_direction``/``kick_direction`` here are already in raw
+world/engine-frame coordinates by the time this module sees them — any
+canonical-AI-frame de-mirroring happens earlier, at the network-forward
+boundary (see ``ai/obs/canonical.py``), not here.
 """
 from __future__ import annotations
 
@@ -82,7 +87,9 @@ def apply_action_to_player(
             match,
             direction_3d,
             float(gating.kick_power_fraction) if gating.kick_power_fraction > 0 else 0.85,
-            Vector3(*gating.kick_spin) if gating.kick_spin is not None else Vector3.zero(),
+            # Spin is disabled for the neural network for now -- see
+            # agent_plans/spin_implementation_plan.md for the plan to re-enable it.
+            Vector3.zero(),
         )
 
     # --- Tackle: arm intent; _check_armed_tackles resolves on contact ---

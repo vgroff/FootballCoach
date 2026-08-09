@@ -137,6 +137,7 @@ def record_episodes(
     sample_interval_s: float = 0.2,
     opponent_rules_prob: float = 0.0,
     opponent_immobile_prob: float | None = None,
+    verbose_stats: bool = False,
 ) -> dict:
     """Run *n_episodes* with rules-based AI driving the trainee and opponent.
 
@@ -481,13 +482,14 @@ def record_episodes(
                 log.info(
                     f"  reward breakdown (per ep, since last log, trainee+opponent): {_comp_str}"
                 )
-            log.info(
-                f"  kick/tackle samples (since last log): "
-                f"kicks={_kick_count_since_log}  tackles={_tackle_count_since_log}"
-                f"  (totals: kicks={_kick_count_total}  tackles={_tackle_count_total})"
-            )
-            _log_action_stats_summary(_ep_counts_since_log, label="since last log")
-            _log_poss_reward_summary(_poss_reward_since_log, label="since last log")
+            if verbose_stats:
+                log.info(
+                    f"  kick/tackle samples (since last log): "
+                    f"kicks={_kick_count_since_log}  tackles={_tackle_count_since_log}"
+                    f"  (totals: kicks={_kick_count_total}  tackles={_tackle_count_total})"
+                )
+                _log_action_stats_summary(_ep_counts_since_log, label="since last log")
+                _log_poss_reward_summary(_poss_reward_since_log, label="since last log")
             _comp_acc.clear()
             _comp_acc_episodes = 0
             _kick_count_since_log = 0
@@ -575,6 +577,7 @@ def _run_recording_job(job: dict) -> dict:
             sample_interval_s=job["sample_interval_s"],
             opponent_rules_prob=job["opponent_rules_prob"],
             opponent_immobile_prob=job["opponent_immobile_prob"],
+            verbose_stats=job.get("verbose_stats", False),
         )
         elapsed = time.time() - t0
 
@@ -605,8 +608,9 @@ def _run_recording_job(job: dict) -> dict:
         remaining -= batch
         episodes_done += batch
 
-    _log_action_stats_summary(all_episode_action_counts)
-    _log_poss_reward_summary(all_episode_poss_reward)
+    if job.get("verbose_stats", False):
+        _log_action_stats_summary(all_episode_action_counts)
+        _log_poss_reward_summary(all_episode_poss_reward)
 
     return {"total_steps": total_steps, "n_files": n_files_written}
 
@@ -645,6 +649,8 @@ def main() -> None:
                              "Remainder are immobile, unless --opponent-immobile-prob is also given.")
     parser.add_argument("--opponent-immobile-prob", type=float, default=_default_opp_immobile_prob,
                         help=f"Probability (0–1) that the opponent is immobile (default: {_default_opp_immobile_prob:.2f} from config ratios).")
+    parser.add_argument("--verbose-stats", action="store_true",
+                        help="Print per-log-interval kick/tackle/possession detail stats (noisy; off by default)")
     parser.add_argument("--info", action="store_true",
                         help="Print info about existing files and exit")
     _default_n_processes = int(_cfg.get("bc", {}).get("demo_recording_n_processes", 1))
@@ -673,6 +679,20 @@ def main() -> None:
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Resume: start file indices after the highest existing file so we never overwrite.
+    import re as _re
+    _existing = [
+        int(m.group(1))
+        for p in output_dir.glob(f"phase{args.phase}_*.npz")
+        if (m := _re.search(r"_(\d+)\.npz$", p.name))
+    ]
+    _file_idx_offset = (max(_existing) + 1) if _existing else 0
+    if _file_idx_offset > 0:
+        log.warning(
+            f"Output dir already contains {len(_existing)} file(s) (up to index {_file_idx_offset - 1}). "
+            f"Appending new files from index {_file_idx_offset} — existing files will NOT be overwritten."
+        )
+
     n_eps = args.n_episodes
     eps_per_file = args.episodes_per_file
     n_files = (n_eps + eps_per_file - 1) // eps_per_file
@@ -690,7 +710,8 @@ def main() -> None:
             "n_episodes": n_eps,
             "episodes_per_file": eps_per_file,
             "output_dir": str(output_dir),
-            "file_idx_start": 0,
+            "file_idx_start": _file_idx_offset,
+            "verbose_stats": args.verbose_stats,
             "seed": args.seed,
             "sample_interval_s": args.sample_interval,
             "opponent_rules_prob": args.opponent_rules_prob,
@@ -710,7 +731,7 @@ def main() -> None:
     base_eps = n_eps // n_processes
     remainder = n_eps % n_processes
     jobs: list[dict] = []
-    file_idx_cursor = 0
+    file_idx_cursor = _file_idx_offset
     for i in range(n_processes):
         worker_eps = base_eps + (1 if i < remainder else 0)
         if worker_eps == 0:
@@ -721,6 +742,7 @@ def main() -> None:
             "episodes_per_file": eps_per_file,
             "output_dir": str(output_dir),
             "file_idx_start": file_idx_cursor,
+            "verbose_stats": args.verbose_stats,
             "seed": args.seed + i,
             "sample_interval_s": args.sample_interval,
             "opponent_rules_prob": args.opponent_rules_prob,

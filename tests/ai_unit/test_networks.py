@@ -208,7 +208,7 @@ class TestExecutionNetwork:
         ("exec_move_logit", (2, 1)),
         ("sprint_logit", (2, 1)),
         ("kick_logit", (2, 1)),
-        ("kick_direction", (2, 2)),
+        ("kick_direction", (2, 3)),  # 3D unit vector (elevation added for upward kicks)
         ("kick_power", (2, 1)),
         ("kick_spin", (2, 3)),
         ("tackle_attempt_logit", (2, 1)),

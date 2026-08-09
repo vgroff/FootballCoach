@@ -340,12 +340,12 @@ class TestPhase1Reward:
     def test_proximity_bonus_on_timeout_increases_with_closeness(self):
         """Ball near the box on timeout earns a larger prox bonus than ball far away.
 
-        prox is normalized by start_ball_to_box_dist_m (the episode's own
-        ball-to-box distance at the start), so this must be passed as a
-        realistic value — leaving it at the 1.0 default would make "near"
-        (dist=1.0) and "far" (dist=9999.0) both saturate to comps["prox"]=0.0.
-        proximity_bonus_scale is 0.0 in the live config (disabled), so this
-        test overrides it locally to a non-zero value to exercise the formula.
+        prox uses a FIXED 40m pitch-scale reference (no initial-state
+        dependency, see reward.py's module invariant), so "near" (dist=1.0)
+        and "far" (dist=9999.0) are meaningfully different without needing any
+        extra episode-start parameter. proximity_bonus_scale is 0.0 in the
+        live config (disabled), so this test overrides it locally to a
+        non-zero value to exercise the formula.
         """
         _cfg_prox = {**_CFG1, "proximity_bonus_scale": 0.65}
         _, comps_near, _ = phase1_reward(
@@ -354,7 +354,6 @@ class TestPhase1Reward:
             ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
             illegal_action_attempted=False, reached_opponent_box_with_possession=False,
             cfg=_cfg_prox, timed_out=True, ball_dist_to_opponent_box_m=1.0,
-            start_ball_to_box_dist_m=30.0,
         )
         _, comps_far, _ = phase1_reward(
             prev_ball_dist=1.0, curr_ball_dist=1.0,
@@ -362,7 +361,6 @@ class TestPhase1Reward:
             ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
             illegal_action_attempted=False, reached_opponent_box_with_possession=False,
             cfg=_cfg_prox, timed_out=True, ball_dist_to_opponent_box_m=9999.0,
-            start_ball_to_box_dist_m=30.0,
         )
         assert comps_near["prox"] > comps_far["prox"]
 
@@ -404,7 +402,6 @@ class TestPhase1Reward:
                 ball_progress_toward_goal_m=1.0, ball_went_out_after_touch=False,
                 illegal_action_attempted=False, reached_opponent_box_with_possession=False,
                 cfg={**_CFG1, "ball_progress_scale": 1.0},
-                start_ball_to_box_dist_m=1.0,
                 prog_reward_clamp=0.5,
                 cumulative_state=cum_state,
             )
@@ -425,7 +422,7 @@ class TestPhase1Reward:
                 ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
                 illegal_action_attempted=False, reached_opponent_box_with_possession=False,
                 cfg={**_CFG1, "ball_approach_speed_bonus": 1.0},
-                start_ball_dist_m=1.0, player_speed_mps=1.0, heading_cos_sim=1.0,
+                player_speed_mps=1.0, heading_cos_sim=1.0,
                 appr_sq_approach_reward_clamp=0.3,
                 cumulative_state=cum_state,
             )
@@ -443,7 +440,7 @@ class TestPhase1Reward:
                 ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
                 illegal_action_attempted=False, reached_opponent_box_with_possession=False,
                 cfg={**_CFG1, "ball_retreat_speed_penalty": 1.0},
-                start_ball_dist_m=1.0, player_speed_mps=1.0, heading_cos_sim=-1.0,
+                player_speed_mps=1.0, heading_cos_sim=-1.0,
                 appr_sq_retreat_reward_clamp=0.3,
                 cumulative_state=cum_state,
             )

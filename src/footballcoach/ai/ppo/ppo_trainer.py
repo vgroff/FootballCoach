@@ -55,6 +55,7 @@ from footballcoach.ai.eval.seeded_eval import (
 from footballcoach.ai.models.decision_network import DecisionNetwork, derive_get_possession_prob
 from footballcoach.ai.models.execution_network import ExecutionNetwork, flatten_decision_heads
 from footballcoach.ai.obs.augment import augment_batch, augment_obs_bc
+from footballcoach.ai.obs.canonical import canonicalize_obs, mirror_x
 from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer, HEAD_LP_KEYS
 from footballcoach.ai.ppo.schedules import TrainingSchedules
 
@@ -1354,7 +1355,8 @@ class PPOTrainer:
                 f"  [eval vs {_label}] step={self._total_steps:,}  "
                 f"seeds={len(self._eval_seeds)}x{self._eval_repeats_per_seed}  "
                 f"win={result.win_rate_pct:.0f}%  "
-                f"mean_rew={result.mean_reward:.3f}±{result.std_reward:.3f}  "
+                f"mean_rew={result.mean_reward:.3f}±{result.std_reward:.3f} "
+                f"(sem={result.sem_reward:.3f})  "
                 f"V={result.mean_value_pred:.3f}  gap={result.mean_value_pred - result.mean_reward:+.3f}  "
                 f"outcomes={result.outcomes}"
             )
@@ -1487,10 +1489,14 @@ class PPOTrainer:
                 f"split: {len(_p0_train_idx):,} train / {len(_p0_val_idx):,} val rows"
             )
 
-            def _eval_p0_val_loss() -> float:
-                """Combined dec_bc + value MSE on the held-out val rows (no grad)."""
+            def _eval_p0_val_loss() -> tuple[float, float, float]:
+                """Combined dec_bc + value MSE on the held-out val rows (no grad).
+                Returns (combined, bc_adj, val_mse) where bc_adj = bc - floor."""
                 self.decision_net.eval()
                 _v_losses: list[float] = []
+                _v_bc_losses: list[float] = []
+                _v_mse_losses: list[float] = []
+                _v_floors: list[float] = []
                 with torch.no_grad():
                     for _obs_v, _lbl_v, _ret_v in dataset.iterate_minibatches(
                         batch_size=batch_size, shuffle=False, device=self.device,
@@ -1510,6 +1516,12 @@ class PPOTrainer:
                             dec_label_smoothing=self._bc_dec_label_smoothing,
                             return_breakdown=True,
                         )
+                        _floor_v = compute_bc_loss_floor(
+                            _lbl_v,
+                            dec_weight=self._bc_dec_weight,
+                            dec_label_smoothing=self._bc_dec_label_smoothing,
+                            has_exec=False,
+                        )
                         _e_v = self._value_heads(
                             _obs_v["self_feat"], _obs_v["other_feat"],
                             _obs_v["exists_mask"], _obs_v["ball_feat"], _obs_v["global_feat"],
@@ -1517,8 +1529,15 @@ class PPOTrainer:
                         )
                         _mse_v = F.mse_loss(_e_v.value.squeeze(-1), _ret_v) / (ret_std ** 2)
                         _v_losses.append((_bc_v + self._phase0_value_coef * _mse_v).item())
+                        _v_bc_losses.append(_bc_v.item())
+                        _v_mse_losses.append(_mse_v.item())
+                        _v_floors.append(_floor_v)
                 self.decision_net.train()
-                return float(np.mean(_v_losses)) if _v_losses else float("nan")
+                _combined = float(np.mean(_v_losses)) if _v_losses else float("nan")
+                _bc_mean = float(np.mean(_v_bc_losses)) if _v_bc_losses else float("nan")
+                _floor_mean = float(np.mean(_v_floors)) if _v_floors else 0.0
+                _mse_mean = float(np.mean(_v_mse_losses)) if _v_mse_losses else float("nan")
+                return _combined, _bc_mean - _floor_mean, _mse_mean
 
             _p0_best_val_loss = float("inf")
             _p0_best_state: Optional[dict] = None
@@ -1596,15 +1615,19 @@ class PPOTrainer:
                     f"{self._phase0_value_coef * np.mean(epoch_val_losses):.4f}"
                 )
                 if len(_p0_val_idx) > 0:
-                    _p0_vl = _eval_p0_val_loss()
+                    _p0_vl, _p0_vl_bc_adj, _p0_vl_mse = _eval_p0_val_loss()
                     _p0_improved = _p0_vl < (_p0_best_val_loss - self._p0_early_stop_min_delta)
+                    _val_core = (
+                        f"    val  p0_val_loss={_p0_vl:.4f}  bc_adj={_p0_vl_bc_adj:.4f}  "
+                        f"val_mse={_p0_vl_mse:.4f}  best={min(_p0_best_val_loss, _p0_vl):.4f}"
+                    )
                     if _p0_early_stop_enabled:
                         log.info(
-                            f"    val  p0_val_loss={_p0_vl:.4f}  best={min(_p0_best_val_loss, _p0_vl):.4f}"
+                            _val_core
                             + ("  (improved)" if _p0_improved else f"  (patience {_p0_patience_ctr + 1}/{self._p0_early_stop_patience})")
                         )
                     else:
-                        log.info(f"    val  p0_val_loss={_p0_vl:.4f}")
+                        log.info(_val_core)
                     if _p0_improved:
                         _p0_best_val_loss = _p0_vl
                         if _p0_early_stop_enabled:
@@ -2771,20 +2794,36 @@ class PPOTrainer:
         ], dim=-1)
 
     @torch.no_grad()
-    def _sample_action(self, obs_dict: dict, deterministic: bool = False) -> tuple:
+    def _sample_action(
+        self,
+        obs_dict: dict,
+        deterministic: bool = False,
+        deterministic_decision: bool = False,
+        deterministic_direction: bool = False,
+    ) -> tuple:
         """Forward pass + sample from all distributions.
 
         Args:
             deterministic: if True, use each head's mode/mean instead of a
-                stochastic sample (Bernoulli -> >=0.5, Categorical -> argmax,
-                Normal/Direction heads -> mean) — for evaluating a checkpoint
-                without PPO exploration noise. Never used during rollout
-                collection/training, only via load_for_inference() callers.
+                stochastic sample for EVERY head (Bernoulli -> >=0.5,
+                Categorical -> argmax, Normal/Direction heads -> mean) —
+                shorthand for deterministic_decision=deterministic_direction=True.
+            deterministic_decision: if True, only the discrete decision/execution
+                heads (Bernoulli intents incl. exec_move/sprint/kick/tackle_attempt,
+                and the pass/tackle/mark Categorical targets) use their mode;
+                move/kick direction still sample.
+            deterministic_direction: if True, only the continuous move_direction/
+                kick_direction heads use their mean; discrete heads still sample.
+            These are for evaluating a checkpoint without (all or part of) PPO
+            exploration noise. Never used during rollout collection/training,
+            only via load_for_inference() callers.
 
         Returns:
             (decision_action, log_prob, value, decision_probs,
              execution_physical, decision_physical, target_slots)
         """
+        det_decision = deterministic or deterministic_decision
+        det_direction = deterministic or deterministic_direction
         dev = self.device
         sf = obs_dict["self_feat"].unsqueeze(0).to(dev)
         of = obs_dict["other_feat"].unsqueeze(0).to(dev)
@@ -2793,6 +2832,13 @@ class PPOTrainer:
         gf = obs_dict["global_feat"].unsqueeze(0).to(dev)
         sat = obs_dict["self_ai_type"].unsqueeze(0).to(dev) if "self_ai_type" in obs_dict else None
         oat = obs_dict["other_ai_type"].unsqueeze(0).to(dev) if "other_ai_type" in obs_dict else None
+
+        # Canonical AI frame: mirror world-frame obs so self always attacks
+        # +x (see ai/obs/canonical.py). x_sign is reused below to decanonicalize
+        # move_direction/kick_direction before they're returned to the caller.
+        # N=1 here (single-player action sampling), so reduce to a python float.
+        sf, of, bf, x_sign = canonicalize_obs(sf, of, bf)
+        x_sign = float(x_sign.item())
 
         # Decision network forward
         d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
@@ -2805,21 +2851,21 @@ class PPOTrainer:
         gp_extra_dist = IndependentBernoulli(d_heads.get_possession_raw)
         mark_dist = IndependentBernoulli(d_heads.mark_logit)
         hold_dist = IndependentBernoulli(d_heads.hold_position_logit)
-        shoot = shoot_dist.mode() if deterministic else shoot_dist.sample()
-        pass_ = pass_dist.mode() if deterministic else pass_dist.sample()
-        move = move_dist.mode() if deterministic else move_dist.sample()
-        tackle = tackle_dist.mode() if deterministic else tackle_dist.sample()
-        gp_extra = gp_extra_dist.mode() if deterministic else gp_extra_dist.sample()
-        mark = mark_dist.mode() if deterministic else mark_dist.sample()
-        hold = hold_dist.mode() if deterministic else hold_dist.sample()
+        shoot = shoot_dist.mode() if det_decision else shoot_dist.sample()
+        pass_ = pass_dist.mode() if det_decision else pass_dist.sample()
+        move = move_dist.mode() if det_decision else move_dist.sample()
+        tackle = tackle_dist.mode() if det_decision else tackle_dist.sample()
+        gp_extra = gp_extra_dist.mode() if det_decision else gp_extra_dist.sample()
+        mark = mark_dist.mode() if det_decision else mark_dist.sample()
+        hold = hold_dist.mode() if det_decision else hold_dist.sample()
 
         # Categorical targets (masked)
         pass_tgt_dist = MaskedCategorical(d_heads.pass_target_logits, em)
         tackle_tgt_dist = MaskedCategorical(d_heads.tackle_target_logits, em)
         mark_tgt_dist = MaskedCategorical(d_heads.mark_target_logits, em)
-        pass_tgt = pass_tgt_dist.mode() if deterministic else pass_tgt_dist.sample()
-        tackle_tgt = tackle_tgt_dist.mode() if deterministic else tackle_tgt_dist.sample()
-        mark_tgt = mark_tgt_dist.mode() if deterministic else mark_tgt_dist.sample()
+        pass_tgt = pass_tgt_dist.mode() if det_decision else pass_tgt_dist.sample()
+        tackle_tgt = tackle_tgt_dist.mode() if det_decision else tackle_tgt_dist.sample()
+        mark_tgt = mark_tgt_dist.mode() if det_decision else mark_tgt_dist.sample()
 
         # Continuous decision heads (pre-squash raw samples for PPO)
         mv_center_raw = d_heads.move_region_center  # (1, 2), no extra noise for now - use mean
@@ -2855,8 +2901,11 @@ class PPOTrainer:
         mv_size_phys = 1.0 + 3.0 * torch.sigmoid(mv_size_raw)  # [1, 4] m
         mv_speed_phys = float(torch.sigmoid(mv_speed_raw) * 9.5)  # [0, v_top]
 
+        # Decanonicalize: move_region_center is a world-frame physical target.
+        mv_center_world = mirror_x(mv_center_phys.squeeze(0), x_sign)
+
         decision_physical = {
-            "move_region_center_m": mv_center_phys.squeeze(0).cpu().numpy(),
+            "move_region_center_m": mv_center_world.cpu().numpy(),
             "move_region_size_m": float(mv_size_phys),
             "move_arrival_speed_mps": mv_speed_phys,
         }
@@ -2869,21 +2918,21 @@ class PPOTrainer:
         sprint_dist = IndependentBernoulli(e_heads.sprint_logit)
         kick_dist = IndependentBernoulli(e_heads.kick_logit)
         tackle_attempt_dist = IndependentBernoulli(e_heads.tackle_attempt_logit)
-        exec_move = exec_move_dist.mode() if deterministic else exec_move_dist.sample()
-        sprint = sprint_dist.mode() if deterministic else sprint_dist.sample()
-        kick = kick_dist.mode() if deterministic else kick_dist.sample()
-        tackle_attempt = tackle_attempt_dist.mode() if deterministic else tackle_attempt_dist.sample()
+        exec_move = exec_move_dist.mode() if det_decision else exec_move_dist.sample()
+        sprint = sprint_dist.mode() if det_decision else sprint_dist.sample()
+        kick = kick_dist.mode() if det_decision else kick_dist.sample()
+        tackle_attempt = tackle_attempt_dist.mode() if det_decision else tackle_attempt_dist.sample()
 
         # Direction heads: sample from Normal(mean, std) per design doc 8.6.
         # We store the noisy raw sample (not the mean) so that log_prob ratios
         # during the PPO update are meaningful — new_mean vs stored sample.
-        # In deterministic mode we use the (normalized) mean direction instead.
+        # In deterministic (direction) mode we use the (normalized) mean direction instead.
         eps = 1e-6
         log_std_move = self.execution_net.move_dir_log_std
         log_std_kick = self.execution_net.kick_dir_log_std
         move_dir_head = self._move_dir_head(e_heads.move_direction, log_std_move)
         kick_dir_head = self._kick_dir_head(e_heads.kick_direction, log_std_kick)
-        if deterministic:
+        if det_direction:
             move_dir_raw = move_dir_head.mode_physical()  # (1, 2)
             kick_dir_raw = kick_dir_head.mode_physical()   # (1, 3)
         else:
@@ -2895,12 +2944,16 @@ class PPOTrainer:
         kick_power_phys = float(torch.sigmoid(e_heads.kick_power))
         kick_spin_raw = e_heads.kick_spin.squeeze(0)
 
+        # Decanonicalize: these are world-frame physical directions from here on.
+        move_dir_world = mirror_x(move_dir_phys, x_sign)
+        kick_dir_world = mirror_x(kick_dir_phys, x_sign)
+
         execution_physical = {
             "exec_move": bool(exec_move.item() > 0.5),
-            "move_direction": move_dir_phys.cpu().numpy(),
+            "move_direction": move_dir_world.cpu().numpy(),
             "sprint": bool(sprint.item() > 0.5),
             "kick_this_tick": bool(kick.item() > 0.5),
-            "kick_direction": kick_dir_phys.cpu().numpy(),
+            "kick_direction": kick_dir_world.cpu().numpy(),
             "kick_power_fraction": kick_power_phys,
             "kick_spin": kick_spin_raw.cpu().numpy(),
             "tackle_attempt": bool(tackle_attempt.item() > 0.5),

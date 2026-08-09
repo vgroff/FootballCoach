@@ -48,8 +48,16 @@ def main() -> None:
     parser.add_argument("--n-parallel-workers", type=int, default=None,
                         help="Subprocess workers for eval (default: ai_config.json eval.eval_n_parallel_workers). 1 = sequential.")
     parser.add_argument("--deterministic", action="store_true",
-                        help="Run the checkpoint's policy deterministically (mode/mean of each "
-                             "action head instead of a stochastic PPO sample) -- no exploration noise.")
+                        help="Run the checkpoint's policy fully deterministically (mode/mean of every "
+                             "action head instead of a stochastic PPO sample) -- no exploration noise. "
+                             "Shorthand for --deterministic-decision --deterministic-direction.")
+    parser.add_argument("--deterministic-decision", action="store_true",
+                        help="Only the discrete decision/execution heads (shoot/pass/move/tackle/etc. "
+                             "intents and pass/tackle/mark targets) use their mode; move/kick direction "
+                             "still sample stochastically.")
+    parser.add_argument("--deterministic-direction", action="store_true",
+                        help="Only the move_direction/kick_direction heads use their mean; discrete "
+                             "decision/execution heads still sample stochastically.")
     args = parser.parse_args()
 
     if not args.baseline_only and args.checkpoint is None:
@@ -105,6 +113,8 @@ def main() -> None:
     neural_stats = _run_evaluation(
         trainer, env, args.n_trials, args.repeats_per_seed, args.checkpoint, args.n_parallel_workers,
         deterministic=args.deterministic,
+        deterministic_decision=args.deterministic_decision,
+        deterministic_direction=args.deterministic_direction,
     )
     log.info(f"  Neural net eval done: {neural_stats['n_trials']} episodes, "
              f"win={neural_stats['win_rate_pct']:.1f}%")
@@ -139,7 +149,10 @@ def main() -> None:
 
 
 def _checkpoint_eval_env_factory(
-    checkpoint_path: str, device: str, definition_kwargs: dict, deterministic: bool = False,
+    checkpoint_path: str, device: str, definition_kwargs: dict,
+    deterministic: bool = False,
+    deterministic_decision: bool = False,
+    deterministic_direction: bool = False,
 ) -> tuple:
     """Module-level (picklable) worker factory for parallel evaluate.py runs
     -- each subprocess reloads the checkpoint fresh from disk (live
@@ -155,7 +168,14 @@ def _checkpoint_eval_env_factory(
     def _env_factory(seed: int) -> ScenarioEnv:
         return ScenarioEnv(**definition_kwargs, seed=seed)
 
-    sample_fn = functools.partial(trainer._sample_action, deterministic=deterministic) if deterministic else trainer._sample_action
+    sample_fn = trainer._sample_action
+    if deterministic or deterministic_decision or deterministic_direction:
+        sample_fn = functools.partial(
+            trainer._sample_action,
+            deterministic=deterministic,
+            deterministic_decision=deterministic_decision,
+            deterministic_direction=deterministic_direction,
+        )
     return _env_factory, sample_fn
 
 
@@ -163,6 +183,8 @@ def _run_evaluation(
     trainer, env, n_trials: Optional[int] = None, repeats_per_seed: Optional[int] = None,
     checkpoint_path: Optional[str] = None, n_parallel_workers: Optional[int] = None,
     deterministic: bool = False,
+    deterministic_decision: bool = False,
+    deterministic_direction: bool = False,
 ) -> dict:
     """Run the shared seeded evaluation (ai/eval/seeded_eval.py) against the
     checkpoint's own env/definition, reusing the SAME fixed seed list as
@@ -171,7 +193,9 @@ def _run_evaluation(
     ai_config.json's eval.eval_n_seeds/eval_repeats_per_seed when given.
     n_parallel_workers>1 requires checkpoint_path (each subprocess reloads
     the checkpoint itself -- see _checkpoint_eval_env_factory). deterministic=True
-    runs the policy's mode/mean instead of sampling (see PPOTrainer._sample_action)."""
+    runs the policy's mode/mean instead of sampling; deterministic_decision/
+    deterministic_direction narrow this to just the discrete or just the
+    direction heads respectively (see PPOTrainer._sample_action)."""
     from footballcoach.ai.config import load_ai_config
     from footballcoach.ai.env.scenario_env import ScenarioEnv
     from footballcoach.ai.eval.seeded_eval import (
@@ -201,7 +225,8 @@ def _run_evaluation(
             max_episode_s=env.max_episode_s,
         )
         worker_factory = functools.partial(
-            _checkpoint_eval_env_factory, checkpoint_path, "cpu", _def_kwargs, deterministic,
+            _checkpoint_eval_env_factory, checkpoint_path, "cpu", _def_kwargs,
+            deterministic, deterministic_decision, deterministic_direction,
         )
         result = run_seeded_evaluation_parallel(worker_factory, seeds, repeats, n_workers=n_workers)
     else:
@@ -216,7 +241,14 @@ def _run_evaluation(
             )
 
         import functools
-        sample_fn = functools.partial(trainer._sample_action, deterministic=deterministic) if deterministic else trainer._sample_action
+        sample_fn = trainer._sample_action
+        if deterministic or deterministic_decision or deterministic_direction:
+            sample_fn = functools.partial(
+                trainer._sample_action,
+                deterministic=deterministic,
+                deterministic_decision=deterministic_decision,
+                deterministic_direction=deterministic_direction,
+            )
         result = run_seeded_evaluation(_env_factory, sample_fn, seeds, repeats)
 
     d = result.as_dict()
@@ -299,7 +331,7 @@ def _print_combined_stats(combined: dict) -> None:
 
     nn = combined["neural_net"]
     log.info(f"  Neural net:  win={nn['win_rate_pct']:.1f}%  "
-             f"reward={nn['mean_reward']:.2f}±{nn['std_reward']:.2f}  "
+             f"reward={nn['mean_reward']:.2f}±{nn['std_reward']:.2f} (sem={nn['sem_reward']:.2f})  "
              f"outcomes={nn['outcomes']}  (win/loss/tout/miss: {nn['outcome_breakdown']})")
 
     bl = combined.get("baseline_rules_vs_rules")

@@ -8,7 +8,7 @@ import math
 from typing import TYPE_CHECKING
 
 import pygame
-
+import pygame.gfxdraw
 from footballcoach.config import load_graphics_config
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.pitch import Pitch
@@ -230,6 +230,9 @@ class Renderer:
         centre = cam.world_to_screen(0, 0)
         radius_px = cam.scale_length(pitch.centre_circle_radius_m)
         pygame.draw.circle(surface, style.PITCH_LINE_WHITE, centre, radius_px, line_w)
+        pygame.gfxdraw.aacircle(surface, centre[0], centre[1], radius_px, style.PITCH_LINE_WHITE)
+        if line_w > 1:
+            pygame.gfxdraw.aacircle(surface, centre[0], centre[1], max(0, radius_px - line_w + 1), style.PITCH_LINE_WHITE)
 
         # Penalty boxes and six-yard boxes, both ends.
         half_box_w = pitch.box_width_m / 2.0
@@ -304,9 +307,11 @@ class Renderer:
                 surface.blit(ts, (tp[0] - gr - 1, tp[1] - gr - 1))
 
         pygame.draw.circle(surface, style.BALL_COLOUR, pos, radius_px)
+        pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px, style.BALL_COLOUR)
         if self._ball_outline and self._ball_outline_width > 0.0:
             if self._ball_outline_width >= 1.0:
                 pygame.draw.circle(surface, style.BALL_OUTLINE, pos, radius_px, int(self._ball_outline_width))
+                pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px, style.BALL_OUTLINE)
             else:
                 # Sub-pixel: draw 1px outline at reduced alpha for a softer border
                 _oa = int(self._ball_outline_width * 255)
@@ -399,7 +404,7 @@ class Renderer:
                 sy = pos[1] + trail_dy * start_dist + perp_dy * perp_offset
                 ex = sx + trail_dx * self._speed_line_length_px
                 ey = sy + trail_dy * self._speed_line_length_px
-                pygame.draw.line(surface, style.SPEED_LINE_COLOUR, (int(sx), int(sy)), (int(ex), int(ey)), 2)
+                pygame.draw.aaline(surface, style.SPEED_LINE_COLOUR, (sx, sy), (ex, ey))
 
         if is_inactive:
             # Draw on a small per-pixel-alpha surface so the player reads as
@@ -411,6 +416,7 @@ class Renderer:
             surface.blit(player_surf, (pos[0] - centre[0], pos[1] - centre[1]))
         else:
             pygame.draw.circle(surface, colour, pos, radius_px)
+            pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px, colour)
 
         # --- Low-stamina flash: outermost ring, pulsing at configured hz ---
         if player.stamina < self._stamina_flash_threshold and not is_inactive:
@@ -418,19 +424,22 @@ class Renderer:
             flash_on = (pygame.time.get_ticks() % int(period_ms * 2)) < int(period_ms)
             if flash_on:
                 pygame.draw.circle(surface, style.STAMINA_FLASH_OUTLINE, pos, radius_px + 11, 2)
+                pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px + 11, style.STAMINA_FLASH_OUTLINE)
 
         # State outline rings: CONTROLLING_BALL (cyan) and INACTIVE_TACKLED (red).
-        # These are separate from the possession/selection outlines, and stack
-        # outward so they're each visible simultaneously.
         if player.state == PlayerState.CONTROLLING_BALL:
             pygame.draw.circle(surface, style.CONTROL_DELAY_OUTLINE, pos, radius_px + 4, 2)
+            pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px + 4, style.CONTROL_DELAY_OUTLINE)
         elif is_inactive:
             pygame.draw.circle(surface, style.INACTIVE_OUTLINE, pos, radius_px + 4, 2)
+            pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px + 4, style.INACTIVE_OUTLINE)
 
         if has_ball:
             pygame.draw.circle(surface, style.POSSESSION_OUTLINE, pos, radius_px + 2, self._possession_outline_thickness)
+            pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px + 2, style.POSSESSION_OUTLINE)
         if selected:
             pygame.draw.circle(surface, style.SELECTED_OUTLINE, pos, radius_px + 7, 2)
+            pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px + 7, style.SELECTED_OUTLINE)
 
         # Heading indicator - a short line showing facing direction.
         if self._heading_alpha > 0:
@@ -447,7 +456,7 @@ class Renderer:
             lp0 = (pos[0] - sx, pos[1] - sy)
             lp1 = (pos[0] + tip_dx - sx, pos[1] + tip_dy - sy)
             r, g, b = style.PITCH_LINE_WHITE
-            pygame.draw.line(h_surf, (r, g, b, self._heading_alpha), lp0, lp1, 2)
+            pygame.draw.aaline(h_surf, (r, g, b, self._heading_alpha), lp0, lp1)
             surface.blit(h_surf, (sx, sy))
 
         label = self.hud_font.render(player.player_id, True, style.HUD_TEXT)
@@ -582,6 +591,12 @@ class Renderer:
                     (*style.TRAJ_CONE_RGB, style.TRAJ_CONE_ALPHA),
                     poly,
                 )
+                # AA edge on top of the filled polygon.
+                pygame.gfxdraw.aapolygon(
+                    cone_surf,
+                    [(int(x), int(y)) for x, y in poly],
+                    (*style.TRAJ_CONE_RGB, min(255, style.TRAJ_CONE_ALPHA + 60)),
+                )
                 surface.blit(cone_surf, (0, 0))
 
         # --- Coloured trajectory segments ------------------------------------
@@ -600,26 +615,59 @@ class Renderer:
             else:
                 colour = style.TRAJ_DESCENDING
 
-            pygame.draw.line(surface, colour, s0, s1, 2)
+            # Two offset aalines approximate a smooth 2px-wide antialiased line.
+            dx, dy = s1[0] - s0[0], s1[1] - s0[1]
+            slen = math.hypot(dx, dy)
+            if slen > 1e-6:
+                nx, ny = -dy / slen, dx / slen  # perpendicular unit vector
+                pygame.draw.aaline(surface, colour,
+                    (s0[0] - nx * 0.5, s0[1] - ny * 0.5),
+                    (s1[0] - nx * 0.5, s1[1] - ny * 0.5))
+                pygame.draw.aaline(surface, colour,
+                    (s0[0] + nx * 0.5, s0[1] + ny * 0.5),
+                    (s1[0] + nx * 0.5, s1[1] + ny * 0.5))
+            else:
+                pygame.draw.aaline(surface, colour, s0, s1)
+
+        # --- Apex ticks: short orthogonal line at each local z-maximum ------
+        for i in range(1, len(points) - 1):
+            if points[i].z > points[i - 1].z and points[i].z > points[i + 1].z:
+                sx, sy = self.camera.world_to_screen(points[i].x, points[i].y)
+                ax, ay = self.camera.world_to_screen(points[i - 1].x, points[i - 1].y)
+                bx, by = self.camera.world_to_screen(points[i + 1].x, points[i + 1].y)
+                tdx, tdy = bx - ax, by - ay
+                tlen = math.hypot(tdx, tdy)
+                if tlen > 1e-6:
+                    ox, oy = -tdy / tlen, tdx / tlen
+                    half = 6
+                    pygame.draw.aaline(
+                        surface, style.TRAJ_ASCENDING,
+                        (sx - ox * half, sy - oy * half),
+                        (sx + ox * half, sy + oy * half),
+                    )
 
         # --- Endpoint dot ---------------------------------------------------
         last = points[-1]
         end_screen = self.camera.world_to_screen(last.x, last.y)
-        pygame.draw.circle(surface, style.TRAJ_ABOVE_GOAL if last.z > goal_height_m else style.TRAJ_DESCENDING, end_screen, 4)
+        _end_col = style.TRAJ_ABOVE_GOAL if last.z > goal_height_m else style.TRAJ_DESCENDING
+        pygame.gfxdraw.aacircle(surface, end_screen[0], end_screen[1], 4, _end_col)
+        pygame.gfxdraw.filled_circle(surface, end_screen[0], end_screen[1], 4, _end_col)
 
         # --- Phase info + hint panel (bottom of screen, above hotkey bar) ----
         lines: list[tuple[str, tuple[int, int, int]]] = []
+        max_height_m = max((p.z for p in points), default=0.0)
+        height_str = f"{max_height_m:.1f}m (goal: {goal_height_m:.1f}m)"
 
         if ku.phase == KickPhase.AIM_XY:
             pct = int(ku.power_fraction * 100)
-            lines.append((f"KICK  ·  Power: {pct}%", style.HUD_ACCENT))
+            lines.append((f"KICK  ·  Power: {pct}%    Peak: {height_str}", style.HUD_ACCENT))
             lines.append(("Move mouse to aim  —  farther = more power", style.HUD_TEXT))
             lines.append(("Left-click to confirm  ·  Right-click or Esc to cancel", style.HUD_TEXT))
 
         elif ku.phase == KickPhase.AIM_Z:
             pct = int(ku.power_fraction * 100)
             elev_deg = math.degrees(ku.elevation_angle_rad)
-            lines.append((f"KICK  ·  Power: {pct}%    Elevation: {elev_deg:.0f}°", style.HUD_ACCENT))
+            lines.append((f"KICK  ·  Power: {pct}%    Elevation: {elev_deg:.1f}°    Peak: {height_str}", style.HUD_ACCENT))
             lines.append(("Close to player = loft  ·  Far away = flat", style.HUD_TEXT))
             lines.append(("Left-click to confirm  ·  Right-click to go back  ·  Esc cancel", style.HUD_TEXT))
 
@@ -628,7 +676,7 @@ class Renderer:
             elev_deg = math.degrees(ku.elevation_angle_rad)
             spin_mag = ku.spin.length()
             spin_str = f"{spin_mag:.1f} rad/s" if spin_mag > 0.5 else "none"
-            lines.append((f"KICK  ·  Power: {pct}%    Elev: {elev_deg:.0f}°    Spin: {spin_str}", style.HUD_ACCENT))
+            lines.append((f"KICK  ·  Power: {pct}%    Elev: {elev_deg:.1f}°    Spin: {spin_str}    Peak: {height_str}", style.HUD_ACCENT))
             lines.append(("Ahead = topspin  ·  Behind = backspin  ·  Left/right = sidespin", style.HUD_TEXT))
             lines.append(("Left-click to fire  ·  Right-click to go back  ·  Esc cancel", style.HUD_TEXT))
 
