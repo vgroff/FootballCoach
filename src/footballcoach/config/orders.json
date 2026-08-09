@@ -3,11 +3,11 @@
 
   "movement": {
     "_comment": "Brake-to-turn and close-proximity brakes applied in _compute_movement_intent (order layer only — not used by the neural network direct-drive path).",
-    "brake_turn_angle_deg": 75.0,
+    "brake_turn_angle_deg": 72.0,
     "_comment_brake_turn": "Heading change above this triggers brake-to-turn: the order forces SpeedMode.STANDSTILL so the player decelerates before pivoting. 75=current, 90=original less aggressive.",
     "brake_min_speed_mps": 2.0,
     "_comment_brake_min": "Brake-to-turn and close-prox checks only fire above this ground speed. Below it, turn rate is already high enough to pivot freely without braking.",
-    "close_prox_radius_m": 6.0,
+    "close_prox_radius_m": 6.5,
     "close_prox_cos_threshold": 0.3,
     "_comment_close_prox": "Lateral-overshoot brake: within close_prox_radius_m of target, if velocity cos-sim < threshold, force STANDSTILL. Prevents a player arriving at pace from the wrong angle blowing past and orbiting. cos 0.3 = ~73° off-axis.",
     "sprint_to_ball_clearance_margin": 0.4,

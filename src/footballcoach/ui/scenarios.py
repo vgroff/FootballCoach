@@ -29,7 +29,7 @@ from footballcoach.engine.ball_physics import BallPhysicsParams
 from footballcoach.engine.match import Match
 from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.entities import Ball, Pitch, PlayerAttributes, Team
-from footballcoach.entities.player import Player, PlayerState
+from footballcoach.entities.player import Player
 from footballcoach.generation import generate_attributes
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import (
@@ -1666,8 +1666,9 @@ class ScenarioLoop:
     suppressed — the episode continues until a permitted outcome fires or the
     env's own timeout triggers.  ``None`` (default) permits all outcomes,
     which is the correct behaviour for UI scenarios.  Phase-1 training passes
-    ``frozenset({"miss", "goal"})`` so that dispossessed/saved/stalemate/other
-    never terminate the loop; the env catches box-possession itself."""
+    ``frozenset({"miss", "goal"})`` so that dispossessed/saved/box_possession/
+    timeout never terminate the loop directly; the env catches box-possession
+    and timeout itself with its own authoritative tick budget."""
 
     _trial_count: int = field(default=0, init=False, repr=False)
     _trial_tick: int = field(default=0, init=False, repr=False)
@@ -1676,7 +1677,10 @@ class ScenarioLoop:
     _initial_scoreboard: tuple[int, int] = field(default=(0, 0), init=False, repr=False)
     _ball_released: bool = field(default=False, init=False, repr=False)
     outcomes: dict[str, int] = field(
-        default_factory=lambda: {"goal": 0, "saved": 0, "miss": 0, "dispossessed": 0, "other": 0},
+        default_factory=lambda: {
+            "goal": 0, "saved": 0, "miss": 0, "dispossessed": 0,
+            "box_possession": 0, "course_complete": 0, "timeout": 0,
+        },
         init=False, repr=False,
     )
     _pending_outcome: str | None = field(default=None, init=False, repr=False)
@@ -1769,73 +1773,20 @@ class ScenarioLoop:
 
         Out-of-bounds events linger for half the normal duration so the UI
         can briefly show the ball leaving the pitch without a full pause.
-        All other outcomes (goal, saved, dispossessed, other) use the full
-        ``linger_s``.
+        All other outcomes use the full ``linger_s``. Detection itself lives
+        in ``detect_trial_outcome`` (shared with ``ScenarioEnv``) so the UI
+        and training never disagree on what ended a trial.
         """
-        pitch = self._match.pitch
-        ball = self._match.ball
-        scoreboard = self._match.scoreboard
-
-        if abs(ball.position.x) > pitch.half_length + 1.0:
-            self._match.notify_ball_out()
-            return "miss", self.linger_s * 0.5
-        if abs(ball.position.y) > pitch.half_width + 0.5:
-            self._match.notify_ball_out()
-            return "miss", self.linger_s * 0.5
-
-        if (scoreboard.left_goals, scoreboard.right_goals) != self._initial_scoreboard:
-            return "goal", self.linger_s
-
-        if self._ball_released:
-            if ball.possessed_by is not None and ball.possessed_by != self._initial_carrier_id:
-                try:
-                    repossessor = self._match.player_by_id(ball.possessed_by)
-                    initial_carrier = (
-                        self._match.player_by_id(self._initial_carrier_id)
-                        if self._initial_carrier_id else None
-                    )
-                    if initial_carrier is not None and repossessor.team != initial_carrier.team:
-                        if repossessor.is_goalkeeper:
-                            return "saved", self.linger_s
-                        return "dispossessed", self.linger_s
-                except KeyError:
-                    pass
-                return "saved", self.linger_s
-
-            any_controlling = any(
-                p.state == PlayerState.CONTROLLING_BALL for p in self._match.players
-            )
-            if ball.possessed_by is None and ball.velocity.length() < 0.1 and not any_controlling:
-                return "miss", self.linger_s * 0.5
-
-        # Box possession: any player reached the opponent's box with the ball.
-        # Mirrors ScenarioEnv's box_terminal / opponent_box_terminal logic:
-        # Team.LEFT attacks +x so their opponent box is the right box (left=False).
-        # Skipped when definition.box_possession_terminal is False (e.g. 1v2,
-        # where the attacker is meant to enter the box and play to a natural end).
-        if self.definition.box_possession_terminal:
-            from footballcoach.entities.player import Team as _Team
-            for player in self._match.players:
-                if ball.possessed_by == player.player_id:
-                    in_opp_box = pitch.is_in_box(
-                        ball.position,
-                        left=(player.team == _Team.RIGHT),  # opponent box for LEFT; mirrored for RIGHT
-                    )
-                    if in_opp_box:
-                        return "other", self.linger_s
-
-        from footballcoach.rules_ai import NeuralPlayerAI
-        # Only trigger early termination if there are rules-based AI players
-        # (players with an AI that is NOT NeuralPlayerAI). Neural players and
-        # immobile players (ai=None) should not trigger this — the ball settling
-        # is normal during neural play.
-        rules_players = [p for p in self._match.players
-                         if p.ai is not None and not isinstance(p.ai, NeuralPlayerAI)]
-        if rules_players and self._trial_tick >= 30 and all(p.current_order is None for p in rules_players):
-            if ball.velocity.length() < 0.1:
-                return "other", self.linger_s
-
-        if self._trial_tick >= self.timeout_ticks:
-            return "other", self.linger_s
-
-        return None, 0.0
+        from footballcoach.ai.env.outcome import detect_trial_outcome
+        outcome, half_linger = detect_trial_outcome(
+            self._match,
+            initial_scoreboard=self._initial_scoreboard,
+            initial_carrier_id=self._initial_carrier_id,
+            ball_released=self._ball_released,
+            box_possession_terminal=self.definition.box_possession_terminal,
+            trial_tick=self._trial_tick,
+            timeout_ticks=self.timeout_ticks,
+        )
+        if outcome is None:
+            return None, 0.0
+        return outcome, self.linger_s * 0.5 if half_linger else self.linger_s

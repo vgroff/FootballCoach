@@ -75,14 +75,26 @@ class Phase1RulesAI(PlayerAI):
             _arm_box_kick(player, match)
 
 
-def _arm_box_kick(player: Player, match: Match) -> None:
-    """Arm a push-kick toward the near box, as if possessing the ball right now.
+_DECISION_INTERVAL_S = 0.5  # 15 ticks at 30 Hz — one neural decision window
 
-    Called every chase tick so BC sees kick intent throughout the approach.
+
+def _arm_box_kick(player: Player, match: Match) -> None:
+    """Arm a push-kick only when close enough to pick up the ball within one
+    decision interval AND the push-kick heading/distance checks would pass.
     """
+    import math as _math
     from footballcoach.engine.kicking import max_kick_speed_mps
-    from footballcoach.engine.movement import effective_top_speed
+    from footballcoach.engine.movement import effective_top_speed, angle_diff
     from footballcoach.orders import _push_kick_params
+
+    sprint_speed = effective_top_speed(
+        match.movement_params, player.attributes.top_speed, player.stamina, has_ball=False,
+    )
+    dist_to_ball = (match.ball.position - player.position).length_xy()
+    if dist_to_ball > sprint_speed * _DECISION_INTERVAL_S:
+        return
+
+    pk = _push_kick_params()
     pitch = match.pitch
     if player.team == Team.LEFT:
         aim_x = pitch.half_length - pitch.box_length_m / 2.0
@@ -92,13 +104,14 @@ def _arm_box_kick(player: Player, match: Match) -> None:
     push_dir = aim_point - player.position
     if push_dir.length_xy() < 1e-6:
         return
-    pk = _push_kick_params()
+    if (aim_point - player.position).length_xy() < pk["min_dist_m"]:
+        return
+    if abs(angle_diff(player.heading_rad, push_dir.xy().angle_xy())) > _math.radians(pk["max_heading_error_deg"]):
+        return
+
     kick_dist = pk["dist_m"]
     push_unit = push_dir.xy().normalized()
     armed_aim = player.position + Vector3(push_unit.x * kick_dist, push_unit.y * kick_dist, 0.0)
-    sprint_speed = effective_top_speed(
-        match.movement_params, player.attributes.top_speed, player.stamina, has_ball=False,
-    )
     max_kick = max_kick_speed_mps(match.kicking_params, player.attributes.kick_power)
     power = min(1.0, sprint_speed * pk["speed_factor"] / max(max_kick, 0.1))
     player.kick_armed = True
@@ -400,6 +413,12 @@ class SprintWaypointAI(PlayerAI):
     def __init__(self, waypoints: list[Vector3], start_idx: int = 1) -> None:
         self.waypoints = waypoints
         self._next_idx = start_idx
+
+    def course_complete(self, player: Player) -> bool:
+        """True once the runner has arrived at the final waypoint: no more
+        waypoints left to issue AND the last MoveOrder has finished
+        (current_order cleared by the engine on arrival)."""
+        return self._next_idx >= len(self.waypoints) and player.current_order is None
 
     def act(self, player: Player, match: Match, trial_tick: int) -> None:
         if self._next_idx >= len(self.waypoints):

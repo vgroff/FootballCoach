@@ -11,6 +11,38 @@ reward for that step.
 Convention: reward is always a Python float, accumulated over the engine
 ticks within one decision interval and returned as one scalar per step.
 
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! CRITICAL: DO NOT NORMALISE REWARDS BY INITIAL-EPISODE STATE.        !!
+!!                                                                      !!
+!! Normalising a reward term by a quantity measured at episode start    !!
+!! (e.g. start_ball_dist_m, start_ball_to_box_dist_m, start_stamina)   !!
+!! is a MISTAKE in PPO.  Reason:                                        !!
+!!                                                                      !!
+!!  1. The value network does NOT observe the initial-state normaliser. !!
+!!     It sees only the current observation. So the same observed state !!
+!!     produces different return signals across episodes purely because !!
+!!     the spawn was different — the value function literally cannot    !!
+!!     predict this variation, breaking its training signal.            !!
+!!                                                                      !!
+!!  2. PPO + GAE already handles cross-episode baseline variation via   !!
+!!     advantage estimation. That is what the advantage IS for. You do  !!
+!!     not need to normalise manually; doing so fights the baseline.    !!
+!!                                                                      !!
+!! If a large spawn distance produces "too much free reward", the fix   !!
+!! is to tighten the spawn distribution, add episode-cumulative clamps  !!
+!! (see cumulative_clamped_delta()), or tune the coefficient — NOT to   !!
+!! divide by an unobservable initial quantity.                          !!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
+FIXED (2026-08-09): all initial-state dependencies removed.
+  appr        — now raw _delta (m/step)
+  appr_sq     — now raw player_speed_toward_ball^2 (m²/s²)
+  prog        — now raw ball_progress_toward_goal_m (m/step)
+  prox        — now uses fixed 40m pitch-scale reference
+  spd         — now speed_scale * time_remaining_fraction only
+  stam        — scenario_env now passes 1 - final_stamina instead of start - final
+Coefficients may need re-tuning: raw scales are larger than the old normalised values.
+
 phase1_reward() returns a (float, dict[str, float]) tuple where the dict
 breaks the total down by source key:
   appr  — linear ball approach bonus (potential-based; telescopes over an
@@ -74,6 +106,7 @@ breaks the total down by source key:
   prox  — proximity bonus on timeout. Normalized by start_ball_to_box_dist_m
           (previously a fixed 30m constant, inconsistent with spd's use of
           the actual per-episode start distance)
+  step  — flat per-step penalty (encourages finishing faster; every step incl. terminal)
   stam  — stamina usage penalty (episode-end only)
 """
 from __future__ import annotations
@@ -181,22 +214,12 @@ def phase1_reward(
     cumulative_state = cumulative_state or {}
     cumulative_state_after: dict[str, float] = {}
 
-    # Floor-only: a ball spawning ~on top of the player would otherwise create
-    # a divide-by-near-zero blow-up in the normalized terms. No ceiling -- a
-    # larger real spawn distance must normalize by its own true distance.
-    _norm_ball_dist = max(start_ball_dist_m, 1.0)
-
     _delta = prev_ball_dist - curr_ball_dist  # positive = closing, negative = retreating
     if _delta >= 0:
-        # Approach (reward): normalized by start_ball_dist_m so the total
-        # achievable reward from closing distance is ~coef regardless of the
-        # episode's spawn distance (see module docstring).
-        appr_r = cfg.get("ball_approach_bonus", cfg.get("ball_distance_shaping", 0.002)) * (_delta / _norm_ball_dist)
+        appr_r = cfg.get("ball_approach_bonus", cfg.get("ball_distance_shaping", 0.002)) * _delta
         retr_r = 0.0
     else:
         appr_r = 0.0
-        # Retreat (penalty): deliberately NOT normalized — a deterrent's
-        # absolute weight should be scenario-independent (see module docstring).
         retr_r = cfg.get("ball_retreat_penalty", cfg.get("ball_distance_shaping", 0.002)) * _delta
     r += appr_r + retr_r
     comps["appr"] = appr_r
@@ -224,16 +247,12 @@ def phase1_reward(
     # penalties — that have nothing to do with player skill).
     # player_speed_mps * heading_cos_sim depends only on the player's own
     # velocity, so ball motion no longer affects this term. Coefficients 0.0
-    # (default) disable each side independently. Approach side normalizes by
-    # start_ball_dist_m BEFORE squaring (dividing first then squaring gives
-    # the dimensionally-correct v^2/start_dist^2 scaling, not v^2/start_dist).
-    # Retreat side is deliberately left unnormalized — same asymmetric
-    # rationale as appr/retr above.
+    # (default) disable each side independently.
     _player_speed_toward_ball = player_speed_mps * heading_cos_sim
     _appr_sq_coef = float(cfg.get("ball_approach_speed_bonus", 0.0))
     _retr_sq_coef = float(cfg.get("ball_retreat_speed_penalty", _appr_sq_coef))
     if _player_speed_toward_ball > 0.0:
-        _appr_sq_raw = _appr_sq_coef * ((_player_speed_toward_ball / _norm_ball_dist) ** 2)
+        _appr_sq_raw = _appr_sq_coef * (_player_speed_toward_ball ** 2)
     elif _player_speed_toward_ball < 0.0:
         _appr_sq_raw = -_retr_sq_coef * (_player_speed_toward_ball ** 2)
     else:
@@ -271,17 +290,10 @@ def phase1_reward(
     r += poss_r
     comps["poss"] = poss_r
 
-    # Normalized by start_ball_to_box_dist_m (same reference distance used
-    # by spd/prox below) so total achievable progress reward over an episode
-    # is ~ball_progress_scale regardless of how far the ball started from
-    # the opponent box. Single symmetric term (forward and backward progress
-    # share one coefficient) — not split into an asymmetric pair like appr/retr.
-    # prog_reward_clamp bounds the EPISODE-CUMULATIVE total (via
-    # cumulative_clamped_delta()), not this single step's value — a per-step
-    # clamp alone doesn't stop many small steps from summing past the clamp
-    # over a long/wandering episode.
-    _norm_box_dist = max(start_ball_to_box_dist_m, 10.0)
-    _prog_raw = cfg["ball_progress_scale"] * (ball_progress_toward_goal_m / _norm_box_dist) if has_possession_now else 0.0
+    # Ball progress toward box while in possession. prog_reward_clamp bounds
+    # the EPISODE-CUMULATIVE total — a per-step clamp alone doesn't stop many
+    # small steps summing past the clamp over a long/wandering episode.
+    _prog_raw = cfg["ball_progress_scale"] * ball_progress_toward_goal_m if has_possession_now else 0.0
     prog_r, cumulative_state_after["prog"] = cumulative_clamped_delta(
         _prog_raw, cumulative_state.get("prog", 0.0), *symmetric_clamp(prog_reward_clamp)
     )
@@ -300,14 +312,10 @@ def phase1_reward(
     spd_r = 0.0
     if reached_opponent_box_with_possession:
         box_r = cfg["box_possession_terminal"]
-        # Speed bonus: reward finishing faster, scaled by how far the ball
-        # had to travel so a nearby start doesn't trivially earn a large bonus.
-        # bonus = scale × time_remaining_fraction × clamp(start_dist / 30m, 0, 1.5)
-        # Max possible bonus: scale × 1.0 × 1.5  (ball starts 45m+ from box)
+        # Speed bonus: reward finishing faster. Range [0, speed_bonus_scale].
         speed_scale = float(cfg.get("speed_bonus_scale", 0.0))
         if speed_scale > 0.0:
-            dist_weight = min(start_ball_to_box_dist_m / 30.0, 1.5)
-            spd_r = speed_scale * time_fraction_remaining * dist_weight
+            spd_r = speed_scale * time_fraction_remaining
     r += box_r + spd_r
     comps["box"] = box_r
     comps["spd"] = spd_r
@@ -325,26 +333,26 @@ def phase1_reward(
     prox_r = 0.0
     if timed_out:
         tout_r = cfg.get("timeout_penalty", 0.0)
-        # Proximity bonus on timeout: consolation for how close you got with
-        # the ball. Normalized by start_ball_to_box_dist_m (the episode's own
-        # ball-to-box distance at the start) rather than a fixed 30m constant
-        # — consistent with spd's dist_weight above, which already
-        # self-references the same per-episode start distance. A fixed 30m
-        # denominator would always read a large-spawn-distance episode as
-        # "far" even relative to its own start.
-        # scale * max(0, 1 - dist_to_box / start_ball_to_box_dist_m) → 0 at
-        # start distance or farther, scale at the box edge.
+        # Proximity bonus on timeout: consolation for how close the ball is
+        # to the opponent box. Uses a fixed 40m pitch-scale reference so the
+        # formula is fully observable (no initial-state dependency).
+        # scale * max(0, 1 - dist_to_box / 40m) → 0 at 40m+, scale at box edge.
         prox_scale = float(cfg.get("proximity_bonus_scale", 0.0))
         if prox_scale > 0.0:
-            prox = max(0.0, 1.0 - ball_dist_to_opponent_box_m / _norm_box_dist)
+            prox = max(0.0, 1.0 - ball_dist_to_opponent_box_m / 40.0)
             prox_r = prox_scale * prox
     r += tout_r + prox_r
     comps["tout"] = tout_r
     comps["prox"] = prox_r
 
-    # Stamina usage penalty — only applied at episode end (begin-to-end stamina drain).
-    # Discourages unnecessary sprinting without punishing individual steps.
-    # stamina_used = start_stamina - final_stamina (0.0 on non-terminal steps).
+    # Flat per-step penalty to discourage dawdling. Applied every step (including
+    # terminal steps). Equivalent to a time limit that "costs" something.
+    step_r = -float(cfg.get("step_penalty", 0.0))
+    r += step_r
+    comps["step"] = step_r
+
+    # Stamina penalty — only at episode end. stamina_used = 1 - final_stamina
+    # (0.0 on non-terminal steps), so -coef * (1 - full) penalises exhaustion.
     _stam_coef = float(cfg.get("stamina_sprint_penalty", 0.0))
     stam_r = -_stam_coef * stamina_used if (episode_done and _stam_coef > 0.0) else 0.0
     r += stam_r

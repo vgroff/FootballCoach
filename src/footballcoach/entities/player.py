@@ -67,7 +67,26 @@ class Player:
     # action executes (not when the order is set).  Signature: (player) -> None.
     # Useful for recording, logging, UI effects, stats, etc.
     on_kick: object | None = field(default=None, repr=False)     # fired when a kick/shoot/pass lands
-    on_tackle: object | None = field(default=None, repr=False)   # fired when a tackle attempt executes
+    on_tackle: object | None = field(default=None, repr=False)   # fired when a tackle attempt executes (before the skill roll)
+    # Fired right after the skill roll resolves, on BOTH the tackler and the
+    # tacklee, with the boolean tackler_won result AND whether THIS player was
+    # the tackler (was_tackler) or the tacklee for this specific attempt.
+    # Signature: (player, tackler_won, was_tackler) -> None. was_tackler lets
+    # callers pair this with on_tackle (which only fires on the tackler, i.e.
+    # counts ATTEMPTS initiated) without double-counting a tacklee's outcome
+    # as if they had attempted a tackle themselves.
+    # Distinct from on_tackle (which fires unconditionally on attempt, before
+    # the outcome is known) — lets callers (e.g. BC recording) tally success/fail.
+    on_tackle_result: object | None = field(default=None, repr=False)
+    # Analogous to on_tackle_result but for the AUTO-TACKLE (collision)
+    # fallback path only (_check_head_on_tackles) -- fires on both the
+    # tackler and tacklee with the same (player, tackler_won, was_tackler)
+    # signature. on_tackle/on_tackle_result never fire for auto-tackles (see
+    # test_tackle.py's auto-tackle-vs-armed-path tests), but possession still
+    # transfers exactly the same way, so callers who want to also see/count
+    # THOSE events (e.g. BC recording stats) use this separate callback
+    # instead of conflating them with intentional/armed tackle attempts.
+    on_auto_tackle_result: object | None = field(default=None, repr=False)
     on_possession_gained: object | None = field(default=None, repr=False)  # fired by match._set_possession() when this player gains the ball
 
     # Unconditional per-tick kick flag — set True inside kick_direct() every

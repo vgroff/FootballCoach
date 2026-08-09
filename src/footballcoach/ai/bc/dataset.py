@@ -69,6 +69,8 @@ class DemonstrationDataset:
         bc_labels: np.ndarray,
         rewards: np.ndarray | None = None,
         dones: np.ndarray | None = None,
+        reward_components: np.ndarray | None = None,
+        reward_component_keys: list[str] | None = None,
     ):
         n = len(obs_self_feat)
         assert all(len(x) == n for x in [
@@ -83,6 +85,16 @@ class DemonstrationDataset:
         # rewards/dones are optional — older files won't have them
         self._rewards = rewards if rewards is not None else np.zeros(n, dtype=np.float32)
         self._dones   = dones   if dones   is not None else np.zeros(n, dtype=np.float32)
+        # reward_components/keys are optional -- older files predate per-
+        # component persistence (see record_demonstrations.py). Falls back to
+        # an empty (n, 0) array + empty key list rather than zeros-with-
+        # unknown-width, since there's no width to infer without the keys.
+        from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS
+        self._reward_component_keys = reward_component_keys if reward_component_keys is not None else [k for k, _ in REWARD_COMP_LABELS]
+        self._reward_components = (
+            reward_components if reward_components is not None
+            else np.zeros((n, len(self._reward_component_keys)), dtype=np.float32)
+        )
         self._n = n
         self._trivial_mask_cache: np.ndarray | None = None
 
@@ -90,6 +102,11 @@ class DemonstrationDataset:
     def has_rewards(self) -> bool:
         """True if this dataset was recorded with reward/done data."""
         return self._rewards.any()
+
+    @property
+    def has_reward_components(self) -> bool:
+        """True if this dataset was recorded with per-component reward data."""
+        return self._reward_components.any()
 
     def __len__(self) -> int:
         return self._n
@@ -115,6 +132,10 @@ class DemonstrationDataset:
                 f"uv run python -m footballcoach.ai.scripts.record_demonstrations "
                 f"--phase 1 --n-episodes <N> --output <dir>"
             )
+        _rc_keys = (
+            [str(k) for k in data["meta_reward_component_keys"]]
+            if "meta_reward_component_keys" in data else None
+        )
         return cls(
             obs_self_feat=data["obs_self_feat"],
             obs_other_feat=data["obs_other_feat"],
@@ -124,12 +145,18 @@ class DemonstrationDataset:
             bc_labels=bc_labels,
             rewards=data["rewards"] if "rewards" in data else np.zeros(n, dtype=np.float32),
             dones=data["dones"]     if "dones"   in data else np.zeros(n, dtype=np.float32),
+            reward_components=data["reward_components"] if "reward_components" in data else None,
+            reward_component_keys=_rc_keys,
         )
 
     @classmethod
     def from_files(cls, paths: list[str | Path]) -> "DemonstrationDataset":
         """Load and concatenate multiple .npz files."""
         parts = [cls.from_file(p) for p in paths]
+        # reward_component_keys must agree across files (fixed by REWARD_COMP_LABELS
+        # order at recording time) -- use the first part's keys/columns; parts
+        # recorded before this feature existed already fell back to the same
+        # default key list in __init__, so concatenation stays column-aligned.
         return cls(
             obs_self_feat=np.concatenate([p._self_feat for p in parts]),
             obs_other_feat=np.concatenate([p._other_feat for p in parts]),
@@ -139,6 +166,8 @@ class DemonstrationDataset:
             bc_labels=np.concatenate([p._labels for p in parts]),
             rewards=np.concatenate([p._rewards for p in parts]),
             dones=np.concatenate([p._dones for p in parts]),
+            reward_components=np.concatenate([p._reward_components for p in parts]),
+            reward_component_keys=parts[0]._reward_component_keys,
         )
 
     @classmethod
@@ -157,14 +186,18 @@ class DemonstrationDataset:
         log.info(f"Dataset: {len(ds):,} steps loaded")
         return ds
 
-    # Only steps where bc_labels[:, _I_VALID] == 1.0 and the opponent is not
-    # immobile are used for BC training. Immobile-opponent episodes are kept in
-    # the demo files (useful for inspection/replay) but excluded from training
-    # because the trainee never faces a real adversary in those episodes.
+    # Only steps where bc_labels[:, _I_VALID] == 1.0 and SELF is not immobile
+    # are used for BC training -- this must key off ai_type (self), not
+    # opponent_ai_type. A row where self is rules/neural is a legitimate BC
+    # example of "how to play" regardless of what the opponent is doing
+    # (including standing still) -- excluding those too (as an earlier,
+    # buggy version of this method did via opponent_ai_type) silently threw
+    # away every rules-AI demonstration row from rules-vs-immobile episodes,
+    # not just the immobile player's own (correctly excluded) rows.
     def valid_indices(self) -> np.ndarray:
         valid = self._labels[:, _I_VALID] > 0.5
-        not_immobile_opp = self._labels[:, _I_OPPONENT_AI_TYPE] < (AI_TYPE_IMMOBILE - 0.5)
-        return np.where(valid & not_immobile_opp)[0]
+        self_not_immobile = self._labels[:, _I_AI_TYPE] < (AI_TYPE_IMMOBILE - 0.5)
+        return np.where(valid & self_not_immobile)[0]
 
     def split_train_val_indices(
         self, val_frac: float = 0.15, valid_only: bool = True,
@@ -181,7 +214,7 @@ class DemonstrationDataset:
             val_frac: Fraction of complete episodes to hold out for
                 validation. 0.0 disables the split (val indices will be empty).
             valid_only: If True, restrict both splits to ``valid_indices()``
-                (BC-valid, non-immobile-opponent rows) before splitting —
+                (BC-valid, non-immobile-self rows) before splitting —
                 matches the row set BC training actually iterates over.
 
         Returns:
@@ -369,6 +402,37 @@ class DemonstrationDataset:
             returns[i] = running
         return returns
 
+    def compute_component_returns(self, gamma: float = 0.99) -> dict[str, np.ndarray]:
+        """Per-component discounted MC return, mirroring ``compute_returns()``
+        but computed independently for each reward component column so the
+        components sum exactly to ``compute_returns()``'s total return
+        (each component uses the SAME gamma/episode boundaries).
+
+        Requires the dataset to have been recorded with per-component reward
+        data (``has_reward_components``); returns an all-zero array per key
+        otherwise (same "silently zero, don't crash" convention as
+        ``has_rewards``/``compute_returns()`` on reward-less datasets).
+
+        Returns:
+            dict mapping component short-key (see REWARD_COMP_LABELS) to a
+            float32 array of shape (N,), one MC return-contribution series
+            per component.
+        """
+        dones = self._dones
+        n = self._n
+        out: dict[str, np.ndarray] = {}
+        for col, key in enumerate(self._reward_component_keys):
+            comp_rewards = self._reward_components[:, col]
+            comp_returns = np.zeros(n, dtype=np.float32)
+            running = 0.0
+            for i in range(n - 1, -1, -1):
+                if dones[i] > 0.5:
+                    running = 0.0
+                running = comp_rewards[i] + gamma * running
+                comp_returns[i] = running
+            out[key] = comp_returns
+        return out
+
     def iterate_minibatches_with_returns(
         self,
         batch_size: int,
@@ -394,9 +458,15 @@ class DemonstrationDataset:
                 value-target signal.
         """
         indices = self.valid_indices() if valid_only else np.arange(self._n)
+        # Shuffle BLOCK order, not row order: indices is sorted, so shuffling
+        # rows would make every gather below (self._self_feat[idx], etc.)
+        # touch random, far-apart rows -- shuffling which contiguous block
+        # goes in which minibatch slot preserves random batch composition
+        # across epochs while keeping each gather a near-contiguous slice.
+        block_starts = list(range(0, len(indices), batch_size))
         if shuffle:
-            np.random.shuffle(indices)
-        for start in range(0, len(indices), batch_size):
+            np.random.shuffle(block_starts)
+        for start in block_starts:
             idx = indices[start:start + batch_size]
             if len(idx) == 0:
                 continue
@@ -481,10 +551,14 @@ class DemonstrationDataset:
                     keep_mask[excluded] = False
                     indices = indices[keep_mask]
 
+        # Shuffle BLOCK order, not row order -- see iterate_minibatches_with_returns()
+        # above for the cache-locality rationale (indices may already be a
+        # filtered/gapped-but-sorted subset here due to downsampling above).
+        block_starts = list(range(0, len(indices), batch_size))
         if shuffle:
-            np.random.shuffle(indices)
+            np.random.shuffle(block_starts)
 
-        for start in range(0, len(indices), batch_size):
+        for start in block_starts:
             idx = indices[start:start + batch_size]
             if len(idx) == 0:
                 continue

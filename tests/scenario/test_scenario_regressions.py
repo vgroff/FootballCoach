@@ -129,15 +129,20 @@ def test_sprint_scenario_reaches_all_three_waypoints():
 
 
 def test_sprint_scenario_first_trial_runs_long_enough():
-    """The first trial must last at least 30 ticks. If it ends sooner the
-    ScenarioLoop is terminating prematurely (e.g. between waypoints when
-    current_order is transiently None)."""
+    """The first trial must last at least 30 ticks and end with a proper
+    "course_complete" outcome (the runner reaching its last waypoint), not
+    a timeout. If it ends sooner the ScenarioLoop is terminating prematurely
+    (e.g. between waypoints when current_order is transiently None).
+
+    linger_s=0.0 so the trial's end tick is exactly the completion tick, not
+    completion + linger — this test only cares about premature termination,
+    not linger timing (covered by the dedicated linger tests)."""
     defn = ScenarioDefinition(
         key="test_sprint_transient", label="test", description="",
         build=_build_multi_waypoint_sprint,
         on_tick=_sprint_on_tick,
     )
-    loop = ScenarioLoop(definition=defn, max_trials=1, timeout_ticks=600)
+    loop = ScenarioLoop(definition=defn, max_trials=1, timeout_ticks=600, linger_s=0.0)
 
     ticks_until_end = 0
     for i in range(600):
@@ -148,6 +153,10 @@ def test_sprint_scenario_first_trial_runs_long_enough():
     assert ticks_until_end >= 30, (
         f"First trial ended after only {ticks_until_end} ticks — "
         "ScenarioLoop is terminating prematurely between waypoints."
+    )
+    assert loop.outcomes["course_complete"] == 1, (
+        f"Trial ended via outcome {loop.outcomes} instead of reaching the final "
+        "waypoint (course_complete) — timeout should never fire here."
     )
 
 

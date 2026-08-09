@@ -99,6 +99,43 @@ Override the save directory with `--checkpoint-dir path/`.
 | `src/footballcoach/ai/env/reward.py` | `phase1_reward()`, `phase2_reward()` — all coefficients from `ai_config.json` |
 | `src/footballcoach/ai/ppo/rollout_buffer.py` | Buffer storage + `compute_gae()` |
 
+### !!!! CRITICAL REWARD DESIGN RULE — READ BEFORE TOUCHING reward.py !!!!
+
+**Reward terms must not depend on initial episode state in any way.**
+
+This includes normalisation, delta-from-start, and any use of an initial
+quantity as a scaling factor. The principle:
+
+- The value network receives only the *current* observation. Initial-episode
+  quantities (`start_ball_dist_m`, `start_ball_to_box_dist_m`, `start_stamina`,
+  …) are invisible to it from step 1 onward. Any reward that depends on them
+  makes the same observed state produce a different return across episodes purely
+  from spawn randomness — the value MSE target becomes unpredictable for the
+  right reasons and training breaks.
+- PPO + GAE is already specifically designed to normalise out cross-episode
+  baseline variance via advantage estimation. That is its entire job. Encoding
+  initial state into rewards fights GAE rather than helping it.
+- **This applies to deltas too**, not only ratios. `start_stamina - final_stamina`
+  is still an initial-state dependency. The correct stamina penalty is
+  `1 - final_stamina` (final state only, observable at episode end).
+
+**Correct alternatives:**
+- Tighten spawn distributions to reduce raw variance.
+- Episode-cumulative clamps (`cumulative_clamped_delta()`) to cap lucky-spawn windfalls.
+- Use final/current state values only; tune the coefficient and let GAE handle the rest.
+
+**Known violations in Phase 1 (to be fixed before next major run):**
+| Term | Dependency | Status |
+|------|-----------|--------|
+| `appr` | divided by `start_ball_dist_m` | BUG |
+| `appr_sq` (approach) | divided by `start_ball_dist_m` before squaring | BUG |
+| `prog` | divided by `start_ball_to_box_dist_m` | BUG |
+| `prox` | ratio uses `start_ball_to_box_dist_m` as denominator | BUG |
+| `spd` | `dist_weight = start_ball_to_box_dist_m / 30m` | BUG |
+| `stam` | `start_stamina - final_stamina`; fix: use `1 - final_stamina` | BUG |
+
+Not affected: `retr`, `appr_sq` retreat side, `poss`, `hdg`, `out`, `ill`, `box`, `lpos`, `lterm`, `tout`.
+
 ### Tier 3: Read when debugging observations, network architecture, or actions
 
 | File | Why it matters |

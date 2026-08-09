@@ -573,6 +573,18 @@ class Match:
             if result.tackler_won:
                 self._set_possession(other.player_id)
             apply_tackle_result(result, other, carrier, self.tackling_params)
+            # NOTE: on_tackle/on_tackle_result deliberately do NOT fire here,
+            # mirroring on_tackle's existing scope — this is the collision-
+            # based auto-tackle fallback, not a recordable AI-intended attempt
+            # (see test_tackle.py's auto-tackle-vs-armed-path tests). Firing
+            # on_tackle_result here with no matching on_tackle "attempt" would
+            # corrupt success/fail stats derived from on_tackle counts.
+            # on_auto_tackle_result is the separate, dedicated callback for
+            # callers that DO want to see/count these events.
+            if other.on_auto_tackle_result is not None:
+                other.on_auto_tackle_result(other, result.tackler_won, True)
+            if carrier.on_auto_tackle_result is not None:
+                carrier.on_auto_tackle_result(carrier, result.tackler_won, False)
             return  # only one head-on tackle per tick
 
     def _complete_control(self, player: Player) -> None:
@@ -695,6 +707,10 @@ class Match:
             if result.tackler_won and self._target_has_or_controls_ball(target):
                 self._set_possession(player.player_id)
             apply_tackle_result(result, player, target, self.tackling_params)
+            if player.on_tackle_result is not None:
+                player.on_tackle_result(player, result.tackler_won, True)
+            if target.on_tackle_result is not None:
+                target.on_tackle_result(target, result.tackler_won, False)
 
     def _check_goal(self) -> None:
         side = check_goal(self.ball, self.pitch)

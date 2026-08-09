@@ -179,10 +179,10 @@ class ScenarioEnv:
         # This has no effect on builds that don't accept it (e.g. phase 2).
         build_kwargs = {**self.scenario_kwargs, "sim_dt_s": self._dt_s}
         # terminal_outcomes: phase 1 only allows "miss"/"goal" to terminate
-        # the loop; everything else (dispossessed, saved, stalemate, "other")
-        # is suppressed so the episode runs until the env's own timeout or
-        # box-possession check fires. timeout_ticks=10**9 so the loop's
-        # internal timeout never races the env's authoritative one.
+        # the loop; everything else (dispossessed, saved, box_possession,
+        # timeout) is suppressed so the episode runs until the env's own
+        # timeout or box-possession check fires. timeout_ticks=10**9 so the
+        # loop's internal timeout never races the env's authoritative one.
         _terminal = frozenset({"miss", "goal"}) if self.phase == 1 else None
         self._loop = ScenarioLoop(
             definition=self.definition,
@@ -545,6 +545,10 @@ class ScenarioEnv:
                 # going out of bounds (neither player wins by shooting).
                 if self.phase == 1 and outcome_label == "goal":
                     outcome_label = "miss"
+                # Ball left pitch without trainee touching it — not a real miss,
+                # just a bad starting scenario (no penalty was applied).
+                if outcome_label == "miss" and not self._ball_touched_by_trainee:
+                    outcome_label = "invalid"
             info.trial_outcome = outcome_label
 
         info.is_rules_episode = getattr(match, "_opponent_use_rules_ai", False)
@@ -760,7 +764,7 @@ class ScenarioEnv:
         track correctly across the whole episode.
         """
         _speed, _hdg_cos = self._player_speed_and_heading_cos(player_obj, ball_pos)
-        _stamina_used = max(0.0, start_stamina - player_obj.stamina) if episode_done else 0.0
+        _stamina_used = (1.0 - player_obj.stamina) if episode_done else 0.0
         return phase1_reward(
             prev_ball_dist=prev_ball_dist,
             curr_ball_dist=curr_ball_dist,

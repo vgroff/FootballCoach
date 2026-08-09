@@ -174,6 +174,7 @@ def spin_from_mouse(
     mouse_dx_world: float,
     mouse_dy_world: float,
     max_spin_magnitude_rads: float,
+    max_drag_m: float = 10.0,
 ) -> Vector3:
     """Convert mouse position relative to player into a spin vector.
 
@@ -184,9 +185,7 @@ def spin_from_mouse(
     if dist < 1e-6:
         return Vector3.zero()
 
-    # Scale magnitude: capped at MAX_KICK_DRAG_M for full spin
-    from footballcoach.ui.input import MAX_KICK_DRAG_M  # avoid circular at module level
-    magnitude = min(1.0, dist / MAX_KICK_DRAG_M) * max_spin_magnitude_rads
+    magnitude = min(1.0, dist / max_drag_m) * max_spin_magnitude_rads
 
     # Angle of mouse relative to aim direction
     mouse_angle = math.atan2(mouse_dy_world, mouse_dx_world)

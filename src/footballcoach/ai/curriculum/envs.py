@@ -46,8 +46,12 @@ def _build_phase1_env(phase: CurriculumPhase):
 
     from footballcoach.ai.config import load_ai_config
     _curriculum_cfg = load_ai_config().get("curriculum", {})
-    _rules_prob = float(_curriculum_cfg.get("phase1_opponent_rules_prob", 0.0))
-    _immobile_prob = float(_curriculum_cfg.get("phase1_opponent_immobile_prob", 1.0))
+    _rules_ratio = float(_curriculum_cfg.get("phase1_opponent_rules_ratio", 0.0))
+    _immobile_ratio = float(_curriculum_cfg.get("phase1_opponent_immobile_ratio", 1.0))
+    _neural_ratio = float(_curriculum_cfg.get("phase1_opponent_neural_ratio", 0.0))
+    _total = _rules_ratio + _immobile_ratio + _neural_ratio
+    _rules_prob = (_rules_ratio / _total) if _total > 0 else 0.0
+    _immobile_prob = (_immobile_ratio / _total) if _total > 0 else 1.0
     defn = ScenarioDefinition(
         key="phase1_1v1",
         label="Phase 1: 1v1 Get Possession",

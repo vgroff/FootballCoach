@@ -44,7 +44,6 @@ from footballcoach.orders import GetPossessionOrder, KickOrder, MoveOrder, PassO
 from footballcoach.ui.camera import Camera
 
 CLICK_DRAG_THRESHOLD_PX = 6
-MAX_KICK_DRAG_M = 15.0
 GROUND_AIM_HEIGHT_M = 0.3
 SELECT_TOLERANCE_PX = 6
 
@@ -276,31 +275,32 @@ class MatchInputController:
 
         phase = self._kick_ui.phase
 
+        from footballcoach.config import load_graphics_config
+        cfg = load_graphics_config()["kick_ui"]
+        max_drag_m = float(cfg.get("max_drag_m", 10.0))
+
         if phase == KickPhase.AIM_XY:
             if dist_m > 1e-6:
                 self._kick_ui.aim_dir_x = dx / dist_m
                 self._kick_ui.aim_dir_y = dy / dist_m
-            self._kick_ui.power_fraction = min(1.0, dist_m / MAX_KICK_DRAG_M)
+            self._kick_ui.power_fraction = min(1.0, dist_m / max_drag_m)
             self._kick_ui.aim_distance_m = min(dist_m * 2.0, 60.0)
 
         elif phase == KickPhase.AIM_Z:
             # Mouse close to player = max loft; far away = flat.
-            from footballcoach.config import load_graphics_config
-            cfg = load_graphics_config()["kick_ui"]
             max_loft_rad = math.radians(cfg["max_loft_angle_deg"])
-            t = 1.0 - min(1.0, dist_m / MAX_KICK_DRAG_M)
+            t = 1.0 - min(1.0, dist_m / max_drag_m)
             self._kick_ui.elevation_angle_rad = max_loft_rad * t
 
         elif phase == KickPhase.SPIN:
-            from footballcoach.config import load_graphics_config
             from footballcoach.ui.kick_trajectory import spin_from_mouse
-            cfg = load_graphics_config()["kick_ui"]
             self._kick_ui.spin = spin_from_mouse(
                 self._kick_ui.aim_dir_x,
                 self._kick_ui.aim_dir_y,
                 dx,
                 dy,
                 cfg["max_spin_magnitude_rads"],
+                max_drag_m,
             )
 
     def _advance_kick_ui(self) -> None:

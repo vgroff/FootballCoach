@@ -704,8 +704,12 @@ class App:
                 tally = f"Goals: {o['goal']}  Saved: {o['saved']}  Miss: {o['miss']}"
                 if o.get("dispossessed", 0):
                     tally += f"  Disp: {o['dispossessed']}"
-                if o["other"]:
-                    tally += f"  Other: {o['other']}"
+                if o.get("box_possession", 0):
+                    tally += f"  Box: {o['box_possession']}"
+                if o.get("course_complete", 0):
+                    tally += f"  Done: {o['course_complete']}"
+                if o.get("timeout", 0):
+                    tally += f"  Timeout: {o['timeout']}"
                 hud_lines.append(tally)
         else:
             left, right = self.match.scoreboard.left_goals, self.match.scoreboard.right_goals
@@ -725,7 +729,9 @@ class App:
         # Expose linger progress to the game-log renderer (0.0 = not lingering).
         if self._scenario_loop is not None and self._scenario_loop._pending_outcome is not None:
             loop = self._scenario_loop
-            total = loop.linger_s if loop._pending_outcome in ("goal", "saved", "dispossessed", "other") else loop.linger_s * 0.5
+            # "miss" is the only outcome that lingers for half the duration (see
+            # detect_trial_outcome); everything else uses the full linger_s.
+            total = loop.linger_s * 0.5 if loop._pending_outcome == "miss" else loop.linger_s
             self.game_log.linger_frac = loop._linger_remaining_s / max(total, 0.001)
             self.game_log.linger_outcome = loop._pending_outcome
         else:

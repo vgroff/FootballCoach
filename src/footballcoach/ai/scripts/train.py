@@ -121,8 +121,12 @@ def main() -> None:
         logging.getLogger("footballcoach.ai").setLevel(logging.DEBUG)
 
     import torch
+
+    from footballcoach.ai.config import load_ai_config
+
     torch.manual_seed(args.seed)
     random.seed(args.seed)
+    torch.set_num_threads(int(load_ai_config().get("ppo", {}).get("main_process_torch_threads", 4)))
 
     device = torch.device(args.device)
 
@@ -143,7 +147,6 @@ def main() -> None:
 
     from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
     from footballcoach.ai.curriculum.phases import PHASES_BY_ID
-    from footballcoach.ai.config import load_ai_config
 
     phase = PHASES_BY_ID.get(args.phase)
     if phase is None:

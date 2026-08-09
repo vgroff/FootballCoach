@@ -77,6 +77,7 @@ REWARD_COMP_LABELS: list[tuple[str, str]] = [
     ("lterm", "opponent_box"),
     ("tout",  "timeout"),
     ("prox",  "proximity_bonus"),
+    ("step",  "step_penalty"),
     ("stam",  "stamina_penalty"),
 ]
 
@@ -157,6 +158,7 @@ _PHASE1_OUTCOME_KEYS: list[tuple[str, str]] = [
     ("opponent_box_possession", "loss"),
     ("timeout", "tout"),
     ("miss", "miss"),
+    ("invalid", "inval"),
 ]
 
 
@@ -375,8 +377,16 @@ class PPOTrainer:
         self._value_pretrain_early_stop_patience = int(bc_cfg.get("value_pretrain_early_stop_patience", 5))
         self._value_pretrain_early_stop_min_delta = float(bc_cfg.get("value_pretrain_early_stop_min_delta", 1e-4))
         self._value_pretrain_weight_decay = float(bc_cfg.get("value_pretrain_weight_decay", 0.0))
+        # Decoupled from ppo.minibatch_size (PPO's 12000 is tuned for the
+        # clip/KL-early-stop dynamics of the policy update, not for a plain
+        # supervised value-MSE regression). Used by pretrain_value() and
+        # Phase 0's demo-return value warm-up in pretrain_combined() -- both
+        # previously fell back silently to self.minibatch_size.
+        self._value_pretrain_batch_size = int(bc_cfg.get("value_pretrain_batch_size", 512))
         self._bc_pretrain_early_stop_patience = int(bc_cfg.get("bc_pretrain_early_stop_patience", 0))
         self._bc_pretrain_early_stop_min_delta = float(bc_cfg.get("bc_pretrain_early_stop_min_delta", 1e-4))
+        self._p0_early_stop_patience = int(bc_cfg.get("demo_pretrain_early_stop_patience", 0))
+        self._p0_early_stop_min_delta = float(bc_cfg.get("demo_pretrain_early_stop_min_delta", 1e-4))
         self._demo_value_pretrain_epochs = int(bc_cfg.get("demo_value_pretrain_epochs", 10))
         self._demo_value_pretrain_lr = float(bc_cfg.get("demo_value_pretrain_lr", 4e-3))
         self._demo_value_pretrain_gamma = float(bc_cfg.get("demo_value_pretrain_gamma", 0.99))
@@ -1450,6 +1460,9 @@ class PPOTrainer:
             demo_returns = dataset.compute_returns(gamma=self._demo_value_pretrain_gamma)
             ret_t_all = torch.from_numpy(demo_returns).to(self.device)
             ret_std = ret_t_all.std().clamp(min=1.0)
+
+            _p0_train_idx, _p0_val_idx = dataset.split_train_val_indices(val_frac=0.15, valid_only=True)
+            _p0_early_stop_enabled = self._p0_early_stop_patience > 0 and len(_p0_val_idx) > 0
             log.info(
                 f"Phase 0 — decision-net warm-up (BC + "
                 f"{'self.value_net' if self.separate_value_net else 'execution_net.value_head'} "
@@ -1457,15 +1470,56 @@ class PPOTrainer:
                 f"gamma={self._demo_value_pretrain_gamma}, "
                 f"returns mean={ret_t_all.mean():.2f}  std={ret_std:.2f}  "
                 f"lr={self._demo_value_pretrain_lr}  "
-                f"phase0_value_coef={self._phase0_value_coef}"
+                f"phase0_value_coef={self._phase0_value_coef}  "
+                f"split: {len(_p0_train_idx):,} train / {len(_p0_val_idx):,} val rows"
             )
+
+            def _eval_p0_val_loss() -> float:
+                """Combined dec_bc + value MSE on the held-out val rows (no grad)."""
+                self.decision_net.eval()
+                _v_losses: list[float] = []
+                with torch.no_grad():
+                    for _obs_v, _lbl_v, _ret_v in dataset.iterate_minibatches(
+                        batch_size=batch_size, shuffle=False, device=self.device,
+                        indices_override=_p0_val_idx, returns=demo_returns,
+                    ):
+                        _sat_v, _oat_v = _ai_types(_obs_v)
+                        _d_v = self.decision_net(
+                            _obs_v["self_feat"], _obs_v["other_feat"],
+                            _obs_v["exists_mask"], _obs_v["ball_feat"], _obs_v["global_feat"],
+                            _sat_v, _oat_v,
+                        )
+                        _bc_v, _ = bc_loss_from_tensor(
+                            _lbl_v, _d_v, exec_heads=None,
+                            direction_loss_weight=self._bc_dir_loss_w,
+                            region_loss_weight=self._bc_region_loss_w,
+                            dec_weight=self._bc_dec_weight,
+                            dec_label_smoothing=self._bc_dec_label_smoothing,
+                            return_breakdown=True,
+                        )
+                        _e_v = self._value_heads(
+                            _obs_v["self_feat"], _obs_v["other_feat"],
+                            _obs_v["exists_mask"], _obs_v["ball_feat"], _obs_v["global_feat"],
+                            _d_v, _sat_v, _oat_v,
+                        )
+                        _mse_v = F.mse_loss(_e_v.value.squeeze(-1), _ret_v) / (ret_std ** 2)
+                        _v_losses.append((_bc_v + self._phase0_value_coef * _mse_v).item())
+                self.decision_net.train()
+                return float(np.mean(_v_losses)) if _v_losses else float("nan")
+
+            _p0_best_val_loss = float("inf")
+            _p0_best_state: Optional[dict] = None
+            _p0_patience_ctr = 0
+            _p0_stopped_early = False
+
             for epoch in range(_demo_epochs):
                 epoch_losses: list[float] = []
                 epoch_bc_losses: list[float] = []
                 epoch_val_losses: list[float] = []
+                epoch_floors: list[float] = []
                 for obs_dict, bc_labels, ret_batch in dataset.iterate_minibatches(
                     batch_size=batch_size, shuffle=True, device=self.device,
-                    valid_only=True, returns=demo_returns,
+                    indices_override=_p0_train_idx, returns=demo_returns,
                 ):
                     _sat, _oat = _ai_types(obs_dict)
                     d_heads = self.decision_net(
@@ -1484,6 +1538,12 @@ class PPOTrainer:
                         dec_label_smoothing=self._bc_dec_label_smoothing,
                         return_breakdown=True,
                     )
+                    epoch_floors.append(compute_bc_loss_floor(
+                        bc_labels,
+                        dec_weight=self._bc_dec_weight,
+                        dec_label_smoothing=self._bc_dec_label_smoothing,
+                        has_exec=False,
+                    ))
                     # The one live critic IS trained here against the same
                     # demo returns — self.value_net when separate_value_net
                     # is on (via _value_heads(), routed to value_opt below),
@@ -1512,13 +1572,52 @@ class PPOTrainer:
                     epoch_losses.append(combined.item())
                     epoch_bc_losses.append(dec_bc_loss.item())
                     epoch_val_losses.append(val_loss.item())
+                _mean_bc = float(np.mean(epoch_bc_losses))
+                _mean_floor = float(np.mean(epoch_floors)) if epoch_floors else 0.0
                 log.info(
                     f"  Phase 0 epoch {epoch + 1}/{_demo_epochs}: "
                     f"loss={np.mean(epoch_losses):.4f}  "
-                    f"dec_bc={np.mean(epoch_bc_losses):.4f}  "
-                    f"val={np.mean(epoch_val_losses):.4f}(x{self._phase0_value_coef})="
+                    f"dec_bc={_mean_bc:.4f}  bc_adj={_mean_bc - _mean_floor:.4f}"
+                    f"(floor={_mean_floor:.4f})  "
+                    f"val_mse={np.mean(epoch_val_losses):.4f}(x{self._phase0_value_coef})="
                     f"{self._phase0_value_coef * np.mean(epoch_val_losses):.4f}"
                 )
+                if len(_p0_val_idx) > 0:
+                    _p0_vl = _eval_p0_val_loss()
+                    _p0_improved = _p0_vl < (_p0_best_val_loss - self._p0_early_stop_min_delta)
+                    if _p0_early_stop_enabled:
+                        log.info(
+                            f"    val  p0_val_loss={_p0_vl:.4f}  best={min(_p0_best_val_loss, _p0_vl):.4f}"
+                            + ("  (improved)" if _p0_improved else f"  (patience {_p0_patience_ctr + 1}/{self._p0_early_stop_patience})")
+                        )
+                    else:
+                        log.info(f"    val  p0_val_loss={_p0_vl:.4f}")
+                    if _p0_improved:
+                        _p0_best_val_loss = _p0_vl
+                        if _p0_early_stop_enabled:
+                            _p0_best_state = {
+                                "decision_net": copy.deepcopy(self.decision_net.state_dict()),
+                                **(({"value_net": copy.deepcopy(self.value_net.state_dict())} if self.separate_value_net
+                                    else {"exec_value_head": copy.deepcopy(self.execution_net.value_head.state_dict())})),
+                            }
+                            _p0_patience_ctr = 0
+                    elif _p0_early_stop_enabled:
+                        _p0_patience_ctr += 1
+                        if _p0_patience_ctr >= self._p0_early_stop_patience:
+                            log.info(
+                                f"  [Phase 0] early stop at epoch {epoch + 1} "
+                                f"(val stagnant for {self._p0_early_stop_patience} epochs, "
+                                f"best={_p0_best_val_loss:.4f})"
+                            )
+                            _p0_stopped_early = True
+                            break
+            if _p0_stopped_early and _p0_best_state is not None:
+                self.decision_net.load_state_dict(_p0_best_state["decision_net"])
+                if self.separate_value_net:
+                    self.value_net.load_state_dict(_p0_best_state["value_net"])
+                else:
+                    self.execution_net.value_head.load_state_dict(_p0_best_state["exec_value_head"])
+                log.info(f"  [Phase 0] restored best-val weights (p0_val_loss={_p0_best_val_loss:.4f})")
             log.info(f"Phase 0 done (decision-net BC + critic value_head warm-up, {_demo_epochs} epoch(s))")
         elif _demo_epochs > 0 and not dataset.has_rewards:
             log.info(
@@ -2319,8 +2418,9 @@ class PPOTrainer:
             ``{"episode_returns": list[float], "outcomes_vs_rules": list[str],
             "outcomes_vs_immobile": list[str], "outcomes_vs_neural": list[str]}``
         """
-        _batch_size = batch_size if batch_size is not None else self.minibatch_size
-        log.info(f"Value pre-training: {n_steps} steps, {n_epochs} epochs, lr={lr}")
+        # Decoupled from ppo.minibatch_size -- see self._value_pretrain_batch_size.
+        _batch_size = batch_size if batch_size is not None else self._value_pretrain_batch_size
+        log.info(f"Value pre-training: {n_steps} steps, {n_epochs} epochs, lr={lr}, batch_size={_batch_size}")
         if self.separate_value_net:
             # self.value_net is fully independent of the BC-primed policy trunk --
             # nothing to freeze/protect, train the whole thing (this is the whole
@@ -2662,8 +2762,15 @@ class PPOTrainer:
         ], dim=-1)
 
     @torch.no_grad()
-    def _sample_action(self, obs_dict: dict) -> tuple:
+    def _sample_action(self, obs_dict: dict, deterministic: bool = False) -> tuple:
         """Forward pass + sample from all distributions.
+
+        Args:
+            deterministic: if True, use each head's mode/mean instead of a
+                stochastic sample (Bernoulli -> >=0.5, Categorical -> argmax,
+                Normal/Direction heads -> mean) — for evaluating a checkpoint
+                without PPO exploration noise. Never used during rollout
+                collection/training, only via load_for_inference() callers.
 
         Returns:
             (decision_action, log_prob, value, decision_probs,
@@ -2682,18 +2789,28 @@ class PPOTrainer:
         d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
 
         # Sample from each decision head
-        shoot = IndependentBernoulli(d_heads.shoot_logit).sample()
-        pass_ = IndependentBernoulli(d_heads.pass_logit).sample()
-        move = IndependentBernoulli(d_heads.move_logit).sample()
-        tackle = IndependentBernoulli(d_heads.tackle_logit).sample()
-        gp_extra = IndependentBernoulli(d_heads.get_possession_raw).sample()
-        mark = IndependentBernoulli(d_heads.mark_logit).sample()
-        hold = IndependentBernoulli(d_heads.hold_position_logit).sample()
+        shoot_dist = IndependentBernoulli(d_heads.shoot_logit)
+        pass_dist = IndependentBernoulli(d_heads.pass_logit)
+        move_dist = IndependentBernoulli(d_heads.move_logit)
+        tackle_dist = IndependentBernoulli(d_heads.tackle_logit)
+        gp_extra_dist = IndependentBernoulli(d_heads.get_possession_raw)
+        mark_dist = IndependentBernoulli(d_heads.mark_logit)
+        hold_dist = IndependentBernoulli(d_heads.hold_position_logit)
+        shoot = shoot_dist.mode() if deterministic else shoot_dist.sample()
+        pass_ = pass_dist.mode() if deterministic else pass_dist.sample()
+        move = move_dist.mode() if deterministic else move_dist.sample()
+        tackle = tackle_dist.mode() if deterministic else tackle_dist.sample()
+        gp_extra = gp_extra_dist.mode() if deterministic else gp_extra_dist.sample()
+        mark = mark_dist.mode() if deterministic else mark_dist.sample()
+        hold = hold_dist.mode() if deterministic else hold_dist.sample()
 
         # Categorical targets (masked)
-        pass_tgt = MaskedCategorical(d_heads.pass_target_logits, em).sample()
-        tackle_tgt = MaskedCategorical(d_heads.tackle_target_logits, em).sample()
-        mark_tgt = MaskedCategorical(d_heads.mark_target_logits, em).sample()
+        pass_tgt_dist = MaskedCategorical(d_heads.pass_target_logits, em)
+        tackle_tgt_dist = MaskedCategorical(d_heads.tackle_target_logits, em)
+        mark_tgt_dist = MaskedCategorical(d_heads.mark_target_logits, em)
+        pass_tgt = pass_tgt_dist.mode() if deterministic else pass_tgt_dist.sample()
+        tackle_tgt = tackle_tgt_dist.mode() if deterministic else tackle_tgt_dist.sample()
+        mark_tgt = mark_tgt_dist.mode() if deterministic else mark_tgt_dist.sample()
 
         # Continuous decision heads (pre-squash raw samples for PPO)
         mv_center_raw = d_heads.move_region_center  # (1, 2), no extra noise for now - use mean
@@ -2739,19 +2856,30 @@ class PPOTrainer:
         e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
 
         # Sample execution heads
-        exec_move = IndependentBernoulli(e_heads.exec_move_logit).sample()
-        sprint = IndependentBernoulli(e_heads.sprint_logit).sample()
-        kick = IndependentBernoulli(e_heads.kick_logit).sample()
-        tackle_attempt = IndependentBernoulli(e_heads.tackle_attempt_logit).sample()
+        exec_move_dist = IndependentBernoulli(e_heads.exec_move_logit)
+        sprint_dist = IndependentBernoulli(e_heads.sprint_logit)
+        kick_dist = IndependentBernoulli(e_heads.kick_logit)
+        tackle_attempt_dist = IndependentBernoulli(e_heads.tackle_attempt_logit)
+        exec_move = exec_move_dist.mode() if deterministic else exec_move_dist.sample()
+        sprint = sprint_dist.mode() if deterministic else sprint_dist.sample()
+        kick = kick_dist.mode() if deterministic else kick_dist.sample()
+        tackle_attempt = tackle_attempt_dist.mode() if deterministic else tackle_attempt_dist.sample()
 
         # Direction heads: sample from Normal(mean, std) per design doc 8.6.
         # We store the noisy raw sample (not the mean) so that log_prob ratios
         # during the PPO update are meaningful — new_mean vs stored sample.
+        # In deterministic mode we use the (normalized) mean direction instead.
         eps = 1e-6
         log_std_move = self.execution_net.move_dir_log_std
         log_std_kick = self.execution_net.kick_dir_log_std
-        move_dir_raw = self._move_dir_head(e_heads.move_direction, log_std_move).sample_raw()  # (1, 2)
-        kick_dir_raw = self._kick_dir_head(e_heads.kick_direction, log_std_kick).sample_raw()   # (1, 3)
+        move_dir_head = self._move_dir_head(e_heads.move_direction, log_std_move)
+        kick_dir_head = self._kick_dir_head(e_heads.kick_direction, log_std_kick)
+        if deterministic:
+            move_dir_raw = move_dir_head.mode_physical()  # (1, 2)
+            kick_dir_raw = kick_dir_head.mode_physical()   # (1, 3)
+        else:
+            move_dir_raw = move_dir_head.sample_raw()  # (1, 2)
+            kick_dir_raw = kick_dir_head.sample_raw()   # (1, 3)
         move_dir_phys = (move_dir_raw / (move_dir_raw.norm(dim=-1, keepdim=True) + eps)).squeeze(0)
         kick_dir_phys = (kick_dir_raw / (kick_dir_raw.norm(dim=-1, keepdim=True) + eps)).squeeze(0)
 

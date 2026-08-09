@@ -25,15 +25,22 @@ Notes to self:
 
 
 Current notes:
-- " read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
-- " read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md "
+- " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
+- " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md "
 - train blockers:
-    - Do a trianing run with no kicking?
+    - Plan: try with non-separate value net
+    - lose possesion 0 in the debug value script is sus
+    - Can value network predict with only immobiles? Should be easy AF
+    - rules-based AI should reposition between enemy and the goal if they are slower and it's possible
+    - !Use the debug script to check how the torch threads affects training and change the defaults correspondingly if needed (including for PPO!) - I get the sense it helps, but not 100% sure
     - value loss kinda sucks - maybe because of kicking? maybe because it should be one network?
-        - Go back to separate value network?d
-        - Get the match logs of the worst predictions in the val set
+        - step back for a sec - if it can't predict the rules-based AI rewards, then we're fucked (tbf, they use rules v rules, so maybe see how it does on rules vs immobile). Check which ones it struggles with and what the numbers are actually like. Is it predicting the monte-carlo stuff as it should be?
         - to a train/test set for val loss on rules-based demonstrations and see how it does
+        - Get the match logs of the worst predictions in the val set
+    - The UI Phase 1 (and maybe all?) should use the same scenario thingy code as training, and it should use that to output rewards in the game logs when they trigger (e.g. get_possesion +1 for trainee) when showing scenarios. Makes debugging easier
+    - BC train, then do deterministic vs immobile and see how we do compared with PPO
     - always have the option of doing a small set to scenarios each time, say 100, so that we can really track progression?
+    - [] ! do we have 2 values of max spin, in UI and engine? BAD. Max spin determined by kick precision and kick power together maybe? We should try to model it sensibly
     - [] value netowrk fixed - can we switch back to not having a separate value network?
     - [] still getting very large policy ratios sometimes - check what is the contributing factor (Dont we already see this?)
     - [] get match logs for best performing (by reward) and "smartest" (most adv, idk) runs each epoch
@@ -162,6 +169,9 @@ Past MVP - Late Stage Plans
 
 Mechanics
 - Think about introducing non-linearities in kick power, stamina etc... stuff that maybe less spearated in effect than theye are in rarity (gaussian), or the reverse (e.g. dribbling, maybe gets extra good at 80+)
+
+Matches:
+- Could add some commentary kinda easily - e.g. pass happens, say a phrase like "X passes over to Y"
 
 Coaching
 - Your players train their neural networks over time on actual data

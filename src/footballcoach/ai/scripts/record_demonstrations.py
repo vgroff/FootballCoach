@@ -59,6 +59,70 @@ def _build_env_and_label_fn(phase_id: int):
 
 
 # ---------------------------------------------------------------------------
+# Action-count summary (tackle/kick armed, attempted, success/fail)
+# ---------------------------------------------------------------------------
+
+def _log_action_stats_summary(
+    episode_action_counts: list[dict[str, dict[str, int]]], label: str = "whole run"
+) -> None:
+    """Log per-episode mean/std/median and grand totals for tackle/kick
+    action counters (armed ticks, attempts, win/loss, kicks executed), PER
+    ROLE (trainee/opponent) -- see episode_action_counts population in
+    record_episodes(). Per-role, not combined: every tackle attempt has
+    exactly one winner and one loser, so a trainee+opponent-combined win/loss
+    total is always 100% and tells you nothing about actual tackle skill.
+    """
+    if not episode_action_counts:
+        return
+    roles = list(episode_action_counts[0].keys())
+    keys = list(episode_action_counts[0][roles[0]].keys())
+    n_eps = len(episode_action_counts)
+    log.info(f"Action-count summary over {n_eps} episode(s) ({label}):")
+    for role in roles:
+        log.info(f"  [{role}]")
+        for k in keys:
+            vals = np.array([ep[role][k] for ep in episode_action_counts], dtype=np.float64)
+            total = int(vals.sum())
+            log.info(
+                f"    {k:18s} total={total:6d}  per-ep: mean={vals.mean():6.2f}  "
+                f"std={vals.std():6.2f}  median={np.median(vals):6.1f}  "
+                f"min={vals.min():.0f}  max={vals.max():.0f}"
+            )
+        attempts_total = sum(ep[role]["tackle_attempts"] for ep in episode_action_counts)
+        wins_total = sum(ep[role]["tackle_wins"] for ep in episode_action_counts)
+        if attempts_total > 0:
+            log.info(
+                f"    tackle win rate: {wins_total}/{attempts_total} = {100.0 * wins_total / attempts_total:.1f}%"
+            )
+        auto_attempts_total = sum(ep[role]["auto_tackle_attempts"] for ep in episode_action_counts)
+        auto_wins_total = sum(ep[role]["auto_tackle_wins"] for ep in episode_action_counts)
+        if auto_attempts_total > 0:
+            log.info(
+                f"    auto-tackle win rate: {auto_wins_total}/{auto_attempts_total} = "
+                f"{100.0 * auto_wins_total / auto_attempts_total:.1f}%"
+            )
+
+
+def _log_poss_reward_summary(episode_poss_reward: list[dict[str, float]], label: str = "whole run") -> None:
+    """Log per-episode mean/std/median and grand totals for the get_possession
+    ("poss")/lose_possession ("lpos") reward components -- env-level
+    (trainee+opponent combined, same convention as the reward-breakdown log
+    line above), tracked per-episode for the same reason as
+    _log_action_stats_summary."""
+    if not episode_poss_reward:
+        return
+    n_eps = len(episode_poss_reward)
+    log.info(f"get_possession/lose_possession reward summary over {n_eps} episode(s) ({label}, trainee+opponent):")
+    for k, name in (("poss", "get_possession"), ("lpos", "lose_possession")):
+        vals = np.array([ep[k] for ep in episode_poss_reward], dtype=np.float64)
+        log.info(
+            f"  {name:16s} total={vals.sum():+8.2f}  per-ep: mean={vals.mean():+6.3f}  "
+            f"std={vals.std():6.3f}  median={np.median(vals):+6.3f}  "
+            f"min={vals.min():+.3f}  max={vals.max():+.3f}"
+        )
+
+
+# ---------------------------------------------------------------------------
 # Recording logic
 # ---------------------------------------------------------------------------
 
@@ -92,6 +156,7 @@ def record_episodes(
     Returns a dict of numpy arrays ready to be saved as .npz.
     """
     from footballcoach.rules_ai import Phase1RulesAI
+    from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS
 
     # Override the env's ticks-per-decision to match sample_interval_s so that
     # env.step() advances by sample_interval_s and we sample at that cadence.
@@ -108,6 +173,15 @@ def record_episodes(
     bc_labels = []
     rewards = []
     dones = []
+    # Per-step reward-component breakdown, one fixed-width row per sample --
+    # column order = REWARD_COMP_LABELS (short-key order), so this stays in
+    # sync with ppo_trainer.py's diagnostics/reward.py's component keys
+    # without a separate schema. Mid-step samples (timed samples, and every
+    # sample except the one right after env.step()) carry all-zero rows,
+    # same convention as `rewards`/`dones` -- the real per-step breakdown is
+    # only ever known right after env.step() returns.
+    reward_components: list[np.ndarray] = []
+    _comp_key_order = [k for k, _ in REWARD_COMP_LABELS]
 
     steps_total = 0
     steps_valid = 0
@@ -130,6 +204,46 @@ def record_episodes(
     _tackle_count_since_log = 0
     _kick_count_total = 0
     _tackle_count_total = 0
+
+    # Engine-level action counters (armed intent, attempted contact, and
+    # win/loss outcome), tracked PER ROLE (trainee/opponent, not summed
+    # together -- every tackle attempt has exactly one winner and one loser,
+    # so a combined win/loss total is always 100% and tells you nothing;
+    # see debugging notes). Tracked per-episode so both the periodic log
+    # lines (since-last-log window) and the end-of-run summary (whole run)
+    # can report mean/std/median over episodes as well as grand totals.
+    # tackle_armed/kick_armed are per-tick flags on Player, sampled once per
+    # env.step() via definition.on_tick; on_tackle/on_tackle_result fire
+    # exactly once per real tackle attempt/outcome regardless of
+    # sample_interval_s.
+    # auto_tackle_attempts/wins/losses are the collision-based fallback path
+    # (_check_head_on_tackles, on_auto_tackle_result) -- separate from
+    # tackle_attempts/wins/losses (the intentional/armed path, on_tackle/
+    # on_tackle_result) since the two paths never fire the same callback
+    # pair; see player.py's on_auto_tackle_result docstring.
+    _ACTION_COUNT_KEYS = (
+        "tackle_armed_ticks", "kick_armed_ticks",
+        "tackle_attempts", "tackle_wins", "tackle_losses",
+        "auto_tackle_attempts", "auto_tackle_wins", "auto_tackle_losses",
+        "kicks_executed",
+    )
+    _ROLES = ("trainee", "opponent")
+    episode_action_counts: list[dict[str, dict[str, int]]] = []
+    _ep_counts: dict[str, dict[str, int]] = {
+        role: {k: 0 for k in _ACTION_COUNT_KEYS} for role in _ROLES
+    }
+    # Since-last-periodic-log accumulator (mirrors _comp_acc's reset pattern).
+    _ep_counts_since_log: list[dict[str, dict[str, int]]] = []
+
+    # Per-episode cumulative get_possession/lose_possession reward (env-level,
+    # i.e. trainee+opponent combined -- same convention as _comp_acc/rewards
+    # above, there's no separate per-player reward signal at this
+    # granularity). Tracked per-episode (not just since-last-log) so the
+    # final summary can report mean/std/median across the whole run,
+    # matching the action-count summary's level of detail.
+    episode_poss_reward: list[dict[str, float]] = []
+    _ep_poss_reward: dict[str, float] = {"poss": 0.0, "lpos": 0.0}
+    _poss_reward_since_log: list[dict[str, float]] = []
 
     if total_episodes is None:
         total_episodes = n_episodes
@@ -175,6 +289,7 @@ def record_episodes(
             bc_labels.append(label_arr)
             rewards.append(np.float32(reward))
             dones.append(np.float32(done))
+            reward_components.append(np.zeros(len(_comp_key_order), dtype=np.float32))
             steps_total += 1
             if label.valid:
                 steps_valid += 1
@@ -185,8 +300,69 @@ def record_episodes(
                     _tackle_count_since_log += 1
                     _tackle_count_total += 1
 
+    # Sample tackle_armed/kick_armed (transient per-tick flags on Player,
+    # reset every tick by Match._process_orders) once per physics tick via
+    # definition.on_tick -- the only hook that runs at tick granularity
+    # inside env.step()'s multi-tick loop. Wraps whatever on_tick the
+    # scenario already had (phase1_training_on_tick is currently a no-op,
+    # but this must not silently drop it if that changes).
+    _orig_on_tick = env.definition.on_tick
+
+    def _sample_armed_flags(match, trial_tick):  # noqa: ANN001
+        if _orig_on_tick is not None:
+            _orig_on_tick(match, trial_tick)
+        for role, pid in (("trainee", env.trainee_player_id), ("opponent", "opponent")):
+            try:
+                p = match.player_by_id(pid)
+            except KeyError:
+                continue
+            if p.tackle_armed:
+                _ep_counts[role]["tackle_armed_ticks"] += 1
+            if p.kick_armed:
+                _ep_counts[role]["kick_armed_ticks"] += 1
+
+    env.definition.on_tick = _sample_armed_flags
+
+    def _make_on_tackle_result(role: str):
+        def _cb(player, tackler_won, was_tackler):  # noqa: ANN001
+            # Only tally wins/losses for attempts THIS role initiated (was_tackler)
+            # -- otherwise a role's win+loss total (as tacklee) inflates past its
+            # own tackle_attempts count, which only counts attempts it initiated.
+            if not was_tackler:
+                return
+            _ep_counts[role]["tackle_wins" if tackler_won else "tackle_losses"] += 1
+        return _cb
+
+    def _make_on_auto_tackle_result(role: str):
+        # Auto-tackle (collision path) has no separate "armed"/"attempt"
+        # callback -- on_auto_tackle_result IS the attempt signal, fired
+        # once the outcome is already known, so count the attempt here too.
+        def _cb(player, tackler_won, was_tackler):  # noqa: ANN001
+            if not was_tackler:
+                return
+            _ep_counts[role]["auto_tackle_attempts"] += 1
+            _ep_counts[role]["auto_tackle_wins" if tackler_won else "auto_tackle_losses"] += 1
+        return _cb
+
+    def _make_on_kick(role: str, pid: str):
+        def _cb(player):  # noqa: ANN001
+            _ep_counts[role]["kicks_executed"] += 1
+            _record_now(player_id=pid)
+        return _cb
+
+    def _make_on_tackle(role: str, pid: str):
+        def _cb(player):  # noqa: ANN001
+            _ep_counts[role]["tackle_attempts"] += 1
+            _record_now(player_id=pid)
+        return _cb
+
     for ep in range(n_episodes):
         env.reset()
+        for role in _ROLES:
+            for k in _ep_counts[role]:
+                _ep_counts[role][k] = 0
+        for k in _ep_poss_reward:
+            _ep_poss_reward[k] = 0.0
 
         # Drive trainee with rules-based AI and attach action callbacks.
         # Callbacks fire inside env.step()'s 15-tick loop, so episodes still
@@ -194,8 +370,10 @@ def record_episodes(
         try:
             player = env._loop.match.player_by_id(env.trainee_player_id)
             player.ai = Phase1RulesAI()
-            player.on_kick = lambda p: _record_now(player_id=env.trainee_player_id)
-            player.on_tackle = lambda p: _record_now(player_id=env.trainee_player_id)
+            player.on_kick = _make_on_kick("trainee", env.trainee_player_id)
+            player.on_tackle = _make_on_tackle("trainee", env.trainee_player_id)
+            player.on_tackle_result = _make_on_tackle_result("trainee")
+            player.on_auto_tackle_result = _make_on_auto_tackle_result("trainee")
         except (AttributeError, KeyError):
             pass
 
@@ -222,8 +400,10 @@ def record_episodes(
                 opp.ai = None
                 match._opponent_use_rules_ai = False
                 match._opponent_is_immobile = True
-            opp.on_kick = lambda p: _record_now(player_id="opponent")
-            opp.on_tackle = lambda p: _record_now(player_id="opponent")
+            opp.on_kick = _make_on_kick("opponent", "opponent")
+            opp.on_tackle = _make_on_tackle("opponent", "opponent")
+            opp.on_tackle_result = _make_on_tackle_result("opponent")
+            opp.on_auto_tackle_result = _make_on_auto_tackle_result("opponent")
         except (AttributeError, KeyError):
             pass
 
@@ -239,11 +419,17 @@ def record_episodes(
             n_appended = len(rewards) - n_before
             # Advance sim by sample_interval_s; kick/tackle callbacks fire inside
             _obs, _reward, done, last_info = env.step()
-            # Backfill reward/done onto every row just appended for this timed
-            # sample (trainee + opponent both share the env-level reward/done —
-            # there is no separate per-player reward signal at this granularity).
+            # Backfill reward/done/components onto every row just appended for
+            # this timed sample (trainee + opponent both share the env-level
+            # reward/done/components — there is no separate per-player signal
+            # at this granularity).
+            _comp_row = np.array(
+                [env.last_reward_components.get(k, 0.0) for k in _comp_key_order],
+                dtype=np.float32,
+            )
             for i in range(1, n_appended + 1):
                 rewards[-i] = np.float32(_reward)
+                reward_components[-i] = _comp_row
                 if done:
                     dones[-i] = np.float32(1.0)
             # Accrue this step's reward for the NEXT kick/tackle callback (if
@@ -253,8 +439,15 @@ def record_episodes(
             # train.py's "_comp_acc" diagnostic for the analogous pattern).
             for _k, _v in env.last_reward_components.items():
                 _comp_acc[_k] = _comp_acc.get(_k, 0.0) + _v
+            _ep_poss_reward["poss"] += env.last_reward_components.get("poss", 0.0)
+            _ep_poss_reward["lpos"] += env.last_reward_components.get("lpos", 0.0)
 
         _comp_acc_episodes += 1
+        episode_poss_reward.append(dict(_ep_poss_reward))
+        _poss_reward_since_log.append(dict(_ep_poss_reward))
+        _ep_counts_snapshot = {role: dict(_ep_counts[role]) for role in _ROLES}
+        episode_action_counts.append(_ep_counts_snapshot)
+        _ep_counts_since_log.append(_ep_counts_snapshot)
 
         # Track episode outcome
         outcome = getattr(last_info, "trial_outcome", None) or "unknown"
@@ -293,11 +486,16 @@ def record_episodes(
                 f"kicks={_kick_count_since_log}  tackles={_tackle_count_since_log}"
                 f"  (totals: kicks={_kick_count_total}  tackles={_tackle_count_total})"
             )
+            _log_action_stats_summary(_ep_counts_since_log, label="since last log")
+            _log_poss_reward_summary(_poss_reward_since_log, label="since last log")
             _comp_acc.clear()
             _comp_acc_episodes = 0
             _kick_count_since_log = 0
             _tackle_count_since_log = 0
+            _ep_counts_since_log.clear()
+            _poss_reward_since_log.clear()
 
+    env.definition.on_tick = _orig_on_tick  # restore original
     env._ticks_per_decision = orig_ticks  # restore original
 
     return {
@@ -309,8 +507,25 @@ def record_episodes(
         "bc_labels":       np.stack(bc_labels).astype(np.float32),
         "rewards":         np.array(rewards, dtype=np.float32),
         "dones":           np.array(dones, dtype=np.float32),
+        "reward_components": np.stack(reward_components).astype(np.float32),
+        "meta_reward_component_keys": np.array(_comp_key_order),
         "meta_phase":      np.array(phase_id, dtype=np.int32),
         "meta_scenario":   np.bytes_(scenario_key),
+        "meta_episode_action_counts": np.array(
+            [
+                [ep[role][k] for role in _ROLES for k in _ACTION_COUNT_KEYS]
+                for ep in episode_action_counts
+            ],
+            dtype=np.int64,
+        ),
+        # Flattened "role.key" column labels, matching meta_episode_action_counts'
+        # column order -- per-role dicts can't round-trip through .npz directly.
+        "meta_episode_action_count_keys": np.array(
+            [f"{role}.{k}" for role in _ROLES for k in _ACTION_COUNT_KEYS]
+        ),
+        "meta_episode_poss_reward": np.array(
+            [[ep["poss"], ep["lpos"]] for ep in episode_poss_reward], dtype=np.float32
+        ),
     }
 
 
@@ -343,6 +558,8 @@ def _run_recording_job(job: dict) -> dict:
     episodes_done = 0
     total_steps = 0
     n_files_written = 0
+    all_episode_action_counts: list[dict[str, int]] = []
+    all_episode_poss_reward: list[dict[str, float]] = []
 
     while remaining > 0:
         batch = min(eps_per_file, remaining)
@@ -363,6 +580,17 @@ def _run_recording_job(job: dict) -> dict:
 
         n_steps = len(data["bc_labels"])
         total_steps += n_steps
+        # Unflatten "role.key" columns (see record_episodes()'s
+        # meta_episode_action_count_keys comment) back into per-role dicts.
+        _flat_keys = list(data["meta_episode_action_count_keys"])
+        for row in data["meta_episode_action_counts"]:
+            _ep_dict: dict[str, dict[str, int]] = {}
+            for flat_k, v in zip(_flat_keys, row.tolist()):
+                role, _, k = str(flat_k).partition(".")
+                _ep_dict.setdefault(role, {})[k] = v
+            all_episode_action_counts.append(_ep_dict)
+        for poss, lpos in data["meta_episode_poss_reward"]:
+            all_episode_poss_reward.append({"poss": float(poss), "lpos": float(lpos)})
 
         fname = Path(job["output_dir"]) / f"phase{job['phase_id']}_{file_idx:04d}.npz"
         np.savez_compressed(fname, **data)
@@ -376,6 +604,9 @@ def _run_recording_job(job: dict) -> dict:
         n_files_written += 1
         remaining -= batch
         episodes_done += batch
+
+    _log_action_stats_summary(all_episode_action_counts)
+    _log_poss_reward_summary(all_episode_poss_reward)
 
     return {"total_steps": total_steps, "n_files": n_files_written}
 
@@ -401,16 +632,19 @@ def main() -> None:
     parser.add_argument("--sample-interval", type=float, default=_default_interval,
                         help=f"Sim-seconds between timed samples (default: {_default_interval}). "
                              "Kicks and tackles are always recorded regardless.")
-    _default_opp_rules_prob = float(_cfg.get("curriculum", {}).get("phase1_demo_opponent_rules_prob", 0.3))
+    _demo_curr = _cfg.get("curriculum", {})
+    _demo_rules_r = float(_demo_curr.get("phase1_demo_opponent_rules_ratio", 1.0))
+    _demo_immobile_r = float(_demo_curr.get("phase1_demo_opponent_immobile_ratio", 1.0))
+    _demo_neural_r = float(_demo_curr.get("phase1_demo_opponent_neural_ratio", 0.0))
+    _demo_total = _demo_rules_r + _demo_immobile_r + _demo_neural_r
+    _default_opp_rules_prob = (_demo_rules_r / _demo_total) if _demo_total > 0 else 0.5
+    _default_opp_immobile_prob = (_demo_immobile_r / _demo_total) if _demo_total > 0 else 0.5
     parser.add_argument("--opponent-rules-prob", type=float, default=_default_opp_rules_prob,
                         help=f"Probability (0–1) that the opponent uses the rules-based AI each "
-                             f"demo episode (default: {_default_opp_rules_prob} from config). "
+                             f"demo episode (default: {_default_opp_rules_prob:.2f} from config ratios). "
                              "Remainder are immobile, unless --opponent-immobile-prob is also given.")
-    _default_opp_immobile_prob = float(_cfg.get("curriculum", {}).get("phase1_demo_opponent_immobile_prob", 0.0))
     parser.add_argument("--opponent-immobile-prob", type=float, default=_default_opp_immobile_prob,
-                        help=f"Probability (0–1) that the opponent is immobile, independent of "
-                             f"--opponent-rules-prob (default: {_default_opp_immobile_prob} from config). "
-                             "0.0 (default) preserves old behaviour: remainder after rules-prob is immobile.")
+                        help=f"Probability (0–1) that the opponent is immobile (default: {_default_opp_immobile_prob:.2f} from config ratios).")
     parser.add_argument("--info", action="store_true",
                         help="Print info about existing files and exit")
     _default_n_processes = int(_cfg.get("bc", {}).get("demo_recording_n_processes", 1))

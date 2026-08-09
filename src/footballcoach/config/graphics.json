@@ -41,8 +41,9 @@
     "alpha": 60
   },
   "kick_ui": {
-    "_comment": "Kick trajectory preview and spin input constants used by the UI kick system.",
-    "trajectory_duration_s": 3.0,
+    "_comment": "Kick trajectory preview and spin input constants. max_drag_m: mouse distance (metres) for full power — also scales elevation and spin sensitivity. trajectory_duration_s: seconds of trajectory shown. max_loft_angle_deg: elevation at closest mouse position. max_spin_magnitude_rads: spin at furthest mouse position.",
+    "max_drag_m": 10.0,
+    "trajectory_duration_s": 1.5,
     "max_loft_angle_deg": 70.0,
     "max_spin_magnitude_rads": 15.0
   },

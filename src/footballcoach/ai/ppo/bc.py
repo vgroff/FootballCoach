@@ -305,6 +305,8 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         _snap_on_possession_gained = player.on_possession_gained
         _snap_on_kick = player.on_kick
         _snap_on_tackle = player.on_tackle
+        _snap_on_tackle_result = player.on_tackle_result
+        _snap_on_auto_tackle_result = player.on_auto_tackle_result
         _snap_ball_possessed_by = match.ball.possessed_by
         _snap_ball_velocity = match.ball.velocity
         _snap_ball_position = match.ball.position
@@ -313,11 +315,13 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         # order is a FRESH object from Phase1RulesAI().act() above (not
         # current_exec), so its own internal state starts clean.
         player.current_order = order
-        # Prevent on_kick/on_tackle from firing real callbacks during this
-        # exploratory execute() (e.g. record_demonstrations.py wires these to
-        # _record_now(), which would otherwise recursively re-enter here).
+        # Prevent on_kick/on_tackle/on_tackle_result from firing real callbacks
+        # during this exploratory execute() (e.g. record_demonstrations.py wires
+        # these to _record_now(), which would otherwise recursively re-enter here).
         player.on_kick = None
         player.on_tackle = None
+        player.on_tackle_result = None
+        player.on_auto_tackle_result = None
         try:
             _dt = env._dt_s
             order.execute(player, match, _dt)
@@ -345,6 +349,8 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
             player.on_possession_gained = _snap_on_possession_gained
             player.on_kick = _snap_on_kick
             player.on_tackle = _snap_on_tackle
+            player.on_tackle_result = _snap_on_tackle_result
+            player.on_auto_tackle_result = _snap_on_auto_tackle_result
             match.ball.possessed_by = _snap_ball_possessed_by
             match.ball.velocity = _snap_ball_velocity
             match.ball.position = _snap_ball_position

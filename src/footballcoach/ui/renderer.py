@@ -703,7 +703,9 @@ class Renderer:
 
         line_h = self.hud_font.get_height() + 2
         box_w = 480
-        linger_h = line_h + 2 if show_linger else 0
+        # linger gets its own label row plus a separate bar row so the text
+        # never overlaps the fill rect underneath it.
+        linger_h = line_h * 2 + 2 if show_linger else 0
         box_h = len(entries) * line_h + 6 + linger_h
         bar_h = 34  # hotkey bar height — sit just above it
         box_x = surface.get_width() - box_w - 6
@@ -719,13 +721,15 @@ class Renderer:
             surface.blit(text, (box_x + 4, box_y + 3 + i * line_h))
 
         if show_linger:
-            bar_y = box_y + box_h - linger_h
-            filled_w = max(2, int((box_w - 8) * linger_frac))
-            pygame.draw.rect(surface, (40, 40, 60), (box_x + 4, bar_y + 3, box_w - 8, line_h - 4), border_radius=3)
-            pygame.draw.rect(surface, style.HUD_ACCENT, (box_x + 4, bar_y + 3, filled_w, line_h - 4), border_radius=3)
             outcome_str = getattr(game_log, "linger_outcome", None) or "resetting"
             label = self.hud_font.render(f"⏳ {outcome_str}", True, style.HUD_TEXT)
-            surface.blit(label, (box_x + 8, bar_y + 3))
+            label_y = box_y + box_h - linger_h
+            surface.blit(label, (box_x + 8, label_y))
+
+            bar_y = label_y + line_h
+            filled_w = max(2, int((box_w - 8) * linger_frac))
+            pygame.draw.rect(surface, (40, 40, 60), (box_x + 4, bar_y, box_w - 8, line_h - 4), border_radius=3)
+            pygame.draw.rect(surface, style.HUD_ACCENT, (box_x + 4, bar_y, filled_w, line_h - 4), border_radius=3)
 
     def draw_pause_notification(self, surface: pygame.Surface, message: str) -> None:
         """Draws a prominent centred banner when the game is auto-paused after
