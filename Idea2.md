@@ -33,8 +33,11 @@ Current notes:
         - check timeouts, see if we can reduce them
         - check evaulations/compare with determinstic ones
         - do we need more data?
-        - try with non-separate value net
+            - try with non-separate value net
+                - double chek everything is sensible with frozen layers and parameters etc... maybe switch to using the decision net head rather than execution? maybe test it on a pretrained model vs sepearte ones. would make more sense though
     - [] !get the real clause
+    - does phase 0 do as well as the debug script? - no reason it shouldnt really
+    - make boost value network capacity a little
     - what happens with kick spin in the neural network atm? in phase 1 and evals?
     - Do some tests with inline code and small rollout to see which many envs/worker combinastions are fastest, and how much capacity matters
     - Can value network predict with only immobiles? Should be easy AF

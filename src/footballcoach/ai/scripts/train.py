@@ -36,6 +36,44 @@ def _rules_1v1_build(*args, **kwargs):
     return match
 
 
+def _rules_vs_rules_1v1_build(*args, **kwargs):
+    """Module-level (picklable) scenario builder for the pre-training reward
+    diagnostic -- rules AI on BOTH sides (see main())."""
+    from footballcoach.rules_ai import Phase1RulesAI
+    from footballcoach.ui.scenarios import build_1v1_scenario
+
+    match = build_1v1_scenario(*args, **kwargs)
+    for p in match.players:
+        p.ai = Phase1RulesAI()
+    match._opponent_use_rules_ai = True
+    match._opponent_is_immobile = False
+    return match
+
+
+def _immobile_1v1_build(*args, **kwargs):
+    """Module-level (picklable) scenario builder for pre-PPO immobile-opponent eval."""
+    from footballcoach.ui.scenarios import build_1v1_scenario
+
+    match = build_1v1_scenario(*args, **kwargs)
+    opp = match.player_by_id("opponent")
+    opp.ai = None
+    match._opponent_use_rules_ai = False
+    match._opponent_is_immobile = True
+    return match
+
+
+def _neural_1v1_build(*args, **kwargs):
+    """Module-level (picklable) scenario builder for pre-PPO self-play eval."""
+    from footballcoach.ui.scenarios import build_1v1_scenario
+
+    match = build_1v1_scenario(*args, **kwargs)
+    opp = match.player_by_id("opponent")
+    opp.ai = None
+    match._opponent_use_rules_ai = False
+    match._opponent_is_immobile = False
+    return match
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Train the football AI with PPO")
     parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 3, 4],
@@ -352,17 +390,9 @@ def main() -> None:
             _diag_n = 40
             log.info(f"Reward diagnostic: running {_diag_n} rules-vs-rules episodes...")
             try:
-                from footballcoach.rules_ai import Phase1RulesAI
-                from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
+                from footballcoach.ui.scenarios import ScenarioDefinition
                 from footballcoach.ai.env.scenario_env import ScenarioEnv
-                def _rr_build(*_a, **_kw):
-                    match = build_1v1_scenario(*_a, **_kw)
-                    for p in match.players:
-                        p.ai = Phase1RulesAI()
-                    match._opponent_use_rules_ai = True
-                    match._opponent_is_immobile = False
-                    return match
-                _diag_defn = ScenarioDefinition(key="diag_rr", label="diag", description="rules vs rules diagnostic", build=_rr_build)
+                _diag_defn = ScenarioDefinition(key="diag_rr", label="diag", description="rules vs rules diagnostic", build=_rules_vs_rules_1v1_build)
                 _diag_env = ScenarioEnv(_diag_defn, trainee_player_id="trainee", phase=1, max_episode_s=env.max_episode_s)
                 _comp_acc: dict[str, float] = {}
                 _ep_rewards: list[float] = []
@@ -475,14 +505,7 @@ def main() -> None:
             log.info(f"  rew breakdown (rules, per ep): {_comp_str}")
 
         # Evaluate against immobile opponent only
-        def _immobile_build(*args, **kwargs):
-            match = build_1v1_scenario(*args, **kwargs)
-            opp = match.player_by_id("opponent")
-            opp.ai = None
-            match._opponent_use_rules_ai = False
-            match._opponent_is_immobile = True
-            return match
-        immobile_defn = ScenarioDefinition(key="1v1_immobile", label="1v1 immobile", description="1v1 vs immobile opponent", build=_immobile_build)
+        immobile_defn = ScenarioDefinition(key="1v1_immobile", label="1v1 immobile", description="1v1 vs immobile opponent", build=_immobile_1v1_build)
         immobile_env = ScenarioEnv(
             immobile_defn, trainee_player_id="trainee", phase=1,
             max_episode_s=env.max_episode_s,
@@ -506,17 +529,10 @@ def main() -> None:
         # Evaluate neural vs neural (self-play): the BC-pretrained policy plays itself.
         # Uses secondary_player_ids so the opponent also runs NeuralPlayerAI with the
         # same sample_action_fn — true self-play, no rules involvement.
-        def _neural_build(*args, **kwargs):
-            match = build_1v1_scenario(*args, **kwargs)
-            opp = match.player_by_id("opponent")
-            opp.ai = None
-            match._opponent_use_rules_ai = False
-            match._opponent_is_immobile = False
-            return match
         neural_defn = ScenarioDefinition(
             key="1v1_neural", label="1v1 self-play",
             description="1v1 neural vs neural (self-play)",
-            build=_neural_build,
+            build=_neural_1v1_build,
         )
         neural_env = ScenarioEnv(
             neural_defn, trainee_player_id="trainee", phase=1,

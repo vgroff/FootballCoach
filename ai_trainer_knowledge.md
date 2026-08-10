@@ -276,7 +276,9 @@ block to show which heads changed most since the rollout was collected.
 **`PlayerFeatures` layout (27 floats)** — last two fields are new absolute position:
 - `pos_x = player.position.x / 52.5` — world-frame x, ≈[-1,1] on standard pitch
 - `pos_y = player.position.y / 34.0` — world-frame y, ≈[-1,1] on standard pitch
-- Both are negated by the augmenter under `flip_x` / `flip_y` respectively.
+- `pos_x` is negated for `Team.RIGHT` observers by the permanent canonical-AI-frame
+  wrapper (`ai/obs/canonical.py`), NOT `obs/augment.py`'s random augmenter.
+  `pos_y` is still negated by `obs/augment.py`'s random `flip_y` augmentation.
 - Self slot has non-zero `pos_x`/`pos_y` (unlike `rel_dx`/`rel_dy` which are always 0 for self).
 
 **`GlobalFeatures` pitch/goal/box dims** are now normalised by standard values
@@ -701,17 +703,22 @@ in `PPOTrainer` so every phase automatically gets augmentation.
 
 ### What it does
 
-Each real rollout batch is expanded by **4 × `augment_n_slot_shuffles`** before
-any gradient step.  Default `augment_n_slot_shuffles=3` → **12× augmentation**.
+Each real rollout batch is expanded by **`N_FLIP_VARIANTS` (2) ×
+`augment_n_slot_shuffles`** before any gradient step. Default
+`augment_n_slot_shuffles=3` → **6× augmentation**.
 
-**Geometric flips** (4 variants: identity, flip_x, flip_y, flip_xy):
-- flip_x: negate all x-direction quantities (positions, velocities, heading_cos,
-  attacking_direction, action vectors, BC label direction)
-- flip_y: negate all y-direction quantities (heading_sin, etc.)
-- Angular velocity (spin) is a pseudovector: under flip_x, spin_y and spin_z
-  negate; under flip_y, spin_x and spin_z negate.
-- These are **exact symmetries** of the football environment — reward and
-  terminal conditions are identical under pitch reflections.
+**Geometric flips** (2 variants: identity, flip_y — flip_x/flip_xy were
+removed once flip_x became a PERMANENT canonical-frame transform instead of
+a random augmentation, see "Canonical AI frame" in `ai/knowledge.md` and
+`ai/obs/canonical.py`):
+- flip_y: negate all y-direction quantities (heading_sin, etc.) — still a
+  real, independent symmetry once the attacking axis is fixed by the
+  canonical frame.
+- Angular velocity (spin) is a pseudovector: under flip_y, spin_x and spin_z
+  negate (flip_x's spin_y/spin_z negation logic still lives in
+  `augment.py` as inert/reused-by-`canonical.py` code, not a live augmentation).
+- This is an **exact symmetry** of the football environment — reward and
+  terminal conditions are identical under this pitch reflection.
 
 **Slot permutations** (`n_slot_shuffles` per geometric variant):
 - Randomly permute the opponent-player slot ordering in `other_feat`/`exists_mask`.

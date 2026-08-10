@@ -626,12 +626,67 @@ invariance.
 
 **Additional augmentation** (`obs/augment.py`) is applied inside `PPOTrainer._ppo_update()`
 **for ALL training phases in this repo**.  Each rollout batch is expanded by
-4 × `ppo.augment_n_slot_shuffles` (default 12×):
-- 4 geometric flips: identity, flip_x, flip_y, flip_xy (exact pitch symmetries)
+`N_FLIP_VARIANTS` (2) × `ppo.augment_n_slot_shuffles` (default 6× total):
+- 2 geometric flips: identity, flip_y (the one remaining exact pitch symmetry
+  once the attacking axis is fixed — see "Canonical AI frame" below for why
+  flip_x is no longer part of this random augmentation)
 - n slot permutations per flip (exact for permutation-invariant attention)
 Field indices for each flip are derived from `fields(PlayerFeatures)` /
 `fields(BallFeatures)` at import time — see `obs/augment.py` for the full
-derivation including pseudovector (spin) transforms.
+derivation including pseudovector (spin) transforms. Always use
+`augment.N_FLIP_VARIANTS` (never a hardcoded `4`) when tiling a parallel
+array (e.g. `ret_batch.repeat(...)`) to match the augmented batch size —
+a stale hardcoded `4` here (left over from when flip_x was still a random
+augmentation) broke `pretrain_combined()`'s Phase 1 value-loss batch-size
+match once flip_x was removed from `_FLIP_VARIANTS`.
+
+### Canonical AI frame (`obs/canonical.py`)
+
+Both networks are permanently wrapped in `PPOTrainer.__init__`
+(`CanonicalNetworkWrapper`, see `ai/obs/canonical.py`): `self.decision_net`,
+`self.execution_net`, and `self.value_net` (when `--separate-value-net`) are
+all `CanonicalNetworkWrapper` instances, not the raw `DecisionNetwork`/
+`ExecutionNetwork` modules.
+
+**What it does**: on every `forward()` call, the wrapper negates every
+x-signed field (`obs/augment.py`'s `PLAYER_FLIP_X_IDX`/`BALL_FLIP_X_IDX`) in
+`self_feat`/`other_feat`/`ball_feat` for a `Team.RIGHT` observer (derived
+from that row's `attacking_direction` field — see
+`canonical.x_sign_of()`/`X_SIGN_FIELD_IDX`), before delegating to the real
+network. So every network input is transformed so "my own team always
+attacks +x" — the network never has to learn to condition on which raw
+engine team it is; `is_own_team` + this fixed convention is all it needs.
+
+**Why a wrapper and not baked into `encoder.py`/`bc.py`**: `obs/encoder.py`
+and recorded BC `.npz` files stay in plain, unmirrored world-frame
+coordinates — matching match logs and UI replays, and never needing
+re-recording if the convention ever changes. There is exactly ONE
+implementation of the mirror (the wrapper), used automatically by every
+existing `self.decision_net(...)`/`self.execution_net(...)`/
+`self.value_net(...)` call site in `ppo_trainer.py` with **zero changes**
+to those call sites — this was a deliberate redesign after an earlier
+attempt hand-inserted the mirror at ~15 individual call sites, which was
+exactly the kind of hand-duplicated-logic-drift risk this codebase already
+has scars from (see "Orders vs execution-network labels boundary" above).
+
+**What the wrapper does NOT do**: it never touches network *outputs*
+(`DecisionHeadsRaw`/`ExecutionHeadsRaw`) — those stay in canonical frame.
+This is intentional: log_prob/BC-loss computations need the network output
+compared against other canonical-frame quantities (BC labels via
+`canonicalize_bc_labels()`, the rollout buffer's stored raw action samples
+used to recompute PPO's importance ratio) — decanonicalizing here would
+just require re-canonicalizing one line later. The ONE place decanonicalize
+happens is `PPOTrainer._sample_action()`, right before the sampled
+`move_direction`/`kick_direction`/`move_region_center_m` are handed back to
+the caller as the actual physical action applied to engine state (via
+`mirror_x()`, using the same `x_sign` derived once at the top of that
+method) — everything downstream of that point (`apply_nn_action.py`, the
+engine) is plain world-frame, same as it always was.
+
+`state_dict()`/`load_state_dict()` are transparently delegated straight to
+the wrapped module (bypassing `nn.Module`'s default submodule-prefixed
+behaviour) so checkpoint keys are byte-identical to pre-wrapper checkpoints
+— no migration needed for old `.pt` files.
 
 **IMPORTANT — target slot index remapping**: when a slot permutation is
 applied, the stored `pass_target`, `tackle_target`, `mark_target` action
