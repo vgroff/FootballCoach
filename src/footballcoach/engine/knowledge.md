@@ -23,12 +23,11 @@ steppable `Match` with a fixed timestep. All constants come from
 4. step_ball (if loose)   - advance free-flight physics for a loose ball,
                              UNLESS a player is currently CONTROLLING_BALL
 5. _update_loose_ball_pickup - check if any ACTIVE player is close enough to
-                             a loose ball to start a control-time countdown;
-                             freezes the ball's velocity the instant contact
-                             is made
-6. release-grace countdown - decrement ball.release_grace_s if active
-7. resolve_all_overlaps   - push apart any overlapping players
-8. goal_linger countdown / _check_goal - if a goal linger is active, count
+                             AND closing on (see subtlety #2) a loose ball to
+                             start a control-time countdown; freezes the
+                             ball's velocity the instant contact is made
+6. resolve_all_overlaps   - push apart any overlapping players
+7. goal_linger countdown / _check_goal - if a goal linger is active, count
                              it down and call _reset_after_goal() when it
                              expires; otherwise detect goals normally
 ```
@@ -36,24 +35,28 @@ steppable `Match` with a fixed timestep. All constants come from
 **Ordering subtlety #1 - kick-then-pickup:** step 4 (advance loose-ball
 physics) runs *before* step 5 (check pickup), not after. If a player kicks
 the ball in step 2, the ball is released at the kicker's feet with a new
-velocity. If we checked pickup before moving the ball, the kicker would
-find the ball at distance 0 from himself and immediately start
-"controlling" it again, silently cancelling every kick. Moving physics
-first lets the ball travel away from the kicker within the same tick before
-pickup-eligibility is checked.
+velocity. Moving physics first lets the ball travel away from the kicker
+within the same tick, so its post-kick velocity (moving away from the
+kicker) is what subtlety #2's closing-velocity check actually sees.
 
-**Ordering subtlety #2 - release grace period:** even with subtlety #1
-handled, a *slow* pass/kick (a few m/s - realistic for a short pass; see
-`kicking.pass_speed_mps`) doesn't necessarily clear the passer's own
-`pickup_radius_m` (0.4m) within a single 1/30s tick. Without a fix, the
-passer would still instantly re-acquire their own pass a few ticks later.
-`Ball.last_released_by` / `Ball.release_grace_s` (set by
-`Match._start_release_grace`, called right after `kick_ball`/`pass_ball` in
-`_process_orders`) exclude the releasing player specifically from
-`_update_loose_ball_pickup` for `release_grace_duration_s` (0.3s by
-default) - long enough for even a minimum-pace pass to put a couple of
-metres between itself and the passer, but short enough not to meaningfully
-delay a teammate's *own* attempt to receive a fast return pass.
+**Ordering subtlety #2 - pickup requires closing velocity, not just
+proximity:** `_update_loose_ball_pickup` calls `possession.can_pick_up_ball()`,
+which requires a player be within `ball_pickup.pickup_radius_m` (0.4m) AND
+either (a) closing on the ball — the relative velocity `ball.velocity -
+player.velocity` has a component reducing the separation — or (b) the
+relative speed is below `ball_pickup.closing_speed_deadzone_mps` (0.3m/s by
+default), i.e. ball and player are both roughly stationary relative to each
+other so "closing" isn't a meaningful requirement. This replaced an earlier
+purely time-based "release grace period" (a short window during which the
+releasing player specifically was excluded from pickup) — the old approach
+special-cased "who kicked it" rather than modelling the actual physical
+fact: a player can't catch a ball that's moving away from them faster than
+they're closing on it, regardless of who released it or when. The
+closing-velocity rule handles the kicker/passer case for free (their own
+kick is moving away from them, so it fails the closing check) without any
+per-player bookkeeping, and generalises to any loose-ball scenario
+(deflections, rebounds) with the same rule. See `possession.py`'s
+`can_pick_up_ball()` docstring and `tests/unit/test_ball_pickup.py`.
 
 **Ordering subtlety #3 - the ball freezes on contact, not on control
 completion:** `_update_loose_ball_pickup` sets `ball.velocity = Vector3.zero()`
@@ -627,7 +630,7 @@ opponent. Two modes per tick, selected automatically:
 - **Standoff mode**: otherwise, moves to a point between the target and the
   ball at `mark_standoff_m` (config, default 1.5m) offset from the target
   toward the ball, decelerating to a standstill there. Uses
-  `_braking_speed_mode()` — no velocity snaps.
+  `orders.braking_speed_mode()` — no velocity snaps.
 
 `MarkOrder` **never auto-completes** (analogous to `SaveOrder`); it must be
 explicitly replaced with a different order. Config:
@@ -678,7 +681,7 @@ player.on_tackle  = lambda player: ...   # ChaseTackleOrder (when contact is mad
 ```
 
 - `on_kick` fires inside `Match._process_orders()` immediately after `kick_ball()`
-  or `pass_ball()` is called and `_start_release_grace()` completes.
+  or `pass_ball()` is called.
 - `on_tackle` fires when `are_touching(player, target)` is True and
   `target.is_available_to_tackle()` — i.e. at the moment the tackle attempt
   executes, before the tackle outcome is resolved.

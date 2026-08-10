@@ -47,8 +47,10 @@ from footballcoach.ai.ppo.bc import (
     _I_AI_TYPE,
     _I_DIR_X,
     _I_DIR_Y,
+    _I_EXEC_MOVE,
     _I_KICK_THIS_TICK,
     _I_OPPONENT_AI_TYPE,
+    _I_SPRINT,
     _I_TACKLE_ATTEMPT,
     _I_VALID,
 )
@@ -288,9 +290,12 @@ class DemonstrationDataset:
 
         Row 0 of every episode (no valid "previous" row within the episode)
         is never eligible. Rows within ``exclude_radius_steps`` of a
-        ``kick_this_tick=1`` or ``tackle_attempt=1`` row (same episode) are
-        also never eligible, so straight-line run-ups immediately preceding
-        a rare event are not stripped.
+        ``kick_this_tick=1``, ``tackle_attempt=1``, or a ``sprint``/
+        ``exec_move`` speedMode change from the preceding row (same episode)
+        are also never eligible — a speedMode transition (e.g. SPRINT to JOG
+        braking into a target) is itself a non-trivial event that a fixed
+        0.3s sample interval can easily miss on either side of, so run-ups
+        immediately around it are protected the same way as kicks/tackles.
 
         Computed once at load time; the *exclusion subset* drawn from this
         mask is what gets freshly re-rolled every epoch (see
@@ -325,8 +330,21 @@ class DemonstrationDataset:
             cos_sim[idx] = (cur_n * prev_n).sum(axis=-1)
         trivial[idx] = cos_sim[idx] > cos_threshold
 
+        # SpeedMode transition (sprint or exec_move differs from the previous
+        # row, same episode) counts as a rare event too -- see docstring.
+        sprint = self._labels[:, _I_SPRINT]
+        exec_move = self._labels[:, _I_EXEC_MOVE]
+        speed_mode_changed = np.zeros(n, dtype=bool)
+        if n > 1:
+            changed = (sprint[1:] != sprint[:-1]) | (exec_move[1:] != exec_move[:-1])
+            speed_mode_changed[1:] = changed & prev_is_same_episode[1:]
+
         # Exclude rows within exclude_radius_steps of a rare event, same episode.
-        rare_event = (self._labels[:, _I_KICK_THIS_TICK] > 0.5) | (self._labels[:, _I_TACKLE_ATTEMPT] > 0.5)
+        rare_event = (
+            (self._labels[:, _I_KICK_THIS_TICK] > 0.5)
+            | (self._labels[:, _I_TACKLE_ATTEMPT] > 0.5)
+            | speed_mode_changed
+        )
         if exclude_radius_steps > 0 and rare_event.any():
             near_rare = np.zeros(n, dtype=bool)
             rare_idx = np.where(rare_event)[0]

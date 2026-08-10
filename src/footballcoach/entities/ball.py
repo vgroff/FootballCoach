@@ -18,15 +18,6 @@ class Ball:
     # Player id currently in possession (ball "stuck" to them), or None if loose.
     possessed_by: str | None = None
 
-    # Player id who most recently released the ball (kick/pass/tackle-loss),
-    # and a short remaining grace period (seconds) during which THAT SAME
-    # player cannot immediately re-pick it up. Without this, a slow pass/kick
-    # (a few m/s) doesn't travel far enough in a single physics tick to clear
-    # the passer's own pickup radius, so they'd instantly re-acquire their
-    # own pass - see engine/knowledge.md's "release grace period" note.
-    last_released_by: str | None = None
-    release_grace_s: float = 0.0
-
     # Countdown timer set to just_bounced_display_duration_s whenever the
     # ball makes a genuine bounce (incoming vz exceeds BOUNCE_THRESHOLD_MPS).
     # Decayed by dt each tick in ball_physics.step_ball. Used by the renderer

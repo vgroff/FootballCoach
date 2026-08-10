@@ -27,7 +27,7 @@ each lives in `engine/match.py`'s `Match._process_orders`, not here. See
 
 `MoveOrder` has an optional `max_speed_on_arrival_mps` field (`None` =
 resolve to jog speed, `0.0` = full standstill). The engine uses
-`_braking_speed_mode()` to switch from SPRINT→JOG→STANDSTILL early enough
+`orders.braking_speed_mode()` to switch from SPRINT→JOG→STANDSTILL early enough
 to arrive at the requested speed — see the **Engine/AI boundary** section
 below. No order is permitted to assign `player.velocity` directly.
 
@@ -208,9 +208,11 @@ that is covered.
 
 ### Arrival logic (`MoveOrder`, `MarkOrder` standoff)
 
-`_braking_speed_mode(dist, speed, arrival_speed, ...)` in `match.py`
-looks ahead each tick and returns the appropriate `SpeedMode` so the player
-naturally decelerates to `arrival_speed` by the time they reach the target:
+`braking_speed_mode(dist, speed, arrival_speed, ...)` in `orders.py` (called
+from `_compute_movement_intent()` — order-layer logic, NOT engine physics;
+the neural network's direct-drive path bypasses it entirely) looks ahead each
+tick and returns the appropriate `SpeedMode` so the player naturally
+decelerates to `arrival_speed` by the time they reach the target:
 
 - `MoveOrder.max_speed_on_arrival_mps`:
   - `None` (default) → resolved to jog speed at execution; order completes
@@ -221,6 +223,6 @@ naturally decelerates to `arrival_speed` by the time they reach the target:
   - Any explicit `float` → treated as the speed threshold at arrival.
 - `MarkOrder` standoff position always uses `arrival_speed=0.0` (the marker
   holds the standoff point still).
-- `_braking_speed_mode` also has a 0.5 m close-range guard that forces
+- `braking_speed_mode` also has a 0.5 m close-range guard that forces
   `STANDSTILL` regardless of the braking-distance calculation, preventing
   low-speed re-acceleration oscillation near the target.

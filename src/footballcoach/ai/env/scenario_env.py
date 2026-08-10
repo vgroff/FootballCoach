@@ -120,7 +120,13 @@ class ScenarioEnv:
         # Cleared in reset() since a fresh Match/pitch is built each episode.
         self._box_bounds_cache: dict = {}
         self._max_episode_ticks: int = 1
-        self._ball_touched_by_trainee: bool = False
+        # player_id of whoever last possessed or kicked the ball, updated every
+        # tick. Used solely to attribute the ball_out_penalty / "miss" outcome
+        # to the ONE player who actually put the ball out — not to everyone who
+        # ever touched it earlier in the episode. None if nobody has touched
+        # the ball yet this episode (in which case no ball_out penalty applies
+        # to anyone).
+        self._last_ball_toucher_id: Optional[str] = None
         self._trainee_had_possession_last_step: bool = False
         # True while the ball is loose after the trainee lost it and no OTHER
         # player has taken possession yet (e.g. a push-kick dribble touch, or
@@ -142,7 +148,6 @@ class ScenarioEnv:
         # Per-secondary-player state
         self._sec_last_ball_dist: dict = {}
         self._sec_start_stamina: dict = {}
-        self._sec_ball_touched: dict = {}
         # Per-secondary-player running UNCLAMPED cumulative-term state, see
         # reward.cumulative_clamped_delta() / self._trainee_cumulative_state.
         # dict[pid] -> dict[term_name] -> running unclamped sum (e.g. "prog", "appr_sq").
@@ -198,7 +203,7 @@ class ScenarioEnv:
         self._ema.reset()
         self._episode_ticks = 0
         self._trial_done = False
-        self._ball_touched_by_trainee = False
+        self._last_ball_toucher_id = None
         self._box_bounds_cache = {}
         self._prev_goal_count = (
             self._loop.match.scoreboard.left_goals,
@@ -268,7 +273,6 @@ class ScenarioEnv:
                 self._sec_ema[pid] = EMAFilter.from_config()
             self._sec_ema[pid].reset()
             self._sec_last_ball_dist[pid] = self._ball_dist_for_player(pid)
-            self._sec_ball_touched[pid] = False
             # Record stamina at episode start for THIS secondary player, same
             # treatment as the trainee above — see
             # _compute_phase1_reward_for_player().
@@ -355,14 +359,16 @@ class ScenarioEnv:
         sec_prog_accum = {pid: 0.0 for pid in sec_pre}
 
         for _ in range(self._ticks_per_decision):
-            # Track ball touches by trainee
-            if match.ball.possessed_by == self.trainee_player_id:
-                self._ball_touched_by_trainee = True
-
-            # Track ball touches by secondary players
-            for pid in sec_pre:
-                if match.ball.possessed_by == pid:
-                    self._sec_ball_touched[pid] = True
+            # Track who last touched the ball (possession or a kick this
+            # tick) -- the SOLE source of truth for who gets blamed if the
+            # ball goes out. Deliberately overwrites on every touch so only
+            # the most recent toucher is ever penalised, never everyone who
+            # touched the ball earlier in the episode.
+            if match.ball.possessed_by is not None:
+                self._last_ball_toucher_id = match.ball.possessed_by
+            for _p in match.players:
+                if _p.kicked_this_tick:
+                    self._last_ball_toucher_id = _p.player_id
 
             # Track shot events (KickOrder completing toward goal)
             if self._detect_shot_this_tick(match, player):
@@ -445,8 +451,13 @@ class ScenarioEnv:
         new_goal_count = (match.scoreboard.left_goals, match.scoreboard.right_goals)
         self._prev_goal_count = new_goal_count
 
-        # Ball went out after trainee touched it
-        ball_went_out = trial_ended_this_step and outcome_this_step == "miss" and self._ball_touched_by_trainee
+        # Ball went out and the trainee was the last player to touch it
+        # (possession or kick) — only the last toucher is ever penalised.
+        ball_went_out = (
+            trial_ended_this_step
+            and outcome_this_step == "miss"
+            and self._last_ball_toucher_id == self.trainee_player_id
+        )
 
         # Ball progress toward opponent BOX (not raw goal-line x) — counts
         # lateral movement into the box. Per-tick accumulated (see
@@ -537,9 +548,13 @@ class ScenarioEnv:
                 # going out of bounds (neither player wins by shooting).
                 if self.phase == 1 and outcome_label == "goal":
                     outcome_label = "miss"
-                # Ball left pitch without trainee touching it — not a real miss,
-                # just a bad starting scenario (no penalty was applied).
-                if outcome_label == "miss" and not self._ball_touched_by_trainee:
+                # Ball went out with nobody having touched it this episode —
+                # an unintentional/nobody's-fault miss (e.g. bad initial
+                # placement/velocity), not a real ball_out_penalty case for
+                # either player. Split from "miss" (intentional-ish: the
+                # last toucher is penalised) so eval/log breakdowns can tell
+                # the two apart.
+                if outcome_label == "miss" and self._last_ball_toucher_id is None:
                     outcome_label = "invalid"
             info.trial_outcome = outcome_label
 
@@ -576,7 +591,7 @@ class ScenarioEnv:
             sec_ball_went_out = (
                 trial_ended_this_step
                 and outcome_this_step == "miss"
-                and self._sec_ball_touched.get(pid, False)
+                and self._last_ball_toucher_id == pid
             )
             # Per-tick scan (sec_gained_count/sec_lost_count) instead of a
             # simple before/after comparison — see trainee note above.

@@ -317,8 +317,6 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         _snap_ball_possessed_by = match.ball.possessed_by
         _snap_ball_velocity = match.ball.velocity
         _snap_ball_position = match.ball.position
-        _snap_last_released_by = match.ball.last_released_by
-        _snap_release_grace_s = match.ball.release_grace_s
         # order is a FRESH object from Phase1RulesAI().act() above (not
         # current_exec), so its own internal state starts clean.
         player.current_order = order
@@ -361,8 +359,6 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
             match.ball.possessed_by = _snap_ball_possessed_by
             match.ball.velocity = _snap_ball_velocity
             match.ball.position = _snap_ball_position
-            match.ball.last_released_by = _snap_last_released_by
-            match.ball.release_grace_s = _snap_release_grace_s
 
     if isinstance(order, MoveOrder):
         move_region_center = np.array(

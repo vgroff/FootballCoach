@@ -1687,9 +1687,8 @@ class ScenarioLoop:
     Trial-end detection (in priority order):
     1. Ball crosses the touchline or goal line (out of bounds / goal).
     2. Scoreboard changed (goal scored into a net).
-    3. Initial ball carrier released ball and ball resolved (save, miss, dispossessed).
-    4. All non-persistent orders resolved and ball settled.
-    5. Timeout failsafe (default 500 ticks ≈ 16.7 s at 30 Hz).
+    3. Initial ball carrier released ball and ball resolved (saved, dispossessed).
+    4. Timeout failsafe (default 500 ticks ≈ 16.7 s at 30 Hz).
     """
 
     definition: ScenarioDefinition

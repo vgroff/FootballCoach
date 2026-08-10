@@ -160,5 +160,10 @@
     "_comment": "Player-player velocity damping on overlap. collision_velocity_retention: fraction of closing speed kept per tick (0.5 = 50% reduction). collision_damping_min_closing_speed_mps: closing speeds below this floor are left untouched, preventing unbounded compounding over many ticks of sustained overlap (see design doc for worked example).",
     "collision_velocity_retention": 0.5,
     "collision_damping_min_closing_speed_mps": 0.3
+  },
+  "ball_pickup": {
+    "_comment": "Loose-ball pickup eligibility. A player within pickup_radius_m may only pick up the ball if they are CLOSING on it (relative velocity, i.e. (ball.velocity - player.velocity), has a component reducing the separation) OR the relative speed is below closing_speed_deadzone_mps (near-stationary relative motion -- e.g. a ball resting or barely rolling next to a player -- is always pickable, no need to be actively closing). This replaces the old time-based release-grace hack: a player can no longer instantly re-pick-up a ball they just kicked away at real speed, because it is moving away from them (not closing) -- with no special-casing of 'who kicked it'. It also naturally lets a ball rolling past a slow/stationary player be picked up only if the player has a real closing velocity component toward it, not by proximity alone. See engine/knowledge.md.",
+    "pickup_radius_m": 0.4,
+    "closing_speed_deadzone_mps": 0.3
   }
 }

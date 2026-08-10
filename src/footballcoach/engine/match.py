@@ -36,7 +36,7 @@ from footballcoach.engine.movement import (
     regen_stamina,
     step_player_towards,
 )
-from footballcoach.engine.possession import ControlTimeParams, control_time_s, compute_difficulty
+from footballcoach.engine.possession import BallPickupParams, ControlTimeParams, can_pick_up_ball, control_time_s, compute_difficulty
 from footballcoach.engine.scoring import Scoreboard, check_goal
 from footballcoach.engine.tackling import TacklingParams, apply_tackle_result, attempt_tackle, tackle_angle_modifier
 from footballcoach.entities.ball import Ball
@@ -101,19 +101,19 @@ class Match:
     repulsion_params: RepulsionParams = field(default_factory=RepulsionParams.from_config)
     collision_params: CollisionParams = field(default_factory=CollisionParams.from_config)
     marking_params: MarkingParams = field(default_factory=MarkingParams.from_config)
+    ball_pickup_params: BallPickupParams = field(default_factory=BallPickupParams.from_config)
 
     paused: bool = False
     time_s: float = 0.0
 
     # Pickup radius: how close a loose ball must be to a player before that
-    # player begins the first-touch control-time countdown.
+    # player begins the first-touch control-time countdown. Synced from
+    # ball_pickup_params.pickup_radius_m in __post_init__ (single source of
+    # truth in config) - kept as its own field since it's read as a simple
+    # attribute in several places (e.g. tests, GetPossession order homing
+    # logic) that predate ball_pickup_params. Do not set this independently
+    # of ball_pickup_params; override ball_pickup_params instead.
     pickup_radius_m: float = 0.4
-
-    # How long (seconds) the player who just released the ball (kick/pass)
-    # is excluded from re-picking it up. Needed because a slow pass/kick
-    # (a few m/s) doesn't necessarily clear the passer's own pickup radius
-    # within a single physics tick - see engine/knowledge.md.
-    release_grace_duration_s: float = 0.3
 
     # Sim-seconds to keep the ball in the net after a goal before resetting
     # to centre.  0.0 = immediate reset (tests / headless use).  Set to
@@ -128,6 +128,9 @@ class Match:
     # Optional match event logger for post-hoc inspection.  None by default
     # so training/tests incur zero cost when logging is not needed.
     match_logger: MatchLogger | None = field(default=None, repr=False)
+
+    def __post_init__(self) -> None:
+        self.pickup_radius_m = self.ball_pickup_params.pickup_radius_m
 
     def player_by_id(self, player_id: str) -> Player:
         for p in self.players:
@@ -155,20 +158,21 @@ class Match:
         # Advance a loose ball's free-flight physics *before* checking for
         # pickup, so a ball that was just kicked this tick has already moved
         # away from the kicker's feet before we check whether anyone is close
-        # enough to start controlling it. Without this ordering, a player who
-        # just kicked the ball would immediately re-acquire it at distance 0.
+        # enough to start controlling it (also matters for can_pick_up_ball's
+        # closing-velocity check below, which needs the ball's post-kick
+        # trajectory to correctly read as "moving away" from the kicker).
         #
         # Ball mid-control (CONTROLLING_BALL) is now possessed immediately on
         # contact, so step_ball() is already a no-op for it (possessed_by is set).
+        pre_flight_position = self.ball.position
         if self.ball.possessed_by is None:
-            pre_flight_position = self.ball.position
             step_ball(self.ball, dt, self.ball_physics_params)
             resolve_ball_block_by_inactive_players(
                 self.ball, self.players, pre_flight_position, self.ball_physics_params.block_restitution
             )
             resolve_goal_boundary(self.ball, self.pitch, self.ball_physics_params)
 
-        self._update_loose_ball_pickup(dt)
+        self._update_loose_ball_pickup(dt, pre_flight_position)
 
         self._check_armed_tackles()
         self._check_head_on_tackles()
@@ -183,11 +187,6 @@ class Match:
                 self._reset_after_goal()
         else:
             self._check_goal()
-
-        if self.ball.release_grace_s > 0.0:
-            self.ball.release_grace_s = max(0.0, self.ball.release_grace_s - dt)
-            if self.ball.release_grace_s == 0.0:
-                self.ball.last_released_by = None
 
         self.time_s += dt
 
@@ -257,14 +256,6 @@ class Match:
                 )
 
     # -------------------------------------------------------------------------
-
-    def _start_release_grace(self, player_id: str) -> None:
-        """Marks `player_id` as temporarily unable to re-pick-up the ball
-        they just released (kicked/passed), for `release_grace_duration_s`.
-        See the `release_grace_duration_s` field docstring for why this is
-        needed."""
-        self.ball.last_released_by = player_id
-        self.ball.release_grace_s = self.release_grace_duration_s
 
     def _update_state_timers(self, dt: float) -> None:
         for player in self.players:
@@ -380,16 +371,13 @@ class Match:
         self.ball.position = self.ball.position.with_z(self.ball.radius_m)
         self.ball.velocity = carrier.velocity
 
-    def _update_loose_ball_pickup(self, dt: float) -> None:
+    def _update_loose_ball_pickup(self, dt: float, pre_flight_position: Vector3) -> None:
         if self.ball.possessed_by is not None:
             return
         for player in self.players:
             if player.state != PlayerState.ACTIVE:
                 continue
-            if self.ball.release_grace_s > 0.0 and self.ball.last_released_by == player.player_id:
-                continue  # can't re-pick-up the ball they just kicked/passed
-            distance = player.position.xy().distance_to(self.ball.position.xy())
-            if distance > self.pickup_radius_m:
+            if not can_pick_up_ball(player, self.ball, self.ball_pickup_params, pre_flight_position):
                 continue
 
             relative_speed = (self.ball.velocity - player.velocity).length()
@@ -748,47 +736,3 @@ def _drain_if_sprinting(params: MovementParams, player: Player, sprinting: bool,
     if not sprinting:
         return player.stamina
     return drain_stamina(params, player.stamina, player.attributes.stamina, 1.0, dt)
-
-
-def _braking_speed_mode(
-    dist: float,
-    current_speed: float,
-    arrival_speed: float,
-    a_max: float,
-    standstill_decel_mult: float,
-    jog_speed: float,
-    sprint_requested: bool,
-) -> SpeedMode:
-    """Picks the ``SpeedMode`` for this tick so the player arrives at
-    ``arrival_speed`` (m/s) within ``dist`` metres without overshooting.
-
-    Logic:
-    - If ``arrival_speed >= jog_speed``, no braking is needed: return
-      SPRINT or JOG per ``sprint_requested``.
-    - If ``arrival_speed ≈ 0`` (< 0.1):
-        * Always STANDSTILL within 0.5 m (close-range guard that prevents
-          re-acceleration oscillation when braking_dist ≈ 0 at low speed).
-        * Switch to STANDSTILL earlier when ``dist <= v²/(2·a_eff)``
-          (deceleration physics: the distance needed to reach 0 from the
-          current speed under the boosted standstill deceleration).
-    - Otherwise switch to JOG within the corresponding braking distance.
-    """
-    if arrival_speed >= jog_speed - 0.05:
-        return SpeedMode.SPRINT if sprint_requested else SpeedMode.JOG
-
-    if arrival_speed < 0.1:
-        # Always decelerate within 0.5 m to avoid low-speed oscillation.
-        if dist <= 0.5:
-            return SpeedMode.STANDSTILL
-        a_eff = a_max * standstill_decel_mult
-        braking_dist = (current_speed ** 2) / (2.0 * a_eff) if current_speed > 0.0 else 0.0
-        if dist <= braking_dist:
-            return SpeedMode.STANDSTILL
-    else:
-        # Mid-range arrival speed: decelerate to JOG within braking distance.
-        v_sq_diff = max(0.0, current_speed ** 2 - arrival_speed ** 2)
-        braking_dist = v_sq_diff / (2.0 * a_max) if a_max > 0.0 else 0.0
-        if dist <= braking_dist:
-            return SpeedMode.JOG
-
-    return SpeedMode.SPRINT if sprint_requested else SpeedMode.JOG

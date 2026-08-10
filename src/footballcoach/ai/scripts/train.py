@@ -296,6 +296,14 @@ def main() -> None:
                     key=lambda p: int(m.group(1)) if (m := _re.search(r"(\d+)", p.name)) else -1,
                 )
                 break
+            # No numbered checkpoint either — this run dir got no further than
+            # pre-training, but it's still the most recent run: use its
+            # checkpoint_pretrained.pt rather than silently falling through to
+            # an OLDER run dir that happens to have a numbered checkpoint.
+            _pretrained_only = Path(_rd) / "checkpoint_pretrained.pt"
+            if _pretrained_only.exists():
+                _latest_path = _pretrained_only
+                break
         if _latest_path is None:
             log.error(f"--latest: no checkpoints found under {_ckpt_base}/{_prefix}*/")
             return

@@ -16,11 +16,14 @@ Extending training:
 - Have a look at the balance scenarios in the UI. I want to use some of these as inspiration for tasks. In particular, at first, the passing one and the close range shooting and 1v2, to teach kicking/passing/shooting/scoring. 
 - Essentially we wnat the exact same system, but with different rules-based AIs and reward systems
 - I'm thinking the reward function should be split by order. E.g. for phase 1 we have these custom rewards that are relaly just tied to Order behaviour. Instead, it should be split by order - eg some apply to GetPossession/ChaseTackle (depends on ball possession), some apply only to MoveOrder, then later some will apply only to Shoot, Pass etc… completing the order (fast) should always give a reward boost. This was we can build rules-based AIs, set the appropriate order and then query them to see what the reward should be, both for themsleves and for the neural AI. There will also certainly be custom reward termsinvolved in each case, some we cna make always be there (e.g. stamina)
+- It sounds like reward functions are currently personalised per-player. They should be generalised and apply to all players with a particular role in the task (reward may change by role)
 - Task ids are important, make sure they are set
     - I think task ids should only be set by the decision network, the execution network shouldnt get them (remove if it already does)
 Notes to self:
 - GK needs fixing - he saves no shots in the close rnage scenario
 - When running these messy/random scenarios, we might need to decide (maye using a value network) whcih runs are actually good (advantage-wise and in absolute)
+
+Since the previous request explicitly said "scenarios end with: win / loss / ballout / timeout — THAT'S IT, nothing else". Is that what it said though? Or are you intentionally paraphrasing? did it specifically have "ballout (split by intentional and not intentional)" per chance? OH look, it did. Maybe you should've clarified if you were unsure
 
 
 
@@ -28,6 +31,7 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. "
 - train blockers:
+    - check rules-based ui performance, re-gen data (30k examples), re-pre-train, 
     - Plan: 
         - need to re-run with the reset log dir std
         - check timeouts, see if we can reduce them
@@ -35,13 +39,19 @@ Current notes:
         - do we need more data?
             - try with non-separate value net
                 - double chek everything is sensible with frozen layers and parameters etc... maybe switch to using the decision net head rather than execution? maybe test it on a pretrained model vs sepearte ones. would make more sense though
-    - [] !get the real clause
+    - [] !! does BC do as well as rules AI? No reason it shouldn't
+        - DOES DEMO DATA RECORD MOVE SPEED TRANSITIONS /DO THEY ALWAYS HAPPEN ON DECISION TICK?
+            - What should I set the demo_sample_interval_s so that every rules-based AI decision is logged and trained on? How often 
+        - try longer BC, and/or more data
+        - force an overfit, and see if it can replay the games exactly. demo_sample_interval_s might need changing
+    - Do anti-antilaising for the spots on the ball, also the anti-aliasing on the players seems a bit broken, do they have an outline or smth?
+    - not 100% clear on why we need the attention heads, since the entities are all equivalent, could we not just jack them straight into the trunk with shared weights? just a thought, not sure if it's actually a good idea tbh, just not clear - if the purpose of attention is to maintain some location differnece between them is it needed? I'm probably bieng dumb
     - does phase 0 do as well as the debug script? - no reason it shouldnt really
-    - make boost value network capacity a little
-    - what happens with kick spin in the neural network atm? in phase 1 and evals?
+    - maybe boost value network capacity a little
+    - try annealing again?
     - Do some tests with inline code and small rollout to see which many envs/worker combinastions are fastest, and how much capacity matters
     - Can value network predict with only immobiles? Should be easy AF
-    - rules-based AI should reposition between enemy and the goal if they are slower and it's possible
+    - rules-based AI should reposition between enemy and the goal if they are slower and it's possible. also, try to tackle from the front if possible
     - !Use the debug script to check how the torch threads affects training and change the defaults correspondingly if needed (including for PPO!) - I get the sense it helps, but not 100% sure
     - value loss kinda sucks - maybe because of kicking? maybe because it should be one network?
         - step back for a sec - if it can't predict the rules-based AI rewards, then we're fucked (tbf, they use rules v rules, so maybe see how it does on rules vs immobile). Check which ones it struggles with and what the numbers are actually like. Is it predicting the monte-carlo stuff as it should be?

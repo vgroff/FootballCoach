@@ -260,6 +260,50 @@ class TestDownsampleTrivial:
             lo, hi = max(0, kick_row - 5), min(n_per_ep * n_eps, kick_row + 6)
             assert not mask[lo:hi].any()
 
+    def test_rows_near_speed_mode_change_never_trivial(self, tmp_path):
+        """A sprint/exec_move transition (no kick/tackle involved) must be
+        treated as a rare event too -- rows within exclude_radius_steps of it
+        are never eligible for trivial-row downsampling."""
+        from footballcoach.ai.ppo.bc import _I_EXEC_MOVE, _I_SPRINT
+
+        ds, n_per_ep, n_eps = self._write_trivial_dataset(tmp_path)
+        # Give every row a steady sprint=1/exec_move=1 baseline, then flip
+        # sprint to 0 (SPRINT -> JOG) at row 10 of each episode -- no kick
+        # or tackle involved, purely a speedMode change.
+        ds._labels[:, _I_SPRINT] = 1.0
+        ds._labels[:, _I_EXEC_MOVE] = 1.0
+        for e in range(n_eps):
+            change_row = e * n_per_ep + 10
+            ds._labels[change_row:, _I_SPRINT] = 0.0
+
+        mask = ds._compute_trivial_mask(exclude_radius_steps=5)
+        for e in range(n_eps):
+            change_row = e * n_per_ep + 10
+            lo, hi = max(0, change_row - 5), min(n_per_ep * n_eps, change_row + 6)
+            assert not mask[lo:hi].any()
+
+    def test_speed_mode_change_at_episode_boundary_does_not_leak(self, tmp_path):
+        """A sprint/exec_move difference between the LAST row of one episode
+        and the FIRST row of the next must not be treated as a transition --
+        rows are only compared to the previous row within the same episode."""
+        from footballcoach.ai.ppo.bc import _I_EXEC_MOVE, _I_SPRINT
+
+        ds, n_per_ep, n_eps = self._write_trivial_dataset(tmp_path)
+        ds._labels[:, _I_SPRINT] = 1.0
+        ds._labels[:, _I_EXEC_MOVE] = 1.0
+        # Flip sprint only on episode boundaries (first row of episode 1+).
+        for e in range(1, n_eps):
+            ds._labels[e * n_per_ep, _I_SPRINT] = 0.0
+
+        mask = ds._compute_trivial_mask(exclude_radius_steps=5)
+        # Rows well away from both the episode boundary and the unrelated
+        # kick event (at offset 10, see _write_trivial_dataset) should
+        # remain trivial-eligible -- i.e. the boundary "transition" must not
+        # radiate protection across episodes.
+        for e in range(1, n_eps):
+            far_row = e * n_per_ep + 16
+            assert mask[far_row]
+
     def test_downsampling_never_excludes_ineligible_rows(self, tmp_path):
         ds, n_per_ep, n_eps = self._write_trivial_dataset(tmp_path)
         mask = ds._compute_trivial_mask(exclude_radius_steps=5)

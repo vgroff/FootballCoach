@@ -36,13 +36,13 @@
 
   "push_kick": {
     "_comment": "MoveOrder push-kick: when push_kick_enabled=True the ball carrier kicks the ball ahead rather than dribbling, then sprints to it. Only fires when the remaining distance exceeds min_dist_m (so the player doesn't kick near the destination). The ball is kicked at speed_factor x the player's free-sprint speed. Opponents whose ETA to the landing spot is less than the carrier's ETA x clearance_margin are considered a threat — the kick is skipped if any such opponent exists.",
-    "dist_m": 13.0,
+    "dist_m": 11.0,
     "_comment_dist": "How far ahead (m) to kick the ball.",
-    "min_dist_m": 26.0,
+    "min_dist_m": 28.0,
     "_comment_min_dist": "Don't push-kick when this close to the destination.",
     "speed_factor": 1.1,
     "_comment_speed_factor": "Ball is kicked at speed_factor x carrier's free-sprint speed, ensuring it stays ahead of the running player.",
-    "clearance_margin": 1.75,
+    "clearance_margin": 1.65,
     "_comment_clearance": "ETA safety margin: if any opponent's ETA to landing spot < carrier's ETA x clearance_margin, skip the kick. 0.95 = 5% margin.",
     "max_heading_error_deg": 30.0,
     "_comment_heading": "Don't push-kick if the player's current heading differs from the kick direction by more than this many degrees. Prevents kicking sideways or backwards."

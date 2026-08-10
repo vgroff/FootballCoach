@@ -70,7 +70,7 @@
     "low_accel_attr_0.1": {
       "reference_speed_mps": 8.14,
       "time_to_start_reversing_s": 1.367,
-      "separation_after_10s_m": 137.88
+      "separation_after_10s_m": 137.49
     },
     "high_accel_attr_0.9": {
       "reference_speed_mps": 8.14,
@@ -242,8 +242,8 @@
   },
   "pass_10m_precision_0.15": {
     "n_trials": 200,
-    "succeeded": 168,
-    "success_rate_pct": 84.0
+    "succeeded": 169,
+    "success_rate_pct": 84.5
   },
   "pass_10m_precision_0.9": {
     "n_trials": 200,
@@ -399,8 +399,8 @@
   "save_far_post_fast_vs_slow_gk": {
     "fast_gk": {
       "n_trials": 300,
-      "saved": 152,
-      "save_rate_pct": 50.67
+      "saved": 172,
+      "save_rate_pct": 57.33
     },
     "slow_gk": {
       "n_trials": 300,
@@ -421,20 +421,20 @@
     }
   },
   "save_rate_grid_pct": {
-    "gk_speed=0.1_near_post": 79.3,
+    "gk_speed=0.1_near_post": 88.0,
     "gk_speed=0.1_centre": 90.0,
     "gk_speed=0.1_far_post": 0.0,
-    "gk_speed=0.5_near_post": 79.3,
+    "gk_speed=0.5_near_post": 88.0,
     "gk_speed=0.5_centre": 91.3,
     "gk_speed=0.5_far_post": 6.7,
-    "gk_speed=0.9_near_post": 79.3,
+    "gk_speed=0.9_near_post": 88.0,
     "gk_speed=0.9_centre": 91.3,
-    "gk_speed=0.9_far_post": 42.0
+    "gk_speed=0.9_far_post": 46.7
   },
   "save_random_scenarios_good_vs_bad": {
     "n_scenarios": 300,
-    "good_gk_save_rate_pct": 86.3,
-    "bad_gk_save_rate_pct": 82.3
+    "good_gk_save_rate_pct": 87.3,
+    "bad_gk_save_rate_pct": 83.7
   },
   "shoot_low_attrs_random_in_box": {
     "n_trials": 500,
@@ -480,8 +480,8 @@
   },
   "pass_40m_precision_0.5": {
     "n_trials": 200,
-    "succeeded": 47,
-    "success_rate_pct": 23.5
+    "succeeded": 48,
+    "success_rate_pct": 24.0
   },
   "pass_40m_precision_0.9": {
     "n_trials": 200,

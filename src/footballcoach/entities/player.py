@@ -228,7 +228,6 @@ class Player:
         if is_first_touch:
             self.state = PlayerState.ACTIVE
             self.state_timer_s = 0.0
-        match._start_release_grace(self.player_id)
         match._log_debug(f"{self.player_id} kicked (direct)  power={power_fraction:.2f}")
         self.kicked_this_tick = True
         _vel = match.ball.velocity
@@ -272,7 +271,6 @@ class Player:
         if is_first_touch:
             self.state = PlayerState.ACTIVE
             self.state_timer_s = 0.0
-        match._start_release_grace(self.player_id)
         match._log_debug(f"{self.player_id} kicked (direct 3D)  power={power_fraction:.2f}")
         self.kicked_this_tick = True
         _vel = match.ball.velocity

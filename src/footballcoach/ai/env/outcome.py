@@ -9,7 +9,13 @@ rewards/termination.
 
 Outcome vocabulary (no catch-all "other" bucket -- every outcome is named
 for what actually happened):
-    "miss"          - ball left the pitch, or came to rest unpossessed.
+    "miss"          - ball left the pitch (out of bounds). ScenarioEnv
+                      (phase 1 only) further splits this into "miss" (some
+                      player last touched/kicked the ball -- that player is
+                      penalised) vs "invalid" (nobody touched it at all this
+                      episode -- nobody's fault, no penalty) -- see
+                      ScenarioEnv.step(). This module only ever returns the
+                      undifferentiated "miss".
     "goal"          - scoreboard changed.
     "saved"         - initial carrier's opponent goalkeeper took the ball.
     "dispossessed"  - initial carrier's opponent outfield player took the ball.
@@ -21,7 +27,7 @@ for what actually happened):
 from __future__ import annotations
 
 from footballcoach.engine.match import Match
-from footballcoach.entities.player import PlayerState, Team
+from footballcoach.entities.player import Team
 
 
 def detect_trial_outcome(
@@ -68,10 +74,6 @@ def detect_trial_outcome(
             except KeyError:
                 pass
             return "saved", False
-
-        any_controlling = any(p.state == PlayerState.CONTROLLING_BALL for p in match.players)
-        if ball.possessed_by is None and ball.velocity.length() < 0.1 and not any_controlling:
-            return "miss", True
 
     # Box possession: any player dribbled the ball into the opponent's box.
     # Team.LEFT attacks +x so their opponent box is the right box (left=False).

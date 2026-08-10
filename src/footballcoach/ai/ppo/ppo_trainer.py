@@ -184,11 +184,13 @@ _PHASE1_OUTCOME_KEYS: list[tuple[str, str]] = [
 
 def outcome_breakdown(outcomes: list[str]) -> str:
     """Format a list of StepInfo.trial_outcome strings as
-    "win%/loss%/tout%/miss%[/other%]" -- a fuller breakdown than just
+    "win%/loss%/tout%/miss%/inval%[/other%]" -- a fuller breakdown than just
     win/loss so a swing in win% can be traced to (e.g.) more timeouts vs.
     more losses vs. more ball-out-of-play, instead of both being lumped into
-    an invisible remainder. 'other' only appears if some outcome value isn't
-    one of the four known keys above (e.g. a phase-2 "goal"/"dispossessed"
+    an invisible remainder. "inval" is a ball-out with no toucher at all
+    (nobody's fault, e.g. a bad initial placement) as opposed to "miss"
+    (the last toucher is blamed). 'other' only appears if some outcome value
+    isn't one of the known keys above (e.g. a phase-2 "goal"/"dispossessed"
     leaking through, or an "unknown" from a missing info object).
     """
     n = len(outcomes)

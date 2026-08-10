@@ -69,6 +69,53 @@ class OrderLayerParams:
         )
 
 
+def braking_speed_mode(
+    dist: float,
+    current_speed: float,
+    arrival_speed: float,
+    a_max: float,
+    standstill_decel_mult: float,
+    jog_speed: float,
+    sprint_requested: bool,
+):
+    """Picks the SpeedMode for this tick so the player arrives at
+    ``arrival_speed`` (m/s) within ``dist`` metres without overshooting.
+
+    Order-layer logic (not engine physics): the neural network's direct-drive
+    path bypasses this entirely and must learn braking behaviour itself.
+
+    Logic:
+    - If ``arrival_speed >= jog_speed``, no braking is needed: return
+      SPRINT or JOG per ``sprint_requested``.
+    - If ``arrival_speed ≈ 0`` (< 0.1):
+        * Always STANDSTILL within 0.5 m (close-range guard that prevents
+          re-acceleration oscillation when braking_dist ≈ 0 at low speed).
+        * Switch to STANDSTILL earlier when ``dist <= v²/(2·a_eff)``
+          (deceleration physics: the distance needed to reach 0 from the
+          current speed under the boosted standstill deceleration).
+    - Otherwise switch to JOG within the corresponding braking distance.
+    """
+    from footballcoach.engine.movement import SpeedMode
+
+    if arrival_speed >= jog_speed - 0.05:
+        return SpeedMode.SPRINT if sprint_requested else SpeedMode.JOG
+
+    if arrival_speed < 0.1:
+        if dist <= 0.5:
+            return SpeedMode.STANDSTILL
+        a_eff = a_max * standstill_decel_mult
+        braking_dist = (current_speed ** 2) / (2.0 * a_eff) if current_speed > 0.0 else 0.0
+        if dist <= braking_dist:
+            return SpeedMode.STANDSTILL
+    else:
+        v_sq_diff = max(0.0, current_speed ** 2 - arrival_speed ** 2)
+        braking_dist = v_sq_diff / (2.0 * a_max) if a_max > 0.0 else 0.0
+        if dist <= braking_dist:
+            return SpeedMode.JOG
+
+    return SpeedMode.SPRINT if sprint_requested else SpeedMode.JOG
+
+
 # ---------------------------------------------------------------------------
 # Shared movement-intent helper
 # ---------------------------------------------------------------------------
@@ -106,7 +153,7 @@ def _compute_movement_intent(
         Apply the brake-to-turn heuristic (decelerate when heading change >90°).
     """
     from footballcoach.engine.movement import (
-        SpeedMode, angle_diff, braking_speed_mode,
+        SpeedMode, angle_diff,
         effective_acceleration, effective_top_speed,
     )
     from footballcoach.steering import compute_repulsion
@@ -484,7 +531,6 @@ class PassOrder:
                 kicking_params=match.kicking_params,
                 power_multiplier=self.power_multiplier,
             )
-            match._start_release_grace(player.player_id)
             match._log_debug(f"{player.player_id} passed to {pass_target}")
             if player.on_kick is not None:
                 player.on_kick(player)
@@ -810,7 +856,6 @@ class ShootOrder:
             kicker_velocity=player.velocity,
             kicker_top_speed_mps=top_speed,
         )
-        match._start_release_grace(player.player_id)
         match._log_info(f"{player.player_id} shot at goal  power={self.power_fraction:.2f}")
         if player.on_kick is not None:
             player.on_kick(player)

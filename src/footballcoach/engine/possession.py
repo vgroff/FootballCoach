@@ -10,7 +10,9 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from footballcoach.config import load_physics_config, require_section
+from footballcoach.entities.ball import Ball
 from footballcoach.entities.player import Player
+from footballcoach.mathutils import Vector3
 
 
 @dataclass(frozen=True)
@@ -71,6 +73,99 @@ class ControlTimeParams:
             outfield_max_reach_height_m=d.get("outfield_max_reach_height_m", 2.0),
             control_tackle_immune_height_m=d.get("control_tackle_immune_height_m", 0.95),
         )
+
+
+@dataclass(frozen=True)
+class BallPickupParams:
+    """Config-driven constants for loose-ball pickup eligibility."""
+    pickup_radius_m: float
+    closing_speed_deadzone_mps: float  # below this relative speed, pickup is allowed even without closing
+
+    @staticmethod
+    def from_config() -> "BallPickupParams":
+        d = require_section(load_physics_config(), "ball_pickup")
+        return BallPickupParams(
+            pickup_radius_m=d["pickup_radius_m"],
+            closing_speed_deadzone_mps=d["closing_speed_deadzone_mps"],
+        )
+
+
+def can_pick_up_ball(
+    player: Player,
+    ball: Ball,
+    params: BallPickupParams,
+    ball_pre_tick_position: Vector3 | None = None,
+) -> bool:
+    """True if `player` is close enough to `ball`'s CURRENT position AND
+    either closed on it at some point during this tick's motion, or is
+    moving relative to it slowly enough that "closing" isn't a meaningful
+    requirement (a resting/barely-rolling ball right next to a player
+    should always be pickable).
+
+    Replaces the old time-based "release grace" hack: a player can no
+    longer instantly re-pick-up a ball they just kicked away at real speed,
+    because it is moving away from them (not closing) — with no
+    special-casing of who kicked it. It also means a ball rolling PAST a
+    slow/stationary player is only picked up if they have a real closing
+    velocity component toward it, not by proximity alone.
+
+    `ball_pre_tick_position` (the ball's position before this tick's
+    free-flight step) is used to also test the ball's whole swept path this
+    tick, not just its end-of-tick position — a fast ball (e.g. a hard shot,
+    10+ m per tick relative to the pickup radius) can tunnel straight past
+    a player within one tick, ending up on the far side and reading as
+    "receding" under a naive endpoint-only check even though it clearly
+    passed within pickup range. The swept check ONLY applies when the ball
+    started the tick OUTSIDE the pickup radius — this is what distinguishes
+    genuine tunneling from a player who just released the ball themselves
+    this same tick (whose pre-tick position is at their own feet, i.e.
+    already inside the radius): a kick must not be treated as "swept past
+    and back" just because its segment happens to start inside the radius.
+    `None` (default) skips the swept check entirely (endpoint-only).
+    See engine/knowledge.md.
+    """
+    to_ball = ball.position.xy() - player.position.xy()
+    distance = to_ball.length()
+    within_radius = distance <= params.pickup_radius_m
+
+    started_outside_radius = (
+        ball_pre_tick_position is not None
+        and ball_pre_tick_position.xy().distance_to(player.position.xy()) > params.pickup_radius_m
+    )
+    swept_within_radius = started_outside_radius and _swept_closest_distance(
+        ball_pre_tick_position.xy(), ball.position.xy(), player.position.xy()
+    ) <= params.pickup_radius_m
+
+    if not within_radius and not swept_within_radius:
+        return False
+
+    relative_velocity = ball.velocity - player.velocity
+    relative_speed = relative_velocity.length_xy()
+    if relative_speed <= params.closing_speed_deadzone_mps:
+        return True
+    if swept_within_radius:
+        # The ball travelled through pickup range this tick despite ending
+        # up outside/receding -- a genuine tunneling case, not "kicker
+        # re-picking up their own kick" (that case never starts outside the
+        # radius). Always eligible regardless of endpoint closing direction.
+        return True
+    if distance <= 1e-9:
+        return True  # already coincident; direction of closing is undefined
+    # Closing iff the relative velocity has a component reducing the
+    # separation, i.e. pointing from the ball toward the player.
+    closing_component = -(relative_velocity.x * to_ball.x + relative_velocity.y * to_ball.y)
+    return closing_component > 0.0
+
+
+def _swept_closest_distance(segment_start: Vector3, segment_end: Vector3, point: Vector3) -> float:
+    """Closest distance from `point` to the line segment [segment_start, segment_end]."""
+    seg = segment_end - segment_start
+    seg_len_sq = seg.length_squared()
+    if seg_len_sq <= 1e-12:
+        return segment_start.distance_to(point)
+    t = max(0.0, min(1.0, (point - segment_start).dot(seg) / seg_len_sq))
+    closest = segment_start + seg * t
+    return closest.distance_to(point)
 
 
 def height_difficulty_factor(params: ControlTimeParams, ball_height_m: float) -> float:

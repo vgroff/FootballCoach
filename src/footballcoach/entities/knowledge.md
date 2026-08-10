@@ -67,12 +67,11 @@ ball to the carrying player's position every tick (see
 `Match._sync_possessed_ball`). Free-flight physics only resumes once the
 ball is released (by a kick, a successful tackle, going out of play, etc.).
 
-Also tracks `last_released_by: str | None` and `release_grace_s: float`,
-managed by `Match._start_release_grace()` / decremented in `Match.step()`.
-These exist to stop a player from instantly re-picking-up a ball they just
-kicked/passed - see `engine/knowledge.md`'s tick-order notes ("ordering
-subtlety #2") for the full rationale. Don't set these fields directly
-outside of `Match`/tests; they're an engine-internal bookkeeping detail.
+Loose-ball pickup eligibility (including stopping a player from instantly
+re-picking-up a ball they just kicked/passed) is governed by a
+closing-velocity check in `possession.can_pick_up_ball()`, not by any field
+on `Ball` itself - see `engine/knowledge.md`'s tick-order notes ("ordering
+subtlety #2").
 
 `just_bounced_timer_s: float = 0.0` is a **display-only** countdown set by
 `engine/ball_physics.step_ball()` to `just_bounced_display_duration_s` (0.3 s,
