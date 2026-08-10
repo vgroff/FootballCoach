@@ -187,8 +187,16 @@ def record_episodes(
     steps_total = 0
     steps_valid = 0
 
-    # Outcome counters
+    # Outcome counters, and the ground-truth per-episode outcome list (the
+    # exact `info.trial_outcome` string ScenarioEnv computed -- see
+    # ai/env/outcome.py's outcome vocabulary and ScenarioEnv.step()'s
+    # "invalid" split). Persisted verbatim (meta_episode_outcomes below) so
+    # DemonstrationDataset never has to INFER an episode's outcome from
+    # per-row reward components again -- that inference is fundamentally
+    # incomplete (e.g. an "invalid" ball-out with no toucher fires no
+    # per-player reward component at all, so there is nothing to infer from).
     outcome_counts: dict[str, int] = {}
+    episode_outcomes: list[str] = []
 
     # Reward component breakdown accumulator (mirrors train.py's diagnostic
     # "_comp_acc" pattern), reset after each periodic log line so the
@@ -453,6 +461,7 @@ def record_episodes(
         # Track episode outcome
         outcome = getattr(last_info, "trial_outcome", None) or "unknown"
         outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
+        episode_outcomes.append(outcome)
 
         global_ep = episode_offset + ep + 1
         if global_ep % 10 == 0 or global_ep == total_episodes:
@@ -528,6 +537,10 @@ def record_episodes(
         "meta_episode_poss_reward": np.array(
             [[ep["poss"], ep["lpos"]] for ep in episode_poss_reward], dtype=np.float32
         ),
+        # Ground-truth per-episode outcome strings (see episode_outcomes
+        # comment above) -- one entry per complete episode, same order as
+        # `dones`' done=1 rows.
+        "meta_episode_outcomes": np.array(episode_outcomes, dtype="U32"),
     }
 
 

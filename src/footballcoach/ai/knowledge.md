@@ -211,7 +211,11 @@ trivial-row downsampling (which is specifically about reducing redundant
   for the value side, i.e. `execution_net.value_head` is the single live
   critic trained here, consistent with the rest of the codebase (Phase 1,
   `pretrain_value()`, PPO). Per-epoch log line reports `loss=`, `dec_bc=`,
-  and `val=` separately. Config: `demo_value_pretrain_epochs`,
+  and `val=` separately. Uses the same `bc.downsample_trivial_*` config as
+  Phase 1's train loop (train rows only, never the held-out val split) —
+  same per-epoch frac schedule (`downsample_trivial_frac_default` /
+  `_frac_high_epoch` / `_epoch_threshold`), same trivial-row cache. Config:
+  `demo_value_pretrain_epochs`,
   `demo_value_pretrain_lr`, `demo_value_pretrain_gamma`,
   `phase0_value_coef` (default 1.0). Skipped if the dataset has no reward
   data or `demo_value_pretrain_epochs=0`.

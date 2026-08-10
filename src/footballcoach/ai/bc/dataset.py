@@ -73,6 +73,7 @@ class DemonstrationDataset:
         dones: np.ndarray | None = None,
         reward_components: np.ndarray | None = None,
         reward_component_keys: list[str] | None = None,
+        episode_outcomes: np.ndarray | None = None,
     ):
         n = len(obs_self_feat)
         assert all(len(x) == n for x in [
@@ -97,8 +98,23 @@ class DemonstrationDataset:
             reward_components if reward_components is not None
             else np.zeros((n, len(self._reward_component_keys)), dtype=np.float32)
         )
+        # Ground-truth per-EPISODE outcome strings (ScenarioEnv's
+        # info.trial_outcome, verbatim -- "box_possession"/
+        # "opponent_box_possession"/"timeout"/"miss"/"invalid", see
+        # ai/env/outcome.py's outcome vocabulary), one entry per complete
+        # episode in dataset order. None/missing (older recordings predating
+        # record_demonstrations.py's meta_episode_outcomes) for a dataset
+        # with dones -> classify_outcome() cannot know the true outcome and
+        # must say so explicitly (never silently guess from reward
+        # components again -- see classify_outcome()'s docstring).
+        self._episode_outcomes = (
+            np.asarray(episode_outcomes, dtype=object) if episode_outcomes is not None else None
+        )
         self._n = n
         self._trivial_mask_cache: np.ndarray | None = None
+        self._outcome_by_row_cache: np.ndarray | None = None
+        self._episode_end_rows_cache: np.ndarray | None = None
+        self._episode_ranges_cache: list[tuple[int, int]] | None = None
 
     @property
     def has_rewards(self) -> bool:
@@ -109,6 +125,241 @@ class DemonstrationDataset:
     def has_reward_components(self) -> bool:
         """True if this dataset was recorded with per-component reward data."""
         return self._reward_components.any()
+
+    @property
+    def has_episode_outcomes(self) -> bool:
+        """True if this dataset has ground-truth per-episode outcome strings
+        (``meta_episode_outcomes``, see ``classify_outcome()``) -- required
+        for ``classify_outcome()``/``row_outcomes()``/``outcome_by_row()``.
+        False for recordings made before this field existed; re-record to
+        enable outcome-split diagnostics."""
+        return self._episode_outcomes is not None
+
+    # Number of consecutive done=1 rows that mark ONE real episode boundary
+    # (see episode_row_ranges()'s docstring) -- record_demonstrations.py's
+    # _record_now(player_id=None) always appends exactly trainee+opponent
+    # (2 rows) for the terminal timed sample, both backfilled done=1.
+    _DONE_ROWS_PER_EPISODE_BOUNDARY = 2
+
+    def _full_dataset_episode_row_ranges(self) -> list[tuple[int, int]]:
+        """Cached [(start, end_inclusive), ...] row-index ranges for each
+        complete episode over the WHOLE dataset (unfiltered), computed
+        directly from ``self._dones``.
+
+        Episodes are delimited by ``dones==1``, but record_demonstrations.py's
+        ``_record_now(player_id=None)`` appends BOTH the trainee's AND the
+        opponent's row for every timed sample, and backfills ``done=1`` onto
+        BOTH rows at episode end (see its "player_id=None -> records BOTH
+        trainee and opponent -> appends 2 rows" comment) -- so a single real
+        episode boundary is exactly ``_DONE_ROWS_PER_EPISODE_BOUNDARY`` (2)
+        CONSECUTIVE ``done=1`` rows, not one, and NOT an arbitrarily long run
+        either: if one episode's terminal pair is immediately followed by
+        the very next episode's terminal pair (e.g. two consecutive
+        single-timed-sample episodes with no intervening non-done row),
+        treating "however many done=1 rows in a row" as ONE boundary would
+        wrongly merge two real episodes into one. Every 2 consecutive
+        done=1 rows are therefore closed off as their own episode
+        immediately, regardless of what follows.
+
+        MUST be computed over the FULL, unfiltered dataset -- not an
+        arbitrary row_pool -- because a filtered pool (e.g.
+        ``valid_indices()``, which can drop ONE of an episode's two
+        terminal done=1 rows, such as the immobile opponent's own row) may
+        never observe 2 consecutive done=1 rows for a real episode at all,
+        silently losing that boundary. ``episode_row_ranges()`` intersects
+        this full-dataset truth with any given row_pool instead of
+        re-deriving boundaries from the (possibly filtered) pool itself.
+        """
+        if self._episode_ranges_cache is None:
+            ranges: list[tuple[int, int]] = []
+            start = 0
+            done_streak = 0
+            for idx in range(self._n):
+                is_done = self._dones[idx] > 0.5
+                if is_done:
+                    done_streak += 1
+                    if done_streak == self._DONE_ROWS_PER_EPISODE_BOUNDARY:
+                        ranges.append((start, idx))
+                        start = idx + 1
+                        done_streak = 0
+                else:
+                    done_streak = 0
+            self._episode_ranges_cache = ranges
+        return self._episode_ranges_cache
+
+    def episode_row_ranges(self, row_pool: np.ndarray) -> list[tuple[int, int]]:
+        """Return [(start, end_inclusive), ...] row-index ranges, ONE PER
+        FULL-DATASET EPISODE that has at least one row present in
+        *row_pool* (assumed contiguous-in-dataset-order and sorted
+        increasing, e.g. a train/val split from ``split_train_val_indices()``
+        or ``np.arange(len(self))``) -- ``start``/``end`` are *row_pool*'s
+        own first/last row belonging to that episode, which may be a proper
+        subset of the full-dataset episode's rows if *row_pool* is filtered
+        (e.g. ``valid_indices()``). Episode boundaries themselves are always
+        resolved against the FULL dataset first (see
+        ``_full_dataset_episode_row_ranges()``'s docstring for why), so a
+        filtered pool can never miss or merge an episode boundary.
+
+        A trailing partial episode (row_pool contains rows from an episode
+        whose full-dataset boundary hasn't been reached yet, i.e. an
+        incomplete recording) is dropped, matching prior behaviour.
+        """
+        if len(row_pool) == 0:
+            return []
+        full_ranges = self._full_dataset_episode_row_ranges()
+        full_ends = np.array([end for _s, end in full_ranges], dtype=np.int64)
+        # Which full-dataset episode does each row_pool row belong to?
+        ep_of_row = np.searchsorted(full_ends, row_pool, side="left")
+        ranges: list[tuple[int, int]] = []
+        n_eps = len(full_ranges)
+        pos = 0
+        while pos < len(row_pool):
+            ep_idx = int(ep_of_row[pos])
+            if ep_idx >= n_eps:
+                break  # trailing rows past the last complete episode -- drop.
+            run_end = pos
+            while run_end + 1 < len(row_pool) and ep_of_row[run_end + 1] == ep_idx:
+                run_end += 1
+            ranges.append((int(row_pool[pos]), int(row_pool[run_end])))
+            pos = run_end + 1
+        return ranges
+
+    def n_episodes(self, row_pool: np.ndarray | None = None) -> int:
+        """Number of COMPLETE episodes with at least one row present in
+        *row_pool* (default: the whole dataset), correctly resolving
+        episode boundaries against the FULL dataset even when *row_pool* is
+        filtered (see ``episode_row_ranges()``'s docstring) -- use this
+        instead of ``int(ds._dones.sum())``/``int(ds._dones[idx].sum())``,
+        which silently double the true episode count whenever 2+ players
+        share a timed sample (every real Phase-1 recording)."""
+        pool = row_pool if row_pool is not None else np.arange(self._n)
+        return len(self.episode_row_ranges(pool))
+
+    def _episode_end_rows(self) -> np.ndarray:
+        """Cached, sorted array of the LAST row index of each real episode
+        over the WHOLE dataset (see ``_full_dataset_episode_row_ranges()``).
+        Index ``i`` here is episode ``i``'s end row, matching
+        ``self._episode_outcomes[i]``'s order 1:1."""
+        if self._episode_end_rows_cache is None:
+            ranges = self._full_dataset_episode_row_ranges()
+            self._episode_end_rows_cache = np.array([end for _start, end in ranges], dtype=np.int64)
+        return self._episode_end_rows_cache
+
+    # Maps ScenarioEnv's ground-truth info.trial_outcome strings (see
+    # ai/env/outcome.py's outcome vocabulary and ScenarioEnv.step()'s
+    # "invalid" split) to the short labels used by debug_value_network.py /
+    # value_mse_by_outcome() breakdowns. Phase 1 has exactly these five
+    # possible endings -- ANY other/missing value is a genuine bug upstream
+    # (see classify_outcome()), never a legitimate fifth outcome.
+    _OUTCOME_LABEL_MAP: dict[str, str] = {
+        "box_possession": "win",
+        "opponent_box_possession": "loss",
+        "timeout": "timeout",
+        "miss": "ball_out",
+        "invalid": "invalid",
+    }
+
+    def classify_outcome(self, end_row: int) -> str:
+        """Classify the outcome of the episode CONTAINING *end_row* using the
+        GROUND-TRUTH ``info.trial_outcome`` string persisted by
+        record_demonstrations.py (see ``meta_episode_outcomes`` /
+        ``self._episode_outcomes``) -- NOT inferred from reward components.
+
+        *end_row* need not be an exact full-dataset episode-end row: callers
+        commonly pass the LAST row of an episode within a FILTERED row_pool
+        (e.g. ``row_outcomes(train_idx)`` after ``valid_indices()`` dropped
+        some rows from that episode, such as the immobile opponent's own
+        rows) -- that filtered last row is always <= the true full-dataset
+        end row for the same episode and > the previous episode's end row,
+        so mapping to "the first full-dataset episode-end row >= end_row"
+        always resolves to the correct episode regardless of filtering.
+
+        Phase 1 has exactly five possible endings (see ai/env/outcome.py /
+        ScenarioEnv.step()): a player wins (box_possession), a player loses
+        (opponent_box_possession), the ball goes out with a toucher (miss ->
+        "ball_out"), the ball goes out with NO toucher (invalid -- nobody's
+        fault, e.g. bad spawn), or timeout. There is no sixth case, and no
+        legitimate "unknown" -- reward-component-based inference was wrong
+        because "invalid" episodes fire NO per-player reward component at
+        all (nothing to infer from), which is exactly why this method no
+        longer infers anything.
+
+        Raises ``ValueError`` if this dataset predates ``meta_episode_outcomes``
+        (re-record demonstrations), if *end_row* falls after the last known
+        episode boundary, or if the recorded string isn't one of the five
+        known outcomes above -- all are bugs to fix at the source, not
+        something to paper over with a silent "unknown" bucket.
+        """
+        if self._episode_outcomes is None:
+            raise ValueError(
+                "This dataset has no ground-truth episode outcomes "
+                "(meta_episode_outcomes) -- re-record demonstrations with "
+                "the current record_demonstrations.py to enable outcome "
+                "classification."
+            )
+        # episode index = index of the first full-dataset episode-end row
+        # >= end_row (see docstring above for why this correctly handles a
+        # filtered row_pool's own last row, not just an exact full-dataset
+        # match) -- NOT dones[:end_row+1].sum(), which double-counts every
+        # episode when 2+ players share one timed sample and both get
+        # done=1 on the same episode (the exact bug that caused an
+        # IndexError past the end of self._episode_outcomes).
+        end_rows = self._episode_end_rows()
+        pos = int(np.searchsorted(end_rows, end_row, side="left"))
+        if pos >= len(end_rows):
+            raise ValueError(
+                f"row {end_row} is past the last known episode boundary "
+                f"(last end row: {end_rows[-1] if len(end_rows) else 'n/a'}) -- "
+                f"classify_outcome() must be called with a row belonging to "
+                f"a complete episode."
+            )
+        ep_idx = pos
+        if ep_idx >= len(self._episode_outcomes):
+            raise ValueError(
+                f"episode {ep_idx} (row {end_row}) has no matching entry in "
+                f"meta_episode_outcomes (length {len(self._episode_outcomes)}) -- "
+                f"the dataset's dones/episode-boundary count disagrees with "
+                f"the number of episodes actually recorded; re-record with a "
+                f"consistent record_demonstrations.py version."
+            )
+        raw_outcome = str(self._episode_outcomes[ep_idx])
+        try:
+            return self._OUTCOME_LABEL_MAP[raw_outcome]
+        except KeyError:
+            raise ValueError(
+                f"Unrecognised trial_outcome {raw_outcome!r} for episode {ep_idx} "
+                f"(row {end_row}) -- Phase 1 only ever produces "
+                f"{sorted(self._OUTCOME_LABEL_MAP)}. This means ScenarioEnv "
+                f"produced an outcome outside its documented vocabulary; fix "
+                f"the source (ai/env/outcome.py / ai/env/scenario_env.py), "
+                f"do not silently bucket this as \"unknown\"."
+            ) from None
+
+    def row_outcomes(self, row_pool: np.ndarray) -> np.ndarray:
+        """Return a dtype=object array, same length/order as *row_pool*,
+        tagging every row with the outcome (see ``classify_outcome()``) of
+        the complete episode it belongs to. Rows belonging to a trailing
+        incomplete episode (no terminal ``done`` row in row_pool) are
+        tagged "incomplete". ``row_pool`` must be sorted increasing (true
+        for ``split_train_val_indices()``'s train/val arrays and
+        ``np.arange(len(self))``)."""
+        out = np.full(len(row_pool), "incomplete", dtype=object)
+        for start, end in self.episode_row_ranges(row_pool):
+            outcome = self.classify_outcome(end)
+            lo = int(np.searchsorted(row_pool, start))
+            hi = int(np.searchsorted(row_pool, end, side="right"))
+            out[lo:hi] = outcome
+        return out
+
+    def outcome_by_row(self) -> np.ndarray:
+        """Cached ``row_outcomes(np.arange(len(self)))`` over the WHOLE
+        dataset -- callers indexing an arbitrary (possibly unsorted/
+        non-contiguous) row-index chunk (e.g. a training minibatch) should
+        index directly into this array rather than re-deriving outcomes
+        from just their chunk (which may not span whole episodes)."""
+        if self._outcome_by_row_cache is None:
+            self._outcome_by_row_cache = self.row_outcomes(np.arange(self._n))
+        return self._outcome_by_row_cache
 
     def __len__(self) -> int:
         return self._n
@@ -149,6 +400,10 @@ class DemonstrationDataset:
             dones=data["dones"]     if "dones"   in data else np.zeros(n, dtype=np.float32),
             reward_components=data["reward_components"] if "reward_components" in data else None,
             reward_component_keys=_rc_keys,
+            episode_outcomes=(
+                [str(o) for o in data["meta_episode_outcomes"]]
+                if "meta_episode_outcomes" in data else None
+            ),
         )
 
     @classmethod
@@ -159,6 +414,12 @@ class DemonstrationDataset:
         # order at recording time) -- use the first part's keys/columns; parts
         # recorded before this feature existed already fell back to the same
         # default key list in __init__, so concatenation stays column-aligned.
+        # episode_outcomes: concatenate per-part lists in file order, matching
+        # each part's dones=1 row order -- but ONLY if every part has them; a
+        # mix of old (no meta_episode_outcomes) and new files would produce
+        # an outcome list misaligned with the concatenated dones, which is
+        # worse than just falling back to None for the whole dataset.
+        _all_have_outcomes = all(p._episode_outcomes is not None for p in parts)
         return cls(
             obs_self_feat=np.concatenate([p._self_feat for p in parts]),
             obs_other_feat=np.concatenate([p._other_feat for p in parts]),
@@ -170,6 +431,9 @@ class DemonstrationDataset:
             dones=np.concatenate([p._dones for p in parts]),
             reward_components=np.concatenate([p._reward_components for p in parts]),
             reward_component_keys=parts[0]._reward_component_keys,
+            episode_outcomes=(
+                np.concatenate([p._episode_outcomes for p in parts]) if _all_have_outcomes else None
+            ),
         )
 
     @classmethod
@@ -228,19 +492,30 @@ class DemonstrationDataset:
         if val_frac <= 0.0 or len(base_indices) == 0:
             return base_indices, np.array([], dtype=base_indices.dtype)
 
-        dones_subset = self._dones[base_indices]
-        episode_end_positions = np.where(dones_subset > 0.5)[0]
-        n_complete_eps = len(episode_end_positions)
+        # Episode boundaries resolved against the FULL dataset (see
+        # episode_row_ranges()'s docstring) -- NOT re-derived from
+        # base_indices' own (possibly filtered) dones, which can miss a
+        # boundary entirely if valid_indices() drops one of an episode's
+        # two terminal done=1 rows (e.g. the immobile opponent's own row),
+        # or merge two adjacent single-sample episodes if it doesn't.
+        # Splitting on a missed/merged boundary is a real train/val leakage
+        # bug, not just an off-by-one count.
+        ranges = self.episode_row_ranges(base_indices)
+        n_complete_eps = len(ranges)
         if n_complete_eps < 2:
             return base_indices, np.array([], dtype=base_indices.dtype)
 
         n_val_eps = max(1, round(val_frac * n_complete_eps))
         n_train_eps = n_complete_eps - n_val_eps
-        ep_starts = np.concatenate([[0], episode_end_positions[:-1] + 1])
 
+        val_row_set: set[int] = set()
+        for start, end in ranges[n_train_eps:]:
+            lo = int(np.searchsorted(base_indices, start))
+            hi = int(np.searchsorted(base_indices, end, side="right"))
+            val_row_set.update(range(lo, hi))
         val_mask = np.zeros(len(base_indices), dtype=bool)
-        for _i in range(n_train_eps, n_complete_eps):
-            val_mask[ep_starts[_i]:episode_end_positions[_i] + 1] = True
+        if val_row_set:
+            val_mask[np.fromiter(val_row_set, dtype=np.int64)] = True
         train_mask = ~val_mask
 
         return base_indices[train_mask], base_indices[val_mask]

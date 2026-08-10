@@ -28,14 +28,17 @@ Since the previous request explicitly said "scenarios end with: win / loss / bal
 
 
 Current notes:
-- " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. what do we think of how the training is going? "
-- " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. "
+- " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. Please do not skip any of them. what do we think of how the training is going? "
+- " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
     - check rules-based ui performance, re-gen data (30k examples), re-pre-train, 
+    - !!! value net performance on rules v immobile - still seems sus - can it do better with gamma=0.999 or 1?
+        - setup rewards so even the LR can do well in the debug script
+        -2026-08-10 17:23:49,776 INFO   dones=1 rows: 24,000  |  zero-reward rows: 16,098 (1.5%) ???
+            - from debug script, why are there any zero reward rows???
+    - !!! relative distances aren't euclidean!!! they have different divisors!!!!! I could accept using it on the absolute pos features, but should def be avoided on rel dist, no??? Investigate 
     - Plan: 
-        - need to re-run with the reset log dir std
-        - check timeouts, see if we can reduce them
-        - check evaulations/compare with determinstic ones
+        - need to re-run with the reset log dir std?
         - do we need more data?
             - try with non-separate value net
                 - double chek everything is sensible with frozen layers and parameters etc... maybe switch to using the decision net head rather than execution? maybe test it on a pretrained model vs sepearte ones. would make more sense though
@@ -44,7 +47,7 @@ Current notes:
             - What should I set the demo_sample_interval_s so that every rules-based AI decision is logged and trained on? How often 
         - try longer BC, and/or more data
         - force an overfit, and see if it can replay the games exactly. demo_sample_interval_s might need changing
-    - Do anti-antilaising for the spots on the ball, also the anti-aliasing on the players seems a bit broken, do they have an outline or smth?
+    - Do anti-antilaising for the spots on the ball, also the anti-aliasing on the players seems a bit broken, do they have an outline or smth? Also, I'm not sure either the ball outline or the state rings are anti-aliased. Also also, how does the width work with those, and how does the offset work on the rings?
     - not 100% clear on why we need the attention heads, since the entities are all equivalent, could we not just jack them straight into the trunk with shared weights? just a thought, not sure if it's actually a good idea tbh, just not clear - if the purpose of attention is to maintain some location differnece between them is it needed? I'm probably bieng dumb
     - does phase 0 do as well as the debug script? - no reason it shouldnt really
     - maybe boost value network capacity a little

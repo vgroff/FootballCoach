@@ -210,6 +210,43 @@ def outcome_breakdown(outcomes: list[str]) -> str:
 _PHASE1_OUTCOME_LEGEND = "/".join(label for _, label in _PHASE1_OUTCOME_KEYS)
 
 
+def value_mse_by_outcome(
+    pred: torch.Tensor, target: torch.Tensor, outcomes: list[str],
+) -> dict[str, tuple[float, int]]:
+    """Per-outcome (raw MSE, n_rows) breakdown of a value-prediction batch,
+    shared by every value-fitting call site (Phase 0 demo warm-up, PPO
+    rollout value pre-training, and the PPO value loss itself) so "is the
+    critic doing worse on losses/timeouts than wins" can be answered the
+    same way everywhere instead of duplicating the group-by logic per
+    caller. ``outcomes`` must be the same length as ``pred``/``target``
+    (e.g. a dataset's ``row_outcomes()`` for demo rows, or a rollout
+    batch's ``step_outcomes`` list, with "" -> "unknown"). Empty/missing
+    outcome strings are grouped under "unknown".
+    """
+    if len(outcomes) == 0:
+        return {}
+    sq_err = (pred.detach() - target).float().cpu().numpy() ** 2
+    out: dict[str, tuple[float, int]] = {}
+    labels = np.array([o if o else "unknown" for o in outcomes], dtype=object)
+    for name in np.unique(labels):
+        mask = labels == name
+        n = int(mask.sum())
+        out[str(name)] = (float(sq_err[mask].sum() / max(n, 1)), n)
+    return out
+
+
+def format_outcome_mse_breakdown(by_outcome: dict[str, tuple[float, int]]) -> str:
+    """One-line ``outcome=mse(n)`` summary of ``value_mse_by_outcome()``'s
+    output, for appending to an existing log line without a full extra
+    multi-line block -- callers that want the fuller multi-line form (see
+    debug_value_network.py) can iterate the dict themselves instead."""
+    if not by_outcome:
+        return ""
+    return "  ".join(
+        f"{name}={mse:.3f}(n={n})" for name, (mse, n) in sorted(by_outcome.items())
+    )
+
+
 def _binary_confusion_counts(
     pred_logit: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor, threshold: float = 0.5,
 ) -> tuple[float, float, float]:
@@ -1503,19 +1540,41 @@ class PPOTrainer:
                 f"split: {len(_p0_train_idx):,} train / {len(_p0_val_idx):,} val rows"
             )
 
-            def _eval_p0_val_loss() -> tuple[float, float, float]:
+            # Requires ground-truth episode outcomes (see
+            # DemonstrationDataset.has_episode_outcomes) -- falls back to an
+            # all-"n/a" lookup for older recordings rather than raising, so
+            # Phase 0 warm-up still runs without the outcome breakdown.
+            if dataset.has_episode_outcomes:
+                _p0_outcome_by_row = dataset.outcome_by_row()
+            else:
+                log.warning("Dataset has no ground-truth episode outcomes -- "
+                            "Phase 0 val-loss-by-outcome breakdown will be skipped.")
+                _p0_outcome_by_row = np.full(len(dataset), "n/a", dtype=object)
+
+            def _eval_p0_val_loss() -> tuple[float, float, float, dict[str, tuple[float, int]]]:
                 """Combined dec_bc + value MSE on the held-out val rows (no grad).
-                Returns (combined, bc_adj, val_mse) where bc_adj = bc - floor."""
+                Returns (combined, bc_adj, val_mse, val_mse_by_outcome) where
+                bc_adj = bc - floor and val_mse_by_outcome is the per-outcome
+                (raw value MSE, n_rows) breakdown (see value_mse_by_outcome())."""
                 self.decision_net.eval()
                 _v_losses: list[float] = []
                 _v_bc_losses: list[float] = []
                 _v_mse_losses: list[float] = []
                 _v_floors: list[float] = []
+                _outc_sq_err: dict[str, float] = {}
+                _outc_n: dict[str, int] = {}
+                _pos = 0
                 with torch.no_grad():
                     for _obs_v, _lbl_v, _ret_v in dataset.iterate_minibatches(
                         batch_size=batch_size, shuffle=False, device=self.device,
                         indices_override=_p0_val_idx, returns=demo_returns,
                     ):
+                        # iterate_minibatches(shuffle=False) with indices_override yields
+                        # contiguous batch_size-sized slices of _p0_val_idx in order, so
+                        # this chunk (for the outcome lookup only) is reconstructable here
+                        # without the generator itself yielding row indices.
+                        _chunk = _p0_val_idx[_pos:_pos + len(_ret_v)]
+                        _pos += len(_ret_v)
                         _sat_v, _oat_v = _ai_types(_obs_v)
                         _d_v = self.decision_net(
                             _obs_v["self_feat"], _obs_v["other_feat"],
@@ -1542,17 +1601,27 @@ class PPOTrainer:
                             _obs_v["exists_mask"], _obs_v["ball_feat"], _obs_v["global_feat"],
                             _d_v, _sat_v, _oat_v,
                         )
-                        _mse_v = F.mse_loss(_e_v.value.squeeze(-1), _ret_v) / (ret_std ** 2)
+                        _pred_v = _e_v.value.squeeze(-1)
+                        _mse_v = F.mse_loss(_pred_v, _ret_v) / (ret_std ** 2)
                         _v_losses.append((_bc_v + self._phase0_value_coef * _mse_v).item())
                         _v_bc_losses.append(_bc_v.item())
                         _v_mse_losses.append(_mse_v.item())
                         _v_floors.append(_floor_v)
+                        for _name, (_mse, _n) in value_mse_by_outcome(
+                            _pred_v, _ret_v, list(_p0_outcome_by_row[_chunk])
+                        ).items():
+                            _outc_sq_err[_name] = _outc_sq_err.get(_name, 0.0) + _mse * _n
+                            _outc_n[_name] = _outc_n.get(_name, 0) + _n
                 self.decision_net.train()
                 _combined = float(np.mean(_v_losses)) if _v_losses else float("nan")
                 _bc_mean = float(np.mean(_v_bc_losses)) if _v_bc_losses else float("nan")
                 _floor_mean = float(np.mean(_v_floors)) if _v_floors else 0.0
                 _mse_mean = float(np.mean(_v_mse_losses)) if _v_mse_losses else float("nan")
-                return _combined, _bc_mean - _floor_mean, _mse_mean
+                _by_outcome = {
+                    name: (_outc_sq_err[name] / max(_outc_n[name], 1), _outc_n[name])
+                    for name in _outc_sq_err
+                }
+                return _combined, _bc_mean - _floor_mean, _mse_mean, _by_outcome
 
             _p0_best_val_loss = float("inf")
             _p0_best_state: Optional[dict] = None
@@ -1564,9 +1633,20 @@ class PPOTrainer:
                 epoch_bc_losses: list[float] = []
                 epoch_val_losses: list[float] = []
                 epoch_floors: list[float] = []
+                if self._downsample_trivial_enabled:
+                    _p0_ds_frac = (
+                        self._downsample_trivial_frac_high_epoch
+                        if epoch >= self._downsample_trivial_epoch_threshold
+                        else self._downsample_trivial_frac_default
+                    )
+                else:
+                    _p0_ds_frac = 0.0
                 for obs_dict, bc_labels, ret_batch in dataset.iterate_minibatches(
                     batch_size=batch_size, shuffle=True, device=self.device,
                     indices_override=_p0_train_idx, returns=demo_returns,
+                    downsample_trivial_frac=_p0_ds_frac,
+                    downsample_trivial_cos_threshold=self._downsample_trivial_cos_threshold,
+                    downsample_trivial_exclude_radius_steps=self._downsample_trivial_exclude_radius_steps,
                 ):
                     _sat, _oat = _ai_types(obs_dict)
                     d_heads = self.decision_net(
@@ -1631,7 +1711,7 @@ class PPOTrainer:
                     f"{self._phase0_value_coef * np.mean(epoch_val_losses):.4f}"
                 )
                 if len(_p0_val_idx) > 0:
-                    _p0_vl, _p0_vl_bc_adj, _p0_vl_mse = _eval_p0_val_loss()
+                    _p0_vl, _p0_vl_bc_adj, _p0_vl_mse, _p0_vl_by_outc = _eval_p0_val_loss()
                     _p0_improved = _p0_vl < (_p0_best_val_loss - self._p0_early_stop_min_delta)
                     _val_core = (
                         f"    val  p0_val_loss={_p0_vl:.4f}  bc_adj={_p0_vl_bc_adj:.4f}  "
@@ -1644,6 +1724,8 @@ class PPOTrainer:
                         )
                     else:
                         log.info(_val_core)
+                    if _p0_vl_by_outc:
+                        log.info(f"    val_mse by outcome: {format_outcome_mse_breakdown(_p0_vl_by_outc)}")
                     if _p0_improved:
                         _p0_best_val_loss = _p0_vl
                         if _p0_early_stop_enabled:
@@ -2560,10 +2642,12 @@ class PPOTrainer:
         # Pre-load val tensors to device once.
         val_returns_t = None
         val_obs_dict = None
+        val_outcomes: list[str] = []
         if val_batch_raw is not None:
             val_returns_t = val_batch_raw["returns"].to(self.device)
             val_obs_dict = {k.replace("obs/", ""): val_batch_raw[k].to(self.device)
                             for k in val_batch_raw if k.startswith("obs/")}
+            val_outcomes = val_batch_raw.get("step_outcomes", [])
 
         n = len(returns_t)
         mean_loss = float("nan")
@@ -2706,6 +2790,10 @@ class PPOTrainer:
                         if _sep_net is not None else ""
                     )
                 )
+                if val_outcomes:
+                    _val_by_outc = value_mse_by_outcome(_val_preds, val_returns_t, val_outcomes)
+                    if _val_by_outc:
+                        log.info(f"    val_mse by outcome: {format_outcome_mse_breakdown(_val_by_outc)}")
                 if _vl < _best_val_loss - _EARLY_STOP_MIN_DELTA:
                     _best_val_loss = _vl
                     _patience = 0
@@ -3184,6 +3272,21 @@ class PPOTrainer:
         all_value_loss = []
         all_entropy = []
         all_kl = []
+        # Per-outcome value-loss accumulator (see value_mse_by_outcome()) --
+        # squared-error sum + row count per outcome string, across every
+        # minibatch of this update (main loop + value-only continuation
+        # below), for a single end-of-update breakdown log line.
+        _outc_sq_err_sum: dict[str, float] = {}
+        _outc_n_sum: dict[str, int] = {}
+        _step_outcomes = batch.get("step_outcomes", [])
+
+        def _accum_value_by_outcome(pred: torch.Tensor, target: torch.Tensor, idx: torch.Tensor) -> None:
+            if not _step_outcomes:
+                return
+            outcomes_mb = [_step_outcomes[i] for i in idx.tolist()]
+            for _name, (_mse, _n) in value_mse_by_outcome(pred, target, outcomes_mb).items():
+                _outc_sq_err_sum[_name] = _outc_sq_err_sum.get(_name, 0.0) + _mse * _n
+                _outc_n_sum[_name] = _outc_n_sum.get(_name, 0) + _n
         all_bc_loss = []
         all_bc_tackle_loss: list[float] = []   # BCE on tackle_attempt head only
         all_tackle_prob: list[float] = []       # mean sigmoid(tackle_attempt_logit) per mb
@@ -3371,6 +3474,7 @@ class PPOTrainer:
                 # the value gradient from overwhelming the policy gradient.
                 ret_var = returns.var().clamp(min=1.0)
                 value_loss = F.mse_loss(new_values, mb_ret) / ret_var
+                _accum_value_by_outcome(new_values, mb_ret, mb_idx)
 
                 # Entropy bonus
                 entropy = self._compute_entropy(d_heads, e_heads, em)
@@ -3620,6 +3724,7 @@ class PPOTrainer:
 
                     ret_var = returns.var().clamp(min=1.0)
                     value_loss_vo = F.mse_loss(new_values_vo, mb_ret) / ret_var
+                    _accum_value_by_outcome(new_values_vo, mb_ret, mb_idx)
 
                     if self.separate_value_net:
                         self.value_net_optimizer.zero_grad()
@@ -4148,6 +4253,13 @@ class PPOTrainer:
                 if n_dir else ""
             )
         )
+
+        if _outc_n_sum:
+            _value_by_outcome = {
+                name: (_outc_sq_err_sum[name] / max(_outc_n_sum[name], 1), _outc_n_sum[name])
+                for name in _outc_sq_err_sum
+            }
+            log.info(f"  [value loss by outcome] {format_outcome_mse_breakdown(_value_by_outcome)}")
 
         return {
             "policy_loss": float(np.mean(all_policy_loss)),
