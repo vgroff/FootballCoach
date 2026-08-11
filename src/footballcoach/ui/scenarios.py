@@ -173,6 +173,16 @@ class ScenarioDefinition:
     """If False, ScenarioLoop never ends a trial on box possession alone.
     Use for scenarios (e.g. 1v2) where the attacker is expected to enter
     the box and should be allowed to shoot, get tackled, or score naturally."""
+    win_outcome: str | None = None
+    """Outcome key treated as 'Win' in the HUD counter — matches seeded_eval's
+    win_outcome param so the UI tally is directly comparable to training/eval
+    metrics.  None = fall back to the generic goal/saved/miss display."""
+    outcome_remap: "Callable[[Match, str, str | None], str] | None" = None
+    """Optional per-outcome label transformer called as remap(match, raw_outcome,
+    last_ball_toucher_id) before the outcome is recorded.  Used by phase1 to
+    apply the same label transforms ScenarioEnv does (goal→miss, miss→invalid
+    when untouched, box_possession→opponent_box_possession when it's the
+    opponent in the box) so UI tallies match training/eval breakdowns exactly."""
 
 
 def build_penalty_scenario(rng_reduction: float = 0.3) -> Match:
@@ -986,13 +996,15 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
     checkpoints = []
     for _d in _all_run_dirs:
         checkpoints.extend(_discover_checkpoints(_d.rstrip("/")))
+    _phase1_count = len(checkpoints)  # index boundary before longterm entries
     checkpoints.extend(_discover_checkpoints("checkpoints/longterm"))
     # Friendly display names: run{N}/filename
     def _ckpt_label(p: str) -> str:
         parts = Path(p).parts
         return f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else parts[-1]
     ckpt_labels = tuple(_ckpt_label(c) for c in checkpoints) if checkpoints else ("(none)",)
-    ckpt_default = ckpt_labels[-1]  # most recent
+    # Default: most recent phase1_run checkpoint; fall back to last item if no phase1 runs exist
+    ckpt_default = ckpt_labels[_phase1_count - 1] if _phase1_count > 0 else ckpt_labels[-1]
 
     _cfg = _phase1_scenario_cfg()
     params_list: list = [
@@ -1111,6 +1123,23 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
     build._phase1_params = params_list  # type: ignore[attr-defined]
 
     return build, on_tick
+
+
+def _phase1_outcome_remap(match: Match, outcome: str, last_toucher_id: str | None) -> str:
+    """Adapter: maps ScenarioLoop's (match, outcome, last_toucher_id) signature to
+    remap_phase1_outcome() in outcome.py so there is one source of truth."""
+    from footballcoach.ai.env.outcome import remap_phase1_outcome
+    # box_terminal / opponent_box_terminal are already resolved by
+    # detect_trial_outcome -> ScenarioLoop._trial_outcome before we get here,
+    # so outcome is already the final raw key from that function; we only need
+    # the goal/miss/invalid transforms that live in remap_phase1_outcome.
+    return remap_phase1_outcome(
+        outcome,
+        last_ball_toucher_id=last_toucher_id,
+        box_terminal=(outcome == "box_possession"),
+        opponent_box_terminal=False,
+        timeout=(outcome == "timeout"),
+    )
 
 
 def _find_latest_phase1_checkpoint_dir() -> str:
@@ -1511,6 +1540,8 @@ SCENARIOS: list[ScenarioDefinition] = [
         build=_phase1_build,
         on_tick=_phase1_on_tick,
         params=_phase1_build._phase1_params,  # type: ignore[attr-defined]
+        win_outcome="box_possession",  # matches seeded_eval win_outcome
+        outcome_remap=_phase1_outcome_remap,
     ),
     ScenarioDefinition(
         key="1v1_phase1",
@@ -1715,11 +1746,9 @@ class ScenarioLoop:
     _initial_carrier_id: str | None = field(default=None, init=False, repr=False)
     _initial_scoreboard: tuple[int, int] = field(default=(0, 0), init=False, repr=False)
     _ball_released: bool = field(default=False, init=False, repr=False)
+    _last_ball_toucher_id: str | None = field(default=None, init=False, repr=False)
     outcomes: dict[str, int] = field(
-        default_factory=lambda: {
-            "goal": 0, "saved": 0, "miss": 0, "dispossessed": 0,
-            "box_possession": 0, "course_complete": 0, "timeout": 0,
-        },
+        default_factory=dict,
         init=False, repr=False,
     )
     _pending_outcome: str | None = field(default=None, init=False, repr=False)
@@ -1737,8 +1766,22 @@ class ScenarioLoop:
             self._match.scoreboard.right_goals,
         )
         self._ball_released = False
+        self._last_ball_toucher_id = None
         self._pending_outcome = None
         self._linger_remaining_s = 0.0
+
+    def _apply_remap(self, outcome: str) -> str:
+        if self.definition.outcome_remap is not None:
+            return self.definition.outcome_remap(self._match, outcome, self._last_ball_toucher_id)
+        return outcome
+
+    def _track_ball_toucher(self) -> None:
+        ball = self._match.ball
+        if ball.possessed_by is not None:
+            self._last_ball_toucher_id = ball.possessed_by
+        for _p in self._match.players:
+            if getattr(_p, "kicked_this_tick", False):
+                self._last_ball_toucher_id = _p.player_id
 
     @property
     def match(self) -> Match:
@@ -1764,9 +1807,10 @@ class ScenarioLoop:
                 self.definition.on_tick(self._match, self._trial_tick)
             self._match.step()
             self._trial_tick += 1
+            self._track_ball_toucher()
             self._linger_remaining_s -= self._match.dt_s
             if self._linger_remaining_s <= 0.0:
-                self.outcomes[self._pending_outcome] += 1
+                self.outcomes[self._pending_outcome] = self.outcomes.get(self._pending_outcome, 0) + 1
                 self._trial_count += 1
                 if not self.complete:
                     self._start_trial()
@@ -1777,6 +1821,7 @@ class ScenarioLoop:
             self.definition.on_tick(self._match, self._trial_tick)
         self._match.step()
         self._trial_tick += 1
+        self._track_ball_toucher()
         # Call on_tick again after the step so that controllers can reissue
         # orders in the same tick they were cleared by match.step(). Without
         # this, a MoveOrder completing inside match.step() leaves
@@ -1796,11 +1841,12 @@ class ScenarioLoop:
                 and outcome not in self.terminal_outcomes):
             outcome = None
         if outcome is not None:
+            outcome = self._apply_remap(outcome)
             if linger > 0.0:
                 self._pending_outcome = outcome
                 self._linger_remaining_s = linger
                 return False
-            self.outcomes[outcome] += 1
+            self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
             self._trial_count += 1
             if not self.complete:
                 self._start_trial()

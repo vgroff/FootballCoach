@@ -726,15 +726,27 @@ class App:
             o = loop.outcomes
             total = sum(o.values())
             if total > 0:
-                tally = f"Goals: {o['goal']}  Saved: {o['saved']}  Miss: {o['miss']}"
-                if o.get("dispossessed", 0):
-                    tally += f"  Disp: {o['dispossessed']}"
-                if o.get("box_possession", 0):
-                    tally += f"  Box: {o['box_possession']}"
-                if o.get("course_complete", 0):
-                    tally += f"  Done: {o['course_complete']}"
-                if o.get("timeout", 0):
-                    tally += f"  Timeout: {o['timeout']}"
+                win_key = loop.definition.win_outcome
+                if win_key is not None:
+                    # Same order as ppo_trainer._PHASE1_OUTCOME_KEYS / outcome_breakdown()
+                    from footballcoach.ai.ppo.ppo_trainer import _PHASE1_OUTCOME_KEYS
+                    known = {k for k, _ in _PHASE1_OUTCOME_KEYS}
+                    parts = [f"{lbl}: {o.get(k, 0)}" for k, lbl in _PHASE1_OUTCOME_KEYS]
+                    other = sum(v for k, v in o.items() if k not in known)
+                    if other:
+                        parts.append(f"Other: {other}")
+                    pct = 100 * o.get(win_key, 0) // total
+                    tally = "  ".join(parts) + f"  ({pct}% win)"
+                else:
+                    tally = f"Goals: {o['goal']}  Saved: {o['saved']}  Miss: {o['miss']}"
+                    if o.get("dispossessed", 0):
+                        tally += f"  Disp: {o['dispossessed']}"
+                    if o.get("box_possession", 0):
+                        tally += f"  Box: {o['box_possession']}"
+                    if o.get("course_complete", 0):
+                        tally += f"  Done: {o['course_complete']}"
+                    if o.get("timeout", 0):
+                        tally += f"  Timeout: {o['timeout']}"
                 hud_lines.append(tally)
         else:
             left, right = self.match.scoreboard.left_goals, self.match.scoreboard.right_goals

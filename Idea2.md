@@ -32,11 +32,14 @@ Current notes:
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
     - check rules-based ui performance, re-gen data (30k examples), re-pre-train, 
-    - !!! value net performance on rules v immobile - still seems sus - can it do better with gamma=0.999 or 1?
-        - setup rewards so even the LR can do well in the debug script
-        -2026-08-10 17:23:49,776 INFO   dones=1 rows: 24,000  |  zero-reward rows: 16,098 (1.5%) ???
-            - from debug script, why are there any zero reward rows???
-    - !!! relative distances aren't euclidean!!! they have different divisors!!!!! I could accept using it on the absolute pos features, but should def be avoided on rel dist, no??? Investigate 
+    - !! value pretrain - why does it do so much better during PPO than during pretrain??? is the reported loss before or after re-train? Can we get the other one too? Is it using the right decision network in pretrain?
+    - !! Still a ton of invalids during Phase 1, even with the lower params, seems weird, check it out
+        - how are the starting positions etc... generated?
+    - Try more aggresive learning just to see how it does? 
+        - Increase step penalty?
+        - Maybe re-introduce the shaping rewards?
+    - Do some performance profiling - how long spent on rollouts vs PPO vs evals etc.. n_envs - how much faster does it get with more of them? How many do we want? Main threads too? - can try this with the evals script maybe?
+    - re-introduce speed bonus or nah?
     - Plan: 
         - need to re-run with the reset log dir std?
         - do we need more data?

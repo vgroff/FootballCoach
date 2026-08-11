@@ -28,6 +28,42 @@ HEAD_LP_KEYS = [
 ]
 
 
+def _backfill_step_outcomes(step_outcomes: list[str], dones: list[float]) -> list[str]:
+    """Propagate each episode's terminal ``info.trial_outcome`` string (only
+    ever recorded on the done=1 row, see ``RolloutBuffer.add()``'s
+    ``step_outcome`` param) onto EVERY row of that same episode, not just
+    the terminal one.
+
+    Without this, every mid-episode row's step_outcome stays "" and gets
+    bucketed under a fabricated "unknown" outcome by
+    ``ppo_trainer.value_mse_by_outcome()`` -- overwhelmingly the majority of
+    rows in any non-trivial episode, making a per-outcome value-loss
+    breakdown almost entirely "unknown" (the exact bug reported live: PPO's
+    value-pretrain val_mse-by-outcome log line showing "unknown=...(n=21118)"
+    dwarfing every real outcome bucket). PPO's ``dones`` are one row per
+    real step per player transition here (no trainee+opponent pairing like
+    ``DemonstrationDataset``'s recorded .npz rows), so a single done=1 row
+    IS the correct, unambiguous episode boundary -- no collapsing logic
+    needed, unlike ``DemonstrationDataset.episode_row_ranges()``.
+
+    A trailing incomplete episode (rows after the last done=1) keeps "" for
+    every row in it (never fabricate an outcome for an episode that hasn't
+    actually ended) -- callers should still treat "" client-side as
+    "no meaningful outcome yet", not silently rename it "unknown"
+    downstream.
+    """
+    out = list(step_outcomes)
+    ep_start = 0
+    for i, d in enumerate(dones):
+        if d > 0.5:
+            outcome = step_outcomes[i]
+            if outcome:
+                for j in range(ep_start, i + 1):
+                    out[j] = outcome
+            ep_start = i + 1
+    return out
+
+
 @dataclass
 class RolloutBuffer:
     """Stores transitions for one PPO rollout (N decision steps).
@@ -272,7 +308,7 @@ class RolloutBuffer:
 
         result["sample_weights"] = torch.tensor(self.weights, dtype=torch.float32)
         result["reward_comps_raw"] = list(self.reward_comps)
-        result["step_outcomes"] = list(self.step_outcomes)
+        result["step_outcomes"] = _backfill_step_outcomes(self.step_outcomes, self.dones)
 
         return result
 

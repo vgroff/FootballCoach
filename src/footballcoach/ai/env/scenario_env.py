@@ -32,6 +32,7 @@ from footballcoach.ai.action.apply_nn_action import (
     encode_slot_player_ids,
 )
 from footballcoach.ai.config import load_ai_config
+from footballcoach.ai.env.outcome import remap_phase1_outcome
 from footballcoach.ai.env.reward import EMAFilter, phase1_reward, phase2_reward
 from footballcoach.ai.obs.encoder import MAX_OTHER_PLAYERS, encode_observation
 from footballcoach.ai.obs.schema import ObservationBatch
@@ -536,26 +537,16 @@ class ScenarioEnv:
         done = trial_ended_this_step or timeout or any_box_terminal
 
         if done:
-            if box_terminal:
-                outcome_label = "box_possession"
-            elif opponent_box_terminal:
-                outcome_label = "opponent_box_possession"
-            elif timeout:
-                outcome_label = "timeout"
+            if self.phase == 1:
+                outcome_label = remap_phase1_outcome(
+                    outcome_this_step or "",
+                    last_ball_toucher_id=self._last_ball_toucher_id,
+                    box_terminal=box_terminal,
+                    opponent_box_terminal=opponent_box_terminal,
+                    timeout=timeout,
+                )
             else:
-                outcome_label = outcome_this_step
-                # Phase 1 has no goal condition: treat it the same as the ball
-                # going out of bounds (neither player wins by shooting).
-                if self.phase == 1 and outcome_label == "goal":
-                    outcome_label = "miss"
-                # Ball went out with nobody having touched it this episode —
-                # an unintentional/nobody's-fault miss (e.g. bad initial
-                # placement/velocity), not a real ball_out_penalty case for
-                # either player. Split from "miss" (intentional-ish: the
-                # last toucher is penalised) so eval/log breakdowns can tell
-                # the two apart.
-                if outcome_label == "miss" and self._last_ball_toucher_id is None:
-                    outcome_label = "invalid"
+                outcome_label = outcome_this_step or ""
             info.trial_outcome = outcome_label
 
         info.is_rules_episode = getattr(match, "_opponent_use_rules_ai", False)

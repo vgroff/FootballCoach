@@ -254,11 +254,11 @@ def _player_features(
     attacking_dir = +1.0 if player.team == Team.LEFT else -1.0
 
     feat = PlayerFeatures(
-        rel_dx=dx / half_len,
-        rel_dy=dy / half_wid,
+        rel_dx=dx / half_diag,
+        rel_dy=dy / half_diag,
         distance_m=dist / half_diag,
-        ball_rel_dx=ball_dx / half_len,
-        ball_rel_dy=ball_dy / half_wid,
+        ball_rel_dx=ball_dx / half_diag,
+        ball_rel_dy=ball_dy / half_diag,
         ball_distance_m=ball_dist / half_diag,
         ball_vel_rel_x=ball_vel_rel_x,
         ball_vel_rel_y=ball_vel_rel_y,
@@ -284,8 +284,8 @@ def _player_features(
         attacking_direction=attacking_dir,
         exists=1.0,
         is_immobile=1.0 if is_immobile else 0.0,
-        pos_x=player.position.x / 52.5,
-        pos_y=player.position.y / 34.0,
+        pos_x=player.position.x / half_diag,
+        pos_y=player.position.y / half_diag,
     )
     return feat.to_array()
 
@@ -301,8 +301,8 @@ def _ball_features(
 
     is_possessed = 1.0 if ball.possessed_by is not None else 0.0
     feat = BallFeatures(
-        pos_x=ball.position.x / 52.5,
-        pos_y=ball.position.y / 34.0,
+        pos_x=ball.position.x / half_diag,
+        pos_y=ball.position.y / half_diag,
         height_m=ball.position.z / height_norm_m,
         velocity_x=ball.velocity.x / vel_norm,
         velocity_y=ball.velocity.y / vel_norm,

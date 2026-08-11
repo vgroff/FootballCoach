@@ -100,3 +100,30 @@ def detect_trial_outcome(
         return "timeout", False
 
     return None, False
+
+
+def remap_phase1_outcome(
+    outcome: str,
+    *,
+    last_ball_toucher_id: str | None,
+    box_terminal: bool,
+    opponent_box_terminal: bool,
+    timeout: bool,
+) -> str:
+    """Apply phase-1 outcome label transforms shared by ScenarioEnv and ScenarioLoop.
+
+    Call this after detect_trial_outcome returns a non-None outcome, passing
+    the same box_terminal / opponent_box_terminal / timeout flags used to
+    decide ``done``.  Returns the final label to record.
+    """
+    if box_terminal:
+        return "box_possession"
+    if opponent_box_terminal:
+        return "opponent_box_possession"
+    if timeout:
+        return "timeout"
+    if outcome == "goal":
+        outcome = "miss"
+    if outcome == "miss" and last_ball_toucher_id is None:
+        return "invalid"
+    return outcome

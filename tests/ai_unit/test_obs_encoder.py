@@ -224,17 +224,19 @@ class TestSlotShuffling:
 
 class TestPositionNormalization:
     def test_other_player_relative_position_correct(self, duel_match):
-        """p2 is at x=10, p1 at x=0. rel_dx should be 10 / half_length."""
+        """p2 is at x=10, p1 at x=0. rel_dx should be 10 / half_diag (isotropic norm)."""
         obs = encode_observation(duel_match, "p1", time_remaining_s=60.0,
                                  rng=random.Random(0))
         half_len = duel_match.pitch.length_m / 2.0
-        expected_rel_dx = 10.0 / half_len
+        half_wid = duel_match.pitch.width_m / 2.0
+        half_diag = math.hypot(half_len, half_wid)
+        expected_rel_dx = 10.0 / half_diag
 
         slot = next(i for i in range(MAX_OTHER_PLAYERS) if obs.exists_mask[i] > 0.5)
         assert obs.other_feat[slot, _pf_idx("rel_dx")] == pytest.approx(expected_rel_dx, rel=1e-4)
 
-    def test_player_at_pitch_boundary_gives_rel_one(self, standard_pitch):
-        """A player standing exactly at the right goal line should have rel_dx ≈ 1."""
+    def test_player_at_pitch_boundary_gives_rel_dx_matching_half_diag(self, standard_pitch):
+        """A player standing exactly at the right goal line should have rel_dx == half_length / half_diag."""
         import random as _random
         from footballcoach.engine.match import Match
         from footballcoach.entities.player import Player, Team
@@ -250,8 +252,12 @@ class TestPositionNormalization:
                       rng_reduction=1.0, rng=_random.Random(0))
 
         obs = encode_observation(match, "obs", time_remaining_s=60.0, rng=_random.Random(0))
+        half_len = standard_pitch.length_m / 2.0
+        half_wid = standard_pitch.width_m / 2.0
+        half_diag = math.hypot(half_len, half_wid)
+        expected_rel_dx = half_len / half_diag
         slot = next(i for i in range(MAX_OTHER_PLAYERS) if obs.exists_mask[i] > 0.5)
-        assert obs.other_feat[slot, _pf_idx("rel_dx")] == pytest.approx(1.0, rel=1e-4)
+        assert obs.other_feat[slot, _pf_idx("rel_dx")] == pytest.approx(expected_rel_dx, rel=1e-4)
 
     def test_distance_metric_is_non_negative(self, duel_match):
         obs = encode_observation(duel_match, "p1", time_remaining_s=60.0,

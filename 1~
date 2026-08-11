@@ -1,0 +1,96 @@
+2026-08-10 19:50:06,326 INFO Loading 1880 demonstration file(s) from demonstrations/phase1_debug
+2026-08-10 19:50:06,326 INFO Loading 1880 demonstration file(s) from demonstrations/phase1_debug
+2026-08-10 19:50:16,070 INFO Dataset: 862,326 steps loaded
+2026-08-10 19:50:16,070 INFO Dataset: 862,326 steps loaded
+2026-08-10 19:50:16,071 INFO Loaded 862,326 rows total
+2026-08-10 19:50:16,071 INFO Loaded 862,326 rows total
+2026-08-10 19:50:16,072 INFO has_rewards=True
+2026-08-10 19:50:16,072 INFO has_rewards=True
+2026-08-10 19:50:16,081 INFO valid_indices(): 441,005 rows (51.1% of total)
+2026-08-10 19:50:16,081 INFO valid_indices(): 441,005 rows (51.1% of total)
+2026-08-10 19:50:16,336 INFO Returns over ALL rows: mean=3.106 std=1.088 min=-5.005 max=5.858
+2026-08-10 19:50:16,336 INFO Returns over ALL rows: mean=3.106 std=1.088 min=-5.005 max=5.858
+2026-08-10 19:50:16,337 INFO Returns over valid_indices(): mean=3.086 std=1.091
+2026-08-10 19:50:16,337 INFO Returns over valid_indices(): mean=3.086 std=1.091
+2026-08-10 19:50:16,631 INFO --- Dataset distribution (862,326 rows, 15000 episodes) ---
+2026-08-10 19:50:16,631 INFO --- Dataset distribution (862,326 rows, 15000 episodes) ---
+2026-08-10 19:50:16,645 INFO   self.ai_type == rules: 51.1%
+2026-08-10 19:50:16,645 INFO   self.ai_type == rules: 51.1%
+2026-08-10 19:50:16,654 INFO   self.ai_type == immobile: 48.9%
+2026-08-10 19:50:16,654 INFO   self.ai_type == immobile: 48.9%
+2026-08-10 19:50:16,659 INFO   self.ai_type == neural: 0.0%
+2026-08-10 19:50:16,659 INFO   self.ai_type == neural: 0.0%
+2026-08-10 19:50:16,664 INFO   opponent.ai_type == rules: 48.9%
+2026-08-10 19:50:16,664 INFO   opponent.ai_type == rules: 48.9%
+2026-08-10 19:50:16,669 INFO   opponent.ai_type == immobile: 51.1%
+2026-08-10 19:50:16,669 INFO   opponent.ai_type == immobile: 51.1%
+2026-08-10 19:50:16,674 INFO   opponent.ai_type == neural: 0.0%
+2026-08-10 19:50:16,674 INFO   opponent.ai_type == neural: 0.0%
+2026-08-10 19:50:16,682 INFO   valid rows: kick_this_tick rate=18.12%  tackle_attempt rate=0.10%
+2026-08-10 19:50:16,682 INFO   valid rows: kick_this_tick rate=18.12%  tackle_attempt rate=0.10%
+2026-08-10 19:50:16,683 INFO   dones=1 rows: 30,000  |  zero-reward rows: 19,684 (2.3%)
+2026-08-10 19:50:16,683 INFO   dones=1 rows: 30,000  |  zero-reward rows: 19,684 (2.3%)
+2026-08-10 19:50:16,698 INFO   return percentiles (all rows): p10=1.94  p50=3.19  p90=4.30
+2026-08-10 19:50:16,698 INFO   return percentiles (all rows): p10=1.94  p50=3.19  p90=4.30
+2026-08-10 19:50:17,291 INFO --- Reward component breakdown (30000 episodes in dataset) ---
+2026-08-10 19:50:17,291 INFO --- Reward component breakdown (30000 episodes in dataset) ---
+2026-08-10 19:50:17,291 INFO   component           mean      std       min       max
+2026-08-10 19:50:17,291 INFO   component           mean      std       min       max
+2026-08-10 19:50:17,295 INFO   approach          +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,295 INFO   approach          +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,298 INFO   retreat           +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,298 INFO   retreat           +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,302 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,302 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,307 INFO   heading           +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,307 INFO   heading           +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,319 INFO   get_possession    +0.969    0.956    +0.000    +4.000
+2026-08-10 19:50:17,319 INFO   get_possession    +0.969    0.956    +0.000    +4.000
+2026-08-10 19:50:17,323 INFO   progress          +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,323 INFO   progress          +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,327 INFO   lose_possession    -0.002    0.066    -1.800    +0.000
+2026-08-10 19:50:17,327 INFO   lose_possession    -0.002    0.066    -1.800    +0.000
+2026-08-10 19:50:17,330 INFO   ball_out          -0.048    0.489    -5.000    +0.000
+2026-08-10 19:50:17,330 INFO   ball_out          -0.048    0.489    -5.000    +0.000
+2026-08-10 19:50:17,334 INFO   illegal           +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,334 INFO   illegal           +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,342 INFO   box_possession    +3.821    0.827    +0.000    +4.000
+2026-08-10 19:50:17,342 INFO   box_possession    +3.821    0.827    +0.000    +4.000
+2026-08-10 19:50:17,345 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,345 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,348 INFO   opponent_box      -0.002    0.080    -4.000    +0.000
+2026-08-10 19:50:17,348 INFO   opponent_box      -0.002    0.080    -4.000    +0.000
+2026-08-10 19:50:17,351 INFO   timeout           -0.000    0.016    -2.000    +0.000
+2026-08-10 19:50:17,351 INFO   timeout           -0.000    0.016    -2.000    +0.000
+2026-08-10 19:50:17,353 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,353 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
+2026-08-10 19:50:17,356 INFO   step_penalty      -0.140    0.170    -1.195    -0.005
+2026-08-10 19:50:17,356 INFO   step_penalty      -0.140    0.170    -1.195    -0.005
+2026-08-10 19:50:17,368 INFO   stamina_penalty    -0.119    0.054    -0.251    +0.000
+2026-08-10 19:50:17,368 INFO   stamina_penalty    -0.119    0.054    -0.251    +0.000
+2026-08-10 19:50:17,797 INFO --- MC returns by outcome (all rows, 862,326 rows) ---
+2026-08-10 19:50:17,797 INFO --- MC returns by outcome (all rows, 862,326 rows) ---
+2026-08-10 19:50:17,816 INFO   ball_out     n=  7,130  mean=-2.602  std=1.701  min=-5.005  max=+1.975
+2026-08-10 19:50:17,816 INFO   ball_out     n=  7,130  mean=-2.602  std=1.701  min=-5.005  max=+1.975
+2026-08-10 19:50:17,828 INFO   invalid      n= 11,748  mean=-0.055  std=0.033  min=-0.162  max=-0.005
+2026-08-10 19:50:17,828 INFO   invalid      n= 11,748  mean=-0.055  std=0.033  min=-0.162  max=-0.005
+2026-08-10 19:50:17,838 INFO   loss         n=     32  mean=-4.096  std=0.073  min=-4.193  max=-3.937
+2026-08-10 19:50:17,838 INFO   loss         n=     32  mean=-4.096  std=0.073  min=-4.193  max=-3.937
+2026-08-10 19:50:17,847 INFO   timeout      n=    241  mean=-0.973  std=0.685  min=-2.052  max=+1.333
+2026-08-10 19:50:17,847 INFO   timeout      n=    241  mean=-0.973  std=0.685  min=-2.052  max=+1.333
+2026-08-10 19:50:17,860 INFO   win          n=843,175  mean=+3.200  std=0.869  min=-0.863  max=+5.858
+2026-08-10 19:50:17,860 INFO   win          n=843,175  mean=+3.200  std=0.869  min=-0.863  max=+5.858
+2026-08-10 19:50:18,102 INFO Train/val split (valid_only=True): 375,424 train rows across 12750 episodes  |  65,581 val rows across 2250 episodes
+2026-08-10 19:50:18,102 INFO Train/val split (valid_only=True): 375,424 train rows across 12750 episodes  |  65,581 val rows across 2250 episodes
+2026-08-10 19:50:18,470 INFO --- Linear regression baseline (top_speed, ball_dist, ball_to_box, time_remaining) ---
+2026-08-10 19:50:18,470 INFO --- Linear regression baseline (top_speed, ball_dist, ball_to_box, time_remaining) ---
+2026-08-10 19:50:18,536 INFO   [all outcomes] n_train=375,424  n_val=65,581  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.292, -0.247, -1.901, 3.523, 0.764]
+    train_rmse=0.9227 (norm=0.8479)  val_rmse=0.9438 (norm=0.8673)
+2026-08-10 19:50:18,536 INFO   [all outcomes] n_train=375,424  n_val=65,581  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.292, -0.247, -1.901, 3.523, 0.764]
+    train_rmse=0.9227 (norm=0.8479)  val_rmse=0.9438 (norm=0.8673)
+2026-08-10 19:50:18,886 INFO   [win outcomes only] n_train=367,174  n_val=64,178  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.297, 0.796, -1.951, 3.614, 0.691]
+    train_rmse=0.6341 (norm=0.7211)  val_rmse=0.6367 (norm=0.7241)
+2026-08-10 19:50:18,886 INFO   [win outcomes only] n_train=367,174  n_val=64,178  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.297, 0.796, -1.951, 3.614, 0.691]
+    train_rmse=0.6341 (norm=0.7211)  val_rmse=0.6367 (norm=0.7241)
+2026-08-10 19:50:19,987 INFO Fitting fresh separate value network: 1 epochs, lr=0.005, weight_decay=0.0, batch_size=512, train_ret_std=1.088, outcome_reweight=False
+2026-08-10 19:50:19,987 INFO Fitting fresh separate value network: 1 epochs, lr=0.005, weight_decay=0.0, batch_size=512, train_ret_std=1.088, outcome_reweight=False
