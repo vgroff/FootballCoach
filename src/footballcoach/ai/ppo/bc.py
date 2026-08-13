@@ -921,9 +921,10 @@ class BCPretrainer:
 
 def _label_to_env_action(label: BCLabel, env) -> dict:
     """Build a minimal env action dict from a BCLabel so the env can be
-    stepped during pre-training.  The trainee's order is set by the env's
-    apply_action_to_player via to_orders.py — we just need plausible
-    decision_probs and execution_physical.
+    stepped during pre-training.  The trainee's physical action is applied
+    directly onto the Player object by the env's call into
+    apply_nn_action.py::apply_action_to_player() (no Order is ever set) —
+    we just need plausible decision_probs and execution_physical.
     """
     from footballcoach.ai.action.schema import ExecutionAction
 

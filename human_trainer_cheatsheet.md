@@ -113,6 +113,16 @@ uv run python -m footballcoach.ai.scripts.train \
 # --total-steps 60000
 ```
 
+### Evaluation
+```bash
+uv run python -m footballcoach.ai.scripts.evaluate \
+    --checkpoint checkpoints/longterm/checkpoint_vgood_immobile.pt \
+    --phase 1 --n-trials 200 --no-baseline \
+    --output results/eval_run60_pretrained_det_immobile.json
+```
+
+### 
+
 ### Checkpoint dir is auto-generated as `checkpoints/phase1_runN/` (next available N). Override with `--checkpoint-dir checkpoints/my_run/`.
 
 ---

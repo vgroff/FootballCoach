@@ -61,16 +61,24 @@ def apply_action_to_player(
     from footballcoach.engine.movement import SpeedMode
 
     # --- Movement: exec_move decides standstill vs moving; sprint decides speed ---
-    if gating.exec_move:
-        d = gating.move_direction
-        if d is not None and np.linalg.norm(d) > 1e-6:
-            player.desired_direction = Vector3(float(d[0]), float(d[1]), 0.0)
-        else:
-            player.desired_direction = Vector3.zero()
-        player.desired_speed_mode = SpeedMode.SPRINT if gating.sprint else SpeedMode.JOG
+    # move_direction is set from gating.move_direction regardless of exec_move:
+    # step_player_towards() turns a STANDSTILL player to face a nonzero
+    # target_direction while decelerating to a stop (turn-in-place), same as
+    # a rules-AI order sitting at SpeedMode.STANDSTILL with a real
+    # desired_direction (e.g. settling into first-touch ball control). The BC
+    # label already supervises move_direction unconditionally (phase1_labels()
+    # captures it whenever player.desired_direction is nonzero post-execute(),
+    # not gated on exec_move; bc_loss_from_tensor's cosine loss is gated only
+    # on the label having a direction, never on exec_move) -- this was pure
+    # inference-time information loss, discarding an already-trained signal.
+    d = gating.move_direction
+    if d is not None and np.linalg.norm(d) > 1e-6:
+        player.desired_direction = Vector3(float(d[0]), float(d[1]), 0.0)
     else:
         player.desired_direction = Vector3.zero()
-        player.desired_speed_mode = SpeedMode.STANDSTILL
+    player.desired_speed_mode = (
+        (SpeedMode.SPRINT if gating.sprint else SpeedMode.JOG) if gating.exec_move else SpeedMode.STANDSTILL
+    )
 
     # --- Kick: immediate physics via 3D direction, no ballistic solve ---
     # Fires only when the player actually has the ball; if not (e.g. cached gating

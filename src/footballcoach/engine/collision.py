@@ -215,8 +215,12 @@ def can_tackle(tackler: Player, tacklee: Player) -> bool:
     `INACTIVE_TACKLED` (e.g. mid tackle-cooldown from a previous contest).
 
     Single source of truth for tackle eligibility -- use this everywhere a
-    tackle attempt is gated (engine order execution, `tackle_direct()`, and
-    BC label generation) so they can never drift apart.
+    tackle attempt is gated via an Order (rules-AI `ChaseTackleOrder`/
+    `GetPossessionOrder` execution in orders.py) or BC label generation, so
+    they can never drift apart. NOT used by the neural network's
+    tackle_armed path -- `Match._check_armed_tackles()` inlines its own
+    (deliberately different, wider) overlap-radius check instead; see its
+    docstring.
     """
     return (
         are_touching(tackler, tacklee)

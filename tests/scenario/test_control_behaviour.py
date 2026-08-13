@@ -127,7 +127,15 @@ def test_controlling_ground_ball_can_be_tackled():
 def test_controlling_aerial_ball_immune_to_regular_tackle():
     """A player controlling a high ball (above waist height) cannot be tackled
     via a GetPossessionOrder/ChaseTackle approach."""
-    receiver = make_player("rcv", Team.LEFT, attr_value=0.5, position=Vector3(0, 0, 0))
+    # Receiver nudged from (0,0,0) to (0.05,0,0) -- clearly closer to the ball
+    # (0.25m) than the tackler is (0.29m) so pickup contention is unambiguous
+    # (closest ACTIVE candidate wins ties, see engine/knowledge.md's ball-
+    # pickup contention note). The original (0,0,0)/0.59 placement was a
+    # near-tie (0.30m vs 0.29m) that previously happened to resolve to the
+    # receiver only via players-list iteration order. Ball/tackler positions
+    # are left untouched so the tackler's tick-1 GetPossessionOrder chase
+    # target and tick-2 touching-range tackle attempt are unaffected.
+    receiver = make_player("rcv", Team.LEFT, attr_value=0.5, position=Vector3(0.05, 0, 0))
     tackler = make_player("tkl", Team.RIGHT, attr_value=0.0, tackling=1.0,
                           position=Vector3(0.59, 0, 0))
 

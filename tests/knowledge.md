@@ -136,9 +136,12 @@ training - just forward passes with random inputs and arithmetic checks.
   physical bounds; DirectionHead output is a unit vector; no NaN anywhere.
 - `test_gating.py` — winner-take-all rule, 0.5 does not fire (strictly >),
   highest-prob head wins, target slot propagation, execution pass-through.
-- `test_to_orders.py` — correct order type assigned for each action, illegal
-  preconditions detected (shoot without possession, tackle while inactive,
-  tackle own teammate, no valid target), NONE with/without active order.
+- `test_apply_nn_action.py` — correct direct-field application for each
+  action (`desired_direction`/`desired_speed_mode`/`kick_with_direction()`/
+  `tackle_armed` — no Order of any kind is ever assigned), illegal
+  preconditions detected (kick without possession is a silent no-op; tackle
+  while inactive, tackle with no valid carrier, and tackle own team's carrier
+  all set `illegal_action=True`).
 - `test_reward.py` — per-component arithmetic for phase1_reward and
   phase2_reward, EMAFilter slow/fast alpha, post-goal window expiry, reset.
 - `test_networks.py` — DecisionNetwork and ExecutionNetwork output shapes for

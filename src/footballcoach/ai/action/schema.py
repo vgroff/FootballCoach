@@ -45,8 +45,10 @@ class DecisionHeadsRaw:
     tackle_target_logits: "torch.Tensor" # (batch, MAX_OTHER_PLAYERS)
     mark_target_logits: "torch.Tensor"   # (batch, MAX_OTHER_PLAYERS)
 
-    move_region_center: "torch.Tensor"   # (batch, 2) raw, tanh-squashed to norm position in to_orders.py
-    move_region_size: "torch.Tensor"     # (batch, 1) raw, sigmoid+scale to 1-4m in to_orders.py
+    move_region_center: "torch.Tensor"   # (batch, 2) raw; tanh-squashed where consumed (bc.py/ppo_trainer.py)
+                                          # for BC loss / reward shaping ONLY -- strategic context, never a
+                                          # motor control input (apply_nn_action.py never reads this field)
+    move_region_size: "torch.Tensor"     # (batch, 1) raw, sigmoid+scale to 1-4m -- same strategic-context-only caveat
     move_arrival_speed: "torch.Tensor"   # (batch, 1) raw, sigmoid+scale to 0-top_speed
     region_of_play_center: "torch.Tensor"  # (batch, 2)
     region_of_play_size: "torch.Tensor"    # (batch, 1) raw, sigmoid+scale to 15-40m

@@ -95,6 +95,7 @@ def can_pick_up_ball(
     ball: Ball,
     params: BallPickupParams,
     ball_pre_tick_position: Vector3 | None = None,
+    player_pre_tick_position: Vector3 | None = None,
 ) -> bool:
     """True if `player` is close enough to `ball`'s CURRENT position AND
     either closed on it at some point during this tick's motion, or is
@@ -109,31 +110,52 @@ def can_pick_up_ball(
     slow/stationary player is only picked up if they have a real closing
     velocity component toward it, not by proximity alone.
 
-    `ball_pre_tick_position` (the ball's position before this tick's
-    free-flight step) is used to also test the ball's whole swept path this
-    tick, not just its end-of-tick position — a fast ball (e.g. a hard shot,
-    10+ m per tick relative to the pickup radius) can tunnel straight past
-    a player within one tick, ending up on the far side and reading as
-    "receding" under a naive endpoint-only check even though it clearly
-    passed within pickup range. The swept check ONLY applies when the ball
-    started the tick OUTSIDE the pickup radius — this is what distinguishes
+    `ball_pre_tick_position` / `player_pre_tick_position` (each entity's
+    position before this tick's movement) are used to test the WHOLE swept
+    path of ball-relative-to-player this tick, not just the end-of-tick
+    separation — a fast ball (e.g. a hard shot, 10+ m per tick relative to
+    the pickup radius) can tunnel straight past a player within one tick,
+    and symmetrically a fast player can sweep straight past a slow/
+    stationary ball (e.g. a sprinting player grazing the edge of the pickup
+    radius) — both end up on the "far side" reading as separated/receding
+    under a naive endpoint-only check even though the two were within
+    pickup range at some instant during the tick. Passing either or both
+    pre-tick positions enables the corresponding side of the sweep; the
+    check is done in the ball-relative-to-player frame (see
+    `_swept_min_separation`) so it is exactly symmetric and also correctly
+    covers the case where BOTH ball and player move during the tick (e.g. a
+    rolling ball crossed by a sprinting player) — a case neither one-sided
+    check alone would catch. Omitting a side's pre-tick position treats
+    that entity as stationary at its current (end-of-tick) position for the
+    sweep, which exactly reproduces the historical ball-only-tunneling
+    behaviour when `player_pre_tick_position` is omitted.
+
+    The swept check ONLY applies when the two entities started the tick
+    OUTSIDE the pickup radius of each other — this is what distinguishes
     genuine tunneling from a player who just released the ball themselves
     this same tick (whose pre-tick position is at their own feet, i.e.
     already inside the radius): a kick must not be treated as "swept past
     and back" just because its segment happens to start inside the radius.
-    `None` (default) skips the swept check entirely (endpoint-only).
-    See engine/knowledge.md.
+    The same reasoning protects a player who was already standing next to
+    the ball at the start of the tick — their own movement must not be
+    treated as a fresh tunneling event either; they fall through to the
+    ordinary closing-velocity/deadzone check below, same as always.
+
+    Passing neither pre-tick position (both `None`, the default) skips the
+    swept check entirely (endpoint-only). See engine/knowledge.md.
     """
     to_ball = ball.position.xy() - player.position.xy()
     distance = to_ball.length()
     within_radius = distance <= params.pickup_radius_m
 
-    started_outside_radius = (
-        ball_pre_tick_position is not None
-        and ball_pre_tick_position.xy().distance_to(player.position.xy()) > params.pickup_radius_m
-    )
-    swept_within_radius = started_outside_radius and _swept_closest_distance(
-        ball_pre_tick_position.xy(), ball.position.xy(), player.position.xy()
+    ball_pre_xy = ball_pre_tick_position.xy() if ball_pre_tick_position is not None else ball.position.xy()
+    player_pre_xy = player_pre_tick_position.xy() if player_pre_tick_position is not None else player.position.xy()
+
+    have_sweep_info = ball_pre_tick_position is not None or player_pre_tick_position is not None
+    started_outside_radius = have_sweep_info and ball_pre_xy.distance_to(player_pre_xy) > params.pickup_radius_m
+
+    swept_within_radius = started_outside_radius and _swept_min_separation(
+        ball_pre_xy, ball.position.xy(), player_pre_xy, player.position.xy()
     ) <= params.pickup_radius_m
 
     if not within_radius and not swept_within_radius:
@@ -144,10 +166,15 @@ def can_pick_up_ball(
     if relative_speed <= params.closing_speed_deadzone_mps:
         return True
     if swept_within_radius:
-        # The ball travelled through pickup range this tick despite ending
-        # up outside/receding -- a genuine tunneling case, not "kicker
-        # re-picking up their own kick" (that case never starts outside the
-        # radius). Always eligible regardless of endpoint closing direction.
+        # Ball-relative-to-player travelled through pickup range this tick
+        # despite ending up outside/receding -- a genuine tunneling case,
+        # not "kicker re-picking up their own kick" (that case never starts
+        # outside the radius, see started_outside_radius above). Always
+        # eligible regardless of endpoint closing direction: since both
+        # entities are assumed to move in straight lines this tick, a
+        # relative-position chord that dips inside the radius necessarily
+        # means the two were closing on each other at some point during
+        # the sweep, even if they are diverging again by the tick's end.
         return True
     if distance <= 1e-9:
         return True  # already coincident; direction of closing is undefined
@@ -166,6 +193,30 @@ def _swept_closest_distance(segment_start: Vector3, segment_end: Vector3, point:
     t = max(0.0, min(1.0, (point - segment_start).dot(seg) / seg_len_sq))
     closest = segment_start + seg * t
     return closest.distance_to(point)
+
+
+def _swept_min_separation(
+    ball_start: Vector3, ball_end: Vector3, player_start: Vector3, player_end: Vector3,
+) -> float:
+    """Minimum ball-to-player separation during this tick, assuming BOTH
+    move in straight lines from their tick-start to tick-end positions.
+
+    Computed by translating into the ball-relative-to-player frame: the
+    relative position `ball(t) - player(t)` for `t` in [0, 1] traces a
+    straight line (the difference of two linear motions is itself linear)
+    from `ball_start - player_start` to `ball_end - player_end`, so the
+    minimum separation over the tick is just the closest distance from that
+    relative-position segment to the origin. This is exactly
+    `_swept_closest_distance` applied in the relative frame -- passing
+    `player_start == player_end` (a stationary player reference) reduces it
+    to the original ball-only sweep, and passing `ball_start == ball_end`
+    reduces it to the symmetric player-only sweep. Correctly handles both
+    moving simultaneously too (e.g. a rolling ball crossed by a sprinting
+    player), which neither one-sided check alone would catch.
+    """
+    return _swept_closest_distance(
+        ball_start - player_start, ball_end - player_end, Vector3.zero(),
+    )
 
 
 def height_difficulty_factor(params: ControlTimeParams, ball_height_m: float) -> float:

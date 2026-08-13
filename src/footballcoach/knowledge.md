@@ -52,12 +52,12 @@ from outside the `Player` class.
 
 `MoveOrder` and all Order types are used by:
 - The **rules-based AI** (assign `player.ai = Phase1RulesAI()` etc.; `Match.step()` calls `player.ai.act(player, match, tick)` automatically)
-- **BC label generation** (supervised teacher signal)
-- **High-level decision head fires** — when the neural network's shoot/pass/
-  tackle/get_possession/mark Bernoulli heads fire, `to_orders.py` calls the
-  corresponding player method, which sets the Order
+- **BC label generation** (supervised teacher signal — reads what order the
+  rules AI *would* issue on a scratch player snapshot and translates it into
+  equivalent physical targets for imitation; never issues a real Order on a
+  live player)
 - **`HybridPlayerAI`'s order-override channel** (`rules_ai.py`) — a sanctioned
-  third case: a human (via the UI) or a rules-based caller can assign a real
+  second case: a human (via the UI) or a rules-based caller can assign a real
   `Order` directly to a normally neural-controlled player, bypassing the
   neural network entirely for as long as that order is in progress. See
   `ai/knowledge.md`'s "HybridPlayerAI" section — this is orthogonal to (and
@@ -65,14 +65,31 @@ from outside the `Player` class.
   which instead forces decision-head *probabilities* before gating while
   keeping the execution network in control of physical motor output.
 
-The **execution neural network drives movement** via `move_direction` (a unit
-vector) + `sprint` (Bernoulli), NOT via `move_region_center` from the decision
-network.  `to_orders.py::apply_movement_to_player` converts this to a far-target
-`MoveOrder` (50m in the direction vector) so the engine's `step_player_towards`
-picks up the correct heading for all ~15 ticks in the decision interval.
+**The neural network itself never issues an Order — not even when a decision
+head (shoot/pass/tackle/get_possession/mark) fires.** Those decision heads are
+strategic-context *input* to the execution network only.
+`ai/action/apply_nn_action.py::apply_action_to_player()` is the sole place
+execution-network outputs touch engine state, and it writes directly onto the
+`Player` object — no Order of any kind is constructed:
 
-- `move_logit < 0.5` (SelectedAction.NONE) → `player.stop()` → STANDSTILL
-- `move_logit >= 0.5` → `player.move_to(position + move_direction * 50m, sprint=sprint)`
+- **Movement**: `gating.exec_move` (an **execution**-network Bernoulli,
+  distinct from the **decision**-network's own `move` head) selects
+  STANDSTILL vs moving. When moving, `player.desired_direction` is set
+  straight from `gating.move_direction` (a unit vector) and
+  `player.desired_speed_mode` to SPRINT or JOG per `gating.sprint`. No
+  `MoveOrder`, no `player.move_to()` call — the engine's `_apply_movement()`
+  loop reads `desired_direction`/`desired_speed_mode` directly every tick.
+- **Kick**: `player.kick_with_direction(match, direction_3d, power, spin)`
+  when `gating.kick_this_tick` fires — a parallel chokepoint to
+  `kick_direct()` (used by `KickOrder`/rules AI/`MoveOrder`'s push-kick) that
+  takes an explicit 3D direction instead of an aim point + auto-solved
+  trajectory. Both set `kicked_this_tick`/`last_kick_*` and fire `on_kick` —
+  see `entities/knowledge.md`.
+- **Tackle**: `player.tackle_armed = True` when `gating.tackle_attempt` fires
+  (preconditions permitting) — the engine resolves it on contact in
+  `Match._check_armed_tackles()`, the same mechanism a rules-AI
+  `ChaseTackleOrder`/`GetPossessionOrder` ultimately arms. No "attempt now"
+  method call and no `ChaseTackleOrder` is created.
 
 The decision network's `move_region_center` / `move_arrival_speed` are
 **strategic context** for reward shaping and BC label generation — they are

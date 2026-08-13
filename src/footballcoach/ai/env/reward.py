@@ -374,7 +374,7 @@ def phase2_reward(
         max_episode_ticks: Total episode length in ticks.
         shot_on_target: Shot would reach the goal (not blocked/wide).
         goal_scored: Ball crossed the goal line this step.
-        illegal_action_attempted: Illegal action flag from to_orders.py.
+        illegal_action_attempted: Illegal action flag from apply_nn_action.py.
         possession_lost_to_keeper: Keeper caught/saved the ball.
         cfg: The 'reward.phase2' section of ai_config.json.
     """

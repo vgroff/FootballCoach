@@ -14,7 +14,9 @@ Outputs:
   kick_logit       - Bernoulli: kick this tick?
   kick_direction   - unit vector (L2-normalized inside forward(); mean is always on unit circle)
   kick_power       - raw scalar; sigmoid -> [0, 1] power_fraction
-  kick_spin        - raw 3D vector (physical units determined by to_orders.py)
+  kick_spin        - raw 3D vector; currently DISABLED at the apply_nn_action.py
+                     chokepoint (always passed as Vector3.zero() regardless of
+                     this output) -- see agent_plans/spin_implementation_plan.md
   tackle_attempt_logit - Bernoulli
   value            - critic value estimate (shared trunk Option A)
 """

@@ -32,12 +32,19 @@ Current notes:
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
     - check rules-based ui performance, re-gen data (30k examples), re-pre-train, 
+    - !! Maybe immobile opponent can't win? Maybe lower timeout? would reduce the value error.
     - !! value pretrain - why does it do so much better during PPO than during pretrain??? is the reported loss before or after re-train? Can we get the other one too? Is it using the right decision network in pretrain?
-    - !! Still a ton of invalids during Phase 1, even with the lower params, seems weird, check it out
-        - how are the starting positions etc... generated?
+        - what if we load in the actual network in the debug value net script? deterministic vs not? Can it do as well/better?
+        - what's frozen/shared for the value network?
+        - try debug value net with the decision network heads insted of it's own network
+    - Demo should log kick aim, not acutl kick direction (post-error)
+    - log entropy + entropy loss contribution for each head
+    - print what the actual MC contribution of each rewrd is per step
     - Try more aggresive learning just to see how it does? 
         - Increase step penalty?
         - Maybe re-introduce the shaping rewards?
+    - DO players have current stamina?
+    - bring annealing back?
     - Do some performance profiling - how long spent on rollouts vs PPO vs evals etc.. n_envs - how much faster does it get with more of them? How many do we want? Main threads too? - can try this with the evals script maybe?
     - re-introduce speed bonus or nah?
     - Plan: 

@@ -64,7 +64,7 @@ ai/
     schema.py         # DecisionHeadsRaw, DecisionAction, ExecutionHeadsRaw, ExecutionAction
     distributions.py  # IndependentBernoulli, MaskedCategorical, SquashedNormalHead, DirectionHead
     gating.py         # select_action() - pure Python winner-take-all, NEVER in gradient graph
-    to_orders.py      # Execution outputs -> DIRECT player physics (NO ORDERS - see below)
+    apply_nn_action.py # Execution outputs -> DIRECT player physics (NO ORDERS - see below)
   models/
     entity_encoder.py    # shared per-entity MLP + nn.MultiheadAttention
     decision_network.py  # DecisionNetwork.from_config() + derive_get_possession_prob()
@@ -524,15 +524,22 @@ etc.) are used **only** by:
 - The rules-based AI (`Phase1RulesAI`, `StagedGoalkeeper`, etc.)
 - Human input in the UI
 
-The **only** things `apply_action_to_player()` in `to_orders.py` does:
-1. **Movement**: sets `player.desired_direction` (Vector3) and
-   `player.desired_speed_mode` (SpeedMode) directly from `gating.move_direction`
-   and `gating.sprint`. The engine's `_apply_movement()` loop reads these fields.
-2. **Kick**: calls `player.kick_direct(match, aim_pt, power, spin)` if
-   `gating.kick_this_tick` is True. This executes kick physics immediately with
-   no KickOrder.
-3. **Tackle**: calls `player.tackle_direct(match, target_id)` if
-   `gating.tackle_attempt` is True and preconditions are met.
+The **only** things `apply_action_to_player()` in `ai/action/apply_nn_action.py` does:
+1. **Movement**: `gating.exec_move` selects STANDSTILL vs moving; sets
+   `player.desired_direction` (Vector3) and `player.desired_speed_mode`
+   (SpeedMode) directly from `gating.move_direction` and `gating.sprint`. The
+   engine's `_apply_movement()` loop reads these fields.
+2. **Kick**: calls `player.kick_with_direction(match, direction_3d, power, spin)`
+   if `gating.kick_this_tick` is True. This executes kick physics immediately
+   with no KickOrder. (`kick_with_direction` is a parallel chokepoint to
+   `kick_direct` — used by `KickOrder`/rules AI/`MoveOrder`'s push-kick — that
+   takes an explicit 3D direction instead of an aim point; both set
+   `kicked_this_tick`/`last_kick_*` and fire `on_kick`.)
+3. **Tackle**: sets `player.tackle_armed = True` if `gating.tackle_attempt` is
+   True and preconditions are met (else returns `illegal_action=True`); there
+   is no `tackle_direct()` method. `Match._check_armed_tackles()` resolves the
+   armed tackle on contact — the same mechanism a rules-AI `ChaseTackleOrder`
+   ultimately arms.
 
 The decision network heads (`shoot`, `pass_`, `move`, `get_possession`, `mark`,
 `hold_position`) are **inputs to the execution network** — they provide
@@ -742,7 +749,7 @@ Key test files:
 - `test_gae.py` – hand-computed GAE reference cases, episode boundary, bootstrapping
 - `test_distributions.py` – masked slots exactly zero, squashed bounds, unit vectors
 - `test_gating.py` – winner-take-all selection, threshold edge cases, pass-through
-- `test_to_orders.py` – legal/illegal action detection, correct order types
+- `test_apply_nn_action.py` – legal/illegal action detection, correct direct-field application
 - `test_reward.py` – per-component arithmetic, EMA latency, convergence
 - `test_networks.py` – forward pass shapes, no-NaN, get_possession constraint
 

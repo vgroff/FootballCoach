@@ -1197,6 +1197,14 @@ def build_1v1_scenario(
     Pass ``trainee_team`` to pin the side (used by tests / UI scenarios that
     need a fixed attacking direction).
 
+    An immobile opponent can never reach ITS OWN box with possession by any
+    means other than spawning inside it and getting lucky with a ball roll
+    (it never moves) -- that coincidence is excluded outright by re-rolling
+    the opponent's spawn position out of their own box whenever this
+    episode's opponent-type roll lands on immobile. Rules-based and neural
+    opponents are unaffected (they can legitimately end up in their own box
+    through real play).
+
     Ball velocity is resampled (up to 20 times) until a linear extrapolation
     at the initial speed for 3 seconds stays in bounds (ignoring friction -
     conservative).  If all attempts fail the ball starts at rest.
@@ -1330,6 +1338,59 @@ def build_1v1_scenario(
         opponent.ai = None
         match._opponent_use_rules_ai = False
         match._opponent_is_immobile = False
+
+    if match._opponent_is_immobile:
+        # An immobile opponent issues no order/AI of its own, so its
+        # position never changes UNDER ITS OWN POWER -- but it is not
+        # perfectly frozen: resolve_all_overlaps() (engine/collision.py)
+        # pushes apart any overlapping ACTIVE players purely from physical
+        # collision, with no regard for whether either side has an AI. If
+        # the trainee repeatedly contests the ball right next to the
+        # opponent's own box, each contact can nudge the immobile opponent
+        # a little -- a spawn point merely OUTSIDE the box with zero margin
+        # could still get walked across the line over the course of an
+        # episode. A real clearance margin (not just non-overlap) is needed
+        # to make this genuinely impossible rather than just less likely.
+        #
+        # This matters because reaching its own box with possession is the
+        # phase-1 terminal condition that, from the opponent's side, reads
+        # as a trainee loss -- for an opponent that can never chase or even
+        # meaningfully hold a defensive line, that's a pure coincidence
+        # with zero skill/intent behind it. It produced badly-mispredicted,
+        # high-variance value-loss rows (opponent_box_possession MSE ~48
+        # against a return std of ~1.8) while also unfairly zeroing the
+        # trainee's terminal reward for what is, from its perspective, a
+        # coin flip. Re-rolling the spawn point (with margin) is sufficient
+        # since position is otherwise stable -- still respects
+        # opponent_min_dist_m/opponent_max_dist_m if the caller set them.
+        _immobile_own_box_margin_m = 2.0
+
+        def _immobile_pos_ok(pos: Vector3) -> bool:
+            half_box_w = pitch.box_width_m / 2.0 + _immobile_own_box_margin_m
+            if opponent_team == Team.LEFT:
+                in_x = pos.x <= -pitch.half_length + pitch.box_length_m + _immobile_own_box_margin_m
+            else:
+                in_x = pos.x >= pitch.half_length - pitch.box_length_m - _immobile_own_box_margin_m
+            in_y = -half_box_w <= pos.y <= half_box_w
+            if in_x and in_y:
+                return False
+            if opponent_min_dist_m > 0.0 or opponent_max_dist_m < 9999.0:
+                d = math.hypot(pos.x - trainee.position.x, pos.y - trainee.position.y)
+                if not (opponent_min_dist_m <= d <= opponent_max_dist_m):
+                    return False
+            return True
+
+        if not _immobile_pos_ok(opponent.position):
+            for _reroll_attempt in range(50):
+                _candidate = _rand_pos()
+                if _immobile_pos_ok(_candidate):
+                    opponent.position = _candidate
+                    break
+            # else: 50 attempts exhausted (only possible with a pathologically
+            # tight opponent_min_dist_m/max_dist_m window) -- fall back to
+            # whatever the last candidate was, same lenient philosophy as the
+            # ball-placement loop above.
+
     return match
 
 

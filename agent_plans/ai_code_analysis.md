@@ -606,6 +606,19 @@ add a one-line note in `/memories/repo/rules.md` that the previously-tracked
 `to_orders.py` bug appears fixed as of this review (pending confirmation) so
 future sessions don't keep re-flagging already-fixed code as broken.
 
+**RESOLVED (follow-up session, confirmed via direct code read of
+`apply_nn_action.py`):** the fix genuinely landed — `apply_action_to_player()`
+sets `desired_direction`/`desired_speed_mode` directly, calls
+`kick_with_direction()`, and sets `tackle_armed`; no Order/MoveOrder is ever
+constructed. All `to_orders.py` filename references and the stale
+`kick_direct()`/`tackle_direct()` claims have now been corrected across
+`src/footballcoach/knowledge.md`, `src/footballcoach/entities/knowledge.md`,
+`src/footballcoach/engine/knowledge.md`, `src/footballcoach/ai/knowledge.md`,
+`ai_trainer_knowledge.md`, `tests/knowledge.md`, and the handful of inline
+code comments that repeated the same stale filename/mechanism
+(`entities/player.py`, `ai/action/schema.py`, `ai/models/decision_network.py`,
+`ai/models/execution_network.py`, `ai/env/reward.py`, `ai/ppo/bc.py`).
+
 ### 2.6 `gating.py`'s `_HEAD_ORDER`/`_HEAD_TO_ACTION` duplication (finding #8)
 
 ```python

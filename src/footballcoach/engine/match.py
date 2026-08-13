@@ -148,6 +148,15 @@ class Match:
             return
         dt = self.dt_s
 
+        # Snapshot pre-movement positions for the swept ball-pickup check
+        # (_update_loose_ball_pickup) -- must be captured before
+        # _process_orders/_apply_movement actually move anyone this tick.
+        # Captured for all players (not just currently-ACTIVE ones) so a
+        # player whose INACTIVE_TACKLED/CONTROLLING_BALL timer expires
+        # later this same tick (in _update_state_timers, right below) still
+        # has a valid pre-tick position on record.
+        pre_tick_player_positions = {p.player_id: p.position for p in self.players}
+
         self._update_state_timers(dt)
         self._process_orders(dt)
         self._apply_movement(dt)
@@ -172,7 +181,7 @@ class Match:
             )
             resolve_goal_boundary(self.ball, self.pitch, self.ball_physics_params)
 
-        self._update_loose_ball_pickup(dt, pre_flight_position)
+        self._update_loose_ball_pickup(dt, pre_flight_position, pre_tick_player_positions)
 
         self._check_armed_tackles()
         self._check_head_on_tackles()
@@ -221,12 +230,17 @@ class Match:
 
         Orders and AI set ``player.desired_direction`` and ``player.desired_speed_mode`` each tick.
         This is the ONLY place ``step_player_towards`` and stamina drain are called for locomotion.
-        Players with ``desired_speed_mode=None`` had no movement intent this tick — their velocity
-        is left unchanged (physics inertia coasts them forward).
+        Players with ``desired_speed_mode=None`` had no movement intent this tick (e.g. a brief gap
+        between one order completing and the AI deciding the next one) — velocity/heading are left
+        unchanged, but position still advances from the existing velocity (basic inertial coasting;
+        no deceleration/turning, since there's no intent to decelerate or turn towards). Without
+        this, a player with nonzero velocity would freeze in place for any no-intent tick, which
+        step_player_towards's own physics never does (it always advances position from velocity).
         ``desired_speed_mode`` is cleared to ``None`` after application so each tick is independent.
         """
         for player in self.players:
             if player.desired_speed_mode is None:
+                player.position = player.position + player.velocity * dt
                 continue
             has_ball = (
                 self.ball.possessed_by == player.player_id
@@ -305,14 +319,34 @@ class Match:
         """Runs one tick of 'acquire the ball' behaviour, shared by
         ``GetPossessionOrder`` and ``MarkOrder``'s intercept/tackle fallback.
 
+        - Returns ``True`` once possession is actually confirmed
+          (``self.ball.possessed_by == player.player_id``).
         - If another player has the ball: chase them and, on contact, attempt
-          a tackle.  Returns ``True`` once the tackle has been resolved.
-        - If the ball is loose: sprint to intercept.  Returns ``True`` when
-          already within pickup radius (``_update_loose_ball_pickup`` handles
-          the rest next tick).
-        - Returns ``False`` while still en-route (chasing / sprinting).
+          a tackle.
+        - If the ball is loose: sprint to intercept, continuing to close the
+          distance and set movement intent every tick — including while
+          already within pickup radius — until possession is confirmed
+          above. Previously this branch returned ``True`` purely from
+          geometric proximity ("at the ball — pickup will complete next
+          tick"), assuming pickup always succeeds once close enough. That's
+          not guaranteed: `possession.can_pick_up_ball`'s closing-velocity
+          release-grace check can legitimately block pickup on that tick
+          (e.g. a player who just push-kicked the ball away, now standing
+          right next to a ball still moving away from them). When that
+          happened, the order completed and cleared itself without actually
+          gaining possession and without ever setting movement intent that
+          tick — `act()` would then immediately re-issue a fresh
+          ``GetPossessionOrder`` next tick, which repeated the same hollow
+          "complete" with no motion, in a loop, until the ball drifted far
+          enough away for the proximity check to stop firing (often 1-2
+          ticks of the player doing nothing productive after every
+          push-kick). Gating completion on the ACTUAL confirmed possession
+          (`has_ball`, computed below but previously never used for this)
+          fixes this at the source — no test-side workaround needed.
         """
         has_ball = self.ball.possessed_by == player.player_id
+        if has_ball:
+            return True
         carrier = self.ball_carrier()
 
         order = player.current_order
@@ -350,8 +384,6 @@ class Match:
                     dist_to_intercept = (intercept - player.position).length_xy()
                     intercept = intercept + ball_vel_xy * (dist_to_intercept * overshoot_frac / ball_speed_xy)
             direction = intercept - player.position
-            if direction.length_xy() <= self.pickup_radius_m:
-                return True  # at the ball — pickup will complete next tick
             from footballcoach.orders import _compute_movement_intent
             adj_dir, sm = _compute_movement_intent(
                 player, direction, self,
@@ -371,45 +403,67 @@ class Match:
         self.ball.position = self.ball.position.with_z(self.ball.radius_m)
         self.ball.velocity = carrier.velocity
 
-    def _update_loose_ball_pickup(self, dt: float, pre_flight_position: Vector3) -> None:
+    def _update_loose_ball_pickup(
+        self, dt: float, pre_flight_position: Vector3, pre_tick_player_positions: dict[str, Vector3],
+    ) -> None:
         if self.ball.possessed_by is not None:
             return
+
+        # Collect every ACTIVE player eligible to pick up the ball this tick
+        # (including via the swept-tunneling exception -- see
+        # possession.can_pick_up_ball), then resolve contention by picking
+        # whoever is CURRENTLY closest to the ball, rather than the first
+        # eligible player in self.players' (essentially arbitrary, team-
+        # assignment-order) iteration order. This also naturally prefers a
+        # player who is genuinely standing on the ball right now over one
+        # who is only eligible because they swept past it earlier this tick
+        # and has since moved further away -- a swept-only candidate is by
+        # definition currently outside pickup_radius_m, so a within-radius
+        # candidate (if any) always wins the distance comparison.
+        candidates: list[Player] = []
         for player in self.players:
             if player.state != PlayerState.ACTIVE:
                 continue
-            if not can_pick_up_ball(player, self.ball, self.ball_pickup_params, pre_flight_position):
+            player_pre_tick_position = pre_tick_player_positions.get(player.player_id)
+            if not can_pick_up_ball(
+                player, self.ball, self.ball_pickup_params, pre_flight_position, player_pre_tick_position,
+            ):
                 continue
+            candidates.append(player)
 
-            relative_speed = (self.ball.velocity - player.velocity).length()
-            player.firsttime_difficulty = compute_difficulty(
-                self.control_time_params, self.ball.height_m, relative_speed, player.speed_mps
-            )
-            t_control = control_time_s(
-                self.control_time_params,
-                self.ball.height_m,
-                relative_speed,
-                player.speed_mps,
-                player.attributes.ball_control,
-                is_goalkeeper_in_box=player.is_goalkeeper and self.pitch.is_in_either_box(player.position),
-            )
-            noise_sigma = t_control * self.control_time_params.noise_sigma_fraction * (1.0 - self.rng_reduction)
-            t_control = max(0.01, t_control + self.rng.gauss(0.0, noise_sigma))
-
-            player.state = PlayerState.CONTROLLING_BALL
-            player.state_timer_s = t_control
-            # Grant possession immediately so the ball is glued to the player
-            # via _sync_possessed_ball each tick (rather than frozen in space).
-            # Speed is snapped down by control_speed_multiplier on contact;
-            # the player then coasts at that reduced speed until control ends.
-            self._set_possession(player.player_id)
-            player.velocity = player.velocity * self.movement_params.control_speed_multiplier
-            # Only one player may pick up a loose ball per tick -- without this,
-            # a second player also within pickup_radius_m (e.g. a tackler
-            # standing right next to the receiver) would unconditionally
-            # overwrite the possession just granted above.
+        if not candidates:
             return
-            # Display hint for the UI action-icon system (consumed by renderer, not engine logic).
-            player.action_icon = "🧤" if player.is_goalkeeper else "✋"
+
+        player = min(
+            candidates,
+            key=lambda p: (p.position.xy().distance_to(self.ball.position.xy()), p.player_id),
+        )
+
+        relative_speed = (self.ball.velocity - player.velocity).length()
+        player.firsttime_difficulty = compute_difficulty(
+            self.control_time_params, self.ball.height_m, relative_speed, player.speed_mps
+        )
+        t_control = control_time_s(
+            self.control_time_params,
+            self.ball.height_m,
+            relative_speed,
+            player.speed_mps,
+            player.attributes.ball_control,
+            is_goalkeeper_in_box=player.is_goalkeeper and self.pitch.is_in_either_box(player.position),
+        )
+        noise_sigma = t_control * self.control_time_params.noise_sigma_fraction * (1.0 - self.rng_reduction)
+        t_control = max(0.01, t_control + self.rng.gauss(0.0, noise_sigma))
+
+        player.state = PlayerState.CONTROLLING_BALL
+        player.state_timer_s = t_control
+        # Grant possession immediately so the ball is glued to the player
+        # via _sync_possessed_ball each tick (rather than frozen in space).
+        # Speed is snapped down by control_speed_multiplier on contact;
+        # the player then coasts at that reduced speed until control ends.
+        self._set_possession(player.player_id)
+        player.velocity = player.velocity * self.movement_params.control_speed_multiplier
+        # Display hint for the UI action-icon system (consumed by renderer, not engine logic).
+        player.action_icon = "🧤" if player.is_goalkeeper else "✋"
 
 
     def _leading_pass_target(self, passer: Player, order: "PassOrder") -> Vector3:

@@ -25,15 +25,32 @@ of the engine.
 
 ### Direct-physics methods for the neural network
 
-Two methods on `Player` exist **exclusively for the neural network** to call
-via `to_orders.py`. They bypass the Orders system entirely:
+`Player.kick_direct()` and `Player.kick_with_direction()` bypass the Orders
+system entirely and execute kick physics immediately — no `KickOrder` is
+created either way. Only `kick_with_direction()` is called by the neural
+network (via `ai/action/apply_nn_action.py::apply_action_to_player()`);
+`kick_direct()` is used by `KickOrder.execute()`/rules AI and by
+`MoveOrder`'s push-kick behaviour (`orders.py::_do_push_kick()`):
 
-- `player.kick_direct(match, aim_point, power_fraction, spin)` — executes kick
-  physics immediately (same logic as `KickOrder.execute()`, which now delegates
-  here). No `KickOrder` is created. Only fires if `ball.possessed_by == player.player_id`.
-- `player.tackle_direct(match, target_player_id)` — attempts an immediate
-  tackle if in contact range. Returns `True` if contact was resolved, `False`
-  if out of range. No `ChaseTackleOrder` is created.
+- `player.kick_direct(match, aim_point, power_fraction, spin)` — aims at an
+  explicit target point; the ball's launch direction is solved from that aim
+  point (same logic as `KickOrder.execute()`, which delegates here). Only
+  fires if `ball.possessed_by == player.player_id`.
+- `player.kick_with_direction(match, direction_3d, power_fraction, spin)` —
+  takes an explicit 3D unit direction directly, no aim-point ballistic solve.
+  Neural network only.
+
+Both are otherwise equivalent chokepoints: each independently sets
+`player.kicked_this_tick = True`, `last_kick_direction`/`last_kick_power_fraction`/
+`last_kick_spin`, and fires `player.on_kick` if set — see `ai/knowledge.md`'s
+BC label table for why this matters (BC supervision reads these fields, not
+order types).
+
+There is no `tackle_direct()` method. The neural network arms a tackle by
+setting `player.tackle_armed = True` (via `apply_action_to_player()`) — the
+same flag a rules-AI `ChaseTackleOrder`/`GetPossessionOrder` sets when it
+closes to contact range. Either way, `Match._check_armed_tackles()` is what
+actually resolves the tackle on contact; no order object is required.
 
 All other action methods (`kick()`, `move_to()`, `get_possession()`, etc.)
 set `current_order` and are for the **rules-based AI and human input only**.

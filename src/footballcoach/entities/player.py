@@ -165,7 +165,11 @@ class Player:
 
     # ------------------------------------------------------------------
     # Atomic action methods — the only correct way to assign Orders.
-    # PlayerAI subclasses, to_orders.py, and tests all call these.
+    # Rules-based PlayerAI subclasses, HybridPlayerAI's order-override
+    # channel, and tests all call these. The neural network's execution
+    # path (ai/action/apply_nn_action.py) does NOT call these -- it sets
+    # desired_direction/desired_speed_mode/tackle_armed directly and never
+    # issues an Order at all.
     # Never set player.current_order to an Order dataclass directly
     # from outside this class.
     # ------------------------------------------------------------------
@@ -329,9 +333,10 @@ class Player:
         """Move toward a target position.
 
         Used by the rules-based AI and BC label generation.
-        The neural execution network drives movement via move_direction
-        (a far-target MoveOrder constructed in to_orders.py), not by
-        calling this method with a strategic region centre.
+        The neural execution network drives movement via move_direction,
+        applied by setting desired_direction/desired_speed_mode directly in
+        ai/action/apply_nn_action.py -- no MoveOrder or call to this method
+        is involved.
         """
         from footballcoach.orders import MoveOrder
         self.current_order = MoveOrder(

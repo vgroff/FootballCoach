@@ -74,7 +74,25 @@ caught mid-air) - only velocity is zeroed. Correspondingly,
 the ball is possessed - a frozen ball must stay frozen for the whole
 control-time window, not just for the first tick.
 
-If you reorder `Match.step()`, keep all three of the above dependencies in
+**Ordering subtlety #4 - pickup swept check covers BOTH entities, and
+contention is resolved by current distance, not list order:**
+`possession.can_pick_up_ball()` accepts both `ball_pre_tick_position` and
+`player_pre_tick_position` and checks the swept path of ball-relative-to-
+player, so a fast PLAYER grazing past a slow/stationary ball within one tick
+is caught by the same tunneling exception as a fast ball grazing past a slow
+player (see `possession._swept_min_separation`) — also correctly handles
+both moving simultaneously. `Match.step()` snapshots every player's position
+at the very top of the tick, before `_process_orders`/`_apply_movement` can
+move anyone, into `pre_tick_player_positions`, and threads it through to
+`_update_loose_ball_pickup`. When multiple ACTIVE players are eligible in
+the same tick (including via the swept exception), the one with the
+smallest CURRENT distance to the ball wins — not the first eligible player
+in `self.players` iteration order (a fragile, order-dependent tie-break the
+contention logic used to have). A within-radius candidate always beats a
+swept-only one, since a swept-only candidate is by definition currently
+outside `pickup_radius_m`.
+
+If you reorder `Match.step()`, keep all four of the above dependencies in
 mind.
 
 ## `movement.py` - movement, stamina, turning
@@ -719,29 +737,43 @@ never reads it back.
 
 ## AI / engine boundary (relevant when wiring up the AI training loop)
 
-The AI package (`src/footballcoach/ai/`) drives the engine via the standard
-`orders.py` / `actions.py` interface — same as the UI.  `ai/action/to_orders.py`
-translates neural-network gating output into `MoveOrder`, `KickOrder`,
-`PassOrder`, `ChaseTackleOrder`, `GetPossessionOrder`, `MarkOrder` objects
-and assigns them to `player.current_order`, then `Match.step()` handles
-execution identically to any other caller.
+**The AI package does NOT drive the engine via Orders.** An earlier design
+routed neural-network output through the standard `orders.py`/`actions.py`
+interface (constructing `MoveOrder`/`KickOrder`/etc. and assigning them to
+`player.current_order`, same as the UI/rules AI); that has since been
+replaced by `ai/action/apply_nn_action.py::apply_action_to_player()`, which
+writes execution-network output directly onto `Player` fields — no Order of
+any kind is ever constructed for a neural-controlled player. See
+`knowledge.md`'s "Neural network / Orders boundary" section and
+`ai/knowledge.md`'s "THE NEURAL NETWORK NEVER ISSUES ORDERS" section for the
+full current picture; only the rules-based AI, BC label generation (reading,
+never issuing), and `HybridPlayerAI`'s explicit order-override channel ever
+touch `player.current_order`.
 
-**Illegal-action guardrail audit** (ai_design_doc.md section 11 checklist;
-items confirmed vs engine behaviour as of the time the AI package was added):
+**Illegal-action guardrail audit** (current state, not the original
+ai_design_doc.md section 11 checklist — that described the since-replaced
+Order-based path):
 
-- `KickOrder`/`ShootOrder`: `Match._process_orders` requires `ball.possessed_by
-  == player.player_id` before calling `kick_ball`/`pass_ball`; an AI
-  attempting to shoot without possession is safely a no-op at the engine
-  level. `to_orders.py` detects this independently and sets `illegal_action=True`
-  for the reward function.
-- `ChaseTackleOrder`/`GetPossessionOrder`: `attempt_tackle()` call sites
-  already check `player.state != INACTIVE_TACKLED` via `player.is_available_to_tackle()`.
-  `to_orders.py` additionally refuses to assign these orders to inactive players.
-- `PassOrder`: same possession precondition as `KickOrder` (checked in
-  `to_orders.py`; engine-level guard is the same `kick_ball` path).
-- `SaveOrder`: documented as "goalkeeper-only" in orders.py; the engine
-  does not enforce this with a hard guard (it would just chase the ball as
-  an outfield player); `to_orders.py` does not currently guard non-GK save
-  attempts — add a guard if non-GK save orders prove to be a training issue.
+- **Tackle**: `apply_action_to_player()` explicitly flags
+  `illegal_action=True` for `tackle_while_inactive` (player not
+  `is_available_to_tackle()`) and `tackle_no_carrier` (no opposition ball
+  carrier to tackle) before ever setting `player.tackle_armed`. This is the
+  only case currently wired into the reward function's
+  `illegal_action_penalty` (see `ai/env/reward.py`).
+- **Kick**: `player.kick_with_direction()` silently no-ops if
+  `ball.possessed_by != player.player_id` (mirrors the engine-level safety
+  net `KickOrder`/`kick_direct()` also rely on), but `apply_action_to_player()`
+  does not currently flag this as `illegal_action` for the reward function —
+  a kick attempted without possession is a safe no-op, just not a penalised
+  one at present.
+- **Pass**: there is no separate pass-execution action in the current
+  execution network (`ExecutionHeadsRaw` has no dedicated pass head) —
+  passing is Phase 3 (not yet implemented, see `ai_trainer_knowledge.md`
+  curriculum section), so `PassOrder` is not part of this boundary at all
+  today.
+- **Save**: `SaveOrder` is rules-AI/GK-only in every current phase; the
+  execution network has no save action, so there is nothing to guard here
+  either.
 - AI must be punished for illegal attempts AND the engine must be a safe
-  no-op — both protections coexist (see design doc 9.7).
+  no-op — both protections coexist where implemented (see design doc 9.7);
+  currently that's tackle only, per above.

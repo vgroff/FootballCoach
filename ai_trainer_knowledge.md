@@ -145,7 +145,7 @@ Not affected: `retr`, `appr_sq` retreat side, `poss`, `hdg`, `out`, `ill`, `box`
 | `src/footballcoach/ai/models/decision_network.py` | `DecisionNetwork.from_config()` |
 | `src/footballcoach/ai/models/execution_network.py` | `ExecutionNetwork.from_config()` |
 | `src/footballcoach/ai/action/gating.py` | `select_action()` — winner-take-all, NO gradients |
-| `src/footballcoach/ai/action/to_orders.py` | Applies execution outputs DIRECTLY to player — **no Orders**. Sets `desired_direction`, `desired_speed_mode`, calls `kick_direct()`, `tackle_direct()` |
+| `src/footballcoach/ai/action/apply_nn_action.py` | Applies execution outputs DIRECTLY to player — **no Orders**. Sets `desired_direction`, `desired_speed_mode`, calls `kick_with_direction()`, sets `tackle_armed = True` (no `tackle_direct()` method exists) |
 | `src/footballcoach/ai/action/distributions.py` | `IndependentBernoulli`, `MaskedCategorical`, `SquashedNormalHead`, `DirectionHead` |
 | `src/footballcoach/ai/obs/augment.py` | Geometric + slot-permutation augmentation. **CRITICAL**: target slot indices (pass/tackle/mark) are remapped through the inverse permutation — do not remove this |
 
@@ -153,8 +153,12 @@ Not affected: `retr`, `appr_sq` retreat side, `poss`, `hdg`, `out`, `ill`, `box`
 
 The neural network NEVER sets `player.current_order`. It ONLY:
 1. Sets `player.desired_direction` (Vector3) + `player.desired_speed_mode` (SpeedMode) directly
-2. Calls `player.kick_direct(match, ...)` when `kick_this_tick` is True
-3. Calls `player.tackle_direct(match, ...)` when `tackle_attempt` is True
+2. Calls `player.kick_with_direction(match, ...)` when `kick_this_tick` is True
+   (a parallel chokepoint to `kick_direct()`, used by `KickOrder`/rules AI — both
+   set `kicked_this_tick`/`last_kick_*` and fire `on_kick`)
+3. Sets `player.tackle_armed = True` when `tackle_attempt` is True — there is no
+   `tackle_direct()` method; `Match._check_armed_tackles()` resolves the tackle
+   on contact, the same mechanism a rules-AI `ChaseTackleOrder` also arms
 
 The decision heads (`shoot`, `pass_`, `move`, `get_possession`, etc.) are
 **inputs to the execution network** providing strategic context. They do NOT
@@ -211,8 +215,16 @@ All players share **one** `DecisionNetwork` and **one** `ExecutionNetwork`
   `kick_this_tick` (Bernoulli), `kick_direction`, `kick_power`, `kick_spin`,
   `tackle_attempt` (Bernoulli), `value`
 
-**Decision interval**: networks run every **0.5s** of sim time (~15 engine
-ticks at 1/30s).  Between decisions, the last assigned `Order` persists.
+**Decision interval**: networks run every `ai_config.json["observation"]["decision_interval_s"]`
+of sim time — currently **0.25s** (not the 0.5s this doc previously stated;
+check the config, it has drifted at least once). At the config's
+`sim_dt_s=0.05` (20Hz, training) that's 5 engine ticks; the UI always runs at
+30Hz regardless of `sim_dt_s` (see `ui/scenarios.py`'s `DECISION_INTERVAL_MS_DEFAULT`
+for the UI's own independently-configurable interval, default 500ms).
+Between decisions, no Order persists — the neural network never issues one
+(see 3.2's `apply_nn_action.py` note below); instead `player.desired_direction`/
+`player.desired_speed_mode` stay fixed at whatever `apply_action_to_player()`
+last wrote, and the engine's `_apply_movement()` reads them fresh every tick.
 
 ### 3.2 Action gating (CRITICAL — do not confuse with training)
 
@@ -220,7 +232,8 @@ Two completely separate concerns:
 
 1. **In-game gating** (`gating.py::select_action()`): pure Python,
    `@no_grad`, post-sampling.  If any sigmoid head > 0.5 → the highest
-   one "wins" (all others treated as 0) → drives the engine via `to_orders.py`.
+   one "wins" (all others treated as 0) → drives the engine via
+   `apply_nn_action.py` (direct field writes, no Orders — see above).
    This is *not* differentiable.
 
 2. **PPO log_prob**: computed on raw logits/samples *before* gating, inside
@@ -767,7 +780,8 @@ step=28,679 | rew=8.76 | pol=0.02 val=1.00 ent=0.25 kl=0.16  bc=2.84(x0.17) | 28
 |-------|---------|
 | `rew` | Mean episode return over last 20 episodes |
 | `pol` | PPO clipped surrogate policy loss (`-(min(ratio*adv, clip(ratio)*adv)).mean()`). Small and can be either sign — don't read meaning into the sign per-rollout, only into large sustained trends |
-| `val` | **Normalised MSE** of the value head: `MSE(predicted, GAE_return) / Var(returns)`.  ~1.0 = predicting the mean (no better than constant).  <0.5 = critic is useful.  0.85 after warmup is expected — it improves as returns stabilise |
+| `val` | **Normalised MSE** of the value head: `MSE(predicted, GAE_return) / Var(returns)`.  ~1.0 = predicting the mean (no better than constant).  <0.5 = critic is useful.  0.85 after warmup is expected — it improves as returns stabilise. **IMPORTANT — this is an in-sample number**: it's `np.mean(all_value_loss)` in `_ppo_update()` (`ppo_trainer.py`), averaged over losses computed progressively DURING this rollout's own minibatch training loop (and, after an early-stop, during the value-only continuation's extra epochs — all on the same batch). It is NOT held-out and is NOT directly comparable to `pretrain_value()`'s reported val loss (which uses a genuine 85/15 episode-level train/val split, evaluated in `.eval()` mode on unseen episodes). Seeing `val` noticeably lower than the pretrain val loss does not by itself mean the critic generalises better post-PPO — see `val_pre` below for the fair comparison, and see the "value-only continuation" section's own documented risk of overfitting the critic to a single rollout batch. |
+| `val_pre` | **Pre-update value loss** — the SAME normalised-MSE formula, but computed ONCE on this rollout's full batch with the weights as they were *before* this call's minibatch training loop starts (`pre_update_value_loss` in the returned metrics dict). Since this rollout's transitions were collected under the policy/value from the end of the previous update, the critic has never been trained on this exact data yet, so `val_pre` is a genuine held-out-ish generalisation number — directly comparable to `pretrain_value()`'s val loss, unlike `val` above. Compare `val_pre` across successive rollouts (not `val_pre` vs `val` within one rollout) to track real generalisation improvement over training. |
 | `ent` | Policy entropy (higher = more exploration) |
 | `kl` | Approximate KL divergence from old policy.  >0.1 = large update (KL diagnostics printed separately). Repeated >1.0 = policy diverging |
 | `bc=X(xY)` | BC auxiliary loss value × current annealing coefficient (`bc.aux_coeff_start/end/aux_coeff_anneal_fraction`).  Disappears once coeff reaches 0 |
@@ -886,7 +900,7 @@ scenario's `build_*` function (e.g. `"trainee"` for phase 1,
 uv run pytest tests/ai_unit/ -v
 ```
 Files: `test_obs_schema`, `test_obs_encoder`, `test_gae`, `test_distributions`,
-`test_gating`, `test_to_orders`, `test_reward`, `test_networks`.
+`test_gating`, `test_apply_nn_action`, `test_reward`, `test_networks`.
 
 ### Smoke tests (actual training loop, ~10s)
 ```bash

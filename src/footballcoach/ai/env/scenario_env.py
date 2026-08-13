@@ -482,7 +482,17 @@ class ScenarioEnv:
         self._trainee_pending_loss = _trainee_pending_loss
         box_terminal = in_opponent_box and trainee_has_possession_now
 
-        # Opponent reached trainee's box with possession (phase 1 terminal — trainee loses)
+        # Opponent reached trainee's box with possession (phase 1 terminal — trainee loses).
+        # Excluded outright when the opponent is immobile: it never chases or
+        # holds a defensive line, so the only way it could ever satisfy this
+        # otherwise would be a pure coincidence of spawn position (and/or
+        # incidental collision push-apart nudging it there — see
+        # ui/scenarios.py's build_1v1_scenario, which also re-rolls the
+        # immobile opponent's spawn away from its own box with a clearance
+        # margin, belt-and-braces). Gating the terminal condition itself
+        # here is the actually-robust fix: it holds regardless of how the
+        # immobile opponent's position ever got wherever it is, rather than
+        # trying to prevent every possible geometric path to this outcome.
         in_trainee_box = match.pitch.is_in_box(
             match.ball.position,
             left=(player.team == Team.LEFT),  # trainee's own box
@@ -491,6 +501,7 @@ class ScenarioEnv:
             in_trainee_box
             and match.ball.possessed_by is not None
             and match.ball.possessed_by != self.trainee_player_id
+            and not getattr(match, "_opponent_is_immobile", False)
         )
 
         timeout = self._episode_ticks >= int(self.max_episode_s / self._dt_s)

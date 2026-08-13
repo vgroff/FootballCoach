@@ -111,7 +111,8 @@ class DecisionNetwork(nn.Module):
         self.tackle_target_logits = nn.Linear(trunk_hidden, MAX_OTHER_PLAYERS)
         self.mark_target_logits = nn.Linear(trunk_hidden, MAX_OTHER_PLAYERS)
 
-        # --- Continuous heads (raw outputs; squashing in to_orders.py) ---
+        # --- Continuous heads (raw outputs; squashing where consumed, e.g.
+        # bc.py/ppo_trainer.py -- strategic context only, not a motor input) ---
         # move_region_center: 2D normalized offset; tanh-squashed later
         self.move_region_center = nn.Linear(trunk_hidden, 2)
         # move_region_size: sigmoid+scale to [1, 4] m

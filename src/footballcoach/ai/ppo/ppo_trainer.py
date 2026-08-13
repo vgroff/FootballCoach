@@ -1136,7 +1136,8 @@ class PPOTrainer:
             f"[PPO] step={self._total_steps:,}  speed={steps_per_sec:.0f}/s  "
             f"reward={mean_ep_reward:.2f}{opp_rew_str}",
             f"  loss     policy={metrics['policy_loss']:.4f}  "
-            f"value={metrics['value_loss']:.4f}(x{self.vf_coef})={self.vf_coef * metrics['value_loss']:.4f}",
+            f"value={metrics['value_loss']:.4f}(x{self.vf_coef})={self.vf_coef * metrics['value_loss']:.4f}"
+            f"  val_pre={metrics['pre_update_value_loss']:.4f}",
             f"           entropy={metrics['entropy']:.4f}  kl={metrics['approx_kl']:.4f}"
             + (f"  {bc_str.strip()}" if bc_str else ""),
             f"  value    {_val_diag_str}",
@@ -3348,6 +3349,44 @@ class PPOTrainer:
         _move_ls_start = float(self.execution_net.move_dir_log_std.mean().item())
         _kick_ls_start = float(self.execution_net.kick_dir_log_std.mean().item())
 
+        # --- Pre-update value loss: a genuinely held-out-ish generalisation
+        # diagnostic, computed on this rollout's FULL batch with the current
+        # weights BEFORE any minibatch training this call touches them (this
+        # rollout's transitions were collected under the policy/value from
+        # the END of the previous update, so the critic has never been
+        # trained on this exact data). Uses the same MSE/Var(returns)
+        # formula as the in-sample `value_loss`/`val=` computed below (and
+        # as pretrain_value()'s val loss), so it's directly comparable to
+        # both -- unlike `all_value_loss` below, which averages losses
+        # computed progressively DURING training on this same batch (and,
+        # after early-stop, during the value-only continuation's extra
+        # epochs on the same data), so it structurally reads better than a
+        # true generalisation number regardless of any real overfitting on
+        # top. See ai_trainer_knowledge.md section 8's "val=" / "val_pre="
+        # note for the full rationale.
+        _ret_var_full = returns.var().clamp(min=1.0)
+        with torch.no_grad():
+            _pre_sq_err_sum = 0.0
+            _pre_n = 0
+            for _start in range(0, n, self.minibatch_size):
+                _idx = torch.arange(_start, min(_start + self.minibatch_size, n))
+                _pre_obs = {k.replace("obs/", ""): batch[k][_idx].to(self.device)
+                            for k in batch if k.startswith("obs/")}
+                _psf, _pof, _pem = _pre_obs["self_feat"], _pre_obs["other_feat"], _pre_obs["exists_mask"]
+                _pbf, _pgf = _pre_obs["ball_feat"], _pre_obs["global_feat"]
+                _psat, _poat = _ai_types(_pre_obs)
+                _pd_heads = self.decision_net(_psf, _pof, _pem, _pbf, _pgf, _psat, _poat)
+                if self.separate_value_net:
+                    _pd_heads_v = _detach_decision_heads(_pd_heads)
+                    _pe_heads = self.value_net(_psf, _pof, _pem, _pbf, _pgf, _pd_heads_v, _psat, _poat)
+                else:
+                    _pe_heads = self.execution_net(_psf, _pof, _pem, _pbf, _pgf, _pd_heads, _psat, _poat)
+                _pred = _pe_heads.value.squeeze(-1)
+                _pret = returns[_idx].to(self.device)
+                _pre_sq_err_sum += F.mse_loss(_pred, _pret, reduction="sum").item()
+                _pre_n += len(_idx)
+            pre_update_value_loss = (_pre_sq_err_sum / max(_pre_n, 1)) / float(_ret_var_full)
+
         for epoch_i in range(self.n_epochs):
             epoch_start = time.perf_counter()
             indices = torch.randperm(n)
@@ -4264,6 +4303,7 @@ class PPOTrainer:
         return {
             "policy_loss": float(np.mean(all_policy_loss)),
             "value_loss": float(np.mean(all_value_loss)),
+            "pre_update_value_loss": pre_update_value_loss,
             "entropy": float(np.mean(all_entropy)),
             "approx_kl": float(np.mean(all_kl)),
             "bc_loss": float(np.mean(all_bc_loss)),

@@ -189,3 +189,148 @@ class TestMovingPlayer:
         player.velocity = Vector3(5.0, 0.5, 0)  # angled slightly toward the ball's lane
         ball = _ball(Vector3(0.0, 0.0, 0), velocity=Vector3(5.0, 0.0, 0))
         assert can_pick_up_ball(player, ball, _PARAMS)
+
+
+class TestPlayerSweptTunneling:
+    """Symmetric counterpart to TestSweptTunneling: a fast PLAYER sweeping
+    past a slow/stationary ball within one tick, exercised via the new
+    `player_pre_tick_position` parameter. See engine/knowledge.md."""
+
+    def test_fast_player_grazing_stationary_ball_is_pickable(self):
+        """Player sweeps in a straight line from (-1, 0.35) to (1, 0.35)
+        (constant y=0.35, inside the 0.4m radius) past a stationary ball at
+        the origin. Both the tick-start and tick-end positions are outside
+        the radius (distance ~1.06m), but the swept path grazes past at
+        0.35m -- must be pickable via the player-side tunneling exception.
+
+        The player is ALSO moving fast (+x) at the tick's end, i.e. already
+        past and receding from the ball at that instant (closing_component
+        < 0 at the endpoint) -- this specifically exercises that the grant
+        does not depend on the endpoint velocity direction, only on the
+        geometric sweep, mirroring the ball-side "regardless of endpoint
+        closing direction" rule.
+        """
+        player = make_player(position=Vector3(1.0, 0.35, 0))
+        player.velocity = Vector3(20.0, 0, 0)  # sprinting hard, already past+receding
+        player_pre = Vector3(-1.0, 0.35, 0)
+        ball = _ball(Vector3(0, 0, 0))  # stationary
+        assert can_pick_up_ball(player, ball, _PARAMS, player_pre_tick_position=player_pre)
+
+    def test_fast_player_passing_just_outside_radius_not_pickable(self):
+        """Same sweep but offset to y=0.45 (just outside the 0.4m radius) --
+        must NOT be pickable."""
+        player = make_player(position=Vector3(1.0, 0.45, 0))
+        player.velocity = Vector3(20.0, 0, 0)
+        player_pre = Vector3(-1.0, 0.45, 0)
+        ball = _ball(Vector3(0, 0, 0))
+        assert not can_pick_up_ball(player, ball, _PARAMS, player_pre_tick_position=player_pre)
+
+    def test_player_already_within_radius_at_tick_start_not_treated_as_tunneling(self):
+        """CRITICAL regression test, symmetric to
+        test_own_kick_starting_inside_radius_is_never_treated_as_tunneling:
+        a player who was ALREADY standing next to the ball at the start of
+        the tick (pre-tick separation <= radius) must not get a free pass
+        via the swept exception just because the ball is now receding fast
+        -- must fall through to the ordinary closing-velocity check and be
+        rejected."""
+        player = make_player(position=Vector3(0, 0, 0))
+        player_pre = Vector3(0.05, 0, 0)  # started well within radius of the ball
+        ball = _ball(Vector3(0.3, 0, 0), velocity=Vector3(2.0, 0, 0))  # receding fast
+        assert not can_pick_up_ball(player, ball, _PARAMS, player_pre_tick_position=player_pre)
+
+    def test_player_pre_tick_position_at_exactly_radius_boundary_does_not_trigger_sweep(self):
+        """Pre-tick separation exactly equal to the radius (not strictly
+        greater) must NOT count as 'started outside' -- boundary must match
+        the existing `distance <= radius` convention used everywhere else."""
+        player = make_player(position=Vector3(2.0, 0, 0))
+        player_pre = Vector3(-_PARAMS.pickup_radius_m, 0, 0)  # exactly radius_m from a ball at origin
+        ball = _ball(Vector3(0, 0, 0), velocity=Vector3(5.0, 0, 0))  # receding fast, endpoint far away
+        # started_outside_radius should be False (separation == radius, not >),
+        # so no swept grant; ordinary check (out of radius, not deadzone) rejects it.
+        assert not can_pick_up_ball(player, ball, _PARAMS, player_pre_tick_position=player_pre)
+
+    def test_stationary_player_pre_tick_equals_post_tick_no_crash(self):
+        """Degenerate zero-length player-swept segment (player didn't move
+        this tick) must not error and must fall back sanely to the ordinary
+        endpoint check -- symmetric to the ball-side degenerate test."""
+        player = make_player(position=Vector3(0.3, 0, 0))
+        player_pre = Vector3(0.3, 0, 0)
+        ball = _ball(Vector3(0, 0, 0), velocity=Vector3.zero())
+        assert can_pick_up_ball(player, ball, _PARAMS, player_pre_tick_position=player_pre)
+
+    def test_omitting_player_pre_tick_position_matches_ball_only_behaviour_exactly(self):
+        """Passing only ball_pre_tick_position (player_pre_tick_position
+        omitted) must reproduce the original ball-only-tunneling results
+        bit-for-bit -- the historical default path must be unaffected by
+        the new parameter's existence."""
+        player = make_player(position=Vector3(0, 0, 0))
+        pre_tick = Vector3(-5.0, 0, 0)
+        ball = _ball(Vector3(5.0, 0, 0), velocity=Vector3(300.0, 0, 0))
+        assert can_pick_up_ball(player, ball, _PARAMS, ball_pre_tick_position=pre_tick)
+        assert can_pick_up_ball(
+            player, ball, _PARAMS, ball_pre_tick_position=pre_tick, player_pre_tick_position=None,
+        )
+
+    def test_player_side_sweep_is_the_exact_mirror_of_ball_side_sweep(self):
+        """Construct the mirror image of
+        test_fast_ball_tunneling_past_player_within_one_tick_is_pickable:
+        instead of a stationary player and a ball sweeping from -5 to +5,
+        use a stationary ball and a player sweeping from -5 to +5 (with the
+        same fast receding endpoint velocity) -- must be pickable, proving
+        the two code paths are genuinely symmetric and not just
+        superficially similar."""
+        ball = _ball(Vector3(0, 0, 0))  # stationary at origin, at what was the player's spot
+        player = make_player(position=Vector3(5.0, 0, 0))  # ends where the ball used to end
+        player.velocity = Vector3(300.0, 0, 0)  # receding fast at the endpoint, like the ball was
+        player_pre = Vector3(-5.0, 0, 0)  # started where the ball used to start
+        assert can_pick_up_ball(player, ball, _PARAMS, player_pre_tick_position=player_pre)
+
+
+class TestBothEntitiesMovingSweep:
+    """Neither ball-only nor player-only sweep alone can catch a close pass
+    where BOTH entities move during the tick and neither one's individual
+    endpoint-vs-fixed-point check would register a close approach -- only
+    the relative-motion sweep (see possession._swept_min_separation) does.
+    """
+
+    def test_crossing_paths_both_moving_is_pickable(self):
+        """Ball travels along y=0 from x=-1 to x=1; player travels along
+        x=0.2 from y=-1 to y=1 over the SAME tick (synchronized linear
+        interpolation). Their paths cross near the origin around the
+        segment's midpoint, well within the 0.4m radius, even though every
+        individual endpoint pairing is over 1m apart."""
+        ball_pre = Vector3(-1.0, 0.0, 0)
+        ball = _ball(Vector3(1.0, 0.0, 0))
+        player_pre = Vector3(0.2, -1.0, 0)
+        player = make_player(position=Vector3(0.2, 1.0, 0))
+        assert can_pick_up_ball(
+            player, ball, _PARAMS,
+            ball_pre_tick_position=ball_pre, player_pre_tick_position=player_pre,
+        )
+
+    def test_both_moving_but_paths_stay_far_apart_not_pickable(self):
+        """Same shape of motion, but the player's line (x=5) never comes
+        close to the ball's line (y=0, x in [-1, 1]) -- must not be
+        pickable."""
+        ball_pre = Vector3(-1.0, 0.0, 0)
+        ball = _ball(Vector3(1.0, 0.0, 0))
+        player_pre = Vector3(5.0, -1.0, 0)
+        player = make_player(position=Vector3(5.0, 1.0, 0))
+        assert not can_pick_up_ball(
+            player, ball, _PARAMS,
+            ball_pre_tick_position=ball_pre, player_pre_tick_position=player_pre,
+        )
+
+    def test_both_moving_endpoints_within_radius_still_pickable_via_ordinary_check(self):
+        """Sanity check: if both pre-tick positions are given but the
+        TICK-END separation already satisfies the ordinary within_radius
+        check, the result must still be pickable regardless of the sweep
+        (the sweep is an additional exception, not a replacement)."""
+        ball_pre = Vector3(-1.0, 0.0, 0)
+        ball = _ball(Vector3(0.1, 0.0, 0), velocity=Vector3.zero())
+        player_pre = Vector3(5.0, -1.0, 0)  # started far away, unrelated to the ball's path
+        player = make_player(position=Vector3(0.0, 0.0, 0))  # ends up right next to the ball
+        assert can_pick_up_ball(
+            player, ball, _PARAMS,
+            ball_pre_tick_position=ball_pre, player_pre_tick_position=player_pre,
+        )
