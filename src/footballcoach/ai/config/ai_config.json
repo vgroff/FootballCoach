@@ -228,7 +228,9 @@
     "demo_sample_interval_s": 0.5,
     "_comment_demo_sample": "Time between timed observation samples during demonstration recording. Kick2 and tackles are always recorded regardless.",
     "demo_recording_n_processes": 8,
-    "_comment_demo_recording_n_processes": "Number of worker PROCESSES for record_demonstrations.py (--n-processes overrides this). 1 (default) = current single-process behaviour. >1 splits --n-episodes evenly across that many subprocesses, each independently driving rules-based AI on both sides (no policy network, no weight sync needed -- much simpler than ppo.n_parallel_envs) and writing its own disjoint range of phase{N}_XXXX.npz files. Same GIL/physics rationale as ppo.n_parallel_envs -- see ai_trainer_knowledge.md 'Parallel rollout collection'."
+    "_comment_demo_recording_n_processes": "Number of worker PROCESSES for record_demonstrations.py (--n-processes overrides this). 1 (default) = current single-process behaviour. >1 splits --n-episodes evenly across that many subprocesses, each independently driving rules-based AI on both sides (no policy network, no weight sync needed -- much simpler than ppo.n_parallel_envs) and writing its own disjoint range of phase{N}_XXXX.npz files. Same GIL/physics rationale as ppo.n_parallel_envs -- see ai_trainer_knowledge.md 'Parallel rollout collection'.",
+    "demo_worker_torch_threads": 1,
+    "_comment_demo_worker_torch_threads": "torch.set_num_threads() per record_demonstrations.py worker (--worker-torch-threads overrides this). Only matters when --driver-checkpoint/--teacher-checkpoint load a network -- torch defaults to one thread per logical core, so with demo_recording_n_processes > 1 every worker left uncapped oversubscribes badly (N processes x full-core threading each). Keep at 1 unless you have a specific reason to raise it. Mirrors ppo.worker_torch_threads."
   },
 
   "ema": {
@@ -297,6 +299,27 @@
     "opponent_min_dist_m": 10.0,
     "opponent_max_dist_m": 24.0,
     "_comment_opponent_dist": "Constrain opponent placement distance from trainee. Both default to unconstrained. E.g. min=5, max=20 keeps opponent nearby but not on top."
+  },
+
+  "physics_pretrain": {
+    "_comment": "Self-supervised ball-dynamics pretraining, see agent_plans/ball_physics_pretrain_plan.md. Trains a small frozen encoder offline (train_ball_dynamics.py); the live network only ever loads its checkpoint via network.ball_physics_encoder_checkpoint below.",
+    "ball": {
+      "hidden_dim": 128,
+      "latent_dim": 24,
+      "horizons_s": [0.2, 0.5, 1.0, 2.0, 3.0, 8.0],
+      "n_episodes": 200000,
+      "pitch_scale_range": [0.67, 1.33],
+      "restitution_scale_range": [0.67, 1.33],
+      "ball_speed_max_mps": 30.0,
+      "out_of_bounds_start_frac": 0.05,
+      "spin_active_frac": 0.65,
+      "_comment_spin_active_frac": "Fraction of episodes given a random-axis, random-magnitude spin (§4.2). The rest get zero spin -- real play is usually low/no-spin, so always sampling nonzero spin would over-represent it in the training distribution.",
+      "epochs": 150,
+      "batch_size": 1024,
+      "lr": 2e-3,
+      "early_stop_patience": 5,
+      "early_stop_min_delta": 1e-4
+    }
   }
 
 }

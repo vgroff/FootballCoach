@@ -532,10 +532,12 @@ Sampling strategy:
   event. ~7k steps for 200 phase-1 episodes (~7s to record).
 - Reward wiring: kick/tackle callback samples used to hardcode `reward=0.0`,
   silently dropping real reward (e.g. `gain_possession_bonus`) that fired on
-  exactly that tick. Fixed via a mutable `_pending_reward` cell:
-  `_record_now(reward=None, ...)` (the callback default) consumes and clears
-  `_pending_reward[0]`; the main loop accrues `_pending_reward[0] +=
-  float(_reward)` after every `env.step()`, so reward is never double-counted
+  exactly that tick. Fixed via a per-player `_pending_reward: dict[str, float]`
+  (keyed by player id, not a single shared cell — see "Per-player rewards"
+  below for why that distinction matters): `_record_now(reward=None, ...)`
+  (the callback default) consumes and clears `_pending_reward[pid]` for that
+  ONE player only; the main loop accrues each player's own reward into their
+  own dict entry after every `env.step()`, so reward is never double-counted
   or dropped regardless of when a kick/tackle callback fires relative to a
   timed sample.
 - Periodic logging (every 10 episodes, or at the final episode) now also
@@ -544,6 +546,78 @@ Sampling strategy:
   `env.step()` and reset after each log line) — mirrors `train.py`'s
   pre-training reward diagnostic (`_comp_acc` pattern) so demo-recording
   reward shaping can be sanity-checked the same way.
+
+**Neural driver/teacher** (`--driver-checkpoint`/`--teacher-checkpoint`): the
+trainee can be driven by a loaded checkpoint's own policy instead of
+`Phase1RulesAI` (`--driver-checkpoint`, wired via `env.sample_action_fn` +
+`ScenarioEnv.reset()`'s existing `NeuralPlayerAI` auto-assignment — no new
+mechanism needed), and/or BC labels can be sourced from a neural teacher's own
+forward pass instead of the rules-AI order-simulation counterfactual
+(`--teacher-checkpoint`, via `bc.phase1_labels_from_teacher()`). The two are
+orthogonal: driver picks which states get visited, teacher picks what
+supervises them — DAgger-style dataset generation, not circular self-imitation,
+since the teacher is a genuinely separate forward pass, decoupled from
+whichever AI is physically driving the player that tick.
+
+**Per-player rewards, NOT a shared/duplicated value**: `_record_now(player_id=
+None)` (used for every timed sample) records BOTH the trainee's row and the
+opponent's row. It used to give both rows the exact SAME reward value (the
+trainee's own, from `env.step()`'s scalar return) — silently mislabeling the
+opponent's row with someone else's reward AND double-counting that value in
+every downstream MC return / episode-total computation. Fixed via
+`ScenarioEnv.always_compute_secondary_reward` (opt-in, off by default so real
+PPO training is unaffected — see its docstring in `scenario_env.py`): when
+set, `env.last_secondary_results` gets a real entry for a secondary player
+EVERY step, computed through the exact same `_compute_phase1_reward_for_player()`
+call already used for the trainee and for a neural secondary player during
+real PPO training — regardless of whether that secondary player is actually
+neural-driven. `record_demonstrations.py` sets this flag unconditionally and
+reads each row's own reward from it, instead of reusing the trainee's value.
+
+**`compute_returns()`/`compute_component_returns()` are player-track-aware**:
+trainee and opponent rows are INTERLEAVED within an episode's row range (one
+timed sample appends the trainee's row then the opponent's row, back to
+back), not laid out as two contiguous blocks. A flat backward MC scan over
+the whole episode range would therefore mix the two players' reward streams
+— e.g. the trainee's computed return would incorrectly include the
+opponent's future rewards too. Fixed via a new per-row `is_trainee` field
+(1.0/0.0, recorded by `record_demonstrations.py`, defaults to all-1.0 for
+older files predating it) — `DemonstrationDataset.compute_returns()` now
+maintains two independent running accumulators (trainee-track,
+opponent-track), each row only updating/reading its own. A second, related
+bug found and fixed at the same time: episodes end with 2 CONSECUTIVE
+`done=1` rows (one per player, backfilled onto both terminal rows by
+`_record_now(player_id=None)`) — naively resetting on every `done=1` row (a
+bug that predates the per-track split; the original single-flat-scan version
+had it too) makes the SECOND reset wipe out whichever track wasn't at that
+exact row, silently discarding that player's terminal reward from every
+earlier row's return. Fixed by collapsing consecutive `done=1` rows into a
+single reset (`prev_had_done` tracking in both functions).
+
+**!!!! Hardcoded to exactly 2 players (trainee + one opponent) — will need
+extending once a demo dataset has more than 2 players !!!!** All of the
+per-player-reward/`is_trainee` machinery above assumes exactly one trainee
+track and one opponent track:
+- `is_trainee` is a binary flag, not a player id — `compute_returns()`'s
+  two-accumulator (`running_trainee`/`running_opponent`) design has no room
+  for a third track.
+- `record_demonstrations.py`'s `_record_now()` hardcodes
+  `ids = [env.trainee_player_id, "opponent"]` — a third player's rows would
+  need a real multi-id list here, sourced from `secondary_player_ids`
+  (already a list on `ScenarioEnv`, so the *reward-computation* side
+  — `env.always_compute_secondary_reward` — already generalizes to N
+  secondary players for free; only the recording/dataset side is 2-player-
+  specific).
+- `reward_components` stays one ENV-LEVEL (all players combined) value
+  duplicated onto every player's row — already a known limitation for 2
+  players (see `compute_component_returns()`'s docstring); with N players
+  this convention would need rethinking too, not just extending.
+Until Phase 1 (1v1) is the only scenario with demo recording, this is fine —
+but the FIRST 2v2+ (or N-secondary-player) demo-recording scenario must
+revisit `is_trainee` (→ a real per-row player-id/role field), the two-
+accumulator scan in `compute_returns()`/`compute_component_returns()` (→ a
+dict of accumulators keyed by that field), and `_record_now()`'s hardcoded
+`ids` list, together — not just one of them.
 
 ## Critical design rules
 

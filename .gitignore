@@ -3,6 +3,7 @@ __pycache__/
 checkpoints/
 results/
 demonstrations/
+physics_pretrain_data/
 /tmp/
 debug_*.py
 *.py[oc]

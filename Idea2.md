@@ -20,6 +20,9 @@ Extending training:
 - Task ids are important, make sure they are set
     - I think task ids should only be set by the decision network, the execution network shouldnt get them (remove if it already does)
 - Certain coefficients may need setting on a per-phase level, hopefully not too many, but potentially things like BC aux (e.g. kicking only or not)
+- Record demonstrations needs to handle more than 2 players
+    - Sould be able to do some nice OOP here, a class that has the player in question and it's rewards and outcomes, or whatever, let's make it clean
+    - Should also apply to the diagnotics during training, should be able to count outcomes/rewards per-player and print them sensibly 
 Notes to self:
 - GK needs fixing - he saves no shots in the close rnage scenario
 - When running these messy/random scenarios, we might need to decide (maye using a value network) whcih runs are actually good (advantage-wise and in absolute)
@@ -32,19 +35,23 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. Please do not skip any of them. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
-    - !! next plan - generate a ton of demo data uisng vvgood immobile
-        - check the match logs that do poorly on invalid
+    - !!!!!!! BC training matching issue! with the orders and getPossession and whateve
+    - !! generate a ton of demo data uisng vvgood immobile
+        - for value net pretraining + BC when we change a neural net
+        - TIMESTEPS ARNE'T UNIFORM!!
+        - on debug value net - check the match logs that do poorly on invalid
+    - !!!!!!! Add heading to the neural network. Also increase capacity, and do BC training I guess
+        - !!! heading add by just making velocity + speed a unit vector + magnitude?
+    - !! Implement and try out the physics encoder thingy, just for the ball
+        - add variability in other physics stuff - drag, air coefficient etc... find them all
+        - do a generative kind of training - each epoch, generate 1k episodes, and add them to the dataset
+            - keep some for the val set
+            - once n_episodes > threshold, drop some randomly
+        - if it works well, consider predicting rel distance to the ball over time
+    - In demo generation - encode empty players more intelligently to use less RAM? float 16 for the decision heads (marginal)?
     - !!! Do some performance profiling - how long spent on rollouts vs PPO vs evals etc.. n_envs - how much faster does it get with more of them? How many do we want? Main threads too? - can try this with the evals script maybe?
-        - To try: vary envs, vary threads, try non-separate network (might need to add in to force this), reset log dir std, vary opponent distribution
-        - check reward stats by outcome
-        - results:
-            - sep, 1 env, 1 thread, 2096 steps, 200ms per epoch, 10s
-                - same with 2 threads, same with 5
-                - 0.3s per ep, 30s to do 5k steps, 165 steps/s
-            - sep, 8 envs, 5k steps, 15.6s
-            - make a demo thing or equivalent so that we save the rollouts!
-            - vary dir log std!
-            - vary opponents!
+        - vary opponents!
+        - make outcomes from the POV of the player - especially for reporting stats, or it'll break. Currently outcomes are global (e.g. win is for trainee win)
     - !!! Phone note:
         - Shorter timeout so that we get a bit more of them?
         - Does lowering dt improve performance or not?

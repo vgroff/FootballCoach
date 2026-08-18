@@ -101,6 +101,23 @@ class ScenarioEnv:
         # When set, neural actions are applied to secondary players each step
         # and their transitions are stored in last_secondary_results.
         self.sample_action_fn = None
+        # Opt-in, off by default: when True, last_secondary_results gets an
+        # entry for EVERY configured secondary player every step, computed via
+        # the same _compute_phase1_reward_for_player() the trainee/neural
+        # secondary players use -- regardless of whether that player is
+        # neural-driven. Normally (False) a secondary player only gets an
+        # entry when it has a live NeuralPlayerAI transition (last_transition
+        # is not None), because PPOTrainer._train() drains this list via
+        # buffer.add(obs=sec["obs"], action=..., log_prob=sec["log_prob"], ...)
+        # -- fields that ONLY exist on a real neural transition. Flipping this
+        # on for that path would KeyError the instant a rules-AI/immobile
+        # opponent episode hit this loop (50%+ of Phase 1 episodes). Entries
+        # added because of this flag (no live transition) omit those neural-
+        # only fields -- only {"reward", "done"} -- so this must stay False
+        # unless the caller (record_demonstrations.py, which reads reward/done
+        # only, never drains this into a PPO rollout buffer) explicitly opts
+        # in by setting env.always_compute_secondary_reward = True.
+        self.always_compute_secondary_reward = False
 
         cfg = load_ai_config()
         self._obs_cfg = cfg["observation"]
@@ -492,28 +509,44 @@ class ScenarioEnv:
         lost_possession = trainee_lost_count
         self._trainee_had_possession_last_step = trainee_has_possession_now
         self._trainee_pending_loss = _trainee_pending_loss
-        box_terminal = in_opponent_box and trainee_has_possession_now
+        box_terminal = (
+            in_opponent_box
+            and trainee_has_possession_now
+            and self._can_score_box_terminal(player)
+        )
 
         # Opponent reached trainee's box with possession (phase 1 terminal — trainee loses).
-        # Excluded outright when the opponent is immobile: it never chases or
-        # holds a defensive line, so the only way it could ever satisfy this
-        # otherwise would be a pure coincidence of spawn position (and/or
-        # incidental collision push-apart nudging it there — see
-        # ui/scenarios.py's build_1v1_scenario, which also re-rolls the
-        # immobile opponent's spawn away from its own box with a clearance
-        # margin, belt-and-braces). Gating the terminal condition itself
-        # here is the actually-robust fix: it holds regardless of how the
-        # immobile opponent's position ever got wherever it is, rather than
-        # trying to prevent every possible geometric path to this outcome.
+        # Excluded when the ball carrier has no real controller (see
+        # _can_score_box_terminal): it never chases or holds a defensive
+        # line, so the only way it could ever satisfy this otherwise would
+        # be a pure coincidence of spawn position (and/or incidental
+        # collision push-apart nudging it there — see ui/scenarios.py's
+        # build_1v1_scenario, which also re-rolls the immobile opponent's
+        # spawn away from its own box with a clearance margin,
+        # belt-and-braces). Gating the terminal condition itself here is
+        # the actually-robust fix: it holds regardless of how the immobile
+        # opponent's position ever got wherever it is, rather than trying
+        # to prevent every possible geometric path to this outcome.
+        #
+        # Looked up generically by whoever is actually carrying the ball
+        # (not hardcoded to "the opponent") so this holds even once a
+        # scenario has more than one non-trainee player.
         in_trainee_box = match.pitch.is_in_box(
             match.ball.position,
             left=(player.team == Team.LEFT),  # trainee's own box
         )
+        _carrier_id = match.ball.possessed_by
+        _carrier_can_score = False
+        if _carrier_id is not None and _carrier_id != self.trainee_player_id:
+            try:
+                _carrier_can_score = self._can_score_box_terminal(match.player_by_id(_carrier_id))
+            except KeyError:
+                _carrier_can_score = False
         opponent_box_terminal = (
             in_trainee_box
-            and match.ball.possessed_by is not None
-            and match.ball.possessed_by != self.trainee_player_id
-            and not getattr(match, "_opponent_is_immobile", False)
+            and _carrier_id is not None
+            and _carrier_id != self.trainee_player_id
+            and _carrier_can_score
         )
 
         timeout = self._episode_ticks >= int(self.max_episode_s / self._dt_s)
@@ -594,9 +627,12 @@ class ScenarioEnv:
                 sec_player = match.player_by_id(pid)
             except KeyError:
                 continue
-            if not (hasattr(sec_player, "ai") and sec_player.ai is not None
-                    and hasattr(sec_player.ai, "last_transition")
-                    and sec_player.ai.last_transition is not None):
+            _sec_has_transition = (
+                hasattr(sec_player, "ai") and sec_player.ai is not None
+                and hasattr(sec_player.ai, "last_transition")
+                and sec_player.ai.last_transition is not None
+            )
+            if not _sec_has_transition and not self.always_compute_secondary_reward:
                 continue
 
             sec_curr_ball_dist = self._ball_dist_for_player(pid, match)
@@ -625,7 +661,20 @@ class ScenarioEnv:
                 match.ball.position,
                 left=(sec_player.team == Team.RIGHT),
             )
-            sec_box_terminal = sec_in_atk_box and match.ball.possessed_by == pid
+            # Gated via the SAME shared _can_score_box_terminal() used by
+            # box_terminal/opponent_box_terminal above -- note
+            # sec_box_terminal does NOT feed into the real episode-ending
+            # `done` below, so leaving it ungated (as it was before this
+            # helper existed) let the one-time box_possession_terminal/
+            # speed_bonus reward re-fire every tick for as long as an
+            # immobile secondary player happened to be sitting where the
+            # ball settled (confirmed: 64 consecutive ticks in one real
+            # recorded episode) instead of once.
+            sec_box_terminal = (
+                sec_in_atk_box
+                and match.ball.possessed_by == pid
+                and self._can_score_box_terminal(sec_player)
+            )
 
             if self.phase == 1:
                 # Routes through the SAME shared _compute_phase1_reward_for_player()
@@ -646,7 +695,10 @@ class ScenarioEnv:
                     lost_possession_this_step=sec_lost_poss,
                     ball_progress_toward_goal_m=sec_ball_prog,
                     ball_went_out_after_touch=sec_ball_went_out,
-                    illegal_action_attempted=sec_player.ai.last_transition.get("illegal_action", False),
+                    illegal_action_attempted=(
+                        sec_player.ai.last_transition.get("illegal_action", False)
+                        if _sec_has_transition else False
+                    ),
                     reached_opponent_box_with_possession=sec_box_terminal,
                     opponent_reached_trainee_box=box_terminal,  # from sec's POV, trainee winning = sec losing
                     timed_out=timeout and not sec_box_terminal and not box_terminal,
@@ -659,13 +711,25 @@ class ScenarioEnv:
                 _sec_comps = {}
 
             self.last_secondary_results.append({
-                **sec_player.ai.last_transition,
+                **(sec_player.ai.last_transition if _sec_has_transition else {}),
+                "player_id": pid,
                 "reward": sec_reward,
                 "done": 1.0 if done else 0.0,
+                # This player's OWN component breakdown -- kept separate
+                # from self.last_reward_components (the trainee's own),
+                # NOT merged into it. Merging used to make e.g. a "win"
+                # episode's trainee row carry BOTH the trainee's own
+                # box_possession_terminal bonus AND the losing secondary
+                # player's own loss_terminal penalty added together,
+                # silently corrupting every per-component diagnostic (and,
+                # for self-play PPO training with a neural secondary
+                # player, the trainee's own stored rollout-buffer
+                # reward_comps too -- see ppo_trainer.py's `reward_comps=
+                # dict(getattr(env, "last_reward_components", {}))`).
+                # Callers that want each player's own row-level components
+                # (e.g. record_demonstrations.py) must read them from here.
+                "reward_components": dict(_sec_comps),
             })
-            # Accumulate secondary components into last_reward_components
-            for _k, _v in _sec_comps.items():
-                self.last_reward_components[_k] = self.last_reward_components.get(_k, 0.0) + _v
         _match_time_s = match.time_s
         _ball_pos = match.ball.position
         if done:
@@ -766,6 +830,37 @@ class ScenarioEnv:
         else:
             _cos = 1.0  # neutral: no penalty when stationary or at ball
         return _speed, _cos
+
+    @staticmethod
+    def _can_score_box_terminal(player_obj) -> bool:
+        """True iff `player_obj` has a real controller and can therefore
+        legitimately trigger a box-terminal event (reaching a scoring box
+        with possession).
+
+        Shared by EVERY phase-1 box-terminal check below (`box_terminal` --
+        trainee win, `opponent_box_terminal` -- trainee loss, and
+        `sec_box_terminal` -- each secondary player's own reward) -- do not
+        re-derive this gate at a second call site. Before this helper
+        existed, each of those three sites independently decided whether to
+        exclude an immobile player (via a single match-level
+        `_opponent_is_immobile` flag, checked at some call sites and not
+        others) instead of asking a genuinely player-scoped question --
+        `sec_box_terminal` missed the gate entirely, letting a ball that
+        settled near an immobile demo-recording opponent by physics
+        coincidence re-fire the one-time box/speed-bonus reward every tick
+        for as long as the fluke held (confirmed: 64 consecutive ticks in
+        one real recorded episode) instead of once.
+
+        `player_obj.ai is None` means no controller was ever assigned (the
+        immobile-opponent build path) -- a player with no controller can
+        never intentionally "reach" anything, so the ball settling near
+        them isn't a real terminal event. This is per-player rather than a
+        single global match flag, so it generalises correctly to however
+        many non-trainee players a scenario ever has, unlike
+        `_opponent_is_immobile` (see ai/knowledge.md's "hardcoded to
+        exactly 2 players" note).
+        """
+        return player_obj.ai is not None
 
     def _compute_phase1_reward_for_player(
         self,

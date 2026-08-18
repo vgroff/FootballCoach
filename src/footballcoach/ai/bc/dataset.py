@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import logging
 import os
+import zipfile
 from pathlib import Path
 from typing import Generator
 
@@ -74,6 +75,7 @@ class DemonstrationDataset:
         reward_components: np.ndarray | None = None,
         reward_component_keys: list[str] | None = None,
         episode_outcomes: np.ndarray | None = None,
+        is_trainee: np.ndarray | None = None,
     ):
         n = len(obs_self_feat)
         assert all(len(x) == n for x in [
@@ -88,6 +90,16 @@ class DemonstrationDataset:
         # rewards/dones are optional — older files won't have them
         self._rewards = rewards if rewards is not None else np.zeros(n, dtype=np.float32)
         self._dones   = dones   if dones   is not None else np.zeros(n, dtype=np.float32)
+        # 1.0 = this row is the trainee's own row, 0.0 = the opponent's.
+        # Trainee/opponent rows are interleaved within an episode (see
+        # record_demonstrations.py's _record_now()) -- compute_returns()/
+        # compute_component_returns() need this to segment their backward MC
+        # scan per player-track, otherwise the two players' reward streams
+        # get mixed into each other's "returns". Older files predating this
+        # field default to all-1.0 (everything treated as one track) --
+        # exactly the previous (imperfect but at least self-consistent)
+        # flat-scan behavior, not a new failure mode.
+        self._is_trainee = is_trainee if is_trainee is not None else np.ones(n, dtype=np.float32)
         # reward_components/keys are optional -- older files predate per-
         # component persistence (see record_demonstrations.py). Falls back to
         # an empty (n, 0) array + empty key list rather than zeros-with-
@@ -404,36 +416,171 @@ class DemonstrationDataset:
                 [str(o) for o in data["meta_episode_outcomes"]]
                 if "meta_episode_outcomes" in data else None
             ),
+            is_trainee=data["is_trainee"] if "is_trainee" in data else None,
         )
 
     @classmethod
     def from_files(cls, paths: list[str | Path]) -> "DemonstrationDataset":
-        """Load and concatenate multiple .npz files."""
-        parts = [cls.from_file(p) for p in paths]
-        # reward_component_keys must agree across files (fixed by REWARD_COMP_LABELS
-        # order at recording time) -- use the first part's keys/columns; parts
-        # recorded before this feature existed already fell back to the same
-        # default key list in __init__, so concatenation stays column-aligned.
-        # episode_outcomes: concatenate per-part lists in file order, matching
-        # each part's dones=1 row order -- but ONLY if every part has them; a
-        # mix of old (no meta_episode_outcomes) and new files would produce
-        # an outcome list misaligned with the concatenated dones, which is
-        # worse than just falling back to None for the whole dataset.
-        _all_have_outcomes = all(p._episode_outcomes is not None for p in parts)
+        """Load and concatenate multiple .npz files.
+
+        Two-pass, pre-allocated loading -- NOT "build a ``DemonstrationDataset``
+        per file via ``from_file()``, keep the whole list of them alive, then
+        ``np.concatenate`` across the list once at the end". That naive
+        approach's peak memory is roughly the final dataset's size TWICE over
+        (every file's decompressed arrays plus the freshly concatenated
+        output are all live simultaneously), plus real per-object overhead
+        once the file count runs into the tens of thousands -- e.g.
+        ``record_demonstrations.py --output`` re-used across many runs, which
+        always appends rather than overwrites (see its module docstring).
+        That combination OOM-killed a real run at ~25k files despite the
+        on-disk dataset itself being only a few GB compressed.
+
+        Pass 1 (light) opens every file once just to read one array's shape
+        (also validating ``bc_labels``'s width there, same check
+        ``from_file()`` does) and which optional fields it has -- no full
+        decompression of the big arrays (``obs_other_feat`` etc.) happens
+        yet. Pass 2 (heavy) pre-allocates the final arrays ONCE at their
+        exact final size, then re-opens each file and copies straight into
+        its slice, so at most one file's worth of decompressed data is ever
+        alive alongside the (single, final-sized) output arrays -- peak
+        memory is the final dataset's size plus one file, not the final
+        dataset's size plus 25,000 files' worth of live Python objects.
+        """
+        from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS
+
+        if not paths:
+            raise FileNotFoundError("from_files() called with an empty path list")
+
+        # --- Pass 1: per-file row count + which optional fields are present,
+        # without holding any file's decompressed arrays around afterward.
+        # Unreadable files (e.g. a record_demonstrations.py writer still
+        # mid-np.savez_compressed() on this exact filename -- it writes
+        # directly to the final name, no temp-file+rename, so a concurrent
+        # reader can catch it half-written) are skipped with a warning
+        # rather than crashing the whole load -- see ai_trainer_knowledge.md. ---
+        good_paths: list[Path] = []
+        n_per_file: list[int] = []
+        all_have_outcomes = True
+        ref_shapes: dict[str, tuple] = {}
+        ref_dtypes: dict[str, np.dtype] = {}
+        reward_component_keys: list[str] | None = None
+
+        for p in paths:
+            try:
+                data = np.load(p)
+                bc_labels_i = data["bc_labels"]
+            except (OSError, zipfile.BadZipFile, EOFError, ValueError) as e:
+                log.warning(f"Skipping unreadable .npz file {p}: {e!r} "
+                            f"(likely still being written by a concurrent recorder)")
+                continue
+            if bc_labels_i.shape[-1] != BC_LABEL_DIM:
+                raise ValueError(
+                    f"{p}: bc_labels has width {bc_labels_i.shape[-1]}, expected "
+                    f"BC_LABEL_DIM={BC_LABEL_DIM}. This .npz was recorded with an "
+                    f"older BC label schema (e.g. missing kick_direction/kick_power/"
+                    f"kick_spin fields added for full execution-head BC coverage). "
+                    f"Re-record demonstrations: "
+                    f"uv run python -m footballcoach.ai.scripts.record_demonstrations "
+                    f"--phase 1 --n-episodes <N> --output <dir>"
+                )
+            good_paths.append(p)
+            n_per_file.append(bc_labels_i.shape[0])
+            if "meta_episode_outcomes" not in data.files:
+                all_have_outcomes = False
+            if not ref_shapes:
+                for key in ("obs_self_feat", "obs_other_feat", "obs_exists_mask",
+                            "obs_ball_feat", "obs_global_feat", "bc_labels"):
+                    arr = bc_labels_i if key == "bc_labels" else data[key]
+                    ref_shapes[key] = arr.shape[1:]
+                    ref_dtypes[key] = arr.dtype
+                reward_component_keys = (
+                    [str(k) for k in data["meta_reward_component_keys"]]
+                    if "meta_reward_component_keys" in data.files
+                    else [k for k, _ in REWARD_COMP_LABELS]
+                )
+
+        if not good_paths:
+            raise FileNotFoundError(
+                f"None of the {len(paths)} .npz file(s) passed to from_files() "
+                "could be read (all skipped as unreadable/corrupt -- see warnings above)"
+            )
+        total_n = sum(n_per_file)
+
+        # --- Pre-allocate the final arrays ONCE -- this is the whole point:
+        # never hold more than one file's worth of extra data alongside them. ---
+        obs_self_feat = np.empty((total_n, *ref_shapes["obs_self_feat"]), dtype=ref_dtypes["obs_self_feat"])
+        obs_other_feat = np.empty((total_n, *ref_shapes["obs_other_feat"]), dtype=ref_dtypes["obs_other_feat"])
+        obs_exists_mask = np.empty((total_n, *ref_shapes["obs_exists_mask"]), dtype=ref_dtypes["obs_exists_mask"])
+        obs_ball_feat = np.empty((total_n, *ref_shapes["obs_ball_feat"]), dtype=ref_dtypes["obs_ball_feat"])
+        obs_global_feat = np.empty((total_n, *ref_shapes["obs_global_feat"]), dtype=ref_dtypes["obs_global_feat"])
+        bc_labels = np.empty((total_n, *ref_shapes["bc_labels"]), dtype=ref_dtypes["bc_labels"])
+        # rewards/dones/reward_components default to zero for files that lack
+        # them (backward compat, matches from_file()'s own per-file default) --
+        # pre-zeroing the whole array up front means a file without the key
+        # simply leaves its slice untouched in pass 2, no per-file branching cost.
+        rewards = np.zeros(total_n, dtype=np.float32)
+        dones = np.zeros(total_n, dtype=np.float32)
+        reward_components = np.zeros((total_n, len(reward_component_keys)), dtype=np.float32)
+        # is_trainee defaults to 1.0 (all-one-track), NOT 0.0 -- matches
+        # __init__'s backward-compat default for files predating this field
+        # (see its docstring); zero-defaulting here would silently relabel
+        # every un-tagged row as "opponent".
+        is_trainee = np.ones(total_n, dtype=np.float32)
+        # episode_outcomes: only populated if EVERY file has it -- a mix of
+        # old (no meta_episode_outcomes) and new files would produce an
+        # outcome list misaligned with dones, worse than falling back to None
+        # for the whole dataset (matches the previous concatenate-based logic).
+        # UNLIKE every other field above, this is indexed by EPISODE COUNT,
+        # not row count -- one entry per complete episode in the file, not
+        # one per step -- so it can't be sized/sliced by `total_n`/`offset`
+        # the same way. Collected as a plain list and concatenated once at
+        # the end instead; it's small (episodes, not rows) so this doesn't
+        # reintroduce the peak-memory problem this rewrite exists to fix.
+        episode_outcomes_parts: list[np.ndarray] = [] if all_have_outcomes else None
+
+        # --- Pass 2: re-open each file, copy its arrays straight into the
+        # pre-allocated slice, then let it be garbage-collected before the
+        # next iteration -- at most one file's decompressed data is alive
+        # at any point. ---
+        offset = 0
+        for p, n_i in zip(good_paths, n_per_file):
+            data = np.load(p)
+            sl = slice(offset, offset + n_i)
+            obs_self_feat[sl] = data["obs_self_feat"]
+            obs_other_feat[sl] = data["obs_other_feat"]
+            obs_exists_mask[sl] = data["obs_exists_mask"]
+            obs_ball_feat[sl] = data["obs_ball_feat"]
+            obs_global_feat[sl] = data["obs_global_feat"]
+            bc_labels[sl] = data["bc_labels"]
+            if "rewards" in data.files:
+                rewards[sl] = data["rewards"]
+            if "dones" in data.files:
+                dones[sl] = data["dones"]
+            if "reward_components" in data.files:
+                reward_components[sl] = data["reward_components"]
+            if "is_trainee" in data.files:
+                is_trainee[sl] = data["is_trainee"]
+            if episode_outcomes_parts is not None:
+                episode_outcomes_parts.append(data["meta_episode_outcomes"])
+            offset += n_i
+
+        episode_outcomes = (
+            np.concatenate(episode_outcomes_parts) if episode_outcomes_parts is not None else None
+        )
+
         return cls(
-            obs_self_feat=np.concatenate([p._self_feat for p in parts]),
-            obs_other_feat=np.concatenate([p._other_feat for p in parts]),
-            obs_exists_mask=np.concatenate([p._exists_mask for p in parts]),
-            obs_ball_feat=np.concatenate([p._ball_feat for p in parts]),
-            obs_global_feat=np.concatenate([p._global_feat for p in parts]),
-            bc_labels=np.concatenate([p._labels for p in parts]),
-            rewards=np.concatenate([p._rewards for p in parts]),
-            dones=np.concatenate([p._dones for p in parts]),
-            reward_components=np.concatenate([p._reward_components for p in parts]),
-            reward_component_keys=parts[0]._reward_component_keys,
-            episode_outcomes=(
-                np.concatenate([p._episode_outcomes for p in parts]) if _all_have_outcomes else None
-            ),
+            obs_self_feat=obs_self_feat,
+            obs_other_feat=obs_other_feat,
+            obs_exists_mask=obs_exists_mask,
+            obs_ball_feat=obs_ball_feat,
+            obs_global_feat=obs_global_feat,
+            bc_labels=bc_labels,
+            rewards=rewards,
+            dones=dones,
+            reward_components=reward_components,
+            reward_component_keys=reward_component_keys,
+            episode_outcomes=episode_outcomes,
+            is_trainee=is_trainee,
         )
 
     @classmethod
@@ -686,6 +833,18 @@ class DemonstrationDataset:
         an episode (done=1) bootstrap to 0.  The return array has the same
         length as the dataset.
 
+        Trainee and opponent rows are INTERLEAVED within an episode's row
+        range (see record_demonstrations.py's ``_record_now()`` -- a timed
+        sample appends the trainee's row then the opponent's row back to
+        back), not laid out as two contiguous blocks. A single flat backward
+        scan would therefore mix the two players' reward streams together --
+        e.g. the trainee's return at row i would incorrectly include the
+        opponent's future rewards too, since they're adjacent in the flat
+        array. This scans each player's own subsequence independently (keyed
+        by ``self._is_trainee``), both reset together at every episode
+        boundary, so each row's return only ever accumulates that SAME
+        player's own subsequent rewards.
+
         Args:
             gamma: Discount factor (default matches PPO config).
 
@@ -694,22 +853,59 @@ class DemonstrationDataset:
         """
         rewards = self._rewards
         dones   = self._dones
+        is_trainee = self._is_trainee
         n = self._n
         returns = np.zeros(n, dtype=np.float32)
-        running = 0.0
-        # Scan backward: at a done boundary reset running sum
+        running_trainee = 0.0
+        running_opponent = 0.0
+        # Scan backward: at a done boundary reset BOTH players' running sums
+        # (an episode boundary ends the episode for both tracks at once, even
+        # though `dones` is only guaranteed set on the specific row(s) that
+        # triggered it -- see the 2-consecutive-done-rows convention in
+        # episode_row_ranges()). Each row only updates/reads its OWN track.
+        #
+        # `prev_had_done` collapses 2 CONSECUTIVE done=1 rows (one per
+        # player, marking the SAME boundary -- see
+        # record_demonstrations.py's `_record_now(player_id=None)`, which
+        # backfills done=1 onto both the trainee's and opponent's terminal
+        # row) into a SINGLE reset. Without this, the second done=1 row
+        # encountered (the earlier-in-time row of the pair, since this scans
+        # backward) would fire ANOTHER reset and silently wipe out whichever
+        # track's accumulator had JUST been correctly seeded by the first
+        # done=1 row a moment ago -- discarding that player's own terminal
+        # reward from every earlier row's return. This bug predates the
+        # per-track split above; a single flat scan had the exact same flaw.
+        prev_had_done = False
         for i in range(n - 1, -1, -1):
-            if dones[i] > 0.5:
-                running = 0.0
-            running = rewards[i] + gamma * running
-            returns[i] = running
+            is_done = dones[i] > 0.5
+            if is_done and not prev_had_done:
+                running_trainee = 0.0
+                running_opponent = 0.0
+            if is_trainee[i] > 0.5:
+                running_trainee = rewards[i] + gamma * running_trainee
+                returns[i] = running_trainee
+            else:
+                running_opponent = rewards[i] + gamma * running_opponent
+                returns[i] = running_opponent
+            prev_had_done = is_done
         return returns
 
     def compute_component_returns(self, gamma: float = 0.99) -> dict[str, np.ndarray]:
         """Per-component discounted MC return, mirroring ``compute_returns()``
-        but computed independently for each reward component column so the
-        components sum exactly to ``compute_returns()``'s total return
-        (each component uses the SAME gamma/episode boundaries).
+        (including its same-player-track backward scan, for the same
+        row-interleaving reason -- see its docstring) but computed
+        independently for each reward component column.
+
+        NOTE: unlike ``rewards`` (which is now genuinely per-player, see
+        record_demonstrations.py's per-player reward fix), ``reward_components``
+        is still recorded as one ENV-LEVEL (trainee+opponent combined) value
+        duplicated onto both players' rows for a given timestep (a separate,
+        pre-existing convention -- see ``ai/knowledge.md``). This function's
+        per-track segmentation still removes the row-interleaving double-count
+        (each track now sums every OTHER row instead of every row), but the
+        summed component values themselves remain the combined env-level
+        figure, not a true per-player split -- so this will NOT sum exactly
+        to ``compute_returns()``'s total for a given player-track row.
 
         Requires the dataset to have been recorded with per-component reward
         data (``has_reward_components``); returns an all-zero array per key
@@ -722,17 +918,31 @@ class DemonstrationDataset:
             per component.
         """
         dones = self._dones
+        is_trainee = self._is_trainee
         n = self._n
         out: dict[str, np.ndarray] = {}
         for col, key in enumerate(self._reward_component_keys):
             comp_rewards = self._reward_components[:, col]
             comp_returns = np.zeros(n, dtype=np.float32)
-            running = 0.0
+            running_trainee = 0.0
+            running_opponent = 0.0
+            # See compute_returns()'s matching comment: prev_had_done
+            # collapses the 2-consecutive-done-rows-per-boundary convention
+            # into a single reset, so the second done=1 row doesn't wipe out
+            # whichever track wasn't at that specific row.
+            prev_had_done = False
             for i in range(n - 1, -1, -1):
-                if dones[i] > 0.5:
-                    running = 0.0
-                running = comp_rewards[i] + gamma * running
-                comp_returns[i] = running
+                is_done = dones[i] > 0.5
+                if is_done and not prev_had_done:
+                    running_trainee = 0.0
+                    running_opponent = 0.0
+                if is_trainee[i] > 0.5:
+                    running_trainee = comp_rewards[i] + gamma * running_trainee
+                    comp_returns[i] = running_trainee
+                else:
+                    running_opponent = comp_rewards[i] + gamma * running_opponent
+                    comp_returns[i] = running_opponent
+                prev_had_done = is_done
             out[key] = comp_returns
         return out
 

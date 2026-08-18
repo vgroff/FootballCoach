@@ -30,6 +30,24 @@ import os
 import time
 from pathlib import Path
 
+# Must run BEFORE numpy (or torch, which imports it) is first imported
+# ANYWHERE in this process -- numpy's underlying BLAS reads these env vars at
+# import/first-use to size its OWN internal thread pool, independent of
+# torch.set_num_threads(). Left unset, each process's numpy calls (the
+# physics engine and observation encoder are numpy-heavy) AND torch calls
+# (when --driver-checkpoint/--teacher-checkpoint load a network) default to
+# one thread PER LOGICAL CORE -- fine for a single process, but with
+# --n-processes > 1 (the common case here) every worker fights for the same
+# cores, oversubscribing badly. Mirrors debug_value_network.py's identical
+# top-of-file guard for the same reason -- see its comment for the full
+# multiprocessing-spawn-bootstrap rationale (this file uses the same "spawn"
+# context, so this must run this early in every worker too, not just main).
+# os.environ.setdefault() (not a flat assignment) so an operator's own
+# OMP_NUM_THREADS etc from the shell is still respected if already set.
+for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+           "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+    os.environ.setdefault(_v, "1")
+
 import numpy as np
 
 logging.basicConfig(
@@ -181,6 +199,16 @@ def record_episodes(
         # so decision_interval_ticks/max_episode_s/ema_smoothed are all
         # correctly derived from the env instead of guessed here.
         env.sample_action_fn = driver_trainer._sample_action
+    # Opt in to a REAL per-player reward for the opponent's row too (via
+    # env.last_secondary_results), computed through the exact same
+    # _compute_phase1_reward_for_player() the trainee and real PPO training's
+    # neural secondary players already use -- not the trainee's own reward
+    # copy-pasted onto the opponent's row. Off by default on ScenarioEnv
+    # (would crash PPOTrainer's rollout-buffer drain the instant it saw a
+    # non-neural secondary player -- see the flag's docstring in
+    # scenario_env.py); safe here since record_demonstrations.py only ever
+    # reads reward/done off these rows, never feeds them into a PPO buffer.
+    env.always_compute_secondary_reward = True
     from footballcoach.rules_ai import Phase1RulesAI
     from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS
 
@@ -199,6 +227,12 @@ def record_episodes(
     bc_labels = []
     rewards = []
     dones = []
+    # 1.0 if this row is the TRAINEE's own row, 0.0 if it's the opponent's --
+    # trainee and opponent rows are interleaved within an episode (see
+    # _record_now()), so DemonstrationDataset.compute_returns() needs this to
+    # segment its backward MC scan per player-track instead of mixing the two
+    # players' reward streams together. See "is_trainee" note in dataset.py.
+    is_trainee_flags = []
     # Per-step reward-component breakdown, one fixed-width row per sample --
     # column order = REWARD_COMP_LABELS (short-key order), so this stays in
     # sync with ppo_trainer.py's diagnostics/reward.py's component keys
@@ -282,16 +316,20 @@ def record_episodes(
     if total_episodes is None:
         total_episodes = n_episodes
 
-    # Mutable cell holding the reward accrued since the last time it was
-    # consumed by a sample (timed sample or kick/tackle callback). Cleared to
-    # 0.0 every time it's read so reward is never double-counted across rows,
-    # and never silently dropped when a kick/tackle callback fires between
-    # timed samples (see the main loop below, which accrues into this cell
-    # after each env.step()).
-    _pending_reward: list[float] = [0.0]
+    # Per-player reward accrued since the last time it was consumed by a
+    # sample (timed sample or kick/tackle callback), keyed by player id.
+    # Cleared per-player every time it's read so reward is never
+    # double-counted across rows and never silently dropped when a kick/
+    # tackle callback fires between timed samples (see the main loop below,
+    # which accrues into this dict after each env.step()). Kept per-player
+    # (not one shared scalar) because the trainee and the opponent get
+    # GENUINELY DIFFERENT rewards -- see _record_now()'s docstring.
+    _pending_reward: dict[str, float] = {}
 
-    def _record_now(reward: float | None = None, done: bool = False, player_id: str | None = None):
-        """Append one (obs, label) sample per player.
+    def _record_now(reward: float | None = None, done: bool = False, player_id: str | None = None) -> list[str]:
+        """Append one (obs, label) sample per player. Returns the list of
+        player ids recorded, in append order, so the caller can backfill
+        each row's OWN reward after env.step() (see the main loop below).
 
         player_id=None (used for timed samples) records BOTH the trainee and
         the opponent in one call. A specific player_id (used for on_kick/
@@ -299,19 +337,25 @@ def record_episodes(
         player.
 
         reward=None (the default, used by kick/tackle callbacks) consumes and
-        clears whatever reward has accrued since the last sample via
-        ``_pending_reward`` — previously this was hardcoded to 0.0, silently
-        dropping the actual step reward (e.g. gain_possession_bonus) that
-        fired at exactly the kick/tackle tick. Timed samples explicitly pass
-        reward=0.0 and get their real reward backfilled after env.step().
+        clears whatever reward has accrued for THAT SPECIFIC player since
+        their last sample, via ``_pending_reward[pid]`` — never another
+        player's value. Timed samples explicitly pass reward=0.0 (a
+        placeholder) and get each player's real, INDIVIDUALLY-COMPUTED
+        reward backfilled after env.step() — the trainee's own reward
+        (env.step()'s return) is NOT the same value as the opponent's own
+        reward (env.last_secondary_results, computed via the same
+        _compute_phase1_reward_for_player() call PPO training itself uses
+        for a neural secondary player — see env.always_compute_secondary_
+        reward). Previously both rows were given the trainee's reward
+        value, silently double-counting it in every downstream MC-return/
+        episode-total computation and mislabeling the opponent's row with
+        someone else's reward.
         """
         ids = [env.trainee_player_id, "opponent"] if player_id is None else [player_id]
         nonlocal steps_total, steps_valid
         nonlocal _kick_count_since_log, _tackle_count_since_log, _kick_count_total, _tackle_count_total
-        if reward is None:
-            reward = _pending_reward[0]
-            _pending_reward[0] = 0.0
         for pid in ids:
+            pid_reward = _pending_reward.pop(pid, 0.0) if reward is None else reward
             obs = env._get_obs(player_id=pid)
             label = label_fn(env, player_id=pid)
             label_arr = label.to_array()
@@ -321,8 +365,9 @@ def record_episodes(
             ball_feats.append(obs.ball_feat.copy())
             global_feats.append(obs.global_feat.copy())
             bc_labels.append(label_arr)
-            rewards.append(np.float32(reward))
+            rewards.append(np.float32(pid_reward))
             dones.append(np.float32(done))
+            is_trainee_flags.append(np.float32(1.0 if pid == env.trainee_player_id else 0.0))
             reward_components.append(np.zeros(len(_comp_key_order), dtype=np.float32))
             steps_total += 1
             if label.valid:
@@ -333,6 +378,7 @@ def record_episodes(
                 if label.tackle_attempt > 0.5:
                     _tackle_count_since_log += 1
                     _tackle_count_total += 1
+        return ids
 
     # Sample tackle_armed/kick_armed (transient per-tick flags on Player,
     # reset every tick by Match._process_orders) once per physics tick via
@@ -449,37 +495,64 @@ def record_episodes(
         done = False
         last_info = None
         while not done:
-            # Timed sample at sample_interval_s cadence (reward=0 for mid-step samples;
-            # the actual reward from env.step() is assigned to the NEXT sample(s) or
-            # appended to the episode-end step below).
+            # Timed sample at sample_interval_s cadence (reward=0 placeholder
+            # for mid-step samples; each player's OWN real reward is assigned
+            # to their row(s) below, or accrued for the NEXT sample(s)).
             # player_id=None -> records BOTH trainee and opponent -> appends 2 rows.
             n_before = len(rewards)
-            _record_now(reward=0.0, done=False)
+            _recorded_ids = _record_now(reward=0.0, done=False)
             n_appended = len(rewards) - n_before
             # Advance sim by sample_interval_s; kick/tackle callbacks fire inside
             _obs, _reward, done, last_info = env.step()
-            # Backfill reward/done/components onto every row just appended for
-            # this timed sample (trainee + opponent both share the env-level
-            # reward/done/components — there is no separate per-player signal
-            # at this granularity).
-            _comp_row = np.array(
-                [env.last_reward_components.get(k, 0.0) for k in _comp_key_order],
-                dtype=np.float32,
-            )
-            for i in range(1, n_appended + 1):
-                rewards[-i] = np.float32(_reward)
-                reward_components[-i] = _comp_row
+            # Per-player reward for this step: the trainee's own (env.step()'s
+            # return) plus the opponent's own (env.last_secondary_results,
+            # populated regardless of the opponent's driver type because
+            # env.always_compute_secondary_reward=True was set above) — NOT
+            # the same value duplicated onto both, see _record_now()'s
+            # docstring for why that was wrong.
+            _reward_by_pid = {env.trainee_player_id: float(_reward)}
+            for _sec in env.last_secondary_results:
+                _reward_by_pid[_sec["player_id"]] = float(_sec["reward"])
+            # Backfill reward/done onto each row just appended for this timed
+            # sample with THAT row's own player's reward AND reward_components
+            # (env.last_reward_components is the trainee's own; each
+            # secondary player's own breakdown lives on its
+            # last_secondary_results entry — see scenario_env.py's
+            # last_secondary_results docstring for why these are no longer
+            # merged together. Previously every row got the SAME env-level-
+            # combined dict regardless of which player it belonged to,
+            # e.g. a trainee "win" row would also carry the losing
+            # opponent's own loss_terminal penalty.
+            _comp_by_pid = {env.trainee_player_id: env.last_reward_components}
+            for _sec in env.last_secondary_results:
+                _comp_by_pid[_sec["player_id"]] = _sec.get("reward_components", {})
+            for _offset, _pid in enumerate(_recorded_ids):
+                _i = n_appended - _offset
+                rewards[-_i] = np.float32(_reward_by_pid.get(_pid, _reward))
+                _pid_comps = _comp_by_pid.get(_pid, {})
+                reward_components[-_i] = np.array(
+                    [_pid_comps.get(k, 0.0) for k in _comp_key_order], dtype=np.float32,
+                )
                 if done:
-                    dones[-i] = np.float32(1.0)
-            # Accrue this step's reward for the NEXT kick/tackle callback (if
-            # any) that fires before the next timed sample — see _record_now.
-            _pending_reward[0] += float(_reward)
+                    dones[-_i] = np.float32(1.0)
+            # Accrue each player's own reward for THEIR next kick/tackle
+            # callback (if any) that fires before the next timed sample.
+            for _pid, _r in _reward_by_pid.items():
+                _pending_reward[_pid] = _pending_reward.get(_pid, 0.0) + _r
             # Accumulate reward component breakdown for periodic logging (see
             # train.py's "_comp_acc" diagnostic for the analogous pattern).
-            for _k, _v in env.last_reward_components.items():
-                _comp_acc[_k] = _comp_acc.get(_k, 0.0) + _v
-            _ep_poss_reward["poss"] += env.last_reward_components.get("poss", 0.0)
-            _ep_poss_reward["lpos"] += env.last_reward_components.get("lpos", 0.0)
+            # This periodic run-wide SUMMARY is deliberately env-level (all
+            # players' components summed) -- there's no per-player breakdown
+            # at this granularity (see _ep_poss_reward's own docstring
+            # above) -- so explicitly sum every _comp_by_pid dict here,
+            # now that env.last_reward_components alone no longer includes
+            # the secondary players' own contribution (see the backfill
+            # above).
+            for _pid_comps in _comp_by_pid.values():
+                for _k, _v in _pid_comps.items():
+                    _comp_acc[_k] = _comp_acc.get(_k, 0.0) + _v
+            _ep_poss_reward["poss"] += sum(c.get("poss", 0.0) for c in _comp_by_pid.values())
+            _ep_poss_reward["lpos"] += sum(c.get("lpos", 0.0) for c in _comp_by_pid.values())
 
         _comp_acc_episodes += 1
         episode_poss_reward.append(dict(_ep_poss_reward))
@@ -547,6 +620,7 @@ def record_episodes(
         "obs_global_feat": np.stack(global_feats).astype(np.float32),
         "bc_labels":       np.stack(bc_labels).astype(np.float32),
         "rewards":         np.array(rewards, dtype=np.float32),
+        "is_trainee":      np.array(is_trainee_flags, dtype=np.float32),
         "dones":           np.array(dones, dtype=np.float32),
         "reward_components": np.stack(reward_components).astype(np.float32),
         "meta_reward_component_keys": np.array(_comp_key_order),
@@ -601,6 +675,14 @@ def _run_recording_job(job: dict) -> dict:
     env, label_fn, scenario_key = _build_env_and_label_fn(job["phase_id"])
 
     driver_trainer = None
+    if job.get("driver_checkpoint") or job.get("teacher_checkpoint"):
+        # Explicit redundant safeguard on top of the module-level
+        # OMP_NUM_THREADS-etc guard above -- torch's own internal thread pool
+        # doesn't reliably pick up those env vars in every build, so cap it
+        # directly too (mirrors debug_value_network.py's rollout workers).
+        import torch as _torch
+        _torch.set_num_threads(max(1, int(job.get("worker_torch_threads", 1))))
+
     if job.get("driver_checkpoint"):
         from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
         driver_trainer = PPOTrainer.load_for_inference(job["driver_checkpoint"])
@@ -740,10 +822,20 @@ def main() -> None:
     parser.add_argument("--n-processes", type=int, default=_default_n_processes,
                         help=f"Number of worker processes to split --n-episodes across "
                              f"(default: {_default_n_processes} from config). 1 = current "
-                             "single-process behaviour. No neural network is involved in "
-                             "recording, so unlike PPO's --n-parallel-envs there's no weight "
-                             "sync -- each worker just records its own share of episodes into "
-                             "its own disjoint .npz file range.")
+                             "single-process behaviour. Unlike PPO's --n-parallel-envs there's "
+                             "no weight sync -- each worker just records its own share of "
+                             "episodes into its own disjoint .npz file range (and, with "
+                             "--driver-checkpoint/--teacher-checkpoint, loads its own copy of "
+                             "the checkpoint independently).")
+    _default_worker_torch_threads = int(_cfg.get("bc", {}).get("demo_worker_torch_threads", 1))
+    parser.add_argument("--worker-torch-threads", type=int, default=_default_worker_torch_threads,
+                        help=f"torch.set_num_threads() per worker (default: "
+                             f"{_default_worker_torch_threads} from config). Only matters with "
+                             "--driver-checkpoint/--teacher-checkpoint (no torch is loaded "
+                             "otherwise). Keep this at 1 when --n-processes > 1 -- torch defaults "
+                             "to one thread per logical core, so N processes each left uncapped "
+                             "oversubscribes badly; this is on top of the module-level "
+                             "OMP_NUM_THREADS-etc guard, which caps numpy/BLAS the same way.")
     args = parser.parse_args()
 
     import random
@@ -801,6 +893,7 @@ def main() -> None:
             "opponent_immobile_prob": args.opponent_immobile_prob,
             "driver_checkpoint": args.driver_checkpoint,
             "teacher_checkpoint": args.teacher_checkpoint,
+            "worker_torch_threads": args.worker_torch_threads,
         })
         log.info(
             f"Done. {result['n_files']} file(s), {result['total_steps']:,} total steps → {output_dir}"
@@ -834,6 +927,7 @@ def main() -> None:
             "opponent_immobile_prob": args.opponent_immobile_prob,
             "driver_checkpoint": args.driver_checkpoint,
             "teacher_checkpoint": args.teacher_checkpoint,
+            "worker_torch_threads": args.worker_torch_threads,
             "worker_idx": i,
         })
         file_idx_cursor += (worker_eps + eps_per_file - 1) // eps_per_file

@@ -495,6 +495,23 @@ suite, keep any new tests here using a tiny `rollout_steps`).
   stable minibatch gradient descent instead of noisy single-sample online updates.
 - **Always use the offline dataset when it exists.** Online pre-training
   (dataset=None) is noisy and oscillates on episode resets.
+- Can also be driven by a neural checkpoint instead of pure rules-AI play —
+  `record_demonstrations.py --driver-checkpoint`/`--teacher-checkpoint`
+  (state visitation vs. BC-label supervision, independently selectable) — see
+  `ai/knowledge.md`'s "Demonstration recording" section.
+
+**!!!! Hardcoded to exactly 2 players (trainee + one opponent) !!!!** The
+per-player-reward plumbing (`ScenarioEnv.always_compute_secondary_reward`,
+`record_demonstrations.py`'s per-pid `_pending_reward`) and
+`DemonstrationDataset`'s `is_trainee` field / `compute_returns()`'s two-track
+backward scan all assume exactly one trainee track and one opponent track —
+see the "!!!! Hardcoded to exactly 2 players !!!!" note in `ai/knowledge.md`'s
+"Demonstration recording" section for the full breakdown of what specifically
+needs generalizing (a real per-row player-id, not a binary flag; a dict of
+per-track accumulators, not two named variables; `_record_now()`'s hardcoded
+`ids = [trainee, "opponent"]`). Whoever adds the first demo-recording scenario
+with more than 2 players (2v2+, or extra secondary players) must revisit all
+three together, not just one.
 
 **BC aux loss annealing** (`ai_config.json::bc.aux_coeff_anneal_fraction`):
 - `aux_coeff_start=0.95` → `aux_coeff_end=0.0`, reaching zero by
