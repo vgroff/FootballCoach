@@ -127,6 +127,48 @@ uv run python -m footballcoach.ai.scripts.evaluate \
 
 ---
 
+## Value-net diagnostics / re-pretraining (`debug_value_network.py`)
+
+Repo-root script (gitignored, not a package module) for fitting/diagnosing the
+value head outside a full training run — either against a recorded demo
+`.npz` dataset (`--data`), or, with `--checkpoint`, by loading a trained
+checkpoint and collecting a fresh on-policy rollout with it (an ad-hoc
+`pretrain_value()` you can rerun on demand). Prints per-outcome RMSE
+breakdown, a linear-regression baseline over hand-picked scalar features
+(top_speed/ball_dist/ball_to_box/time_remaining), and reward-component
+stats — much more diagnostic detail than a normal training run's log.
+
+```bash
+uv run python debug_value_network.py \
+    --checkpoint checkpoints/longterm/checkpoint_vvgood_immobile.pt \
+    --rollout-steps 185000 \
+    --n-parallel-envs 8 \
+    --worker-torch-threads 1 \
+    --epochs 100 \
+    --gamma 0.992 \
+    --lr 2e-4 \
+    --val-frac 0.2 \
+    --seed 0 --patience 20 --batch-size 4096 \
+    --reset-dir-log-std --weight-decay 1e-6 --reset-value-weights \
+    2>&1 | tee -a debug_runs.md
+```
+
+- `--reset-value-weights` reinitializes `value_head`/`value_ai_type_channel`
+  fresh instead of continuing from the checkpoint's — required whenever the
+  checkpoint predates a value-head architecture change (checkpoints still
+  *load*, just with those specific params falling back to fresh init and a
+  warning, so pass this flag rather than leaving them half-stale).
+- `--reset-dir-log-std` resets move/kick direction exploration std to config
+  init before collecting the rollout (affects action sampling, not just the
+  later fit).
+- `--progress-milestone-pct N` (default 10) — how granular the rollout
+  progress lines are once output isn't a live terminal (auto-detected; piping
+  to `tee`/a file downgrades the live bar to milestone lines automatically so
+  the log doesn't fill with hundreds of `\r`-separated lines). Raise for a
+  smaller log.
+
+---
+
 ## Useful flags
 
 | Flag | Effect |

@@ -19,6 +19,7 @@ Extending training:
 - It sounds like reward functions are currently personalised per-player. They should be generalised and apply to all players with a particular role in the task (reward may change by role)
 - Task ids are important, make sure they are set
     - I think task ids should only be set by the decision network, the execution network shouldnt get them (remove if it already does)
+- Certain coefficients may need setting on a per-phase level, hopefully not too many, but potentially things like BC aux (e.g. kicking only or not)
 Notes to self:
 - GK needs fixing - he saves no shots in the close rnage scenario
 - When running these messy/random scenarios, we might need to decide (maye using a value network) whcih runs are actually good (advantage-wise and in absolute)
@@ -31,13 +32,33 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. Please do not skip any of them. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
-    - check rules-based ui performance, re-gen data (30k examples), re-pre-train, 
-    - !! Maybe immobile opponent can't win? Maybe lower timeout? would reduce the value error.
+    - !! next plan - generate a ton of demo data uisng vvgood immobile
+        - check the match logs that do poorly on invalid
+    - !!! Do some performance profiling - how long spent on rollouts vs PPO vs evals etc.. n_envs - how much faster does it get with more of them? How many do we want? Main threads too? - can try this with the evals script maybe?
+        - To try: vary envs, vary threads, try non-separate network (might need to add in to force this), reset log dir std, vary opponent distribution
+        - check reward stats by outcome
+        - results:
+            - sep, 1 env, 1 thread, 2096 steps, 200ms per epoch, 10s
+                - same with 2 threads, same with 5
+                - 0.3s per ep, 30s to do 5k steps, 165 steps/s
+            - sep, 8 envs, 5k steps, 15.6s
+            - make a demo thing or equivalent so that we save the rollouts!
+            - vary dir log std!
+            - vary opponents!
+    - !!! Phone note:
+        - Shorter timeout so that we get a bit more of them?
+        - Does lowering dt improve performance or not?
+    - try annealing? - worth proving that kick push is actually faster tbh
+    - !! value network HAS to work on rules-based, used the debug value net script to prove it - there's almost no variance per-seed (Claude showed this will the evalute script in the "Review PPO..." chat)
+    - Is any data missing during BC or does it have everything? If so, why can't it predit it corectly?
+        - boost sprint/move loss??
+    - !! Do a full-ass BC training all the way
     - !! value pretrain - why does it do so much better during PPO than during pretrain??? is the reported loss before or after re-train? Can we get the other one too? Is it using the right decision network in pretrain?
         - what if we load in the actual network in the debug value net script? deterministic vs not? Can it do as well/better?
         - what's frozen/shared for the value network?
         - try debug value net with the decision network heads insted of it's own network
     - Demo should log kick aim, not acutl kick direction (post-error)
+    - make running speed continuous - could help with the dt quantisation, and easy to do (don't change rules-based)
     - log entropy + entropy loss contribution for each head
     - print what the actual MC contribution of each rewrd is per step
     - Try more aggresive learning just to see how it does? 
@@ -45,7 +66,6 @@ Current notes:
         - Maybe re-introduce the shaping rewards?
     - DO players have current stamina?
     - bring annealing back?
-    - Do some performance profiling - how long spent on rollouts vs PPO vs evals etc.. n_envs - how much faster does it get with more of them? How many do we want? Main threads too? - can try this with the evals script maybe?
     - re-introduce speed bonus or nah?
     - Plan: 
         - need to re-run with the reset log dir std?

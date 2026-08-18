@@ -103,8 +103,8 @@
   "repulsion_ball_carrier_avoidance": {
     "min_sep_with_ball_m": 1.7673,
     "min_sep_without_ball_m": 1.6652,
-    "mean_close_approach_speed_with_ball_mps": 8.483,
-    "mean_close_approach_speed_without_ball_mps": 8.813,
+    "mean_close_approach_speed_with_ball_mps": 8.487,
+    "mean_close_approach_speed_without_ball_mps": 8.834,
     "carrier_is_slower": true
   },
   "dribble_penalty_near_zero_margin": {

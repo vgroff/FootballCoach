@@ -29,6 +29,32 @@ from __future__ import annotations
 from footballcoach.engine.match import Match
 from footballcoach.entities.player import Team
 
+# Canonical, ordered list of every raw outcome key detect_trial_outcome() can
+# return (see the vocabulary docstring above), plus a short display label for
+# each. This is the single source of truth for "what outcomes exist" -- UI
+# tallies (ScenarioLoop.outcomes / app.py) iterate this instead of hardcoding
+# their own key list, so adding a new outcome here is enough to make it show
+# up everywhere automatically.
+RAW_OUTCOME_KEYS: tuple[str, ...] = (
+    "goal",
+    "saved",
+    "miss",
+    "dispossessed",
+    "box_possession",
+    "course_complete",
+    "timeout",
+)
+
+RAW_OUTCOME_LABELS: dict[str, str] = {
+    "goal": "Goals",
+    "saved": "Saved",
+    "miss": "Miss",
+    "dispossessed": "Disp",
+    "box_possession": "Box",
+    "course_complete": "Done",
+    "timeout": "Timeout",
+}
+
 
 def detect_trial_outcome(
     match: Match,

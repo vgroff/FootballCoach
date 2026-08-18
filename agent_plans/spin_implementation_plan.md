@@ -29,6 +29,229 @@ waste time re-deriving it.
 
 ---
 
+## 0. IMPORTANT — 2026-08-17: `kick_power`/`kick_spin` PPO sampling landed, `kick_spin` is now FROZEN. Read this before touching sampling/log_prob/entropy code.
+
+This section documents a **scoped, deliberately partial** step taken toward
+this plan, and the immediately-following decision to freeze `kick_spin`
+back out of training. Do not "clean this up" by assuming it's an oversight
+— read the reasoning below first. If you're implementing the rest of this
+plan (real spin physics), section 0.4 below is your checklist.
+
+### 0.1 What actually landed
+
+Before this date, `kick_power` and `kick_spin` were **fully deterministic**
+at the PPO level — see §1.3/§6 above (kept for historical context, now
+partially superseded by this section for these two heads specifically):
+`kick_power_phys = float(torch.sigmoid(e_heads.kick_power))` and
+`kick_spin_raw = e_heads.kick_spin.squeeze(0)`, no sampling, no log_prob, no
+entropy, no PPO trust-region protection. Both `kick_power_log_std`/
+`kick_spin_log_std` existed as `nn.Parameter`s but were never read anywhere.
+
+This was fixed **without** the axis/magnitude redesign in §2 above (that
+part of the plan is still not implemented — deliberately deferred, see the
+scope discussion that led here). What changed instead, keeping `kick_spin`
+as the original raw `(batch, 3)` vector head (no dimensionality change):
+
+- `ExecutionNetwork.kick_power_log_std`/`kick_spin_log_std`
+  ([execution_network.py](../src/footballcoach/ai/models/execution_network.py))
+  now initialize from `ppo.kick_power_log_std_init`/`ppo.kick_spin_log_std_init`
+  in `ai_config.json` instead of a hardcoded `torch.zeros(...)`.
+- `PPOTrainer` gained two helper methods next to `_move_dir_head`/`_kick_dir_head`
+  ([ppo_trainer.py](../src/footballcoach/ai/ppo/ppo_trainer.py)):
+  - `_kick_power_head(mean, log_std) -> SquashedNormalHead` — sigmoid-squashed
+    to `[0,1]`, same convention `kick_power` always had physically.
+  - `_kick_spin_dist(mean, log_std) -> torch.distributions.Normal` — **plain,
+    unsquashed** 3D Normal. Neither `DirectionHead` (forces a unit-vector
+    mean — wrong, spin isn't unit length) nor `SquashedNormalHead` (forces a
+    bounded range — spin has no bounded physical range wired up) fit an
+    unbounded raw vector, so this is a small bespoke distribution, not a
+    reused class.
+- `_sample_action()` now samples both heads for real (mode in
+  deterministic-direction mode, else `sample_raw()`/`rsample()`), gated by
+  `kick=True` — same gating `kick_direction` already had, since both are
+  only ever consumed downstream inside the engine's `if kick_this_tick:`
+  block. Raw samples are stored in `raw_exec_samples`/`_action_to_numpy` as
+  `kick_power_raw`/`kick_spin_raw`.
+- `_compute_log_prob`, `_recompute_log_prob`, `_per_head_new_log_probs`
+  (+ `rollout_buffer.HEAD_LP_KEYS`, extended to 15 entries — was 13) all
+  gained matching gated terms for both heads.
+- `_compute_entropy` gained `p_kick`-weighted entropy terms for both,
+  controlled by new `ppo.ent_kick_power_weight`/`ppo.ent_kick_spin_weight`
+  config keys (mirroring `ent_dir_weight`'s pattern, not reusing it — neither
+  head is a `DirectionHead`).
+- The deterministic-mode diagnostic block inside `_ppo_update()` (the
+  `diag_act`/`_per_head_new_lp` local stack used for the worst-sample KL
+  printout) was extended to match — this is what the regression tests
+  (`test_smoke.py::test_ppo_update_produces_finite_losses` et al.) caught
+  when it was missed on the first pass: a hardcoded 12-wide local stack
+  silently desynced from the now-15-wide `HEAD_LP_KEYS`, causing a tensor
+  shape mismatch crash. If you extend `HEAD_LP_KEYS` again in the future,
+  grep for `_per_head_names` and `_new_lp_heads_map` in `ppo_trainer.py` —
+  there are (at least) two more hand-maintained parallel lists there that
+  don't auto-derive their width from `HEAD_LP_KEYS` and will silently
+  produce wrong (not crashing) diagnostics, or in the `_old_per_head`
+  slicing case, crash, if you add a head and forget them.
+- **Physical behaviour is unchanged**: `kick_power_fraction`/`kick_spin`
+  still feed the exact same downstream dict keys as before; `apply_nn_action.py`
+  still hardcodes `Vector3.zero()` for spin regardless of what
+  `gating.kick_spin` contains. This step was PPO-plumbing-only.
+
+### 0.2 Why `kick_spin` was then immediately frozen (and `kick_power` was not)
+
+Once `kick_spin` had a real distribution and real log_prob/entropy, it
+started **costing** something for zero benefit: since spin still has no
+physical effect, every bit of gradient/exploration noise spent on it is
+pure waste, and worse, actively risks polluting the PPO ratio/KL for a
+reason that isn't obvious on first read — worth spelling out because it
+generalizes to any future "wire up the distribution but not the physics
+yet" situation in this codebase:
+
+**Freezing `kick_spin`'s own Linear weights + `kick_spin_log_std` via
+`requires_grad_(False)` is necessary but NOT sufficient.**
+`e_heads.kick_spin = self.kick_spin(h)` — even with the `kick_spin` Linear
+layer's own weights frozen, its *output* keeps drifting every rollout,
+because the shared trunk `h` (`ExecutionNetwork.forward()`'s `self.trunk(...)`
+output, shared with `move_direction`/`kick_direction`/`kick_power`/every
+other live head) keeps moving under gradients from every head that IS
+still training. So the stored "old" sample vs. the recomputed "new" mean
+at update time keep diverging purely as a side effect of unrelated heads
+training — injecting spurious ratio/KL contributions from a head that's
+supposed to be inert, exactly as if its log_std were slowly, silently
+increasing on its own.
+
+This is the **exact same problem** `_ppo_lp_masked_heads` was already built
+to solve for `decision_net`'s phase-frozen heads (see `set_frozen_heads()`'s
+docstring: *"explicit masking removes noisy log_prob contributions from
+heads that carry no reward signal for this phase"*). The fix here is the
+same pattern, not a new idea — freeze the parameters (stops gradient) AND
+explicitly zero the term everywhere it's summed into a scalar loss/ratio
+(stops trunk-drift noise from leaking in via a frozen-but-still-computed
+value). Skipping the second half is the trap: `requires_grad=False` alone
+*looks* like it should be enough, and silently isn't.
+
+**`kick_power` was NOT frozen** — it has a real, live physical effect (kick
+launch speed via `kick_with_direction()`), so its exploration/log_prob is
+legitimate signal, not waste. Only `kick_spin` is a pure no-op right now.
+
+### 0.3 What "frozen" means, concretely
+
+Freeze is **unconditional / permanent**, not curriculum-phase-scoped —
+`set_frozen_heads()`'s existing mechanism is phase-conditional because
+`decision_net`'s frozen heads (shoot/pass/tackle/mark/hold in phase 1) are
+expected to become live again in a later phase. `kick_spin` is different:
+it's a hardcoded `Vector3.zero()` no-op in `apply_nn_action.py` regardless
+of which phase is running, so there's no phase boundary where un-freezing
+it would suddenly make sense — the only correct trigger to unfreeze it is
+"real spin physics landed" (section 0.4), not a curriculum transition.
+
+Two things freeze needs to touch, and they're structurally different:
+
+1. **`execution_net.kick_spin`** — an `nn.Linear`, so
+   `for p in execution_net.kick_spin.parameters(): p.requires_grad_(False)`
+   works exactly like `set_frozen_heads()`'s existing loop.
+2. **`execution_net.kick_spin_log_std`** — a **bare `nn.Parameter`**, not
+   wrapped in a module. `getattr(execution_net, "kick_spin_log_std")` does
+   NOT have a `.parameters()` method — calling `set_frozen_heads()`'s
+   existing loop on it as-is will `AttributeError`. Needs its own
+   `.requires_grad_(False)` call, or a small extension to whatever freezing
+   helper is used so it can accept both raw `nn.Parameter`s and modules.
+
+And the masking side (the actually load-bearing half, per 0.2): `kick_spin`
+needs to be excluded from the summed loss/ratio in **all four** of
+`_compute_log_prob`, `_recompute_log_prob`, `_per_head_new_log_probs`, and
+`_compute_entropy` in `ppo_trainer.py` — not just the sampling side. Easiest
+implementation is probably a plain `bool` (`self._kick_spin_frozen = True`,
+set once in `__init__`, no curriculum plumbing) guarding each of the four
+`kick_spin` blocks added in section 0.1, rather than trying to force this
+into the existing `_ppo_lp_masked_heads` frozenset (that set's `in`/`not in`
+checks are keyed by `decision_net` attribute name strings like
+`"shoot_logit"` and threaded through `set_frozen_heads(list[str])`'s
+phase-driven call sites in `train.py` — reusing it for a permanently-frozen
+`execution_net` sub-head would work but conflates two conceptually
+different kinds of "frozen" for no real benefit; a dedicated flag is
+clearer to read later, at the cost of one more `if` per site).
+
+**`kick_power` is deliberately left completely unaffected by any of this**
+— no flag, no masking, still fully live per section 0.1.
+
+### 0.4 How to re-enable `kick_spin` training (checklist, for whoever implements real spin physics)
+
+This is the point where the rest of this document (§2 onward: axis+magnitude
+output heads, the `topspin_axis`/`sidespin_axis` basis reconstruction in
+`apply_nn_action.py`, the BC loss rewrite, `max_spin_rad_s` clamping) finally
+gets implemented and `kick_spin` stops being a no-op. At that point:
+
+1. **Remove the freeze**: undo whichever of `requires_grad_(False)` calls
+   from §0.3 were added (grep `kick_spin` in `execution_network.py`'s
+   construction / `ppo_trainer.py`'s `__init__` for whatever comment marks
+   this — reference this section by name in that comment when you add it,
+   so it's easy to find later).
+2. **Remove the masking**: delete the `if not self._kick_spin_frozen:` (or
+   equivalent) guards from `_compute_log_prob`/`_recompute_log_prob`/
+   `_per_head_new_log_probs`/`_compute_entropy` added alongside the freeze.
+3. **Decide the dimensionality question for real this time**: §2.1/§2.1.1
+   argue for replacing the raw `(batch, 3)` `kick_spin` head with a 2D
+   `kick_spin_axis` (coefficients over the `kick_direction`-derived
+   `topspin_axis`/`sidespin_axis` basis) + `kick_spin_magnitude` scalar,
+   rather than keeping the free 3-vector this frozen version used. If you
+   do adopt that redesign, `_kick_spin_dist()` (the bespoke unsquashed
+   Normal added in §0.1) gets replaced by the `DirectionHead`(dim=2) +
+   `SquashedNormalHead` pair described in §2.3, not reused as-is — the
+   whole point of the redesign is to stop wasting a degree of freedom on
+   the physically-inert axis, which the current frozen 3-vector version
+   still has (moot while frozen, not moot once live).
+4. **Wire the BC loss properly**: §4.1's projection-onto-basis rewrite,
+   including the `kick_precision` plumbing decision (§4.1 options (i) vs
+   (ii) — re-recording demo datasets is a real cost, see §5).
+5. **Augmentation — do not skip this, it's an easy silent-bug trap**:
+   `ai/obs/augment.py`'s `_DIR_ACTION_KEYS` frozenset currently does **NOT**
+   include `kick_power_raw` or `kick_spin_raw` — both fall through to the
+   `else` branch (`flipped_actions[k] = v`, unchanged pass-through) under
+   `flip_y` augmentation. This is **correct and requires no change for
+   `kick_power`** (a true scalar, flip-invariant either way). It is
+   **currently harmless for `kick_spin` only because it's frozen** — a
+   frozen head's stored raw sample never gets compared against a
+   recomputed log_prob in a way that matters (see §0.2, the ONLY reason it's
+   safe to leave un-augmented right now is that it's excluded from every
+   loss sum entirely). The moment `kick_spin` (or its `kick_spin_axis`
+   replacement) is unfrozen, this becomes a real correctness bug: augmented
+   samples would silently pair a flipped observation with an unflipped
+   spin target, corrupting that head's log_prob under augmentation exactly
+   the way `augment.py`'s existing pseudovector handling
+   (`_BC_KICK_SPIN_X_COL`/`Y_COL`/`Z_COL`) already prevents for the BC
+   label path. What to add depends on which representation you picked in
+   step 3:
+   - **Raw 3-vector kept as-is**: add `kick_spin_raw` to a pseudovector
+     variant of the flip handling — negate indices 0 and 2 (x, z) under
+     `flip_y`, mirroring `BALL_FLIP_Y_IDX`'s treatment of `ball.spin` — this
+     is NOT the same rule `_DIR_ACTION_KEYS` uses (that negates index 1 for
+     a *polar* vector), so `kick_spin_raw` cannot simply be added to
+     `_DIR_ACTION_KEYS` as-is; it needs its own pseudovector-flip branch.
+   - **2D axis+magnitude redesign adopted**: per this document's §2.1.1
+     equivariance derivation (verified by direct computation, not just
+     "should work"), the topspin coefficient (index 0) is flip-invariant
+     and the sidespin coefficient (index 1) negates under `flip_y` — which
+     numerically **is** exactly `_DIR_ACTION_KEYS`'s existing rule
+     (`v2[:, 1] *= -1.0` under `flip_y`, index 0 untouched). In that case
+     `kick_spin_axis_raw` CAN simply be added to `_DIR_ACTION_KEYS`
+     directly. `kick_spin_magnitude_raw` needs no entry either way (scalar,
+     flip-invariant, same as `kick_power_raw`).
+   Either way: add a regression test. `augment.py` has no existing test
+   coverage asserting a specific numeric sign-flip outcome for any
+   `kick_spin*` action key (the BC-label path's `_BC_KICK_SPIN_*_COL`
+   flipping IS tested — check `tests/ai_unit/` for the existing augmentation
+   test file and follow its pattern for whichever key you add).
+6. **Re-run the full AI test suite** (`uv run pytest tests/ai_unit
+   tests/ai_scenario -v`), and specifically add one new test before
+   unfreezing: assert `kick_spin`'s log_prob/entropy contribution is
+   exactly `0.0` while frozen (protects against a future accidental
+   double-unfreeze-by-omission), and a second test asserting it becomes
+   nonzero/finite once unfrozen — the two tests should fail loudly if
+   someone flips the freeze flag without also removing the masking, or
+   vice versa (the exact "necessary but not sufficient" trap from §0.2).
+
+---
+
 ## 1. Why the current design is broken
 
 ### 1.1 No physical clamp on the neural kick path
@@ -181,7 +404,34 @@ normalization step and no scalar magnitude head. Two consequences:
 
 ## 2. Target design
 
-### 2.1 Network output: axis + magnitude, not a raw 3-vector
+### 2.1 Network output: in-plane axis (2D) + magnitude, not a raw 3-vector
+
+**Revised 2026-08-17** — the original version of this section kept
+`kick_spin_axis` as a free 3D unit vector. That was wrong: a free 3D unit
+vector is not constrained to be perpendicular to `kick_direction`, and the
+component of spin *parallel* to the kick's velocity contributes exactly
+zero to the Magnus force (`magnus_force = spin.cross(velocity) * ...` in
+`ball_physics.py` — a vector crossed with a parallel vector is zero). So a
+3D unit-axis head still leaves the network free to spend capacity and
+exploration noise on a component that can never affect the ball's flight
+— it fixes *unbounded magnitude* (the original problem) but not the
+*wasted degree of freedom* (a distinct problem, discussed and dismissed in
+conversation before this doc existed, and re-raised on review of this
+plan).
+
+The correct fix is to output only the **2 coefficients that span the plane
+perpendicular to `kick_direction`** — this is not a loss of expressiveness
+(topspin, backspin, and sidespin are all still fully representable at any
+kick elevation, see §2.1.1) and it structurally guarantees the
+physically-inert component is exactly zero rather than hoping training
+suppresses it. `ui/kick_trajectory.py::spin_from_mouse()` already
+implements this exact idea for the human kick UI — mouse angle `θ` around
+the player selects a point on the unit circle of a 2-vector basis
+(`topspin_axis`, `sidespin_axis`) that spans the plane ⊥ to the kick's aim
+direction, and mouse distance sets the magnitude. This section adopts the
+same pattern for the network, generalized to handle elevation (§2.1.1)
+since the UI's version is a flat/horizontal approximation (see the
+caveat at the end of §2.1.1).
 
 Replace:
 
@@ -192,39 +442,106 @@ self.kick_spin = nn.Linear(trunk_hidden, 3)             # raw spin vector
 with two heads:
 
 ```python
-self.kick_spin_axis = nn.Linear(trunk_hidden, 3)         # raw 3-vector, L2-normalized to unit axis in forward()
+self.kick_spin_axis = nn.Linear(trunk_hidden, 2)         # raw 2-vector (in-plane coeffs), L2-normalized to a unit 2-vector in forward()
 self.kick_spin_magnitude = nn.Linear(trunk_hidden, 1)    # raw scalar; sigmoid -> [0, 1] fraction of max_spin_rad_s
 ```
 
 In `forward()`, alongside the existing `kick_direction` normalization:
 
 ```python
-raw_spin_axis = self.kick_spin_axis(h)
+raw_spin_axis = self.kick_spin_axis(h)  # (batch, 2) — coefficients over (topspin_axis, sidespin_axis)
 ...
 return ExecutionHeadsRaw(
     ...
-    kick_spin_axis=raw_spin_axis / (raw_spin_axis.norm(dim=-1, keepdim=True) + eps),
+    kick_spin_axis=raw_spin_axis / (raw_spin_axis.norm(dim=-1, keepdim=True) + eps),  # (batch, 2) unit vector [cos_theta, sin_theta]
     kick_spin_magnitude=self.kick_spin_magnitude(h),  # raw; sigmoid applied by caller, matches kick_power convention
     ...
 )
 ```
 
-This exactly mirrors the existing `kick_direction` (unit vector, computed
+Note the network never sees or constructs the 3D basis vectors themselves
+— it only ever outputs 2 numbers (an in-plane angle, represented as a unit
+2-vector for the same reasons `move_direction`/`kick_direction` are). The
+3D reconstruction happens once, downstream, in `apply_nn_action.py`
+(§2.2), where `kick_direction` (this same network's own other output) is
+already available to build the basis from.
+
+This still mirrors the existing `kick_direction` (unit vector, computed
 in-network) / `kick_power` (raw scalar, sigmoid applied by the caller at
 sample time, see `ppo_trainer.py` line ~2912
-`kick_power_phys = float(torch.sigmoid(e_heads.kick_power))`) split.
+`kick_power_phys = float(torch.sigmoid(e_heads.kick_power))`) split — just
+at 2 output dims instead of 3 for the axis half.
 
-**Why axis rather than "spin about an arbitrary 3D axis" being hard to
-learn:** in practice most footballing spin is either topspin/backspin
-(axis roughly perpendicular to the direction of travel, in the horizontal
-plane) or side-spin (axis roughly vertical). An unconstrained 3D unit
-axis can represent all of these; forcing e.g. a fixed vertical axis would
-remove topspin/backspin capability, so we keep the full 3D unit vector
-rather than reducing dimensionality further. This is a deliberate,
-minimal scope decision — do not "simplify" to a 1D or 2D parameterization
-without discussing trajectory/Magnus-effect implications with the physics
-model first (see `engine/knowledge.md` and the ball physics module for
-how spin currently affects trajectory).
+#### 2.1.1 Basis construction (handles elevation correctly; UI does not)
+
+The UI's `topspin_axis = rotate_90_ccw(aim_dir_xy)` is only exactly
+perpendicular to the *actual* 3D kick direction when the kick is flat
+(`elevation_angle_rad = 0`) — `aim_dir` in `spin_from_mouse()` is built
+from the horizontal `AIM_XY` phase only, before the separate `AIM_Z`
+(elevation) phase runs, so for any lofted human kick today the UI's spin
+basis is a small approximation, not exact. This has presumably gone
+unnoticed because lofted spin kicks are rare and the resulting curve error
+is subtle.
+
+For the network, do it exactly instead, using the *actual* 3D
+`kick_direction` (which can have a nonzero z-component from elevation).
+Given unit vector `d = kick_direction`:
+
+```python
+world_up = Vector3(0.0, 0.0, 1.0)
+topspin_axis = d.cross(world_up).normalized()      # horizontal, guaranteed ⊥ d for any d (property of cross product)
+sidespin_axis = topspin_axis.cross(d).normalized()  # ⊥ both d and topspin_axis; tilts with elevation
+```
+
+**Corrected 2026-08-17 (implementation pass)** — an earlier draft of this
+section had `topspin_axis`/`sidespin_axis` swapped. Checked against the
+UI: `spin_from_mouse()`'s `topspin_axis = (-aim_dir_y, aim_dir_x, 0)` is
+the **horizontal**, in-plane-rotated-90° vector (matches `d.cross(world_up)`
+above, up to an inconsequential sign), and its `sidespin_axis = (0,0,1)`
+is the **fixed vertical** one (matches `topspin_axis.cross(d)` reducing to
+world-z at zero elevation). Get this backwards and the physical labels
+invert: spin about the *horizontal* axis ⊥ to travel produces a *vertical*
+Magnus force (dip/lift = topspin/backspin); spin about the *vertical* axis
+produces a *horizontal* Magnus force (curl = sidespin) — so the horizontal
+cross-product vector must be named `topspin_axis`, not `sidespin_axis`.
+
+`topspin_axis` reduces to the UI's (rotated) `topspin_axis` direction
+when `d` is horizontal — the two schemes agree exactly at zero elevation,
+they only diverge for lofted kicks, where the network's version stays
+exact and the UI's stays approximate. (Not proposing to fix the UI's
+approximation in this plan — flagging it only so nobody assumes the UI's
+formula can be reused verbatim for the network path; it can't, for lofted
+kicks specifically.) Degenerate case: `d` parallel to `world_up` (a
+perfectly vertical kick) makes `d.cross(world_up)` zero — not physically
+reachable given `max_loft_angle_deg` constraints, but guard with a fallback
+axis (e.g. world `+x`) rather than dividing by ~0, same defensive pattern
+already used elsewhere in this codebase (`+ eps` on every other
+normalization in this plan).
+
+**Equivariance under `flip_y` — now verified by direct computation, not
+just "should work" (see the abandoned equivariance note further down in
+this doc, superseded by this box):** with `d' = (d_x, -d_y, d_z)` (the
+mirrored kick direction) and both axes re-derived fresh from `d'` via the
+same formulas, `topspin_axis(d')` equals the **pseudovector transform** of
+`topspin_axis(d)` (x,z negate, y unchanged) — exactly like `spin_x`/`spin_z`
+in `BALL_FLIP_Y_IDX` — while `sidespin_axis(d')` equals the **polar-vector**
+transform of `sidespin_axis(d)` (only y negates) — like `kick_direction`
+itself. Working through what this means for the actual spin vector
+`spin = mag·(cos_t·topspin_axis + sin_t·sidespin_axis)` under a true
+physical mirror: the **topspin coefficient (`cos_t`) is unchanged**, and
+the **sidespin coefficient (`sin_t`) negates**. This matches physical
+intuition directly — a ball's forward/backward tumble (topspin/backspin)
+looks identical mirrored; a ball curling right becomes a ball curling left
+in the mirror (sidespin flips handedness). Concretely: if the raw 2-vector
+is stored as `[cos_t, sin_t]` (index 0 = topspin, index 1 = sidespin),
+`flip_y` must negate **index 1 only** — which is exactly what
+`augment.py`'s existing `_DIR_ACTION_KEYS` flip rule already does
+(`v2[:, 1] *= -1.0` under `flip_y`), so `kick_spin_axis_raw` can reuse that
+existing mechanism directly rather than needing bespoke flip code. (Not
+verified for `flip_x` — currently moot, `flip_x` is excluded from
+`_FLIP_VARIANTS` per the canonical-AI-frame note elsewhere in this
+codebase — flag as unverified if `flip_x` augmentation is ever
+reintroduced.)
 
 ### 2.2 Where the magnitude gets scaled to physical units
 
@@ -248,13 +565,23 @@ Concretely, in `apply_action_to_player()`
 from footballcoach.engine.kicking import KickingParams, max_spin_rad_s
 
 if gating.kick_this_tick:
-    kick_dir = gating.kick_direction
+    kick_dir = gating.kick_direction  # unit Vector3, this same network's kick_direction output
     ...
-    spin_axis = gating.kick_spin_axis
+    cos_t, sin_t = gating.kick_spin_axis  # (2,) unit vector: coeffs over (topspin_axis, sidespin_axis)
     spin_magnitude_frac = gating.kick_spin_magnitude_fraction  # already sigmoid'd, in [0, 1]
-    if spin_axis is not None and np.linalg.norm(spin_axis) > 1e-6:
+
+    world_up = Vector3(0.0, 0.0, 1.0)
+    _top_raw = kick_dir.cross(world_up)
+    if _top_raw.length() > 1e-6:
+        topspin_axis = _top_raw.normalized()
+    else:
+        topspin_axis = Vector3(1.0, 0.0, 0.0)  # degenerate near-vertical-kick fallback, see §2.1.1
+    sidespin_axis = topspin_axis.cross(kick_dir).normalized()
+
+    if spin_magnitude_frac > 1e-6:
         max_spin = max_spin_rad_s(match.kicking_params, player.attributes.kick_precision)
-        spin_vec = Vector3(*spin_axis) * (spin_magnitude_frac * max_spin)
+        spin_dir_unit = topspin_axis * cos_t + sidespin_axis * sin_t  # already unit length: cos_t^2+sin_t^2=1, axes orthonormal
+        spin_vec = spin_dir_unit * (spin_magnitude_frac * max_spin)
     else:
         spin_vec = Vector3.zero()
     player.kick_with_direction(
@@ -264,6 +591,13 @@ if gating.kick_this_tick:
         spin_vec,
     )
 ```
+
+Basis construction is duplicated between here and §2.1.1 conceptually —
+consider factoring `kick_spin_basis(kick_direction: Vector3) -> tuple[Vector3, Vector3]`
+into a shared helper (e.g. `ai/action/apply_nn_action.py` itself, or a
+small physics-adjacent module both it and any future BC/eval code can
+import) rather than inlining the cross-product math at every call site —
+worth deciding at implementation time, not blocking for this plan.
 
 Note `match.kicking_params` — confirm this attribute name exists on
 `Match` (it's referenced as `match.kicking_params` in
@@ -285,9 +619,11 @@ neural AI).
 
 **Axis:** reuse `DirectionHead` exactly as `kick_direction` already does
 — it already supports arbitrary vector dimensionality (constructed with
-`raw_vector: torch.Tensor` of shape `(..., 3)` for `kick_direction`, so
-`(..., 3)` for `kick_spin_axis` works identically). Add a new learnable
-log_std parameter:
+`raw_vector: torch.Tensor` of shape `(..., 3)` for `kick_direction`; use
+`(..., 2)` for `kick_spin_axis` — confirm `DirectionHead`'s log_prob/
+entropy math doesn't hardcode dim=3 anywhere, e.g. in a normalizing
+constant; it shouldn't, since it's meant to be dimension-generic, but
+verify before assuming). Add a new learnable log_std parameter:
 
 ```python
 self.kick_spin_axis_log_std = nn.Parameter(torch.full((1,), kick_spin_axis_log_std_init))
@@ -317,10 +653,10 @@ spin_mag_head = SquashedNormalHead(
 )
 
 if det_direction:
-    spin_axis_raw = spin_axis_head.mode_physical()          # (1, 3)
+    spin_axis_raw = spin_axis_head.mode_physical()          # (1, 2)
     spin_mag_raw = spin_mag_head.mode_physical()            # (1, 1) already in [0,1]
 else:
-    spin_axis_raw = spin_axis_head.sample_raw()              # (1, 3), pre-normalized already inside DirectionHead
+    spin_axis_raw = spin_axis_head.sample_raw()              # (1, 2), pre-normalized already inside DirectionHead
     spin_mag_raw = spin_mag_head.to_physical(spin_mag_head.sample_raw())
 
 spin_axis_phys = (spin_axis_raw / (spin_axis_raw.norm(dim=-1, keepdim=True) + eps)).squeeze(0)
@@ -383,7 +719,7 @@ Add to the `network` section, next to the existing dir_log_std_* keys:
 
 ```json
 "kick_spin_axis_log_std_init": -2.2,
-"_comment_kick_spin_axis_log_std_init": "Initial log_std for the kick_spin_axis DirectionHead (isotropic Normal on the raw 3-vector before L2-normalize). Mirrors kick_dir_log_std_init; separate parameter so spin axis exploration can be tuned independently of kick_direction exploration. Falls back to dir_log_std_init if absent.",
+"_comment_kick_spin_axis_log_std_init": "Initial log_std for the kick_spin_axis DirectionHead (isotropic Normal on the raw 2-vector, before L2-normalize, over the (topspin_axis, sidespin_axis) basis derived from kick_direction -- see plan section 2.1.1, NOT a raw 3-vector). Mirrors kick_dir_log_std_init; separate parameter so spin axis exploration can be tuned independently of kick_direction exploration. Falls back to dir_log_std_init if absent.",
 "kick_spin_axis_log_std_target": -1.8,
 "kick_spin_axis_log_std_reg_coef": 0.0,
 "_comment_kick_spin_axis_log_std_reg": "L2 restoring force toward kick_spin_axis_log_std_target, mirrors dir_log_std_reg for move/kick direction heads. 0.0 = disabled.",
@@ -433,21 +769,68 @@ label, decompose only in the loss function.** This avoids changing
 derives axis + magnitude from the stored raw vector at loss-computation
 time:
 
+**Equivariance note (only relevant because of the §2.1 axis-dimensionality
+change, doesn't apply to the original 3D-axis version of this plan) —
+verified by direct computation in §2.1.1, not just "should be fine by
+construction":** `augment_batch()`'s `flip_y` variant negates the
+y-components of both `kick_direction` and `kick_spin` (the latter as a
+pseudovector — spin_x/z negate, per `ai/knowledge.md`) *before* this loss
+code ever runs, so `label_kick_dir` and `target_spin_raw` above are always
+already-flipped, consistent world-frame vectors by the time the basis is
+built. §2.1.1 works through the actual transform: the topspin coefficient
+(`target_topspin_component`) is invariant under `flip_y`, the sidespin
+coefficient (`target_sidespin_component`) negates — so
+`target_spin_axis_2d[:, 0]` (topspin) is unchanged and
+`target_spin_axis_2d[:, 1]` (sidespin) negates, matching exactly how
+`augment.py` already flips `kick_spin_axis_raw` via the existing
+`_DIR_ACTION_KEYS` mechanism (§2.1.1's tail note). Still add a regression
+test asserting this end-to-end (a known label run through
+`augment_batch(..., flip_y)` should produce a `target_spin_axis_2d` whose
+column 0 is unchanged and column 1 is negated) — the derivation is now
+verified on paper, not in code, and this is exactly the kind of
+silently-always-zero-today code path (§5.1: no current demo has nonzero
+spin) that stays untested for a long time by default.
+
+The BC label stays a raw 3-vector (world-frame `kick_spin`), and the loss
+now projects it onto the **label's own** `(topspin_axis, sidespin_axis)`
+basis — built from the label's `kick_direction` (already stored at indices
+18-19/24, see the BC label table) using the exact same cross-product
+construction as §2.1.1/§2.2, so target and prediction live in the same
+2D coordinate system before comparing:
+
 ```python
-# --- Execution: kick_spin_axis (cosine) and kick_spin_magnitude (MSE) ---
+# --- Execution: kick_spin_axis (cosine, 2D) and kick_spin_magnitude (MSE) ---
 kicked_mask = labels[:, _I_KICK_THIS_TICK] > 0.5
 if kicked_mask.any():
-    target_spin_raw = labels[:, _I_KICK_SPIN_X:_I_KICK_SPIN_Z + 1]  # (N, 3), raw rad/s
+    target_spin_raw = labels[:, _I_KICK_SPIN_X:_I_KICK_SPIN_Z + 1]  # (N, 3), raw rad/s, world frame
     target_spin_mag = target_spin_raw.norm(dim=-1)                  # (N,)
     has_spin = target_spin_mag > 1e-6
 
-    # Axis cosine loss (only meaningful where target magnitude is nonzero;
-    # rows with exactly zero spin -- e.g. every current rules-AI demo row --
-    # contribute zero axis loss, matching the existing has_kick_dir pattern).
+    # Build the same 2D basis used at apply-time (§2.1.1), from the
+    # label's OWN kick_direction (indices 18-19/24) -- not the network's
+    # kick_direction prediction, since this is the BC *target* side.
     eps = 1e-6
-    target_spin_axis = target_spin_raw / (target_spin_mag.clamp_min(eps).unsqueeze(-1))
-    pred_spin_axis = exec_heads.kick_spin_axis / (exec_heads.kick_spin_axis.norm(dim=-1, keepdim=True) + eps)
-    spin_axis_cos_loss = 1.0 - (pred_spin_axis * target_spin_axis).sum(dim=-1)
+    label_kick_dir = labels[:, [_I_KICK_DIR_X, _I_KICK_DIR_Y, _I_KICK_DIR_Z]]  # (N, 3), already unit
+    world_up = torch.tensor([0.0, 0.0, 1.0], device=labels.device).expand_as(label_kick_dir)
+    top_raw = torch.cross(label_kick_dir, world_up, dim=-1)
+    top_norm = top_raw.norm(dim=-1, keepdim=True)
+    topspin_axis = torch.where(top_norm > eps, top_raw / top_norm.clamp_min(eps),
+                                torch.tensor([1.0, 0.0, 0.0], device=labels.device))
+    sidespin_axis = torch.cross(topspin_axis, label_kick_dir, dim=-1)  # already unit (both inputs orthonormal)
+
+    # Project the raw 3D target spin onto this 2D basis. Any residual
+    # component of target_spin_raw parallel to label_kick_dir (should be
+    # ~0 for real kicks, since that's the physically-inert axis, but real
+    # recorded data / float noise may not be exact) is silently dropped --
+    # this is intentional: BC is teaching the physically-relevant subspace
+    # only, not the noise floor of the recording pipeline.
+    target_topspin_component = (target_spin_raw * topspin_axis).sum(dim=-1)   # (N,)
+    target_sidespin_component = (target_spin_raw * sidespin_axis).sum(dim=-1) # (N,)
+    target_spin_axis_2d = torch.stack([target_topspin_component, target_sidespin_component], dim=-1)
+    target_spin_axis_2d = target_spin_axis_2d / target_spin_mag.clamp_min(eps).unsqueeze(-1)
+
+    pred_spin_axis = exec_heads.kick_spin_axis / (exec_heads.kick_spin_axis.norm(dim=-1, keepdim=True) + eps)  # (N, 2)
+    spin_axis_cos_loss = 1.0 - (pred_spin_axis * target_spin_axis_2d).sum(dim=-1)
     spin_axis_loss_per = direction_loss_weight * torch.where(
         kicked_mask & has_spin, spin_axis_cos_loss, torch.zeros_like(spin_axis_cos_loss)
     )
@@ -462,6 +845,22 @@ if kicked_mask.any():
     spin_mag_loss_per = torch.where(kicked_mask, spin_mag_mse, torch.zeros_like(spin_mag_mse))
     loss += exec_weight * spin_mag_loss_per
 ```
+
+**Why this is safe today, and what to watch for later:** every current
+demo row has `target_spin_raw = [0,0,0]` (rules AI never spins kicks, see
+§5.1), so `has_spin` is `False` everywhere and this whole block is
+currently a no-op in practice — the 2D-projection machinery only starts
+mattering once either (a) a human-recorded demo with spin is added, or
+(b) PPO's own on-policy exploration starts generating nonzero spin, which
+isn't BC-supervised at all (BC only sees demo-recorded rows). Don't take
+"BC loss is ~0 on this term" as validation that the projection math is
+correct — write a dedicated unit test with a synthetic label that has a
+known `kick_direction` + `kick_spin` and assert the recovered 2D
+coefficients match a hand-computed expectation, since this is exactly the
+kind of silently-always-zero code path that hides bugs for a long time
+(cf. `ai/knowledge.md`'s "Orders vs execution-network labels boundary"
+bug history — this codebase has been bitten by silently-untested
+label-derivation code before).
 
 **kick_precision plumbing problem:** `max_spin_cap` above needs
 `max_spin_rad_s(kicking_params, kick_precision)` computed **per-row**,
@@ -770,10 +1169,22 @@ change — just don't let the two uses get re-coupled in a future edit.
 
 - [x] **Immediate**: hardcode `spin=Vector3.zero()` on the neural kick
       path in `apply_nn_action.py` (done as part of this planning pass).
-- [ ] Add `kick_spin_axis` (unit 3-vector head) + `kick_spin_magnitude`
-      (scalar sigmoid head) to `ExecutionNetwork`, replacing the single
-      raw `kick_spin` head; update `ExecutionHeadsRaw`/`ExecutionAction`
+- [ ] Add `kick_spin_axis` (unit **2**-vector head, coefficients over the
+      `kick_direction`-derived `(topspin_axis, sidespin_axis)` basis —
+      see §2.1.1, NOT a raw 3-vector) + `kick_spin_magnitude` (scalar
+      sigmoid head) to `ExecutionNetwork`, replacing the single raw
+      `kick_spin` head; update `ExecutionHeadsRaw`/`ExecutionAction`
       dataclasses in `ai/action/schema.py` accordingly.
+- [ ] Add a `kick_spin_basis(kick_direction) -> (topspin_axis, sidespin_axis)`
+      helper (§2.1.1/§2.2) and use it from both `apply_nn_action.py` and
+      the BC loss (§4.1) rather than duplicating the cross-product math.
+- [ ] Add a unit test asserting the 2D axis reconstruction round-trips
+      correctly for a hand-picked `kick_direction`/`kick_spin` pair, and a
+      second test confirming the projected 2D target is correctly
+      equivariant under `augment_batch(..., flip_y)` (§4.1's equivariance
+      note) — both currently exercise an always-zero code path in
+      practice (no demo data has nonzero spin yet), so don't rely on the
+      BC loss number alone to catch a bug here.
 - [ ] Add `kick_spin_axis_log_std` (reuse `DirectionHead`) and
       `kick_spin_magnitude_log_std` (reuse/add `SquashedNormalHead`
       sampling) parameters; wire config keys per §3.

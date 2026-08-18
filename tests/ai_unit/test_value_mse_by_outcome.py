@@ -1,15 +1,19 @@
-"""Unit tests for ppo_trainer.value_mse_by_outcome() / format_outcome_mse_breakdown()
+"""Unit tests for ppo_trainer.value_mse_by_outcome() / format_outcome_rmse_breakdown()
 -- the shared helper used by debug_value_network.py, PPOTrainer.pretrain_combined()'s
 Phase 0, PPOTrainer.pretrain_value(), and PPOTrainer._ppo_update() to report value
 loss split by episode outcome (see ai_trainer_knowledge.md / Idea2.md's "value loss
-split by outcome" request).
+split by outcome" request). value_mse_by_outcome() itself still returns raw MSE
+(squared-error units); format_outcome_rmse_breakdown() takes the sqrt at display
+time so the printed numbers are in the same units as the value/return itself.
 """
 from __future__ import annotations
+
+import math
 
 import pytest
 import torch
 
-from footballcoach.ai.ppo.ppo_trainer import format_outcome_mse_breakdown, value_mse_by_outcome
+from footballcoach.ai.ppo.ppo_trainer import format_outcome_rmse_breakdown, value_mse_by_outcome
 
 
 class TestValueMseByOutcome:
@@ -63,11 +67,13 @@ class TestValueMseByOutcome:
         assert "timeout" in result
 
 
-class TestFormatOutcomeMseBreakdown:
+class TestFormatOutcomeRmseBreakdown:
     def test_empty_dict_returns_empty_string(self):
-        assert format_outcome_mse_breakdown({}) == ""
+        assert format_outcome_rmse_breakdown({}) == ""
 
-    def test_formats_sorted_by_outcome_name(self):
+    def test_formats_sorted_by_outcome_name_as_rmse(self):
         by_outcome = {"win": (0.5, 10), "loss": (2.0, 3)}
-        formatted = format_outcome_mse_breakdown(by_outcome)
-        assert formatted == "loss=2.000(n=3)  win=0.500(n=10)"
+        formatted = format_outcome_rmse_breakdown(by_outcome)
+        expected_loss = math.sqrt(2.0)
+        expected_win = math.sqrt(0.5)
+        assert formatted == f"loss={expected_loss:.3f}(n=3)  win={expected_win:.3f}(n=10)"

@@ -42,13 +42,24 @@ def _send_ball_out(match, toucher_id: str) -> None:
     The ball must be LOOSE (not `possessed_by`) here -- a possessed ball is
     snapped back onto its carrier every tick by `_sync_possessed_ball()`,
     which would silently undo a manually-set out-of-bounds position.
-    `kicked_this_tick` is the same flag `ScenarioEnv` reads to attribute
-    the touch, mirroring what `Player.kick_direct()` sets in real play.
+    `kicked_this_tick` is the same flag ScenarioLoop._track_ball_toucher()
+    reads to attribute the touch, mirroring what `Player.kick_direct()` sets
+    in real play.
+
+    match.step() is monkeypatched to a no-op: the real one resets EVERY
+    player's kicked_this_tick=False at the top of _process_orders() (see
+    Player.kicked_this_tick's per-tick reset in match.py), which would wipe
+    this synthetic flag before ScenarioLoop._track_ball_toucher() -- now
+    correctly called AFTER match.step(), not before, see the toucher-
+    tracking dedup fix -- ever observes it. detect_trial_outcome() only
+    reads match.ball.position (never requires match.step() to have run),
+    so the no-op is safe for outcome detection too.
     """
     match.ball.possessed_by = None
     match.ball.position = Vector3(match.pitch.half_length + 5.0, 0.0, 0.0)
     match.ball.velocity = Vector3(5.0, 0.0, 0.0)
     match.player_by_id(toucher_id).kicked_this_tick = True
+    match.step = lambda: None
 
 
 class TestBallOutAttribution:
@@ -91,7 +102,12 @@ class TestBallOutAttribution:
         match.ball.position = Vector3(trainee.position.x, trainee.position.y, 0.0)
         match.ball.velocity = Vector3(0.0, 0.0, 0.0)
         env.step()
-        assert env._last_ball_toucher_id == "trainee"
+        # Mid-episode (trial not over yet): the LIVE tracker lives on
+        # ScenarioLoop now (single source of truth, see the toucher-tracking
+        # dedup fix) -- env._loop.last_completed_trial_toucher_id only
+        # updates when a trial actually ENDS, so it isn't the right thing to
+        # check here.
+        assert env._loop._last_ball_toucher_id == "trainee"
 
         # Now the opponent takes it and kicks it out.
         _send_ball_out(match, "opponent")

@@ -664,10 +664,18 @@ Bernoulli heads.  Use only when no dataset is available.
 
 **Mode 3 — Auxiliary loss during PPO:**
 At each PPO rollout step, `label_fn(env)` is called and a `BCLabel` is
-stored in the rollout buffer.  During `_ppo_update()`, a BC loss term is
-added: `total_loss += bc_coeff * bc_loss`.  `bc_coeff` anneals linearly
-from `aux_coeff_start` to `aux_coeff_end` over `aux_coeff_anneal_fraction`
-of total training steps (default 0.2 → 0.0 by 30%), then stays 0.0.
+stored in the rollout buffer.  During `_ppo_update()`, `bc_loss_from_tensor(...,
+split_kick=True, split_tackle=True)` splits the combined BC loss into three
+*differentiable* groups (see "Splitting kick/tackle vs. other BC pressure"
+below) and adds: `total_loss += bc_coeff * other_group_loss + bc_kick_coeff
+* kick_group_loss + bc_tackle_coeff * tackle_group_loss`. All three
+coefficients anneal linearly (`bc_coeff` from `aux_coeff_start` to
+`aux_coeff_end`; `bc_kick_coeff` from `kick_aux_coeff_start` to
+`kick_aux_coeff_end`; `bc_tackle_coeff` from `tackle_aux_coeff_start` to
+`tackle_aux_coeff_end`) over the shared `aux_coeff_anneal_fraction` of total
+training steps (default 0.2 → 0.0 by 30%), then hold flat. This split is
+Mode-3-only — the offline `pretrain_combined()` passes still use the single
+combined loss.
 
 ### What is supervised
 
@@ -682,6 +690,51 @@ of total training steps (default 0.2 → 0.0 by 30%), then stays 0.0.
   at the `Player.kick_direct()` chokepoint via `last_kick_direction`/
   `last_kick_power_fraction`/`last_kick_spin`, so this works for any AI that
   kicks, not just Phase1RulesAI. See `agent_plans/bc_kick_supervision_plan.md`.
+
+### `kick_armed`: pre-kick aiming, not just the physical kick tick
+
+Rules AI can *arm* a push-kick — `rules_ai.py::_arm_box_kick()` sets
+`Player.kick_armed`/`kick_armed_aim_point`/`kick_armed_power_fraction`/
+`kick_armed_spin` one or more ticks before the physical kick actually fires
+(once the player is close enough to reach the ball within one decision
+interval). `phase1_labels()` treats `kick_this_tick` as `1.0` on **both**
+the physically-executed kick tick (`player.kicked_this_tick`) and any armed
+approach tick (`player.kick_armed`) — and on armed-only ticks, derives
+`kick_direction`/`kick_power` from `kick_armed_aim_point`/
+`kick_armed_power_fraction` rather than leaving them unsupervised. This is
+deliberate and already correct: players need to be aiming/powering right
+during the run-up, not just at the moment of contact.
+
+Because of this, kicking is **not** a near-empty minority class in Phase 1
+demonstrations the way `kck=0` in a *trained policy's* activation log line
+might suggest (that line reflects what the policy has learned to do, not
+what the rules-AI teacher demonstrated). Measured over 20 episodes of
+`demonstrations/phase1_long/`: **656 valid BC rows, 78 with
+`kick_this_tick=1` (~11.9%), ~3.9 kick rows/episode.** `pos_weight_kick`
+(see `DemonstrationDataset.compute_pos_weights()`) still treats it as the
+minority class relative to ~88% negatives, which remains correct — just not
+"rare-to-nonexistent."
+
+### Splitting kick/tackle vs. other BC pressure (Mode 3 only)
+
+`bc_loss_from_tensor(..., split_kick=True, split_tackle=True)` additionally
+returns a dict of plain (non-detached) tensors, always including
+`"other_group_loss"` plus `"kick_group_loss"` (iff `split_kick`) and/or
+`"tackle_group_loss"` (iff `split_tackle`) — unlike `return_breakdown=True`'s
+diagnostic dict, whose values are `float(...)`-cast and carry no gradient,
+these stay attached to the autograd graph so a caller can weight and
+backprop through them independently. `kick_group_loss` covers
+`kick_this_tick`/`kick_direction`/`kick_power`/`kick_spin` (all four
+kick-related heads, including `kick_spin` even though its PPO sampling is
+currently frozen — see `agent_plans/spin_implementation_plan.md` section 0 —
+so its BC term is included for consistency but is zero-gradient until
+unfrozen); `tackle_group_loss` covers just the `tackle_attempt` BCE (tackle
+has no direction/power/spin sub-heads the way kicking does); `other_group_loss`
+is everything else, with whichever of the two groups were split out
+subtracted from it. Set `bc.aux_coeff_start/end = 0.0` and
+`bc.kick_aux_coeff_start/end = 1.0` and/or `bc.tackle_aux_coeff_start/end =
+1.0` in `ai_config.json` to apply BC pressure to kicking and/or tackling
+only for a training round, without touching the rest of the policy.
 
 ### Adding BC for a new phase
 
@@ -791,6 +844,10 @@ step=28,679 | rew=8.76 | pol=0.02 val=1.00 ent=0.25 kl=0.16  bc=2.84(x0.17) | 28
 | `ta_p` / `kk_p` | Mean predicted probability (`sigmoid(logit)`, pre-sampling) of `tackle_attempt` / `kick_this_tick` this rollout, printed to 4 decimal places. Distinct from `act: tk=`/`kck=` (post-sampling 0/1 activation rate) — `ta_p`/`kk_p` show the underlying continuous probability even when the sampled/gated action never actually fires, so they're the better signal for "is the head learning anything at all" vs. "is it ever selected" |
 | `vs_rules(N): W%/L%/T%/M%[/O%]` | Full outcome breakdown (`outcome_breakdown()` in `ppo_trainer.py`) over the N **rules-based opponent** episodes this rollout: trainee win% / opponent win% / timeout% / ball-out(miss)% (only present if `curriculum.phase1_opponent_rules_prob > 0`). A trailing `/O%` ("other") appears only if some outcome isn't one of those four known keys. Previously this only showed W%/L%, silently lumping timeouts and ball-out-of-play into an invisible remainder — use the fuller breakdown to tell whether a win% swing is from more losses vs. more timeouts vs. more ball-out |
 | `vs_neural(N): W%/L%/T%/M%[/O%]` | Same breakdown for **neural opponent** episodes (shared-weight self-play).  Compare to `vs_rules` to see if improvement is vs the rules AI or just self-play |
+| `|adv|` (in the `value` line, next to `V=`/`R=`/`adv=`) | Mean **absolute** advantage this rollout (`adv_mean`/`adv_std` are signed and average toward ~0, masking magnitude). This is the companion number for reading a rising `entropy=`: the entropy bonus's pull on the loss is `ent_coef * entropy` with a FIXED `ent_coef` every rollout, while the policy-gradient term's pull scales with `|advantage|`. As a policy converges, advantages shrink (there's less room to improve, and the critic gets better at predicting outcomes) — so a shrinking `|adv|` alongside a still-rising `entropy` is the numeric signature of the entropy term starting to win the "tug of war" essentially unopposed, not a sign the policy still needs more exploration. |
+| `entropy` line (`shoot=... pass_=... move=... ... sprint=... move_dir=... kick_dir=...`) | Per-head decomposition of the aggregate `entropy=` scalar (same terms `_compute_entropy()` sums, individually), with `(+Δ)`/`(-Δ)` vs. the previous rollout in parens. Printed every rollout (not gated behind a KL threshold like `[per-head KL]`). Use this to see WHICH heads are actually driving a rising total — e.g. a couple of Bernoulli heads saturating toward `p=0.5`, or `move_dir`/`kick_dir` climbing toward their `dir_log_std_max` clamp — rather than only the opaque summed total. `sprint`/`move_dir`/`kick_dir` are already `E[parent active]`-weighted, matching what's actually added into the loss (see `_compute_entropy`'s docstring). |
+
+**Entropy has no built-in "fight back" mechanism with a fixed `ent_coef`.** It's easy to expect PPO to naturally sharpen its own distribution as it converges — and early in training it does, because the policy-gradient term (∝ `|advantage|`, which is large when the policy is still bad) dominates a comparatively small, fixed entropy bonus. But nothing makes the entropy term's own strength shrink as training progresses — `ent_coef * entropy`'s gradient pushes toward more randomness by the same fixed amount at step 6,000,000 as at step 32,000. Meanwhile the policy-gradient term naturally *weakens* over training (advantages shrink as the critic and policy both improve — there's less room left to correct). Late in training the entropy term isn't beating a strong opponent, it's coasting against a weak one. This is why every mature PPO implementation either anneals `ent_coef` to a small/zero floor or picks a constant small enough that it's never a factor — a fixed, non-trivial `ent_coef` (this repo's default `0.05` is on the higher end of common ranges) is not something the algorithm self-corrects. See `checkpoints/phase1_run110`'s 6M-step run for a concrete case: entropy climbed monotonically the entire run (0.60 → 4.69, still rising at the final rollout) while `vs_immobile` win rate rose 58%→92% then fell back to 81% once the accumulated randomness in execution-critical heads (kick/tackle/braking timing) started costing real points (`miss`/`timeout` outcome counts rose from ~0 at the peak to a recurring share by the end).
 
 When a minibatch's KL exceeds `ppo.target_kl`, the epoch loop early-stops and up to three follow-up phases may run (see `ai/knowledge.md` "KL early-stop and per-head diagnostics" for full detail):
 ```
@@ -809,6 +866,7 @@ If `mean_kl` for the whole rollout exceeds `KL_DIAG_THRESHOLD` (hardcoded `0.04`
 
 - For small mean-shifts, `KL ≈ (Δμ)² / (2σ²)` — **larger σ directly reduces how much a given angular drift contributes to per-minibatch KL**, which is one lever for reducing `target_kl` early-stops (in addition to `target_kl` itself and `minibatch_size`).
 - `ppo.ent_dir_weight` controls how much the direction heads' entropy contributes to the entropy bonus; raising it pushes the optimizer to prefer a larger learned σ (more exploration credit for less certainty) — a widely-used indirect way to loosen the KL budget for direction drift specifically, at the cost of noisier/less confident direction output.
+- **`ent_dir_weight` is entropy-bonus-only** — it does NOT scale the direction heads' contribution to `_compute_log_prob`/`_recompute_log_prob`/`_per_head_new_log_probs` (the actual PPO ratio) any more. It used to: at a small value (e.g. `0.002`), that coupling silently raised the direction heads' TRUE probability ratio to the power `ent_dir_weight` (`ratio_true^ent_dir_weight`), compressing any real drift toward `ratio≈1` — defeating PPO's clip/KL trust-region protection for those heads specifically (large true drift never triggered clipping or early-stop) while also attenuating the real policy-gradient signal reaching them by the same factor, compounding with (not replaced by) `direction_learning_rate`/`direction_max_grad_norm` below. This is the likely explanation for `move_direction`/`kick_direction` log_std barely moving (`dlog_std≈0.00001`, `Δσ°≈0.000/step`) across essentially every rollout in every run analysed before this fix. `direction_max_grad_norm` was raised `0.015→0.3` at the same time since gradients reaching these params are now much larger — re-tune by watching the `[grad clip] direction: N/M steps clipped` log line, this is an informed guess not a calibrated value.
 - `ppo.dir_log_std_init` only sets the *initial* value of the learned `nn.Parameter` at network construction — it does not bound anything after training starts (that's `dir_log_std_min`/`dir_log_std_max`'s job). Current tuned values: `dir_log_std_init=-1.0` (σ≈0.37, ~21° angular std), `dir_log_std_min=-2.5` (σ≈0.082, ~4.7°), `dir_log_std_max=-0.3` (σ≈0.74, ~42°) — a tighter range than earlier experiments (`dir_log_std_max=0.8`, σ up to ≈2.23, ~85°+ angular std) that produced excessive KL from direction drift alone.
 
 Offline BC epoch lines (during `pretrain_combined`):
@@ -816,7 +874,7 @@ Offline BC epoch lines (during `pretrain_combined`):
   BC epoch 5/50: bc_loss=0.52  dir_cos=0.34  kick_dir_cos=0.12  mv_p=1.000  spr_p=0.868  kk_p=0.0004  tk_p=0.038
 ```
 - `dir_cos` — mean cosine similarity between predicted and label `move_direction` for valid steps in that epoch.  Should rise toward 1.0 across epochs.
-- `kick_dir_cos` — same but for `kick_direction`, restricted to rows where `kick_this_tick==1`. Expect this to be noisy/near-NaN when kicks are rare in the dataset (e.g. Phase 1).
+- `kick_dir_cos` — same but for `kick_direction`, restricted to rows where `kick_this_tick==1`. `kick_this_tick` is `1.0` on both physically-executed kick ticks AND on `kick_armed` "approach" ticks (see "kick_armed: pre-kick aiming" below) — measured across 20 `demonstrations/phase1_long/` episodes, ~11.9% of valid rows are labelled `kick_this_tick=1` (~3.9 kick rows/episode), so this metric is a real minority-class signal, not a near-empty one. It can still be noisy per-epoch since it's a much smaller row count than the ~88% majority-class heads.
 - `mv_p`/`spr_p`/`kk_p`/`tk_p` — mean predicted probability (`sigmoid(logit)`) for `exec_move`/`sprint`/`kick`/`tackle_attempt` respectively, over valid BC rows. Same `BC repair epoch` log line also reports all four. Use these (not just the aggregated `exec_bce` loss term in the `[...]` breakdown) to see whether kick/tackle are learning any real signal at all versus staying pinned near their BC-label base rate.
 
 ---
@@ -1021,6 +1079,49 @@ runs are unaffected unless opted in):
 reward-component mean/std/min/max table already printed by the main PPO
 rollout loop (see `REWARD_COMP_LABELS`), logged as
 `[value pretrain rollout] rew/ep (...)`.
+
+### `debug_value_network.py` — standalone value-net diagnostic/pretrain tool
+Repo-root script (gitignored, not tracked — `debug_*.py`), not part of the
+package. Fits a value head against Monte Carlo returns either from a
+recorded demo `.npz` dataset (`--data`, the original mode) or, with
+`--checkpoint`, by loading a trained checkpoint and collecting a fresh
+on-policy rollout with it — effectively an ad-hoc `pretrain_value()` you can
+rerun against a saved checkpoint outside of a full training run, with far
+more diagnostic output (per-outcome RMSE breakdown, a linear-regression
+baseline over hand-picked scalar features, reward-component means, etc.).
+
+Example: rerun value pretraining against a checkpoint's own rollout, 8
+parallel workers, resetting both the critic and direction-exploration std
+so training starts clean on top of the checkpoint's trunk/policy:
+```bash
+uv run python debug_value_network.py \
+    --checkpoint checkpoints/longterm/checkpoint_vvgood_immobile.pt \
+    --rollout-steps 185000 \
+    --n-parallel-envs 8 \
+    --worker-torch-threads 1 \
+    --epochs 100 \
+    --gamma 0.992 \
+    --lr 2e-4 \
+    --val-frac 0.2 \
+    --seed 0 --patience 20 --batch-size 4096 \
+    --reset-dir-log-std --weight-decay 1e-6 --reset-value-weights \
+    2>&1 | tee -a debug_runs.md
+```
+`--reset-value-weights` is required whenever the checkpoint predates a
+`value_head`/`value_ai_type_channel` architecture change (e.g. the elapsed-
+time value-only side channel) — `load_checkpoint()` now loads such
+checkpoints tolerantly (skips shape-mismatched params with a warning instead
+of raising), but those specific params keep a fresh random init either way,
+so training them from scratch via `--reset-value-weights` is the correct
+move rather than leaving them half-stale.
+
+`--progress-milestone-pct N` (default 10) controls how granular the rollout
+progress lines are when output isn't a live terminal — `ProgressReporter`
+(`ai/progress.py`) now auto-detects whether its stream is a tty and
+downgrades the live `\r`-updating bar to coarse milestone lines whenever it
+isn't (e.g. piped to `tee`/redirected to a file), so redirected runs don't
+fill the log with hundreds of near-duplicate `\r`-separated lines. Raise
+`--progress-milestone-pct` (e.g. 25 or 50) to shrink the log further.
 
 ### BC pretrain train/val split + early stop (`bc.bc_pretrain_early_stop_patience`)
 `pretrain_combined()`'s main BC epoch loop (Phase 1) previously trained

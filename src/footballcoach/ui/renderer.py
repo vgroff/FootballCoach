@@ -805,18 +805,31 @@ class Renderer:
         values: dict[str, object],
         title: str = "Scenario Parameters",
         open_choice_param: "str | None" = None,
-    ) -> dict[str, tuple[pygame.Rect, pygame.Rect]]:
-        """Draws the scenario-parameter adjustment screen and returns a dict
-        mapping param name → (left_rect, right_rect) for click detection.
+        open_choice_folder: "str | None" = None,
+        dropdown_scroll: int = 0,
+    ) -> tuple[dict[str, tuple[pygame.Rect, pygame.Rect]], int]:
+        """Draws the scenario-parameter adjustment screen. Returns
+        ``(button_rects, clamped_dropdown_scroll)`` — ``button_rects`` maps
+        param name → (left_rect, right_rect) for click detection.
 
-        - ScenarioParam:       [-]  value  [+]
-        - ScenarioChoiceParam: click value area to open dropdown, or [>] to cycle
-        - ScenarioBoolParam:   [checkbox]  label
+        - ScenarioParam:              [-]  value  [+]
+        - ScenarioChoiceParam:        click value area to open a scrollable
+                                       dropdown, or [>] to cycle
+        - ScenarioGroupedChoiceParam: click value area to open a two-level
+                                       dropdown — a scrollable list of groups
+                                       first, then (after picking one) a
+                                       scrollable list of values within that
+                                       group; [>] cycles the flat option space
+        - ScenarioBoolParam:          [checkbox]  label
 
-        When ``open_choice_param`` is set, a dropdown list is rendered below that
-        param row.  Dropdown option rects are keyed as ``"{name}__option__{value}"``.
+        When ``open_choice_param`` is set, a dropdown list is rendered below
+        that param row. Plain-choice option rects are keyed as
+        ``"{name}__option__{value}"``. Grouped-choice group rects are keyed
+        as ``"{name}__folder__{group}"``, a back button (shown once a group
+        is expanded) as ``"{name}__grpback__"``, and leaf value rects reuse
+        ``"{name}__option__{value}"``.
         """
-        from footballcoach.ui.scenarios import ScenarioBoolParam, ScenarioChoiceParam
+        from footballcoach.ui.scenarios import ScenarioBoolParam, ScenarioChoiceParam, ScenarioGroupedChoiceParam
         surface.fill(style.HUD_BG)
         sw, sh = surface.get_size()
 
@@ -894,6 +907,31 @@ class Renderer:
                 # val_rect = "minus" (toggle), arrow_rect = "plus" (cycle)
                 button_rects[param.name] = (val_rect, arrow_rect)
 
+            elif isinstance(param, ScenarioGroupedChoiceParam):
+                # Same row look as ScenarioChoiceParam; opens a two-level
+                # (group -> value) dropdown instead of a flat list.
+                current = values.get(param.name, param.default)
+                is_open = (open_choice_param == param.name)
+                val_w = 200 + btn_w + gap
+                val_rect = pygame.Rect(col_minus_x, y + (row_h - btn_h) // 2, val_w, btn_h)
+                arrow_rect = pygame.Rect(col_plus_x, y + (row_h - btn_h) // 2, btn_w, btn_h)
+                hovered_val = val_rect.collidepoint(mouse_pos)
+                val_bg = (70, 90, 110) if is_open else ((60, 70, 90) if hovered_val else (40, 40, 55))
+                pygame.draw.rect(surface, val_bg, val_rect, border_radius=4)
+                pygame.draw.rect(surface, style.HUD_ACCENT if is_open else (80, 80, 100), val_rect, 1, border_radius=4)
+                choice_str = str(current)
+                if len(choice_str) > 30:
+                    choice_str = "…" + choice_str[-29:]
+                arrow_sym = "▲" if is_open else "▼"
+                val_surf = self.hud_font.render(f"{choice_str}  {arrow_sym}", True, style.HUD_ACCENT)
+                surface.blit(val_surf, (val_rect.x + 6, val_rect.y + (btn_h - val_surf.get_height()) // 2))
+                hov_arr = arrow_rect.collidepoint(mouse_pos)
+                pygame.draw.rect(surface, (70, 70, 90) if hov_arr else (40, 40, 55), arrow_rect, border_radius=4)
+                sym = self.hud_font.render(">", True, style.HUD_ACCENT)
+                surface.blit(sym, (arrow_rect.x + (btn_w - sym.get_width()) // 2,
+                                   arrow_rect.y + (btn_h - sym.get_height()) // 2))
+                button_rects[param.name] = (val_rect, arrow_rect)
+
             else:
                 # Standard numeric slider: [-] value [+]
                 val = values.get(param.name, param.default)
@@ -911,31 +949,117 @@ class Renderer:
                 button_rects[param.name] = (minus_rect, plus_rect)
 
         # Render open dropdown list (drawn after all rows so it overlays them).
+        # Returns the clamped scroll offset actually used, so the caller can
+        # persist it (list length can shrink between frames, e.g. switching
+        # from a folder list to a shorter value list).
+        clamped_scroll = dropdown_scroll
+        MAX_VISIBLE_ITEMS = 10
+        ITEM_H = 28
+
+        def _draw_dropdown_list(
+            items: list[tuple[str, str]],  # (key, display_label)
+            selected_key: object,
+            anchor_x: int,
+            anchor_y: int,
+            list_w: int,
+            key_prefix: str,
+            scroll_name: str,
+        ) -> int:
+            """Draws a scrollable list of items and registers their click
+            rects under ``f"{key_prefix}{key}"``. When the list is truncated,
+            also draws a click-to-page up/down chevron column (registered as
+            ``f"{scroll_name}__scrollup__"`` / ``"__scrolldown__"``) alongside
+            the mouse-wheel/keyboard scroll paths, since wheel events aren't
+            reliably delivered on every platform/window-manager combo.
+            Returns the clamped scroll offset used for this list."""
+            total = len(items)
+            visible = min(total, MAX_VISIBLE_ITEMS)
+            scroll = max(0, min(dropdown_scroll, max(0, total - visible)))
+            scrollable = total > visible
+            chevron_w = 22 if scrollable else 0
+            item_w = list_w - chevron_w
+            list_rect = pygame.Rect(anchor_x - 2, anchor_y - 2, list_w + 4, visible * ITEM_H + 4)
+            pygame.draw.rect(surface, (25, 25, 38), list_rect, border_radius=4)
+            pygame.draw.rect(surface, style.HUD_ACCENT, list_rect, 1, border_radius=4)
+            for vi in range(visible):
+                ii = scroll + vi
+                key, label = items[ii]
+                item_rect = pygame.Rect(anchor_x, anchor_y + vi * ITEM_H, item_w, ITEM_H)
+                hov = item_rect.collidepoint(mouse_pos)
+                sel = (key == selected_key)
+                item_bg = (60, 90, 60) if sel else ((55, 55, 75) if hov else (30, 30, 45))
+                pygame.draw.rect(surface, item_bg, item_rect)
+                label_str = label if len(label) <= 32 else "…" + label[-31:]
+                lsurf = self.hud_font.render(label_str, True, style.HUD_ACCENT if sel else style.HUD_TEXT)
+                surface.blit(lsurf, (item_rect.x + 6, item_rect.y + (ITEM_H - lsurf.get_height()) // 2))
+                button_rects[f"{key_prefix}{key}"] = (item_rect, item_rect)
+            if scrollable:
+                track_h = visible * ITEM_H
+                chevron_x = anchor_x + item_w
+                up_h = track_h // 2
+                up_rect = pygame.Rect(chevron_x, anchor_y, chevron_w, up_h)
+                down_rect = pygame.Rect(chevron_x, anchor_y + up_h, chevron_w, track_h - up_h)
+                for rect, symbol, enabled in (
+                    (up_rect, "▲", scroll > 0),
+                    (down_rect, "▼", scroll < total - visible),
+                ):
+                    hov = enabled and rect.collidepoint(mouse_pos)
+                    pygame.draw.rect(surface, (70, 70, 90) if hov else (40, 40, 55), rect, border_radius=4)
+                    colour = style.HUD_ACCENT if enabled else (75, 75, 85)
+                    sym_surf = self.hud_font.render(symbol, True, colour)
+                    surface.blit(sym_surf, (rect.x + (chevron_w - sym_surf.get_width()) // 2,
+                                            rect.y + (rect.height - sym_surf.get_height()) // 2))
+                button_rects[f"{scroll_name}__scrollup__"] = (up_rect, up_rect)
+                button_rects[f"{scroll_name}__scrolldown__"] = (down_rect, down_rect)
+            return scroll
+
         if open_choice_param is not None:
             open_param = next((p for p in params if p.name == open_choice_param), None)
-            if open_param is not None and isinstance(open_param, ScenarioChoiceParam):
-                open_idx = params.index(open_param)
-                open_y = start_y + open_idx * row_h + row_h  # just below the row
-                item_h = 30
-                list_w = 200 + btn_w + gap
-                list_x = col_minus_x
-                # Draw backdrop
-                list_rect = pygame.Rect(list_x - 2, open_y - 2, list_w + 4, len(open_param.choices) * item_h + 4)
-                pygame.draw.rect(surface, (25, 25, 38), list_rect, border_radius=4)
-                pygame.draw.rect(surface, style.HUD_ACCENT, list_rect, 1, border_radius=4)
+            open_idx = params.index(open_param) if open_param is not None else -1
+            list_w = 200 + btn_w + gap
+            list_x = col_minus_x
+            open_y = start_y + open_idx * row_h + row_h  # just below the row
+
+            if isinstance(open_param, ScenarioChoiceParam):
                 current = values.get(open_param.name, open_param.default)
-                for ci, choice in enumerate(open_param.choices):
-                    item_rect = pygame.Rect(list_x, open_y + ci * item_h, list_w, item_h)
-                    hov = item_rect.collidepoint(mouse_pos)
-                    sel = (choice == current)
-                    item_bg = (60, 90, 60) if sel else ((55, 55, 75) if hov else (30, 30, 45))
-                    pygame.draw.rect(surface, item_bg, item_rect)
-                    label_str = str(choice)
-                    if len(label_str) > 32:
-                        label_str = "…" + label_str[-31:]
-                    lsurf = self.hud_font.render(label_str, True, style.HUD_ACCENT if sel else style.HUD_TEXT)
-                    surface.blit(lsurf, (item_rect.x + 6, item_rect.y + (item_h - lsurf.get_height()) // 2))
-                    button_rects[f"{open_param.name}__option__{choice}"] = (item_rect, item_rect)
+                items = [(c, str(c)) for c in open_param.choices]
+                clamped_scroll = _draw_dropdown_list(
+                    items, current, list_x, open_y, list_w, f"{open_param.name}__option__", open_param.name,
+                )
+
+            elif isinstance(open_param, ScenarioGroupedChoiceParam):
+                current = values.get(open_param.name, open_param.default)
+                if open_choice_folder is None:
+                    # Level 1: pick a group. Highlight the group containing
+                    # the current value.
+                    current_folder = next(
+                        (g for g, vals in open_param.groups if current in vals), None,
+                    )
+                    items = [(g, g) for g, _vals in open_param.groups]
+                    clamped_scroll = _draw_dropdown_list(
+                        items, current_folder, list_x, open_y, list_w, f"{open_param.name}__folder__", open_param.name,
+                    )
+                else:
+                    # Level 2: pick a value within the expanded group, with a
+                    # back button above the list to return to group picking.
+                    group_values = next(
+                        (vals for g, vals in open_param.groups if g == open_choice_folder), (),
+                    )
+                    back_rect = pygame.Rect(list_x, open_y, list_w, ITEM_H)
+                    hov_back = back_rect.collidepoint(mouse_pos)
+                    pygame.draw.rect(surface, (55, 55, 75) if hov_back else (35, 35, 50), back_rect, border_radius=4)
+                    back_surf = self.hud_font.render(f"← {open_choice_folder}", True, style.HUD_TEXT)
+                    surface.blit(back_surf, (back_rect.x + 6, back_rect.y + (ITEM_H - back_surf.get_height()) // 2))
+                    button_rects[f"{open_param.name}__grpback__"] = (back_rect, back_rect)
+
+                    def _leaf_label(v: str) -> str:
+                        _folder, _sep, rest = v.partition("/")
+                        return rest if _sep else v
+
+                    items = [(v, _leaf_label(v)) for v in group_values]
+                    clamped_scroll = _draw_dropdown_list(
+                        items, current, list_x, open_y + ITEM_H + 4, list_w, f"{open_param.name}__option__", open_param.name,
+                    )
 
         # Start / Back buttons near the bottom.
         bottom_y = start_y + len(params) * row_h + 30
@@ -953,4 +1077,4 @@ class Renderer:
                                 rect.y + (rect.height - txt.get_height()) // 2))
         button_rects["__start__"] = (start_rect, start_rect)
         button_rects["__back__"] = (back_rect, back_rect)
-        return button_rects
+        return button_rects, clamped_scroll

@@ -138,8 +138,10 @@ def record_episodes(
     opponent_rules_prob: float = 0.0,
     opponent_immobile_prob: float | None = None,
     verbose_stats: bool = False,
+    driver_trainer=None,
 ) -> dict:
-    """Run *n_episodes* with rules-based AI driving the trainee and opponent.
+    """Run *n_episodes* with rules-based AI driving the trainee and opponent
+    (or a neural checkpoint driving the trainee, see ``driver_trainer``).
 
     Sampling strategy:
       - on_kick / on_tackle player callbacks fire at the exact engine tick the
@@ -153,9 +155,32 @@ def record_episodes(
         sample_interval_s: How often (in sim-seconds) to record a timed sample.
             Kicks and tackles are always recorded via callbacks regardless.
             Default is 0.2s.
+        driver_trainer: Optional loaded ``PPOTrainer`` (e.g. via
+            ``PPOTrainer.load_for_inference()``). When given, the TRAINEE is
+            driven by this checkpoint (via ``NeuralPlayerAI``, auto-assigned
+            by ``ScenarioEnv.reset()`` once ``env.sample_action_fn`` is set —
+            see below) instead of ``Phase1RulesAI()``, so recorded states
+            reflect this policy's own state visitation rather than the rules
+            AI's. ``label_fn`` is independent of this — pass
+            ``bc.phase1_labels_from_teacher`` (bound to a teacher trainer, via
+            ``functools.partial`` or a lambda) as ``label_fn`` to also source
+            BC labels from a neural teacher instead of Phase1RulesAI; the two
+            are orthogonal (driver = state visitation, label_fn = supervision
+            target) and may be the same checkpoint, different checkpoints
+            (e.g. across an architecture change), or mixed with the default
+            rules-AI label_fn. The opponent is unaffected by this parameter —
+            it stays governed by ``opponent_rules_prob``/
+            ``opponent_immobile_prob`` as before.
 
     Returns a dict of numpy arrays ready to be saved as .npz.
     """
+    if driver_trainer is not None:
+        # ScenarioEnv.reset() (called at the top of the episode loop below)
+        # auto-assigns NeuralPlayerAI to the trainee whenever
+        # env.sample_action_fn is set -- same wiring PPOTrainer.train() uses,
+        # so decision_interval_ticks/max_episode_s/ema_smoothed are all
+        # correctly derived from the env instead of guessed here.
+        env.sample_action_fn = driver_trainer._sample_action
     from footballcoach.rules_ai import Phase1RulesAI
     from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS
 
@@ -373,12 +398,17 @@ def record_episodes(
         for k in _ep_poss_reward:
             _ep_poss_reward[k] = 0.0
 
-        # Drive trainee with rules-based AI and attach action callbacks.
-        # Callbacks fire inside env.step()'s 15-tick loop, so episodes still
-        # terminate correctly via env.step()'s box-possession / timeout checks.
+        # Drive trainee with rules-based AI (or a neural checkpoint, when
+        # driver_trainer is given -- env.reset() just above already assigned
+        # NeuralPlayerAI to it via env.sample_action_fn, so don't override
+        # that here) and attach action callbacks. Callbacks fire inside
+        # env.step()'s 15-tick loop regardless of which AI drives the player,
+        # so episodes still terminate correctly via env.step()'s
+        # box-possession / timeout checks.
         try:
             player = env._loop.match.player_by_id(env.trainee_player_id)
-            player.ai = Phase1RulesAI()
+            if driver_trainer is None:
+                player.ai = Phase1RulesAI()
             player.on_kick = _make_on_kick("trainee", env.trainee_player_id)
             player.on_tackle = _make_on_tackle("trainee", env.trainee_player_id)
             player.on_tackle_result = _make_on_tackle_result("trainee")
@@ -554,17 +584,40 @@ def _run_recording_job(job: dict) -> dict:
 
     Must stay top-level/picklable -- used both directly (single-process path)
     and as the target of a ``multiprocessing`` worker (see
-    ``--n-processes``/``bc.demo_recording_n_processes``). Independent of any
-    neural network, so unlike ai/ppo/rollout_worker.py there is no weight
-    sync needed -- each job is fully self-contained and just needs its own
-    RNG seed (to avoid identical episodes across workers) and its own
-    disjoint file_idx range (to avoid filename collisions).
+    ``--n-processes``/``bc.demo_recording_n_processes``). Each job carries
+    checkpoint PATHS (``driver_checkpoint``/``teacher_checkpoint``), not
+    loaded trainer objects -- torch modules aren't reliably picklable across
+    a spawn-context Pool boundary, so each worker loads its own copy here
+    (once per job, not per episode/file). Otherwise fully self-contained --
+    each job just needs its own RNG seed (to avoid identical episodes across
+    workers) and its own disjoint file_idx range (to avoid filename
+    collisions); no weight sync is needed even with a checkpoint involved,
+    unlike ai/ppo/rollout_worker.py, since nothing here is being trained.
     """
     import random as _random
     np.random.seed(job["seed"])
     _random.seed(job["seed"])
 
     env, label_fn, scenario_key = _build_env_and_label_fn(job["phase_id"])
+
+    driver_trainer = None
+    if job.get("driver_checkpoint"):
+        from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+        driver_trainer = PPOTrainer.load_for_inference(job["driver_checkpoint"])
+        log.info(f"[worker {job.get('worker_idx', 0)}] Driver checkpoint loaded: {job['driver_checkpoint']}")
+
+    if job.get("teacher_checkpoint"):
+        from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+        from footballcoach.ai.ppo.bc import phase1_labels_from_teacher
+        # Reuse the driver trainer instead of loading a second copy when both
+        # checkpoints are identical -- the common "distill this checkpoint
+        # against itself, on-policy" case.
+        if job.get("driver_checkpoint") == job["teacher_checkpoint"] and driver_trainer is not None:
+            teacher_trainer = driver_trainer
+        else:
+            teacher_trainer = PPOTrainer.load_for_inference(job["teacher_checkpoint"])
+        log.info(f"[worker {job.get('worker_idx', 0)}] Teacher checkpoint loaded: {job['teacher_checkpoint']}")
+        label_fn = lambda env, player_id=None, _t=teacher_trainer: phase1_labels_from_teacher(env, _t, player_id)
 
     n_eps = job["n_episodes"]
     eps_per_file = job["episodes_per_file"]
@@ -591,6 +644,7 @@ def _run_recording_job(job: dict) -> dict:
             opponent_rules_prob=job["opponent_rules_prob"],
             opponent_immobile_prob=job["opponent_immobile_prob"],
             verbose_stats=job.get("verbose_stats", False),
+            driver_trainer=driver_trainer,
         )
         elapsed = time.time() - t0
 
@@ -664,6 +718,22 @@ def main() -> None:
                         help=f"Probability (0–1) that the opponent is immobile (default: {_default_opp_immobile_prob:.2f} from config ratios).")
     parser.add_argument("--verbose-stats", action="store_true",
                         help="Print per-log-interval kick/tackle/possession detail stats (noisy; off by default)")
+    parser.add_argument("--driver-checkpoint", type=str, default=None,
+                        help="Path to a trained checkpoint (.pt). When given, the TRAINEE is "
+                             "driven by this checkpoint's own policy instead of Phase1RulesAI, "
+                             "so recorded states reflect this policy's own on-policy state "
+                             "visitation. Independent of --teacher-checkpoint (may be the same "
+                             "path, a different checkpoint, or omitted to keep BC labels from "
+                             "Phase1RulesAI as before). The opponent is unaffected -- still "
+                             "governed by --opponent-rules-prob/--opponent-immobile-prob.")
+    parser.add_argument("--teacher-checkpoint", type=str, default=None,
+                        help="Path to a trained checkpoint (.pt). When given, BC labels are "
+                             "read directly from this checkpoint's decision/execution network "
+                             "forward pass (soft probabilities, every head) instead of "
+                             "Phase1RulesAI's order-simulation counterfactual -- see "
+                             "footballcoach.ai.ppo.bc.phase1_labels_from_teacher(). Independent "
+                             "of --driver-checkpoint: this only changes what supervises each "
+                             "recorded state, not which states get visited.")
     parser.add_argument("--info", action="store_true",
                         help="Print info about existing files and exit")
     _default_n_processes = int(_cfg.get("bc", {}).get("demo_recording_n_processes", 1))
@@ -729,6 +799,8 @@ def main() -> None:
             "sample_interval_s": args.sample_interval,
             "opponent_rules_prob": args.opponent_rules_prob,
             "opponent_immobile_prob": args.opponent_immobile_prob,
+            "driver_checkpoint": args.driver_checkpoint,
+            "teacher_checkpoint": args.teacher_checkpoint,
         })
         log.info(
             f"Done. {result['n_files']} file(s), {result['total_steps']:,} total steps → {output_dir}"
@@ -760,6 +832,8 @@ def main() -> None:
             "sample_interval_s": args.sample_interval,
             "opponent_rules_prob": args.opponent_rules_prob,
             "opponent_immobile_prob": args.opponent_immobile_prob,
+            "driver_checkpoint": args.driver_checkpoint,
+            "teacher_checkpoint": args.teacher_checkpoint,
             "worker_idx": i,
         })
         file_idx_cursor += (worker_eps + eps_per_file - 1) // eps_per_file

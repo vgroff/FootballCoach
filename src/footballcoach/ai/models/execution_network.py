@@ -121,6 +121,8 @@ class ExecutionNetwork(nn.Module):
         trunk_hidden: int = 256,
         dir_log_std_init: float = -2.0,
         kick_dir_log_std_init: Optional[float] = None,
+        kick_power_log_std_init: float = 0.0,
+        kick_spin_log_std_init: float = 0.0,
         value_extra_hidden: int = 16,
         value_hidden_dim: int = 0,
         value_dropout: float = 0.0,
@@ -208,7 +210,18 @@ class ExecutionNetwork(nn.Module):
         # sampling if the caller hasn't switched to eval() -- this only adds
         # noise to the *value* estimate (used for GAE bootstrapping), never to
         # the action distributions, so it is harmless there.
-        value_in_dim = trunk_hidden + value_extra_hidden
+        # Value-only elapsed-time scalar: derived from global_feat's
+        # time_remaining_norm column (index 1, see obs/schema.py
+        # GlobalFeatures) as elapsed_norm = 1 - time_remaining_norm, fed
+        # straight into value_head only (never into `h`/the shared trunk).
+        # time_remaining_norm is already present in global_feat and already
+        # reaches the value estimate indirectly via the trunk, so this adds
+        # no new information -- it's a privileged, undiluted copy of a
+        # signal we already know is important for MC-return regression
+        # (episode progress), mirroring value_ai_type_channel's pattern of
+        # giving the critic a dedicated, trunk-bypassing view of something
+        # that matters disproportionately to it.
+        value_in_dim = trunk_hidden + value_extra_hidden + 1
         if value_hidden_dim > 0:
             self.value_head = nn.Sequential(
                 nn.Dropout(value_dropout),
@@ -236,8 +249,17 @@ class ExecutionNetwork(nn.Module):
         self.move_dir_log_std = nn.Parameter(torch.full((1,), dir_log_std_init))
         _kick_ls_init = kick_dir_log_std_init if kick_dir_log_std_init is not None else dir_log_std_init
         self.kick_dir_log_std = nn.Parameter(torch.full((1,), _kick_ls_init))
-        self.kick_power_log_std = nn.Parameter(torch.zeros(1))
-        self.kick_spin_log_std = nn.Parameter(torch.zeros(3))
+        # kick_power/kick_spin log_std: previously fixed at torch.zeros(...) and
+        # never actually read anywhere -- both heads were applied fully
+        # deterministically (sigmoid(mean) / raw mean, no sampling, no PPO
+        # log_prob/ratio, no entropy). See agent_plans/spin_implementation_plan.md
+        # section 6 -- kick_power is a SquashedNormalHead like kick_spin_magnitude
+        # would be; kick_spin stays an unsquashed 3D Normal for now (still
+        # physically disabled at apply_nn_action.py, this is a scoped fix for
+        # the missing-exploration bug only, not the fuller axis/magnitude
+        # redesign discussed in the plan doc).
+        self.kick_power_log_std = nn.Parameter(torch.full((1,), kick_power_log_std_init))
+        self.kick_spin_log_std = nn.Parameter(torch.full((3,), kick_spin_log_std_init))
 
     def forward(
         self,
@@ -276,7 +298,8 @@ class ExecutionNetwork(nn.Module):
             self_ai_type, other_ai_type, exists_mask,
             self_embed=self_embed_raw.detach(), other_embed=other_embed_raw.detach(),
         )
-        value_input = torch.cat([h, value_extra], dim=-1)
+        elapsed_norm = 1.0 - global_feat[:, 1:2]
+        value_input = torch.cat([h, value_extra, elapsed_norm], dim=-1)
 
         eps = 1e-6
         raw_move = self.move_direction(h)
@@ -298,6 +321,8 @@ class ExecutionNetwork(nn.Module):
     def from_config(
         cls,
         trunk_hidden_override: Optional[int] = None,
+        value_hidden_dim_override: Optional[int] = None,
+        entity_embed_dim_override: Optional[int] = None,
         shared_entity_encoder: Optional[nn.Module] = None,
         shared_ball_mlp: Optional[nn.Module] = None,
         shared_global_mlp: Optional[nn.Module] = None,
@@ -305,6 +330,17 @@ class ExecutionNetwork(nn.Module):
         """Build from ai_config.json.
 
         trunk_hidden_override: overrides trunk_hidden (used for value_net sizing).
+        value_hidden_dim_override: overrides value_hidden_dim (the value_head's
+            own hidden layer width, 0 = single linear layer -- see
+            debug_value_network.py's --value-hidden-dim, added for capacity
+            sweeps investigating whether the critic is underfit).
+        entity_embed_dim_override: overrides entity_embed_dim for THIS
+            network's own entity encoder only. Only meaningful when
+            shared_entity_encoder is None (a shared encoder brings its own
+            fixed embed dim) -- e.g. debug_value_network.py's value_net,
+            which never shares an encoder with decision_net, so this is a
+            free capacity knob there. ai/knowledge.md
+            "Debugging" note for `debug_value_network.py`.
         shared_*: pass DecisionNetwork modules to share weights (see PPOTrainer.from_config).
         """
         from footballcoach.ai.config import load_ai_config
@@ -315,9 +351,17 @@ class ExecutionNetwork(nn.Module):
         # Falls back to trunk_hidden when absent or null.
         exec_trunk = cfg.get("exec_trunk_hidden") or cfg["trunk_hidden"]
         trunk = trunk_hidden_override if trunk_hidden_override is not None else exec_trunk
+        value_hidden = (
+            value_hidden_dim_override if value_hidden_dim_override is not None
+            else cfg.get("value_hidden_dim", 0)
+        )
+        entity_embed = (
+            entity_embed_dim_override if entity_embed_dim_override is not None
+            else cfg["entity_embed_dim"]
+        )
         return cls(
             latent_dim=cfg["latent_dim"],
-            entity_embed_dim=cfg["entity_embed_dim"],
+            entity_embed_dim=entity_embed,
             num_attention_heads=cfg["num_attention_heads"],
             self_mlp_hidden=cfg["self_mlp_hidden"],
             ball_mlp_hidden=cfg["ball_mlp_hidden"],
@@ -326,8 +370,10 @@ class ExecutionNetwork(nn.Module):
             trunk_hidden=trunk,
             dir_log_std_init=ppo_cfg.get("dir_log_std_init", -2.0),
             kick_dir_log_std_init=ppo_cfg.get("kick_dir_log_std_init", None),
+            kick_power_log_std_init=ppo_cfg.get("kick_power_log_std_init", 0.0),
+            kick_spin_log_std_init=ppo_cfg.get("kick_spin_log_std_init", 0.0),
             value_extra_hidden=cfg.get("value_extra_hidden", 16),
-            value_hidden_dim=cfg.get("value_hidden_dim", 0),
+            value_hidden_dim=value_hidden,
             value_dropout=cfg.get("value_dropout", 0.0),
             inter_player_num_heads=cfg.get("inter_player_attn_heads", 0),
             shared_entity_encoder=shared_entity_encoder,

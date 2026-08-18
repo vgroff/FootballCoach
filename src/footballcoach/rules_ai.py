@@ -11,6 +11,10 @@ Classes:
   PassReceiverAI          — continue on current order until ball within radius, then GetPossession
   BallReceiverThenShootAI — wait for ball receipt, set up shot/run, then delegate
   SprintWaypointAI        — issue sequential MoveOrders along a waypoint list
+  StopWhenIdleAI          — issue StopOrder whenever there's no active order; reusable
+                            fallback so a player with a single fire-and-forget order
+                            (KickOrder/PassOrder/...) decelerates to a stop afterward
+                            instead of coasting forever on stale velocity
   NeuralPlayerAI          — wraps a PPO network; samples every N ticks, exposes
                             last_transition for the rollout buffer
   HybridPlayerAI          — NeuralPlayerAI + two independent human-override
@@ -19,6 +23,7 @@ Classes:
 """
 from __future__ import annotations
 
+import math
 import random
 
 from footballcoach.entities.player import Player, PlayerAI, PlayerState, Team
@@ -30,6 +35,7 @@ from footballcoach.orders import (
     MoveOrder,
     SaveOrder,
     ShootOrder,
+    StopOrder,
 )
 
 
@@ -73,6 +79,29 @@ class Phase1RulesAI(PlayerAI):
             elif player.current_order.sprint != should_sprint:
                 player.current_order = GetPossessionOrder(sprint=should_sprint)
             _arm_box_kick(player, match)
+
+
+class StopWhenIdleAI(PlayerAI):
+    """Reusable fallback: whenever the player has no active order, issues a
+    ``StopOrder`` so they decelerate to a standstill through their normal
+    braking physics, rather than coasting forever on stale velocity.
+
+    ``Match._apply_movement`` deliberately leaves velocity/heading untouched
+    on any tick with no movement intent set (``desired_speed_mode is None``)
+    — that's a real signal used elsewhere (e.g. BC label generation) to mean
+    "no order was in effect this tick", so the engine can't just always
+    auto-brake there. For a player driven by a single fire-and-forget order
+    (``KickOrder``, ``PassOrder``, a self-cancelling ``SaveOrder``, ...) with
+    no AI to decide what's next, that gap is permanent rather than momentary
+    — assign this class as ``player.ai`` (instead of leaving ``ai=None``) to
+    close it. Any richer AI wanting the same "stop when there's nothing else
+    to do" fallback (e.g. after a one-off task completes) can reuse the same
+    one-line pattern directly in its own ``act()`` — see ``PassReceiverAI``.
+    """
+
+    def act(self, player: Player, match: Match, trial_tick: int) -> None:
+        if player.current_order is None:
+            player.current_order = StopOrder()
 
 
 _DECISION_INTERVAL_S = 0.5  # 15 ticks at 30 Hz — one neural decision window
@@ -196,13 +225,18 @@ def _should_sprint_to_ball(player: Player, match: Match) -> bool:
     return has_opponents is False
 
 
+_GK_PARKED_TOLERANCE_M = 0.5  # matches MoveOrder's widened arrival tolerance for max_speed_on_arrival_mps=0.0
+
+
 class StagedGoalkeeperAI(PlayerAI):
     """GK AI: jogs to goal centre, then reacts to shots.
 
     Enters SaveOrder only when the ball's trajectory is aimed at the GK's goal
     (linear projection to the goal-line x).  Exits SaveOrder as soon as the ball
     becomes possessed by anyone — even an attacker receiving a pass — and jogs
-    back to goal centre.
+    back to goal centre.  Once parked at goal centre it faces outfield (see
+    ``_outfield_heading``) rather than whatever heading the final approach
+    step happened to leave it at.
     """
 
     def __init__(self, jog_to_centre: bool = True) -> None:
@@ -213,6 +247,11 @@ class StagedGoalkeeperAI(PlayerAI):
         if player.team == Team.LEFT:
             return match.pitch.left_goal_centre
         return match.pitch.right_goal_centre
+
+    def _outfield_heading(self, player: Player) -> float:
+        """Heading facing away from the GK's own goal line, into the pitch."""
+        from footballcoach.entities.player import Team
+        return 0.0 if player.team == Team.LEFT else math.pi
 
     def _ball_aimed_at_goal(self, player: Player, match: Match) -> bool:
         """True if the loose ball's straight-line path projects into the goal mouth."""
@@ -245,6 +284,20 @@ class StagedGoalkeeperAI(PlayerAI):
         half_goal_w = pitch.goal_width_m / 2.0 * 1.3  # 30% margin for early reaction
         return abs(proj_y) < half_goal_w
 
+    def _face_outfield_if_parked(self, player: Player, match: Match) -> None:
+        """If already stationary at goal centre, snap heading to face outfield.
+
+        Physics never turns a stationary player (no movement intent to turn
+        towards), so without this the GK keeps whatever heading its last
+        approach step happened to leave it at -- including, by default,
+        heading_rad=0.0 (facing +x), which for a Team.RIGHT GK means facing
+        straight into their own net.
+        """
+        target = self._goal_centre(player, match)
+        dist = player.position.xy().distance_to(target.xy())
+        if dist <= _GK_PARKED_TOLERANCE_M and player.speed_mps < 0.05:
+            player.heading_rad = self._outfield_heading(player)
+
     def act(self, player: Player, match: Match, trial_tick: int) -> None:
         ball = match.ball
 
@@ -256,6 +309,12 @@ class StagedGoalkeeperAI(PlayerAI):
                     target_position=target, sprint=False, max_speed_on_arrival_mps=0.0,
                 )
                 match._log_debug(f"[AI] {player.player_id}: back to goal centre (ball possessed)")
+            elif player.current_order is None:
+                # Idle while someone else has the ball (e.g. the attacker's
+                # build-up run) -- this is the common case, so make sure
+                # heading gets fixed here too, not just in the "ball loose"
+                # branch below.
+                self._face_outfield_if_parked(player, match)
             return
 
         # Ball is loose — enter SaveOrder if aimed at our goal.
@@ -268,20 +327,48 @@ class StagedGoalkeeperAI(PlayerAI):
         # Ball is loose but not threatening — fill None with goal-centre jog.
         if player.current_order is None:
             target = self._goal_centre(player, match)
-            player.current_order = MoveOrder(
-                target_position=target, sprint=False, max_speed_on_arrival_mps=0.0,
-            )
+            dist = player.position.xy().distance_to(target.xy())
+            if dist <= _GK_PARKED_TOLERANCE_M and player.speed_mps < 0.05:
+                self._face_outfield_if_parked(player, match)
+            else:
+                player.current_order = MoveOrder(
+                    target_position=target, sprint=False, max_speed_on_arrival_mps=0.0,
+                )
 
 
 class BallCarrierAttackerAI(PlayerAI):
     """Ball carrier runs toward goal; if their MoveOrder progress stalls
-    (distance to target starts increasing) or the order completes, switches
-    to a ShootOrder at the configured aim point."""
+    (distance to target starts increasing), the order completes, or the
+    player is already at least as close to goal as the MoveOrder's own
+    target (see below), switches to a ShootOrder.
 
-    def __init__(self, aim_point: Vector3, power_fraction: float = 0.9) -> None:
+    The shot target is resolved lazily via ``resolve_aim_point()`` -- see
+    its docstring: pass a fixed ``aim_point`` for deterministic behaviour
+    (tests, or scenarios that don't want smart aiming), or leave it ``None``
+    (default) to pick a live, goalkeeper-aware corner at the moment of
+    shooting via ``shot_selection.choose_shot_target()``.
+    """
+
+    def __init__(self, aim_point: Vector3 | None = None, power_fraction: float = 0.9) -> None:
         self.aim_point = aim_point
         self.power_fraction = power_fraction
         self._prev_dist_to_target: float | None = None
+
+    def _goal_centre(self, player: Player, match: Match) -> Vector3:
+        return match.pitch.right_goal_centre if player.team == Team.LEFT else match.pitch.left_goal_centre
+
+    def resolve_aim_point(self, player: Player, match: Match) -> Vector3:
+        """Returns the fixed ``aim_point`` given at construction, if any;
+        otherwise computes a smart, goalkeeper-aware corner live (see
+        ``shot_selection.choose_shot_target``) using the shooter's and
+        opposing goalkeeper's CURRENT positions -- called right at the
+        moment of shooting, not baked in at scenario-build time, so it
+        reacts to how the play has actually developed."""
+        if self.aim_point is not None:
+            return self.aim_point
+        from footballcoach.shot_selection import choose_shot_target
+        gk = next((p for p in match.players if p.team != player.team and p.is_goalkeeper), None)
+        return choose_shot_target(player, self.power_fraction, gk, match.pitch, match.rng)
 
     def act(self, player: Player, match: Match, trial_tick: int) -> None:
         if match.ball.possessed_by != player.player_id:
@@ -289,18 +376,40 @@ class BallCarrierAttackerAI(PlayerAI):
             return
         order = player.current_order
         if isinstance(order, MoveOrder):
+            # Repulsion steering (see steering.py) can push the ball carrier
+            # around an obstacle in a way that carries them closer to goal
+            # than the MoveOrder's own target -- e.g. dodging wide of a
+            # defender overshoots the intended run. Continuing to chase the
+            # now-relatively-behind target would mean moving BACKWARDS
+            # (away from goal) just to satisfy the literal waypoint. Once
+            # that happens there's no reason to keep running: shoot from
+            # here instead, same as a normal arrival/stall. Measured against
+            # true goal centre (not the eventual shot target, which may be
+            # an off-centre corner picked only once shooting is decided).
+            goal_centre = self._goal_centre(player, match)
+            goal_dist = player.position.xy().distance_to(goal_centre.xy())
+            target_goal_dist = order.target_position.xy().distance_to(goal_centre.xy())
+            if goal_dist <= target_goal_dist:
+                player.current_order = ShootOrder(
+                    aim_point=self.resolve_aim_point(player, match), power_fraction=self.power_fraction,
+                    compensate_for_run=False,
+                )
+                match._log_info(f"[AI] {player.player_id}: ShootOrder (overtook move target)")
+                return
             dist = player.position.xy().distance_to(order.target_position.xy())
             prev = self._prev_dist_to_target
             self._prev_dist_to_target = dist
             if prev is not None and dist > prev:
                 player.current_order = ShootOrder(
-                    aim_point=self.aim_point, power_fraction=self.power_fraction
+                    aim_point=self.resolve_aim_point(player, match), power_fraction=self.power_fraction,
+                    compensate_for_run=False,
                 )
                 match._log_info(f"[AI] {player.player_id}: ShootOrder (stalled)")
         elif order is None:
             self._prev_dist_to_target = None
             player.current_order = ShootOrder(
-                aim_point=self.aim_point, power_fraction=self.power_fraction
+                aim_point=self.resolve_aim_point(player, match), power_fraction=self.power_fraction,
+                compensate_for_run=False,
             )
             match._log_info(f"[AI] {player.player_id}: ShootOrder")
 
@@ -309,7 +418,11 @@ class PassReceiverAI(PlayerAI):
     """Continues on whatever order the player currently holds until the loose
     ball comes within ``get_possession_radius_m``, then switches to
     ``GetPossessionOrder``.  Once possession is gained, delegates to
-    ``after_receipt_ai`` (if provided) for all subsequent ticks.
+    ``after_receipt_ai`` (if provided) for all subsequent ticks; if no
+    ``after_receipt_ai`` was given, falls back to ``StopWhenIdleAI``'s
+    behaviour (decelerate to a standstill via ``StopOrder``) so the receiver
+    doesn't coast forever on stale velocity once ``GetPossessionOrder``
+    completes.
 
     Typical usage — pair with an initial ``MoveOrder`` set at scenario-build
     time so the receiver runs toward a useful position and only commits to
@@ -334,6 +447,8 @@ class PassReceiverAI(PlayerAI):
         if self._received:
             if self.after_receipt_ai is not None:
                 self.after_receipt_ai.act(player, match, trial_tick)
+            elif player.current_order is None:
+                player.current_order = StopOrder()
             return
 
         if match.ball.possessed_by == player.player_id:
@@ -360,12 +475,16 @@ class BallReceiverThenShootAI(PlayerAI):
 
     def __init__(
         self,
-        goal_aim_point: Vector3,
-        shoot_immediately: bool,
+        goal_aim_point: Vector3 | None = None,
+        shoot_immediately: bool = False,
         run_fraction: float = 0.3,
         power_fraction: float = 0.85,
         get_possession_radius_m: float = 8.0,
     ) -> None:
+        """``goal_aim_point``: fixed shot target, or ``None`` (default) for
+        a live, goalkeeper-aware corner pick at the moment of shooting --
+        see ``BallCarrierAttackerAI.resolve_aim_point()``, which this class
+        delegates to via its internal ``_carrier_ai``."""
         self.goal_aim_point = goal_aim_point
         self._shoot_immediately = shoot_immediately
         self._run_fraction = run_fraction
@@ -380,14 +499,18 @@ class BallReceiverThenShootAI(PlayerAI):
                 self._received = True
                 if self._shoot_immediately:
                     player.current_order = ShootOrder(
-                        aim_point=self.goal_aim_point,
+                        aim_point=self._carrier_ai.resolve_aim_point(player, match),
                         power_fraction=self._carrier_ai.power_fraction,
+                        compensate_for_run=False,
                     )
                     match._log_info(f"[AI] {player.player_id}: ShootOrder (immediate)")
                 else:
+                    # goal centre (not the eventual shot target -- see
+                    # resolve_aim_point) just to gauge how far to run first.
+                    goal_x = self._carrier_ai._goal_centre(player, match).x
                     run_target = Vector3(
                         player.position.x
-                        + (self.goal_aim_point.x - player.position.x) * self._run_fraction,
+                        + (goal_x - player.position.x) * self._run_fraction,
                         player.position.y,
                         0.0,
                     )

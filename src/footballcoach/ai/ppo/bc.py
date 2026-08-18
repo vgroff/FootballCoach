@@ -190,6 +190,20 @@ class BCLabel:
 # Rules-based label generators
 # ---------------------------------------------------------------------------
 
+def _ai_type_of(ai) -> float:
+    """Classify a ``player.ai`` instance into an AI_TYPE_* code for the
+    value-only ``ai_type``/``opponent_ai_type`` side channel. Checked in this
+    order: rules-based first (``Phase1RulesAI``), then neural
+    (``NeuralPlayerAI`` — also matches ``HybridPlayerAI``, a subclass), else
+    immobile (``ai is None`` or anything else)."""
+    from footballcoach.rules_ai import Phase1RulesAI, NeuralPlayerAI
+    if isinstance(ai, Phase1RulesAI):
+        return AI_TYPE_RULES
+    if isinstance(ai, NeuralPlayerAI):
+        return AI_TYPE_NEURAL
+    return AI_TYPE_IMMOBILE
+
+
 def phase1_labels(env, player_id: str = None) -> BCLabel:
     """Derive BC labels for Phase 1 by asking Phase1RulesAI what it would do.
 
@@ -218,9 +232,10 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         return BCLabel.invalid()
 
     # ai_type reflects which AI actually controls *player* right now (rules
-    # vs immobile) — NOT which AI the label was derived from (this function
-    # always queries Phase1RulesAI internally regardless of the caller).
-    ai_type = AI_TYPE_RULES if isinstance(player.ai, Phase1RulesAI) else AI_TYPE_IMMOBILE
+    # vs neural vs immobile) — NOT which AI the label was derived from (this
+    # function always queries Phase1RulesAI internally regardless of the
+    # caller).
+    ai_type = _ai_type_of(player.ai)
 
     # opponent_ai_type: which AI controls the OTHER player in the match right
     # now. Phase 1 is strictly 1v1, so "the other player" is unambiguous —
@@ -230,7 +245,7 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     opponent_ai_type = AI_TYPE_IMMOBILE
     for _p in match.players:
         if _p.player_id != player.player_id:
-            opponent_ai_type = AI_TYPE_RULES if isinstance(_p.ai, Phase1RulesAI) else AI_TYPE_IMMOBILE
+            opponent_ai_type = _ai_type_of(_p.ai)
             break
 
     # Execution heads reflect what the rules AI is physically doing RIGHT NOW —
@@ -399,39 +414,172 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         return BCLabel.invalid()
 
 
+def phase1_labels_from_teacher(env, teacher_trainer, player_id: str = None) -> BCLabel:
+    """Derive BC labels for Phase 1 from a neural teacher's own forward pass,
+    instead of ``phase1_labels()``'s Phase1RulesAI order-simulation
+    counterfactual.
+
+    Every head — decision Bernoulli probabilities, move_direction/
+    kick_direction unit vectors, sprint/exec_move/kick_this_tick/
+    tackle_attempt probabilities, kick_power, kick_spin, move_region_center —
+    comes directly from ONE forward call through
+    ``teacher_trainer.decision_net``/``teacher_trainer.execution_net``, fully
+    decoupled from whatever ``player.ai`` is physically doing to *player*
+    this tick. This sidesteps the real-state-vs-counterfactual gap
+    ``phase1_labels()``'s ``kick_this_tick``/``tackle_attempt`` fields have
+    (those read real player/order state because Phase1RulesAI only speaks in
+    Orders, not raw action probabilities, so it needs a snapshot/restore
+    sandbox to get a genuine counterfactual for move/sprint but not for
+    kick/tackle — see that function's docstring and
+    ai/knowledge.md "Orders vs execution-network labels boundary"). A neural
+    teacher has no such gap: every head is read straight off its own output
+    tensors, so kick/tackle labels are just as counterfactual as move/sprint.
+
+    Labels are SOFT (the teacher's own sigmoid probabilities / raw outputs,
+    not hard 0/1) — ``bc_loss_from_tensor()``'s BCE/cosine/MSE terms accept
+    continuous targets directly, no BCLabel schema change needed.
+
+    This is the intended mechanism for neural-to-neural distillation /
+    DAgger-style dataset generation: whoever/whatever physically drives
+    *player* (rules AI, immobile, or another neural checkpoint via
+    ``record_demonstrations.py --driver-checkpoint``) determines which states
+    get visited; ``teacher_trainer`` supplies what to imitate at each visited
+    state, independent of the driver's identity — so this works whether the
+    driver and teacher are the same checkpoint, different checkpoints (e.g.
+    across an architecture change), or the driver is rules-based/immobile.
+
+    ``teacher_trainer`` must be a ``PPOTrainer`` with real ``decision_net``/
+    ``execution_net`` weights loaded (e.g. via
+    ``PPOTrainer.load_for_inference()``) — called directly, under
+    ``torch.no_grad()``, regardless of its own ``.training``/``.eval()``
+    mode.
+
+    All quantities returned here are decanonicalized back to raw WORLD/
+    ENGINE-FRAME coordinates before storage, matching ``phase1_labels()``'s
+    own convention (the network's raw outputs are in CANONICAL frame per
+    ``CanonicalNetworkWrapper`` — see ai/knowledge.md "Canonical AI frame") —
+    the stored dataset stays plain world-frame; ``canonicalize_bc_labels()``
+    re-canonicalizes at consumption time, same as every other label source.
+    """
+    from footballcoach.ai.obs.canonical import x_sign_of, mirror_x
+
+    try:
+        match = env.match
+        if player_id is None:
+            player_id = env.trainee_player_id
+        if match is None:
+            return BCLabel.invalid()
+        player = match.player_by_id(player_id)
+    except (KeyError, AttributeError):
+        return BCLabel.invalid()
+
+    ai_type = _ai_type_of(player.ai)
+    opponent_ai_type = AI_TYPE_IMMOBILE
+    for _p in match.players:
+        if _p.player_id != player.player_id:
+            opponent_ai_type = _ai_type_of(_p.ai)
+            break
+
+    obs = env._get_obs(player_id=player_id)
+    device = next(teacher_trainer.decision_net.parameters()).device
+    obs_dict = {k: v.unsqueeze(0).to(device) for k, v in obs.to_torch_dict().items()}
+    x_sign = float(x_sign_of(obs.self_feat))
+
+    with torch.no_grad():
+        d_heads = teacher_trainer.decision_net(
+            obs_dict["self_feat"], obs_dict["other_feat"], obs_dict["exists_mask"],
+            obs_dict["ball_feat"], obs_dict["global_feat"],
+            obs_dict["self_ai_type"], obs_dict["other_ai_type"],
+        )
+        e_heads = teacher_trainer.execution_net(
+            obs_dict["self_feat"], obs_dict["other_feat"], obs_dict["exists_mask"],
+            obs_dict["ball_feat"], obs_dict["global_feat"],
+            d_heads, obs_dict["self_ai_type"], obs_dict["other_ai_type"],
+        )
+
+    move_direction = mirror_x(e_heads.move_direction.squeeze(0), x_sign).cpu().numpy().astype(np.float32)
+    kick_direction = mirror_x(e_heads.kick_direction.squeeze(0), x_sign).cpu().numpy().astype(np.float32)
+    mv_center_phys = torch.tanh(d_heads.move_region_center) * torch.tensor(
+        [[_PITCH_HALF_LENGTH_M, _PITCH_HALF_WIDTH_M]], device=device
+    )
+    move_region_center = mirror_x(mv_center_phys.squeeze(0), x_sign).cpu().numpy().astype(np.float32)
+    # kick_spin is left unmirrored, matching PPOTrainer._sample_action()'s own
+    # direct-drive decanonicalize step (which mirrors move_direction/
+    # kick_direction but not kick_spin) — kick_spin's PPO sampling is
+    # currently frozen (see agent_plans/spin_implementation_plan.md section 0)
+    # and no call site in the codebase mirrors it, so this stays consistent
+    # rather than introducing a new, unvalidated transform.
+    kick_spin = e_heads.kick_spin.squeeze(0).cpu().numpy().astype(np.float32)
+
+    return BCLabel(
+        shoot=float(torch.sigmoid(d_heads.shoot_logit)),
+        pass_=float(torch.sigmoid(d_heads.pass_logit)),
+        move=float(torch.sigmoid(d_heads.move_logit)),
+        tackle=float(torch.sigmoid(d_heads.tackle_logit)),
+        get_possession_extra=float(torch.sigmoid(d_heads.get_possession_raw)),
+        mark=float(torch.sigmoid(d_heads.mark_logit)),
+        hold_position=float(torch.sigmoid(d_heads.hold_position_logit)),
+        move_direction=move_direction,
+        sprint=float(torch.sigmoid(e_heads.sprint_logit)),
+        move_region_center_m=move_region_center,
+        kick_this_tick=float(torch.sigmoid(e_heads.kick_logit)),
+        tackle_attempt=float(torch.sigmoid(e_heads.tackle_attempt_logit)),
+        exec_move=float(torch.sigmoid(e_heads.exec_move_logit)),
+        valid=True,
+        ai_type=ai_type,
+        opponent_ai_type=opponent_ai_type,
+        kick_direction=kick_direction,
+        kick_power_fraction=float(torch.sigmoid(e_heads.kick_power)),
+        kick_spin=kick_spin,
+    )
+
+
 # ---------------------------------------------------------------------------
 # BC loss floor (analytic minimum achievable loss under label smoothing)
 # ---------------------------------------------------------------------------
 
-def compute_bc_loss_floor(
+def compute_bc_loss_floor_components(
     labels: torch.Tensor,
     pos_weight_kick: float = 1.0,
     pos_weight_tackle_attempt: float = 1.0,
-    dec_weight: float = 1.0,
-    exec_weight: float = 1.0,
     dec_label_smoothing: float = 0.0,
     exec_label_smoothing: float = 0.0,
     has_exec: bool = True,
-) -> float:
-    """Analytic minimum achievable ``bc_loss_from_tensor`` value for this batch.
+) -> dict:
+    """Per-component analytic BC loss floors, unweighted — i.e. matching the
+    scale of ``bc_loss_from_tensor(..., return_breakdown=True)``'s dict
+    *before* ``dec_weight``/``exec_weight`` are applied (those breakdown
+    entries are raw, unweighted per-group means — see that function).
 
     Label smoothing (and, for positive rows, ``pos_weight``) makes the
     BCE-optimal prediction ``p* = y'`` (the smoothed target) rather than the
-    hard 0/1 label, so the achievable minimum loss is no longer 0 — it's the
-    (weighted) binary entropy of each smoothed target:
-    ``H(y') = -y'*ln(y') - (1-y')*ln(1-y')``, scaled by ``pos_weight`` on
-    positive-labelled rows (matching ``F.binary_cross_entropy_with_logits``'s
-    ``pos_weight`` semantics, which multiplies the WHOLE per-sample loss on
-    positive rows, not just the ``-log(p)`` term).
+    hard 0/1 label, so the achievable minimum loss per smoothed Bernoulli
+    head is no longer 0 — it's the (weighted) binary entropy of the smoothed
+    target: ``H(y') = -y'*ln(y') - (1-y')*ln(1-y')``, scaled by
+    ``pos_weight`` on positive-labelled rows (matching
+    ``F.binary_cross_entropy_with_logits``'s ``pos_weight`` semantics, which
+    multiplies the WHOLE per-sample loss on positive rows, not just the
+    ``-log(p)`` term). Note ``H(y')`` is symmetric in the hard label ``y``
+    (``H(0.5*eps) == H(1-0.5*eps)``), so each head's floor depends only on
+    its smoothing constant (and mildly on ``pos_weight``), not on how
+    balanced its labels are — this is what makes per-component floors cheap
+    to reason about without touching the underlying dataset.
 
-    Only the smoothed Bernoulli BCE heads have a nonzero floor — the cosine
-    (direction) and MSE (region/kick_power/kick_spin) terms have a true
+    Only the smoothed Bernoulli BCE components (``decision``, ``exec_bce``,
+    and its constituents ``sprint``/``move``/``tackle_attempt``/``kick``)
+    have a nonzero floor — the cosine (``direction``/``kick_direction``) and
+    MSE (``region``/``kick_power``/``kick_spin``) components have a true
     floor of 0 regardless of smoothing, since they aren't binary-target BCE.
-    This is therefore a lower bound on ``bc_loss_from_tensor``'s return value
-    for the same batch/config, useful as ``bc_adj = bc_loss - floor`` so
-    epoch-to-epoch / config-to-config loss comparisons aren't confounded by
-    a smoothing-only additive offset (see ai_trainer_knowledge.md discussion
-    on BC loss and label smoothing).
+
+    Subtracting these per-component floors from a logged breakdown (e.g.
+    ppo_trainer.py's per-epoch "breakdown  decision=... exec_bce=..." line)
+    keeps components directly comparable to each other and to zero-floor
+    components like ``direction`` — without it, summed multi-head terms
+    (``exec_bce`` sums 4 smoothed heads) look disproportionately large next
+    to unfloored ones purely from the smoothing offset, not real residual
+    error. See ai_trainer_knowledge.md's BC loss / label smoothing
+    discussion, and ``compute_bc_loss_floor`` below (the pre-existing
+    single-scalar total, now a thin wrapper over this function).
 
     Args:
         labels: (N, BC_LABEL_DIM) float32 tensor, same batch passed to
@@ -441,11 +589,19 @@ def compute_bc_loss_floor(
             ``bc_loss_from_tensor``'s ``exec_heads is None`` branch.
 
     Returns:
-        Scalar float floor value, or 0.0 if no valid rows.
+        Dict with keys {decision, exec_bce, sprint, move, tackle_attempt,
+        kick, direction, region, kick_direction, kick_power, kick_spin} —
+        the last five always 0.0 (true zero floor). All-zero dict if no
+        valid rows.
     """
+    zero = {
+        "decision": 0.0, "exec_bce": 0.0, "sprint": 0.0, "move": 0.0,
+        "tackle_attempt": 0.0, "direction": 0.0, "region": 0.0,
+        "kick": 0.0, "kick_direction": 0.0, "kick_power": 0.0, "kick_spin": 0.0,
+    }
     valid = labels[:, _I_VALID] > 0.5
     if not valid.any():
-        return 0.0
+        return zero
 
     def _floor_bce(col: int, pos_weight: float = 1.0, smoothing: float = 0.0) -> torch.Tensor:
         y = labels[:, col]
@@ -471,18 +627,69 @@ def compute_bc_loss_floor(
         + _floor_bce(_I_MARK,    smoothing=dec_label_smoothing)
         + _floor_bce(_I_HOLD,    smoothing=dec_label_smoothing)
     )
-    total_floor = dec_weight * dec_floor
+    result = dict(zero)
+    result["decision"] = float(dec_floor[valid].mean())
 
     if has_exec:
-        exec_floor = (
-            _floor_bce(_I_EXEC_MOVE,      smoothing=exec_label_smoothing)
-            + _floor_bce(_I_SPRINT,         smoothing=exec_label_smoothing)
-            + _floor_bce(_I_KICK_THIS_TICK, pos_weight_kick, smoothing=exec_label_smoothing)
-            + _floor_bce(_I_TACKLE_ATTEMPT, pos_weight_tackle_attempt, smoothing=exec_label_smoothing)
+        move_floor = _floor_bce(_I_EXEC_MOVE, smoothing=exec_label_smoothing)
+        sprint_floor = _floor_bce(_I_SPRINT, smoothing=exec_label_smoothing)
+        kick_floor = _floor_bce(_I_KICK_THIS_TICK, pos_weight_kick, smoothing=exec_label_smoothing)
+        tackle_attempt_floor = _floor_bce(
+            _I_TACKLE_ATTEMPT, pos_weight_tackle_attempt, smoothing=exec_label_smoothing
         )
-        total_floor = total_floor + exec_weight * exec_floor
+        result["move"] = float(move_floor[valid].mean())
+        result["sprint"] = float(sprint_floor[valid].mean())
+        result["kick"] = float(kick_floor[valid].mean())
+        result["tackle_attempt"] = float(tackle_attempt_floor[valid].mean())
+        result["exec_bce"] = float(
+            (move_floor + sprint_floor + kick_floor + tackle_attempt_floor)[valid].mean()
+        )
 
-    return float(total_floor[valid].mean())
+    return result
+
+
+def compute_bc_loss_floor(
+    labels: torch.Tensor,
+    pos_weight_kick: float = 1.0,
+    pos_weight_tackle_attempt: float = 1.0,
+    dec_weight: float = 1.0,
+    exec_weight: float = 1.0,
+    dec_label_smoothing: float = 0.0,
+    exec_label_smoothing: float = 0.0,
+    has_exec: bool = True,
+) -> float:
+    """Analytic minimum achievable ``bc_loss_from_tensor`` value for this batch.
+
+    Thin wrapper over ``compute_bc_loss_floor_components`` (see its
+    docstring for the ``H(y')`` derivation) that applies ``dec_weight``/
+    ``exec_weight`` and sums to the single scalar comparable against
+    ``bc_loss_from_tensor``'s (weighted) total, useful as
+    ``bc_adj = bc_loss - floor`` so epoch-to-epoch / config-to-config loss
+    comparisons aren't confounded by a smoothing-only additive offset (see
+    ai_trainer_knowledge.md discussion on BC loss and label smoothing).
+
+    Args:
+        labels: (N, BC_LABEL_DIM) float32 tensor, same batch passed to
+            ``bc_loss_from_tensor``.
+        has_exec: whether the caller passed a real ``exec_heads`` (i.e.
+            Phase 1/2/3, not Phase 0's decision-only path) — mirrors
+            ``bc_loss_from_tensor``'s ``exec_heads is None`` branch.
+
+    Returns:
+        Scalar float floor value, or 0.0 if no valid rows.
+    """
+    components = compute_bc_loss_floor_components(
+        labels,
+        pos_weight_kick=pos_weight_kick,
+        pos_weight_tackle_attempt=pos_weight_tackle_attempt,
+        dec_label_smoothing=dec_label_smoothing,
+        exec_label_smoothing=exec_label_smoothing,
+        has_exec=has_exec,
+    )
+    total_floor = dec_weight * components["decision"]
+    if has_exec:
+        total_floor += exec_weight * components["exec_bce"]
+    return total_floor
 
 
 # ---------------------------------------------------------------------------
@@ -502,6 +709,8 @@ def bc_loss_from_tensor(
     exec_weight: float = 1.0,
     dec_label_smoothing: float = 0.0,
     exec_label_smoothing: float = 0.0,
+    split_kick: bool = False,
+    split_tackle: bool = False,
 ):
     """Compute BC loss for a minibatch, given packed label tensors.
 
@@ -547,21 +756,56 @@ def bc_loss_from_tensor(
         return_breakdown: If True, also return a dict of per-group mean losses
             {decision, exec_bce, sprint, move, direction, region} for diagnostics.
             When exec_heads is None, the exec-dependent entries are all 0.0.
+        split_kick: If True, also return a dict of two *differentiable*
+            (non-detached) group-loss tensors: {"kick_group_loss",
+            "other_group_loss"}. "kick_group_loss" is the mean (over valid
+            rows) of kick_this_tick BCE + kick_direction cosine + kick_power
+            MSE + kick_spin MSE, each already scaled by exec_weight;
+            "other_group_loss" is everything else in `total` (decision BCEs,
+            move_region_center MSE, exec_move/sprint/tackle_attempt BCE,
+            move_direction cosine). Unlike return_breakdown's dict (whose
+            values are `float(...)`-cast and carry no gradient — diagnostic
+            only), these are plain tensors still attached to the autograd
+            graph, so a caller can do
+            ``coeff_kick * split["kick_group_loss"] + coeff_other *
+            split["other_group_loss"]`` and backprop through it. Combine
+            freely with return_breakdown and/or split_tackle (independent
+            flags) — when either split flag is set, one extra dict is
+            appended to the return tuple (see Returns below); "other_group_loss"
+            always excludes whichever of the kick/tackle groups are split out.
+        split_tackle: If True, also return "tackle_group_loss" in the same
+            split dict as split_kick (created even if split_kick is False):
+            the mean (over valid rows) of the tackle_attempt BCE term alone,
+            scaled by exec_weight — tackle has no direction/power/spin
+            sub-heads the way kicking does, so this is a single-term group.
+            Same differentiable-tensor rationale as split_kick.
 
     Returns:
-        Scalar BC loss (mean over valid steps), or (loss, breakdown_dict) if
-        return_breakdown=True.  Returns zero tensor if no valid steps.
+        Scalar BC loss (mean over valid steps). If return_breakdown and/or
+        (split_kick or split_tackle) are True, additionally returns their
+        dict(s) in that order: (loss[, breakdown_dict][, split_dict]).
+        split_dict always has "other_group_loss"; "kick_group_loss" is
+        present iff split_kick, "tackle_group_loss" iff split_tackle.
+        Returns zero tensor(s) if no valid steps.
     """
     valid = labels[:, _I_VALID] > 0.5  # (N,) bool
     _zero = torch.zeros(1, device=labels.device)
     if not valid.any():
+        result = (_zero,)
         if return_breakdown:
-            return _zero, {
+            result += ({
                 "decision": 0.0, "exec_bce": 0.0, "sprint": 0.0, "move": 0.0,
                 "tackle_attempt": 0.0, "direction": 0.0, "region": 0.0,
-            "kick": 0.0, "kick_direction": 0.0, "kick_power": 0.0, "kick_spin": 0.0,
-            }
-        return _zero
+                "kick": 0.0, "kick_direction": 0.0, "kick_power": 0.0, "kick_spin": 0.0,
+            },)
+        if split_kick or split_tackle:
+            _zero_split = {"other_group_loss": _zero}
+            if split_kick:
+                _zero_split["kick_group_loss"] = _zero
+            if split_tackle:
+                _zero_split["tackle_group_loss"] = _zero
+            result += (_zero_split,)
+        return result if len(result) > 1 else result[0]
 
     loss = torch.zeros(labels.shape[0], device=labels.device)
 
@@ -685,6 +929,36 @@ def bc_loss_from_tensor(
     valid_loss = loss[valid]
     total = valid_loss.mean() if len(valid_loss) > 0 else _zero
 
+    split = None
+    if split_kick or split_tackle:
+        # The per-row component tensors below (kick_loss, kick_dir_loss_per,
+        # kick_power_loss_per, kick_spin_loss_per, tackle_attempt_loss) are
+        # already zeroed on non-applicable rows by the torch.where(...) gates
+        # above -- exactly the row-level structure that return_breakdown's
+        # detached scalar means throw away. Scale each by exec_weight
+        # (matching how they were folded into `loss` above) and sum per-row
+        # *before* reducing to a mean, so the resulting scalars stay attached
+        # to the autograd graph.
+        kick_group_per_row = torch.zeros(labels.shape[0], device=labels.device)
+        tackle_group_per_row = torch.zeros(labels.shape[0], device=labels.device)
+        if split_kick:
+            kick_group_per_row = exec_weight * (
+                kick_loss + kick_dir_loss_per + kick_power_loss_per + kick_spin_loss_per
+            )
+        if split_tackle:
+            tackle_group_per_row = exec_weight * tackle_attempt_loss
+        other_group_per_row = loss - kick_group_per_row - tackle_group_per_row
+
+        def _group_mean(per_row: torch.Tensor) -> torch.Tensor:
+            v = per_row[valid]
+            return v.mean() if len(v) > 0 else _zero
+
+        split = {"other_group_loss": _group_mean(other_group_per_row)}
+        if split_kick:
+            split["kick_group_loss"] = _group_mean(kick_group_per_row)
+        if split_tackle:
+            split["tackle_group_loss"] = _group_mean(tackle_group_per_row)
+
     if return_breakdown:
         # kick_direction/kick_power/kick_spin are gated to zero on non-kick
         # rows (see kicked_mask above) — averaging over ALL valid rows
@@ -715,7 +989,11 @@ def bc_loss_from_tensor(
             "kick_power":     _kicked_mean(kick_power_loss_per),
             "kick_spin":      _kicked_mean(kick_spin_loss_per),
         }
+        if split_kick or split_tackle:
+            return total, breakdown, split
         return total, breakdown
+    if split_kick or split_tackle:
+        return total, split
     return total
 
 

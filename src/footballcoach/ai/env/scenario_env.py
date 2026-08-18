@@ -121,13 +121,13 @@ class ScenarioEnv:
         # Cleared in reset() since a fresh Match/pitch is built each episode.
         self._box_bounds_cache: dict = {}
         self._max_episode_ticks: int = 1
-        # player_id of whoever last possessed or kicked the ball, updated every
-        # tick. Used solely to attribute the ball_out_penalty / "miss" outcome
-        # to the ONE player who actually put the ball out — not to everyone who
-        # ever touched it earlier in the episode. None if nobody has touched
-        # the ball yet this episode (in which case no ball_out penalty applies
-        # to anyone).
-        self._last_ball_toucher_id: Optional[str] = None
+        # Who last possessed or kicked the ball, for attributing the
+        # ball_out_penalty / "miss" outcome to the ONE player who actually put
+        # the ball out. Read via self._loop.last_completed_trial_toucher_id
+        # (ScenarioLoop is the single source of truth for this -- it tracks
+        # it correctly-ordered, i.e. AFTER each match.step(), including the
+        # trial-ending tick; this env used to keep its own separate, less
+        # correctly-ordered copy, now removed).
         self._trainee_had_possession_last_step: bool = False
         # True while the ball is loose after the trainee lost it and no OTHER
         # player has taken possession yet (e.g. a push-kick dribble touch, or
@@ -204,7 +204,6 @@ class ScenarioEnv:
         self._ema.reset()
         self._episode_ticks = 0
         self._trial_done = False
-        self._last_ball_toucher_id = None
         self._box_bounds_cache = {}
         self._prev_goal_count = (
             self._loop.match.scoreboard.left_goals,
@@ -360,17 +359,6 @@ class ScenarioEnv:
         sec_prog_accum = {pid: 0.0 for pid in sec_pre}
 
         for _ in range(self._ticks_per_decision):
-            # Track who last touched the ball (possession or a kick this
-            # tick) -- the SOLE source of truth for who gets blamed if the
-            # ball goes out. Deliberately overwrites on every touch so only
-            # the most recent toucher is ever penalised, never everyone who
-            # touched the ball earlier in the episode.
-            if match.ball.possessed_by is not None:
-                self._last_ball_toucher_id = match.ball.possessed_by
-            for _p in match.players:
-                if _p.kicked_this_tick:
-                    self._last_ball_toucher_id = _p.player_id
-
             # Track shot events (KickOrder completing toward goal)
             if self._detect_shot_this_tick(match, player):
                 shot_taken = True
@@ -387,6 +375,25 @@ class ScenarioEnv:
                     goal_scored = True
                     if self.phase != 1:
                         self._ema.on_goal()
+                    else:
+                        # Phase 1's only win condition is box_possession
+                        # (dribble into the opponent's box) -- there is no
+                        # scoring reward term at all. Normalize "goal" to
+                        # "miss" HERE, before anything downstream branches on
+                        # outcome_this_step, so a goal is treated exactly
+                        # like any other ball-left-the-pitch event: the
+                        # reward's toucher-based fault check (ball_went_out /
+                        # sec_ball_went_out below) and the invalid-vs-miss
+                        # split (remap_phase1_outcome, no toucher -> nobody's
+                        # fault) both apply uniformly, with no separate
+                        # special-casing needed. Previously this normalization
+                        # only happened much later, inside
+                        # remap_phase1_outcome() (label only) -- the reward
+                        # calculation below read the un-normalized "goal"
+                        # directly, so a goal never triggered the ball-out
+                        # penalty even though the episode was labelled
+                        # "ball_out" downstream. See ai_trainer_knowledge.md.
+                        outcome_this_step = "miss"
                 trial_ended_this_step = True
                 break
 
@@ -454,10 +461,15 @@ class ScenarioEnv:
 
         # Ball went out and the trainee was the last player to touch it
         # (possession or kick) — only the last toucher is ever penalised.
+        # self._loop.last_completed_trial_toucher_id is correctly-ordered
+        # (updated after every match.step(), including the trial-ending
+        # tick) and safe to read here since trial_ended_this_step short-
+        # circuits this whole expression to exactly the case where
+        # ScenarioLoop.step() just called _start_trial(), which stashes it.
         ball_went_out = (
             trial_ended_this_step
             and outcome_this_step == "miss"
-            and self._last_ball_toucher_id == self.trainee_player_id
+            and self._loop.last_completed_trial_toucher_id == self.trainee_player_id
         )
 
         # Ball progress toward opponent BOX (not raw goal-line x) — counts
@@ -547,11 +559,18 @@ class ScenarioEnv:
         any_box_terminal = box_terminal or opponent_box_terminal
         done = trial_ended_this_step or timeout or any_box_terminal
 
+        # Stashed BEFORE the secondary-player loop below (which additively
+        # merges secondary components into self.last_reward_components under
+        # the same short keys) -- see _check_match_log_triggers()'s
+        # "ball_out_nonneg" trigger, which needs the TRAINEE's own "out"
+        # component in isolation, not summed with any secondary player's.
+        _trainee_out_component = self.last_reward_components.get("out", 0.0)
+
         if done:
             if self.phase == 1:
                 outcome_label = remap_phase1_outcome(
                     outcome_this_step or "",
-                    last_ball_toucher_id=self._last_ball_toucher_id,
+                    last_ball_toucher_id=self._loop.last_completed_trial_toucher_id,
                     box_terminal=box_terminal,
                     opponent_box_terminal=opponent_box_terminal,
                     timeout=timeout,
@@ -593,7 +612,7 @@ class ScenarioEnv:
             sec_ball_went_out = (
                 trial_ended_this_step
                 and outcome_this_step == "miss"
-                and self._last_ball_toucher_id == pid
+                and self._loop.last_completed_trial_toucher_id == pid
             )
             # Per-tick scan (sec_gained_count/sec_lost_count) instead of a
             # simple before/after comparison — see trainee note above.
@@ -658,19 +677,41 @@ class ScenarioEnv:
         else:
             self._match_logger.accumulate_reward(reward, self.last_reward_components)
         if self.phase == 1 and self.match_log_dir is not None:
-            self._check_match_log_triggers()
+            self._check_match_log_triggers(
+                done=done,
+                outcome_label=info.trial_outcome if done else None,
+                trainee_out_component=_trainee_out_component,
+            )
         return self._get_obs(), reward, done, info
 
     # -----------------------------------------------------------------------
     # Internal helpers
     # -----------------------------------------------------------------------
 
-    def _check_match_log_triggers(self) -> None:
+    def _check_match_log_triggers(
+        self, done: bool = False, outcome_label: Optional[str] = None,
+        trainee_out_component: float = 0.0,
+    ) -> None:
         """Save a named log file the first time each trigger condition fires."""
         triggers: dict[str, bool] = {
             "prog_negative_clamp": (
                 (clamp := self._reward_cfg["phase1"].get("ball_progress_reward_clamp")) is not None
                 and self._trainee_cumulative_state.get("prog", 0.0) <= -clamp
+            ),
+            # Diagnostic for the "ball_out episode with a non-negative
+            # trainee reward" investigation (see ai_trainer_knowledge.md) --
+            # outcome_label == "miss" is the PRE-remap-to-"invalid" raw label
+            # (i.e. classify_outcome() would report this episode as
+            # "ball_out"), but the trainee's own "out" reward component only
+            # fires when the trainee was recorded as the LAST BALL TOUCHER
+            # (see ball_went_out in this file) -- those two can disagree
+            # (e.g. the ball passes within pickup_radius_m of the opponent,
+            # silently reassigning last_completed_trial_toucher_id, right
+            # before the ball leaves the pitch). Saving the full match log
+            # whenever they disagree lets us inspect exactly what happened
+            # on the terminal tick instead of guessing from aggregate stats.
+            "ball_out_nonneg": (
+                done and outcome_label == "miss" and trainee_out_component >= 0.0
             ),
         }
         for name, fired in triggers.items():

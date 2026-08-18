@@ -44,7 +44,13 @@ def main() -> None:
     parser.add_argument("--baseline-trials", type=int, default=40,
                         help="Number of episodes for the rules-vs-rules baseline (default: 40).")
     parser.add_argument("--baseline-only", action="store_true",
-                        help="Run only the rules-vs-rules baseline (no checkpoint required).")
+                        help="Run only the rules-vs-X baseline (no checkpoint required).")
+    parser.add_argument("--baseline-opponent", type=str, default="rules", choices=["rules", "immobile"],
+                        help="Opponent AI for the baseline: 'rules' (default, prior behaviour) or "
+                             "'immobile'. Combine 'immobile' with --baseline-trials 1 and a large "
+                             "--repeats-per-seed to isolate the engine's pure residual-RNG noise "
+                             "floor for one fixed starting state (deterministic rules AI vs a "
+                             "stationary opponent, only the engine's own RNG varies across repeats).")
     parser.add_argument("--n-parallel-workers", type=int, default=None,
                         help="Subprocess workers for eval (default: ai_config.json eval.eval_n_parallel_workers). 1 = sequential.")
     parser.add_argument("--deterministic", action="store_true",
@@ -79,8 +85,8 @@ def main() -> None:
 
     # Baseline-only mode: no checkpoint needed
     if args.baseline_only:
-        log.info(f"Running rules-vs-rules baseline ({args.baseline_trials} episodes, phase={args.phase})...")
-        baseline_stats = _run_baseline_evaluation(None, args.baseline_trials, args.repeats_per_seed, args.n_parallel_workers)
+        log.info(f"Running rules-vs-{args.baseline_opponent} baseline ({args.baseline_trials} episodes, phase={args.phase})...")
+        baseline_stats = _run_baseline_evaluation(None, args.baseline_trials, args.repeats_per_seed, args.n_parallel_workers, args.baseline_opponent)
         combined = {
             "checkpoint": None,
             "checkpoint_step": 0,
@@ -122,8 +128,8 @@ def main() -> None:
     # Run rules-vs-rules baseline (unless suppressed)
     baseline_stats: dict | None = None
     if not args.no_baseline and args.phase == 1:
-        log.info(f"Running rules-vs-rules baseline ({args.baseline_trials} episodes)...")
-        baseline_stats = _run_baseline_evaluation(env, args.baseline_trials, args.repeats_per_seed, args.n_parallel_workers)
+        log.info(f"Running rules-vs-{args.baseline_opponent} baseline ({args.baseline_trials} episodes)...")
+        baseline_stats = _run_baseline_evaluation(env, args.baseline_trials, args.repeats_per_seed, args.n_parallel_workers, args.baseline_opponent)
         log.info(f"  Baseline eval done: win={baseline_stats['win_rate_pct']:.1f}%")
 
     # Combine results
@@ -257,16 +263,50 @@ def _run_evaluation(
     return d
 
 
-def _baseline_env_worker_factory() -> tuple:
-    """Module-level (picklable) worker factory for the rules-vs-rules
-    baseline -- no checkpoint/network involved, so sample_action_fn is None."""
+def _baseline_env_worker_factory(opponent: str = "rules") -> tuple:
+    """Module-level (picklable) worker factory for the rules-vs-X baseline --
+    no checkpoint/network involved, so sample_action_fn is None.
+
+    opponent: "rules" (default, prior behaviour) assigns Phase1RulesAI to
+        BOTH trainee and opponent. "immobile" assigns it to the trainee only
+        and leaves the opponent as whatever build_1v1_scenario's own
+        opponent_rules_prob/opponent_immobile_prob defaults produce (immobile
+        by default) -- i.e. a fully deterministic policy (rules AI has no
+        stochastic sampling of its own) against a stationary opponent, so
+        with a FIXED seed (pinning the initial scenario setup) and
+        repeats_per_seed > 1, the only source of variation across repeats is
+        the engine's own residual RNG (see run_seeded_evaluation's
+        docstring). Use --baseline-trials 1 --repeats-per-seed N to isolate
+        that as a pure noise-floor probe: the resulting std_reward is the
+        irreducible variance for that one fixed starting state, independent
+        of any value-network capacity/gamma choice.
+
+    IMPORTANT: build_1v1_scenario(seed=seed) funnels EVERY random draw --
+    spawn positions, attributes, AND all subsequent match-physics RNG
+    (control-time noise in match.py, kick/pass aim noise in kicking.py,
+    since match.rng is the same object threaded through the whole sim) --
+    through one seeded random.Random(seed) instance (see its own docstring:
+    "every draw below goes through the single rng instance"). So without
+    the reseed below, calling this builder twice with the SAME seed
+    produces a byte-for-byte identical replay, not an independent draw --
+    repeats_per_seed would measure exactly nothing. match.rng is reseeded
+    with fresh, non-deterministic entropy immediately after construction so
+    the INITIAL scenario stays pinned to seed (comparable across different
+    seeds/runs) while everything that happens once the match actually
+    starts genuinely varies from repeat to repeat, matching what
+    run_seeded_evaluation's docstring already claims (and what a
+    noise-floor probe needs to be true).
+    """
     from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
     from footballcoach.rules_ai import Phase1RulesAI
     from footballcoach.ai.env.scenario_env import ScenarioEnv
 
+    _pids = ("trainee", "opponent") if opponent == "rules" else ("trainee",)
+
     def _baseline_build(*args, **kwargs):
         match = build_1v1_scenario(*args, **kwargs)
-        for pid in ("trainee", "opponent"):
+        match.rng = random.Random()  # fresh entropy -- see docstring above
+        for pid in _pids:
             try:
                 match.player_by_id(pid).ai = Phase1RulesAI()
             except KeyError:
@@ -279,8 +319,8 @@ def _baseline_env_worker_factory() -> tuple:
 
         defn = ScenarioDefinition(
             key="baseline_1v1",
-            label="Baseline: rules vs rules",
-            description="Rules-based AI on both sides for win-rate baseline",
+            label=f"Baseline: rules vs {opponent}",
+            description=f"Rules-based AI vs {opponent} opponent for win-rate/noise-floor baseline",
             build=_build,
             on_tick=None,
         )
@@ -291,8 +331,10 @@ def _baseline_env_worker_factory() -> tuple:
 
 def _run_baseline_evaluation(
     env, n_trials: int, repeats_per_seed: Optional[int] = None, n_parallel_workers: Optional[int] = None,
+    opponent: str = "rules",
 ) -> dict:  # env unused, kept for API compat
-    """Run the shared seeded evaluation with rules-based AI on BOTH sides.
+    """Run the shared seeded evaluation with rules-based AI on the trainee
+    side and `opponent` ("rules" or "immobile") on the other.
 
     build_1v1_scenario assigns Phase1RulesAI to both trainee and opponent via
     player.ai; Match.step() fires them automatically.
@@ -310,15 +352,22 @@ def _run_baseline_evaluation(
     )
 
     if n_workers > 1:
+        import functools
         result = run_seeded_evaluation_parallel(
-            _baseline_env_worker_factory, seeds, repeats, n_workers=n_workers,
+            functools.partial(_baseline_env_worker_factory, opponent), seeds, repeats, n_workers=n_workers,
         )
     else:
-        env_factory, sample_action_fn = _baseline_env_worker_factory()
+        env_factory, sample_action_fn = _baseline_env_worker_factory(opponent)
         result = run_seeded_evaluation(env_factory, sample_action_fn, seeds, repeats)
 
     d = result.as_dict()
     del d["mean_value_pred"]  # no neural player in this scenario
+    # min/max/rewards/episode_lengths_s/episode_reward_components are already
+    # in as_dict() -- useful here specifically for the noise-floor probe
+    # (--baseline-trials 1 --repeats-per-seed N): std_reward alone can't tell
+    # a tight cluster from a bimodal spread with rare outliers, and the
+    # per-episode detail lets a specific outlier be explained (which episode,
+    # how long it ran, what its reward components were).
     return d
 
 

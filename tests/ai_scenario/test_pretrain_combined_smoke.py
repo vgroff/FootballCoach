@@ -179,6 +179,86 @@ def test_pretrain_value_returns_rollout_stats():
     assert isinstance(stats["outcomes_vs_neural"], list)
 
 
+def test_bc_train_value_only_freezes_policy_and_restores_after():
+    """bc.bc_train_value_only=True must (1) leave decision_net completely
+    unchanged, (2) leave execution_net's non-value-head params completely
+    unchanged, (3) actually train the value head, and (4) restore every
+    param's requires_grad to its pre-existing baseline afterward (NOT blanket
+    True -- decision_net.value_head and execution_net.kick_spin are
+    permanently frozen elsewhere and must stay that way), so a value-only BC
+    pass can never leak a frozen policy into PPO."""
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    dataset = _make_synthetic_dataset(_make_env(), n=32)
+    env = _make_env()
+    trainer = PPOTrainer.from_config()
+
+    dec_baseline_frozen = [n for n, p in trainer.decision_net.named_parameters() if not p.requires_grad]
+    exec_baseline_frozen = [n for n, p in trainer.execution_net.named_parameters() if not p.requires_grad]
+
+    trainer._bc_train_value_only = True
+    trainer._demo_value_pretrain_epochs = 2
+
+    dec_before = {n: p.clone() for n, p in trainer.decision_net.named_parameters()}
+    exec_before = {n: p.clone() for n, p in trainer.execution_net.named_parameters()}
+
+    trainer.pretrain_combined(
+        env, dataset, n_epochs=3, batch_size=8,
+        bc_lr=1e-3, value_lr=1e-2, rollout_steps=64, value_epochs=1,
+    )
+
+    dec_changed = [n for n, p in trainer.decision_net.named_parameters() if not torch.equal(p, dec_before[n])]
+    exec_changed = [n for n, p in trainer.execution_net.named_parameters() if not torch.equal(p, exec_before[n])]
+    non_value_changed = [n for n in exec_changed if "value_head" not in n and "value_ai_type_channel" not in n]
+
+    assert dec_changed == [], f"decision_net should be fully frozen, but changed: {dec_changed}"
+    assert non_value_changed == [], f"execution_net non-value params should be frozen, but changed: {non_value_changed}"
+    assert any("value_head" in n for n in exec_changed), "value_head should have trained but did not change"
+
+    frozen_after = [n for n, p in trainer.decision_net.named_parameters() if not p.requires_grad]
+    assert frozen_after == dec_baseline_frozen, (
+        f"decision_net requires_grad not restored to baseline: {frozen_after} vs {dec_baseline_frozen}"
+    )
+    frozen_exec_after = [n for n, p in trainer.execution_net.named_parameters() if not p.requires_grad]
+    assert frozen_exec_after == exec_baseline_frozen, (
+        f"execution_net requires_grad not restored to baseline: {frozen_exec_after} vs {exec_baseline_frozen}"
+    )
+
+
+def test_bc_train_value_only_with_separate_value_net_trains_only_value_net():
+    """Same guarantee as above, but for separate_value_net=True: decision_net
+    AND execution_net (the unused critic in this mode) must both stay
+    completely frozen, and only trainer.value_net should move -- confirms
+    bc_train_value_only routes to the correct critic in both regimes, not
+    just the default (non-separate) one."""
+    torch.manual_seed(0)
+    np.random.seed(0)
+
+    dataset = _make_synthetic_dataset(_make_env(), n=32)
+    env = _make_env()
+    trainer = PPOTrainer.from_config(separate_value_net=True)
+    trainer._bc_train_value_only = True
+    trainer._demo_value_pretrain_epochs = 2
+
+    dec_before = {n: p.clone() for n, p in trainer.decision_net.named_parameters()}
+    exec_before = {n: p.clone() for n, p in trainer.execution_net.named_parameters()}
+    valnet_before = {n: p.clone() for n, p in trainer.value_net.named_parameters()}
+
+    trainer.pretrain_combined(
+        env, dataset, n_epochs=3, batch_size=8,
+        bc_lr=1e-3, value_lr=1e-2, rollout_steps=64, value_epochs=1,
+    )
+
+    dec_changed = [n for n, p in trainer.decision_net.named_parameters() if not torch.equal(p, dec_before[n])]
+    exec_changed = [n for n, p in trainer.execution_net.named_parameters() if not torch.equal(p, exec_before[n])]
+    valnet_changed = [n for n, p in trainer.value_net.named_parameters() if not torch.equal(p, valnet_before[n])]
+
+    assert dec_changed == [], f"decision_net should be fully frozen: {dec_changed}"
+    assert exec_changed == [], f"execution_net (unused critic here) should be fully frozen: {exec_changed}"
+    assert len(valnet_changed) > 0, "value_net should have trained but did not change at all"
+
+
 def test_phase0_optimizer_includes_trunk_and_encoder_params():
     """Regression guard for decision #13: Phase 0 must train ALL of
     decision_net's parameters (encoders + trunk + value_head), not just the

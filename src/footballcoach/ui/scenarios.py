@@ -26,6 +26,7 @@ from typing import Callable
 
 from footballcoach.config import load_gameplay_config, load_scenarios_config
 from footballcoach.engine.ball_physics import BallPhysicsParams
+from footballcoach.engine.kicking import PassingParams, pass_speed_mps
 from footballcoach.engine.match import Match
 from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.entities import Ball, Pitch, PlayerAttributes, Team
@@ -76,6 +77,27 @@ class ScenarioChoiceParam:
     label: str
     choices: tuple[str, ...]
     default: str
+
+
+@dataclass(frozen=True)
+class ScenarioGroupedChoiceParam:
+    """A two-level dropdown-style parameter: options are organised into named
+    groups (e.g. checkpoint directories) and the UI first asks the user to
+    pick a group, then a value within that group.
+
+    ``groups`` is an ordered tuple of ``(group_label, (value, ...))`` pairs.
+    The build function receives the selected value string as a kwarg (the
+    same flat value space as ``ScenarioChoiceParam`` — grouping is purely a
+    UI convenience for browsing long option lists). ``default`` must be one
+    of the values across all groups.
+    """
+    name: str
+    label: str
+    groups: tuple[tuple[str, tuple[str, ...]], ...]
+    default: str
+
+    def flat_choices(self) -> tuple[str, ...]:
+        return tuple(v for _group, values in self.groups for v in values)
 
 
 @dataclass(frozen=True)
@@ -137,7 +159,7 @@ def load_trainer_for_ui(checkpoint_path: str):
     return _load_trainer(checkpoint_path)
 
 
-AnyScenarioParam = ScenarioParam | ScenarioChoiceParam | ScenarioBoolParam
+AnyScenarioParam = ScenarioParam | ScenarioChoiceParam | ScenarioGroupedChoiceParam | ScenarioBoolParam
 
 # Universal params appended to every scenario's params screen by the UI.
 # They are NOT forwarded to build(); app.py pops them before calling build().
@@ -396,10 +418,12 @@ def build_close_range_save_scenario(
     shooter_pos = Vector3(-(pitch.half_length - shot_dist), shooter_y, 0)
     shooter = Player.create("striker", Team.RIGHT, shooter_attrs, position=shooter_pos)
 
-    aim_half_sign = -1.0 if gk_start_y >= 0 else 1.0
-    aim_y = aim_half_sign * rng.uniform(half_goal_w * 0.3, half_goal_w - 0.3)
-    aim_z = rng.uniform(0.2, 1.8)
-    aim_point = pitch.left_goal_centre + Vector3(0, aim_y, aim_z)
+    # Live, goalkeeper-aware corner pick (see shot_selection.choose_shot_target)
+    # instead of a fixed bias-away-from-gk_start_y random point -- shooter and
+    # gk are both already positioned above, so this is effectively "at the
+    # moment of shooting" for this scenario (the shot fires on tick 1 anyway).
+    from footballcoach.shot_selection import choose_shot_target
+    aim_point = choose_shot_target(shooter, shooter_power, gk, pitch, rng)
 
     aim_dir = aim_point - shooter_pos
     aim_xy_len = math.hypot(aim_dir.x, aim_dir.y)
@@ -410,6 +434,7 @@ def build_close_range_save_scenario(
     )
     shooter.velocity = Vector3(aim_dir.x / aim_xy_len * run_speed,
                                aim_dir.y / aim_xy_len * run_speed, 0.0)
+    shooter.heading_rad = math.atan2(aim_dir.y, aim_dir.x)
 
     ball = Ball.at_rest(shooter_pos)
     ball.possessed_by = shooter.player_id
@@ -421,8 +446,10 @@ def build_close_range_save_scenario(
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
     )
     gk.current_order = SaveOrder()
+    gk.ai = StopWhenIdleAI()
     shooter.current_order = KickOrder(aim_point=aim_point, power_fraction=shooter_power,
                                       spin=Vector3.zero(), compensate_for_run=False)
+    shooter.ai = StopWhenIdleAI()
     return match
 
 
@@ -474,7 +501,29 @@ def build_pass_scenario(
         mvmt, passer.attributes.top_speed, passer.stamina,
         has_ball=True, ball_control_attr=passer.attributes.ball_control,
     )
-    passer.velocity = Vector3(top_speed * 0.5, 0.0, 0.0)
+    # Run/face toward the actual pass target (receiver_pos, post pitch-edge
+    # clamping) rather than a hardcoded +x -- previously this was always
+    # (top_speed*0.5, 0, 0) regardless of the randomised pass angle, making
+    # the passer visibly run toward the goal instead of toward the pass.
+    pass_dir = receiver_pos - passer_pos
+    pass_dir_xy_len = math.hypot(pass_dir.x, pass_dir.y)
+    # Cap the run-up speed well below the ball's own auto-computed pace
+    # (same formula PassOrder/pass_ball will use at execution time -- see
+    # pass_speed_mps) so the ball is guaranteed to pull away from the
+    # passer instead of the two travelling at near-identical speed. Without
+    # this, a short pass (low auto speed, ~2-4 m/s) barely outran a jogging
+    # top_speed*0.5 run-up, so the passer immediately re-picked up their own
+    # pass (can_pick_up_ball()'s closing/deadzone check never saw real
+    # separation) -- reproduced on 30/30 short (5-8m) trials.
+    ball_phys = BallPhysicsParams.from_config()
+    passing_params = PassingParams.from_config()
+    auto_pass_speed = pass_speed_mps(
+        passing_params, pass_dir_xy_len, ball_phys.gravity_mps2, ball_phys.rolling_friction_coefficient,
+    )
+    run_speed = min(top_speed * 0.5, auto_pass_speed * 0.5)
+    passer.velocity = Vector3(pass_dir.x / pass_dir_xy_len * run_speed,
+                              pass_dir.y / pass_dir_xy_len * run_speed, 0.0)
+    passer.heading_rad = math.atan2(pass_dir.y, pass_dir.x)
 
     ball = Ball.at_rest(passer_pos)
     ball.possessed_by = passer.player_id
@@ -486,6 +535,7 @@ def build_pass_scenario(
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
     )
     passer.current_order = PassOrder(target_position=receiver_pos)
+    passer.ai = StopWhenIdleAI()
     receiver.ai = PassReceiverAI(get_possession_radius_m=8.0)
     return match
 
@@ -501,6 +551,7 @@ from footballcoach.rules_ai import (
     StagedGoalkeeperAI,
     Phase1RulesAI,
     SprintWaypointAI,
+    StopWhenIdleAI,
 )
 
 
@@ -630,12 +681,9 @@ def build_2v2_scenario(
     gk.current_order = MoveOrder(target_position=pitch.right_goal_centre, sprint=False,
                                   max_speed_on_arrival_mps=0.0)
 
-    aim_z = rng.uniform(0.2, 1.5)
-    aim_point = pitch.right_goal_centre + Vector3(
-        0, rng.uniform(-half_goal_w * 0.6, half_goal_w * 0.6), aim_z
-    )
+    # goal_aim_point omitted -> BallCarrierAttackerAI (via BallReceiverThenShootAI)
+    # picks a live, goalkeeper-aware corner at the moment of shooting.
     attacker_b.ai = BallReceiverThenShootAI(
-        goal_aim_point=aim_point,
         shoot_immediately=rng.random() < shoot_immediately_probability,
     )
     defender.ai = Phase1RulesAI()
@@ -660,7 +708,7 @@ def build_1v2_scenario(
     defender_fraction_max: float = 0.7,
     defender_jitter_m: float = 2.0,
     gk_start_jitter_m: float = 1.0,
-    move_fraction_min: float = 0.10,
+    move_fraction_min: float = 0.25,
     move_fraction_max: float = 0.50,
 ) -> Match:
     """1v2: elite attacker vs. average defender + GK."""
@@ -715,11 +763,6 @@ def build_1v2_scenario(
         0.0,
     )
 
-    half_goal_w = pitch.goal_width_m / 2.0
-    aim_point = goal_centre + Vector3(
-        0, rng.uniform(-half_goal_w * 0.7, half_goal_w * 0.7), rng.uniform(0.2, 1.8)
-    )
-
     ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[attacker, defender, gk],
@@ -731,7 +774,23 @@ def build_1v2_scenario(
     defender.current_order = GetPossessionOrder()
     gk.current_order = MoveOrder(target_position=goal_centre, sprint=False, max_speed_on_arrival_mps=0.0)
 
-    attacker.ai = BallCarrierAttackerAI(aim_point, power_fraction=0.9)
+    # Start the attacker already at the speed/heading their MoveOrder will
+    # drive them to, rather than from a standstill -- the scenario is meant
+    # to snapshot a run already in progress, not an explosive first step.
+    run_dir = (move_target - attacker_start).xy()
+    if run_dir.length() > 1e-9:
+        run_dir = run_dir.normalized()
+        mvmt = MovementParams.from_config()
+        run_speed = effective_top_speed(
+            mvmt, attacker.attributes.top_speed, attacker.stamina, has_ball=True,
+            ball_control_attr=attacker.attributes.ball_control,
+        )
+        attacker.velocity = Vector3(run_dir.x * run_speed, run_dir.y * run_speed, 0.0)
+        attacker.heading_rad = math.atan2(run_dir.y, run_dir.x)
+
+    # aim_point omitted -> BallCarrierAttackerAI picks a live, goalkeeper-aware
+    # corner at the moment of shooting (see shot_selection.choose_shot_target).
+    attacker.ai = BallCarrierAttackerAI(power_fraction=0.9)
     defender.ai = Phase1RulesAI()
     gk.ai = StagedGoalkeeperAI()
     return match
@@ -1006,12 +1065,23 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
     # Default: most recent phase1_run checkpoint; fall back to last item if no phase1 runs exist
     ckpt_default = ckpt_labels[_phase1_count - 1] if _phase1_count > 0 else ckpt_labels[-1]
 
+    # Group labels by folder (the part before the "/") so the UI can offer a
+    # folder-first, then-checkpoint two-level dropdown instead of one huge
+    # flat list.
+    def _grouped_ckpt_labels() -> tuple[tuple[str, tuple[str, ...]], ...]:
+        groups: dict[str, list[str]] = {}
+        for label in ckpt_labels:
+            folder, _sep, _rest = label.partition("/")
+            groups.setdefault(folder, []).append(label)
+        return tuple((folder, tuple(vals)) for folder, vals in groups.items())
+    ckpt_groups = _grouped_ckpt_labels()
+
     _cfg = _phase1_scenario_cfg()
     params_list: list = [
-        ScenarioChoiceParam("trainee_checkpoint", "Trainee checkpoint", ckpt_labels, ckpt_default),
+        ScenarioGroupedChoiceParam("trainee_checkpoint", "Trainee checkpoint", ckpt_groups, ckpt_default),
         ScenarioBoolParam("trainee_rules", "Trainee: rules-based override", False),
         ScenarioBoolParam("trainee_immobile", "Trainee: immobile override", False),
-        ScenarioChoiceParam("opponent_checkpoint", "Opponent checkpoint", ckpt_labels, ckpt_default),
+        ScenarioGroupedChoiceParam("opponent_checkpoint", "Opponent checkpoint", ckpt_groups, ckpt_default),
         ScenarioBoolParam("opponent_rules", "Opponent: rules-based override", True),
         ScenarioBoolParam("opponent_immobile", "Opponent: immobile override", False),
         ScenarioChoiceParam("trainee_tier", "Trainee tier", ("generic", "amateur", "semi_pro", "premier_league"), str(_cfg.get("trainee_tier", "generic"))),
@@ -1705,7 +1775,7 @@ SCENARIOS: list[ScenarioDefinition] = [
             ScenarioParam("gk_skill", "GK skill", 0.3, 1.0, 0.05, 0.55),
             ScenarioParam("attacker_start_min_m", "Attacker start min dist (m)", 0.5, 105.0, 0.5, 18.0),
             ScenarioParam("attacker_start_max_m", "Attacker start max dist (m)", 1.0, 105.0, 0.5, 32.0),
-            ScenarioParam("move_fraction_min", "Move fraction min", 0.0, 1.0, 0.05, 0.10),
+            ScenarioParam("move_fraction_min", "Move fraction min", 0.0, 1.0, 0.05, 0.25),
             ScenarioParam("move_fraction_max", "Move fraction max", 0.0, 1.0, 0.05, 0.50),
         ],
     ),
@@ -1808,6 +1878,19 @@ class ScenarioLoop:
     _initial_scoreboard: tuple[int, int] = field(default=(0, 0), init=False, repr=False)
     _ball_released: bool = field(default=False, init=False, repr=False)
     _last_ball_toucher_id: str | None = field(default=None, init=False, repr=False)
+    # Snapshot of _last_ball_toucher_id from the trial that just ENDED,
+    # taken by _start_trial() immediately before it resets the live field
+    # above for the new trial. _last_ball_toucher_id itself is wiped by
+    # _start_trial() before step() returns True for the completed trial, so
+    # a caller (ScenarioEnv) that only looks at step()'s return value would
+    # otherwise always see None -- this is the single source of truth for
+    # "who last touched the ball in the trial that just ended". See
+    # last_completed_trial_toucher_id property below; ScenarioEnv used to
+    # maintain its OWN separate (and separately-buggy: checked pre-tick
+    # instead of post-tick) copy of this exact tracking logic specifically
+    # to work around that reset-before-return timing -- this field replaces
+    # that duplicate entirely.
+    _last_completed_trial_toucher_id: str | None = field(default=None, init=False, repr=False)
     outcomes: dict[str, int] = field(
         default_factory=dict,
         init=False, repr=False,
@@ -1816,6 +1899,14 @@ class ScenarioLoop:
     _linger_remaining_s: float = field(default=0.0, init=False, repr=False)
 
     def __post_init__(self) -> None:
+        # Pre-seed every raw outcome key at 0 so consumers (app.py's HUD
+        # tally) can safely display/iterate any key without needing to
+        # special-case ones that haven't happened yet this session. Outcomes
+        # produced via definition.outcome_remap (e.g. phase-1's "invalid"/
+        # "opponent_box_possession") are still added on the fly as before --
+        # this only guarantees the raw detect_trial_outcome() vocabulary.
+        from footballcoach.ai.env.outcome import RAW_OUTCOME_KEYS
+        self.outcomes.update({key: 0 for key in RAW_OUTCOME_KEYS})
         self._start_trial()
 
     def _start_trial(self) -> None:
@@ -1827,6 +1918,11 @@ class ScenarioLoop:
             self._match.scoreboard.right_goals,
         )
         self._ball_released = False
+        # Stash the just-ended trial's toucher BEFORE resetting the live
+        # field for the new trial -- see _last_completed_trial_toucher_id's
+        # field comment. On the very first call (from __post_init__, no
+        # trial has completed yet) this just stashes None, which is correct.
+        self._last_completed_trial_toucher_id = self._last_ball_toucher_id
         self._last_ball_toucher_id = None
         self._pending_outcome = None
         self._linger_remaining_s = 0.0
@@ -1843,6 +1939,17 @@ class ScenarioLoop:
         for _p in self._match.players:
             if getattr(_p, "kicked_this_tick", False):
                 self._last_ball_toucher_id = _p.player_id
+
+    @property
+    def last_completed_trial_toucher_id(self) -> str | None:
+        """Who last touched the ball in the trial that just ended (correctly
+        ordered: updated after every match.step(), including the final tick
+        -- see _track_ball_toucher()). Valid to read any time after step()
+        returns True for that trial, up until the NEXT trial itself ends
+        (each _start_trial() call re-stashes it). The single source of
+        truth for this -- see ScenarioEnv, which used to duplicate this
+        tracking logic with its own (buggy) copy."""
+        return self._last_completed_trial_toucher_id
 
     @property
     def match(self) -> Match:

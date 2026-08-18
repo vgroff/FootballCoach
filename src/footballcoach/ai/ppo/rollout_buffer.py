@@ -24,7 +24,7 @@ import torch
 HEAD_LP_KEYS = [
     "shoot", "pass_", "move", "tackle", "gp_extra", "mark", "hold",
     "exec_move", "sprint", "kick", "tackle_attempt",
-    "move_dir", "kick_dir",
+    "move_dir", "kick_dir", "kick_power", "kick_spin",
 ]
 
 

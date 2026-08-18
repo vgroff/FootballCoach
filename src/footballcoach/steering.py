@@ -34,6 +34,8 @@ class RepulsionParams:
     alignment_dot_threshold: float
     min_orthogonal_adjust_mps: float
     max_deflection_deg: float = 90.0
+    behind_tolerance_m: float = 1.2
+    velocity_lookahead_s: float = 0.4
 
     @staticmethod
     def from_config() -> "RepulsionParams":
@@ -47,6 +49,8 @@ class RepulsionParams:
             alignment_dot_threshold=d["alignment_dot_threshold"],
             min_orthogonal_adjust_mps=d["min_orthogonal_adjust_mps"],
             max_deflection_deg=d.get("max_deflection_deg", 90.0),
+            behind_tolerance_m=d.get("behind_tolerance_m", 1.2),
+            velocity_lookahead_s=d.get("velocity_lookahead_s", 0.4),
         )
 
 
@@ -91,8 +95,14 @@ def compute_repulsion(
     """
     has_ball = (ball_carrier_id is not None and ball_carrier_id == player.player_id)
 
-    # Distance to the move target (desired_dir is the unnormalised vector to it).
-    target_dist = (desired_dir.x * desired_dir.x + desired_dir.y * desired_dir.y) ** 0.5
+    # Normalised desired direction — used for the final blend AND for the
+    # ahead/behind gate below (desired_dir need not be pre-normalised).
+    desired_len = (desired_dir.x * desired_dir.x + desired_dir.y * desired_dir.y) ** 0.5
+    if desired_len < 1e-9:
+        # Nowhere to go — nothing to blend into, no direction to gate against.
+        return Vector3.zero(), 1.0
+    dd_x = desired_dir.x / desired_len
+    dd_y = desired_dir.y / desired_len
 
     # ── Accumulate repulsion from nearby non-ball-carrier neighbours ──────
     net_rep_x: float = 0.0
@@ -113,9 +123,20 @@ def compute_repulsion(
         if dist < 1e-9 or dist >= params.radius_m:
             continue
 
-        # If already closer to the target than to this obstacle, it is no
-        # longer in the way — ignore its repulsion entirely.
-        if target_dist < dist:
+        # Ahead/behind gate: project the obstacle's *predicted* position
+        # (current position plus a short velocity lookahead) onto the
+        # player's direction of travel. Obstacles behind the player (beyond
+        # behind_tolerance_m of slack) aren't in the way and are ignored,
+        # regardless of straight-line distance. An obstacle moving away from
+        # the path drifts further behind (more likely to be gated out); one
+        # converging into the path drifts further ahead (stays gated in)
+        # even if currently borderline.
+        predicted_x = other.position.x + other.velocity.x * params.velocity_lookahead_s
+        predicted_y = other.position.y + other.velocity.y * params.velocity_lookahead_s
+        ox = predicted_x - player.position.x
+        oy = predicted_y - player.position.y
+        along = ox * dd_x + oy * dd_y
+        if along < -params.behind_tolerance_m:
             continue
 
         # Repulsion: away from other, linear falloff.
@@ -142,12 +163,6 @@ def compute_repulsion(
             net_rep_len * params.speed_penalty_scale,
         )
         speed_multiplier = 1.0 - speed_penalty
-
-    # ── Early-out: no desired direction ───────────────────────────────────
-    desired_len = (desired_dir.x * desired_dir.x + desired_dir.y * desired_dir.y) ** 0.5
-    if desired_len < 1e-9:
-        # Nowhere to go — just return zero, no direction to blend into.
-        return Vector3.zero(), speed_multiplier
 
     # ── Orthogonal nudge when heading nearly straight into nearest obstacle
     ortho_x: float = 0.0
@@ -183,9 +198,6 @@ def compute_repulsion(
                     ortho_y = perp_y * params.min_orthogonal_adjust_mps
 
     # ── Blend: final_dir = normalise(desired_dir_norm + net_rep + ortho) ─
-    dd_x = desired_dir.x / desired_len
-    dd_y = desired_dir.y / desired_len
-
     final_x = dd_x + net_rep_x + ortho_x
     final_y = dd_y + net_rep_y + ortho_y
     final_len = (final_x * final_x + final_y * final_y) ** 0.5

@@ -263,6 +263,39 @@ New `App` state between `MENU` and `MATCH` for parameterized scenarios:
   MENU.
 - `Esc` also returns to MENU from this screen.
 
+### Choice-param dropdowns (`ScenarioChoiceParam` / `ScenarioGroupedChoiceParam`)
+
+Both live in `scenarios.py` alongside `ScenarioParam`/`ScenarioBoolParam` (see
+`AnyScenarioParam`). Both render as a `value ▼` box + `[>]` cycle button and
+open a dropdown list below the row when clicked; `renderer.draw_scenario_params`
+now returns `(button_rects, clamped_dropdown_scroll)` rather than just
+`button_rects` so state can persist the clamp.
+
+- **`ScenarioChoiceParam`** — flat list of string options (e.g. the tier
+  dropdowns). Dropdown option rects: `f"{name}__option__{value}"`.
+- **`ScenarioGroupedChoiceParam`** — options pre-partitioned into
+  `groups: tuple[(group_label, (value, ...))]`; the build function still
+  receives a single flat value string (grouping is UI-only). Used for the
+  Phase 1 scenario's `trainee_checkpoint`/`opponent_checkpoint` pickers,
+  grouped by checkpoint directory (`phase1_runN` / `longterm`), since a flat
+  list across every run quickly exceeds what fits on screen. Clicking the
+  value box opens the **group list** first (`f"{name}__folder__{group}"`
+  rects); clicking a group opens that group's **value list** below a
+  `f"{name}__grpback__"` back row (`f"{name}__option__{value}"` rects, same
+  key format as the flat variant so `App._handle_params_click`'s selection
+  branch is shared). `[>]` still cycles the fully-flattened option space
+  (`param.flat_choices()`) without opening the dropdown.
+- Both dropdown kinds are **scrollable**: at most 10 items render at once
+  (`MAX_VISIBLE_ITEMS` / `ITEM_H` in `renderer.draw_scenario_params`), with a
+  thumb-style scrollbar drawn when the list is truncated. `ScenarioParamsUIState.dropdown_scroll`
+  (`app.py`) holds the offset, advanced by `pygame.MOUSEWHEEL` while a
+  dropdown is open and reset to 0 whenever a dropdown opens or the expanded
+  group changes; `renderer` re-clamps it every frame against the
+  currently-visible list's length (list length can shrink when switching from
+  a folder list to a shorter value list).
+- `ScenarioParamsUIState.open_choice_folder` tracks which group is expanded
+  for a `ScenarioGroupedChoiceParam` (`None` = showing the group list).
+
 ## Balance scenario looping (`ScenarioLoop` in `scenarios.py`)
 
 `ScenarioLoop` wraps a `ScenarioDefinition` and replays it indefinitely

@@ -376,23 +376,60 @@ def main() -> None:
 
     if not args.checkpoint and not args.from_pretrained:
         from footballcoach.ai.bc.dataset import DemonstrationDataset
-        dataset = None
-        if args.bc_dataset:
-            dataset = DemonstrationDataset.from_directory(args.bc_dataset)
-            log.info(f"Offline BC dataset: {len(dataset):,} steps from {args.bc_dataset}")
 
+        # Computed before deciding whether to load the dataset file (below)
+        # so the decision reflects any bc_pretrain_epochs_from_ckpt /
+        # demo_value_pretrain_epochs_from_ckpt swap already applied to
+        # bc_cfg in-place above (--pretrain-from-checkpoint / --latest-pretrain).
         bc_pretrain_epochs = (
             args.bc_pretrain_epochs
             if args.bc_pretrain_epochs is not None
             else int(bc_cfg.get("bc_pretrain_epochs", 30))
         )
+        _demo_epochs_eff = int(bc_cfg.get("demo_value_pretrain_epochs", 0))
+
+        # Loading .npz demonstration files (DemonstrationDataset.from_directory)
+        # can take ~1 minute on a large dataset directory. If both BC-epoch
+        # counts that would actually consume it are 0 (after any _from_ckpt
+        # override), the dataset would never be touched -- skip loading it
+        # entirely and run value-only pre-training instead (identical to what
+        # pretrain_combined()'s Phase 2/3 would do -- see below).
+        dataset = None
+        _skip_dataset_load = bool(args.bc_dataset) and bc_pretrain_epochs == 0 and _demo_epochs_eff == 0
+        if args.bc_dataset and not _skip_dataset_load:
+            dataset = DemonstrationDataset.from_directory(args.bc_dataset)
+            log.info(f"Offline BC dataset: {len(dataset):,} steps from {args.bc_dataset}")
+        elif _skip_dataset_load:
+            log.info(
+                f"Skipping BC dataset load ({args.bc_dataset}): bc_pretrain_epochs=0 and "
+                f"demo_value_pretrain_epochs=0 (after any _from_ckpt override), so the dataset "
+                f"would never be used -- running value-only pre-training instead."
+            )
+
         bc_pretrain_batch_size = (
             args.bc_pretrain_batch_size
             if args.bc_pretrain_batch_size is not None
             else int(bc_cfg.get("bc_pretrain_batch_size", 256))
         )
 
-        if dataset is not None and label_fn is not None:
+        if _skip_dataset_load:
+            # Value-only pre-training: exactly what pretrain_combined()'s
+            # Phase 2/3 would do (it's a thin wrapper over this same
+            # pretrain_value() call, see ppo_trainer.py) -- reusing
+            # combined_pretrain_rollout_steps for n_steps so the rollout size
+            # matches what Phase 2/3 would have used, without needing the BC
+            # dataset loaded (Phase 0/1 are skipped entirely since their
+            # epoch counts are 0, per _skip_dataset_load's condition above).
+            trainer.pretrain_value(
+                env,
+                n_steps=combined_pretrain_rollout_steps,
+                n_epochs=max(1, value_pretrain_epochs),
+                lr=value_pretrain_lr,
+                batch_size=bc_pretrain_batch_size,
+                experiment_separate_value_net=args.experiment_separate_value_net,
+                phase_id=args.phase,
+            )
+        elif dataset is not None and label_fn is not None:
             # Diagnostic: run 40 rules-vs-rules episodes before any training to show
             # the baseline reward component breakdown. Helps calibrate reward shaping.
             _diag_n = 40

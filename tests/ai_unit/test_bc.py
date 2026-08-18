@@ -330,6 +330,144 @@ class TestBCLossFromTensor:
         assert breakdown["kick_spin"] == pytest.approx(0.0)
 
 
+class TestBCLossFromTensorSplitKick:
+    """split_kick=True: kick_group_loss + other_group_loss must reconstruct
+    the combined `total`, and only kick_group_loss should react to kick-only
+    prediction errors (gradient isolation between the two groups)."""
+
+    def test_split_sums_to_total_all_valid(self):
+        n = 4
+        labels = _make_labels([
+            BCLabel(shoot=1.0, kick_this_tick=1.0, kick_power_fraction=0.8, valid=True)
+            for _ in range(n)
+        ])
+        d_heads, e_heads = _zeros_heads(n)
+        total, breakdown, split = bc_loss_from_tensor(
+            labels, d_heads, e_heads, return_breakdown=True, split_kick=True,
+        )
+        recombined = split["kick_group_loss"] + split["other_group_loss"]
+        assert recombined.item() == pytest.approx(total.item(), abs=1e-5)
+
+    def test_kick_only_error_isolated_to_kick_group(self):
+        """A kick_power prediction error should move kick_group_loss but
+        leave other_group_loss untouched (row has no other label deviation)."""
+        n = 1
+        labels = _make_labels([BCLabel(kick_this_tick=1.0, kick_power_fraction=0.8, valid=True)])
+        d_heads, e_heads = _zeros_heads(n)
+        _, _, split_baseline = bc_loss_from_tensor(
+            labels, d_heads, e_heads, return_breakdown=True, split_kick=True,
+        )
+        e_heads.kick_power = torch.tensor([[-5.0]])  # sigmoid(-5)=0.007, far from target 0.8
+        _, _, split_shifted = bc_loss_from_tensor(
+            labels, d_heads, e_heads, return_breakdown=True, split_kick=True,
+        )
+        assert split_shifted["kick_group_loss"].item() > split_baseline["kick_group_loss"].item()
+        assert split_shifted["other_group_loss"].item() == pytest.approx(
+            split_baseline["other_group_loss"].item(), abs=1e-5
+        )
+
+    def test_split_kick_gradient_flows_only_to_kick_heads(self):
+        """kick_group_loss.backward() must produce a nonzero gradient on
+        kick_power but leave shoot_logit's gradient at None/zero -- proving
+        the split tensors are still attached to autograd (unlike
+        return_breakdown's detached floats)."""
+        n = 1
+        labels = _make_labels([BCLabel(shoot=1.0, kick_this_tick=1.0, kick_power_fraction=0.8, valid=True)])
+        d_heads, e_heads = _zeros_heads(n)
+        d_heads.shoot_logit.requires_grad_(True)
+        e_heads.kick_power.requires_grad_(True)
+        _, _, split = bc_loss_from_tensor(
+            labels, d_heads, e_heads, return_breakdown=True, split_kick=True,
+        )
+        split["kick_group_loss"].backward()
+        assert e_heads.kick_power.grad is not None
+        assert e_heads.kick_power.grad.abs().item() > 0.0
+        assert d_heads.shoot_logit.grad is None or d_heads.shoot_logit.grad.abs().item() == 0.0
+
+    def test_split_kick_backward_compatible_without_return_breakdown(self):
+        n = 2
+        labels = _make_labels([BCLabel(kick_this_tick=1.0, valid=True) for _ in range(n)])
+        d_heads, e_heads = _zeros_heads(n)
+        total, split = bc_loss_from_tensor(labels, d_heads, e_heads, split_kick=True)
+        assert set(split.keys()) == {"kick_group_loss", "other_group_loss"}
+        assert isinstance(total, torch.Tensor)
+
+
+class TestBCLossFromTensorSplitTackle:
+    """split_tackle=True: tackle_group_loss + other_group_loss must
+    reconstruct `total`, and only tackle_group_loss should react to
+    tackle_attempt-only prediction errors (gradient isolation)."""
+
+    def test_split_sums_to_total_all_valid(self):
+        n = 4
+        labels = _make_labels([
+            BCLabel(shoot=1.0, tackle_attempt=1.0, valid=True) for _ in range(n)
+        ])
+        d_heads, e_heads = _zeros_heads(n)
+        total, breakdown, split = bc_loss_from_tensor(
+            labels, d_heads, e_heads, return_breakdown=True, split_tackle=True,
+        )
+        recombined = split["tackle_group_loss"] + split["other_group_loss"]
+        assert recombined.item() == pytest.approx(total.item(), abs=1e-5)
+
+    def test_tackle_only_error_isolated_to_tackle_group(self):
+        n = 1
+        labels = _make_labels([BCLabel(tackle_attempt=1.0, valid=True)])
+        d_heads, e_heads = _zeros_heads(n)
+        _, _, split_baseline = bc_loss_from_tensor(
+            labels, d_heads, e_heads, return_breakdown=True, split_tackle=True,
+        )
+        e_heads.tackle_attempt_logit = torch.tensor([[-5.0]])  # sigmoid(-5) far from target 1.0
+        _, _, split_shifted = bc_loss_from_tensor(
+            labels, d_heads, e_heads, return_breakdown=True, split_tackle=True,
+        )
+        assert split_shifted["tackle_group_loss"].item() > split_baseline["tackle_group_loss"].item()
+        assert split_shifted["other_group_loss"].item() == pytest.approx(
+            split_baseline["other_group_loss"].item(), abs=1e-5
+        )
+
+    def test_split_tackle_gradient_flows_only_to_tackle_head(self):
+        n = 1
+        labels = _make_labels([BCLabel(shoot=1.0, tackle_attempt=1.0, valid=True)])
+        d_heads, e_heads = _zeros_heads(n)
+        d_heads.shoot_logit.requires_grad_(True)
+        e_heads.tackle_attempt_logit.requires_grad_(True)
+        _, _, split = bc_loss_from_tensor(
+            labels, d_heads, e_heads, return_breakdown=True, split_tackle=True,
+        )
+        split["tackle_group_loss"].backward()
+        assert e_heads.tackle_attempt_logit.grad is not None
+        assert e_heads.tackle_attempt_logit.grad.abs().item() > 0.0
+        assert d_heads.shoot_logit.grad is None or d_heads.shoot_logit.grad.abs().item() == 0.0
+
+    def test_split_tackle_backward_compatible_without_return_breakdown(self):
+        n = 2
+        labels = _make_labels([BCLabel(tackle_attempt=1.0, valid=True) for _ in range(n)])
+        d_heads, e_heads = _zeros_heads(n)
+        total, split = bc_loss_from_tensor(labels, d_heads, e_heads, split_tackle=True)
+        assert set(split.keys()) == {"tackle_group_loss", "other_group_loss"}
+        assert isinstance(total, torch.Tensor)
+
+    def test_split_kick_and_split_tackle_together(self):
+        """When both flags are set, kick_group_loss + tackle_group_loss +
+        other_group_loss must reconstruct total, and other_group_loss must
+        exclude BOTH groups (regression check for the shared other_group_per_row
+        subtraction in bc_loss_from_tensor)."""
+        n = 1
+        labels = _make_labels([BCLabel(
+            shoot=1.0, kick_this_tick=1.0, kick_power_fraction=0.8,
+            tackle_attempt=1.0, valid=True,
+        )])
+        d_heads, e_heads = _zeros_heads(n)
+        total, breakdown, split = bc_loss_from_tensor(
+            labels, d_heads, e_heads, return_breakdown=True,
+            split_kick=True, split_tackle=True,
+        )
+        assert set(split.keys()) == {"kick_group_loss", "tackle_group_loss", "other_group_loss"}
+        recombined = split["kick_group_loss"] + split["tackle_group_loss"] + split["other_group_loss"]
+        assert recombined.item() == pytest.approx(total.item(), abs=1e-5)
+
+
 class TestBCLossFromTensorDecisionOnly:
     """exec_heads=None (W7 Phase 0 path): loss must equal the decision-only
     subset of the full-signature call, with all exec-dependent terms

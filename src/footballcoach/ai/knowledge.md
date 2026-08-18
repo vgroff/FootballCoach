@@ -146,6 +146,37 @@ issued via an explicit order. Indices 0–11 come from asking the rules AI
 what it *decides* next — these are input to the decision network and
 movement-related execution heads.
 
+### BC loss floor-adjusted breakdown logging
+
+`compute_bc_loss_floor()` (analytic minimum achievable BC loss under label
+smoothing — see its docstring for the `H(y') = -y'ln(y')-(1-y')ln(1-y')`
+derivation) is now a thin wrapper over `compute_bc_loss_floor_components()`,
+which returns the same per-head floors broken out by component (`decision`,
+`exec_bce`, `sprint`, `move`, `tackle_attempt`, `kick`; `direction`/`region`/
+`kick_direction`/`kick_power`/`kick_spin` are always `0.0` — true floor,
+not BCE-smoothed). The floor for a smoothed Bernoulli head depends only on
+its smoothing constant (and mildly on `pos_weight`), never on label
+balance, since `H(y')` is symmetric in the hard label — so per-component
+floors are cheap and dataset-independent to compute.
+
+`PPOTrainer`'s per-epoch `breakdown (floor-adj) decision=... exec_bce=...`
+log line (both the main Phase 1 BC loop and the BC repair loop in
+`pretrain_combined()`) now subtracts each component's own floor before
+printing (clamped at 0 for float noise near convergence). This matters
+because `exec_bce` sums 4 smoothed Bernoulli heads while `direction` is an
+always-floor-0 cosine loss — comparing their *raw* magnitudes overstates
+how much worse exec-head imitation is relative to direction/decision. E.g.
+with `dec_label_smoothing=0.01`/`exec_label_smoothing=0.02`, `decision`'s 7
+heads and `exec_bce`'s 4 heads each carry floors of ≈0.22 nats — a raw
+`decision≈0.23` is therefore almost entirely floor (adjusted residual
+≈0.01, i.e. decision heads are close to perfectly imitated), while raw
+`exec_bce≈0.35`-`0.36` still has a real, non-floor residual of ≈0.13-0.14
+after adjustment — the actual dominant BC gap, not an artifact of summing
+more smoothed heads. Un-adjusted component numbers should not be compared
+to each other directly; use the floor-adjusted log line, or call
+`compute_bc_loss_floor_components()` directly against a raw breakdown dict
+from `bc_loss_from_tensor(..., return_breakdown=True)`.
+
 ### BC class balancing (pos_weight + trivial-row downsampling)
 
 `DemonstrationDataset.compute_pos_weights()` computes inverse-frequency

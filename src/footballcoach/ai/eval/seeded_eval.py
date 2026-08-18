@@ -52,6 +52,17 @@ class SeededEvalResult:
     mean_value_pred: float = float("nan")
     rewards: list = field(default_factory=list)
     outcomes_list: list = field(default_factory=list)
+    # Per-episode wall-clock duration (seconds), same index order as
+    # rewards/outcomes_list -- info.ticks_elapsed * env._dt_s, matching
+    # ppo_trainer.py's episode_durations_s ("ep_len" log line) computation.
+    episode_lengths_s: list = field(default_factory=list)
+    # Per-episode reward-component breakdown (one dict per episode, same
+    # index order as rewards/outcomes_list/episode_lengths_s) -- unlike
+    # reward_component_sums below (pooled across ALL episodes), this lets a
+    # caller inspect e.g. "what made up the total reward for episode i"
+    # (see evaluate.py's noise-floor probe: explaining why a specific
+    # outlier episode's reward came out the way it did).
+    episode_reward_components: list = field(default_factory=list)
     value_preds: list = field(default_factory=list)
     # Per-step (V, discounted-return-to-episode-end) pairs, pooled across all
     # episodes -- V-vs-R diagnostic (see mean_step_v/mean_step_r below).
@@ -89,12 +100,21 @@ class SeededEvalResult:
             "mean_reward": self.mean_reward,
             "std_reward": self.std_reward,
             "sem_reward": self.sem_reward,
+            "min_reward": float(min(self.rewards)) if self.rewards else float("nan"),
+            "max_reward": float(max(self.rewards)) if self.rewards else float("nan"),
             "outcomes": self.outcomes,
             "outcome_breakdown": self.outcome_breakdown,
             "mean_value_pred": self.mean_value_pred,
             "mean_step_v": self.mean_step_v,
             "mean_step_r": self.mean_step_r,
             "reward_components": self.reward_components,
+            # Per-episode detail, all in the same index order -- lets a
+            # caller correlate "this episode's reward/outcome/duration/
+            # component breakdown" rather than only seeing pooled aggregates.
+            "rewards": self.rewards,
+            "outcomes_list": self.outcomes_list,
+            "episode_lengths_s": self.episode_lengths_s,
+            "episode_reward_components": self.episode_reward_components,
         }
 
 
@@ -130,6 +150,8 @@ def run_seeded_evaluation(
     rewards: list[float] = []
     outcomes: dict[str, int] = {}
     outcomes_list: list[str] = []
+    episode_lengths_s: list[float] = []
+    episode_reward_components: list[dict] = []
     value_preds: list[float] = []
     step_v: list[float] = []
     step_r: list[float] = []
@@ -147,6 +169,7 @@ def run_seeded_evaluation(
             ep_reward = 0.0
             ep_step_v: list[float] = []
             ep_step_rew: list[float] = []
+            ep_component_sums: dict[str, float] = {}
             while not done:
                 _, reward, done, info = env.step()
                 ep_reward += reward
@@ -156,6 +179,7 @@ def run_seeded_evaluation(
                     # non-JSON-serializable downstream in evaluate.py.
                     _v = float(_v.item()) if hasattr(_v, "item") else float(_v)
                     reward_component_sums[_k] = reward_component_sums.get(_k, 0.0) + _v
+                    ep_component_sums[_k] = ep_component_sums.get(_k, 0.0) + _v
                 tr = getattr(env, "last_trainee_transition", None)
                 if tr is not None and "value" in tr:
                     _v = tr["value"]
@@ -174,6 +198,12 @@ def run_seeded_evaluation(
             outcome = info.trial_outcome if info else "unknown"
             outcomes[outcome] = outcomes.get(outcome, 0) + 1
             outcomes_list.append(outcome)
+            # Matches ppo_trainer.py's episode_durations_s ("ep_len" log line)
+            # computation exactly: ticks_elapsed * the env's own physics dt.
+            episode_lengths_s.append(
+                float(info.ticks_elapsed) * env._dt_s if info is not None else float("nan")
+            )
+            episode_reward_components.append(ep_component_sums)
             n += 1
             if trial_log_every and n % trial_log_every == 0:
                 log.info(f"  [seeded eval] trial {n}/{total}: seed={seed} "
@@ -192,6 +222,8 @@ def run_seeded_evaluation(
         mean_value_pred=float(np.mean(value_preds)) if value_preds else float("nan"),
         rewards=rewards,
         outcomes_list=outcomes_list,
+        episode_lengths_s=episode_lengths_s,
+        episode_reward_components=episode_reward_components,
         value_preds=value_preds,
         step_v=step_v,
         step_r=step_r,
@@ -204,6 +236,8 @@ def _merge_eval_results(results: list[SeededEvalResult], repeats_per_seed: int) 
 
     rewards: list[float] = []
     outcomes_list: list[str] = []
+    episode_lengths_s: list[float] = []
+    episode_reward_components: list[dict] = []
     value_preds: list[float] = []
     seeds: list[int] = []
     outcomes: dict[str, int] = {}
@@ -213,6 +247,8 @@ def _merge_eval_results(results: list[SeededEvalResult], repeats_per_seed: int) 
     for r in results:
         rewards.extend(r.rewards)
         outcomes_list.extend(r.outcomes_list)
+        episode_lengths_s.extend(r.episode_lengths_s)
+        episode_reward_components.extend(r.episode_reward_components)
         value_preds.extend(r.value_preds)
         seeds.extend(r.seeds)
         step_v.extend(r.step_v)
@@ -235,6 +271,8 @@ def _merge_eval_results(results: list[SeededEvalResult], repeats_per_seed: int) 
         mean_value_pred=float(np.mean(value_preds)) if value_preds else float("nan"),
         rewards=rewards,
         outcomes_list=outcomes_list,
+        episode_lengths_s=episode_lengths_s,
+        episode_reward_components=episode_reward_components,
         value_preds=value_preds,
         step_v=step_v,
         step_r=step_r,

@@ -18,14 +18,23 @@
 
   "repulsion": {
     "_comment": "Player-repulsion steering — used ONLY in steering.py / MoveOrder handling. NOT engine physics. radius_m: distance at which repulsion begins. strength_base: peak directional weight at d=0 (m/s-equivalent, blended into heading not force). ball_carrier_repulsion_mult: extra boost when the moving player has the ball. ball_carrier_speed_penalty_max: max fractional speed penalty for ball carriers (0.45 = 45% reduction). speed_penalty_scale: converts |net_repulsion| to speed penalty fraction. alignment_dot_threshold: trigger orthogonal nudge when rel_vel . net_repulsion < this (i.e. heading nearly straight into obstacle). min_orthogonal_adjust_mps: sideways nudge magnitude (primary tuning knob). max_deflection_deg: hard cap on total direction deflection from repulsion.",
-    "radius_m": 8.0,
-    "strength_base": 0.3,
-    "ball_carrier_repulsion_mult": 2.6,
-    "ball_carrier_speed_penalty_max": 0.45,
-    "speed_penalty_scale": 0.12,
-    "alignment_dot_threshold": -0.7,
-    "min_orthogonal_adjust_mps": 0.75,
-    "max_deflection_deg": 80.0
+    "_comment_gate": "Ahead/behind gate: an obstacle is ignored as 'not in the way' if its position (predicted velocity_lookahead_s seconds ahead) projects behind the player along their direction of travel, beyond behind_tolerance_m of slack. behind_tolerance_m: how far behind the player an obstacle can be before it's ignored regardless of straight-line distance. velocity_lookahead_s: how far ahead (seconds) to predict the obstacle's position using its current velocity before running the ahead/behind test -- an obstacle moving away from the player's path drifts further behind (more likely gated out); one converging into the path drifts further ahead (stays gated in) even if currently borderline. 0.0 = ignore velocity, use current position only.",
+    "radius_m": 9.0,
+    "strength_base": 0.5,
+    "ball_carrier_repulsion_mult": 3.0,
+    "ball_carrier_speed_penalty_max": 0.6,
+    "speed_penalty_scale": 0.15,
+    "alignment_dot_threshold": -0.75,
+    "min_orthogonal_adjust_mps": 2.0,
+    "max_deflection_deg": 80.0,
+    "behind_tolerance_m": 1.2,
+    "velocity_lookahead_s": 0.4
+  },
+
+  "shot_selection": {
+    "_comment": "Smart shot placement — used ONLY by shot_selection.py (an AI-layer decision, not engine physics). corner_tolerance_m: inset from each post (aim point y = ±(goal_width/2 - this)) so shots don't literally target the frame edge. height_tolerance_frac: random shot height is drawn uniformly from [0, this * goal_height_m] -- same height used for both corner candidates so the corner choice isn't confounded by height. The corner itself is NOT random: chosen by comparing ball flight time (real ballistic solve) against the goalkeeper's accel-aware ETA (same sprint_eta model orders.py's GK sprint-vs-jog decision uses), evaluated at the goalkeeping.py interception plane (goal_frame_margin_m in front of the true goal line) so this matches what a real save attempt does.",
+    "corner_tolerance_m": 1.0,
+    "height_tolerance_frac": 0.85
   },
 
   "marking": {

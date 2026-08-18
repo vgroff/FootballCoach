@@ -5,6 +5,7 @@ These run headlessly (no pygame) at rng_reduction=1.0 (deterministic).
 """
 from __future__ import annotations
 
+import math
 import random
 
 from footballcoach.engine.match import Match
@@ -154,9 +155,13 @@ class TestStagedGoalkeeperAI:
 
     def test_issues_move_order_to_goal_centre_when_move_completes_and_ball_not_threatening(self):
         """Once the GK's MoveOrder completes and the ball is not threatening,
-        AI re-issues a goal-centre MoveOrder rather than SaveOrder."""
+        AI re-issues a goal-centre MoveOrder rather than SaveOrder -- as long
+        as it isn't already parked there (see the parked/heading test below
+        for that case)."""
         pitch = Pitch.standard()
-        gk = make_player("gk", Team.LEFT, position=pitch.left_goal_centre, is_goalkeeper=True)
+        gk = make_player("gk", Team.LEFT,
+                          position=pitch.left_goal_centre + Vector3(0.0, 5.0, 0.0),
+                          is_goalkeeper=True)
         ball = Ball.at_rest(Vector3(0.0, 0.0, 0.0))
         match = Match(pitch=pitch, players=[gk], ball=ball,
                       rng_reduction=1.0, rng=random.Random(0))
@@ -167,6 +172,40 @@ class TestStagedGoalkeeperAI:
         assert isinstance(gk.current_order, MoveOrder), (
             "AI should jog back to goal centre when the ball is not aimed at goal"
         )
+
+    def test_faces_outfield_when_parked_at_goal_centre(self):
+        """Once stationary at goal centre with no active order, the GK faces
+        outfield (away from its own goal) rather than keeping whatever
+        heading it last had -- covers both the 'ball loose, not threatening'
+        and 'ball possessed by someone else' cases."""
+        pitch = Pitch.standard()
+        ai = StagedGoalkeeperAI()
+
+        # Team.LEFT defends the left goal -> outfield heading is 0.0 (+x).
+        gk = make_player("gk", Team.LEFT, position=pitch.left_goal_centre, is_goalkeeper=True)
+        gk.heading_rad = 3.14  # wrong heading, as if left over from an earlier dive
+        ball = Ball.at_rest(Vector3(0.0, 0.0, 0.0))
+        match = Match(pitch=pitch, players=[gk], ball=ball,
+                      rng_reduction=1.0, rng=random.Random(0))
+        gk.current_order = None
+        ai.act(gk, match, 0)
+        assert gk.current_order is None
+        assert gk.heading_rad == 0.0
+
+        # Same, but the ball is possessed by someone else (the common case
+        # during an attacker's build-up run) -- must also fix heading here,
+        # not just in the "ball loose" branch.
+        gk2 = make_player("gk2", Team.RIGHT, position=pitch.right_goal_centre, is_goalkeeper=True)
+        gk2.heading_rad = 0.0  # wrong heading for a RIGHT-defending GK (faces own net)
+        other = make_player("attacker", Team.LEFT, position=Vector3(0.0, 0.0, 0.0))
+        ball2 = Ball.at_rest(other.position)
+        ball2.possessed_by = other.player_id
+        match2 = Match(pitch=pitch, players=[gk2, other], ball=ball2,
+                       rng_reduction=1.0, rng=random.Random(0))
+        gk2.current_order = None
+        ai.act(gk2, match2, 0)
+        assert gk2.current_order is None
+        assert gk2.heading_rad == math.pi
 
     def test_does_not_override_save_order(self):
         """AI does not replace an existing SaveOrder with another SaveOrder."""

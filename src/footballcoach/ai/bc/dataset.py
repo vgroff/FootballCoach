@@ -460,9 +460,19 @@ class DemonstrationDataset:
     # buggy version of this method did via opponent_ai_type) silently threw
     # away every rules-AI demonstration row from rules-vs-immobile episodes,
     # not just the immobile player's own (correctly excluded) rows.
+    #
+    # self_not_immobile uses "not close to AI_TYPE_IMMOBILE's code" rather
+    # than "< AI_TYPE_IMMOBILE - 0.5" -- the latter happens to work for
+    # AI_TYPE_RULES=0.0 (below the threshold, kept) but silently also
+    # excludes AI_TYPE_NEURAL=2.0 (above IMMOBILE's code, so still >=
+    # threshold), even though a neural self is exactly as valid a value-
+    # fitting example as a rules self. Only surfaced once something actually
+    # produced AI_TYPE_NEURAL self rows (debug_value_network.py's
+    # --checkpoint on-policy rollout mode) -- see AI_TYPE_NEURAL's "reserved,
+    # unused" docstring note in ai/ppo/bc.py, now used.
     def valid_indices(self) -> np.ndarray:
         valid = self._labels[:, _I_VALID] > 0.5
-        self_not_immobile = self._labels[:, _I_AI_TYPE] < (AI_TYPE_IMMOBILE - 0.5)
+        self_not_immobile = np.abs(self._labels[:, _I_AI_TYPE] - AI_TYPE_IMMOBILE) > 0.5
         return np.where(valid & self_not_immobile)[0]
 
     def split_train_val_indices(

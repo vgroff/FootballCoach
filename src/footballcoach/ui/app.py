@@ -17,7 +17,7 @@ from footballcoach.ui.camera import Camera
 from footballcoach.ui.gamelog import GameLog, LogLevel
 from footballcoach.ui.input import MatchInputController, OrderMode
 from footballcoach.ui.renderer import Renderer
-from footballcoach.ui.scenarios import ScenarioBoolParam, ScenarioChoiceParam, ScenarioParam
+from footballcoach.ui.scenarios import ScenarioBoolParam, ScenarioChoiceParam, ScenarioGroupedChoiceParam, ScenarioParam
 
 
 class Screen(Enum):
@@ -61,13 +61,17 @@ class ScenarioParamsUIState:
     definition: scenarios.ScenarioDefinition | None = None
     values: dict[str, float] = field(default_factory=dict)
     button_rects: dict[str, tuple[pygame.Rect, pygame.Rect]] = field(default_factory=dict)
-    open_choice_param: str | None = None  # which ScenarioChoiceParam dropdown is open
+    open_choice_param: str | None = None  # which ScenarioChoiceParam/ScenarioGroupedChoiceParam dropdown is open
+    open_choice_folder: str | None = None  # for a ScenarioGroupedChoiceParam: which group is expanded (None = folder list)
+    dropdown_scroll: int = 0  # scroll offset (in items) of whichever list is currently showing
 
     def reset_for(self, definition: scenarios.ScenarioDefinition) -> None:
         self.definition = definition
         all_params = list(definition.params) + scenarios.UNIVERSAL_PARAMS
         self.values = {p.name: p.default for p in all_params}
         self.open_choice_param = None
+        self.open_choice_folder = None
+        self.dropdown_scroll = 0
 
     def clear(self) -> None:
         self.definition = None
@@ -186,6 +190,11 @@ class App:
                 self._handle_menu_click(event.pos)
             elif self.screen == Screen.SCENARIO_PARAMS and event.type == pygame.MOUSEBUTTONDOWN:
                 self._handle_params_click(event.pos)
+            elif self.screen == Screen.SCENARIO_PARAMS and event.type == pygame.MOUSEWHEEL:
+                if self._scenario_params_ui.open_choice_param is not None:
+                    self._scenario_params_ui.dropdown_scroll = max(
+                        0, self._scenario_params_ui.dropdown_scroll - event.y
+                    )
             elif self.screen == Screen.MATCH and event.type == pygame.MOUSEBUTTONDOWN and self.help_button_rect.collidepoint(event.pos):
                 self.show_help = not self.show_help
             elif self.screen == Screen.MATCH and not self.show_help:
@@ -218,6 +227,23 @@ class App:
             else:
                 self.log_min_level = LogLevel.INFO
             return
+        if self.screen == Screen.SCENARIO_PARAMS and self._scenario_params_ui.open_choice_param is not None:
+            # Keyboard scroll for the open dropdown — a reliable fallback
+            # alongside the mouse wheel and the click-to-page chevrons, since
+            # wheel-event delivery is flaky on some platforms/window managers.
+            ui = self._scenario_params_ui
+            if key == pygame.K_UP:
+                ui.dropdown_scroll = max(0, ui.dropdown_scroll - 1)
+                return
+            if key == pygame.K_DOWN:
+                ui.dropdown_scroll = ui.dropdown_scroll + 1
+                return
+            if key == pygame.K_PAGEUP:
+                ui.dropdown_scroll = max(0, ui.dropdown_scroll - 5)
+                return
+            if key == pygame.K_PAGEDOWN:
+                ui.dropdown_scroll = ui.dropdown_scroll + 5
+                return
         if self.show_help or self.match is None or self.input_controller is None:
             return
         if key == pygame.K_SPACE:
@@ -290,10 +316,30 @@ class App:
                 param_name, _, idx_str = key.partition("__option__")
                 ui.values[param_name] = idx_str  # stored as string key
                 ui.open_choice_param = None
+                ui.open_choice_folder = None
+                ui.dropdown_scroll = 0
+                return
+            if "__folder__" in key and r.collidepoint(pos):
+                _param_name, _, folder = key.partition("__folder__")
+                ui.open_choice_folder = folder
+                ui.dropdown_scroll = 0
+                return
+            if key.endswith("__grpback__") and r.collidepoint(pos):
+                ui.open_choice_folder = None
+                ui.dropdown_scroll = 0
+                return
+            if key.endswith("__scrollup__") and r.collidepoint(pos):
+                ui.dropdown_scroll = max(0, ui.dropdown_scroll - 1)
+                return
+            if key.endswith("__scrolldown__") and r.collidepoint(pos):
+                ui.dropdown_scroll = ui.dropdown_scroll + 1
                 return
 
         for name, (minus_rect, plus_rect) in ui.button_rects.items():
-            if "__option__" in name:
+            if (
+                "__option__" in name or "__folder__" in name or name.endswith("__grpback__")
+                or name.endswith("__scrollup__") or name.endswith("__scrolldown__")
+            ):
                 continue
             if name == "__start__":
                 if minus_rect.collidepoint(pos):
@@ -319,12 +365,36 @@ class App:
                 # Clicking [>] cycles. Only act if this row was actually hit.
                 if minus_rect.collidepoint(pos):
                     ui.open_choice_param = name if ui.open_choice_param != name else None
+                    ui.open_choice_folder = None
+                    ui.dropdown_scroll = 0
                     break
                 elif plus_rect.collidepoint(pos):
                     current = ui.values.get(name, param.default)
                     idx = list(param.choices).index(current) if current in param.choices else 0
                     ui.values[name] = param.choices[(idx + 1) % len(param.choices)]
                     ui.open_choice_param = None
+                    ui.open_choice_folder = None
+                    break
+            elif isinstance(param, ScenarioGroupedChoiceParam):
+                # Clicking the value area opens the folder list (or closes if
+                # already open). Clicking [>] cycles through the flat option
+                # space without opening the dropdown.
+                if minus_rect.collidepoint(pos):
+                    if ui.open_choice_param == name:
+                        ui.open_choice_param = None
+                        ui.open_choice_folder = None
+                    else:
+                        ui.open_choice_param = name
+                        ui.open_choice_folder = None
+                        ui.dropdown_scroll = 0
+                    break
+                elif plus_rect.collidepoint(pos):
+                    flat = param.flat_choices()
+                    current = ui.values.get(name, param.default)
+                    idx = flat.index(current) if current in flat else 0
+                    ui.values[name] = flat[(idx + 1) % len(flat)]
+                    ui.open_choice_param = None
+                    ui.open_choice_folder = None
                     break
             else:
                 current = ui.values.get(name, param.default)
@@ -738,15 +808,24 @@ class App:
                     pct = 100 * o.get(win_key, 0) // total
                     tally = "  ".join(parts) + f"  ({pct}% win)"
                 else:
-                    tally = f"Goals: {o['goal']}  Saved: {o['saved']}  Miss: {o['miss']}"
-                    if o.get("dispossessed", 0):
-                        tally += f"  Disp: {o['dispossessed']}"
-                    if o.get("box_possession", 0):
-                        tally += f"  Box: {o['box_possession']}"
-                    if o.get("course_complete", 0):
-                        tally += f"  Done: {o['course_complete']}"
-                    if o.get("timeout", 0):
-                        tally += f"  Timeout: {o['timeout']}"
+                    # Iterate whatever outcome keys are actually present
+                    # instead of hardcoding a fixed set -- keeps this in sync
+                    # with detect_trial_outcome()'s vocabulary automatically.
+                    # Known keys use their short display label (canonical
+                    # order); anything unrecognised still shows up, titled
+                    # from its key, so a new/renamed outcome can never be
+                    # silently dropped from the HUD.
+                    from footballcoach.ai.env.outcome import RAW_OUTCOME_KEYS, RAW_OUTCOME_LABELS
+                    ordered_keys = list(RAW_OUTCOME_KEYS) + [
+                        k for k in o if k not in RAW_OUTCOME_KEYS
+                    ]
+                    parts = []
+                    for key in ordered_keys:
+                        count = o.get(key, 0)
+                        if key in ("goal", "saved", "miss") or count:
+                            label = RAW_OUTCOME_LABELS.get(key, key.replace("_", " ").title())
+                            parts.append(f"{label}: {count}")
+                    tally = "  ".join(parts)
                 hud_lines.append(tally)
         else:
             left, right = self.match.scoreboard.left_goals, self.match.scoreboard.right_goals
@@ -788,12 +867,14 @@ class App:
             return
         defn = ui.definition
         all_params = list(defn.params) + scenarios.UNIVERSAL_PARAMS
-        ui.button_rects = self.renderer.draw_scenario_params(
+        ui.button_rects, ui.dropdown_scroll = self.renderer.draw_scenario_params(
             self.surface,
             all_params,
             ui.values,
             title=f"Configure: {defn.label}",
             open_choice_param=ui.open_choice_param,
+            open_choice_folder=ui.open_choice_folder,
+            dropdown_scroll=ui.dropdown_scroll,
         )
 
     def _draw_help_button(self) -> None:
