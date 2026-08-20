@@ -210,6 +210,31 @@ def _compute_movement_intent(
     return adj_dir, speed_mode
 
 
+def _continue_current_motion(
+    player: "Player", match: "Match", *, sprint: bool = True,
+) -> "tuple[Vector3, object]":
+    """Movement intent for a tick where an order just completed an
+    instantaneous action (kick/pass/shot/gained-possession) but there's no
+    reason to stop -- continue in the direction the player is already
+    facing/moving, at the given pace.
+
+    Used instead of leaving ``desired_direction``/``desired_speed_mode``
+    unset, which ``Match._apply_movement`` would otherwise interpret as pure
+    inertial coasting (no acceleration/turning/stamina drain) -- a state the
+    neural decode path (``apply_action_to_player``) can never produce, since
+    it always emits a concrete SPRINT/JOG or an active STANDSTILL brake.
+    """
+    from footballcoach.engine.movement import SpeedMode
+
+    velocity_xy = player.velocity.xy()
+    direction = (
+        velocity_xy if velocity_xy.length() > 1e-6
+        else Vector3.from_angle_xy(player.heading_rad)
+    )
+    speed_mode = SpeedMode.SPRINT if sprint else SpeedMode.JOG
+    return direction, speed_mode
+
+
 def _gk_should_sprint(
     player: "Player",
     match: "Match",
@@ -354,16 +379,29 @@ class MoveOrder:
             or player.speed_mps <= arrival_speed + 0.05
         )
         if dist <= effective_tolerance and speed_ok:
+            # Arrived. Don't just stop dead -- continue at the requested
+            # arrival pace (STANDSTILL if max_speed_on_arrival_mps=0.0 was
+            # explicitly asked for; JOG/SPRINT otherwise) in the same
+            # heading, via the same braking-curve computation the
+            # in-progress branch below uses. Previously this returned
+            # without setting intent at all, which the engine read as
+            # inertial coasting -- unrepresentable by the NN decode path.
+            adj_dir, speed_mode = _compute_movement_intent(
+                player, direction, match,
+                sprint=self.sprint, arrival_dist=dist, arrival_speed=arrival_speed,
+                use_repulsion=True, use_brake_to_turn=True,
+            )
+            player.desired_direction = adj_dir
+            player.desired_speed_mode = speed_mode
             return True
         elif self.reached_target and dist > self.arrival_tolerance_m:
             if self._overshoot_timer_s is None:
                 self._overshoot_timer_s = self.overshoot_timeout_s
             self._overshoot_timer_s -= dt
+            player.desired_direction = Vector3.zero()
+            player.desired_speed_mode = SpeedMode.STANDSTILL
             if self._overshoot_timer_s <= 0.0:
                 return True
-            else:
-                player.desired_direction = Vector3.zero()
-                player.desired_speed_mode = SpeedMode.STANDSTILL
         else:
             adj_dir, speed_mode = _compute_movement_intent(
                 player, direction, match,
@@ -469,6 +507,10 @@ class KickOrder:
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
         """Kick the ball this tick if the player has possession.  Always completes in one tick."""
         player.kick_direct(match, self.aim_point, self.power_fraction, self.spin, self.compensate_for_run)
+        # Follow through -- keep moving rather than freeze after striking the ball.
+        adj_dir, speed_mode = _continue_current_motion(player, match, sprint=True)
+        player.desired_direction = adj_dir
+        player.desired_speed_mode = speed_mode
         return True
 
 
@@ -534,6 +576,11 @@ class PassOrder:
             match._log_debug(f"{player.player_id} passed to {pass_target}")
             if player.on_kick is not None:
                 player.on_kick(player)
+        # Follow through (or, if the ball was already lost, just keep moving
+        # rather than freeze) -- see _continue_current_motion.
+        adj_dir, speed_mode = _continue_current_motion(player, match, sprint=True)
+        player.desired_direction = adj_dir
+        player.desired_speed_mode = speed_mode
         return True
 
 
@@ -556,20 +603,22 @@ class ChaseTackleOrder:
 
         self.status = OrderStatus.IN_PROGRESS
         target = match.player_by_id(self.target_player_id)
+        # Keep tracking the target's motion whether or not contact is made
+        # this tick -- while touching/duelling, freezing mid-tackle is no
+        # more correct than it is while still closing the distance.
+        adj_dir, speed_mode = _compute_movement_intent(
+            player, target.position - player.position, match,
+            sprint=True, arrival_dist=None,
+            use_repulsion=False, use_brake_to_turn=True,
+        )
+        player.desired_direction = adj_dir
+        player.desired_speed_mode = speed_mode
         if are_touching(player, target):
             from footballcoach.engine.collision import can_tackle
             if can_tackle(player, target):
                 match._attempt_tackle_contact(player, target)
             return True
-        else:
-            adj_dir, speed_mode = _compute_movement_intent(
-                player, target.position - player.position, match,
-                sprint=True, arrival_dist=None,
-                use_repulsion=False, use_brake_to_turn=True,
-            )
-            player.desired_direction = adj_dir
-            player.desired_speed_mode = speed_mode
-            return False
+        return False
 
 
 @dataclass
@@ -604,9 +653,20 @@ class SaveOrder:
         has_ball = match.ball.possessed_by == player.player_id
 
         if not player.is_goalkeeper:
-            return True  # silently no-op for outfield
+            # SaveOrder should only ever be assigned to a goalkeeper by the
+            # AI order-selection logic; reaching this means that invariant
+            # was violated elsewhere, not a real match state -- fail loudly
+            # rather than silently no-op'ing.
+            raise AssertionError(
+                f"SaveOrder assigned to non-goalkeeper player {player.player_id!r}"
+            )
         if match._goal_linger_remaining_s > 0.0:
-            return True  # goal just scored — cancel
+            # Goal just scored -- the save is moot and the ball's about to
+            # reset; stand down rather than continuing toward a save point
+            # that no longer means anything.
+            player.desired_direction = Vector3.zero()
+            player.desired_speed_mode = SpeedMode.STANDSTILL
+            return True  # cancel
         if has_ball:
             player.desired_direction = Vector3.zero()
             player.desired_speed_mode = SpeedMode.STANDSTILL
@@ -711,6 +771,11 @@ class GetPossessionOrder:
         # Already have the ball (or callback just fired).
         if match.ball.possessed_by == player.player_id or self._possession_gained:
             player.on_possession_gained = None
+            # Just won the ball mid-chase -- carry momentum into the attack
+            # rather than freezing.
+            adj_dir, speed_mode = _continue_current_motion(player, match, sprint=self.sprint)
+            player.desired_direction = adj_dir
+            player.desired_speed_mode = speed_mode
             return True
 
         done = match._run_get_possession_behaviour(player, dt)
@@ -745,7 +810,12 @@ class MarkOrder:
         try:
             mark_target = match.player_by_id(self.target_player_id)
         except KeyError:
-            return True  # target gone
+            # Players are never removed mid-match in current scenarios, so a
+            # mark target that no longer exists means an order-assignment
+            # bug elsewhere -- fail loudly rather than silently cancelling.
+            raise AssertionError(
+                f"MarkOrder target {self.target_player_id!r} no longer exists in the match"
+            ) from None
         target_has_ball = (
             match.ball.possessed_by == mark_target.player_id
             or mark_target.state == PlayerState.CONTROLLING_BALL
@@ -808,9 +878,13 @@ class ShootOrder:
             kick_ball,
             running_power_multiplier,
         )
-        from footballcoach.engine.movement import effective_top_speed
+        from footballcoach.engine.movement import SpeedMode, effective_top_speed
 
         if match.ball.possessed_by != player.player_id:
+            # Lost the ball before shooting -- real transition, nothing to
+            # react to; stand down explicitly rather than coasting.
+            player.desired_direction = Vector3.zero()
+            player.desired_speed_mode = SpeedMode.STANDSTILL
             return True  # no-op: lost ball
 
         opposition = [p for p in match.players if p.team != player.team]
@@ -832,7 +906,13 @@ class ShootOrder:
                     f"{player.player_id} shoot paused (blocker) → advancing to "
                     f"({clamped_target.x:.1f},{clamped_target.y:.1f})"
                 )
-                return False  # new MoveOrder installed; caller must NOT call _complete_order
+                # Run the newly-installed MoveOrder immediately this tick
+                # instead of leaving intent unset for one tick while it
+                # waits for the next _process_orders pass.
+                if player.current_order.execute(player, match, dt):
+                    match._complete_order(player.current_order)
+                    player.current_order = None
+                return False  # ShootOrder itself is superseded; caller must NOT touch player.current_order for it
 
         top_speed = effective_top_speed(
             match.movement_params, player.attributes.top_speed, player.stamina,
@@ -859,6 +939,10 @@ class ShootOrder:
         match._log_info(f"{player.player_id} shot at goal  power={self.power_fraction:.2f}")
         if player.on_kick is not None:
             player.on_kick(player)
+        # Follow through -- keep moving rather than freeze after the shot.
+        adj_dir, speed_mode = _continue_current_motion(player, match, sprint=True)
+        player.desired_direction = adj_dir
+        player.desired_speed_mode = speed_mode
         return True
 
 

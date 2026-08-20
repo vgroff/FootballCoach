@@ -74,8 +74,8 @@
     "running_direction_precision_penalty_mid": 0.25,
     "running_direction_precision_penalty_max": 0.75,
     "running_direction_min_speed_mps": 1.0,
-    "max_spin_base_rad_s": 12.0,
-    "max_spin_precision_scale": 25.0
+    "max_spin_base_rad_s": 13.0,
+    "max_spin_precision_scale": 32.0
   },
   "passing": {
     "_comment": "Auto-pace for a grounded pass: v = overshoot_factor * sqrt(2*mu_roll*g*distance), clamped to [min,max]. Error model is now unified with kicking (KickingParams) - sigma scales with both precision and effective power.",

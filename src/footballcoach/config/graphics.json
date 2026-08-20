@@ -47,7 +47,7 @@
     "max_drag_m": 10.0,
     "trajectory_duration_s": 0.8,
     "max_loft_angle_deg": 70.0,
-    "max_spin_magnitude_rads": 15.0
+    "max_spin_magnitude_rads": 40.0
   },
   "pause_notification": {
     "_comment": "font_size_px: point size of the auto-pause banner rendered when a human order completes. Default title_font is 32; 26 = ~20% smaller.",

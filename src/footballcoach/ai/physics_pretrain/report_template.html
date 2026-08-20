@@ -1,0 +1,780 @@
+<!doctype html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>Ball Dynamics Training</title>
+<style>
+:root {
+  --bg: #f6f4f0;
+  --surface: #ffffff;
+  --surface-2: #f0ede7;
+  --border: #ddd7cc;
+  --text: #1c1a16;
+  --text-dim: #6b6558;
+  --text-faint: #9b9587;
+  --accent: #d97a3f;
+
+  /* Horizon palette: cool -> warm encodes short -> long prediction horizon */
+  --h0: #1f8fd6;
+  --h1: #2fa3a3;
+  --h2: #6a8f3f;
+  --h3: #b8862c;
+  --h4: #cf5f3a;
+  --h5: #b8433f;
+}
+
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    --bg: #14120f;
+    --surface: #1c1a16;
+    --surface-2: #211e19;
+    --border: #34302a;
+    --text: #ece7dd;
+    --text-dim: #a39c8c;
+    --text-faint: #766f61;
+    --accent: #e69158;
+
+    --h0: #4fb3ff;
+    --h1: #3fd0c8;
+    --h2: #9ecf5f;
+    --h3: #e0ac4f;
+    --h4: #ff8f5f;
+    --h5: #ff6f6a;
+  }
+}
+:root[data-theme="dark"] {
+  --bg: #14120f;
+  --surface: #1c1a16;
+  --surface-2: #211e19;
+  --border: #34302a;
+  --text: #ece7dd;
+  --text-dim: #a39c8c;
+  --text-faint: #766f61;
+  --accent: #e69158;
+
+  --h0: #4fb3ff;
+  --h1: #3fd0c8;
+  --h2: #9ecf5f;
+  --h3: #e0ac4f;
+  --h4: #ff8f5f;
+  --h5: #ff6f6a;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", "Inter", system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.5;
+}
+
+.mono {
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+  font-variant-numeric: tabular-nums;
+}
+
+.wrap {
+  max-width: 1180px;
+  margin: 0 auto;
+  padding: 40px 28px 64px;
+}
+
+header {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 28px;
+  padding-bottom: 24px;
+  border-bottom: 1px solid var(--border);
+}
+
+.eyebrow {
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  font-size: 12px;
+  letter-spacing: 0.08em;
+  text-transform: uppercase;
+  color: var(--accent);
+}
+
+h1 {
+  margin: 0;
+  font-size: 28px;
+  font-weight: 650;
+  letter-spacing: -0.01em;
+  text-wrap: balance;
+}
+
+.subtitle {
+  color: var(--text-dim);
+  font-size: 14.5px;
+  max-width: 62ch;
+}
+
+.stat-row {
+  display: grid;
+  grid-template-columns: repeat(8, 1fr);
+  gap: 1px;
+  background: var(--border);
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  overflow: hidden;
+  margin-bottom: 36px;
+}
+
+.stat.headline .value { color: var(--accent); }
+
+.stat {
+  background: var(--surface);
+  padding: 14px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.stat .label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  color: var(--text-faint);
+}
+
+.stat .value {
+  font-size: 19px;
+  font-weight: 600;
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+}
+
+.stat .value.small { font-size: 15px; font-weight: 500; color: var(--text-dim); }
+
+section.panels {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 20px;
+  margin-bottom: 32px;
+}
+
+@media (max-width: 800px) {
+  section.panels { grid-template-columns: 1fr; }
+  .stat-row { grid-template-columns: repeat(3, 1fr); }
+}
+
+.panel {
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 18px 18px 14px;
+}
+
+.panel-head {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  margin-bottom: 10px;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+
+.panel-title {
+  font-weight: 600;
+  font-size: 14.5px;
+}
+
+.panel-note {
+  font-size: 12px;
+  color: var(--text-faint);
+}
+
+canvas {
+  width: 100%;
+  display: block;
+}
+
+.legend {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px 14px;
+  margin-top: 10px;
+  font-size: 11.5px;
+  color: var(--text-dim);
+}
+
+.legend .item {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+}
+
+.legend .swatch {
+  width: 10px;
+  height: 10px;
+  border-radius: 2px;
+  flex-shrink: 0;
+}
+
+.legend .style-key {
+  display: flex;
+  gap: 14px;
+  margin-left: auto;
+}
+
+.legend .style-key .line {
+  display: inline-block;
+  width: 18px;
+  height: 0;
+  border-top: 2px solid var(--text-dim);
+  margin-right: 4px;
+  vertical-align: middle;
+}
+.legend .style-key .line.dashed { border-top-style: dashed; opacity: 0.7; }
+
+.panel.full { grid-column: 1 / -1; }
+
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+th, td {
+  text-align: right;
+  padding: 7px 10px;
+  border-bottom: 1px solid var(--border);
+  font-family: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, monospace;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+th:first-child, td:first-child,
+th:nth-child(2), td:nth-child(2) { text-align: left; font-family: inherit; color: var(--text-dim); }
+
+thead th {
+  color: var(--text-faint);
+  font-weight: 500;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.table-scroll { overflow-x: auto; }
+
+#examplesTable td.desc {
+  text-align: left;
+  white-space: normal;
+  font-size: 12.5px;
+  color: var(--text-dim);
+}
+
+#examplesTable td:nth-child(3) {
+  text-align: left;
+  font-family: inherit;
+  color: var(--text-faint);
+  text-transform: uppercase;
+  font-size: 10.5px;
+  letter-spacing: 0.04em;
+}
+
+#examplesTable tbody tr.ex-first td {
+  border-top: 1px solid var(--border);
+}
+
+#examplesTable tbody tr.ex-group-1 {
+  background: var(--surface-2);
+}
+
+footer {
+  margin-top: 36px;
+  padding-top: 20px;
+  border-top: 1px solid var(--border);
+  font-size: 12.5px;
+  color: var(--text-faint);
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+</style>
+</head>
+<body>
+
+<div class="wrap">
+  <header>
+    <span class="eyebrow">Physics pretraining · run diagnostics</span>
+    <h1 id="mainTitle">Ball Dynamics Encoder — Training Report</h1>
+    <p class="subtitle" id="subtitle">Loading run…</p>
+  </header>
+
+  <section class="stat-row" id="statRow"></section>
+
+  <section class="panels" id="panels"></section>
+
+  <div class="panel full" id="tablePanel">
+    <div class="panel-head">
+      <span class="panel-title">Best epoch — value by horizon</span>
+      <span class="panel-note">weights restored from this epoch</span>
+    </div>
+    <div class="table-scroll">
+      <table id="bestTable"></table>
+    </div>
+  </div>
+
+  <div class="panel full" id="examplesPanel">
+    <div class="panel-head">
+      <span class="panel-title">Sample predictions</span>
+      <span class="panel-note">10 random (episode, horizon) pairs from the val set, final saved-checkpoint weights — not cherry-picked</span>
+    </div>
+    <div class="table-scroll">
+      <table id="examplesTable"></table>
+    </div>
+  </div>
+
+  <footer id="footer"></footer>
+</div>
+
+<script>
+const DATA = __HISTORY_JSON__;
+
+const HCOLORS = ["--h0","--h1","--h2","--h3","--h4","--h5"];
+
+function resolvedColor(cssVar) {
+  return getComputedStyle(document.documentElement).getPropertyValue(cssVar).trim();
+}
+
+function fmt(x, digits=4) {
+  if (x === null || x === undefined || Number.isNaN(x)) return "—";
+  return Number(x).toFixed(digits);
+}
+
+function buildHeader() {
+  const ds = DATA.dataset_stats, cfg = DATA.config_snapshot;
+  const nEpochs = DATA.epoch.length;
+  const bestIdx = DATA.val_loss.reduce((best, v, i, arr) => (v < arr[best] ? i : best), 0);
+  const bestEpoch = DATA.epoch[bestIdx];
+  const stoppedEarly = nEpochs < (cfg.epochs || nEpochs);
+
+  document.getElementById("subtitle").textContent =
+    `${ds.n_episodes.toLocaleString()} generated episodes, horizons ` +
+    DATA.horizons_s.map(h => h + "s").join(" / ") +
+    ` — ${stoppedEarly ? "stopped early" : "ran full schedule"} at epoch ${nEpochs}, ` +
+    `best weights from epoch ${bestEpoch}.`;
+
+  // Mean (across horizons) Euclidean distance error at the best epoch, in
+  // real units -- the single most literal "how far off is the model
+  // typically" number in this whole report (see pos_dist/vel_dist's
+  // definition in train_ball_dynamics.py's LossBreakdown docstring), so it
+  // leads the stat row ahead of everything else.
+  const meanOf = arr => arr.reduce((a, b) => a + b, 0) / arr.length;
+
+  // Data-driven headline stats (see report.py's `header_stat_defs` param) --
+  // falls back to the ball pipeline's own hardcoded pos_dist/vel_dist pair
+  // when the payload doesn't supply one, so the ball's own reports are
+  // unaffected. Each def: {label, key, unit, scaleKey} -- value is
+  // mean(DATA.val_<key>[bestIdx]), multiplied by DATA.normalization[
+  // scaleKey] if scaleKey is given (else left as the raw normalized/real
+  // value, e.g. an already-real-unit quantity like an angular distance).
+  const headerStatDefs = DATA.header_stat_defs || [
+    { label: "Position error", key: "pos_dist", unit: "m", scaleKey: "pitch_half_diag_m" },
+    { label: "Velocity error", key: "vel_dist", unit: "m/s", scaleKey: "pitch_half_diag_m" },
+  ];
+  const headlineStats = headerStatDefs.map(def => {
+    const raw = meanOf(DATA[`val_${def.key}`][bestIdx]);
+    const scale = def.scaleKey ? DATA.normalization[def.scaleKey] : 1.0;
+    const label = def.unit ? `${fmt(raw * scale, 2)} ${def.unit}` : fmt(raw * scale, 2);
+    return [def.label, label, true];
+  });
+
+  const stats = [
+    ...headlineStats,
+    ["Episodes", ds.n_episodes.toLocaleString()],
+    ["Train / val rows", `${ds.n_train.toLocaleString()} / ${ds.n_val.toLocaleString()}`],
+    ["Epochs run", `${nEpochs}${stoppedEarly ? ` / ${cfg.epochs}` : ""}`],
+    ["Best epoch", bestEpoch],
+    ["Best val loss", fmt(DATA.val_loss[bestIdx])],
+    ["Latent dim", cfg.latent_dim],
+  ];
+  const row = document.getElementById("statRow");
+  row.innerHTML = stats.map(([label, value, headline]) => `
+    <div class="stat ${headline ? 'headline' : ''}">
+      <span class="label">${label}</span>
+      <span class="value ${String(value).length > 8 ? 'small' : ''}">${value}</span>
+    </div>
+  `).join("");
+
+  return bestIdx;
+}
+
+function drawChart(canvas, trainSeries, valSeries, opts) {
+  const dpr = window.devicePixelRatio || 1;
+  const cssW = canvas.clientWidth || 520;
+  const cssH = opts.height || 220;
+  canvas.width = cssW * dpr;
+  canvas.height = cssH * dpr;
+  canvas.style.height = cssH + "px";
+  const ctx = canvas.getContext("2d");
+  ctx.scale(dpr, dpr);
+
+  const padL = 44, padR = opts.unitScale ? 54 : 10, padT = 10, padB = 22;
+  const plotW = cssW - padL - padR;
+  const plotH = cssH - padT - padB;
+
+  const nH = trainSeries.length;
+  const nE = DATA.epoch.length;
+
+  let allVals = [];
+  for (let h = 0; h < nH; h++) {
+    allVals = allVals.concat(trainSeries[h].filter(v => v !== null && !Number.isNaN(v)));
+    allVals = allVals.concat(valSeries[h].filter(v => v !== null && !Number.isNaN(v)));
+  }
+  let yMax, yMin;
+  if (opts.yRange) {
+    [yMin, yMax] = opts.yRange;
+  } else if (allVals.length === 0) {
+    yMin = 0; yMax = 1;
+  } else {
+    yMax = Math.max(...allVals);
+    yMin = opts.logish ? Math.min(...allVals.filter(v => v > 0)) : 0;
+    if (!opts.logish) yMin = 0;
+    if (yMax <= yMin) yMax = yMin + 1;
+    const pad = (yMax - yMin) * 0.08;
+    yMax += pad;
+    if (!opts.logish) yMin = Math.max(0, yMin - pad * 0.2);
+  }
+
+  const borderColor = resolvedColor("--border");
+  const textFaint = resolvedColor("--text-faint");
+  const textDim = resolvedColor("--text-dim");
+
+  ctx.clearRect(0, 0, cssW, cssH);
+
+  // Reference line at log(2) for BCE panels (chance-level baseline).
+  function yOf(v) {
+    return padT + plotH - ((v - yMin) / (yMax - yMin)) * plotH;
+  }
+  function xOf(i) {
+    return padL + (i / Math.max(1, nE - 1)) * plotW;
+  }
+
+  // Gridlines + y ticks
+  ctx.strokeStyle = borderColor;
+  ctx.lineWidth = 1;
+  ctx.font = "10.5px ui-monospace, 'SF Mono', monospace";
+  ctx.fillStyle = textFaint;
+  const nTicks = 4;
+  for (let t = 0; t <= nTicks; t++) {
+    const v = yMin + (t / nTicks) * (yMax - yMin);
+    const y = yOf(v);
+    ctx.beginPath();
+    ctx.moveTo(padL, y);
+    ctx.lineTo(padL + plotW, y);
+    ctx.globalAlpha = 0.5;
+    ctx.stroke();
+    ctx.globalAlpha = 1;
+    ctx.textAlign = "right";
+    ctx.textBaseline = "middle";
+    ctx.fillText(v.toFixed(opts.tickDigits ?? 2), padL - 6, y);
+
+    // Secondary right-hand axis: same y-position, denormalized value.
+    if (opts.unitScale) {
+      ctx.textAlign = "left";
+      ctx.fillStyle = resolvedColor("--accent");
+      ctx.fillText((v * opts.unitScale).toFixed(opts.unitDigits ?? 1), padL + plotW + 6, y);
+      ctx.fillStyle = textFaint;
+    }
+  }
+  if (opts.unitScale) {
+    ctx.textAlign = "left";
+    ctx.textBaseline = "bottom";
+    ctx.font = "10px ui-monospace, 'SF Mono', monospace";
+    ctx.fillStyle = resolvedColor("--accent");
+    ctx.globalAlpha = 0.85;
+    ctx.fillText(opts.unitLabel, padL + plotW + 6, padT);
+    ctx.globalAlpha = 1;
+    ctx.font = "10.5px ui-monospace, 'SF Mono', monospace";
+  }
+
+  if (opts.chanceLine !== undefined && opts.chanceLine > yMin && opts.chanceLine < yMax) {
+    ctx.setLineDash([3, 3]);
+    ctx.strokeStyle = textFaint;
+    ctx.globalAlpha = 0.8;
+    ctx.beginPath();
+    ctx.moveTo(padL, yOf(opts.chanceLine));
+    ctx.lineTo(padL + plotW, yOf(opts.chanceLine));
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  }
+
+  // Best-epoch marker
+  if (opts.bestIdx !== undefined) {
+    const x = xOf(opts.bestIdx);
+    ctx.strokeStyle = textDim;
+    ctx.globalAlpha = 0.55;
+    ctx.setLineDash([2, 3]);
+    ctx.beginPath();
+    ctx.moveTo(x, padT);
+    ctx.lineTo(x, padT + plotH);
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  }
+
+  // x ticks (epoch numbers)
+  ctx.textAlign = "center";
+  ctx.textBaseline = "top";
+  const xTickCount = Math.min(6, nE);
+  for (let t = 0; t < xTickCount; t++) {
+    const idx = Math.round((t / (xTickCount - 1 || 1)) * (nE - 1));
+    ctx.fillStyle = textFaint;
+    ctx.fillText(DATA.epoch[idx], xOf(idx), padT + plotH + 5);
+  }
+
+  function drawLine(series, colorVar, dashed) {
+    const color = resolvedColor(colorVar);
+    ctx.strokeStyle = color;
+    ctx.lineWidth = dashed ? 1.3 : 2;
+    ctx.globalAlpha = dashed ? 0.55 : 0.95;
+    ctx.setLineDash(dashed ? [4, 3] : []);
+    ctx.beginPath();
+    let started = false;
+    for (let i = 0; i < nE; i++) {
+      const v = series[i];
+      if (v === null || Number.isNaN(v)) continue;
+      const x = xOf(i), y = yOf(v);
+      if (!started) { ctx.moveTo(x, y); started = true; }
+      else ctx.lineTo(x, y);
+    }
+    ctx.stroke();
+    ctx.setLineDash([]);
+    ctx.globalAlpha = 1;
+  }
+
+  for (let h = 0; h < nH; h++) {
+    drawLine(trainSeries[h], HCOLORS[h % HCOLORS.length], true);
+  }
+  for (let h = 0; h < nH; h++) {
+    drawLine(valSeries[h], HCOLORS[h % HCOLORS.length], false);
+  }
+}
+
+function seriesFor(key) {
+  // DATA[key] is (n_epochs, n_horizons) -> transpose to n_horizons arrays of n_epochs
+  const arr = DATA[key];
+  const nH = DATA.horizons_s.length;
+  const out = [];
+  for (let h = 0; h < nH; h++) out.push(arr.map(row => row[h]));
+  return out;
+}
+
+// Data-driven since the player-dynamics pipeline reuses this same template
+// (see report.py's `panel_defs` param / train_player_dynamics.py's
+// `_PLAYER_PANEL_DEFS`) -- falls back to the ball's own hardcoded panel set
+// below when the payload doesn't supply one, so this stays a pure
+// extraction with zero behaviour change for the ball pipeline's own runs.
+const PANEL_DEFS = DATA.panel_defs || [
+  { key: "pos_dist", title: "Position error (mean distance)", note: "mean ||pred_pos − target_pos|| — right axis ≈ metres (approx, mixed axes). The literal \"how far off\" number, NOT directly comparable to pos_rmse below (see LossBreakdown docstring) — can legitimately read higher.",
+    tickDigits: 2, unitScale: DATA.normalization.pitch_half_diag_m, unitLabel: "m (approx)", unitDigits: 1 },
+  { key: "vel_dist",  title: "Velocity error (mean distance)", note: "mean ||pred_vel − target_vel|| — right axis = m/s. Same relationship to vel_rmse as pos_dist has to pos_rmse.",
+    tickDigits: 3, unitScale: DATA.normalization.pitch_half_diag_m, unitLabel: "m/s", unitDigits: 2 },
+  { key: "pos_rmse",  title: "Position RMSE",       note: "pos_x, pos_y, height_m — right axis ≈ metres (approx, mixed axes)",
+    tickDigits: 2, unitScale: DATA.normalization.pitch_half_diag_m, unitLabel: "m (approx)", unitDigits: 1 },
+  { key: "vel_rmse",  title: "Velocity RMSE",       note: "velocity_x, y, z — right axis = m/s",
+    tickDigits: 3, unitScale: DATA.normalization.pitch_half_diag_m, unitLabel: "m/s", unitDigits: 2 },
+  { key: "spin_rmse", title: "Spin RMSE",           note: "spin_x, y, z — right axis = rad/s",
+    tickDigits: 3, unitScale: DATA.normalization.ball_spin_norm_max_rad_s, unitLabel: "rad/s", unitDigits: 2 },
+  { key: "oob_bce",  title: "Out-of-bounds BCE",    note: "grey dashed = coin-flip baseline (ln 2 ≈ 0.69)", tickDigits: 2, chanceLine: Math.log(2) },
+  { key: "goal_bce", title: "Goal-scored BCE",      note: "grey dashed = coin-flip baseline (ln 2 ≈ 0.69)", tickDigits: 2, chanceLine: Math.log(2) },
+  { key: "oob_accuracy",   title: "Out-of-bounds accuracy",  note: "(tp+tn) / all — threshold 0.5", tickDigits: 2, yRange: [0, 1] },
+  { key: "oob_precision",  title: "Out-of-bounds precision", note: "tp / (tp+fp) — threshold 0.5", tickDigits: 2, yRange: [0, 1] },
+  { key: "oob_recall",     title: "Out-of-bounds recall",    note: "tp / (tp+fn) — threshold 0.5", tickDigits: 2, yRange: [0, 1] },
+  { key: "goal_accuracy",  title: "Goal-scored accuracy",    note: "(tp+tn) / all — threshold 0.5", tickDigits: 2, yRange: [0, 1] },
+  { key: "goal_precision", title: "Goal-scored precision",   note: "tp / (tp+fp) — gaps = no positive predictions that epoch", tickDigits: 2, yRange: [0, 1] },
+  { key: "goal_recall",    title: "Goal-scored recall",      note: "tp / (tp+fn) — gaps = no actual positives that epoch/split", tickDigits: 2, yRange: [0, 1] },
+  { key: "pos_r2",  title: "Position R²",  note: "1 - MSE/Var(target) vs train-mean baseline — 0 = no better than predicting the mean", tickDigits: 2, yRange: [-0.2, 1], chanceLine: 0 },
+  { key: "vel_r2",  title: "Velocity R²",  note: "1 - MSE/Var(target) vs train-mean baseline — 0 = no better than predicting the mean", tickDigits: 2, yRange: [-0.2, 1], chanceLine: 0 },
+  { key: "spin_r2", title: "Spin R²",      note: "1 - MSE/Var(target) vs train-mean baseline — 0 = no better than predicting the mean", tickDigits: 2, yRange: [-0.2, 1], chanceLine: 0 },
+  { key: "pos_err_pct_disp",  title: "Position error (% of displacement)",  note: "100 × RMSE_model / RMSE(predict initial state) — 100% = as bad as assuming nothing moved, dashed line", tickDigits: 0, chanceLine: 100 },
+  { key: "vel_err_pct_disp",  title: "Velocity error (% of displacement)",  note: "100 × RMSE_model / RMSE(predict initial state) — 100% = as bad as assuming nothing moved, dashed line", tickDigits: 0, chanceLine: 100 },
+  { key: "spin_err_pct_disp", title: "Spin error (% of displacement)",      note: "100 × RMSE_model / RMSE(predict initial state) — 100% = as bad as assuming nothing moved, dashed line", tickDigits: 0, chanceLine: 100 },
+  { key: "pos_err_pct_ballistic",  title: "Position error (% of ballistic)",  note: "100 × RMSE_model / RMSE(v0 + gravity only, no drag/Magnus/bounce) — 100% = as bad as straight-line physics, dashed line", tickDigits: 0, chanceLine: 100 },
+  { key: "vel_err_pct_ballistic",  title: "Velocity error (% of ballistic)",  note: "100 × RMSE_model / RMSE(v0 + gravity only, no drag/Magnus/bounce) — 100% = as bad as straight-line physics, dashed line", tickDigits: 0, chanceLine: 100 },
+  { key: "spin_err_pct_ballistic", title: "Spin error (% of ballistic)",      note: "identical to the persistence baseline — nothing in the ballistic model acts on spin", tickDigits: 0, chanceLine: 100 },
+];
+
+function buildPanels(bestIdx) {
+  const container = document.getElementById("panels");
+  const horizonLabels = DATA.horizons_s.map(h => h + "s");
+
+  container.innerHTML = PANEL_DEFS.map((def, i) => `
+    <div class="panel">
+      <div class="panel-head">
+        <span class="panel-title">${def.title}</span>
+        <span class="panel-note">${def.note}</span>
+      </div>
+      <canvas id="chart-${def.key}"></canvas>
+      <div class="legend">
+        ${horizonLabels.map((label, h) => `
+          <span class="item">
+            <span class="swatch" style="background:var(${HCOLORS[h]})"></span>${label}
+          </span>
+        `).join("")}
+        ${i === 0 ? `
+          <span class="style-key">
+            <span><span class="line dashed"></span>train</span>
+            <span><span class="line"></span>val</span>
+          </span>
+        ` : ""}
+      </div>
+    </div>
+  `).join("");
+
+  for (const def of PANEL_DEFS) {
+    const canvas = document.getElementById(`chart-${def.key}`);
+    const trainSeries = seriesFor(`train_${def.key}`);
+    const valSeries = seriesFor(`val_${def.key}`);
+    drawChart(canvas, trainSeries, valSeries, {
+      tickDigits: def.tickDigits,
+      chanceLine: def.chanceLine,
+      unitScale: def.unitScale,
+      unitLabel: def.unitLabel,
+      unitDigits: def.unitDigits,
+      yRange: def.yRange,
+      bestIdx,
+    });
+  }
+}
+
+function buildBestTable(bestIdx) {
+  const horizonLabels = DATA.horizons_s.map(h => h + "s");
+  const norm = DATA.normalization;
+
+  // Data-driven table rows (see report.py's `best_table_defs` param) --
+  // when the payload supplies one (e.g. the player pipeline), rows are
+  // built generically from {key, unit, scaleKey}; the ball pipeline's own
+  // reports keep using the hardcoded rows below unchanged.
+  if (DATA.best_table_defs) {
+    const genericRows = DATA.best_table_defs.map(def => ({
+      label: def.label || def.key,
+      unitLabel: def.unit,
+      vals: DATA[`val_${def.key}`][bestIdx],
+      scale: def.scaleKey ? norm[def.scaleKey] : undefined,
+      unitDigits: def.unitDigits ?? 2,
+    }));
+    return _renderBestTable(genericRows, horizonLabels);
+  }
+
+  const rows = [
+    { label: "Position error (mean distance)", unitLabel: "≈ m (approx, mixed axes)", vals: DATA.val_pos_dist[bestIdx], scale: norm.pitch_half_diag_m, unitDigits: 2 },
+    { label: "Velocity error (mean distance)", unitLabel: "m/s", vals: DATA.val_vel_dist[bestIdx], scale: norm.pitch_half_diag_m, unitDigits: 2 },
+    { label: "Position RMSE", unitLabel: "≈ m (approx, mixed axes)", vals: DATA.val_pos_rmse[bestIdx], scale: norm.pitch_half_diag_m, unitDigits: 2 },
+    { label: "Velocity RMSE", unitLabel: "m/s", vals: DATA.val_vel_rmse[bestIdx], scale: norm.pitch_half_diag_m, unitDigits: 2 },
+    { label: "Spin RMSE", unitLabel: "rad/s", vals: DATA.val_spin_rmse[bestIdx], scale: norm.ball_spin_norm_max_rad_s, unitDigits: 2 },
+    { label: "Out-of-bounds BCE", vals: DATA.val_oob_bce[bestIdx] },
+    { label: "Goal-scored BCE", vals: DATA.val_goal_bce[bestIdx] },
+    { label: "Out-of-bounds accuracy", primaryUnitsLabel: "ratio", vals: DATA.val_oob_accuracy[bestIdx] },
+    { label: "Out-of-bounds precision", primaryUnitsLabel: "ratio", vals: DATA.val_oob_precision[bestIdx] },
+    { label: "Out-of-bounds recall", primaryUnitsLabel: "ratio", vals: DATA.val_oob_recall[bestIdx] },
+    { label: "Goal-scored accuracy", primaryUnitsLabel: "ratio", vals: DATA.val_goal_accuracy[bestIdx] },
+    { label: "Goal-scored precision", primaryUnitsLabel: "ratio", vals: DATA.val_goal_precision[bestIdx] },
+    { label: "Goal-scored recall", primaryUnitsLabel: "ratio", vals: DATA.val_goal_recall[bestIdx] },
+    { label: "Position R²", primaryUnitsLabel: "vs mean baseline", vals: DATA.val_pos_r2[bestIdx] },
+    { label: "Velocity R²", primaryUnitsLabel: "vs mean baseline", vals: DATA.val_vel_r2[bestIdx] },
+    { label: "Spin R²", primaryUnitsLabel: "vs mean baseline", vals: DATA.val_spin_r2[bestIdx] },
+    { label: "Position error (% of displacement)", primaryUnitsLabel: "% of typical displacement", vals: DATA.val_pos_err_pct_disp[bestIdx] },
+    { label: "Velocity error (% of displacement)", primaryUnitsLabel: "% of typical displacement", vals: DATA.val_vel_err_pct_disp[bestIdx] },
+    { label: "Spin error (% of displacement)", primaryUnitsLabel: "% of typical displacement", vals: DATA.val_spin_err_pct_disp[bestIdx] },
+    { label: "Position error (% of ballistic)", primaryUnitsLabel: "% of ballistic baseline", vals: DATA.val_pos_err_pct_ballistic[bestIdx] },
+    { label: "Velocity error (% of ballistic)", primaryUnitsLabel: "% of ballistic baseline", vals: DATA.val_vel_err_pct_ballistic[bestIdx] },
+    { label: "Spin error (% of ballistic)", primaryUnitsLabel: "% of ballistic baseline", vals: DATA.val_spin_err_pct_ballistic[bestIdx] },
+  ];
+  _renderBestTable(rows, horizonLabels);
+}
+
+function _renderBestTable(rows, horizonLabels) {
+  const table = document.getElementById("bestTable");
+  table.innerHTML = `
+    <thead>
+      <tr>
+        <th>metric (val)</th>
+        <th>units</th>
+        ${horizonLabels.map(l => `<th>${l}</th>`).join("")}
+      </tr>
+    </thead>
+    <tbody>
+      ${rows.map(row => `
+        <tr>
+          <td>${row.label}</td>
+          <td>${row.primaryUnitsLabel ?? "normalized"}</td>
+          ${row.vals.map(v => `<td>${fmt(v, 4)}</td>`).join("")}
+        </tr>
+        ${row.scale ? `
+        <tr>
+          <td></td>
+          <td>${row.unitLabel}</td>
+          ${row.vals.map(v => `<td>${fmt(v * row.scale, row.unitDigits)}</td>`).join("")}
+        </tr>
+        ` : ""}
+      `).join("")}
+    </tbody>
+  `;
+}
+
+function buildExamplesTable() {
+  const examples = DATA.val_examples || [];
+  const table = document.getElementById("examplesTable");
+  if (examples.length === 0) {
+    document.getElementById("examplesPanel").style.display = "none";
+    return;
+  }
+  const rowDefs = [
+    ["input", "input"],
+    ["pred", "pred"],
+    ["target", "target"],
+  ];
+  table.innerHTML = `
+    <thead>
+      <tr>
+        <th>episode</th>
+        <th>horizon</th>
+        <th>row</th>
+        <th>values</th>
+      </tr>
+    </thead>
+    <tbody>
+      ${examples.map((ex, i) => rowDefs.map(([key, label], r) => `
+        <tr class="ex-group-${i % 2}${r === 0 ? ' ex-first' : ''}">
+          <td>${r === 0 ? ex.episode_idx : ""}</td>
+          <td>${r === 0 ? ex.horizon_s + "s" : ""}</td>
+          <td>${label}</td>
+          <td class="desc">${ex[key]}</td>
+        </tr>
+      `).join("")).join("")}
+    </tbody>
+  `;
+}
+
+function buildFooter() {
+  const cfg = DATA.config_snapshot;
+  const ns = DATA.config_namespace || "physics_pretrain.ball";
+  const extra = "spin_active_frac" in cfg ? `, spin_active_frac=${cfg.spin_active_frac ?? "0.35 (default)"}` : "";
+  document.getElementById("footer").innerHTML = `
+    <span class="mono">${ns}</span> — hidden_dim=${cfg.hidden_dim}, latent_dim=${cfg.latent_dim},
+    lr=${cfg.lr}, batch_size=${cfg.batch_size}${extra},
+    out_of_bounds_start_frac=${cfg.out_of_bounds_start_frac}
+    <span>Dashed lines = chance-level baseline (ln 2 ≈ 0.693) on the BCE panels; the vertical marker is the restored best-val epoch.</span>
+  `;
+}
+
+document.getElementById("mainTitle").textContent = DATA.title ? `${DATA.title} Report` : "Ball Dynamics Encoder — Training Report";
+document.title = DATA.title || "Ball Dynamics Training";
+
+const bestIdx = buildHeader();
+buildPanels(bestIdx);
+buildBestTable(bestIdx);
+buildExamplesTable();
+buildFooter();
+
+window.addEventListener("resize", () => buildPanels(bestIdx));
+</script>
+</body>
+</html>

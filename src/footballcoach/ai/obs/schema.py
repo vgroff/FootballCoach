@@ -33,13 +33,13 @@ class PlayerFeatures:
     offset divided by pitch half-dimensions so values stay ≈[-1, 1].
     """
     # --- Position (relative to observing player) ---
-    rel_dx: float = 0.0          # (other.x - self.x) / (pitch.length_m / 2)
-    rel_dy: float = 0.0          # (other.y - self.y) / (pitch.width_m / 2)
+    rel_dx: float = 0.0          # (other.x - self.x) / (half_diag)
+    rel_dy: float = 0.0          # (other.y - self.y) / (half_diag)
     distance_m: float = 0.0      # Euclidean 2D distance / pitch_half_diagonal, redundant but aids learning
 
     # --- Ball position and relative velocity (relative to this player) ---
-    ball_rel_dx: float = 0.0        # (ball.x - player.x) / (pitch.length_m / 2)
-    ball_rel_dy: float = 0.0        # (ball.y - player.y) / (pitch.width_m / 2)
+    ball_rel_dx: float = 0.0        # (ball.x - player.x) / (half_diag)
+    ball_rel_dy: float = 0.0        # (ball.y - player.y) / (half_diag)
     ball_distance_m: float = 0.0    # 2D distance to ball / pitch_half_diagonal
     ball_vel_rel_x: float = 0.0     # (ball.vx - player.vx) / pitch_half_diagonal
     ball_vel_rel_y: float = 0.0     # (ball.vy - player.vy) / pitch_half_diagonal

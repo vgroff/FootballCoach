@@ -1,1089 +1,500 @@
-2026-08-18 11:18:42,540 WARNING --checkpoint and --data both given: using --data as the dataset (no live rollout will be collected) and --checkpoint only to initialize decision_net/value_net's weights -- i.e. warm-starting value fitting from a trained checkpoint against a pre-recorded dataset instead of a fresh rollout.
-2026-08-18 11:18:42,655 INFO Checkpoint checkpoints/longterm/checkpoint_vvgood_immobile.pt: separate_value_net=True (auto-detected)
-2026-08-18 11:18:42,685 WARNING execution_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 11:18:42,687 WARNING value_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 11:18:42,687 INFO Loaded checkpoint: checkpoints/longterm/checkpoint_vvgood_immobile.pt (step 6015060)
-2026-08-18 11:18:42,690 INFO --reset-dir-log-std: reset move_dir_log_std/kick_dir_log_std to config init values before rollout collection.
-2026-08-18 11:18:43,049 INFO Loading 25041 demonstration file(s) from demonstrations/phase1_neural_vvgood
-2026-08-18 11:50:46,663 WARNING --checkpoint and --data both given: using --data as the dataset (no live rollout will be collected) and --checkpoint only to initialize decision_net/value_net's weights -- i.e. warm-starting value fitting from a trained checkpoint against a pre-recorded dataset instead of a fresh rollout.
-2026-08-18 11:50:46,818 INFO Checkpoint checkpoints/longterm/checkpoint_vvgood_immobile.pt: separate_value_net=True (auto-detected)
-2026-08-18 11:50:46,851 WARNING execution_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 11:50:46,852 WARNING value_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 11:50:46,852 INFO Loaded checkpoint: checkpoints/longterm/checkpoint_vvgood_immobile.pt (step 6015060)
-2026-08-18 11:50:46,855 INFO --reset-dir-log-std: reset move_dir_log_std/kick_dir_log_std to config init values before rollout collection.
-2026-08-18 11:50:47,267 INFO Loading 25041 demonstration file(s) from demonstrations/phase1_neural_vvgood
-2026-08-18 11:53:18,500 INFO Dataset: 11,124,006 steps loaded
-2026-08-18 11:53:18,536 INFO Loaded 11,124,006 rows total
-2026-08-18 11:53:18,540 INFO has_rewards=True
-2026-08-18 11:53:18,735 INFO valid_indices(): 5,564,872 rows (50.0% of total)
-2026-08-18 11:53:21,778 INFO Returns over ALL rows: mean=3.784 std=1.388 min=-4.000 max=34.657
-2026-08-18 11:53:21,794 INFO Returns over valid_indices(): mean=3.785 std=1.394
-2026-08-18 11:53:25,667 INFO --- Dataset distribution (11,124,006 rows, 200304 episodes) ---
-2026-08-18 11:53:25,713 INFO   self.ai_type == rules: 0.0%
-2026-08-18 11:53:25,750 INFO   self.ai_type == immobile: 50.0%
-2026-08-18 11:53:25,786 INFO   self.ai_type == neural: 50.0%
-2026-08-18 11:53:25,820 INFO   opponent.ai_type == rules: 0.0%
-2026-08-18 11:53:25,860 INFO   opponent.ai_type == immobile: 50.0%
-2026-08-18 11:53:25,898 INFO   opponent.ai_type == neural: 50.0%
-2026-08-18 11:53:26,622 INFO   valid rows: kick_this_tick rate=0.00%  tackle_attempt rate=0.75%
-2026-08-18 11:53:26,628 INFO   dones=1 rows: 400,608  |  zero-reward rows: 10,410,340 (93.6%)
-2026-08-18 11:53:26,891 INFO   return percentiles (all rows): p10=2.40  p50=3.83  p90=5.45
-2026-08-18 11:53:34,456 INFO --- Reward component breakdown (all episodes, 400608 episode(s)) ---
-2026-08-18 11:53:34,456 INFO   component           mean      std       min       max
-2026-08-18 11:53:34,524 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:34,594 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:34,667 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:34,739 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:34,821 INFO   get_possession    +0.932    0.974    +0.000    +6.000
-2026-08-18 11:53:34,895 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:34,955 INFO   lose_possession    -0.008    0.121    -3.600    +0.000
-2026-08-18 11:53:35,013 INFO   ball_out          -0.027    0.327    -4.000    +0.000
-2026-08-18 11:53:35,079 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:35,145 INFO   box_possession    +1.828    0.560    +0.000    +2.000
-2026-08-18 11:53:35,214 INFO   speed_bonus       +2.095    0.927    -0.023    +3.985
-2026-08-18 11:53:35,275 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:35,345 INFO   timeout           -0.003    0.052    -1.000    +0.000
-2026-08-18 11:53:35,408 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:35,466 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:35,543 INFO   stamina_penalty    -0.072    0.034    -0.157    +0.000
-2026-08-18 11:53:38,263 INFO --- Reward component breakdown (outcome=ball_out, 2698 episode(s)) ---
-2026-08-18 11:53:38,263 INFO   component           mean      std       min       max
-2026-08-18 11:53:38,264 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,264 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,264 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,265 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,265 INFO   get_possession    +0.950    0.747    +0.000    +4.000
-2026-08-18 11:53:38,265 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,265 INFO   lose_possession    -0.002    0.060    -1.800    +0.000
-2026-08-18 11:53:38,265 INFO   ball_out          -4.000    0.000    -4.000    -4.000
-2026-08-18 11:53:38,266 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,266 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,266 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,266 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,267 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,267 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,267 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:38,267 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,058 INFO --- Reward component breakdown (outcome=invalid, 30620 episode(s)) ---
-2026-08-18 11:53:41,058 INFO   component           mean      std       min       max
-2026-08-18 11:53:41,066 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,073 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,080 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,086 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,092 INFO   get_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,101 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,110 INFO   lose_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,116 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,127 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,136 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,145 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,152 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,164 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,172 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,180 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:41,189 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:43,590 INFO --- Reward component breakdown (outcome=loss, 0 episode(s)) ---
-2026-08-18 11:53:45,960 INFO --- Reward component breakdown (outcome=timeout, 1074 episode(s)) ---
-2026-08-18 11:53:45,960 INFO   component           mean      std       min       max
-2026-08-18 11:53:45,961 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,961 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,962 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,962 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,962 INFO   get_possession    +1.063    1.181    +0.000    +6.000
-2026-08-18 11:53:45,962 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,962 INFO   lose_possession    -0.124    0.462    -3.600    +0.000
-2026-08-18 11:53:45,963 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,963 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,963 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,963 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,963 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,963 INFO   timeout           -1.000    0.000    -1.000    -1.000
-2026-08-18 11:53:45,963 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,963 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 11:53:45,964 INFO   stamina_penalty    -0.088    0.029    -0.154    -0.023
-2026-08-18 11:53:51,236 INFO --- MC returns by outcome (all rows, 11,124,006 rows) ---
-2026-08-18 11:53:51,447 INFO   ball_out     n= 52,878  mean=-2.240  std=0.728  min=-4.000  max=-0.226
-2026-08-18 11:53:51,571 INFO   invalid      n=417,414  mean=+0.000  std=0.000  min=+0.000  max=+0.000
-2026-08-18 11:53:51,696 INFO   timeout      n= 72,212  mean=+0.233  std=0.848  min=-2.754  max=+1.547
-2026-08-18 11:53:51,881 INFO   win          n=10,581,502  mean=+3.988  std=1.069  min=-0.316  max=+34.657
-2026-08-18 11:53:58,372 INFO --- Episode total reward by outcome (all rows, 200304 episode(s)) ---
-2026-08-18 11:53:58,408 INFO   ball_out     n= 1,349  mean=-2.551  std=0.593  min=-4.000  max=-1.800
-2026-08-18 11:53:58,409 INFO   invalid      n=15,310  mean=+0.000  std=0.000  min=+0.000  max=+0.000
-2026-08-18 11:53:58,410 INFO   timeout      n=   537  mean=+0.783  std=0.510  min=-1.119  max=+1.335
-2026-08-18 11:53:58,411 INFO   win          n=183,108  mean=+6.128  std=0.663  min=+2.963  max=+35.431
-2026-08-18 11:54:01,465 INFO Train/val split (valid_only=True): 4,452,750 train rows across 160243 episodes  |  1,112,122 val rows across 40061 episodes
-2026-08-18 11:54:06,124 INFO --- Linear regression baseline (top_speed, ball_dist, ball_to_box, time_remaining) ---
-2026-08-18 11:54:06,943 INFO   [all outcomes] n_train=4,452,750  n_val=1,112,122  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.323, -4.054, -1.877, 4.45, 1.464]
-    train_rmse=1.1243 (norm=0.8073)  val_rmse=1.1369 (norm=0.8164)
-2026-08-18 11:54:11,246 INFO   [win outcomes only] n_train=4,235,005  n_val=1,058,460  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.417, -2.092, -1.95, 4.526, 1.432]
-    train_rmse=0.6633 (norm=0.6156)  val_rmse=0.6650 (norm=0.6172)
-2026-08-18 11:54:12,833 INFO value_net: fresh separate value_net (--reset-separate-value-net)  total_params=281,340  trainable_params=281,340
-2026-08-18 11:54:12,844 INFO Fitting fresh separate value network: 100 epochs, lr=0.0002, weight_decay=1e-06, batch_size=1096, train_ret_std=1.393, outcome_reweight=False
-2026-08-18 12:06:01,608 INFO epoch   0/100 (baseline, no training yet)  train_rmse=3.9395 (norm=2.8290)  val_rmse=3.9435 (norm=2.8319)
-2026-08-18 12:06:01,608 INFO     opponent=immobile   train_rmse=3.9395 (n=4452750)  val_rmse=3.9435 (n=1112122)
-2026-08-18 12:06:01,608 INFO     outcome=ball_out      train_rmse=2.4203 (n=20546)  val_rmse=2.4196 (n=5921)
-2026-08-18 12:06:01,608 INFO     outcome=invalid       train_rmse=0.0889 (n=167260)  val_rmse=0.0888 (n=41447)
-2026-08-18 12:06:01,608 INFO     outcome=timeout       train_rmse=0.8697 (n=29939)  val_rmse=0.8914 (n=6294)
-2026-08-18 12:06:01,608 INFO     outcome=win           train_rmse=4.0353 (n=4235005)  val_rmse=4.0376 (n=1058460)
-2026-08-18 15:38:56,103 WARNING --checkpoint and --data both given: using --data as the dataset (no live rollout will be collected) and --checkpoint only to initialize decision_net/value_net's weights -- i.e. warm-starting value fitting from a trained checkpoint against a pre-recorded dataset instead of a fresh rollout.
-2026-08-18 15:38:56,211 INFO Checkpoint checkpoints/longterm/checkpoint_vvgood_immobile.pt: separate_value_net=True (auto-detected)
-2026-08-18 15:38:56,245 WARNING execution_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 15:38:56,248 WARNING value_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 15:38:56,248 INFO Loaded checkpoint: checkpoints/longterm/checkpoint_vvgood_immobile.pt (step 6015060)
-2026-08-18 15:38:56,253 INFO --reset-dir-log-std: reset move_dir_log_std/kick_dir_log_std to config init values before rollout collection.
-2026-08-18 15:38:56,256 INFO Loading 240 demonstration file(s) from demonstrations/phase1_neural_vvgood
-2026-08-18 15:39:58,876 INFO Dataset: 6,667,368 steps loaded
-2026-08-18 15:39:58,876 INFO Loaded 6,667,368 rows total
-2026-08-18 15:39:58,878 INFO has_rewards=True
-2026-08-18 15:39:58,946 INFO valid_indices(): 3,335,345 rows (50.0% of total)
-2026-08-18 15:40:01,266 INFO Returns over ALL rows: mean=0.823 std=3.238 min=-5.140 max=198.470
-2026-08-18 15:40:01,272 INFO Returns over valid_indices(): mean=3.743 std=1.308
-2026-08-18 15:40:03,563 INFO --- Dataset distribution (6,667,368 rows, 120000 episodes) ---
-2026-08-18 15:40:03,600 INFO   self.ai_type == rules: 0.0%
-2026-08-18 15:40:03,625 INFO   self.ai_type == immobile: 50.0%
-2026-08-18 15:40:03,651 INFO   self.ai_type == neural: 50.0%
-2026-08-18 15:40:03,687 INFO   opponent.ai_type == rules: 0.0%
-2026-08-18 15:40:03,716 INFO   opponent.ai_type == immobile: 50.0%
-2026-08-18 15:40:03,746 INFO   opponent.ai_type == neural: 50.0%
-2026-08-18 15:40:04,105 INFO   valid rows: kick_this_tick rate=0.00%  tackle_attempt rate=0.74%
-2026-08-18 15:40:04,109 INFO   dones=1 rows: 240,000  |  zero-reward rows: 6,337,944 (95.1%)
-2026-08-18 15:40:04,213 INFO   return percentiles (all rows): p10=-2.44  p50=0.00  p90=4.69
-2026-08-18 15:40:08,916 INFO --- Reward component breakdown (all episodes, 240000 episode(s)) ---
-2026-08-18 15:40:08,917 INFO   component           mean      std       min       max
-2026-08-18 15:40:08,953 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:09,013 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:09,082 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:09,153 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:09,218 INFO   get_possession    +0.950    1.024    +0.000   +10.000
-2026-08-18 15:40:09,271 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:09,320 INFO   lose_possession    -0.022    0.263    -7.200    +0.000
-2026-08-18 15:40:09,361 INFO   ball_out          -0.028    0.331    -4.000    +0.000
-2026-08-18 15:40:09,400 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:09,447 INFO   box_possession    +1.856    1.497    +0.000  +254.000
-2026-08-18 15:40:09,508 INFO   speed_bonus       +2.137    2.197    -0.023  +239.212
-2026-08-18 15:40:09,558 INFO   opponent_box      -2.289    0.695    -2.500    +0.000
-2026-08-18 15:40:09,601 INFO   timeout           -0.005    0.104    -2.000    +0.000
-2026-08-18 15:40:09,652 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:09,701 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:09,763 INFO   stamina_penalty    -0.122    0.067    -9.830    +0.000
-2026-08-18 15:40:11,422 INFO --- Reward component breakdown (outcome=ball_out, 1650 episode(s)) ---
-2026-08-18 15:40:11,422 INFO   component           mean      std       min       max
-2026-08-18 15:40:11,423 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,423 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,424 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,424 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,425 INFO   get_possession    +0.960    0.759    +0.000    +6.000
-2026-08-18 15:40:11,425 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,425 INFO   lose_possession    -0.009    0.177    -3.600    +0.000
-2026-08-18 15:40:11,425 INFO   ball_out          -4.000    0.000    -4.000    -4.000
-2026-08-18 15:40:11,425 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,426 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,426 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,426 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,426 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,426 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,427 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:11,427 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,127 INFO --- Reward component breakdown (outcome=invalid, 17940 episode(s)) ---
-2026-08-18 15:40:13,127 INFO   component           mean      std       min       max
-2026-08-18 15:40:13,132 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,139 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,147 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,152 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,161 INFO   get_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,167 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,175 INFO   lose_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,179 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,183 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,187 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,195 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,202 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,208 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,214 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,218 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:13,226 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:14,651 INFO --- Reward component breakdown (outcome=loss, 0 episode(s)) ---
-2026-08-18 15:40:16,045 INFO --- Reward component breakdown (outcome=timeout, 654 episode(s)) ---
-2026-08-18 15:40:16,045 INFO   component           mean      std       min       max
-2026-08-18 15:40:16,045 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:16,045 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:16,045 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:16,045 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:16,046 INFO   get_possession    +1.232    1.575    +0.000   +10.000
-2026-08-18 15:40:16,046 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:16,046 INFO   lose_possession    -0.234    0.883    -7.200    +0.000
-2026-08-18 15:40:16,046 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:16,046 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:16,046 INFO   box_possession    +1.394   15.731    +0.000  +254.000
-2026-08-18 15:40:16,046 INFO   speed_bonus       +1.634   18.437    -0.023  +239.212
-2026-08-18 15:40:16,046 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:16,046 INFO   timeout           -1.997    0.055    -2.000    -1.000
-2026-08-18 15:40:16,046 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:16,047 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:40:16,047 INFO   stamina_penalty    -0.170    0.529    -9.830    -0.024
-2026-08-18 15:40:19,113 INFO --- MC returns by outcome (all rows, 6,667,368 rows) ---
-2026-08-18 15:40:19,248 INFO   ball_out     n= 32,987  mean=-1.413  std=1.452  min=-4.774  max=+1.000
-2026-08-18 15:40:19,331 INFO   invalid      n=246,666  mean=+0.000  std=0.069  min=-2.514  max=+6.836
-2026-08-18 15:40:19,405 INFO   timeout      n= 43,945  mean=-0.079  std=7.249  min=-4.307  max=+198.470
-2026-08-18 15:40:19,517 INFO   win          n=6,343,770  mean=+0.873  std=3.254  min=-5.140  max=+139.577
-2026-08-18 15:40:23,984 INFO --- Episode total reward by outcome (all rows, 120000 episode(s)) ---
-2026-08-18 15:40:24,007 INFO   ball_out     n=   825  mean=-3.063  std=0.288  min=-4.000  max=+1.000
-2026-08-18 15:40:24,008 INFO   invalid      n= 8,970  mean=+0.002  std=0.103  min=+0.000  max=+6.892
-2026-08-18 15:40:24,008 INFO   timeout      n=   327  mean=-0.360  std=0.698  min=-3.761  max=+2.773
-2026-08-18 15:40:24,009 INFO   win          n=109,878  mean=+5.187  std=0.799  min=-3.493  max=+36.081
-2026-08-18 15:40:25,939 INFO Train/val split (valid_only=True): 2,670,501 train rows across 96000 episodes  |  664,844 val rows across 24000 episodes
-2026-08-18 15:40:28,716 INFO --- Linear regression baseline (top_speed, ball_dist, ball_to_box, time_remaining) ---
-2026-08-18 15:40:29,418 INFO   [all outcomes] n_train=2,670,501  n_val=664,844  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.361, -4.124, -1.79, 4.009, 1.689]
-    train_rmse=1.0575 (norm=0.8102)  val_rmse=1.0700 (norm=0.8198)
-2026-08-18 15:40:32,069 INFO   [win outcomes only] n_train=2,542,251  n_val=631,216  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.379, -2.201, -1.842, 4.021, 1.757]
-    train_rmse=0.5165 (norm=0.5571)  val_rmse=0.5170 (norm=0.5576)
-2026-08-18 15:40:33,200 INFO value_net: fresh separate value_net (--reset-separate-value-net)  total_params=281,340  trainable_params=281,340
-2026-08-18 15:40:33,205 INFO Fitting fresh separate value network: 100 epochs, lr=0.0002, weight_decay=1e-06, batch_size=3096, train_ret_std=1.305, outcome_reweight=False
-2026-08-18 15:51:38,006 WARNING --checkpoint and --data both given: using --data as the dataset (no live rollout will be collected) and --checkpoint only to initialize decision_net/value_net's weights -- i.e. warm-starting value fitting from a trained checkpoint against a pre-recorded dataset instead of a fresh rollout.
-2026-08-18 15:51:38,128 INFO Checkpoint checkpoints/longterm/checkpoint_vvgood_immobile.pt: separate_value_net=True (auto-detected)
-2026-08-18 15:51:38,160 WARNING execution_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 15:51:38,162 WARNING value_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 15:51:38,162 INFO Loaded checkpoint: checkpoints/longterm/checkpoint_vvgood_immobile.pt (step 6015060)
-2026-08-18 15:51:38,165 INFO --reset-dir-log-std: reset move_dir_log_std/kick_dir_log_std to config init values before rollout collection.
-2026-08-18 15:51:38,167 INFO Loading 240 demonstration file(s) from demonstrations/phase1_neural_vvgood
-2026-08-18 15:52:31,732 INFO Dataset: 6,667,368 steps loaded
-2026-08-18 15:52:31,732 INFO Loaded 6,667,368 rows total
-2026-08-18 15:52:31,734 INFO has_rewards=True
-2026-08-18 15:52:31,880 INFO valid_indices(): 3,335,345 rows (50.0% of total)
-2026-08-18 15:52:34,167 INFO Returns over ALL rows: mean=0.823 std=3.238 min=-5.140 max=198.470
-2026-08-18 15:52:34,173 INFO Returns over valid_indices(): mean=3.743 std=1.308
-2026-08-18 15:52:36,458 INFO --- Dataset distribution (6,667,368 rows, 120000 episodes) ---
-2026-08-18 15:52:36,487 INFO   self.ai_type == rules: 0.0%
-2026-08-18 15:52:36,517 INFO   self.ai_type == immobile: 50.0%
-2026-08-18 15:52:36,544 INFO   self.ai_type == neural: 50.0%
-2026-08-18 15:52:36,582 INFO   opponent.ai_type == rules: 0.0%
-2026-08-18 15:52:36,606 INFO   opponent.ai_type == immobile: 50.0%
-2026-08-18 15:52:36,631 INFO   opponent.ai_type == neural: 50.0%
-2026-08-18 15:52:37,032 INFO   valid rows: kick_this_tick rate=0.00%  tackle_attempt rate=0.74%
-2026-08-18 15:52:37,036 INFO   dones=1 rows: 240,000  |  zero-reward rows: 6,337,944 (95.1%)
-2026-08-18 15:52:37,135 INFO   return percentiles (all rows): p10=-2.44  p50=0.00  p90=4.69
-2026-08-18 15:52:40,699 INFO --- Reward component breakdown (all episodes, 120000 episode(s)) ---
-2026-08-18 15:52:40,699 INFO   component           mean      std       min       max
-2026-08-18 15:52:40,718 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:40,747 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:40,786 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:40,816 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:40,845 INFO   get_possession    +1.899    0.680    +0.000   +10.000
-2026-08-18 15:52:40,865 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:40,887 INFO   lose_possession    -0.045    0.371    -7.200    +0.000
-2026-08-18 15:52:40,907 INFO   ball_out          -0.055    0.661    -8.000    +0.000
-2026-08-18 15:52:40,928 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:40,951 INFO   box_possession    +3.711    2.256    +0.000  +256.000
-2026-08-18 15:52:40,972 INFO   speed_bonus       +4.274    3.347    -0.045  +239.189
-2026-08-18 15:52:41,013 INFO   opponent_box      -4.578    1.390    -5.000    +0.000
-2026-08-18 15:52:41,034 INFO   timeout           -0.011    0.208    -4.000    +0.000
-2026-08-18 15:52:41,065 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:41,088 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:41,112 INFO   stamina_penalty    -0.244    0.120    -9.988    +0.000
-2026-08-18 15:52:43,125 INFO --- Reward component breakdown (outcome=ball_out, 825 episode(s)) ---
-2026-08-18 15:52:43,125 INFO   component           mean      std       min       max
-2026-08-18 15:52:43,125 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,125 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,125 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,125 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,126 INFO   get_possession    +1.920    0.520    +0.000    +6.000
-2026-08-18 15:52:43,126 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,126 INFO   lose_possession    -0.017    0.250    -3.600    +0.000
-2026-08-18 15:52:43,126 INFO   ball_out          -8.000    0.000    -8.000    -8.000
-2026-08-18 15:52:43,126 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,126 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,126 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,126 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,126 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,126 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,127 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:43,127 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,130 INFO --- Reward component breakdown (outcome=invalid, 8970 episode(s)) ---
-2026-08-18 15:52:45,130 INFO   component           mean      std       min       max
-2026-08-18 15:52:45,132 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,133 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,134 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,135 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,136 INFO   get_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,137 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,138 INFO   lose_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,139 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,140 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,141 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,142 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,145 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,147 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,149 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,151 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:45,152 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:46,995 INFO --- Reward component breakdown (outcome=loss, 0 episode(s)) ---
-2026-08-18 15:52:48,825 INFO --- Reward component breakdown (outcome=timeout, 327 episode(s)) ---
-2026-08-18 15:52:48,825 INFO   component           mean      std       min       max
-2026-08-18 15:52:48,826 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:48,826 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:48,826 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:48,826 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:48,826 INFO   get_possession    +2.465    1.400    +0.000   +10.000
-2026-08-18 15:52:48,826 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:48,826 INFO   lose_possession    -0.468    1.206    -7.200    +0.000
-2026-08-18 15:52:48,826 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:48,826 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:48,826 INFO   box_possession    +2.789   22.229    +0.000  +256.000
-2026-08-18 15:52:48,826 INFO   speed_bonus       +3.268   25.971    +0.000  +239.189
-2026-08-18 15:52:48,826 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:48,827 INFO   timeout           -3.994    0.110    -4.000    -2.000
-2026-08-18 15:52:48,827 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:48,827 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 15:52:48,827 INFO   stamina_penalty    -0.341    0.752    -9.988    -0.048
-2026-08-18 15:52:51,893 INFO --- MC returns by outcome (all rows, 6,667,368 rows) ---
-2026-08-18 15:52:52,019 INFO   ball_out     n= 32,987  mean=-1.413  std=1.452  min=-4.774  max=+1.000
-2026-08-18 15:52:52,095 INFO   invalid      n=246,666  mean=+0.000  std=0.069  min=-2.514  max=+6.836
-2026-08-18 15:52:52,171 INFO   timeout      n= 43,945  mean=-0.079  std=7.249  min=-4.307  max=+198.470
-2026-08-18 15:52:52,313 INFO   win          n=6,343,770  mean=+0.873  std=3.254  min=-5.140  max=+139.577
-2026-08-18 15:52:56,756 INFO --- Episode total reward by outcome (all rows, 120000 episode(s)) ---
-2026-08-18 15:52:56,778 INFO   ball_out     n=   825  mean=-3.063  std=0.288  min=-4.000  max=+1.000
-2026-08-18 15:52:56,778 INFO   invalid      n= 8,970  mean=+0.002  std=0.103  min=+0.000  max=+6.892
-2026-08-18 15:52:56,779 INFO   timeout      n=   327  mean=-0.360  std=0.698  min=-3.761  max=+2.773
-2026-08-18 15:52:56,780 INFO   win          n=109,878  mean=+5.187  std=0.799  min=-3.493  max=+36.081
-2026-08-18 15:52:58,623 INFO Train/val split (valid_only=True): 2,670,501 train rows across 96000 episodes  |  664,844 val rows across 24000 episodes
-2026-08-18 15:53:01,456 INFO --- Linear regression baseline (top_speed, ball_dist, ball_to_box, time_remaining) ---
-2026-08-18 15:53:02,293 INFO   [all outcomes] n_train=2,670,501  n_val=664,844  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.361, -4.124, -1.79, 4.009, 1.689]
-    train_rmse=1.0575 (norm=0.8102)  val_rmse=1.0700 (norm=0.8198)
-2026-08-18 15:53:05,133 INFO   [win outcomes only] n_train=2,542,251  n_val=631,216  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.379, -2.201, -1.842, 4.021, 1.757]
-    train_rmse=0.5165 (norm=0.5571)  val_rmse=0.5170 (norm=0.5576)
-2026-08-18 15:53:06,204 INFO value_net: fresh separate value_net (--reset-separate-value-net)  total_params=281,340  trainable_params=281,340
-2026-08-18 15:53:06,209 INFO Fitting fresh separate value network: 100 epochs, lr=0.0002, weight_decay=1e-06, batch_size=3096, train_ret_std=1.305, outcome_reweight=False
-2026-08-18 16:19:38,055 WARNING --checkpoint and --data both given: using --data as the dataset (no live rollout will be collected) and --checkpoint only to initialize decision_net/value_net's weights -- i.e. warm-starting value fitting from a trained checkpoint against a pre-recorded dataset instead of a fresh rollout.
-2026-08-18 16:19:38,156 INFO Checkpoint checkpoints/longterm/checkpoint_vvgood_immobile.pt: separate_value_net=True (auto-detected)
-2026-08-18 16:19:38,187 WARNING execution_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 16:19:38,188 WARNING value_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 16:19:38,188 INFO Loaded checkpoint: checkpoints/longterm/checkpoint_vvgood_immobile.pt (step 6015060)
-2026-08-18 16:19:38,191 INFO --reset-dir-log-std: reset move_dir_log_std/kick_dir_log_std to config init values before rollout collection.
-2026-08-18 16:19:38,191 INFO Loading 5 demonstration file(s) from demonstrations/phase1_neural_vvgood
-2026-08-18 16:19:38,700 INFO Dataset: 54,793 steps loaded
-2026-08-18 16:19:38,700 INFO Loaded 54,793 rows total
-2026-08-18 16:19:38,700 INFO has_rewards=True
-2026-08-18 16:19:38,701 INFO valid_indices(): 27,406 rows (50.0% of total)
-2026-08-18 16:19:38,721 INFO Returns over ALL rows: mean=0.802 std=3.097 min=-4.000 max=6.783
-2026-08-18 16:19:38,721 INFO Returns over valid_indices(): mean=3.717 std=1.368
-2026-08-18 16:19:38,750 INFO --- Dataset distribution (54,793 rows, 1000 episodes) ---
-2026-08-18 16:19:38,752 INFO   self.ai_type == rules: 0.0%
-2026-08-18 16:19:38,752 INFO   self.ai_type == immobile: 50.0%
-2026-08-18 16:19:38,753 INFO   self.ai_type == neural: 50.0%
-2026-08-18 16:19:38,753 INFO   opponent.ai_type == rules: 0.0%
-2026-08-18 16:19:38,753 INFO   opponent.ai_type == immobile: 50.0%
-2026-08-18 16:19:38,753 INFO   opponent.ai_type == neural: 50.0%
-2026-08-18 16:19:38,754 INFO   valid rows: kick_this_tick rate=0.00%  tackle_attempt rate=0.76%
-2026-08-18 16:19:38,754 INFO   dones=1 rows: 2,000  |  zero-reward rows: 52,081 (95.1%)
-2026-08-18 16:19:38,766 INFO   return percentiles (valid rows): p10=2.49  p50=3.81  p90=5.24
-2026-08-18 16:19:38,808 INFO --- Reward component breakdown (all episodes, 1000 episode(s)) ---
-2026-08-18 16:19:38,809 INFO   component           mean      std       min       max
-2026-08-18 16:19:38,809 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,810 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,810 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,810 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,810 INFO   get_possession    +0.942    0.344    +0.000    +3.000
-2026-08-18 16:19:38,810 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,811 INFO   lose_possession    -0.022    0.176    -1.800    +0.000
-2026-08-18 16:19:38,811 INFO   ball_out          -0.032    0.356    -4.000    +0.000
-2026-08-18 16:19:38,811 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,811 INFO   box_possession    +1.814    0.581    +0.000    +2.000
-2026-08-18 16:19:38,811 INFO   speed_bonus       +2.099    0.963    +0.000    +3.850
-2026-08-18 16:19:38,811 INFO   opponent_box      -2.268    0.726    -2.500    +0.000
-2026-08-18 16:19:38,812 INFO   timeout           -0.006    0.109    -2.000    +0.000
-2026-08-18 16:19:38,812 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,812 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,812 INFO   stamina_penalty    -0.118    0.051    -0.221    +0.000
-2026-08-18 16:19:38,828 INFO --- Reward component breakdown (outcome=ball_out, 8 episode(s)) ---
-2026-08-18 16:19:38,829 INFO   component           mean      std       min       max
-2026-08-18 16:19:38,829 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,829 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,829 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,829 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,829 INFO   get_possession    +0.875    0.331    +0.000    +1.000
-2026-08-18 16:19:38,829 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,829 INFO   lose_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,829 INFO   ball_out          -4.000    0.000    -4.000    -4.000
-2026-08-18 16:19:38,829 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,829 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,829 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,830 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,830 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,830 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,830 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,830 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,843 INFO --- Reward component breakdown (outcome=invalid, 82 episode(s)) ---
-2026-08-18 16:19:38,843 INFO   component           mean      std       min       max
-2026-08-18 16:19:38,843 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,843 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   get_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   lose_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,844 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,845 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,857 INFO --- Reward component breakdown (outcome=loss, 0 episode(s)) ---
-2026-08-18 16:19:38,869 INFO --- Reward component breakdown (outcome=timeout, 3 episode(s)) ---
-2026-08-18 16:19:38,869 INFO   component           mean      std       min       max
-2026-08-18 16:19:38,869 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,869 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,869 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,869 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,869 INFO   get_possession    +1.000    0.000    +1.000    +1.000
-2026-08-18 16:19:38,870 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,870 INFO   lose_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,870 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,870 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,870 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,870 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,870 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,870 INFO   timeout           -2.000    0.000    -2.000    -2.000
-2026-08-18 16:19:38,870 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,870 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 16:19:38,870 INFO   stamina_penalty    -0.131    0.014    -0.146    -0.113
-2026-08-18 16:19:38,888 INFO --- MC returns by outcome (valid rows, 27,406 rows) ---
-2026-08-18 16:19:38,889 INFO   ball_out     n=    181  mean=-2.834  std=0.484  min=-4.000  max=-2.023
-2026-08-18 16:19:38,889 INFO   invalid      n=  1,159  mean=+0.000  std=0.000  min=+0.000  max=+0.000
-2026-08-18 16:19:38,890 INFO   timeout      n=    201  mean=-0.245  std=0.482  min=-1.104  max=+0.081
-2026-08-18 16:19:38,891 INFO   win          n= 25,865  mean=+3.960  std=0.937  min=+0.405  max=+6.783
-2026-08-18 16:19:38,925 INFO --- Episode total reward by outcome (valid rows, 1000 episode(s)) ---
-2026-08-18 16:19:38,926 INFO   ball_out     n=     8  mean=-3.125  std=0.331  min=-4.000  max=-3.000
-2026-08-18 16:19:38,926 INFO   invalid      n=    82  mean=+0.000  std=0.000  min=+0.000  max=+0.000
-2026-08-18 16:19:38,926 INFO   timeout      n=     3  mean=-0.084  std=0.014  min=-0.104  max=-0.071
-2026-08-18 16:19:38,926 INFO   win          n=   907  mean=+5.209  std=0.777  min=+1.822  max=+6.783
-2026-08-18 16:19:38,941 INFO Train/val split (valid_only=True): 21,991 train rows across 800 episodes  |  5,415 val rows across 200 episodes
-2026-08-18 16:19:38,966 INFO --- Linear regression baseline (top_speed, ball_dist, ball_to_box, time_remaining) ---
-2026-08-18 16:19:38,970 INFO   [all outcomes] n_train=21,991  n_val=5,415  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[-0.053, -4.377, -1.766, 4.061, 1.94]
-    train_rmse=1.1188 (norm=0.8107)  val_rmse=1.1086 (norm=0.8033)
-2026-08-18 16:19:38,992 INFO   [win outcomes only] n_train=20,720  n_val=5,145  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[-0.281, -2.005, -1.838, 3.938, 2.315]
-    train_rmse=0.4953 (norm=0.5256)  val_rmse=0.4604 (norm=0.4886)
-2026-08-18 16:19:40,215 INFO value_net: fresh separate value_net (--reset-separate-value-net)  total_params=281,340  trainable_params=281,340
-2026-08-18 16:19:40,215 INFO Fitting fresh separate value network: 100 epochs, lr=0.0002, weight_decay=1e-06, batch_size=3096, train_ret_std=1.380, outcome_reweight=False
-2026-08-18 16:19:45,014 INFO epoch   0/100 (baseline, no training yet)  train_rmse=3.8688 (norm=2.8034)  val_rmse=3.8587 (norm=2.7960)
-2026-08-18 16:19:45,014 INFO     opponent=immobile   train_rmse=3.8688 (n=21991)  val_rmse=3.8587 (n=5415)
-2026-08-18 16:19:45,014 INFO     outcome=ball_out      train_rmse=2.9948 (n=143)  val_rmse=2.8548 (n=38)
-2026-08-18 16:19:45,014 INFO     outcome=invalid       train_rmse=0.0893 (n=927)  val_rmse=0.0875 (n=232)
-2026-08-18 16:19:45,014 INFO     outcome=timeout       train_rmse=0.6018 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:19:45,014 INFO     outcome=win           train_rmse=3.9775 (n=20720)  val_rmse=3.9510 (n=5145)
-2026-08-18 16:19:53,471 INFO epoch   1/100  train_rmse=3.7658 (norm=2.7288)  val_rmse=3.5615 (norm=2.5807)
-2026-08-18 16:19:53,471 INFO     opponent=immobile   train_rmse=3.7658 (n=21991)  val_rmse=3.5615 (n=5415)
-2026-08-18 16:19:53,471 INFO     outcome=ball_out      train_rmse=3.0959 (n=143)  val_rmse=3.1199 (n=38)
-2026-08-18 16:19:53,472 INFO     outcome=invalid       train_rmse=0.2107 (n=927)  val_rmse=0.3902 (n=232)
-2026-08-18 16:19:53,472 INFO     outcome=timeout       train_rmse=0.6919 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:19:53,472 INFO     outcome=win           train_rmse=3.8702 (n=20720)  val_rmse=3.6430 (n=5145)
-2026-08-18 16:20:01,755 INFO epoch   2/100  train_rmse=3.3850 (norm=2.4528)  val_rmse=2.9263 (norm=2.1204)
-2026-08-18 16:20:01,755 INFO     opponent=immobile   train_rmse=3.3850 (n=21991)  val_rmse=2.9263 (n=5415)
-2026-08-18 16:20:01,755 INFO     outcome=ball_out      train_rmse=3.4573 (n=143)  val_rmse=3.7158 (n=38)
-2026-08-18 16:20:01,756 INFO     outcome=invalid       train_rmse=0.6156 (n=927)  val_rmse=1.0430 (n=232)
-2026-08-18 16:20:01,756 INFO     outcome=timeout       train_rmse=1.0452 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:20:01,756 INFO     outcome=win           train_rmse=3.4715 (n=20720)  val_rmse=2.9768 (n=5145)
-2026-08-18 16:20:09,493 INFO epoch   3/100  train_rmse=2.5488 (norm=1.8468)  val_rmse=1.7453 (norm=1.2647)
-2026-08-18 16:20:09,493 INFO     opponent=immobile   train_rmse=2.5488 (n=21991)  val_rmse=1.7453 (n=5415)
-2026-08-18 16:20:09,493 INFO     outcome=ball_out      train_rmse=4.3552 (n=143)  val_rmse=5.2132 (n=38)
-2026-08-18 16:20:09,493 INFO     outcome=invalid       train_rmse=1.5988 (n=927)  val_rmse=2.6128 (n=232)
-2026-08-18 16:20:09,493 INFO     outcome=timeout       train_rmse=2.0421 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:20:09,493 INFO     outcome=win           train_rmse=2.5708 (n=20720)  val_rmse=1.6424 (n=5145)
-2026-08-18 16:20:17,499 INFO epoch   4/100  train_rmse=1.6896 (norm=1.2243)  val_rmse=1.7070 (norm=1.2369)
-2026-08-18 16:20:17,499 INFO     opponent=immobile   train_rmse=1.6896 (n=21991)  val_rmse=1.7070 (n=5415)
-2026-08-18 16:20:17,499 INFO     outcome=ball_out      train_rmse=6.4679 (n=143)  val_rmse=7.1453 (n=38)
-2026-08-18 16:20:17,499 INFO     outcome=invalid       train_rmse=3.6781 (n=927)  val_rmse=4.6392 (n=232)
-2026-08-18 16:20:17,499 INFO     outcome=timeout       train_rmse=4.1140 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:20:17,499 INFO     outcome=win           train_rmse=1.4042 (n=20720)  val_rmse=1.3112 (n=5145)
-2026-08-18 16:20:25,086 INFO epoch   5/100  train_rmse=1.6155 (norm=1.1706)  val_rmse=1.4048 (norm=1.0179)
-2026-08-18 16:20:25,086 INFO     opponent=immobile   train_rmse=1.6155 (n=21991)  val_rmse=1.4048 (n=5415)
-2026-08-18 16:20:25,086 INFO     outcome=ball_out      train_rmse=7.2278 (n=143)  val_rmse=6.3828 (n=38)
-2026-08-18 16:20:25,086 INFO     outcome=invalid       train_rmse=4.5136 (n=927)  val_rmse=3.7508 (n=232)
-2026-08-18 16:20:25,087 INFO     outcome=timeout       train_rmse=4.6282 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:20:25,087 INFO     outcome=win           train_rmse=1.1358 (n=20720)  val_rmse=1.0685 (n=5145)
-2026-08-18 16:20:32,788 INFO epoch   6/100  train_rmse=1.4427 (norm=1.0454)  val_rmse=1.3223 (norm=0.9582)
-2026-08-18 16:20:32,788 INFO     opponent=immobile   train_rmse=1.4427 (n=21991)  val_rmse=1.3223 (n=5415)
-2026-08-18 16:20:32,789 INFO     outcome=ball_out      train_rmse=6.5015 (n=143)  val_rmse=6.7982 (n=38)
-2026-08-18 16:20:32,789 INFO     outcome=invalid       train_rmse=3.7508 (n=927)  val_rmse=3.8879 (n=232)
-2026-08-18 16:20:32,789 INFO     outcome=timeout       train_rmse=3.8122 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:20:32,789 INFO     outcome=win           train_rmse=1.0709 (n=20720)  val_rmse=0.9041 (n=5145)
-2026-08-18 16:20:41,012 INFO epoch   7/100  train_rmse=1.3646 (norm=0.9888)  val_rmse=1.2597 (norm=0.9128)
-2026-08-18 16:20:41,012 INFO     opponent=immobile   train_rmse=1.3646 (n=21991)  val_rmse=1.2597 (n=5415)
-2026-08-18 16:20:41,012 INFO     outcome=ball_out      train_rmse=6.6161 (n=143)  val_rmse=6.5680 (n=38)
-2026-08-18 16:20:41,012 INFO     outcome=invalid       train_rmse=3.7967 (n=927)  val_rmse=3.3620 (n=232)
-2026-08-18 16:20:41,012 INFO     outcome=timeout       train_rmse=3.9624 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:20:41,012 INFO     outcome=win           train_rmse=0.9365 (n=20720)  val_rmse=0.9175 (n=5145)
-2026-08-18 16:20:48,994 INFO epoch   8/100  train_rmse=1.2886 (norm=0.9337)  val_rmse=1.1726 (norm=0.8497)
-2026-08-18 16:20:48,994 INFO     opponent=immobile   train_rmse=1.2886 (n=21991)  val_rmse=1.1726 (n=5415)
-2026-08-18 16:20:48,994 INFO     outcome=ball_out      train_rmse=6.4162 (n=143)  val_rmse=7.0267 (n=38)
-2026-08-18 16:20:48,994 INFO     outcome=invalid       train_rmse=3.5809 (n=927)  val_rmse=3.2880 (n=232)
-2026-08-18 16:20:48,994 INFO     outcome=timeout       train_rmse=3.6396 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:20:48,994 INFO     outcome=win           train_rmse=0.8809 (n=20720)  val_rmse=0.7714 (n=5145)
-2026-08-18 16:20:57,042 INFO epoch   9/100  train_rmse=1.2054 (norm=0.8734)  val_rmse=1.1507 (norm=0.8338)
-2026-08-18 16:20:57,042 INFO     opponent=immobile   train_rmse=1.2054 (n=21991)  val_rmse=1.1507 (n=5415)
-2026-08-18 16:20:57,042 INFO     outcome=ball_out      train_rmse=6.1791 (n=143)  val_rmse=7.5111 (n=38)
-2026-08-18 16:20:57,042 INFO     outcome=invalid       train_rmse=3.4912 (n=927)  val_rmse=3.0121 (n=232)
-2026-08-18 16:20:57,042 INFO     outcome=timeout       train_rmse=3.1950 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:20:57,042 INFO     outcome=win           train_rmse=0.7964 (n=20720)  val_rmse=0.7535 (n=5145)
-2026-08-18 16:21:05,195 INFO epoch  10/100  train_rmse=1.1674 (norm=0.8459)  val_rmse=1.1302 (norm=0.8190)
-2026-08-18 16:21:05,195 INFO     opponent=immobile   train_rmse=1.1674 (n=21991)  val_rmse=1.1302 (n=5415)
-2026-08-18 16:21:05,195 INFO     outcome=ball_out      train_rmse=5.9318 (n=143)  val_rmse=7.1412 (n=38)
-2026-08-18 16:21:05,195 INFO     outcome=invalid       train_rmse=3.4700 (n=927)  val_rmse=2.9119 (n=232)
-2026-08-18 16:21:05,195 INFO     outcome=timeout       train_rmse=2.7745 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:21:05,195 INFO     outcome=win           train_rmse=0.7683 (n=20720)  val_rmse=0.7652 (n=5145)
-2026-08-18 16:21:13,197 INFO epoch  11/100  train_rmse=1.1384 (norm=0.8249)  val_rmse=1.1199 (norm=0.8115)
-2026-08-18 16:21:13,197 INFO     opponent=immobile   train_rmse=1.1384 (n=21991)  val_rmse=1.1199 (n=5415)
-2026-08-18 16:21:13,197 INFO     outcome=ball_out      train_rmse=5.8045 (n=143)  val_rmse=7.0635 (n=38)
-2026-08-18 16:21:13,197 INFO     outcome=invalid       train_rmse=3.4109 (n=927)  val_rmse=2.8795 (n=232)
-2026-08-18 16:21:13,197 INFO     outcome=timeout       train_rmse=2.7324 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:21:13,197 INFO     outcome=win           train_rmse=0.7416 (n=20720)  val_rmse=0.7600 (n=5145)
-2026-08-18 16:21:21,186 INFO epoch  12/100  train_rmse=1.1186 (norm=0.8106)  val_rmse=1.1070 (norm=0.8022)
-2026-08-18 16:21:21,187 INFO     opponent=immobile   train_rmse=1.1186 (n=21991)  val_rmse=1.1070 (n=5415)
-2026-08-18 16:21:21,187 INFO     outcome=ball_out      train_rmse=5.6853 (n=143)  val_rmse=7.1912 (n=38)
-2026-08-18 16:21:21,187 INFO     outcome=invalid       train_rmse=3.3196 (n=927)  val_rmse=2.9791 (n=232)
-2026-08-18 16:21:21,187 INFO     outcome=timeout       train_rmse=2.6674 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:21:21,187 INFO     outcome=win           train_rmse=0.7369 (n=20720)  val_rmse=0.7125 (n=5145)
-2026-08-18 16:21:29,279 INFO epoch  13/100  train_rmse=1.1084 (norm=0.8031)  val_rmse=1.1043 (norm=0.8002)
-2026-08-18 16:21:29,279 INFO     opponent=immobile   train_rmse=1.1084 (n=21991)  val_rmse=1.1043 (n=5415)
-2026-08-18 16:21:29,279 INFO     outcome=ball_out      train_rmse=5.5782 (n=143)  val_rmse=7.1448 (n=38)
-2026-08-18 16:21:29,279 INFO     outcome=invalid       train_rmse=3.2516 (n=927)  val_rmse=2.9020 (n=232)
-2026-08-18 16:21:29,279 INFO     outcome=timeout       train_rmse=2.6033 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:21:29,279 INFO     outcome=win           train_rmse=0.7418 (n=20720)  val_rmse=0.7257 (n=5145)
-2026-08-18 16:21:37,020 INFO epoch  14/100  train_rmse=1.0955 (norm=0.7938)  val_rmse=1.0999 (norm=0.7970)
-2026-08-18 16:21:37,020 INFO     opponent=immobile   train_rmse=1.0955 (n=21991)  val_rmse=1.0999 (n=5415)
-2026-08-18 16:21:37,020 INFO     outcome=ball_out      train_rmse=5.4991 (n=143)  val_rmse=7.1487 (n=38)
-2026-08-18 16:21:37,020 INFO     outcome=invalid       train_rmse=3.1967 (n=927)  val_rmse=2.9643 (n=232)
-2026-08-18 16:21:37,020 INFO     outcome=timeout       train_rmse=2.5162 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:21:37,020 INFO     outcome=win           train_rmse=0.7392 (n=20720)  val_rmse=0.7068 (n=5145)
-2026-08-18 16:21:44,913 INFO epoch  15/100  train_rmse=1.0872 (norm=0.7878)  val_rmse=1.1046 (norm=0.8004)
-2026-08-18 16:21:44,913 INFO     opponent=immobile   train_rmse=1.0872 (n=21991)  val_rmse=1.1046 (n=5415)
-2026-08-18 16:21:44,913 INFO     outcome=ball_out      train_rmse=5.5225 (n=143)  val_rmse=6.9548 (n=38)
-2026-08-18 16:21:44,913 INFO     outcome=invalid       train_rmse=3.2330 (n=927)  val_rmse=2.7165 (n=232)
-2026-08-18 16:21:44,914 INFO     outcome=timeout       train_rmse=2.5226 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:21:44,914 INFO     outcome=win           train_rmse=0.7175 (n=20720)  val_rmse=0.7709 (n=5145)
-2026-08-18 16:21:52,884 INFO epoch  16/100  train_rmse=1.0779 (norm=0.7811)  val_rmse=1.0854 (norm=0.7865)
-2026-08-18 16:21:52,884 INFO     opponent=immobile   train_rmse=1.0779 (n=21991)  val_rmse=1.0854 (n=5415)
-2026-08-18 16:21:52,884 INFO     outcome=ball_out      train_rmse=5.3263 (n=143)  val_rmse=6.9393 (n=38)
-2026-08-18 16:21:52,884 INFO     outcome=invalid       train_rmse=3.1480 (n=927)  val_rmse=2.8087 (n=232)
-2026-08-18 16:21:52,884 INFO     outcome=timeout       train_rmse=2.4501 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:21:52,884 INFO     outcome=win           train_rmse=0.7320 (n=20720)  val_rmse=0.7270 (n=5145)
-2026-08-18 16:22:01,050 INFO epoch  17/100  train_rmse=1.0675 (norm=0.7735)  val_rmse=1.0983 (norm=0.7959)
-2026-08-18 16:22:01,050 INFO     opponent=immobile   train_rmse=1.0675 (n=21991)  val_rmse=1.0983 (n=5415)
-2026-08-18 16:22:01,050 INFO     outcome=ball_out      train_rmse=5.3710 (n=143)  val_rmse=6.8424 (n=38)
-2026-08-18 16:22:01,050 INFO     outcome=invalid       train_rmse=3.1379 (n=927)  val_rmse=2.6735 (n=232)
-2026-08-18 16:22:01,050 INFO     outcome=timeout       train_rmse=2.4577 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:22:01,050 INFO     outcome=win           train_rmse=0.7150 (n=20720)  val_rmse=0.7756 (n=5145)
-2026-08-18 16:22:09,248 INFO epoch  18/100  train_rmse=1.0563 (norm=0.7654)  val_rmse=1.0918 (norm=0.7911)
-2026-08-18 16:22:09,248 INFO     opponent=immobile   train_rmse=1.0563 (n=21991)  val_rmse=1.0918 (n=5415)
-2026-08-18 16:22:09,248 INFO     outcome=ball_out      train_rmse=5.2463 (n=143)  val_rmse=6.8350 (n=38)
-2026-08-18 16:22:09,248 INFO     outcome=invalid       train_rmse=3.1302 (n=927)  val_rmse=2.6161 (n=232)
-2026-08-18 16:22:09,248 INFO     outcome=timeout       train_rmse=2.3217 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:22:09,248 INFO     outcome=win           train_rmse=0.7097 (n=20720)  val_rmse=0.7752 (n=5145)
-2026-08-18 16:22:17,376 INFO epoch  19/100  train_rmse=1.0468 (norm=0.7585)  val_rmse=1.0769 (norm=0.7803)
-2026-08-18 16:22:17,376 INFO     opponent=immobile   train_rmse=1.0468 (n=21991)  val_rmse=1.0769 (n=5415)
-2026-08-18 16:22:17,376 INFO     outcome=ball_out      train_rmse=5.1364 (n=143)  val_rmse=6.8474 (n=38)
-2026-08-18 16:22:17,376 INFO     outcome=invalid       train_rmse=3.0148 (n=927)  val_rmse=2.7427 (n=232)
-2026-08-18 16:22:17,376 INFO     outcome=timeout       train_rmse=2.3267 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:22:17,376 INFO     outcome=win           train_rmse=0.7223 (n=20720)  val_rmse=0.7315 (n=5145)
-2026-08-18 16:22:25,690 INFO epoch  20/100  train_rmse=1.0339 (norm=0.7492)  val_rmse=1.0796 (norm=0.7823)
-2026-08-18 16:22:25,690 INFO     opponent=immobile   train_rmse=1.0339 (n=21991)  val_rmse=1.0796 (n=5415)
-2026-08-18 16:22:25,690 INFO     outcome=ball_out      train_rmse=5.0771 (n=143)  val_rmse=6.9141 (n=38)
-2026-08-18 16:22:25,690 INFO     outcome=invalid       train_rmse=3.0040 (n=927)  val_rmse=2.7599 (n=232)
-2026-08-18 16:22:25,690 INFO     outcome=timeout       train_rmse=2.2783 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:22:25,690 INFO     outcome=win           train_rmse=0.7090 (n=20720)  val_rmse=0.7280 (n=5145)
-2026-08-18 16:22:33,632 INFO epoch  21/100  train_rmse=1.0343 (norm=0.7495)  val_rmse=1.0730 (norm=0.7775)
-2026-08-18 16:22:33,632 INFO     opponent=immobile   train_rmse=1.0343 (n=21991)  val_rmse=1.0730 (n=5415)
-2026-08-18 16:22:33,632 INFO     outcome=ball_out      train_rmse=5.0500 (n=143)  val_rmse=6.8502 (n=38)
-2026-08-18 16:22:33,632 INFO     outcome=invalid       train_rmse=3.0538 (n=927)  val_rmse=2.7315 (n=232)
-2026-08-18 16:22:33,632 INFO     outcome=timeout       train_rmse=2.2117 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:22:33,632 INFO     outcome=win           train_rmse=0.7034 (n=20720)  val_rmse=0.7271 (n=5145)
-2026-08-18 16:22:41,694 INFO epoch  22/100  train_rmse=1.0184 (norm=0.7379)  val_rmse=1.0778 (norm=0.7810)
-2026-08-18 16:22:41,694 INFO     opponent=immobile   train_rmse=1.0184 (n=21991)  val_rmse=1.0778 (n=5415)
-2026-08-18 16:22:41,694 INFO     outcome=ball_out      train_rmse=4.8699 (n=143)  val_rmse=6.6545 (n=38)
-2026-08-18 16:22:41,694 INFO     outcome=invalid       train_rmse=2.8761 (n=927)  val_rmse=2.5309 (n=232)
-2026-08-18 16:22:41,694 INFO     outcome=timeout       train_rmse=2.1769 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:22:41,694 INFO     outcome=win           train_rmse=0.7218 (n=20720)  val_rmse=0.7790 (n=5145)
-2026-08-18 16:22:49,826 INFO epoch  23/100  train_rmse=1.0097 (norm=0.7316)  val_rmse=1.0686 (norm=0.7743)
-2026-08-18 16:22:49,826 INFO     opponent=immobile   train_rmse=1.0097 (n=21991)  val_rmse=1.0686 (n=5415)
-2026-08-18 16:22:49,826 INFO     outcome=ball_out      train_rmse=4.9278 (n=143)  val_rmse=6.6194 (n=38)
-2026-08-18 16:22:49,826 INFO     outcome=invalid       train_rmse=2.9490 (n=927)  val_rmse=2.5651 (n=232)
-2026-08-18 16:22:49,826 INFO     outcome=timeout       train_rmse=2.1691 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:22:49,826 INFO     outcome=win           train_rmse=0.6926 (n=20720)  val_rmse=0.7625 (n=5145)
-2026-08-18 16:22:57,848 INFO epoch  24/100  train_rmse=1.0008 (norm=0.7252)  val_rmse=1.0687 (norm=0.7744)
-2026-08-18 16:22:57,848 INFO     opponent=immobile   train_rmse=1.0008 (n=21991)  val_rmse=1.0687 (n=5415)
-2026-08-18 16:22:57,848 INFO     outcome=ball_out      train_rmse=4.8272 (n=143)  val_rmse=6.7369 (n=38)
-2026-08-18 16:22:57,848 INFO     outcome=invalid       train_rmse=2.8661 (n=927)  val_rmse=2.6293 (n=232)
-2026-08-18 16:22:57,848 INFO     outcome=timeout       train_rmse=2.1316 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:22:57,848 INFO     outcome=win           train_rmse=0.7005 (n=20720)  val_rmse=0.7451 (n=5145)
-2026-08-18 16:23:05,216 INFO epoch  25/100  train_rmse=0.9954 (norm=0.7213)  val_rmse=1.0685 (norm=0.7742)
-2026-08-18 16:23:05,216 INFO     opponent=immobile   train_rmse=0.9954 (n=21991)  val_rmse=1.0685 (n=5415)
-2026-08-18 16:23:05,216 INFO     outcome=ball_out      train_rmse=4.7167 (n=143)  val_rmse=6.6086 (n=38)
-2026-08-18 16:23:05,216 INFO     outcome=invalid       train_rmse=2.8395 (n=927)  val_rmse=2.5156 (n=232)
-2026-08-18 16:23:05,216 INFO     outcome=timeout       train_rmse=2.0705 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:23:05,216 INFO     outcome=win           train_rmse=0.7041 (n=20720)  val_rmse=0.7705 (n=5145)
-2026-08-18 16:23:12,827 INFO epoch  26/100  train_rmse=0.9862 (norm=0.7146)  val_rmse=1.0721 (norm=0.7769)
-2026-08-18 16:23:12,827 INFO     opponent=immobile   train_rmse=0.9862 (n=21991)  val_rmse=1.0721 (n=5415)
-2026-08-18 16:23:12,827 INFO     outcome=ball_out      train_rmse=4.7114 (n=143)  val_rmse=6.6474 (n=38)
-2026-08-18 16:23:12,827 INFO     outcome=invalid       train_rmse=2.8043 (n=927)  val_rmse=2.5529 (n=232)
-2026-08-18 16:23:12,827 INFO     outcome=timeout       train_rmse=2.0589 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:23:12,827 INFO     outcome=win           train_rmse=0.6973 (n=20720)  val_rmse=0.7678 (n=5145)
-2026-08-18 16:23:20,717 INFO epoch  27/100  train_rmse=0.9770 (norm=0.7079)  val_rmse=1.0647 (norm=0.7715)
-2026-08-18 16:23:20,717 INFO     opponent=immobile   train_rmse=0.9770 (n=21991)  val_rmse=1.0647 (n=5415)
-2026-08-18 16:23:20,717 INFO     outcome=ball_out      train_rmse=4.6868 (n=143)  val_rmse=6.7689 (n=38)
-2026-08-18 16:23:20,717 INFO     outcome=invalid       train_rmse=2.7865 (n=927)  val_rmse=2.6298 (n=232)
-2026-08-18 16:23:20,717 INFO     outcome=timeout       train_rmse=2.0734 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:23:20,717 INFO     outcome=win           train_rmse=0.6873 (n=20720)  val_rmse=0.7367 (n=5145)
-2026-08-18 16:23:28,650 INFO epoch  28/100  train_rmse=0.9688 (norm=0.7020)  val_rmse=1.0837 (norm=0.7852)
-2026-08-18 16:23:28,650 INFO     opponent=immobile   train_rmse=0.9688 (n=21991)  val_rmse=1.0837 (n=5415)
-2026-08-18 16:23:28,650 INFO     outcome=ball_out      train_rmse=4.6475 (n=143)  val_rmse=6.6534 (n=38)
-2026-08-18 16:23:28,650 INFO     outcome=invalid       train_rmse=2.7723 (n=927)  val_rmse=2.4655 (n=232)
-2026-08-18 16:23:28,650 INFO     outcome=timeout       train_rmse=2.0330 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:23:28,650 INFO     outcome=win           train_rmse=0.6805 (n=20720)  val_rmse=0.7968 (n=5145)
-2026-08-18 16:23:36,685 INFO epoch  29/100  train_rmse=0.9691 (norm=0.7022)  val_rmse=1.0606 (norm=0.7685)
-2026-08-18 16:23:36,685 INFO     opponent=immobile   train_rmse=0.9691 (n=21991)  val_rmse=1.0606 (n=5415)
-2026-08-18 16:23:36,685 INFO     outcome=ball_out      train_rmse=4.4575 (n=143)  val_rmse=6.5419 (n=38)
-2026-08-18 16:23:36,685 INFO     outcome=invalid       train_rmse=2.6583 (n=927)  val_rmse=2.5586 (n=232)
-2026-08-18 16:23:36,685 INFO     outcome=timeout       train_rmse=1.9783 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:23:36,685 INFO     outcome=win           train_rmse=0.7110 (n=20720)  val_rmse=0.7567 (n=5145)
-2026-08-18 16:23:44,387 INFO epoch  30/100  train_rmse=0.9575 (norm=0.6938)  val_rmse=1.0850 (norm=0.7862)
-2026-08-18 16:23:44,387 INFO     opponent=immobile   train_rmse=0.9575 (n=21991)  val_rmse=1.0850 (n=5415)
-2026-08-18 16:23:44,387 INFO     outcome=ball_out      train_rmse=4.4872 (n=143)  val_rmse=6.5537 (n=38)
-2026-08-18 16:23:44,387 INFO     outcome=invalid       train_rmse=2.6937 (n=927)  val_rmse=2.4188 (n=232)
-2026-08-18 16:23:44,387 INFO     outcome=timeout       train_rmse=2.0214 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:23:44,387 INFO     outcome=win           train_rmse=0.6854 (n=20720)  val_rmse=0.8112 (n=5145)
-2026-08-18 16:23:52,462 INFO epoch  31/100  train_rmse=0.9572 (norm=0.6936)  val_rmse=1.0731 (norm=0.7776)
-2026-08-18 16:23:52,462 INFO     opponent=immobile   train_rmse=0.9572 (n=21991)  val_rmse=1.0731 (n=5415)
-2026-08-18 16:23:52,462 INFO     outcome=ball_out      train_rmse=4.3916 (n=143)  val_rmse=6.3934 (n=38)
-2026-08-18 16:23:52,462 INFO     outcome=invalid       train_rmse=2.6014 (n=927)  val_rmse=2.4564 (n=232)
-2026-08-18 16:23:52,462 INFO     outcome=timeout       train_rmse=1.9722 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:23:52,462 INFO     outcome=win           train_rmse=0.7062 (n=20720)  val_rmse=0.7988 (n=5145)
-2026-08-18 16:24:00,264 INFO epoch  32/100  train_rmse=0.9569 (norm=0.6934)  val_rmse=1.0572 (norm=0.7661)
-2026-08-18 16:24:00,264 INFO     opponent=immobile   train_rmse=0.9569 (n=21991)  val_rmse=1.0572 (n=5415)
-2026-08-18 16:24:00,264 INFO     outcome=ball_out      train_rmse=4.4739 (n=143)  val_rmse=6.5267 (n=38)
-2026-08-18 16:24:00,264 INFO     outcome=invalid       train_rmse=2.6995 (n=927)  val_rmse=2.4576 (n=232)
-2026-08-18 16:24:00,264 INFO     outcome=timeout       train_rmse=1.9943 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:24:00,264 INFO     outcome=win           train_rmse=0.6849 (n=20720)  val_rmse=0.7677 (n=5145)
-2026-08-18 16:24:08,058 INFO epoch  33/100  train_rmse=0.9488 (norm=0.6875)  val_rmse=1.0731 (norm=0.7776)
-2026-08-18 16:24:08,058 INFO     opponent=immobile   train_rmse=0.9488 (n=21991)  val_rmse=1.0731 (n=5415)
-2026-08-18 16:24:08,058 INFO     outcome=ball_out      train_rmse=4.3055 (n=143)  val_rmse=6.6568 (n=38)
-2026-08-18 16:24:08,058 INFO     outcome=invalid       train_rmse=2.5952 (n=927)  val_rmse=2.5622 (n=232)
-2026-08-18 16:24:08,058 INFO     outcome=timeout       train_rmse=1.9471 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:24:08,058 INFO     outcome=win           train_rmse=0.6996 (n=20720)  val_rmse=0.7672 (n=5145)
-2026-08-18 16:24:16,029 INFO epoch  34/100  train_rmse=0.9419 (norm=0.6825)  val_rmse=1.0666 (norm=0.7729)
-2026-08-18 16:24:16,029 INFO     opponent=immobile   train_rmse=0.9419 (n=21991)  val_rmse=1.0666 (n=5415)
-2026-08-18 16:24:16,030 INFO     outcome=ball_out      train_rmse=4.3038 (n=143)  val_rmse=6.7008 (n=38)
-2026-08-18 16:24:16,030 INFO     outcome=invalid       train_rmse=2.5792 (n=927)  val_rmse=2.6430 (n=232)
-2026-08-18 16:24:16,030 INFO     outcome=timeout       train_rmse=1.9404 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:24:16,030 INFO     outcome=win           train_rmse=0.6926 (n=20720)  val_rmse=0.7421 (n=5145)
-2026-08-18 16:24:23,891 INFO epoch  35/100  train_rmse=0.9473 (norm=0.6864)  val_rmse=1.0598 (norm=0.7680)
-2026-08-18 16:24:23,891 INFO     opponent=immobile   train_rmse=0.9473 (n=21991)  val_rmse=1.0598 (n=5415)
-2026-08-18 16:24:23,891 INFO     outcome=ball_out      train_rmse=4.3190 (n=143)  val_rmse=6.6567 (n=38)
-2026-08-18 16:24:23,891 INFO     outcome=invalid       train_rmse=2.5573 (n=927)  val_rmse=2.5824 (n=232)
-2026-08-18 16:24:23,891 INFO     outcome=timeout       train_rmse=2.0615 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:24:23,891 INFO     outcome=win           train_rmse=0.6999 (n=20720)  val_rmse=0.7444 (n=5145)
-2026-08-18 16:24:31,802 INFO epoch  36/100  train_rmse=0.9338 (norm=0.6766)  val_rmse=1.0599 (norm=0.7680)
-2026-08-18 16:24:31,802 INFO     opponent=immobile   train_rmse=0.9338 (n=21991)  val_rmse=1.0599 (n=5415)
-2026-08-18 16:24:31,802 INFO     outcome=ball_out      train_rmse=4.2783 (n=143)  val_rmse=6.6770 (n=38)
-2026-08-18 16:24:31,802 INFO     outcome=invalid       train_rmse=2.5589 (n=927)  val_rmse=2.5752 (n=232)
-2026-08-18 16:24:31,802 INFO     outcome=timeout       train_rmse=1.9529 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:24:31,802 INFO     outcome=win           train_rmse=0.6850 (n=20720)  val_rmse=0.7443 (n=5145)
-2026-08-18 16:24:39,852 INFO epoch  37/100  train_rmse=0.9214 (norm=0.6676)  val_rmse=1.0667 (norm=0.7729)
-2026-08-18 16:24:39,852 INFO     opponent=immobile   train_rmse=0.9214 (n=21991)  val_rmse=1.0667 (n=5415)
-2026-08-18 16:24:39,852 INFO     outcome=ball_out      train_rmse=4.1819 (n=143)  val_rmse=6.5038 (n=38)
-2026-08-18 16:24:39,852 INFO     outcome=invalid       train_rmse=2.5095 (n=927)  val_rmse=2.3903 (n=232)
-2026-08-18 16:24:39,852 INFO     outcome=timeout       train_rmse=1.9154 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:24:39,852 INFO     outcome=win           train_rmse=0.6804 (n=20720)  val_rmse=0.7921 (n=5145)
-2026-08-18 16:24:47,824 INFO epoch  38/100  train_rmse=0.9164 (norm=0.6641)  val_rmse=1.0813 (norm=0.7835)
-2026-08-18 16:24:47,824 INFO     opponent=immobile   train_rmse=0.9164 (n=21991)  val_rmse=1.0813 (n=5415)
-2026-08-18 16:24:47,824 INFO     outcome=ball_out      train_rmse=4.1927 (n=143)  val_rmse=6.5833 (n=38)
-2026-08-18 16:24:47,824 INFO     outcome=invalid       train_rmse=2.4584 (n=927)  val_rmse=2.5449 (n=232)
-2026-08-18 16:24:47,824 INFO     outcome=timeout       train_rmse=1.9543 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:24:47,824 INFO     outcome=win           train_rmse=0.6802 (n=20720)  val_rmse=0.7864 (n=5145)
-2026-08-18 16:24:55,959 INFO epoch  39/100  train_rmse=0.9137 (norm=0.6621)  val_rmse=1.0549 (norm=0.7644)
-2026-08-18 16:24:55,959 INFO     opponent=immobile   train_rmse=0.9137 (n=21991)  val_rmse=1.0549 (n=5415)
-2026-08-18 16:24:55,959 INFO     outcome=ball_out      train_rmse=4.0825 (n=143)  val_rmse=6.3153 (n=38)
-2026-08-18 16:24:55,959 INFO     outcome=invalid       train_rmse=2.4644 (n=927)  val_rmse=2.4613 (n=232)
-2026-08-18 16:24:55,959 INFO     outcome=timeout       train_rmse=1.9101 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:24:55,959 INFO     outcome=win           train_rmse=0.6811 (n=20720)  val_rmse=0.7769 (n=5145)
-2026-08-18 16:25:04,084 INFO epoch  40/100  train_rmse=0.9091 (norm=0.6587)  val_rmse=1.0800 (norm=0.7826)
-2026-08-18 16:25:04,084 INFO     opponent=immobile   train_rmse=0.9091 (n=21991)  val_rmse=1.0800 (n=5415)
-2026-08-18 16:25:04,084 INFO     outcome=ball_out      train_rmse=4.1154 (n=143)  val_rmse=6.6425 (n=38)
-2026-08-18 16:25:04,084 INFO     outcome=invalid       train_rmse=2.4174 (n=927)  val_rmse=2.5347 (n=232)
-2026-08-18 16:25:04,084 INFO     outcome=timeout       train_rmse=1.9727 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:25:04,084 INFO     outcome=win           train_rmse=0.6790 (n=20720)  val_rmse=0.7824 (n=5145)
-2026-08-18 16:25:12,492 INFO epoch  41/100  train_rmse=0.8988 (norm=0.6513)  val_rmse=1.0606 (norm=0.7685)
-2026-08-18 16:25:12,492 INFO     opponent=immobile   train_rmse=0.8988 (n=21991)  val_rmse=1.0606 (n=5415)
-2026-08-18 16:25:12,492 INFO     outcome=ball_out      train_rmse=3.9676 (n=143)  val_rmse=6.6441 (n=38)
-2026-08-18 16:25:12,492 INFO     outcome=invalid       train_rmse=2.3941 (n=927)  val_rmse=2.5751 (n=232)
-2026-08-18 16:25:12,492 INFO     outcome=timeout       train_rmse=1.8818 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:25:12,492 INFO     outcome=win           train_rmse=0.6768 (n=20720)  val_rmse=0.7476 (n=5145)
-2026-08-18 16:25:20,466 INFO epoch  42/100  train_rmse=0.8897 (norm=0.6447)  val_rmse=1.0719 (norm=0.7767)
-2026-08-18 16:25:20,467 INFO     opponent=immobile   train_rmse=0.8897 (n=21991)  val_rmse=1.0719 (n=5415)
-2026-08-18 16:25:20,467 INFO     outcome=ball_out      train_rmse=3.9294 (n=143)  val_rmse=6.4530 (n=38)
-2026-08-18 16:25:20,467 INFO     outcome=invalid       train_rmse=2.3533 (n=927)  val_rmse=2.4344 (n=232)
-2026-08-18 16:25:20,467 INFO     outcome=timeout       train_rmse=1.9107 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:25:20,467 INFO     outcome=win           train_rmse=0.6712 (n=20720)  val_rmse=0.7965 (n=5145)
-2026-08-18 16:25:28,416 INFO epoch  43/100  train_rmse=0.8829 (norm=0.6398)  val_rmse=1.0841 (norm=0.7856)
-2026-08-18 16:25:28,416 INFO     opponent=immobile   train_rmse=0.8829 (n=21991)  val_rmse=1.0841 (n=5415)
-2026-08-18 16:25:28,416 INFO     outcome=ball_out      train_rmse=3.9324 (n=143)  val_rmse=6.3213 (n=38)
-2026-08-18 16:25:28,416 INFO     outcome=invalid       train_rmse=2.3493 (n=927)  val_rmse=2.3525 (n=232)
-2026-08-18 16:25:28,416 INFO     outcome=timeout       train_rmse=1.9010 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:25:28,416 INFO     outcome=win           train_rmse=0.6623 (n=20720)  val_rmse=0.8321 (n=5145)
-2026-08-18 16:25:36,381 INFO epoch  44/100  train_rmse=0.8838 (norm=0.6404)  val_rmse=1.0675 (norm=0.7735)
-2026-08-18 16:25:36,381 INFO     opponent=immobile   train_rmse=0.8838 (n=21991)  val_rmse=1.0675 (n=5415)
-2026-08-18 16:25:36,381 INFO     outcome=ball_out      train_rmse=3.7735 (n=143)  val_rmse=6.5410 (n=38)
-2026-08-18 16:25:36,381 INFO     outcome=invalid       train_rmse=2.2821 (n=927)  val_rmse=2.5839 (n=232)
-2026-08-18 16:25:36,381 INFO     outcome=timeout       train_rmse=1.8605 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:25:36,381 INFO     outcome=win           train_rmse=0.6813 (n=20720)  val_rmse=0.7630 (n=5145)
-2026-08-18 16:25:44,292 INFO epoch  45/100  train_rmse=0.8780 (norm=0.6362)  val_rmse=1.0769 (norm=0.7804)
-2026-08-18 16:25:44,292 INFO     opponent=immobile   train_rmse=0.8780 (n=21991)  val_rmse=1.0769 (n=5415)
-2026-08-18 16:25:44,292 INFO     outcome=ball_out      train_rmse=3.7648 (n=143)  val_rmse=6.6707 (n=38)
-2026-08-18 16:25:44,292 INFO     outcome=invalid       train_rmse=2.2635 (n=927)  val_rmse=2.6316 (n=232)
-2026-08-18 16:25:44,292 INFO     outcome=timeout       train_rmse=1.8328 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:25:44,292 INFO     outcome=win           train_rmse=0.6771 (n=20720)  val_rmse=0.7614 (n=5145)
-2026-08-18 16:25:52,283 INFO epoch  46/100  train_rmse=0.8767 (norm=0.6353)  val_rmse=1.0791 (norm=0.7819)
-2026-08-18 16:25:52,283 INFO     opponent=immobile   train_rmse=0.8767 (n=21991)  val_rmse=1.0791 (n=5415)
-2026-08-18 16:25:52,283 INFO     outcome=ball_out      train_rmse=3.7638 (n=143)  val_rmse=6.4750 (n=38)
-2026-08-18 16:25:52,283 INFO     outcome=invalid       train_rmse=2.3415 (n=927)  val_rmse=2.4072 (n=232)
-2026-08-18 16:25:52,283 INFO     outcome=timeout       train_rmse=1.8523 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:25:52,283 INFO     outcome=win           train_rmse=0.6629 (n=20720)  val_rmse=0.8091 (n=5145)
-2026-08-18 16:26:00,390 INFO epoch  47/100  train_rmse=0.8679 (norm=0.6289)  val_rmse=1.0808 (norm=0.7832)
-2026-08-18 16:26:00,390 INFO     opponent=immobile   train_rmse=0.8679 (n=21991)  val_rmse=1.0808 (n=5415)
-2026-08-18 16:26:00,390 INFO     outcome=ball_out      train_rmse=3.6697 (n=143)  val_rmse=6.4837 (n=38)
-2026-08-18 16:26:00,390 INFO     outcome=invalid       train_rmse=2.2590 (n=927)  val_rmse=2.4454 (n=232)
-2026-08-18 16:26:00,390 INFO     outcome=timeout       train_rmse=1.8032 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:26:00,390 INFO     outcome=win           train_rmse=0.6684 (n=20720)  val_rmse=0.8058 (n=5145)
-2026-08-18 16:26:07,960 INFO epoch  48/100  train_rmse=0.8612 (norm=0.6240)  val_rmse=1.0798 (norm=0.7824)
-2026-08-18 16:26:07,960 INFO     opponent=immobile   train_rmse=0.8612 (n=21991)  val_rmse=1.0798 (n=5415)
-2026-08-18 16:26:07,960 INFO     outcome=ball_out      train_rmse=3.6470 (n=143)  val_rmse=6.6670 (n=38)
-2026-08-18 16:26:07,961 INFO     outcome=invalid       train_rmse=2.1712 (n=927)  val_rmse=2.6817 (n=232)
-2026-08-18 16:26:07,961 INFO     outcome=timeout       train_rmse=1.8610 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:26:07,961 INFO     outcome=win           train_rmse=0.6714 (n=20720)  val_rmse=0.7580 (n=5145)
-2026-08-18 16:26:15,569 INFO epoch  49/100  train_rmse=0.8582 (norm=0.6219)  val_rmse=1.0947 (norm=0.7932)
-2026-08-18 16:26:15,570 INFO     opponent=immobile   train_rmse=0.8582 (n=21991)  val_rmse=1.0947 (n=5415)
-2026-08-18 16:26:15,570 INFO     outcome=ball_out      train_rmse=3.6516 (n=143)  val_rmse=6.4687 (n=38)
-2026-08-18 16:26:15,570 INFO     outcome=invalid       train_rmse=2.2599 (n=927)  val_rmse=2.4152 (n=232)
-2026-08-18 16:26:15,570 INFO     outcome=timeout       train_rmse=1.8973 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:26:15,570 INFO     outcome=win           train_rmse=0.6529 (n=20720)  val_rmse=0.8302 (n=5145)
-2026-08-18 16:26:23,312 INFO epoch  50/100  train_rmse=0.8527 (norm=0.6179)  val_rmse=1.0849 (norm=0.7861)
-2026-08-18 16:26:23,312 INFO     opponent=immobile   train_rmse=0.8527 (n=21991)  val_rmse=1.0849 (n=5415)
-2026-08-18 16:26:23,312 INFO     outcome=ball_out      train_rmse=3.4604 (n=143)  val_rmse=6.5200 (n=38)
-2026-08-18 16:26:23,312 INFO     outcome=invalid       train_rmse=2.1124 (n=927)  val_rmse=2.3976 (n=232)
-2026-08-18 16:26:23,312 INFO     outcome=timeout       train_rmse=1.7293 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:26:23,312 INFO     outcome=win           train_rmse=0.6785 (n=20720)  val_rmse=0.8158 (n=5145)
-2026-08-18 16:26:30,959 INFO epoch  51/100  train_rmse=0.8493 (norm=0.6154)  val_rmse=1.0807 (norm=0.7831)
-2026-08-18 16:26:30,959 INFO     opponent=immobile   train_rmse=0.8493 (n=21991)  val_rmse=1.0807 (n=5415)
-2026-08-18 16:26:30,959 INFO     outcome=ball_out      train_rmse=3.5895 (n=143)  val_rmse=6.8104 (n=38)
-2026-08-18 16:26:30,959 INFO     outcome=invalid       train_rmse=2.1725 (n=927)  val_rmse=2.7568 (n=232)
-2026-08-18 16:26:30,959 INFO     outcome=timeout       train_rmse=1.8875 (n=201)  val_rmse=nan (n=0)
-2026-08-18 16:26:30,959 INFO     outcome=win           train_rmse=0.6565 (n=20720)  val_rmse=0.7376 (n=5145)
-2026-08-18 16:26:30,959 INFO Early stopping at epoch 51/100 (val normalized MSE did not improve for 12 epochs).
-2026-08-18 16:26:30,959 INFO Best val normalized MSE achieved: 0.5843 (RMSE=0.7644; <1.0 = better than predicting the mean; <0.5 = useful critic)
-2026-08-18 16:26:31,880 INFO --- Per-component MC-return magnitude (val rows) ---
-2026-08-18 16:26:31,880 INFO   get_possession    mean=+0.4692  std=0.4761
-2026-08-18 16:26:31,880 INFO   lose_possession   mean=-0.0058  std=0.0696
-2026-08-18 16:26:31,880 INFO   ball_out          mean=-0.0259  std=0.3085
-2026-08-18 16:26:31,880 INFO   box_possession    mean=+1.6729  std=0.4149
-2026-08-18 16:26:31,880 INFO   speed_bonus       mean=+1.6935  std=0.8001
-2026-08-18 16:26:31,880 INFO   opponent_box      mean=-2.0912  std=0.5186
-2026-08-18 16:26:31,880 INFO   stamina_penalty   mean=-0.1107  std=0.0405
-2026-08-18 16:26:32,161 INFO --- Reward-component vs. value-residual correlation (200 val episodes) ---
-2026-08-18 16:26:32,162 INFO   component            corr   comp_std
-2026-08-18 16:26:32,163 INFO   lose_possession    +0.066     0.0777
-2026-08-18 16:26:32,163 INFO   ball_out           +0.466     0.3455
-2026-08-18 16:26:32,163 INFO   speed_bonus        +0.607     0.9274
-2026-08-18 16:26:32,163 INFO   get_possession     +0.641     0.2786
-2026-08-18 16:26:32,163 INFO   stamina_penalty    -0.660     0.0417
-2026-08-18 16:26:32,163 INFO   box_possession     +0.791     0.5054
-2026-08-18 16:26:32,163 INFO   opponent_box       -0.791     0.6318
-2026-08-18 16:26:32,163 INFO   (components near the top -- low |corr| despite real variance -- are the ones the value net's errors track least; read alongside the per-component MC-return magnitude above.)
-2026-08-18 16:26:32,174 INFO --- Worst val episode for outcome=ball_out (2 episode(s)): rows [46751, 46801], residual=-7.392 -- saved match log to results/debug_value_worst_episode_ball_out.json ---
-2026-08-18 16:26:32,176 INFO --- Worst val episode for outcome=invalid (18 episode(s)): rows [45010, 45034], residual=-5.035 -- saved match log to results/debug_value_worst_episode_invalid.json ---
-2026-08-18 16:26:32,178 INFO --- Worst val episode for outcome=win (180 episode(s)): rows [52963, 53083], residual=-2.462 -- saved match log to results/debug_value_worst_episode_win.json ---
-2026-08-18 17:09:04,457 WARNING --checkpoint and --data both given: using --data as the dataset (no live rollout will be collected) and --checkpoint only to initialize decision_net/value_net's weights -- i.e. warm-starting value fitting from a trained checkpoint against a pre-recorded dataset instead of a fresh rollout.
-2026-08-18 17:09:04,602 INFO Checkpoint checkpoints/longterm/checkpoint_vvgood_immobile.pt: separate_value_net=True (auto-detected)
-2026-08-18 17:09:04,642 WARNING execution_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 17:09:04,644 WARNING value_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 17:09:04,644 INFO Loaded checkpoint: checkpoints/longterm/checkpoint_vvgood_immobile.pt (step 6015060)
-2026-08-18 17:09:04,648 INFO --reset-dir-log-std: reset move_dir_log_std/kick_dir_log_std to config init values before rollout collection.
-2026-08-18 17:09:04,649 INFO Loading 46 demonstration file(s) from demonstrations/phase1_neural_vvgood
-2026-08-18 17:09:17,789 INFO Dataset: 1,194,878 steps loaded
-2026-08-18 17:09:17,789 INFO Loaded 1,194,878 rows total
-2026-08-18 17:09:17,790 INFO has_rewards=True
-2026-08-18 17:09:17,818 INFO valid_indices(): 597,733 rows (50.0% of total)
-2026-08-18 17:09:18,451 INFO Returns over ALL rows: mean=0.807 std=3.099 min=-5.129 max=11.631
-2026-08-18 17:09:18,453 INFO Returns over valid_indices(): mean=3.739 std=1.306
-2026-08-18 17:09:19,249 INFO --- Dataset distribution (1,194,878 rows, 21500 episodes) ---
-2026-08-18 17:09:19,259 INFO   self.ai_type == rules: 0.0%
-2026-08-18 17:09:19,272 INFO   self.ai_type == immobile: 50.0%
-2026-08-18 17:09:19,285 INFO   self.ai_type == neural: 50.0%
-2026-08-18 17:09:19,293 INFO   opponent.ai_type == rules: 0.0%
-2026-08-18 17:09:19,303 INFO   opponent.ai_type == immobile: 50.0%
-2026-08-18 17:09:19,310 INFO   opponent.ai_type == neural: 50.0%
-2026-08-18 17:09:19,334 INFO   valid rows: kick_this_tick rate=0.00%  tackle_attempt rate=0.71%
-2026-08-18 17:09:19,336 INFO   dones=1 rows: 43,000  |  zero-reward rows: 1,136,210 (95.1%)
-2026-08-18 17:09:19,358 INFO   return percentiles (valid rows): p10=2.57  p50=3.83  p90=5.15
-2026-08-18 17:09:20,341 INFO --- Reward component breakdown (all episodes, 21500 episode(s)) ---
-2026-08-18 17:09:20,341 INFO   component           mean      std       min       max
-2026-08-18 17:09:20,347 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,351 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,357 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,363 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,372 INFO   get_possession    +0.948    0.338    +0.000    +5.000
-2026-08-18 17:09:20,378 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,384 INFO   lose_possession    -0.022    0.181    -3.600    +0.000
-2026-08-18 17:09:20,392 INFO   ball_out          -0.029    0.342    -4.000    +0.000
-2026-08-18 17:09:20,397 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,405 INFO   box_possession    +1.830    0.558    +0.000    +2.000
-2026-08-18 17:09:20,411 INFO   speed_bonus       +2.095    0.929    -0.015    +3.985
-2026-08-18 17:09:20,418 INFO   opponent_box      -2.287    0.698    -2.500    +0.000
-2026-08-18 17:09:20,423 INFO   timeout           -0.005    0.098    -2.000    +0.000
-2026-08-18 17:09:20,429 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,434 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,441 INFO   stamina_penalty    -0.121    0.051    -0.229    +0.000
-2026-08-18 17:09:20,820 INFO --- Reward component breakdown (outcome=ball_out, 158 episode(s)) ---
-2026-08-18 17:09:20,820 INFO   component           mean      std       min       max
-2026-08-18 17:09:20,820 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,821 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,821 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,821 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,821 INFO   get_possession    +0.918    0.275    +0.000    +1.000
-2026-08-18 17:09:20,821 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,821 INFO   lose_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,821 INFO   ball_out          -4.000    0.000    -4.000    -4.000
-2026-08-18 17:09:20,821 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,822 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,822 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,822 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,822 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,822 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,822 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:20,822 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,216 INFO --- Reward component breakdown (outcome=invalid, 1620 episode(s)) ---
-2026-08-18 17:09:21,216 INFO   component           mean      std       min       max
-2026-08-18 17:09:21,217 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,218 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,220 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,221 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,222 INFO   get_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,222 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,223 INFO   lose_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,223 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,223 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,224 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,224 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,224 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,225 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,225 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,226 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,226 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,617 INFO --- Reward component breakdown (outcome=loss, 0 episode(s)) ---
-2026-08-18 17:09:21,935 INFO --- Reward component breakdown (outcome=timeout, 52 episode(s)) ---
-2026-08-18 17:09:21,935 INFO   component           mean      std       min       max
-2026-08-18 17:09:21,935 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,935 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,935 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,935 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,936 INFO   get_possession    +1.212    0.599    +0.000    +3.000
-2026-08-18 17:09:21,936 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,936 INFO   lose_possession    -0.208    0.518    -1.800    +0.000
-2026-08-18 17:09:21,936 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,936 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,936 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,936 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,936 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,936 INFO   timeout           -2.000    0.000    -2.000    -2.000
-2026-08-18 17:09:21,936 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,936 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:09:21,936 INFO   stamina_penalty    -0.132    0.036    -0.199    -0.047
-2026-08-18 17:09:22,420 INFO --- MC returns by outcome (valid rows, 597,733 rows) ---
-2026-08-18 17:09:22,444 INFO   ball_out     n=  3,220  mean=-2.844  std=0.405  min=-4.000  max=-1.986
-2026-08-18 17:09:22,458 INFO   invalid      n= 21,959  mean=+0.004  std=0.163  min=+0.000  max=+6.809
-2026-08-18 17:09:22,472 INFO   timeout      n=  3,498  mean=-0.402  std=0.598  min=-2.730  max=+0.122
-2026-08-18 17:09:22,491 INFO   win          n=569,056  mean=+3.946  std=0.925  min=-2.600  max=+11.631
-2026-08-18 17:09:23,464 INFO --- Episode total reward by outcome (valid rows, 21500 episode(s)) ---
-2026-08-18 17:09:23,470 INFO   ball_out     n=   158  mean=-3.095  std=0.293  min=-4.000  max=-3.000
-2026-08-18 17:09:23,470 INFO   invalid      n= 1,620  mean=+0.004  std=0.170  min=+0.000  max=+6.864
-2026-08-18 17:09:23,470 INFO   timeout      n=    52  mean=-0.334  std=0.569  min=-1.996  max=-0.031
-2026-08-18 17:09:23,471 INFO   win          n=19,670  mean=+5.182  std=0.788  min=-2.600  max=+12.686
-2026-08-18 17:09:23,931 INFO Train/val split (valid_only=True): 478,663 train rows across 17200 episodes  |  119,070 val rows across 4300 episodes
-2026-08-18 17:09:24,651 INFO --- Linear regression baseline (top_speed, ball_dist, ball_to_box, time_remaining) ---
-2026-08-18 17:09:24,759 INFO   [all outcomes] n_train=478,663  n_val=119,070  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.536, -4.087, -1.748, 3.913, 1.604]
-    train_rmse=1.0555 (norm=0.8159)  val_rmse=1.0914 (norm=0.8437)
-2026-08-18 17:09:25,445 INFO   [win outcomes only] n_train=456,193  n_val=112,863  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.391, -2.216, -1.859, 4.004, 1.771]
-    train_rmse=0.4958 (norm=0.5388)  val_rmse=0.5367 (norm=0.5832)
-2026-08-18 17:09:27,087 INFO value_net: fresh separate value_net (--reset-separate-value-net)  total_params=281,340  trainable_params=281,340
-2026-08-18 17:09:27,090 INFO Fitting fresh separate value network: 100 epochs, lr=0.0002, weight_decay=1e-06, batch_size=3096, train_ret_std=1.294, outcome_reweight=False
-2026-08-18 17:11:59,607 INFO epoch   0/100 (baseline, no training yet)  train_rmse=3.8662 (norm=2.9888)  val_rmse=3.8665 (norm=2.9890)
-2026-08-18 17:11:59,607 INFO     opponent=immobile   train_rmse=3.8662 (n=478663)  val_rmse=3.8665 (n=119070)
-2026-08-18 17:11:59,607 INFO     outcome=ball_out      train_rmse=2.9518 (n=2532)  val_rmse=2.9958 (n=688)
-2026-08-18 17:11:59,607 INFO     outcome=invalid       train_rmse=0.2006 (n=17653)  val_rmse=0.0877 (n=4306)
-2026-08-18 17:11:59,607 INFO     outcome=timeout       train_rmse=0.7038 (n=2285)  val_rmse=0.9174 (n=1213)
-2026-08-18 17:11:59,607 INFO     outcome=win           train_rmse=3.9537 (n=456193)  val_rmse=3.9633 (n=112863)
-2026-08-18 17:15:58,824 INFO epoch   1/100  train_rmse=1.6780 (norm=1.2971)  val_rmse=1.0772 (norm=0.8327)
-2026-08-18 17:15:58,825 INFO     opponent=immobile   train_rmse=1.6780 (n=478663)  val_rmse=1.0772 (n=119070)
-2026-08-18 17:15:58,825 INFO     outcome=ball_out      train_rmse=6.1201 (n=2532)  val_rmse=6.3470 (n=688)
-2026-08-18 17:15:58,825 INFO     outcome=invalid       train_rmse=3.2200 (n=17653)  val_rmse=3.0246 (n=4306)
-2026-08-18 17:15:58,825 INFO     outcome=timeout       train_rmse=3.4779 (n=2285)  val_rmse=3.6976 (n=1213)
-2026-08-18 17:15:58,825 INFO     outcome=win           train_rmse=1.5115 (n=456193)  val_rmse=0.6946 (n=112863)
-2026-08-18 17:19:59,940 INFO epoch   2/100  train_rmse=0.9845 (norm=0.7610)  val_rmse=1.0358 (norm=0.8007)
-2026-08-18 17:19:59,940 INFO     opponent=immobile   train_rmse=0.9845 (n=478663)  val_rmse=1.0358 (n=119070)
-2026-08-18 17:19:59,940 INFO     outcome=ball_out      train_rmse=6.0120 (n=2532)  val_rmse=6.1807 (n=688)
-2026-08-18 17:19:59,940 INFO     outcome=invalid       train_rmse=2.7713 (n=17653)  val_rmse=2.6615 (n=4306)
-2026-08-18 17:19:59,940 INFO     outcome=timeout       train_rmse=3.3017 (n=2285)  val_rmse=3.7086 (n=1213)
-2026-08-18 17:19:59,940 INFO     outcome=win           train_rmse=0.6815 (n=456193)  val_rmse=0.6935 (n=112863)
-2026-08-18 17:23:44,291 INFO epoch   3/100  train_rmse=0.9393 (norm=0.7261)  val_rmse=0.9990 (norm=0.7723)
-2026-08-18 17:23:44,291 INFO     opponent=immobile   train_rmse=0.9393 (n=478663)  val_rmse=0.9990 (n=119070)
-2026-08-18 17:23:44,291 INFO     outcome=ball_out      train_rmse=5.7564 (n=2532)  val_rmse=6.0361 (n=688)
-2026-08-18 17:23:44,291 INFO     outcome=invalid       train_rmse=2.4478 (n=17653)  val_rmse=2.3136 (n=4306)
-2026-08-18 17:23:44,291 INFO     outcome=timeout       train_rmse=3.2520 (n=2285)  val_rmse=3.6244 (n=1213)
-2026-08-18 17:23:44,291 INFO     outcome=win           train_rmse=0.6759 (n=456193)  val_rmse=0.6968 (n=112863)
-2026-08-18 17:26:57,659 INFO epoch   4/100  train_rmse=0.9059 (norm=0.7003)  val_rmse=0.9919 (norm=0.7668)
-2026-08-18 17:26:57,659 INFO     opponent=immobile   train_rmse=0.9059 (n=478663)  val_rmse=0.9919 (n=119070)
-2026-08-18 17:26:57,659 INFO     outcome=ball_out      train_rmse=5.5783 (n=2532)  val_rmse=5.5792 (n=688)
-2026-08-18 17:26:57,659 INFO     outcome=invalid       train_rmse=2.2276 (n=17653)  val_rmse=1.8644 (n=4306)
-2026-08-18 17:26:57,659 INFO     outcome=timeout       train_rmse=3.2110 (n=2285)  val_rmse=3.5229 (n=1213)
-2026-08-18 17:26:57,659 INFO     outcome=win           train_rmse=0.6668 (n=456193)  val_rmse=0.7630 (n=112863)
-2026-08-18 17:29:55,952 INFO epoch   5/100  train_rmse=0.8838 (norm=0.6832)  val_rmse=0.9635 (norm=0.7448)
-2026-08-18 17:29:55,952 INFO     opponent=immobile   train_rmse=0.8838 (n=478663)  val_rmse=0.9635 (n=119070)
-2026-08-18 17:29:55,952 INFO     outcome=ball_out      train_rmse=5.4205 (n=2532)  val_rmse=5.9720 (n=688)
-2026-08-18 17:29:55,952 INFO     outcome=invalid       train_rmse=2.0761 (n=17653)  val_rmse=2.1367 (n=4306)
-2026-08-18 17:29:55,952 INFO     outcome=timeout       train_rmse=3.1824 (n=2285)  val_rmse=3.5956 (n=1213)
-2026-08-18 17:29:55,952 INFO     outcome=win           train_rmse=0.6626 (n=456193)  val_rmse=0.6699 (n=112863)
-2026-08-18 17:33:01,727 INFO epoch   6/100  train_rmse=0.8642 (norm=0.6680)  val_rmse=0.9512 (norm=0.7353)
-2026-08-18 17:33:01,727 INFO     opponent=immobile   train_rmse=0.8642 (n=478663)  val_rmse=0.9512 (n=119070)
-2026-08-18 17:33:01,727 INFO     outcome=ball_out      train_rmse=5.3033 (n=2532)  val_rmse=5.8148 (n=688)
-2026-08-18 17:33:01,727 INFO     outcome=invalid       train_rmse=1.9435 (n=17653)  val_rmse=1.8570 (n=4306)
-2026-08-18 17:33:01,727 INFO     outcome=timeout       train_rmse=3.1345 (n=2285)  val_rmse=3.5898 (n=1213)
-2026-08-18 17:33:01,727 INFO     outcome=win           train_rmse=0.6573 (n=456193)  val_rmse=0.6917 (n=112863)
-2026-08-18 17:50:26,784 WARNING --checkpoint and --data both given: using --data as the dataset (no live rollout will be collected) and --checkpoint only to initialize decision_net/value_net's weights -- i.e. warm-starting value fitting from a trained checkpoint against a pre-recorded dataset instead of a fresh rollout.
-2026-08-18 17:50:26,929 INFO Checkpoint checkpoints/longterm/checkpoint_vvgood_immobile.pt: separate_value_net=True (auto-detected)
-2026-08-18 17:50:26,969 WARNING execution_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 17:50:26,970 WARNING value_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 17:50:26,970 INFO Loaded checkpoint: checkpoints/longterm/checkpoint_vvgood_immobile.pt (step 6015060)
-2026-08-18 17:50:26,973 INFO --reset-dir-log-std: reset move_dir_log_std/kick_dir_log_std to config init values before rollout collection.
-2026-08-18 17:50:26,974 INFO Loading 10 demonstration file(s) from demonstrations/phase1_neural_vvgood
-2026-08-18 17:50:29,990 INFO Dataset: 279,866 steps loaded
-2026-08-18 17:50:29,991 INFO Loaded 279,866 rows total
-2026-08-18 17:50:29,991 INFO has_rewards=True
-2026-08-18 17:50:29,995 INFO valid_indices(): 139,989 rows (50.0% of total)
-2026-08-18 17:50:30,117 INFO Returns over ALL rows: mean=0.807 std=3.098 min=-5.024 max=10.616
-2026-08-18 17:50:30,118 INFO Returns over valid_indices(): mean=3.741 std=1.293
-2026-08-18 17:50:30,235 INFO --- Dataset distribution (279,866 rows, 5000 episodes) ---
-2026-08-18 17:50:30,238 INFO   self.ai_type == rules: 0.0%
-2026-08-18 17:50:30,239 INFO   self.ai_type == immobile: 50.0%
-2026-08-18 17:50:30,241 INFO   self.ai_type == neural: 50.0%
-2026-08-18 17:50:30,243 INFO   opponent.ai_type == rules: 0.0%
-2026-08-18 17:50:30,246 INFO   opponent.ai_type == immobile: 50.0%
-2026-08-18 17:50:30,248 INFO   opponent.ai_type == neural: 50.0%
-2026-08-18 17:50:30,255 INFO   valid rows: kick_this_tick rate=0.00%  tackle_attempt rate=0.54%
-2026-08-18 17:50:30,255 INFO   dones=1 rows: 10,000  |  zero-reward rows: 266,243 (95.1%)
-2026-08-18 17:50:30,268 INFO   return percentiles (valid rows): p10=2.59  p50=3.83  p90=5.15
-2026-08-18 17:50:30,495 INFO --- Reward component breakdown (all episodes, 5000 episode(s)) ---
-2026-08-18 17:50:30,495 INFO   component           mean      std       min       max
-2026-08-18 17:50:30,496 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,497 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,498 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,498 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,499 INFO   get_possession    +0.943    0.324    +0.000    +3.000
-2026-08-18 17:50:30,500 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,500 INFO   lose_possession    -0.017    0.160    -1.800    +0.000
-2026-08-18 17:50:30,501 INFO   ball_out          -0.024    0.309    -4.000    +0.000
-2026-08-18 17:50:30,502 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,502 INFO   box_possession    +1.829    0.560    +0.000    +2.000
-2026-08-18 17:50:30,503 INFO   speed_bonus       +2.085    0.918    -0.015    +3.947
-2026-08-18 17:50:30,503 INFO   opponent_box      -2.286    0.699    -2.500    +0.000
-2026-08-18 17:50:30,504 INFO   timeout           -0.007    0.116    -2.000    +0.000
-2026-08-18 17:50:30,504 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,505 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,505 INFO   stamina_penalty    -0.122    0.051    -0.229    +0.000
-2026-08-18 17:50:30,668 INFO --- Reward component breakdown (outcome=ball_out, 30 episode(s)) ---
-2026-08-18 17:50:30,668 INFO   component           mean      std       min       max
-2026-08-18 17:50:30,668 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,668 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,668 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,668 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,668 INFO   get_possession    +0.967    0.180    +0.000    +1.000
-2026-08-18 17:50:30,669 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,669 INFO   lose_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,669 INFO   ball_out          -4.000    0.000    -4.000    -4.000
-2026-08-18 17:50:30,669 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,669 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,669 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,669 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,669 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,669 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,669 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,669 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,745 INFO --- Reward component breakdown (outcome=invalid, 381 episode(s)) ---
-2026-08-18 17:50:30,745 INFO   component           mean      std       min       max
-2026-08-18 17:50:30,745 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,745 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,745 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,746 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,746 INFO   get_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,746 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,746 INFO   lose_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,746 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,746 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,746 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,746 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,747 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,747 INFO   timeout           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,747 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,747 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,747 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,810 INFO --- Reward component breakdown (outcome=loss, 0 episode(s)) ---
-2026-08-18 17:50:30,872 INFO --- Reward component breakdown (outcome=timeout, 17 episode(s)) ---
-2026-08-18 17:50:30,872 INFO   component           mean      std       min       max
-2026-08-18 17:50:30,872 INFO   approach          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,872 INFO   retreat           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,872 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,872 INFO   heading           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,872 INFO   get_possession    +1.176    0.513    +1.000    +3.000
-2026-08-18 17:50:30,872 INFO   progress          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,872 INFO   lose_possession    -0.159    0.462    -1.800    +0.000
-2026-08-18 17:50:30,872 INFO   ball_out          +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,872 INFO   illegal           +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,872 INFO   box_possession    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,872 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,873 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,873 INFO   timeout           -2.000    0.000    -2.000    -2.000
-2026-08-18 17:50:30,873 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,873 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
-2026-08-18 17:50:30,873 INFO   stamina_penalty    -0.145    0.035    -0.201    -0.081
-2026-08-18 17:50:30,967 INFO --- MC returns by outcome (valid rows, 139,989 rows) ---
-2026-08-18 17:50:30,971 INFO   ball_out     n=    634  mean=-2.842  std=0.360  min=-4.000  max=-2.205
-2026-08-18 17:50:30,973 INFO   invalid      n=  5,135  mean=+0.000  std=0.000  min=+0.000  max=+0.000
-2026-08-18 17:50:30,975 INFO   timeout      n=  1,142  mean=-0.388  std=0.566  min=-2.583  max=+0.141
-2026-08-18 17:50:30,978 INFO   win          n=133,078  mean=+3.952  std=0.905  min=-2.528  max=+10.616
-2026-08-18 17:50:31,164 INFO --- Episode total reward by outcome (valid rows, 5000 episode(s)) ---
-2026-08-18 17:50:31,166 INFO   ball_out     n=    30  mean=-3.067  std=0.249  min=-4.000  max=-3.000
-2026-08-18 17:50:31,166 INFO   invalid      n=   381  mean=+0.000  std=0.000  min=+0.000  max=+0.000
-2026-08-18 17:50:31,166 INFO   timeout      n=    17  mean=-0.257  std=0.466  min=-1.912  max=-0.045
-2026-08-18 17:50:31,166 INFO   win          n= 4,572  mean=+5.174  std=0.762  min=-2.528  max=+11.671
-2026-08-18 17:50:31,258 INFO Train/val split (valid_only=True): 112,352 train rows across 4000 episodes  |  27,637 val rows across 1000 episodes
-2026-08-18 17:50:31,411 INFO --- Linear regression baseline (top_speed, ball_dist, ball_to_box, time_remaining) ---
-2026-08-18 17:50:31,436 INFO   [all outcomes] n_train=112,352  n_val=27,637  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.464, -3.936, -1.804, 4.006, 1.614]
-    train_rmse=1.0192 (norm=0.8025)  val_rmse=1.1295 (norm=0.8893)
-2026-08-18 17:50:31,563 INFO   [win outcomes only] n_train=107,078  n_val=26,000  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.375, -2.19, -1.842, 3.998, 1.779]
-    train_rmse=0.4841 (norm=0.5393)  val_rmse=0.5038 (norm=0.5613)
-2026-08-18 17:50:33,027 INFO value_net: fresh separate value_net (--reset-separate-value-net)  total_params=281,340  trainable_params=281,340
-2026-08-18 17:50:33,027 INFO Fitting fresh separate value network: 100 epochs, lr=0.0002, weight_decay=1e-06, batch_size=3096, train_ret_std=1.270, outcome_reweight=False
-2026-08-18 18:23:38,157 WARNING --checkpoint and --data both given: using --data as the dataset (no live rollout will be collected) and --checkpoint only to initialize decision_net/value_net's weights -- i.e. warm-starting value fitting from a trained checkpoint against a pre-recorded dataset instead of a fresh rollout.
-2026-08-18 18:23:38,676 INFO Checkpoint checkpoints/longterm/checkpoint_vvgood_immobile.pt: separate_value_net=True (auto-detected)
-2026-08-18 18:23:38,844 WARNING execution_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 18:23:38,850 WARNING value_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
-2026-08-18 18:23:38,850 INFO Loaded checkpoint: checkpoints/longterm/checkpoint_vvgood_immobile.pt (step 6015060)
-2026-08-18 18:23:38,864 INFO --reset-dir-log-std: reset move_dir_log_std/kick_dir_log_std to config init values before rollout collection.
-Traceback (most recent call last):
-  File "/home/vincent/Documents/not_work/repos/FootballCoach/debug_value_network.py", line 2208, in <module>
-    main()
-  File "/home/vincent/Documents/not_work/repos/FootballCoach/debug_value_network.py", line 1771, in main
-    ds = DemonstrationDataset.from_directory(args.data)
-         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-  File "/home/vincent/Documents/not_work/repos/FootballCoach/src/footballcoach/ai/bc/dataset.py", line 596, in from_directory
-    raise FileNotFoundError(f"No .npz files found in {directory}")
-FileNotFoundError: No .npz files found in demonstrations/phase1_neural_vvgood
+2026-08-18 21:21:46,651 INFO value_net: fresh separate value_net (--reset-separate-value-net)  total_params=281,340  trainable_params=281,340
+2026-08-18 21:21:46,652 INFO Fitting fresh separate value network: 100 epochs, lr=0.0002, weight_decay=1e-06, batch_size=3096, train_ret_std=1.297, outcome_reweight=False
+2026-08-18 21:21:53,329 INFO epoch   0/100 (baseline, no training yet)  train_rmse=3.8721 (norm=2.9865)  val_rmse=3.9345 (norm=3.0346)
+2026-08-18 21:21:53,329 INFO     opponent=immobile   train_rmse=3.8721 (n=16835)  val_rmse=3.9345 (n=4162)
+2026-08-18 21:21:53,329 INFO     outcome=ball_out      train_rmse=2.8950 (n=106)  val_rmse=3.9513 (n=10)
+2026-08-18 21:21:53,329 INFO     outcome=invalid       train_rmse=0.0893 (n=608)  val_rmse=0.0887 (n=113)
+2026-08-18 21:21:53,329 INFO     outcome=timeout       train_rmse=0.6149 (n=136)  val_rmse=nan (n=0)
+2026-08-18 21:21:53,329 INFO     outcome=win           train_rmse=3.9663 (n=15985)  val_rmse=3.9891 (n=4039)
+2026-08-18 23:38:13,973 WARNING --checkpoint and --data both given: using --data as the dataset (no live rollout will be collected) and --checkpoint only to initialize decision_net/value_net's weights -- i.e. warm-starting value fitting from a trained checkpoint against a pre-recorded dataset instead of a fresh rollout.
+2026-08-18 23:38:14,223 INFO Checkpoint checkpoints/longterm/checkpoint_vvgood_immobile.pt: separate_value_net=True (auto-detected)
+2026-08-18 23:38:14,296 WARNING execution_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
+2026-08-18 23:38:14,299 WARNING value_net: skipped 1 shape-mismatched param(s) (network architecture changed since checkpoint was saved), keeping fresh init for: ['value_head.1.weight']
+2026-08-18 23:38:14,299 INFO Loaded checkpoint: checkpoints/longterm/checkpoint_vvgood_immobile.pt (step 6015060)
+2026-08-18 23:38:14,309 INFO --reset-dir-log-std: reset move_dir_log_std/kick_dir_log_std to config init values before rollout collection.
+2026-08-18 23:38:14,315 INFO Loading 252 demonstration file(s) from demonstrations/phase1_neural_vvgood
+2026-08-18 23:39:01,308 INFO Dataset: 2,785,004 steps loaded
+2026-08-18 23:39:01,310 INFO Loaded 2,785,004 rows total
+2026-08-18 23:39:01,311 INFO has_rewards=True
+2026-08-18 23:39:01,374 INFO valid_indices(): 1,393,215 rows (50.0% of total)
+2026-08-18 23:39:03,873 INFO Returns over ALL rows: mean=0.806 std=3.111 min=-5.124 max=13.009
+2026-08-18 23:39:03,878 INFO Returns over valid_indices(): mean=3.756 std=1.290
+2026-08-18 23:39:05,512 INFO --- Dataset distribution (2,785,004 rows, 50000 episodes) ---
+2026-08-18 23:39:05,541 INFO   self.ai_type == rules: 0.0%
+2026-08-18 23:39:05,570 INFO   self.ai_type == immobile: 50.0%
+2026-08-18 23:39:05,602 INFO   self.ai_type == neural: 50.0%
+2026-08-18 23:39:05,637 INFO   opponent.ai_type == rules: 0.0%
+2026-08-18 23:39:05,666 INFO   opponent.ai_type == immobile: 50.0%
+2026-08-18 23:39:05,691 INFO   opponent.ai_type == neural: 50.0%
+2026-08-18 23:39:06,345 INFO   valid rows: kick_this_tick rate=0.00%  tackle_attempt rate=0.78%
+2026-08-18 23:39:06,348 INFO   dones=1 rows: 100,000  |  zero-reward rows: 2,647,771 (95.1%)
+2026-08-18 23:39:06,387 INFO   return percentiles (trainee's own valid rows): p10=2.63  p50=3.84  p90=5.16
+2026-08-18 23:39:09,352 INFO --- Reward component breakdown (all episodes, 50000 episode(s)) ---
+2026-08-18 23:39:09,352 INFO   component           mean      std       min       max
+2026-08-18 23:39:09,366 INFO   approach          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:09,385 INFO   retreat           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:09,408 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:09,429 INFO   heading           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:09,450 INFO   get_possession    +0.934    0.285    +0.000    +3.000
+2026-08-18 23:39:09,475 INFO   progress          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:09,494 INFO   lose_possession    -0.009    0.088    -1.800    +0.000
+2026-08-18 23:39:09,511 INFO   ball_out          -0.029    0.338    -4.000    +0.000
+2026-08-18 23:39:09,532 INFO   illegal           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:09,551 INFO   box_possession    +1.828    0.560    +0.000    +2.000
+2026-08-18 23:39:09,574 INFO   speed_bonus       +2.092    0.929    -0.023    +3.985
+2026-08-18 23:39:09,591 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:09,613 INFO   timeout           -0.003    0.056    -1.000    +0.000
+2026-08-18 23:39:09,628 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:09,645 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:09,662 INFO   stamina_penalty    -0.072    0.034    -0.158    +0.000
+2026-08-18 23:39:13,109 INFO --- Reward component breakdown (outcome=win, 45708 episode(s)) ---
+2026-08-18 23:39:13,109 INFO   component           mean      std       min       max
+2026-08-18 23:39:13,122 INFO   approach          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:13,139 INFO   retreat           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:13,153 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:13,167 INFO   heading           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:13,182 INFO   get_possession    +1.010    0.100    +1.000    +3.000
+2026-08-18 23:39:13,191 INFO   progress          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:13,199 INFO   lose_possession    -0.009    0.090    -1.800    +0.000
+2026-08-18 23:39:13,210 INFO   ball_out          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:13,225 INFO   illegal           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:13,241 INFO   box_possession    +2.000    0.000    +2.000    +2.000
+2026-08-18 23:39:13,257 INFO   speed_bonus       +2.289    0.703    -0.023    +3.985
+2026-08-18 23:39:13,272 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:13,292 INFO   timeout           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:13,307 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:13,325 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:13,343 INFO   stamina_penalty    -0.078    0.028    -0.158    -0.015
+2026-08-18 23:39:14,649 INFO --- Reward component breakdown (outcome=loss, 0 episode(s)) ---
+2026-08-18 23:39:15,895 INFO --- Reward component breakdown (outcome=ball_out, 359 episode(s)) ---
+2026-08-18 23:39:15,895 INFO   component           mean      std       min       max
+2026-08-18 23:39:15,895 INFO   approach          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,896 INFO   retreat           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,896 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,896 INFO   heading           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,896 INFO   get_possession    +0.953    0.237    +0.000    +2.000
+2026-08-18 23:39:15,897 INFO   progress          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,897 INFO   lose_possession    -0.005    0.067    -0.900    +0.000
+2026-08-18 23:39:15,897 INFO   ball_out          -4.000    0.000    -4.000    -4.000
+2026-08-18 23:39:15,897 INFO   illegal           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,897 INFO   box_possession    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,897 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,897 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,898 INFO   timeout           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,898 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,898 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:15,898 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,340 INFO --- Reward component breakdown (outcome=invalid, 3773 episode(s)) ---
+2026-08-18 23:39:17,341 INFO   component           mean      std       min       max
+2026-08-18 23:39:17,344 INFO   approach          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,346 INFO   retreat           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,348 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,350 INFO   heading           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,353 INFO   get_possession    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,355 INFO   progress          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,359 INFO   lose_possession    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,360 INFO   ball_out          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,362 INFO   illegal           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,365 INFO   box_possession    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,368 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,370 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,372 INFO   timeout           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,374 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,375 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:17,377 INFO   stamina_penalty    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,611 INFO --- Reward component breakdown (outcome=timeout, 160 episode(s)) ---
+2026-08-18 23:39:18,612 INFO   component           mean      std       min       max
+2026-08-18 23:39:18,612 INFO   approach          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,612 INFO   retreat           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,613 INFO   approach_speed    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,613 INFO   heading           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,613 INFO   get_possession    +1.062    0.348    +0.000    +2.000
+2026-08-18 23:39:18,614 INFO   progress          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,614 INFO   lose_possession    -0.101    0.284    -0.900    +0.000
+2026-08-18 23:39:18,614 INFO   ball_out          +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,614 INFO   illegal           +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,614 INFO   box_possession    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,615 INFO   speed_bonus       +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,615 INFO   opponent_box      +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,615 INFO   timeout           -1.000    0.000    -1.000    -1.000
+2026-08-18 23:39:18,615 INFO   proximity_bonus    +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,615 INFO   step_penalty      +0.000    0.000    +0.000    +0.000
+2026-08-18 23:39:18,615 INFO   stamina_penalty    -0.087    0.029    -0.152    -0.012
+2026-08-18 23:39:20,579 INFO --- MC returns by outcome (trainee's own valid rows, 1,393,215 rows) ---
+2026-08-18 23:39:20,645 INFO   ball_out     n=  7,089  mean=-2.822  std=0.396  min=-4.000  max=-1.372
+2026-08-18 23:39:20,683 INFO   invalid      n= 51,507  mean=+0.000  std=0.000  min=+0.000  max=+0.000
+2026-08-18 23:39:20,716 INFO   timeout      n= 10,789  mean=-0.279  std=0.492  min=-1.615  max=+0.395
+2026-08-18 23:39:20,767 INFO   win          n=1,323,830  mean=+3.970  std=0.889  min=+1.098  max=+13.009
+2026-08-18 23:39:24,210 INFO --- Episode total reward by outcome (trainee's own valid rows, 50000 episode(s)) ---
+2026-08-18 23:39:24,226 INFO   ball_out     n=   359  mean=-3.043  std=0.244  min=-4.000  max=-2.000
+2026-08-18 23:39:24,226 INFO   invalid      n= 3,773  mean=+0.000  std=0.000  min=+0.000  max=+0.000
+2026-08-18 23:39:24,227 INFO   timeout      n=   160  mean=-0.115  std=0.210  min=-1.086  max=+0.150
+2026-08-18 23:39:24,227 INFO   win          n=45,708  mean=+5.214  std=0.717  min=+2.847  max=+13.064
+2026-08-18 23:39:25,574 INFO Train/val split (valid_only=True): 1,114,035 train rows across 40000 episodes  |  279,180 val rows across 10000 episodes
+2026-08-18 23:39:27,575 INFO --- Linear regression baseline (top_speed, ball_dist, ball_to_box, time_remaining) ---
+2026-08-18 23:39:28,305 INFO   [all outcomes] n_train=1,114,035  n_val=279,180  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.42, -4.204, -1.791, 4.037, 1.642]
+    train_rmse=1.0366 (norm=0.8013)  val_rmse=1.0135 (norm=0.7834)
+2026-08-18 23:39:31,173 INFO   [win outcomes only] n_train=1,058,219  n_val=265,611  coef(top_speed, ball_dist, ball_to_box, time_rem, intercept)=[0.435, -2.211, -1.839, 4.03, 1.727]
+    train_rmse=0.4375 (norm=0.4923)  val_rmse=0.4449 (norm=0.5007)
+2026-08-18 23:39:33,103 INFO value_net: fresh separate value_net (--reset-separate-value-net)  total_params=281,340  trainable_params=281,340
+2026-08-18 23:39:33,106 INFO Fitting fresh separate value network: 100 epochs, lr=0.0002, weight_decay=1e-06, batch_size=3096, train_ret_std=1.294, outcome_reweight=False
+2026-08-18 23:46:12,965 INFO epoch   0/100 (baseline, no training yet)  train_rmse=3.8768 (norm=2.9967)  val_rmse=3.8761 (norm=2.9962)
+2026-08-18 23:46:12,965 INFO     opponent=immobile   train_rmse=3.8768 (n=1114035)  val_rmse=3.8761 (n=279180)
+2026-08-18 23:46:12,965 INFO     outcome=ball_out      train_rmse=2.9434 (n=5810)  val_rmse=2.9184 (n=1279)
+2026-08-18 23:46:12,965 INFO     outcome=invalid       train_rmse=0.0892 (n=41102)  val_rmse=0.0891 (n=10405)
+2026-08-18 23:46:12,965 INFO     outcome=timeout       train_rmse=0.6332 (n=8904)  val_rmse=0.6047 (n=1885)
+2026-08-18 23:46:12,965 INFO     outcome=win           train_rmse=3.9713 (n=1058219)  val_rmse=3.9684 (n=265611)
+2026-08-18 23:55:47,934 INFO epoch   1/100  train_rmse=1.3212 (norm=1.0213)  val_rmse=0.9262 (norm=0.7159)
+2026-08-18 23:55:47,934 INFO     opponent=immobile   train_rmse=1.3212 (n=1114035)  val_rmse=0.9262 (n=279180)
+2026-08-18 23:55:47,934 INFO     outcome=ball_out      train_rmse=6.0206 (n=5810)  val_rmse=5.7829 (n=1279)
+2026-08-18 23:55:47,934 INFO     outcome=invalid       train_rmse=2.9497 (n=41102)  val_rmse=2.5686 (n=10405)
+2026-08-18 23:55:47,934 INFO     outcome=timeout       train_rmse=3.4502 (n=8904)  val_rmse=3.3618 (n=1885)
+2026-08-18 23:55:47,934 INFO     outcome=win           train_rmse=1.0957 (n=1058219)  val_rmse=0.6340 (n=265611)
+2026-08-19 00:06:06,190 INFO epoch   2/100  train_rmse=0.9113 (norm=0.7044)  val_rmse=0.8753 (norm=0.6766)
+2026-08-19 00:06:06,190 INFO     opponent=immobile   train_rmse=0.9113 (n=1114035)  val_rmse=0.8753 (n=279180)
+2026-08-19 00:06:06,190 INFO     outcome=ball_out      train_rmse=5.6212 (n=5810)  val_rmse=5.6395 (n=1279)
+2026-08-19 00:06:06,190 INFO     outcome=invalid       train_rmse=2.2435 (n=41102)  val_rmse=2.2794 (n=10405)
+2026-08-19 00:06:06,190 INFO     outcome=timeout       train_rmse=3.3635 (n=8904)  val_rmse=3.3215 (n=1885)
+2026-08-19 00:06:06,190 INFO     outcome=win           train_rmse=0.6404 (n=1058219)  val_rmse=0.6086 (n=265611)
+2026-08-19 00:13:26,419 INFO epoch   3/100  train_rmse=0.8706 (norm=0.6729)  val_rmse=0.8405 (norm=0.6497)
+2026-08-19 00:13:26,420 INFO     opponent=immobile   train_rmse=0.8706 (n=1114035)  val_rmse=0.8405 (n=279180)
+2026-08-19 00:13:26,420 INFO     outcome=ball_out      train_rmse=5.4001 (n=5810)  val_rmse=5.3946 (n=1279)
+2026-08-19 00:13:26,420 INFO     outcome=invalid       train_rmse=1.9724 (n=41102)  val_rmse=1.9110 (n=10405)
+2026-08-19 00:13:26,420 INFO     outcome=timeout       train_rmse=3.3181 (n=8904)  val_rmse=3.2604 (n=1885)
+2026-08-19 00:13:26,420 INFO     outcome=win           train_rmse=0.6277 (n=1058219)  val_rmse=0.6197 (n=265611)
+2026-08-19 00:23:27,252 INFO epoch   4/100  train_rmse=0.8331 (norm=0.6440)  val_rmse=0.8157 (norm=0.6305)
+2026-08-19 00:23:27,252 INFO     opponent=immobile   train_rmse=0.8331 (n=1114035)  val_rmse=0.8157 (n=279180)
+2026-08-19 00:23:27,252 INFO     outcome=ball_out      train_rmse=5.2318 (n=5810)  val_rmse=5.2126 (n=1279)
+2026-08-19 00:23:27,253 INFO     outcome=invalid       train_rmse=1.7865 (n=41102)  val_rmse=1.7093 (n=10405)
+2026-08-19 00:23:27,253 INFO     outcome=timeout       train_rmse=3.2018 (n=8904)  val_rmse=3.0257 (n=1885)
+2026-08-19 00:23:27,253 INFO     outcome=win           train_rmse=0.6084 (n=1058219)  val_rmse=0.6237 (n=265611)
+2026-08-19 00:33:18,965 INFO epoch   5/100  train_rmse=0.8042 (norm=0.6217)  val_rmse=0.7854 (norm=0.6071)
+2026-08-19 00:33:18,965 INFO     opponent=immobile   train_rmse=0.8042 (n=1114035)  val_rmse=0.7854 (n=279180)
+2026-08-19 00:33:18,965 INFO     outcome=ball_out      train_rmse=5.1087 (n=5810)  val_rmse=5.1857 (n=1279)
+2026-08-19 00:33:18,965 INFO     outcome=invalid       train_rmse=1.6713 (n=41102)  val_rmse=1.6475 (n=10405)
+2026-08-19 00:33:18,965 INFO     outcome=timeout       train_rmse=3.0263 (n=8904)  val_rmse=2.9778 (n=1885)
+2026-08-19 00:33:18,965 INFO     outcome=win           train_rmse=0.5933 (n=1058219)  val_rmse=0.5912 (n=265611)
+2026-08-19 00:42:29,791 INFO epoch   6/100  train_rmse=0.7708 (norm=0.5958)  val_rmse=0.7717 (norm=0.5965)
+2026-08-19 00:42:29,791 INFO     opponent=immobile   train_rmse=0.7708 (n=1114035)  val_rmse=0.7717 (n=279180)
+2026-08-19 00:42:29,791 INFO     outcome=ball_out      train_rmse=5.0099 (n=5810)  val_rmse=5.0946 (n=1279)
+2026-08-19 00:42:29,791 INFO     outcome=invalid       train_rmse=1.5732 (n=41102)  val_rmse=1.5851 (n=10405)
+2026-08-19 00:42:29,791 INFO     outcome=timeout       train_rmse=2.8443 (n=8904)  val_rmse=2.6895 (n=1885)
+2026-08-19 00:42:29,791 INFO     outcome=win           train_rmse=0.5687 (n=1058219)  val_rmse=0.5927 (n=265611)
+2026-08-19 00:49:35,554 INFO epoch   7/100  train_rmse=0.7527 (norm=0.5819)  val_rmse=0.7855 (norm=0.6072)
+2026-08-19 00:49:35,554 INFO     opponent=immobile   train_rmse=0.7527 (n=1114035)  val_rmse=0.7855 (n=279180)
+2026-08-19 00:49:35,554 INFO     outcome=ball_out      train_rmse=4.9171 (n=5810)  val_rmse=5.0775 (n=1279)
+2026-08-19 00:49:35,554 INFO     outcome=invalid       train_rmse=1.5090 (n=41102)  val_rmse=1.6204 (n=10405)
+2026-08-19 00:49:35,554 INFO     outcome=timeout       train_rmse=2.6873 (n=8904)  val_rmse=2.8038 (n=1885)
+2026-08-19 00:49:35,554 INFO     outcome=win           train_rmse=0.5608 (n=1058219)  val_rmse=0.6048 (n=265611)
+2026-08-19 00:58:55,793 INFO epoch   8/100  train_rmse=0.7460 (norm=0.5766)  val_rmse=0.7412 (norm=0.5729)
+2026-08-19 00:58:55,793 INFO     opponent=immobile   train_rmse=0.7460 (n=1114035)  val_rmse=0.7412 (n=279180)
+2026-08-19 00:58:55,793 INFO     outcome=ball_out      train_rmse=4.8791 (n=5810)  val_rmse=5.3648 (n=1279)
+2026-08-19 00:58:55,793 INFO     outcome=invalid       train_rmse=1.4631 (n=41102)  val_rmse=1.7850 (n=10405)
+2026-08-19 00:58:55,793 INFO     outcome=timeout       train_rmse=2.6291 (n=8904)  val_rmse=2.6826 (n=1885)
+2026-08-19 00:58:55,793 INFO     outcome=win           train_rmse=0.5602 (n=1058219)  val_rmse=0.5128 (n=265611)
+2026-08-19 01:09:19,185 INFO epoch   9/100  train_rmse=0.7227 (norm=0.5586)  val_rmse=0.7186 (norm=0.5555)
+2026-08-19 01:09:19,185 INFO     opponent=immobile   train_rmse=0.7227 (n=1114035)  val_rmse=0.7186 (n=279180)
+2026-08-19 01:09:19,186 INFO     outcome=ball_out      train_rmse=4.8447 (n=5810)  val_rmse=4.9203 (n=1279)
+2026-08-19 01:09:19,186 INFO     outcome=invalid       train_rmse=1.4241 (n=41102)  val_rmse=1.4376 (n=10405)
+2026-08-19 01:09:19,186 INFO     outcome=timeout       train_rmse=2.5211 (n=8904)  val_rmse=2.4643 (n=1885)
+2026-08-19 01:09:19,186 INFO     outcome=win           train_rmse=0.5374 (n=1058219)  val_rmse=0.5496 (n=265611)
+2026-08-19 01:19:33,348 INFO epoch  10/100  train_rmse=0.7140 (norm=0.5519)  val_rmse=0.7218 (norm=0.5579)
+2026-08-19 01:19:33,348 INFO     opponent=immobile   train_rmse=0.7140 (n=1114035)  val_rmse=0.7218 (n=279180)
+2026-08-19 01:19:33,348 INFO     outcome=ball_out      train_rmse=4.7963 (n=5810)  val_rmse=4.9744 (n=1279)
+2026-08-19 01:19:33,348 INFO     outcome=invalid       train_rmse=1.4014 (n=41102)  val_rmse=1.5274 (n=10405)
+2026-08-19 01:19:33,348 INFO     outcome=timeout       train_rmse=2.4647 (n=8904)  val_rmse=2.4412 (n=1885)
+2026-08-19 01:19:33,348 INFO     outcome=win           train_rmse=0.5320 (n=1058219)  val_rmse=0.5429 (n=265611)
+2026-08-19 01:28:14,175 INFO epoch  11/100  train_rmse=0.7057 (norm=0.5455)  val_rmse=0.7430 (norm=0.5743)
+2026-08-19 01:28:14,175 INFO     opponent=immobile   train_rmse=0.7057 (n=1114035)  val_rmse=0.7430 (n=279180)
+2026-08-19 01:28:14,175 INFO     outcome=ball_out      train_rmse=4.7601 (n=5810)  val_rmse=5.4910 (n=1279)
+2026-08-19 01:28:14,175 INFO     outcome=invalid       train_rmse=1.3626 (n=41102)  val_rmse=1.8191 (n=10405)
+2026-08-19 01:28:14,175 INFO     outcome=timeout       train_rmse=2.4061 (n=8904)  val_rmse=2.6422 (n=1885)
+2026-08-19 01:28:14,175 INFO     outcome=win           train_rmse=0.5282 (n=1058219)  val_rmse=0.5058 (n=265611)
+2026-08-19 01:34:43,369 INFO epoch  12/100  train_rmse=0.7066 (norm=0.5462)  val_rmse=0.7090 (norm=0.5481)
+2026-08-19 01:34:43,369 INFO     opponent=immobile   train_rmse=0.7066 (n=1114035)  val_rmse=0.7090 (n=279180)
+2026-08-19 01:34:43,369 INFO     outcome=ball_out      train_rmse=4.7105 (n=5810)  val_rmse=4.8218 (n=1279)
+2026-08-19 01:34:43,369 INFO     outcome=invalid       train_rmse=1.3298 (n=41102)  val_rmse=1.3243 (n=10405)
+2026-08-19 01:34:43,369 INFO     outcome=timeout       train_rmse=2.3965 (n=8904)  val_rmse=2.4108 (n=1885)
+2026-08-19 01:34:43,369 INFO     outcome=win           train_rmse=0.5355 (n=1058219)  val_rmse=0.5536 (n=265611)
+2026-08-19 01:43:09,246 INFO epoch  13/100  train_rmse=0.6939 (norm=0.5364)  val_rmse=0.7279 (norm=0.5627)
+2026-08-19 01:43:09,246 INFO     opponent=immobile   train_rmse=0.6939 (n=1114035)  val_rmse=0.7279 (n=279180)
+2026-08-19 01:43:09,246 INFO     outcome=ball_out      train_rmse=4.6946 (n=5810)  val_rmse=4.5811 (n=1279)
+2026-08-19 01:43:09,246 INFO     outcome=invalid       train_rmse=1.3115 (n=41102)  val_rmse=1.1466 (n=10405)
+2026-08-19 01:43:09,246 INFO     outcome=timeout       train_rmse=2.3346 (n=8904)  val_rmse=2.0646 (n=1885)
+2026-08-19 01:43:09,246 INFO     outcome=win           train_rmse=0.5227 (n=1058219)  val_rmse=0.6117 (n=265611)
+2026-08-19 01:52:24,917 INFO epoch  14/100  train_rmse=0.6850 (norm=0.5295)  val_rmse=0.6844 (norm=0.5290)
+2026-08-19 01:52:24,917 INFO     opponent=immobile   train_rmse=0.6850 (n=1114035)  val_rmse=0.6844 (n=279180)
+2026-08-19 01:52:24,917 INFO     outcome=ball_out      train_rmse=4.6657 (n=5810)  val_rmse=4.9280 (n=1279)
+2026-08-19 01:52:24,917 INFO     outcome=invalid       train_rmse=1.2760 (n=41102)  val_rmse=1.3393 (n=10405)
+2026-08-19 01:52:24,917 INFO     outcome=timeout       train_rmse=2.2927 (n=8904)  val_rmse=2.2447 (n=1885)
+2026-08-19 01:52:24,917 INFO     outcome=win           train_rmse=0.5167 (n=1058219)  val_rmse=0.5190 (n=265611)
+2026-08-19 02:01:21,106 INFO epoch  15/100  train_rmse=0.6857 (norm=0.5300)  val_rmse=0.6964 (norm=0.5383)
+2026-08-19 02:01:21,106 INFO     opponent=immobile   train_rmse=0.6857 (n=1114035)  val_rmse=0.6964 (n=279180)
+2026-08-19 02:01:21,106 INFO     outcome=ball_out      train_rmse=4.6145 (n=5810)  val_rmse=4.7602 (n=1279)
+2026-08-19 02:01:21,106 INFO     outcome=invalid       train_rmse=1.2562 (n=41102)  val_rmse=1.2655 (n=10405)
+2026-08-19 02:01:21,106 INFO     outcome=timeout       train_rmse=2.2731 (n=8904)  val_rmse=2.0836 (n=1885)
+2026-08-19 02:01:21,106 INFO     outcome=win           train_rmse=0.5228 (n=1058219)  val_rmse=0.5541 (n=265611)
+2026-08-19 02:10:22,578 INFO epoch  16/100  train_rmse=0.6814 (norm=0.5267)  val_rmse=0.6915 (norm=0.5345)
+2026-08-19 02:10:22,578 INFO     opponent=immobile   train_rmse=0.6814 (n=1114035)  val_rmse=0.6915 (n=279180)
+2026-08-19 02:10:22,578 INFO     outcome=ball_out      train_rmse=4.6041 (n=5810)  val_rmse=4.6903 (n=1279)
+2026-08-19 02:10:22,578 INFO     outcome=invalid       train_rmse=1.2311 (n=41102)  val_rmse=1.2792 (n=10405)
+2026-08-19 02:10:22,578 INFO     outcome=timeout       train_rmse=2.2398 (n=8904)  val_rmse=2.1789 (n=1885)
+2026-08-19 02:10:22,578 INFO     outcome=win           train_rmse=0.5209 (n=1058219)  val_rmse=0.5467 (n=265611)
+2026-08-19 02:21:37,939 INFO epoch  17/100  train_rmse=0.6710 (norm=0.5187)  val_rmse=0.6930 (norm=0.5357)
+2026-08-19 02:21:37,939 INFO     opponent=immobile   train_rmse=0.6710 (n=1114035)  val_rmse=0.6930 (n=279180)
+2026-08-19 02:21:37,939 INFO     outcome=ball_out      train_rmse=4.5908 (n=5810)  val_rmse=5.1808 (n=1279)
+2026-08-19 02:21:37,939 INFO     outcome=invalid       train_rmse=1.2327 (n=41102)  val_rmse=1.5684 (n=10405)
+2026-08-19 02:21:37,940 INFO     outcome=timeout       train_rmse=2.1974 (n=8904)  val_rmse=2.3604 (n=1885)
+2026-08-19 02:21:37,940 INFO     outcome=win           train_rmse=0.5085 (n=1058219)  val_rmse=0.4895 (n=265611)
+2026-08-19 02:31:29,017 INFO epoch  18/100  train_rmse=0.6726 (norm=0.5199)  val_rmse=0.6749 (norm=0.5217)
+2026-08-19 02:31:29,017 INFO     opponent=immobile   train_rmse=0.6726 (n=1114035)  val_rmse=0.6749 (n=279180)
+2026-08-19 02:31:29,017 INFO     outcome=ball_out      train_rmse=4.5672 (n=5810)  val_rmse=4.9491 (n=1279)
+2026-08-19 02:31:29,017 INFO     outcome=invalid       train_rmse=1.2133 (n=41102)  val_rmse=1.4064 (n=10405)
+2026-08-19 02:31:29,017 INFO     outcome=timeout       train_rmse=2.1828 (n=8904)  val_rmse=2.1508 (n=1885)
+2026-08-19 02:31:29,017 INFO     outcome=win           train_rmse=0.5142 (n=1058219)  val_rmse=0.5005 (n=265611)
+2026-08-19 02:40:23,806 INFO epoch  19/100  train_rmse=0.6675 (norm=0.5159)  val_rmse=0.6882 (norm=0.5320)
+2026-08-19 02:40:23,807 INFO     opponent=immobile   train_rmse=0.6675 (n=1114035)  val_rmse=0.6882 (n=279180)
+2026-08-19 02:40:23,807 INFO     outcome=ball_out      train_rmse=4.5474 (n=5810)  val_rmse=4.9563 (n=1279)
+2026-08-19 02:40:23,807 INFO     outcome=invalid       train_rmse=1.2040 (n=41102)  val_rmse=1.2625 (n=10405)
+2026-08-19 02:40:23,807 INFO     outcome=timeout       train_rmse=2.1477 (n=8904)  val_rmse=2.2008 (n=1885)
+2026-08-19 02:40:23,807 INFO     outcome=win           train_rmse=0.5102 (n=1058219)  val_rmse=0.5318 (n=265611)
+2026-08-19 02:49:18,228 INFO epoch  20/100  train_rmse=0.6607 (norm=0.5107)  val_rmse=0.6688 (norm=0.5169)
+2026-08-19 02:49:18,228 INFO     opponent=immobile   train_rmse=0.6607 (n=1114035)  val_rmse=0.6688 (n=279180)
+2026-08-19 02:49:18,228 INFO     outcome=ball_out      train_rmse=4.5024 (n=5810)  val_rmse=4.8116 (n=1279)
+2026-08-19 02:49:18,228 INFO     outcome=invalid       train_rmse=1.1754 (n=41102)  val_rmse=1.1927 (n=10405)
+2026-08-19 02:49:18,228 INFO     outcome=timeout       train_rmse=2.1212 (n=8904)  val_rmse=2.1195 (n=1885)
+2026-08-19 02:49:18,228 INFO     outcome=win           train_rmse=0.5067 (n=1058219)  val_rmse=0.5206 (n=265611)
+2026-08-19 02:58:11,521 INFO epoch  21/100  train_rmse=0.6615 (norm=0.5113)  val_rmse=0.6787 (norm=0.5246)
+2026-08-19 02:58:11,521 INFO     opponent=immobile   train_rmse=0.6615 (n=1114035)  val_rmse=0.6787 (n=279180)
+2026-08-19 02:58:11,521 INFO     outcome=ball_out      train_rmse=4.4900 (n=5810)  val_rmse=5.0361 (n=1279)
+2026-08-19 02:58:11,521 INFO     outcome=invalid       train_rmse=1.1772 (n=41102)  val_rmse=1.3840 (n=10405)
+2026-08-19 02:58:11,521 INFO     outcome=timeout       train_rmse=2.1131 (n=8904)  val_rmse=2.3025 (n=1885)
+2026-08-19 02:58:11,521 INFO     outcome=win           train_rmse=0.5085 (n=1058219)  val_rmse=0.4994 (n=265611)
+2026-08-19 03:07:08,761 INFO epoch  22/100  train_rmse=0.6599 (norm=0.5101)  val_rmse=0.6854 (norm=0.5298)
+2026-08-19 03:07:08,761 INFO     opponent=immobile   train_rmse=0.6599 (n=1114035)  val_rmse=0.6854 (n=279180)
+2026-08-19 03:07:08,761 INFO     outcome=ball_out      train_rmse=4.4671 (n=5810)  val_rmse=4.9482 (n=1279)
+2026-08-19 03:07:08,761 INFO     outcome=invalid       train_rmse=1.1665 (n=41102)  val_rmse=1.3558 (n=10405)
+2026-08-19 03:07:08,761 INFO     outcome=timeout       train_rmse=2.1037 (n=8904)  val_rmse=2.1444 (n=1885)
+2026-08-19 03:07:08,761 INFO     outcome=win           train_rmse=0.5088 (n=1058219)  val_rmse=0.5207 (n=265611)
+2026-08-19 03:16:13,039 INFO epoch  23/100  train_rmse=0.6509 (norm=0.5032)  val_rmse=0.6806 (norm=0.5261)
+2026-08-19 03:16:13,039 INFO     opponent=immobile   train_rmse=0.6509 (n=1114035)  val_rmse=0.6806 (n=279180)
+2026-08-19 03:16:13,039 INFO     outcome=ball_out      train_rmse=4.4487 (n=5810)  val_rmse=4.7655 (n=1279)
+2026-08-19 03:16:13,039 INFO     outcome=invalid       train_rmse=1.1535 (n=41102)  val_rmse=1.1712 (n=10405)
+2026-08-19 03:16:13,039 INFO     outcome=timeout       train_rmse=2.0822 (n=8904)  val_rmse=2.1132 (n=1885)
+2026-08-19 03:16:13,039 INFO     outcome=win           train_rmse=0.4992 (n=1058219)  val_rmse=0.5405 (n=265611)
+2026-08-19 03:25:09,139 INFO epoch  24/100  train_rmse=0.6523 (norm=0.5042)  val_rmse=0.6896 (norm=0.5331)
+2026-08-19 03:25:09,140 INFO     opponent=immobile   train_rmse=0.6523 (n=1114035)  val_rmse=0.6896 (n=279180)
+2026-08-19 03:25:09,140 INFO     outcome=ball_out      train_rmse=4.4098 (n=5810)  val_rmse=4.5971 (n=1279)
+2026-08-19 03:25:09,140 INFO     outcome=invalid       train_rmse=1.1474 (n=41102)  val_rmse=1.0263 (n=10405)
+2026-08-19 03:25:09,140 INFO     outcome=timeout       train_rmse=2.0790 (n=8904)  val_rmse=1.8515 (n=1885)
+2026-08-19 03:25:09,140 INFO     outcome=win           train_rmse=0.5037 (n=1058219)  val_rmse=0.5767 (n=265611)
+2026-08-19 03:34:01,638 INFO epoch  25/100  train_rmse=0.6469 (norm=0.5001)  val_rmse=0.6900 (norm=0.5334)
+2026-08-19 03:34:01,638 INFO     opponent=immobile   train_rmse=0.6469 (n=1114035)  val_rmse=0.6900 (n=279180)
+2026-08-19 03:34:01,638 INFO     outcome=ball_out      train_rmse=4.4014 (n=5810)  val_rmse=5.0873 (n=1279)
+2026-08-19 03:34:01,638 INFO     outcome=invalid       train_rmse=1.1224 (n=41102)  val_rmse=1.5972 (n=10405)
+2026-08-19 03:34:01,638 INFO     outcome=timeout       train_rmse=2.0670 (n=8904)  val_rmse=2.0631 (n=1885)
+2026-08-19 03:34:01,638 INFO     outcome=win           train_rmse=0.4993 (n=1058219)  val_rmse=0.4956 (n=265611)
+2026-08-19 03:42:47,002 INFO epoch  26/100  train_rmse=0.6422 (norm=0.4964)  val_rmse=0.6857 (norm=0.5300)
+2026-08-19 03:42:47,002 INFO     opponent=immobile   train_rmse=0.6422 (n=1114035)  val_rmse=0.6857 (n=279180)
+2026-08-19 03:42:47,003 INFO     outcome=ball_out      train_rmse=4.3809 (n=5810)  val_rmse=4.5725 (n=1279)
+2026-08-19 03:42:47,003 INFO     outcome=invalid       train_rmse=1.1234 (n=41102)  val_rmse=1.0806 (n=10405)
+2026-08-19 03:42:47,003 INFO     outcome=timeout       train_rmse=2.0527 (n=8904)  val_rmse=1.9888 (n=1885)
+2026-08-19 03:42:47,003 INFO     outcome=win           train_rmse=0.4942 (n=1058219)  val_rmse=0.5654 (n=265611)
+2026-08-19 03:51:33,439 INFO epoch  27/100  train_rmse=0.6389 (norm=0.4939)  val_rmse=0.6683 (norm=0.5166)
+2026-08-19 03:51:33,440 INFO     opponent=immobile   train_rmse=0.6389 (n=1114035)  val_rmse=0.6683 (n=279180)
+2026-08-19 03:51:33,440 INFO     outcome=ball_out      train_rmse=4.3479 (n=5810)  val_rmse=4.7999 (n=1279)
+2026-08-19 03:51:33,440 INFO     outcome=invalid       train_rmse=1.1020 (n=41102)  val_rmse=1.2008 (n=10405)
+2026-08-19 03:51:33,440 INFO     outcome=timeout       train_rmse=2.0465 (n=8904)  val_rmse=1.9447 (n=1885)
+2026-08-19 03:51:33,440 INFO     outcome=win           train_rmse=0.4935 (n=1058219)  val_rmse=0.5246 (n=265611)
+2026-08-19 04:00:23,746 INFO epoch  28/100  train_rmse=0.6404 (norm=0.4950)  val_rmse=0.6884 (norm=0.5321)
+2026-08-19 04:00:23,746 INFO     opponent=immobile   train_rmse=0.6404 (n=1114035)  val_rmse=0.6884 (n=279180)
+2026-08-19 04:00:23,746 INFO     outcome=ball_out      train_rmse=4.3371 (n=5810)  val_rmse=5.0726 (n=1279)
+2026-08-19 04:00:23,746 INFO     outcome=invalid       train_rmse=1.1046 (n=41102)  val_rmse=1.4146 (n=10405)
+2026-08-19 04:00:23,746 INFO     outcome=timeout       train_rmse=2.0478 (n=8904)  val_rmse=2.1523 (n=1885)
+2026-08-19 04:00:23,746 INFO     outcome=win           train_rmse=0.4958 (n=1058219)  val_rmse=0.5127 (n=265611)
+2026-08-19 04:09:09,457 INFO epoch  29/100  train_rmse=0.6366 (norm=0.4921)  val_rmse=0.6747 (norm=0.5215)
+2026-08-19 04:09:09,457 INFO     opponent=immobile   train_rmse=0.6366 (n=1114035)  val_rmse=0.6747 (n=279180)
+2026-08-19 04:09:09,457 INFO     outcome=ball_out      train_rmse=4.3147 (n=5810)  val_rmse=4.9094 (n=1279)
+2026-08-19 04:09:09,457 INFO     outcome=invalid       train_rmse=1.0940 (n=41102)  val_rmse=1.3035 (n=10405)
+2026-08-19 04:09:09,457 INFO     outcome=timeout       train_rmse=2.0333 (n=8904)  val_rmse=1.9876 (n=1885)
+2026-08-19 04:09:09,457 INFO     outcome=win           train_rmse=0.4931 (n=1058219)  val_rmse=0.5175 (n=265611)
+2026-08-19 04:17:58,192 INFO epoch  30/100  train_rmse=0.6341 (norm=0.4902)  val_rmse=0.6697 (norm=0.5177)
+2026-08-19 04:17:58,192 INFO     opponent=immobile   train_rmse=0.6341 (n=1114035)  val_rmse=0.6697 (n=279180)
+2026-08-19 04:17:58,192 INFO     outcome=ball_out      train_rmse=4.2969 (n=5810)  val_rmse=4.9788 (n=1279)
+2026-08-19 04:17:58,192 INFO     outcome=invalid       train_rmse=1.0978 (n=41102)  val_rmse=1.3979 (n=10405)
+2026-08-19 04:17:58,192 INFO     outcome=timeout       train_rmse=2.0299 (n=8904)  val_rmse=2.0663 (n=1885)
+2026-08-19 04:17:58,192 INFO     outcome=win           train_rmse=0.4904 (n=1058219)  val_rmse=0.4952 (n=265611)
+2026-08-19 04:26:41,534 INFO epoch  31/100  train_rmse=0.6322 (norm=0.4887)  val_rmse=0.6731 (norm=0.5203)
+2026-08-19 04:26:41,535 INFO     opponent=immobile   train_rmse=0.6322 (n=1114035)  val_rmse=0.6731 (n=279180)
+2026-08-19 04:26:41,535 INFO     outcome=ball_out      train_rmse=4.2809 (n=5810)  val_rmse=4.5951 (n=1279)
+2026-08-19 04:26:41,535 INFO     outcome=invalid       train_rmse=1.0976 (n=41102)  val_rmse=0.9858 (n=10405)
+2026-08-19 04:26:41,535 INFO     outcome=timeout       train_rmse=2.0296 (n=8904)  val_rmse=2.0838 (n=1885)
+2026-08-19 04:26:41,535 INFO     outcome=win           train_rmse=0.4886 (n=1058219)  val_rmse=0.5529 (n=265611)
+2026-08-19 04:35:30,668 INFO epoch  32/100  train_rmse=0.6299 (norm=0.4869)  val_rmse=0.6637 (norm=0.5130)
+2026-08-19 04:35:30,669 INFO     opponent=immobile   train_rmse=0.6299 (n=1114035)  val_rmse=0.6637 (n=279180)
+2026-08-19 04:35:30,669 INFO     outcome=ball_out      train_rmse=4.2630 (n=5810)  val_rmse=4.6912 (n=1279)
+2026-08-19 04:35:30,669 INFO     outcome=invalid       train_rmse=1.0673 (n=41102)  val_rmse=1.2537 (n=10405)
+2026-08-19 04:35:30,669 INFO     outcome=timeout       train_rmse=2.0222 (n=8904)  val_rmse=1.9739 (n=1885)
+2026-08-19 04:35:30,669 INFO     outcome=win           train_rmse=0.4891 (n=1058219)  val_rmse=0.5175 (n=265611)
+2026-08-19 04:44:22,900 INFO epoch  33/100  train_rmse=0.6273 (norm=0.4849)  val_rmse=0.6798 (norm=0.5255)
+2026-08-19 04:44:22,900 INFO     opponent=immobile   train_rmse=0.6273 (n=1114035)  val_rmse=0.6798 (n=279180)
+2026-08-19 04:44:22,900 INFO     outcome=ball_out      train_rmse=4.2441 (n=5810)  val_rmse=4.6963 (n=1279)
+2026-08-19 04:44:22,900 INFO     outcome=invalid       train_rmse=1.0687 (n=41102)  val_rmse=1.0718 (n=10405)
+2026-08-19 04:44:22,900 INFO     outcome=timeout       train_rmse=2.0146 (n=8904)  val_rmse=2.1712 (n=1885)
+2026-08-19 04:44:22,900 INFO     outcome=win           train_rmse=0.4867 (n=1058219)  val_rmse=0.5487 (n=265611)
+2026-08-19 04:53:17,609 INFO epoch  34/100  train_rmse=0.6268 (norm=0.4845)  val_rmse=0.6711 (norm=0.5188)
+2026-08-19 04:53:17,609 INFO     opponent=immobile   train_rmse=0.6268 (n=1114035)  val_rmse=0.6711 (n=279180)
+2026-08-19 04:53:17,609 INFO     outcome=ball_out      train_rmse=4.2179 (n=5810)  val_rmse=4.7634 (n=1279)
+2026-08-19 04:53:17,609 INFO     outcome=invalid       train_rmse=1.0616 (n=41102)  val_rmse=1.2617 (n=10405)
+2026-08-19 04:53:17,609 INFO     outcome=timeout       train_rmse=2.0196 (n=8904)  val_rmse=1.9539 (n=1885)
+2026-08-19 04:53:17,609 INFO     outcome=win           train_rmse=0.4876 (n=1058219)  val_rmse=0.5241 (n=265611)
+2026-08-19 05:02:09,484 INFO epoch  35/100  train_rmse=0.6245 (norm=0.4828)  val_rmse=0.6692 (norm=0.5173)
+2026-08-19 05:02:09,484 INFO     opponent=immobile   train_rmse=0.6245 (n=1114035)  val_rmse=0.6692 (n=279180)
+2026-08-19 05:02:09,484 INFO     outcome=ball_out      train_rmse=4.1607 (n=5810)  val_rmse=4.9309 (n=1279)
+2026-08-19 05:02:09,484 INFO     outcome=invalid       train_rmse=1.0403 (n=41102)  val_rmse=1.3911 (n=10405)
+2026-08-19 05:02:09,484 INFO     outcome=timeout       train_rmse=2.0163 (n=8904)  val_rmse=1.9292 (n=1885)
+2026-08-19 05:02:09,484 INFO     outcome=win           train_rmse=0.4892 (n=1058219)  val_rmse=0.5014 (n=265611)
+2026-08-19 05:11:13,249 INFO epoch  36/100  train_rmse=0.6208 (norm=0.4798)  val_rmse=0.6798 (norm=0.5255)
+2026-08-19 05:11:13,249 INFO     opponent=immobile   train_rmse=0.6208 (n=1114035)  val_rmse=0.6798 (n=279180)
+2026-08-19 05:11:13,249 INFO     outcome=ball_out      train_rmse=4.1746 (n=5810)  val_rmse=4.7292 (n=1279)
+2026-08-19 05:11:13,249 INFO     outcome=invalid       train_rmse=1.0631 (n=41102)  val_rmse=1.0507 (n=10405)
+2026-08-19 05:11:13,249 INFO     outcome=timeout       train_rmse=2.0019 (n=8904)  val_rmse=2.0380 (n=1885)
+2026-08-19 05:11:13,249 INFO     outcome=win           train_rmse=0.4820 (n=1058219)  val_rmse=0.5526 (n=265611)
+2026-08-19 05:20:13,233 INFO epoch  37/100  train_rmse=0.6196 (norm=0.4790)  val_rmse=0.6599 (norm=0.5101)
+2026-08-19 05:20:13,234 INFO     opponent=immobile   train_rmse=0.6196 (n=1114035)  val_rmse=0.6599 (n=279180)
+2026-08-19 05:20:13,234 INFO     outcome=ball_out      train_rmse=4.1446 (n=5810)  val_rmse=5.0057 (n=1279)
+2026-08-19 05:20:13,234 INFO     outcome=invalid       train_rmse=1.0365 (n=41102)  val_rmse=1.4470 (n=10405)
+2026-08-19 05:20:13,234 INFO     outcome=timeout       train_rmse=2.0016 (n=8904)  val_rmse=2.0466 (n=1885)
+2026-08-19 05:20:13,234 INFO     outcome=win           train_rmse=0.4842 (n=1058219)  val_rmse=0.4747 (n=265611)
+2026-08-19 05:29:09,518 INFO epoch  38/100  train_rmse=0.6154 (norm=0.4757)  val_rmse=0.6705 (norm=0.5183)
+2026-08-19 05:29:09,518 INFO     opponent=immobile   train_rmse=0.6154 (n=1114035)  val_rmse=0.6705 (n=279180)
+2026-08-19 05:29:09,518 INFO     outcome=ball_out      train_rmse=4.1352 (n=5810)  val_rmse=4.6753 (n=1279)
+2026-08-19 05:29:09,518 INFO     outcome=invalid       train_rmse=1.0407 (n=41102)  val_rmse=1.0955 (n=10405)
+2026-08-19 05:29:09,518 INFO     outcome=timeout       train_rmse=1.9967 (n=8904)  val_rmse=1.9057 (n=1885)
+2026-08-19 05:29:09,518 INFO     outcome=win           train_rmse=0.4788 (n=1058219)  val_rmse=0.5427 (n=265611)
+2026-08-19 05:38:04,926 INFO epoch  39/100  train_rmse=0.6181 (norm=0.4778)  val_rmse=0.6605 (norm=0.5105)
+2026-08-19 05:38:04,926 INFO     opponent=immobile   train_rmse=0.6181 (n=1114035)  val_rmse=0.6605 (n=279180)
+2026-08-19 05:38:04,926 INFO     outcome=ball_out      train_rmse=4.1433 (n=5810)  val_rmse=4.8605 (n=1279)
+2026-08-19 05:38:04,926 INFO     outcome=invalid       train_rmse=1.0596 (n=41102)  val_rmse=1.2605 (n=10405)
+2026-08-19 05:38:04,926 INFO     outcome=timeout       train_rmse=1.9894 (n=8904)  val_rmse=2.0438 (n=1885)
+2026-08-19 05:38:04,926 INFO     outcome=win           train_rmse=0.4807 (n=1058219)  val_rmse=0.5028 (n=265611)
+2026-08-19 05:46:58,056 INFO epoch  40/100  train_rmse=0.6138 (norm=0.4744)  val_rmse=0.6754 (norm=0.5221)
+2026-08-19 05:46:58,057 INFO     opponent=immobile   train_rmse=0.6138 (n=1114035)  val_rmse=0.6754 (n=279180)
+2026-08-19 05:46:58,057 INFO     outcome=ball_out      train_rmse=4.1064 (n=5810)  val_rmse=4.7267 (n=1279)
+2026-08-19 05:46:58,057 INFO     outcome=invalid       train_rmse=1.0403 (n=41102)  val_rmse=1.1568 (n=10405)
+2026-08-19 05:46:58,057 INFO     outcome=timeout       train_rmse=1.9820 (n=8904)  val_rmse=1.8927 (n=1885)
+2026-08-19 05:46:58,057 INFO     outcome=win           train_rmse=0.4784 (n=1058219)  val_rmse=0.5423 (n=265611)
+2026-08-19 05:55:45,966 INFO epoch  41/100  train_rmse=0.6100 (norm=0.4715)  val_rmse=0.6628 (norm=0.5123)
+2026-08-19 05:55:45,967 INFO     opponent=immobile   train_rmse=0.6100 (n=1114035)  val_rmse=0.6628 (n=279180)
+2026-08-19 05:55:45,967 INFO     outcome=ball_out      train_rmse=4.0669 (n=5810)  val_rmse=4.5420 (n=1279)
+2026-08-19 05:55:45,967 INFO     outcome=invalid       train_rmse=1.0162 (n=41102)  val_rmse=1.1747 (n=10405)
+2026-08-19 05:55:45,967 INFO     outcome=timeout       train_rmse=1.9837 (n=8904)  val_rmse=2.0046 (n=1885)
+2026-08-19 05:55:45,967 INFO     outcome=win           train_rmse=0.4772 (n=1058219)  val_rmse=0.5290 (n=265611)
+2026-08-19 06:04:34,317 INFO epoch  42/100  train_rmse=0.6092 (norm=0.4709)  val_rmse=0.6682 (norm=0.5165)
+2026-08-19 06:04:34,317 INFO     opponent=immobile   train_rmse=0.6092 (n=1114035)  val_rmse=0.6682 (n=279180)
+2026-08-19 06:04:34,317 INFO     outcome=ball_out      train_rmse=4.0523 (n=5810)  val_rmse=4.6336 (n=1279)
+2026-08-19 06:04:34,317 INFO     outcome=invalid       train_rmse=1.0192 (n=41102)  val_rmse=1.1452 (n=10405)
+2026-08-19 06:04:34,317 INFO     outcome=timeout       train_rmse=1.9831 (n=8904)  val_rmse=1.9258 (n=1885)
+2026-08-19 06:04:34,317 INFO     outcome=win           train_rmse=0.4766 (n=1058219)  val_rmse=0.5368 (n=265611)
+2026-08-19 06:13:27,327 INFO epoch  43/100  train_rmse=0.6065 (norm=0.4688)  val_rmse=0.6578 (norm=0.5085)
+2026-08-19 06:13:27,327 INFO     opponent=immobile   train_rmse=0.6065 (n=1114035)  val_rmse=0.6578 (n=279180)
+2026-08-19 06:13:27,327 INFO     outcome=ball_out      train_rmse=4.0257 (n=5810)  val_rmse=4.9300 (n=1279)
+2026-08-19 06:13:27,327 INFO     outcome=invalid       train_rmse=1.0125 (n=41102)  val_rmse=1.2553 (n=10405)
+2026-08-19 06:13:27,327 INFO     outcome=timeout       train_rmse=1.9711 (n=8904)  val_rmse=1.9347 (n=1885)
+2026-08-19 06:13:27,327 INFO     outcome=win           train_rmse=0.4751 (n=1058219)  val_rmse=0.4995 (n=265611)
+2026-08-19 06:22:19,119 INFO epoch  44/100  train_rmse=0.6046 (norm=0.4674)  val_rmse=0.6824 (norm=0.5275)
+2026-08-19 06:22:19,119 INFO     opponent=immobile   train_rmse=0.6046 (n=1114035)  val_rmse=0.6824 (n=279180)
+2026-08-19 06:22:19,119 INFO     outcome=ball_out      train_rmse=4.0183 (n=5810)  val_rmse=4.5181 (n=1279)
+2026-08-19 06:22:19,119 INFO     outcome=invalid       train_rmse=1.0057 (n=41102)  val_rmse=1.0428 (n=10405)
+2026-08-19 06:22:19,119 INFO     outcome=timeout       train_rmse=1.9696 (n=8904)  val_rmse=1.9839 (n=1885)
+2026-08-19 06:22:19,119 INFO     outcome=win           train_rmse=0.4736 (n=1058219)  val_rmse=0.5663 (n=265611)
+2026-08-19 06:31:03,899 INFO epoch  45/100  train_rmse=0.6032 (norm=0.4663)  val_rmse=0.6733 (norm=0.5204)
+2026-08-19 06:31:03,899 INFO     opponent=immobile   train_rmse=0.6032 (n=1114035)  val_rmse=0.6733 (n=279180)
+2026-08-19 06:31:03,899 INFO     outcome=ball_out      train_rmse=3.9904 (n=5810)  val_rmse=4.6595 (n=1279)
+2026-08-19 06:31:03,899 INFO     outcome=invalid       train_rmse=1.0015 (n=41102)  val_rmse=1.0786 (n=10405)
+2026-08-19 06:31:03,899 INFO     outcome=timeout       train_rmse=1.9659 (n=8904)  val_rmse=1.9358 (n=1885)
+2026-08-19 06:31:03,899 INFO     outcome=win           train_rmse=0.4735 (n=1058219)  val_rmse=0.5475 (n=265611)
+2026-08-19 06:39:49,010 INFO epoch  46/100  train_rmse=0.6037 (norm=0.4666)  val_rmse=0.6638 (norm=0.5131)
+2026-08-19 06:39:49,011 INFO     opponent=immobile   train_rmse=0.6037 (n=1114035)  val_rmse=0.6638 (n=279180)
+2026-08-19 06:39:49,011 INFO     outcome=ball_out      train_rmse=4.0036 (n=5810)  val_rmse=4.9015 (n=1279)
+2026-08-19 06:39:49,011 INFO     outcome=invalid       train_rmse=1.0262 (n=41102)  val_rmse=1.2355 (n=10405)
+2026-08-19 06:39:49,011 INFO     outcome=timeout       train_rmse=1.9638 (n=8904)  val_rmse=2.0069 (n=1885)
+2026-08-19 06:39:49,011 INFO     outcome=win           train_rmse=0.4715 (n=1058219)  val_rmse=0.5091 (n=265611)
+2026-08-19 06:48:43,615 INFO epoch  47/100  train_rmse=0.6035 (norm=0.4665)  val_rmse=0.6648 (norm=0.5139)
+2026-08-19 06:48:43,615 INFO     opponent=immobile   train_rmse=0.6035 (n=1114035)  val_rmse=0.6648 (n=279180)
+2026-08-19 06:48:43,615 INFO     outcome=ball_out      train_rmse=3.9831 (n=5810)  val_rmse=4.7577 (n=1279)
+2026-08-19 06:48:43,615 INFO     outcome=invalid       train_rmse=1.0185 (n=41102)  val_rmse=1.2228 (n=10405)
+2026-08-19 06:48:43,615 INFO     outcome=timeout       train_rmse=1.9580 (n=8904)  val_rmse=2.0250 (n=1885)
+2026-08-19 06:48:43,615 INFO     outcome=win           train_rmse=0.4730 (n=1058219)  val_rmse=0.5176 (n=265611)
+2026-08-19 06:57:41,284 INFO epoch  48/100  train_rmse=0.5982 (norm=0.4624)  val_rmse=0.6726 (norm=0.5199)
+2026-08-19 06:57:41,284 INFO     opponent=immobile   train_rmse=0.5982 (n=1114035)  val_rmse=0.6726 (n=279180)
+2026-08-19 06:57:41,284 INFO     outcome=ball_out      train_rmse=3.9351 (n=5810)  val_rmse=4.6522 (n=1279)
+2026-08-19 06:57:41,284 INFO     outcome=invalid       train_rmse=1.0018 (n=41102)  val_rmse=1.2191 (n=10405)
+2026-08-19 06:57:41,284 INFO     outcome=timeout       train_rmse=1.9611 (n=8904)  val_rmse=2.0498 (n=1885)
+2026-08-19 06:57:41,284 INFO     outcome=win           train_rmse=0.4695 (n=1058219)  val_rmse=0.5322 (n=265611)
+2026-08-19 07:06:44,687 INFO epoch  49/100  train_rmse=0.5987 (norm=0.4628)  val_rmse=0.6945 (norm=0.5368)
+2026-08-19 07:06:44,687 INFO     opponent=immobile   train_rmse=0.5987 (n=1114035)  val_rmse=0.6945 (n=279180)
+2026-08-19 07:06:44,687 INFO     outcome=ball_out      train_rmse=3.9252 (n=5810)  val_rmse=4.7662 (n=1279)
+2026-08-19 07:06:44,687 INFO     outcome=invalid       train_rmse=1.0074 (n=41102)  val_rmse=1.1294 (n=10405)
+2026-08-19 07:06:44,687 INFO     outcome=timeout       train_rmse=1.9552 (n=8904)  val_rmse=2.2160 (n=1885)
+2026-08-19 07:06:44,687 INFO     outcome=win           train_rmse=0.4703 (n=1058219)  val_rmse=0.5592 (n=265611)
+2026-08-19 07:15:31,445 INFO epoch  50/100  train_rmse=0.5961 (norm=0.4608)  val_rmse=0.6599 (norm=0.5101)
+2026-08-19 07:15:31,445 INFO     opponent=immobile   train_rmse=0.5961 (n=1114035)  val_rmse=0.6599 (n=279180)
+2026-08-19 07:15:31,445 INFO     outcome=ball_out      train_rmse=3.9052 (n=5810)  val_rmse=4.8835 (n=1279)
+2026-08-19 07:15:31,445 INFO     outcome=invalid       train_rmse=1.0076 (n=41102)  val_rmse=1.3962 (n=10405)
+2026-08-19 07:15:31,445 INFO     outcome=timeout       train_rmse=1.9476 (n=8904)  val_rmse=1.9531 (n=1885)
+2026-08-19 07:15:31,445 INFO     outcome=win           train_rmse=0.4680 (n=1058219)  val_rmse=0.4894 (n=265611)
+2026-08-19 07:24:27,168 INFO epoch  51/100  train_rmse=0.5963 (norm=0.4609)  val_rmse=0.6756 (norm=0.5222)
+2026-08-19 07:24:27,168 INFO     opponent=immobile   train_rmse=0.5963 (n=1114035)  val_rmse=0.6756 (n=279180)
+2026-08-19 07:24:27,168 INFO     outcome=ball_out      train_rmse=3.9103 (n=5810)  val_rmse=4.9251 (n=1279)
+2026-08-19 07:24:27,168 INFO     outcome=invalid       train_rmse=1.0040 (n=41102)  val_rmse=1.3307 (n=10405)
+2026-08-19 07:24:27,168 INFO     outcome=timeout       train_rmse=1.9464 (n=8904)  val_rmse=2.0725 (n=1885)
+2026-08-19 07:24:27,168 INFO     outcome=win           train_rmse=0.4683 (n=1058219)  val_rmse=0.5130 (n=265611)
+2026-08-19 07:33:15,921 INFO epoch  52/100  train_rmse=0.5941 (norm=0.4592)  val_rmse=0.6739 (norm=0.5209)
+2026-08-19 07:33:15,921 INFO     opponent=immobile   train_rmse=0.5941 (n=1114035)  val_rmse=0.6739 (n=279180)
+2026-08-19 07:33:15,921 INFO     outcome=ball_out      train_rmse=3.8858 (n=5810)  val_rmse=5.1950 (n=1279)
+2026-08-19 07:33:15,921 INFO     outcome=invalid       train_rmse=0.9977 (n=41102)  val_rmse=1.5386 (n=10405)
+2026-08-19 07:33:15,921 INFO     outcome=timeout       train_rmse=1.9445 (n=8904)  val_rmse=2.0677 (n=1885)
+2026-08-19 07:33:15,921 INFO     outcome=win           train_rmse=0.4671 (n=1058219)  val_rmse=0.4737 (n=265611)
+2026-08-19 07:42:03,637 INFO epoch  53/100  train_rmse=0.5924 (norm=0.4579)  val_rmse=0.6795 (norm=0.5252)
+2026-08-19 07:42:03,637 INFO     opponent=immobile   train_rmse=0.5924 (n=1114035)  val_rmse=0.6795 (n=279180)
+2026-08-19 07:42:03,637 INFO     outcome=ball_out      train_rmse=3.8771 (n=5810)  val_rmse=4.7264 (n=1279)
+2026-08-19 07:42:03,637 INFO     outcome=invalid       train_rmse=0.9959 (n=41102)  val_rmse=1.0394 (n=10405)
+2026-08-19 07:42:03,637 INFO     outcome=timeout       train_rmse=1.9351 (n=8904)  val_rmse=2.0288 (n=1885)
+2026-08-19 07:42:03,637 INFO     outcome=win           train_rmse=0.4657 (n=1058219)  val_rmse=0.5533 (n=265611)
+2026-08-19 07:50:53,073 INFO epoch  54/100  train_rmse=0.5881 (norm=0.4546)  val_rmse=0.6702 (norm=0.5181)
+2026-08-19 07:50:53,073 INFO     opponent=immobile   train_rmse=0.5881 (n=1114035)  val_rmse=0.6702 (n=279180)
+2026-08-19 07:50:53,073 INFO     outcome=ball_out      train_rmse=3.8245 (n=5810)  val_rmse=4.5522 (n=1279)
+2026-08-19 07:50:53,073 INFO     outcome=invalid       train_rmse=0.9785 (n=41102)  val_rmse=1.0782 (n=10405)
+2026-08-19 07:50:53,073 INFO     outcome=timeout       train_rmse=1.9392 (n=8904)  val_rmse=1.9066 (n=1885)
+2026-08-19 07:50:53,073 INFO     outcome=win           train_rmse=0.4637 (n=1058219)  val_rmse=0.5487 (n=265611)
+2026-08-19 07:59:39,631 INFO epoch  55/100  train_rmse=0.5877 (norm=0.4542)  val_rmse=0.6679 (norm=0.5163)
+2026-08-19 07:59:39,631 INFO     opponent=immobile   train_rmse=0.5877 (n=1114035)  val_rmse=0.6679 (n=279180)
+2026-08-19 07:59:39,631 INFO     outcome=ball_out      train_rmse=3.7869 (n=5810)  val_rmse=4.8100 (n=1279)
+2026-08-19 07:59:39,631 INFO     outcome=invalid       train_rmse=0.9793 (n=41102)  val_rmse=1.3261 (n=10405)
+2026-08-19 07:59:39,631 INFO     outcome=timeout       train_rmse=1.9357 (n=8904)  val_rmse=1.9225 (n=1885)
+2026-08-19 07:59:39,631 INFO     outcome=win           train_rmse=0.4648 (n=1058219)  val_rmse=0.5122 (n=265611)
+2026-08-19 07:59:39,631 INFO Early stopping at epoch 55/100 (val normalized MSE did not improve for 12 epochs).
+2026-08-19 07:59:39,631 INFO Best val normalized MSE achieved: 0.2586 (RMSE=0.5085; <1.0 = better than predicting the mean; <0.5 = useful critic)
+2026-08-19 08:00:46,340 INFO --- Per-component MC-return magnitude (val rows) ---
+2026-08-19 08:00:46,342 INFO   get_possession    mean=+0.4756  std=0.4737
+2026-08-19 08:00:46,344 INFO   lose_possession   mean=-0.0045  std=0.0617
+2026-08-19 08:00:46,345 INFO   ball_out          mean=-0.0167  std=0.2465
+2026-08-19 08:00:46,346 INFO   box_possession    mean=+1.6761  std=0.4114
+2026-08-19 08:00:46,347 INFO   speed_bonus       mean=+1.7026  std=0.7758
+2026-08-19 08:00:46,349 INFO   timeout           mean=-0.0052  std=0.0643
+2026-08-19 08:00:46,350 INFO   stamina_penalty   mean=-0.0687  std=0.0280
+2026-08-19 08:01:05,843 INFO --- Reward-component vs. value-residual correlation (10000 val episodes) ---
+2026-08-19 08:01:05,843 INFO   component            corr   comp_std
+2026-08-19 08:01:05,893 INFO   lose_possession    +0.030     0.0664
+2026-08-19 08:01:05,894 INFO   timeout            +0.158     0.0310
+2026-08-19 08:01:05,894 INFO   stamina_penalty    -0.324     0.0265
+2026-08-19 08:01:05,894 INFO   ball_out           +0.382     0.2668
+2026-08-19 08:01:05,894 INFO   get_possession     +0.403     0.2550
+2026-08-19 08:01:05,894 INFO   speed_bonus        +0.493     0.8725
+2026-08-19 08:01:05,894 INFO   box_possession     +0.515     0.4710
+2026-08-19 08:01:05,894 INFO   (components near the top -- low |corr| despite real variance -- are the ones the value net's errors track least; read alongside the per-component MC-return magnitude above.)
+2026-08-19 08:01:06,023 INFO --- Worst val episode for outcome=ball_out (61 episode(s)): rows [2322237, 2322285], residual=-8.103 -- saved match log to results/debug_value_worst_episode_ball_out.json ---
+2026-08-19 08:01:06,039 INFO --- Worst val episode for outcome=invalid (764 episode(s)): rows [2320045, 2320071], residual=-5.391 -- saved match log to results/debug_value_worst_episode_invalid.json ---
+2026-08-19 08:01:06,056 INFO --- Worst val episode for outcome=timeout (28 episode(s)): rows [2598290, 2598423], residual=-3.928 -- saved match log to results/debug_value_worst_episode_timeout.json ---
+2026-08-19 08:01:06,076 INFO --- Worst val episode for outcome=win (9147 episode(s)): rows [2758698, 2758736], residual=+6.815 -- saved match log to results/debug_value_worst_episode_win.json ---

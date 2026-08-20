@@ -307,7 +307,19 @@ class Match:
                 if self.match_logger is not None and player.kicked_this_tick:
                     self.match_logger.notify_kick(self.time_s, self.ball.position, player)
                 continue
-            if order.execute(player, self, dt):
+            completed = order.execute(player, self, dt)
+            if player.desired_speed_mode is None:
+                # Every order must explicitly decide movement intent (even
+                # STANDSTILL) on every tick it executes -- leaving it unset
+                # is read by _apply_movement as inertial "coasting", a state
+                # the neural decode path can never produce, which silently
+                # diverges live play from the NN's action-replay/BC-label
+                # view of the same tick. Fail loudly instead of coasting.
+                raise RuntimeError(
+                    f"{type(order).__name__}.execute() for player {player.player_id!r} "
+                    f"did not set desired_direction/desired_speed_mode this tick"
+                )
+            if completed:
                 self._complete_order(order)
                 player.current_order = None
             if player.kicked_this_tick:
@@ -344,31 +356,39 @@ class Match:
           (`has_ball`, computed below but previously never used for this)
           fixes this at the source — no test-side workaround needed.
         """
-        has_ball = self.ball.possessed_by == player.player_id
-        if has_ball:
-            return True
-        carrier = self.ball_carrier()
-
         order = player.current_order
         sprint = getattr(order, 'sprint', True) if order is not None else True
-        speed_mode = SpeedMode.SPRINT if sprint else SpeedMode.JOG
+
+        has_ball = self.ball.possessed_by == player.player_id
+        if has_ball:
+            # Already have the ball -- carry momentum forward rather than
+            # freezing (e.g. MarkOrder delegating in here while its marker
+            # already holds the ball).
+            from footballcoach.orders import _continue_current_motion
+            adj_dir, sm = _continue_current_motion(player, self, sprint=sprint)
+            player.desired_direction = adj_dir
+            player.desired_speed_mode = sm
+            return True
+        carrier = self.ball_carrier()
 
         if carrier is not None and carrier.player_id != player.player_id:
             # Arm the tackle; _check_armed_tackles resolves it when in contact range.
             player.tackle_armed = True
+            from footballcoach.orders import _compute_movement_intent
+            intercept = self._intercept_target(player, carrier.position, carrier.velocity)
+            adj_dir, sm = _compute_movement_intent(
+                player, intercept - player.position, self,
+                sprint=sprint, arrival_dist=None,
+                use_repulsion=False, use_brake_to_turn=True,
+            )
+            player.desired_direction = adj_dir
+            player.desired_speed_mode = sm
             if are_touching(player, carrier):
-                return True  # contact will be resolved this tick by _check_armed_tackles
-            else:
-                from footballcoach.orders import _compute_movement_intent
-                intercept = self._intercept_target(player, carrier.position, carrier.velocity)
-                adj_dir, sm = _compute_movement_intent(
-                    player, intercept - player.position, self,
-                    sprint=sprint, arrival_dist=None,
-                    use_repulsion=False, use_brake_to_turn=True,
-                )
-                player.desired_direction = adj_dir
-                player.desired_speed_mode = sm
-                return False
+                # Contact will be resolved this tick by _check_armed_tackles;
+                # keep tracking the carrier's motion rather than freezing
+                # mid-duel.
+                return True
+            return False
         else:
             # Ball is loose — run to intercept; pickup via _update_loose_ball_pickup.
             intercept = self._intercept_target(player, self.ball.position, self.ball.velocity)

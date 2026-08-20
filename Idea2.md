@@ -22,6 +22,7 @@ Extending training:
 - Certain coefficients may need setting on a per-phase level, hopefully not too many, but potentially things like BC aux (e.g. kicking only or not)
 - Record demonstrations needs to handle more than 2 players
     - Sould be able to do some nice OOP here, a class that has the player in question and it's rewards and outcomes, or whatever, let's make it clean
+    - Might be some useful notes in agent_plans/reward_fixes.md if it hasn't already been implemented
     - Should also apply to the diagnotics during training, should be able to count outcomes/rewards per-player and print them sensibly 
 Notes to self:
 - GK needs fixing - he saves no shots in the close rnage scenario
@@ -35,20 +36,26 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. Please do not skip any of them. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
-    - !!!!!!! BC training matching issue! with the orders and getPossession and whateve
+    - !! Broken current order stuff AI has found bugs!!
+    - !! real neural net: don't normalise by pitch half diag, just normalise by base pitch half diag
+    - !! real neural net: ball spin should be normalised by a fix value rather than this random ass max_rad thing
+    - !! physics network
+        - test quality of embedding with a small capacity (e.g. 10 neurons), newly initialised decoder + shortut switched off - how quickly can it learn? especially during demo pre-train
+            - do tiny batch size for new ones, huge batch for old ones than need fine tune
+        - try switching spin and bc weights back on - do we care though? Time/position of ball out could be useful though. could then go as an input for the proper network
+        - consider - a tiny decoder trained to output the positions/velocities at some time horizons - then tacked on to the output in the proper network
+            - maybe also have it predict time and crossing point for going out
     - !! generate a ton of demo data uisng vvgood immobile
+        - !!!!! Does it have a random seed each time???
         - for value net pretraining + BC when we change a neural net
-        - TIMESTEPS ARNE'T UNIFORM!!
+        - TIMESTEPS ARNE'T UNIFORM!! - how does MC deal with this?
+
         - on debug value net - check the match logs that do poorly on invalid
     - !!!!!!! Add heading to the neural network. Also increase capacity, and do BC training I guess
         - !!! heading add by just making velocity + speed a unit vector + magnitude?
     - !! Implement and try out the physics encoder thingy, just for the ball
-        - add variability in other physics stuff - drag, air coefficient etc... find them all
-        - do a generative kind of training - each epoch, generate 1k episodes, and add them to the dataset
-            - keep some for the val set
-            - once n_episodes > threshold, drop some randomly
-        - if it works well, consider predicting rel distance to the ball over time
     - In demo generation - encode empty players more intelligently to use less RAM? float 16 for the decision heads (marginal)?
+    - !! Remove ball height norm so everything is euclidean again?
     - !!! Do some performance profiling - how long spent on rollouts vs PPO vs evals etc.. n_envs - how much faster does it get with more of them? How many do we want? Main threads too? - can try this with the evals script maybe?
         - vary opponents!
         - make outcomes from the POV of the player - especially for reporting stats, or it'll break. Currently outcomes are global (e.g. win is for trainee win)
@@ -227,6 +234,11 @@ Past MVP - Late Stage Plans
 
 Mechanics
 - Think about introducing non-linearities in kick power, stamina etc... stuff that maybe less spearated in effect than theye are in rarity (gaussian), or the reverse (e.g. dribbling, maybe gets extra good at 80+)j - [Late thing] - Implement a foot choice when kicking, and foot preference and degree of ambitextricity etc... foot choice affects power/precisions depending on direction of kicking vs velocity heading, it affects spin in the same way 
+
+Player stuff:
+- Traits
+    - "risky" - higher temperature, vs "play it safe" lower temperature
+    - 
 
 Matches:
 - Could add some commentary kinda easily - e.g. pass happens, say a phrase like "X passes over to Y"

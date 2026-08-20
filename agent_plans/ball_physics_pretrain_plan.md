@@ -10,7 +10,21 @@
 
 ## 0. Status
 
-**Not started.** This document is the full design; no code exists yet.
+**Standalone pipeline implemented and in active use** (episode generation,
+dataset, network, training script, auto-generated HTML report — §4-7, §9,
+§10). **§8 (wiring the frozen encoder into `DecisionNetwork`/
+`ExecutionNetwork`) is explicitly ON HOLD** pending the user validating the
+standalone pipeline (training data quality, loss curves, classification
+metrics) — do not start §8 without an explicit go-ahead; it's a real
+architecture change that invalidates existing checkpoints (see §8.4).
+
+See §12 for a full account of what was actually built, including a set of
+quality-of-life additions beyond the original design here (random seeds,
+append-mode dataset generation, a live progress bar, fine-grained per-head
+loss/classification-metric reporting, and an auto-opening HTML training
+report) — §11's player-dynamics follow-up should get the same treatment,
+not just the network/pipeline itself (flagged again at the top of §11).
+
 Ball-only for this pass — the analogous player-dynamics network is a
 deliberately deferred follow-up (see §11) once this one is validated.
 
@@ -99,9 +113,33 @@ network (see §8).
 | 11 | `pitch_width_norm` | `pitch.width_m` | `/ 68.0` |
 | 12 | `goal_width_norm` | `pitch.goal_width_m` | `/ 7.32` |
 | 13 | `goal_height_norm` | `pitch.goal_height_m` | `/ 2.44` |
+| 14 | `speed_norm` | `\|velocity_norm\|` | `sqrt(velocity_x^2+velocity_y^2+velocity_z^2)` (in the already-normalized units of fields 3-5) |
+| 15 | `speed_norm_sq` | `speed_norm^2` | engineered feature, see below |
+| 16 | `spin_norm` | `\|spin_norm\|` | `sqrt(spin_x^2+spin_y^2+spin_z^2)` (in the already-normalized units of fields 6-8); no squared counterpart, see below |
+| 17-19 | `magnus_cross_{x,y,z}` | `spin_norm × velocity_norm` | cross product of fields 6-8 and 3-5 (already-normalized units); see below |
 
 Box dims (`box_length`/`box_width`) are deliberately excluded — irrelevant
 to ball flight or the out/goal boundary checks, GK-box-specific only.
+
+**Engineered features (fields 14-19, added post-implementation, see
+§12.6):** `N_INPUT_FIELDS` is 20, not 14 — added after the initial build,
+in response to real training results. Air drag is exactly proportional to
+speed² in the real physics model (`ball_physics.py`: `drag_force =
+-0.5*rho*Cd*A*|v|*v`), a nonlinear combination of the 3 raw velocity
+components (fields 3-5) that a small encoder would otherwise have to learn
+indirectly — fields 14-15 hand it over directly. Spin magnitude (field 16)
+has NO squared counterpart deliberately: checked the physics model and
+nothing there is proportional to spin² (spin decay is a plain exponential,
+linear in spin; the Magnus force below is also linear in spin), unlike
+drag's exact spin²-analogue in speed. The Magnus force is exactly `F ∝ spin
+× velocity` (`ball_physics.py`'s `magnus_force`) — a bilinear combination
+across 6 raw inputs, harder to learn than a simple square, so fields 17-19
+hand over the full 3-component cross product (not just its magnitude) so
+the network keeps the *direction* information that determines which way
+Magnus curves the ball. All of these are deterministic functions of
+already-present inputs (no new information) and free to compute — this is
+meant to be an ongoing category (hand over any known nonlinear physics
+combination that's cheap to compute), see §12.6.
 
 ### 3.2 Decoder output — 11 floats × 5 horizons = 55 floats
 
@@ -287,6 +325,12 @@ anywhere permanent — only `encoder.state_dict()` becomes a real artifact
 ---
 
 ## 7. Training script and config
+
+> **As-built note**: the actual `ai_config.json["physics_pretrain"]["ball"]`
+> section, CLI flags, and logged metrics have since diverged from what's
+> written below (more config keys, richer per-epoch logging, an
+> auto-generated HTML report) — see §12 for the current, accurate picture.
+> This section is kept as the original design record.
 
 New script:
 [`src/footballcoach/ai/physics_pretrain/train_ball_dynamics.py`](../src/footballcoach/ai/physics_pretrain/train_ball_dynamics.py)
@@ -530,10 +574,31 @@ tests/ai_unit/test_ball_physics_pretrain.py       # §10
 
 ## 11. Follow-up: player dynamics network (not implemented here)
 
+> **Implemented — see `agent_plans/player_physics_pretrain_plan.md`.** The
+> standalone player-dynamics pretraining pipeline (episode generator,
+> dataset, network, training script, HTML report) described there was built
+> as a parallel pipeline to this one, per the sketch below. Live-network
+> integration (this plan's §8, and the analogous section for the player net)
+> remains unimplemented/out of scope for that pass too. The sketch below is
+> kept as the original design record — the "as-built" doc explains where
+> the final implementation deviated and why.
+
 Sketch only, for whoever picks this up next, once the ball version is
 validated end-to-end (trained, wired in, and shows some measurable effect —
 e.g. faster BC convergence on kick/out-of-play-adjacent labels, or better
-value-loss calibration near box/boundary states — before investing further):
+value-loss calibration near box/boundary states — before investing further).
+
+> **Bring the QOL layer over too, not just the network/pipeline shape.**
+> §12 documents a set of workflow improvements that turned out to matter a
+> lot in practice while iterating on the ball version (random seeds by
+> default, append-mode data generation, a live progress bar, fine-grained
+> per-head loss AND classification-metric reporting with per-horizon
+> sums/means, and an auto-generated, auto-opening HTML training report).
+> None of that is ball-specific — build the player version's dataset/train
+> scripts with the same shape from the start (e.g. reuse/extend
+> `ai/progress.py`'s `ProgressReporter`, the `report.py`/
+> `report_template.html` pattern, the `pos_weight`-logging +
+> `pos_weight_max`-capping convention) rather than retrofitting it later.
 
 - **Input (18 floats)**: `pos_x, pos_y, heading_rad(sin/cos), velocity_x,
   velocity_y, stamina, top_speed, acceleration, stamina_attr, ball_control,
@@ -615,3 +680,962 @@ value-loss calibration near box/boundary states — before investing further):
   is a separate, smaller potential fix (bump `PLAYER_FEATURE_DIM`,
   invalidate checkpoints/BC data again) tracked here as a pointer, not
   scoped into either this plan or the player-dynamics follow-up.
+
+---
+
+## 12. As-built: the standalone pipeline, and the QOL layer around it
+
+Written up after actually building and iterating on §4-7/§9/§10 (the
+episode generator, dataset, network, and training script), so future work
+(especially §11's player-dynamics follow-up) starts from what's real rather
+than the original design sketch above. **§8 (live-network integration)
+remains untouched/on hold** — everything below is scoped to the standalone
+pretraining pipeline only.
+
+### 12.1 File layout (matches §9, confirmed as-built)
+
+```
+src/footballcoach/ai/physics_pretrain/
+  __init__.py
+  ball_episode_gen.py       # §4 — BallEpisodeGenParams, generate_episode(), generate_shard()
+  ball_dataset.py            # §4.4 — generate_dataset(), BallDynamicsDataset, __main__ CLI
+  ball_dynamics_net.py       # §6 — BallDynamicsEncoder / Decoder / Autoencoder
+  train_ball_dynamics.py     # §7 — compute_loss(), compute_confusion_counts(), train(), __main__ CLI
+  report.py                  # NEW, not in original plan — write_report()/open_in_browser()
+  report_template.html       # NEW — self-contained HTML report template (see 12.4)
+
+checkpoints/physics_pretrain/
+  ball_encoder.pt             # {encoder_state_dict, config_snapshot, normalization, dataset_stats, physics_config_hash}
+  ball_encoder.history.npz    # full per-epoch history, every metric below
+  ball_encoder.report.html    # auto-generated, auto-opened HTML report (gitignored, like the checkpoint)
+
+physics_pretrain_data/ball/   # generated .npz shards (gitignored)
+tests/ai_unit/test_ball_physics_pretrain.py
+```
+
+`ai_config.json["physics_pretrain"]["ball"]` gained keys beyond §7's
+original sketch: `pos_weight_max` (null = uncapped, same convention as
+`bc.pos_weight_max`) and `spin_active_frac` (see 12.2). Current defaults
+drifted from §7's sketch too (e.g. `hidden_dim: 128`, `latent_dim: 24`) —
+read the live config, not the numbers in §7.
+
+### 12.2 Episode generation QOL
+
+- **Random seed by default**: `generate_dataset(seed=None, ...)` (and the
+  CLI's `--seed`, also defaulting to `None`) draws a fresh random base seed
+  via `secrets.randbelow()` and LOGS it (`"...pass --seed <N> to reproduce
+  this run"`) — omitting `--seed` used to silently mean "always seed 0",
+  which made every fresh-directory generation call produce byte-identical
+  episodes. Now it's genuinely random unless you pin it.
+- **Appends, never overwrites**: repeated `generate_dataset()` calls
+  against the same `output_dir` continue shard numbering (and seeding) from
+  whatever's already there (`shard_00000.npz`, `shard_00001.npz`, ...
+  scanned via glob at call time) instead of starting back at
+  `shard_00000.npz` and clobbering it. To start over, delete the directory
+  yourself — there's no `--overwrite` flag, by design (an explicit `rm` is
+  safer than a flag that's easy to pass by habit).
+- **Live progress, shards written as they finish**: uses the project's
+  existing dependency-free [`ai/progress.py`](../src/footballcoach/ai/progress.py)
+  `ProgressReporter` (no new dependency — already used by rollout
+  collection elsewhere) instead of blocking silently until every shard is
+  done. Switched from `pool.map` to `pool.imap_unordered` so each shard
+  gets written to disk (and progress updated) the moment IT finishes,
+  rather than all arriving at once at the end. Auto-downgrades from a live
+  `\r`-updating bar to milestone lines when stdout isn't a real terminal
+  (piped/logged output), so it's safe in both interactive and non-
+  interactive use.
+- **`spin_active_frac`** (config key, default in `ai_config.json`): most
+  episodes now get ZERO ball spin, matching real play (mostly low/no-spin),
+  with only a configurable fraction getting a random-axis/random-magnitude
+  spin — previously every episode got some nonzero spin, over-representing
+  it relative to what the live game actually produces.
+
+### 12.3 Training-loop reporting QOL
+
+`compute_loss()` was restructured from the original §5 sketch (one blended
+"continuous MSE" + one blended "event BCE" per horizon) into much
+finer-grained, separately-reported components — the blended numbers were
+actively hiding information (e.g. `goal_scored`'s BCE, averaged together
+with the much-easier `out_of_bounds` BCE, looked far better than it
+actually was):
+
+- **RMSE, not MSE**, for the three continuous groups — `pos_rmse`,
+  `vel_rmse`, `spin_rmse`, each reported separately (position/velocity/spin
+  are different physical quantities on different scales, so even splitting
+  them from one one another wasn't enough — RMSE is also directly
+  interpretable/convertible to real units, unlike squared-unit MSE). The
+  *optimized* loss is still plain summed MSE — only the *reported* numbers
+  are square-rooted, so this is purely a readability change, not a training
+  change.
+- **`out_of_bounds` BCE and `goal_scored` BCE reported separately**, never
+  merged into one averaged "event BCE" number.
+- **`pos_weight` is printed at the start of training**, per horizon, per
+  flag (e.g. `t=0.2s  out_of_bounds=13.51  goal_scored=35.32`) — makes the
+  class-imbalance severity visible up front instead of an invisible input
+  to the loss. Cappable via the new `pos_weight_max` config key (or
+  `--pos-weight-max` CLI override) if a horizon's weight gets large enough
+  to destabilise training.
+- **Classification metrics, not just BCE**: `compute_confusion_counts()`
+  computes per-horizon `(tp, fp, fn, tn)` at a `logit > 0` (i.e. `p > 0.5`)
+  threshold for both event flags; counts are SUMMED across every batch in
+  an epoch (never averaged per-batch) before computing accuracy/precision/
+  recall — averaging small-batch ratios directly would be wrong here, since
+  a batch can easily have zero positive predictions (or zero actual
+  positives) for the rarer `goal_scored` flag, making that batch's
+  precision/recall undefined. `_classification_metrics()` reports `NaN`
+  (not a misleading `0`) wherever a denominator is genuinely zero for the
+  whole epoch.
+- **Every per-horizon log line ends with an aggregate**: `sum:` for the
+  five loss components (additive — matches what's actually being summed
+  into the total loss), `mean:` (via `_safe_nanmean`, which skips the
+  "Mean of empty slice" warning for an all-`NaN` row) for the three
+  classification ratios, since summing precision/recall across horizons
+  isn't a meaningful quantity the way summing losses is.
+- **Full per-epoch history**, not just the log tail: every metric above,
+  every epoch, saved to `<checkpoint>.history.npz` — `train_pos_rmse`,
+  `val_goal_recall`, etc., shape `(n_epochs, n_horizons)` (or `(n_epochs,)`
+  for scalars like `train_loss`).
+
+### 12.4 Auto-generated HTML training report
+
+`report.py` (`write_report()` + `open_in_browser()`) renders
+`report_template.html` (a real `<!doctype html>...</html>` document, not an
+Artifact-tool body fragment) with the full history + config + normalization
+data embedded as inline JSON, and writes it to
+`<checkpoint>.report.html`. `train()` does this automatically at the end of
+every run and opens it in the OS default browser unless
+`--no-open-report`/`open_browser=False` is passed (`open_in_browser()`
+never raises — a headless environment with no display is a common, benign
+case, not a training failure, so it logs a warning and returns `False`
+instead).
+
+This is a **local file**, deliberately distinct from publishing to a
+shareable claude.ai artifact — that step requires a person-driven tool call
+inside a Claude Code conversation, which a training script has no way to
+trigger itself. The local report is the fully-automatic equivalent: same
+page, same charts, opened straight from disk with zero manual steps.
+
+Report contents (all computed client-side from the embedded JSON, no
+server):
+
+- Header stat strip: episode/row counts, epochs run vs. configured, best
+  epoch, best val loss, latent dim.
+- One chart panel per metric (position/velocity/spin RMSE, out-of-bounds/
+  goal-scored BCE, and — new — accuracy/precision/recall for both event
+  flags): per-horizon lines, color-coded on a cool→warm gradient by horizon
+  length (short=cool, long=warm), train dashed, val solid, a vertical
+  marker at the restored best-val epoch, and — for the three RMSE panels —
+  a secondary right-hand axis in real units (metres/m/s/rad/s), using
+  `pitch_half_diag_m`/`ball_spin_norm_max_rad_s` scale factors saved into
+  the checkpoint at training time (position's conversion is explicitly
+  labeled "approx" — it blends three differently-scaled fields, so there's
+  no single exact metres conversion, only a reasonable stand-in). The BCE
+  panels get a `ln(2)` "coin-flip baseline" reference line instead.
+  Accuracy/precision/recall panels are fixed to a `[0, 1]` y-range rather
+  than auto-scaled.
+- Best-epoch table: every metric above at the best (restored) epoch, per
+  horizon — RMSE rows get both a `normalized` row and a real-unit row (two
+  full-width `<td>`s per row rather than a `rowspan` cell, specifically
+  because an earlier `rowspan` version silently broke `:nth-child`-based
+  column styling — the unit row had one fewer cell than the normalized row,
+  which shifted every value left by one column and made the shortest
+  horizon's value render styled like a label. Worth remembering if this
+  table is extended again: keep every row in a given metric group the same
+  cell count).
+
+Colors/typography/layout follow the `artifact-design` skill's "utilitarian
+dashboard" treatment (dark/light theme-aware CSS tokens, monospace for
+data, a cool→warm horizon palette chosen because it encodes something real
+— short vs. long prediction horizon — rather than being decorative).
+
+### 12.5 What to replicate for the player-dynamics follow-up (§11)
+
+Everything in 12.2-12.4 is dataset/training-loop/reporting infrastructure,
+not ball-specific — when §11 gets built, carry it over rather than
+re-inventing a thinner version:
+
+- `ai/progress.py`'s `ProgressReporter` for episode-generation progress.
+- Append-by-default, randomly-seeded-by-default dataset generation.
+- Per-quantity-group (not blended) loss reporting, with per-horizon
+  sums logged — for the player net that likely means separating position/
+  velocity/heading/stamina RMSE rather than one blended continuous MSE
+  (mirroring the ball net's pos/vel/spin split), plus the same
+  confusion-count-based accuracy/precision/recall treatment for
+  `out_of_bounds`/`goal_scored` (§11's player output already includes
+  both).
+- `pos_weight` printed at training start, cappable via a
+  `physics_pretrain.player.pos_weight_max` config key.
+- A `report.py`/`report_template.html`-style auto-opening local HTML
+  report — likely close enough to reuse most of the template directly
+  (swap the metric key names, add a fourth continuous-RMSE panel for
+  heading), rather than writing a second bespoke report generator.
+  Specifically worth carrying over from the ball version's later additions
+  (§12.6): the `pos_dist`/`vel_dist`-style mean-distance metrics leading
+  the stat row (more literally answers "how far off, typically" than RMSE
+  does — see §12.6's Jensen's-inequality gotcha before assuming RMSE ≥
+  distance for whatever axis-averaging convention gets used), and the
+  sample-predictions table at the bottom (random input/pred/target rows —
+  cheap, and catches things aggregate metrics can hide).
+
+**Lessons learned the hard way in §12.6, worth applying from the START
+this time rather than discovering again after a bad training run:**
+
+- **Interleave every same-epoch auxiliary pass from day one, don't bolt it
+  on later.** The ball net ran main/adjacent-pair/t0 passes as 3 sequential
+  phases for a long time before the ordering bias (whichever pass runs
+  LAST is always measured against the most-updated model that epoch) was
+  even suspected, let alone fixed (`_run_interleaved_train_epoch`). If the
+  player net ends up with more than one same-epoch training pass sharing
+  an optimizer (e.g. an equivalent adjacent-pair or t0 term), build the
+  combined/interleaved loop structure in from the start rather than
+  incurring the same silent per-horizon bias for however long it takes to
+  notice.
+- **Audit EVERY multi-epoch phase for its own best-val tracking and
+  (optional) early stopping, not just the main loop.** Both autoencode
+  pretraining and decoder-only pretraining initially had neither, and both
+  needed it added after real, observed problems (a bad final epoch handed
+  to the next phase; a fixed epoch budget with no way to stop once
+  converged). If the player net gets an analogous pretraining phase, give
+  it its own best-val tracking and its own (separately-configurable, phase-
+  scoped) early-stopping knobs immediately, rather than treating them as
+  the main loop's exclusive privilege.
+- **Look for provably-constrained output fields and encode the constraint
+  architecturally, not just hope the network learns it.** Height (ball_z)
+  turned out to be provably non-negative, worth a single-ReLU special case
+  in the identity-shortcut decoder init instead of the general bidirectional
+  treatment. Player state likely has several analogous constraints worth
+  auditing for up front: stamina/speed magnitude (non-negative), heading
+  (circular — a raw angle is the WRONG representation entirely; encode as
+  `(sin, cos)` pairs rather than trying to make a linear layer respect
+  wraparound), field position (bounded by pitch dimensions, though that's
+  a soft/probabilistic bound unlike height's hard physical floor). Cheap to
+  identify early, expensive to retrofit once an identity-shortcut init
+  already assumes the general bidirectional case everywhere.
+- **When unifying normalization scales across axes of one quantity
+  (position x/y/height sharing one divisor instead of 3 different ones),
+  check what that does to EVERY axis's relative weight in the loss, not
+  just whether it "sounds more consistent."** Naively unifying position's
+  3 divisors to whichever is LARGEST (matching velocity's convention)
+  would have made height's error term ~20x smaller in normalized space
+  than it should be — nearly invisible in `pos_mse`/`pos_rmse` — if height
+  had kept the smaller, more natural `height_norm_m` scale while x/y moved
+  to the much larger pitch-derived one. For the player net, if any
+  analogous per-axis-normalized quantity gets touched (position, velocity),
+  explicitly check the RATIO between the old and new scale for every axis
+  being unified before assuming "one shared divisor" is strictly better —
+  it can silently zero out an axis's contribution to the loss instead.
+- **Audit initial-condition SAMPLING code for physical-plausibility
+  violations separately from the ONGOING simulation code, even when the
+  simulation itself is already correct.** `step_ball`'s ground clamp
+  (`z >= ball_radius_m`) was correct the whole time; the bug was in the
+  INITIAL position sampler, which had never been checked against that same
+  constraint and let ~3.7% of episodes start with the ball's center
+  literally below/inside the ground. The two code paths (seed a state,
+  then simulate it forward) can each independently respect or violate a
+  physical constraint — checking one doesn't imply the other is fine. For
+  the player net, whatever seeds player starting positions/velocities/
+  stamina should get the same explicit check against whatever the ongoing
+  simulation already (presumably correctly) enforces.
+- **Gradient-masking hooks are attached at model CONSTRUCTION time and
+  persist independent of whatever weights get loaded via `load_state_dict`
+  afterward.** This means a checkpoint trained under an OLDER version of an
+  init/masking scheme, resumed under NEWER code, silently gets the NEW
+  code's masking behaviour applied to the OLD code's (possibly very
+  different, possibly load-bearing) weight values — see §12.6's
+  checkpoint-resume caveat for the concrete case this bit the ball net. If
+  the player net's identity-shortcut/masking scheme ever changes after
+  checkpoints already exist, check this interaction explicitly rather than
+  assuming "the weights are what matter, hooks don't need re-checking."
+
+### 12.6 Post-hoc architecture/training tweaks and engineered features
+
+Changes made after the initial as-built pipeline (12.1-12.5) landed, in
+response to real training results (oscillating loss late in training,
+flat-looking velocity/spin RMSE across horizons):
+
+- **Decoder**: switched from 6 independent per-horizon heads to a single
+  shared decoder conditioned on 3 horizon features concatenated onto the
+  latent (`decoder_hidden_dim` in config): `t_norm` (`horizon_s /
+  max(horizons_s)`), `t_norm^2`, and `log(horizon_s)`. Log-only was the
+  original design; switched to all 3 because most of the underlying
+  kinematics is close to linear/quadratic in RAW time for short intervals
+  (position ~ velocity*t, gravity's t^2 term, spin decay ~ linear-per-tick)
+  — log(t) alone forces the network to implicitly apply exp() to recover
+  that, which a linear layer could represent exactly from raw/squared t.
+  Feeding all 3 (cheap, 2 extra scalars) lets the network use whichever
+  combination fits a given output best. Only the decoder sees any of this
+  — the encoder never does, so the latent stays a general dynamics-state
+  representation rather than horizon-specific.
+- **Encoder**: added a gradual-bottleneck layer
+  (`hidden_dim -> encoder_bottleneck_dim -> latent_dim` instead of jumping
+  straight from `hidden_dim` to `latent_dim` in one step). BatchNorm was
+  considered and rejected — it needs `.eval()` reliably called at every
+  inference site to use running stats instead of batch stats, and this
+  encoder is meant to eventually run frozen at batch-of-1 inside the live
+  rollout hot loop (§8, still on hold) — the same class of bug already seen
+  once in this codebase (`network.value_dropout`'s "PPO rollout doesn't
+  call `.eval()`" caveat). LayerNorm (no batch/train-eval dependency) is
+  the safer alternative if normalization is revisited later — not yet
+  added, no immediate need identified.
+- **LR schedule**: added cosine annealing with warm restarts (SGDR,
+  `torch.optim.lr_scheduler.CosineAnnealingWarmRestarts`), config-gated via
+  `lr_cosine_restart_epochs` (0/null = flat LR, prior behaviour). Motivated
+  by train loss oscillating-but-occasionally-improving late in training — a
+  sign the LR was too coarse for the local curvature near the minimum.
+  Current LR is logged per epoch and saved to `.history.npz`, but
+  deliberately NOT added as a report panel — the chart machinery assumes
+  per-horizon train/val series pairs, and LR is a single scalar with no val
+  counterpart, so it'd need its own plotting path.
+- **R² sanity metric**: added per-horizon, per-quantity-group (pos/vel/
+  spin) R² (`1 - MSE/Var(target)`, baseline variance always from
+  `train_idx`) alongside RMSE, specifically to distinguish "genuinely hard
+  to predict that far out" from "collapsed to predicting the mean" when
+  RMSE looks flat across horizons — RMSE magnitude alone can't tell those
+  apart. Same sum-then-divide-once accumulation pattern as the confusion
+  counts (never average per-batch ratios).
+- **Displacement-normalized error** (`{pos,vel,spin}_err_pct_disp`):
+  reuses the same per-horizon accumulated squared-error sums as R², but
+  divides against a "persistence" baseline (predict the episode's OWN
+  initial state, i.e. assume nothing moved -- `BallDynamicsDataset.
+  compute_persistence_baseline_mse()`) instead of the train-set mean, and
+  reports it as `100 * sqrt(MSE_model/MSE_baseline)` -- the model's typical
+  error as a percentage of how far the ball typically moved over that
+  horizon. Motivated by two issues with a plain mean-baseline R²: (1) the
+  mean baseline is weak at short horizons (the ball hasn't moved much, so
+  even "echo the input" scores deceptively high against it), whereas
+  persistence is a much tougher bar there; (2) R² compresses via squaring,
+  so a 0.9 there is only really a ~68% RMSE reduction, not 90% -- reporting
+  the un-squared ratio directly (as a percentage) reads more honestly. An
+  earlier version of this reported `1 - MSE/MSE_persistence` (R² form, same
+  underlying computation) before being replaced with this percentage form
+  for readability. A literal per-sample MAPE-style version (percent error
+  per episode, then averaged) was considered and rejected -- individual
+  episodes can have a near-zero true delta in a given dimension, and
+  dividing by that per sample blows up/dominates the average; summing
+  numerator and denominator separately across the whole population first
+  (as done here) avoids that instability entirely.
+- **Ballistic-baseline error** (`{pos,vel,spin}_err_pct_ballistic`, `Ball
+  DynamicsDataset.compute_ballistic_baseline_mse()`): a third, stronger
+  baseline than persistence for pos/vel specifically -- straight-line
+  physics using ONLY constant velocity + gravity (no drag, no Magnus/spin
+  effects, no bounce), computed in real units per episode (using that
+  episode's own randomized pitch scale) then renormalized to compare
+  against the model's actual (normalized) MSE, same
+  `100 * sqrt(MSE_model/MSE_baseline)` reporting form as the persistence
+  metric. Motivated by: position and velocity are handed to the encoder
+  directly as raw inputs, and `pos0 + v0*t` (+ gravity's t^2 term) is close
+  to exact for short horizons, so it's a much more telling bar than "assume
+  nothing moved" for catching cases where the model isn't even matching
+  free, nearly-linear extrapolation of information it already has. Spin has
+  no separate ballistic model (nothing in this baseline acts on spin), so
+  `spin_err_pct_ballistic` is always identical to `spin_err_pct_disp`.
+  - **Post-launch fix: z is floored at 0 (can't go underground); x/y stay
+    fully unclamped.** An x/y pitch-edge freeze (matching real episodes'
+    freeze-on-out-of-bounds semantics) was tried first and then explicitly
+    reverted at the user's request -- the intent is a "how good is naive
+    straight-line kinematics" baseline, and x/y should keep extrapolating
+    for the FULL horizon regardless of pitch boundaries; only z gets a
+    physical-plausibility floor, since a ball can't be below the ground.
+    Implementation: `z_pred = max(0, pos0.z + vz*t - 0.5*g*t^2)`, computed
+    independently at each horizon from the full (unclamped) `t` -- NOT a
+    "freeze forever after first ground contact" state carried between
+    horizons, just "can't be below the ground at this instant" applied to
+    that horizon's own prediction (a trajectory arcing back above `z=0`
+    later, e.g. thrown up again, is still allowed to be positive at a
+    later horizon even if an earlier horizon clamped it to 0). Velocity is
+    NOT clamped at all, only position's z. Verified in
+    `test_compute_ballistic_baseline_mse_hand_computed` (x_norm allowed
+    past 1.0, proving x/y really is unclamped) and
+    `test_compute_ballistic_baseline_mse_clamps_z_floor_but_not_xy` (z
+    floored at exactly 0 while x keeps extrapolating past the pitch edge
+    in the SAME row/horizon).
+- **Freeze-on-event semantics moved from generation-time to training-time
+  (2026-08-19).** `generate_episode` no longer stops/freezes physics on
+  out_of_bounds OR goal_scored -- the ball is simulated with the SAME
+  regular physics (gravity/drag/Magnus/ground bounce, and goal-net/post/
+  crossbar bounce physics via `resolve_goal_boundary`) for the FULL
+  horizon regardless of event status, so it can genuinely bounce back onto
+  the pitch or back out of a goal mouth. Motivated by the hypothesis
+  (discussed at length re: why oob classification lags goal classification
+  and is hardest at short/mid horizons) that the hard discontinuity the
+  freeze introduces into the pos/vel/spin regression targets is making the
+  network's job harder than necessary, not easier. `out_of_bounds`/
+  `goal_scored` at each recorded horizon are now the INSTANTANEOUS state
+  at that exact moment (no longer latched/sticky) -- a ball out at t=1s
+  but back in bounds at t=2s now has `out_of_bounds=0` at the t=2s horizon.
+  - `generate_episode`/`generate_shard` now additionally return
+    `crossing`/`crossing_time` -- an 11-field row (same layout as one
+    per-horizon target block) capturing the FULL state at the moment
+    out_of_bounds/goal_scored FIRST became true, and when. Persisted per
+    episode in each `.npz` shard (`crossings`/`crossing_times` arrays)
+    alongside the always-continuous `targets`.
+  - `physics_pretrain.ball.freeze_semantics` (default `true`, prior
+    behaviour) is a **training-time**, not generation-time, flag:
+    `BallDynamicsDataset.targets_with_freeze_semantics()` reconstructs the
+    OLD freeze-and-latch targets from the stored continuous trajectory +
+    `crossings`/`crossing_times` (substitutes `crossings` into any horizon
+    at or after that episode's `crossing_time`) right after `train()`
+    loads the dataset. `false` trains against the raw stored data as-is.
+    Both conventions live in the SAME generated dataset, so comparing them
+    is just flipping this flag and re-running -- no regeneration needed.
+  - Verified with `test_generate_episode_simulates_to_exact_horizon_time_
+    not_nearest_tick` (unaffected by this change) plus new coverage for
+    the always-continuous/instantaneous-flags/crossing-capture behavior
+    and `targets_with_freeze_semantics`'s reconstruction (see the test
+    file's `ball_episode_gen`/`BallDynamicsDataset` sections).
+- **BCE loss weight (2026-08-19).** `physics_pretrain.ball.
+  bce_loss_weight` (default 1.0, no behaviour change) multiplies the
+  out_of_bounds/goal_scored BCE terms' contribution to every backpropagated
+  loss in a run (main per-horizon heads, adjacent-pair, autoencode-pretrain,
+  the t0 term) -- threaded through `compute_loss`/`compute_per_episode_
+  loss`/`_single_target_loss(_with_breakdown)`/`_single_target_per_episode_
+  loss`. Reported `oob_bce`/`goal_bce` metrics are always the raw,
+  UNweighted value regardless of this setting, so runs at different
+  weights stay directly comparable. `0.0` fully disables the classification
+  heads' gradient (regression trains exactly as if out_of_bounds/
+  goal_scored didn't exist as targets), for testing whether the
+  classification heads are competing with regression quality. Verified
+  with `test_compute_loss_bce_weight_scales_total_but_not_reported_
+  breakdown` (breakdown unaffected at any weight; `total` scales linearly;
+  `0.0` gives exactly zero gradient at the oob/goal output columns while
+  leaving pos/vel/spin gradient untouched).
+- **Spin loss weight (2026-08-19).** `physics_pretrain.ball.
+  spin_loss_weight` (default 1.0, no behaviour change) -- same idea as
+  `bce_loss_weight` immediately above, but for the spin MSE term instead of
+  the BCE terms, same call sites, same "reported `spin_rmse` is always the
+  raw unweighted value" convention. `0.0` fully disables the spin head's
+  gradient, for testing whether spin regression is competing with (dragging
+  down) pos/vel quality -- motivated directly by the post-training t=0
+  sanity check showing spin reconstruction error far worse (proportionally)
+  than pos/vel's, raising the question of whether spin was worth its share
+  of gradient budget.
+  - **Diagnostic-noise suppression, applies to `bce_loss_weight`/
+    `spin_loss_weight` alike.** Once a weight is 0.0, its component isn't
+    receiving gradient, so printing its raw (frozen, unchanging) value
+    every epoch is noise, not signal -- `spin_rmse` (when `spin_loss_weight
+    ==0`) and `oob_bce`/`goal_bce`/the oob/goal accuracy/precision/recall/R²
+    /err_pct rows (when `bce_loss_weight==0`) are now skipped from the
+    per-epoch console printout specifically (`_LOG_COMPONENTS`/`_LOG_CLS_
+    KEYS`/`_LOG_R2_KEYS`/`_LOG_PCTD_KEYS`/`_LOG_PCTB_KEYS`, filtered
+    variants of the unfiltered `_COMPONENTS`/`_CLS_KEYS`/etc. used
+    everywhere else) -- `history`/`.history.npz`/the HTML report still
+    record every column regardless, so no data is lost, only the console
+    spam is trimmed.
+- **Mean-distance metrics, `pos_dist`/`vel_dist` (2026-08-19).** Added
+  alongside `pos_rmse`/`vel_rmse` (`LossBreakdown`, `compute_loss`,
+  `_single_target_loss_with_breakdown`, `_COMPONENTS`/`_RMSE_UNIT_SCALE`) --
+  purely a REPORTING metric, never contributes to the backpropagated loss.
+  `pos_dist` is the mean PER-SAMPLE Euclidean distance
+  `||pred_pos - target_pos||` (mean taken AFTER the sqrt), motivated by
+  wanting a more literal answer to "how far off is the model typically"
+  than RMSE gives. **Non-obvious gotcha, worth remembering for any future
+  per-axis-averaged-then-square-rooted metric**: `pos_rmse` here is
+  `sqrt(F.mse_loss(...))`, which averages squared error over the 3 position
+  axes AND the batch TOGETHER (dividing by 3), making it closer to a
+  "typical per-AXIS error" than the RMS of the 3D vector distance -- the
+  TRUE RMS-of-distance is `sqrt(3) * pos_rmse`, and Jensen's inequality
+  bounds `pos_dist` against THAT (`pos_dist <= sqrt(3) * pos_rmse`), not
+  against `pos_rmse` directly. First-draft documentation (and verbal
+  explanation to the user) claimed `pos_rmse >= pos_dist` always, which is
+  WRONG for this specific `pos_rmse` definition -- `pos_dist` can and does
+  come out numerically LARGER than `pos_rmse`, verified empirically (real
+  run: `pos_rmse=1.47m`, `pos_dist=1.99m`). Corrected in `LossBreakdown`'s
+  docstring. `vel_dist` mirrors `pos_dist` for velocity, same relationship
+  to `vel_rmse`. Surfaced prominently in the HTML report
+  (`report_template.html`): both lead the top stat row (accent-colored,
+  ahead of episode/epoch counts), get their own chart panels placed FIRST
+  (before the RMSE panels), and their own rows in the best-epoch table.
+- **Sample-predictions table in the HTML report (2026-08-19).** 10 random
+  `(episode, horizon)` pairs from the val set, saved as `val_examples` in
+  the training artifact (`train_ball_dynamics.py`'s `train()`, reusing
+  `describe_input_row`/`describe_target_row` for human-readable strings,
+  reproducible per `--seed` since it draws from the run's own seeded
+  `rng`), rendered as a 3-row-per-example (input/pred/target) table at the
+  bottom of the report. Motivated by wanting to eyeball a handful of
+  TYPICAL predictions directly, as a check against aggregate metrics
+  alone -- complements (doesn't replace) the existing median/worst-episode
+  diagnostic, which is deliberately NOT representative (picked for being
+  extreme).
+- **Combined interleaved training loop, main loop AND decoder-only
+  pretraining (2026-08-19).** Previously each epoch ran 3 SEQUENTIAL
+  passes -- the main per-horizon pass fully start-to-finish, then the
+  adjacent-pair pass fully, then the t0 pass fully (each its own loop, own
+  `optimizer.step()` calls). This meant whichever pass ran LAST each epoch
+  was always measured against (and trained against) a model every OTHER
+  pass had already updated that epoch, while whichever ran FIRST never
+  benefited from the others' updates within that epoch -- the exact same
+  systematic (not noise-averaging-out) bias `_interleaved_horizon_batches`
+  already existed to fix ACROSS HORIZONS within one pass, just not yet
+  applied ACROSS PASS-TYPE. Fixed by a new shared closure,
+  `_run_interleaved_train_epoch(optimizer)`, that builds ONE combined,
+  SHUFFLED sequence of minibatches drawn from all 3 sources (tagged by
+  source so each batch still runs its own correct forward/loss/backward/
+  step), and iterates that single sequence instead of 3 separate loops.
+  Metrics stay fully separate per source in the log/history (`train_loss`
+  vs `train_pair_loss` vs `train_t0_loss`) -- only EXECUTION ORDER changed,
+  not what gets measured or reported. Parameterized by `optimizer` (not a
+  fixed module-level one) specifically so the SAME function serves both the
+  main loop and decoder-only pretraining, which use different optimizer
+  instances over different trainable parameter subsets -- replaced both
+  phases' previously-duplicated 3-block structure with one call each.
+- **Position normalization unified to one shared divisor
+  (2026-08-19).** Under `normalize_kinematics_by_base_pitch=true` (see the
+  original entry above), position's 3 axes (x/y/height) now ALL divide by
+  the base pitch's `half_diag` -- the same divisor velocity already used --
+  instead of x/half_length, y/half_width, height/height_norm_m (3 DIFFERENT
+  divisors, still the behaviour when the flag is `false`). Motivated by:
+  `pos_mse` (`F.mse_loss`) sums squared error across all 3 axes before
+  reporting, so mixing 3 different real-world-to-normalized scales into one
+  combined number muddies what that number means, and specifically makes it
+  hard to reason about which axis dominates the loss. Considered unifying
+  ONLY x/y (leaving height on its own, much smaller, `height_norm_m` scale)
+  but rejected -- height would then be ~20x smaller in normalized space
+  than x/y, meaning height error would barely register in `pos_mse`/
+  `pos_rmse` at all, defeating the point of tracking it. `_kinematics_
+  divisors`/`_kinematics_denorm_scales` (encode/decode sides, `ball_
+  episode_gen.py`/`train_ball_dynamics.py`) and `compute_ballistic_
+  baseline_mse` all updated together to keep the encode/decode/baseline
+  paths consistent. Dataset-generation-time change (like the flag itself)
+  -- requires regenerating any dataset built before this landed, since old
+  shards encode height under the OLD per-axis convention even where the
+  flag itself is unchanged.
+- **`goal_net_collisions_enabled` (2026-08-19).** `physics_pretrain.ball.
+  goal_net_collisions_enabled` (default `true`, no behaviour change) --
+  dataset-generation-time flag gating whether `resolve_goal_boundary()`
+  (goal-net/post/crossbar bounce physics) runs at all once the ball has
+  passed the goal line. `false` skips it entirely -- the ball just keeps
+  flying through the goal mouth under regular gravity/drag/Magnus/ground-
+  bounce physics, as if the frame weren't there. `goal_scored` detection
+  (`check_goal`) is independent of this and unaffected either way. Added to
+  isolate whether the goal-frame's bounce geometry (small, high-curvature
+  region of state space, similar bounce-timing sensitivity to pitch-
+  boundary bounces) is a meaningful contributor to the mid-horizon
+  (t=1-3.5s) R² dip observed in real runs, independent of ordinary
+  pitch-boundary bounces.
+- **Initial-position ball-radius floor (2026-08-19).** Found while
+  investigating why the trained model sometimes predicts a negative height:
+  the dataset itself never contains a negative height ANYWHERE (0 negative
+  values across a full scan of both inputs and targets), so that's a pure
+  model-extrapolation artifact, not a label problem -- but a closer check
+  (comparing against the ball's actual physical floor, `ball_radius_m`
+  =0.11m, not 0, since `position.z` is the ball's CENTER and `step_ball`'s
+  ground clamp holds a resting ball's center at exactly `ball_radius_m`)
+  found that `_sample_position_in_play`/`_sample_position_already_special`
+  were sampling initial `z` from `[0.0, ...)`, letting ~3.7% of episodes
+  start with the ball's center below its own radius (physically, partially
+  buried). Traced the actual physics consequence: `step_ball`'s ground
+  clamp (`if new_position.z <= ball_radius_m: new_position.z = ball_
+  radius_m`) triggers on the very FIRST simulated tick for these episodes,
+  snapping the center straight up to `ball_radius_m` -- and if the sampled
+  initial vertical velocity happened to be downward and fast enough, this
+  reads as a genuine BOUNCE (restitution applied to vertical AND horizontal
+  velocity, spin decayed) despite the ball never having actually fallen
+  from height, an artificial one-frame discontinuity with no real-world
+  analogue. Fixed by flooring all `z` sampling at `ball_radius_m` instead
+  of `0.0` (`BallEpisodeGenParams` gained a `ball_radius_m` field, sourced
+  from `physics.json`'s `ball.radius_m`, threaded into both sampling
+  functions). Dataset-generation-time change -- requires regeneration.
+- **Decoder identity-shortcut: single-unit special case for height
+  (2026-08-19).** `_init_identity_shortcut_decoder`'s `dim` (=9) identity
+  fields each get 2 dedicated hidden units (`ReLU(x) - ReLU(-x) == x`,
+  needed because a single `ReLU` alone clips negative values) -- EXCEPT
+  `Z_FIELD_INDEX` (height's position within those 9 fields, =2), which
+  provably never needs to represent a negative value (see the initial-
+  position fix above -- confirmed empirically, 0 negative values anywhere
+  in the dataset). Height now gets only ONE dedicated unit (`ReLU(x) == x`
+  is already exact for `x>=0`); its would-be second unit (`z_free_idx =
+  2*Z_FIELD_INDEX+1`) is freed up as a genuine SPARE unit instead (same
+  random-init/no-mask treatment as the other spare units, including write
+  access to oob/goal logits) rather than wasting it on a `-1` weight
+  connection nothing in the real data ever needs. Bonus effect: height's
+  dedicated reconstruction path can now never itself contribute a negative
+  value (its one live unit is a bare ReLU, clipped at 0) -- a soft
+  architectural nudge against negative height predictions, though NOT a
+  hard guarantee on the network's overall output (nothing stops OTHER
+  units, e.g. this freed one, from contributing to that output column too,
+  in principle, if the encoder ever routes signal that way).
+  - **Reverted approach, kept for the record: making the freed unit
+    permanently dead instead of a live spare.** Tried first, as a more
+    conservative "definitely can't destabilize anything" option -- zero
+    weight/bias, kept inside the permanently-masked dedicated block, same
+    as if the field simply had 1 fewer unit. Reverted at the user's
+    explicit request in favour of keeping it live: wasting a whole hidden
+    unit for a single field is a bigger cost than fixing the thing that
+    actually broke, which was the REGRESSION TEST's synthetic data (it fed
+    a genuinely negative synthetic "height" target, something the real
+    premise this whole change rests on -- height is never negative --
+    explicitly rules out; the single ReLU unit can never resolve that
+    target no matter how weights move, so real, unmaskable, ever-present
+    gradient destabilized the newly-live shared-optimizer-state unit within
+    a handful of adversarial steps). Fixed by correcting the test's
+    synthetic data (`.abs()` on the synthetic height column) instead of
+    weakening the architecture -- see `test_identity_shortcut_survives_
+    adversarial_classification_gradient`'s updated docstring.
+  - **Checkpoint-resume caveat.** Gradient-masking hooks (`register_hook`)
+    attach to the `Parameter` object at model CONSTRUCTION time, which
+    always happens BEFORE `load_state_dict()` when resuming from a
+    checkpoint -- so hooks always reflect CURRENT code, regardless of what
+    checkpoint is loaded on top, while the WEIGHT VALUES loaded in reflect
+    whatever code trained that checkpoint. For a checkpoint trained under
+    the OLD (pre-this-fix) scheme specifically, `z_free_idx` holds a real,
+    meaningfully-trained negative-half reconstruction weight (not a benign
+    near-zero spare unit) -- loading it under the NEW code's mask (which
+    now treats that column as free to write to oob/goal) re-exposes an
+    already-important weight to exactly the classification-gradient
+    corruption this file's masking exists to prevent, just for this one
+    unit. Not currently guarded against -- worth a warning or an explicit
+    re-mask-on-resume fixup if old checkpoints need to keep training under
+    the new code.
+- **Exact-time horizon simulation (2026-08-19).** `generate_episode` used
+  to snap each `horizons_s` value to the nearest whole physics tick
+  (`round(h / sim_dt_s)`), then record whatever state existed at THAT
+  tick as if it were the literal `horizons_s` value -- a systematic (not
+  random) timing error bounded by `sim_dt_s/2`, worst in RELATIVE terms
+  at the shortest horizons (e.g. with `sim_dt_s=0.06`, `horizons_s[0]=
+  0.2` was actually recorded at t=0.18s, a 10% relative error, vs. ~0.2%
+  by the longest horizon) while the decoder's horizon-conditioning
+  features still used the literal nominal value -- a real, previously
+  unaccounted-for source of label noise concentrated exactly where the
+  horizon-ordering and oob-class-imbalance issues above already made
+  short horizons hardest. Fixed by simulating chronologically to each
+  horizon's EXACT time instead: regular `sim_dt_s`-sized steps until one
+  more would overshoot, then a final partial step of exactly the
+  remainder (`step_ball` takes `dt_s` as a plain parameter with no
+  fixed-tick assumptions baked in, so an arbitrary partial step is exactly
+  as valid as a full one). The out-of-bounds/goal check still runs after
+  EVERY step regardless of size, so freeze detection is unchanged (if
+  anything finer-grained, right at a horizon boundary). Verified with
+  `test_generate_episode_simulates_to_exact_horizon_time_not_nearest_tick`,
+  which spies on `step_ball`'s `dt_s` arguments and checks their
+  cumulative sum lands exactly (not just close) on each horizon time.
+- **Engineered input features** (fields 14-19, see §3's table for the full
+  per-field breakdown): `speed_norm`/`speed_norm_sq` were added because air
+  drag is exactly proportional to speed² in the real physics model
+  (`ball_physics.py`'s drag force). `spin_norm` (magnitude only, no squared
+  counterpart -- checked the physics model and nothing there is
+  proportional to spin²) and the 3-component `magnus_cross_{x,y,z}` (the
+  real `spin × velocity` cross product from `ball_physics.py`'s
+  `magnus_force`, kept as a full vector rather than just its magnitude so
+  the network keeps the direction information that determines which way
+  Magnus curves the ball) were added at the same time. All are
+  deterministic functions of already-present inputs (no new information)
+  and cheap to compute. This is deliberately a *pattern*, not a one-off —
+  the general principle is: when a known physics relationship depends on a
+  nonlinear combination of values already in the input, and that
+  combination is cheap/deterministic to compute, hand it over directly
+  rather than making the network rediscover it. Considered and rejected:
+  distance-to-boundary features (nearest touchline/goal-line) -- the
+  network already gets normalized position directly, and edge distance is
+  a simple LINEAR function of that (`1 - |pos_norm|`), not the kind of
+  nonlinear combination this pattern is meant to address.
+- **Horizon feature: `log1p(t)` instead of `log(t)`**: the decoder's third
+  horizon feature (alongside `t_norm`/`t_norm^2`) is `log1p(horizon_s)`,
+  not plain `log`. `log1p(t) ≈ t` for small t (derivative at t=0 is exactly
+  1), so unlike an arbitrarily-shifted `log(t+eps)`, it doesn't fight the
+  near-linear-kinematics reasoning above near t=0 -- it's close to a
+  redundant near-linear term there, while still flattening/compressing at
+  large t the way plain log(t) did (the actually useful part -- "7s vs
+  10s" closer together than "0.2s vs 0.5s"). Well-defined and unremarkable
+  at t=0 (`log1p(0)=0`), no epsilon to justify. Same pattern already used
+  for `time_remaining` normalization elsewhere in this codebase
+  (`ai/obs/encoder.py`).
+- **`BallDynamicsDecoder.forward_at(latent, horizon_s)`**: a second
+  forward path alongside `forward()`, taking an explicit horizon instead
+  of reading the fixed per-instance trained-grid buffers -- lets the
+  (already-trained) decoder be queried at ANY horizon, not just the ones
+  it saw during training. No decoder architecture change was needed to
+  support this (same 3-feature formula, same weights) -- what it unlocks
+  is described below.
+- **t=0 autoencoding sanity check** (post-training diagnostic, always
+  logged when there's a val split): encode every val episode, decode at
+  `t=0` via `forward_at()` (never a training target under normal
+  per-horizon training), and compare directly against that episode's own
+  input -- the correct answer is exact by construction (nothing has
+  happened yet), which isolates "can the encoder+decoder round-trip
+  through the latent bottleneck at all" from "can it also predict real
+  dynamics". Motivated by: is a ~5-10m position RMSE at short horizons a
+  genuine dynamics-prediction difficulty, or is the latent bottleneck
+  itself (`latent_dim`) losing information it didn't need to lose? A bad
+  t=0 result specifically implicates the bottleneck, since there's no
+  actual prediction difficulty at t=0 to blame instead.
+- **Autoencode pretraining** (`physics_pretrain.ball.
+  autoencode_pretrain_epochs`, default 0/disabled): an optional phase run
+  BEFORE the main training loop that actively trains (not just diagnoses)
+  the t=0 round-trip, across every RECORDED horizon's state (not only the
+  original t=0 samples) via `BallDynamicsDataset.build_autoencoding_data()`
+  + `forward_at(latent, 0.0)`. Primes the bottleneck to preserve
+  information before also asking it to learn dynamics. Flat LR, its own
+  (`autoencode_lr`, separate Adam instance from the main loop's
+  `optimizer`) -- autoencoding is a much easier task than multi-horizon
+  dynamics prediction, so the right step size isn't necessarily the same;
+  falls back to `lr` if unset. Always flat (no cosine schedule -- that's
+  tuned for the main loop specifically). Also logs an "epoch 0 (before
+  training)" baseline pass (forward-only, no gradient step) before the
+  first real epoch, so init quality (e.g. `identity_shortcut`'s effect, see
+  below) is directly visible rather than only inferrable from epoch 1's
+  already-partially-trained numbers.
+- **Adjacent-horizon-pair training**
+  (`physics_pretrain.ball.adjacent_pair_training_enabled`, default true):
+  additional (input, target) training examples derived from data already
+  fully recorded, no new physics simulation needed
+  (`BallDynamicsDataset.build_adjacent_pair_data()`) -- treats each
+  recorded horizon's state as a NEW pseudo-initial-state, predicting the
+  next recorded horizon from it via a fixed, statically-known delta
+  (`horizons_s[i+1] - horizons_s[i]`, same for every row in that
+  pair-type, so `forward_at()` -- one scalar delta per whole batch -- is
+  exactly the right tool; NO decoder change was needed for this, unlike an
+  initial (mistaken) assumption that a batched varying-delta path would be
+  required). Run as an additional training pass within each epoch (same
+  optimizer, same epoch, tracked/logged separately as `train_pair_loss`/
+  `val_pair_loss`). Two distinct benefits, not equally strong: (1) more
+  training examples "for free" (pure reshaping of already-recorded data,
+  no new simulation); (2) more importantly, exposes the encoder to a
+  realistic "mid-trajectory" input distribution -- the ORIGINAL training
+  only ever encodes states drawn from uniform-random t=0 sampling, but a
+  live-deployed encoder (§8, still on hold) will see whatever state the
+  ball happens to be in mid-match, which looks far more like "partway
+  through a trajectory" than "freshly uniform-random sampled". Rows where
+  the episode was ALREADY resolved (out_of_bounds/goal_scored) by the
+  pair's start horizon are excluded -- predicting "stays frozen" from an
+  already-frozen state is trivially correct and would dilute the more
+  informative signal with easy examples (same rationale as
+  `bc.downsample_trivial` elsewhere in this codebase). Deliberately scoped
+  to ADJACENT pairs only (not the full `n_horizons choose 2` combinatorial
+  expansion of every start/end pair) to limit both the trivial-pair risk
+  and the added per-epoch compute cost.
+- **t=0 term during the main loop** (`physics_pretrain.ball.
+  autoencode_during_main_loop_enabled`, default true): the same
+  `build_autoencoding_data()` + `forward_at(latent, 0.0)` mechanism used by
+  autoencode pretraining, but also run as an extra pass EVERY epoch of the
+  MAIN loop, not just before it (mirrors adjacent-pair training's
+  same-epoch-same-optimizer pattern; logged/saved as `train_t0_loss`/
+  `val_t0_loss`). Motivated by a real gap: `horizons_s` never includes a
+  literal `0.0`, so without this, nothing supervises t=0 once the main
+  loop starts -- main-loop gradients, driven purely by the `0.2s`-`10.0s`
+  targets, are free to erode whatever t=0 quality autoencode pretraining
+  established, with zero corrective signal until the post-training t=0
+  diagnostic reports the damage after the fact (too late to do anything
+  about it). Data is derived for free regardless (pure reshaping of
+  already-recorded data, no new simulation) so there's no real cost to
+  keeping this on.
+  - **Full diagnostics, not just the scalar loss** (`_run_t0_pass`/
+    `_log_t0_diagnostics` helpers, shared with decoder-only pretraining
+    below): per-horizon pos/vel/spin RMSE + oob/goal BCE breakdown (same
+    format as the main per-horizon block, prefixed `train t0`/`val   t0`),
+    R² against the train-mean baseline (valid here since the t=0 target IS
+    exactly the recorded state at that horizon -- the same quantity
+    `target_var` is computed over), and (val only) confusion-based
+    accuracy/precision/recall, reusing `compute_group_sq_err`/
+    `compute_confusion_counts` by wrapping the single `forward_at`
+    prediction in a 1-element list. Deliberately does NOT compute
+    `err_pct_disp`/`err_pct_ballistic` for this pass -- those baselines
+    assume the ORIGINAL episode's t=0 state as the starting point, but
+    this task's "input" is horizon h's OWN recorded state reused as a
+    pseudo-initial-state, so reusing those baselines would silently
+    compare against the wrong reference point.
+- **Decoder-only pretraining** (`physics_pretrain.ball.
+  decoder_only_pretrain_epochs`, default 0/disabled;
+  `decoder_only_pretrain_lr`, falls back to `lr`): an optional phase, AFTER
+  autoencode pretraining and BEFORE the main joint loop, that trains the
+  decoder plus `encoder.out` (the latent-producing layer) on the REAL
+  per-horizon dynamics task (main per-horizon loss + adjacent-pair + t=0
+  term, all three, same as a regular main-loop epoch), with `encoder.trunk`
+  (everything before `encoder.out`) frozen. Motivated by the same failure
+  class as the classification leak fixed via `BallDynamicsDecoder`'s
+  identity-shortcut masks, one level further out: on epoch 1 of the main
+  loop, the decoder's dynamics-prediction capacity is still essentially
+  untrained (autoencode pretraining only covers t=0 reconstruction +
+  classification), so its initially large, far-from-converged loss would
+  otherwise drag the encoder's already-good identity mapping around, the
+  same way the classification loss did before that was masked off. The
+  encoder having already learned to represent the initial state accurately
+  (autoencode pretraining + identity shortcut) is a reasonable starting
+  point for a ROUGH dynamics guess even before any decoder-only training
+  happens -- this phase just lets the decoder get most of the way there
+  against a STABLE target before the encoder's trunk is allowed to start
+  moving too. Full diagnostic logging, reusing the exact same helpers/
+  format as a regular main-loop epoch (per-component breakdown, R²,
+  `err_pct_disp`, `err_pct_ballistic`, val confusion metrics) -- but NOT
+  persisted to `history`/`.history.npz`/the HTML report, matching
+  autoencode pretraining's own precedent, and keeping `history`'s "epoch"
+  indices unambiguous relative to the `epochs` config value. No LR
+  schedule here (same convention as autoencode pretraining) -- deliberately
+  a short warm-up, not a training run in its own right. Optional early
+  stopping IS available (see the post-launch fix below), separate from the
+  main loop's own `early_stop_patience`/`early_stop_min_delta`.
+  - **Post-launch fix (2026-08-19): best-val tracking + restore.** This
+    phase originally had no best-state tracking at all -- whatever the
+    model looked like after the LITERAL LAST epoch got handed to the main
+    loop, even if that epoch was a bad one. Observed directly in a real
+    run: epoch 20/20's val_loss spiked to ~4.5x the typical level (this
+    phase's LR is flat/unscheduled and can be noisy), and the main loop's
+    very first epoch showed a correspondingly elevated loss consistent
+    with starting from that bad state rather than an earlier, better one
+    (epoch 18's val_loss, in that run). Fixed by tracking the best-val
+    epoch's weights and restoring them unconditionally at the end of this
+    phase, regardless of whether early stopping (below) is enabled.
+  - **Post-launch fix (2026-08-19): optional early stopping for this
+    phase.** Originally always ran the full configured
+    `decoder_only_pretrain_epochs` count no matter what, unlike the main
+    loop. New `decoder_only_early_stop_patience`/`decoder_only_early_stop_
+    min_delta` config keys (0/disabled by default, no behaviour change) add
+    an early BREAK out of this phase's epoch loop once val hasn't improved
+    for that many consecutive epochs -- separate knobs from the main loop's
+    `early_stop_patience`/`early_stop_min_delta`, since this is typically a
+    much shorter phase with its own LR and dynamics, so the same patience
+    count doesn't mean the same thing here. Best-val weight tracking/
+    restore (above) always happens regardless of this setting; the patience
+    counter only controls whether the loop can end early.
+  - **Post-launch fix (2026-08-19): `encoder.out` trainable, with its
+    identity rows gradient-masked.** Originally the ENTIRE encoder was
+    frozen during this phase (`requires_grad_(False)` on every encoder
+    param). Left that way, the latent's non-identity "spare" dims sit
+    completely untouched through this whole phase, never getting a chance
+    to shape themselves toward anything dynamics-useful before the main
+    loop starts. Now only `encoder.trunk` (input->hidden->hidden->
+    bottleneck, everything upstream of the identity-shortcut concat, which
+    bypasses it entirely -- see `BallDynamicsEncoder`'s docstring) stays
+    frozen; `encoder.out` (the final Linear producing the latent, added to
+    `decoder_only_optimizer`'s param list alongside `model.decoder.
+    parameters()`) is trainable. Its IDENTITY rows (`weight[:N_IDENTITY_
+    SHORTCUT_FIELDS, :]`/`bias[:N_IDENTITY_SHORTCUT_FIELDS]`, producing
+    `latent[0:N_IDENTITY_SHORTCUT_FIELDS] ~= raw pos/vel/spin input`) are
+    still gradient-masked for the duration of this phase specifically
+    (`register_hook`, added right before the phase and `.remove()`'d right
+    after) -- this phase's decoder is at its freshest/noisiest (the whole
+    reason this phase exists), and unlike the main loop (where the decoder
+    has already calmed down by the time the encoder is exposed to it
+    again), leaving those specific rows unmasked here would reopen the
+    same corruption failure mode this session already found once for the
+    decoder's own dedicated units, just one layer further upstream. Same
+    "no soft version of this" precedent as that fix -- scoped to ONLY this
+    phase, since autoencode pretraining and the main loop already train
+    `encoder.out` fully unmasked and that continues to work as intended
+    there (the decoder's gradient is much gentler by the time the main
+    loop starts).
+  - Verified with `test_decoder_only_training_trunk_frozen_but_out_
+    trains_with_identity_rows_masked`: `encoder.trunk` and `encoder.out`'s
+    identity rows stay byte-identical across several training steps, while
+    `encoder.out`'s spare rows and the decoder both measurably move. (The
+    older `test_decoder_only_training_freezes_encoder` still passes too --
+    it exercises the same general freeze-then-optimize mechanism
+    standalone, just no longer describes this phase's actual current
+    scoping.)
+- **Shared engineered-feature helper**: `compute_engineered_features()` in
+  `ball_episode_gen.py` factors out the speed/spin/Magnus formulas (fields
+  14-19) so `_encode_input` (single-row, freshly-sampled state) and the
+  adjacent-pair/autoencode reconstruction code (batched, RECORDED state
+  reused as a pseudo-input) can't drift apart -- both need the identical
+  formulas applied to different kinds of pos/vel/spin data.
+- **Identity-shortcut init** (`physics_pretrain.ball.
+  identity_shortcut_enabled`, default false; `identity_shortcut_noise_std`,
+  default 0.05): motivated by the t=0 autoencoding sanity check target
+  being a much lower bar than general dynamics prediction -- reconstructing
+  a 9-dim (pos/vel/spin) state through an overcomplete latent (e.g.
+  `latent_dim=64`) shouldn't need to be learned from scratch by a randomly
+  initialized network, since a near-lossless copy-through solution is known
+  to exist and is cheap to hand-construct as an init.
+  - **Encoder**: when enabled, the raw input's first
+    `N_IDENTITY_SHORTCUT_FIELDS` (=9) fields are concatenated onto the
+    bottleneck output right before the final `Linear` to `latent_dim`, and
+    that `Linear`'s weights are hand-initialized so `latent[0:9] ~= x[0:9]`
+    at init (`_init_identity_shortcut_linear`). Safe because that final
+    layer has no activation after it (no ReLU-clipping concern).
+  - **Decoder**: 2 of the hidden layer's ReLU units per value (18 of
+    `decoder_hidden_dim`, for the 9 values) are hand-initialized to
+    implement `latent_i` exactly via `ReLU(x) - ReLU(-x) == x` (needed
+    because a naive one-unit identity init would get clipped by the ReLU
+    for negative latent values, which are common here), reading ONLY that
+    one latent dim (horizon-feature weights zeroed) and writing straight to
+    output field `i`, for `i` in `0..9`
+    (`_init_identity_shortcut_decoder`). Because the horizon features are
+    ignored, this makes the decoder predict the PERSISTENCE baseline
+    ("nothing changed") at every horizon at init, not just t=0 -- training
+    then only has to learn the delta away from persistence, rather than
+    the copy-through behaviour AND the dynamics simultaneously from a
+    random start. This lines up with why the persistence baseline
+    (`err_pct_disp`, above) was already established as an informative
+    reference elsewhere in this file.
+  - Both paths route entirely through the latent -- the decoder never sees
+    raw input directly -- so unlike the decoder-skip idea considered (and
+    rejected) earlier in this section, this does NOT undermine the "what
+    capacity does the latent actually need" probe; it only changes the
+    STARTING POINT of a round trip the network still has to actually
+    perform every forward pass.
+  - `identity_shortcut_noise_std` adds Gaussian noise to the otherwise
+    exact ~1/-1 identity weights on both sides, so training doesn't start
+    already sitting exactly on the target (breaks init symmetry between the
+    paired decoder ReLU units too) -- 0.0 gives an exact identity/
+    persistence round trip at init (verified in
+    `test_identity_shortcut_zero_noise_gives_exact_round_trip`).
+  - Requires `latent_dim >= N_IDENTITY_SHORTCUT_FIELDS` (9); raises
+    `ValueError` at construction otherwise.
+  - **Post-launch fix (2026-08-19): the shortcut didn't survive real
+    training.** Observed directly in production (`physics_runs.md`):
+    `pos_rmse` went from ~0.3m at the pre-training baseline to 5+m within
+    1-2 epochs while `oob_bce`/`goal_bce` dropped sharply over the same
+    epochs -- not instability, gradient descent correctly exploiting a
+    shortcut the init accidentally left open. Two distinct problems in
+    `_init_identity_shortcut_decoder`, both in the "spare" hidden units
+    (everything past the 18 dedicated ones):
+    1. The DEDICATED units are alive (real latent signal flows through
+       them), and `second.weight`'s oob/goal output rows started zero but
+       UNMASKED against the dedicated units' columns -- gradient descent
+       cheaply routed classification through those already-informative
+       activations, which pulled gradient back through the dedicated
+       units' OWN weights too (now shared between their "home"
+       reconstruction row and classification), corrupting the identity
+       mapping directly. This is the dominant leak. Fixed with a permanent
+       backward-hook gradient mask on `second.weight[dim:, :2*dim]` --
+       classification can never read the dedicated units, full stop, for
+       the lifetime of training. Kept as a hard, unconditional block (no
+       "soft" variant considered): this isn't about using information,
+       it's about a second, unrelated task getting to retune the specific
+       weights that are supposed to guarantee an exact reconstruction.
+    2. Separately: the spare units start at weight=0, bias=0 on BOTH
+       layers, which is a genuine mathematical fixed point under gradient
+       descent (pre-activation exactly 0 always, `ReLU'(0)=0` by
+       convention, so zero gradient reaches either layer, forever,
+       regardless of loss or learning rate) -- verified directly: after 50
+       adversarial training steps, every example produced the IDENTICAL
+       oob logit, a pure bias-only classifier with zero per-example
+       discrimination. Fixed by re-random-initializing the paths meant to
+       be genuinely free: spare units' read access to the non-identity
+       latent dims + 3 horizon features, and their write access to the
+       oob/goal logits. Their write access to pos/vel/spin stays zero (so
+       the epoch-0 baseline is preserved) but unmasked/trainable, since
+       the main loop still needs spare units to learn real per-horizon
+       dynamics deltas later.
+    - A third question came up in review, not a bug: should spare units
+      also be masked from ever READING the identity latent dims (the
+      mirror image of fix #1)? Initially masked that way too, but
+      reconsidered -- oob/goal genuinely ARE predictable from raw
+      position, so forbidding the classifier from ever using that signal
+      just forces it to redundantly re-derive position-like features
+      elsewhere in the latent, wasting capacity. Unlike leak #1 (which
+      threatens the dedicated units' OWN weights directly), a spare unit
+      reading the identity dims only threatens the encoder's identity
+      weights, indirectly, and only in proportion to how strongly it's
+      wired in -- so instead of a hard mask, `first.weight[2*dim:, :dim]`
+      gets a small (not zero, not frozen) random init: quiet at init, but
+      genuinely free to grow if gradient descent finds it worthwhile.
+      Verified this stays gentle (no collapse) under an 8-step adversarial
+      full encoder+decoder test: `pos_rmse` oscillated in the 0.11-0.16m
+      range rather than blowing up.
+    - Regression test: `test_identity_shortcut_survives_adversarial_classification_gradient`.
+
+  - **Per-phase checkpoints + resume (2026-08-19).** `train()` now writes a
+    full model (encoder+decoder) checkpoint at `<output>.after_autoencode.pt`
+    when autoencode pretraining finishes, `<output>.after_decoder_pretrain.pt`
+    when decoder-only pretraining finishes, and `<output>.after_training.pt`
+    after the main loop (and any best-val-weights restore) finishes -- on top
+    of, not replacing, the existing final encoder-only artifact saved at
+    `output_path` itself. A new `init_checkpoint` param (`--init-checkpoint`
+    on the CLI) loads one of these (or an older encoder-only artifact, via a
+    fallback path that only restores `model.encoder`) BEFORE any phase runs,
+    so a later run can resume from any of the three points. Which phases
+    still execute on top of the restored weights is controlled entirely by
+    the existing `*_pretrain_epochs` config knobs -- e.g. resuming from
+    `after_autoencode` with `autoencode_pretrain_epochs=0` skips straight to
+    decoder-only pretrain/the main loop, while a nonzero value continues
+    autoencode pretraining further first on top of the restored weights.

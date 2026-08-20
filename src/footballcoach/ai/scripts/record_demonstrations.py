@@ -443,6 +443,21 @@ def record_episodes(
                 _ep_counts[role][k] = 0
         for k in _ep_poss_reward:
             _ep_poss_reward[k] = 0.0
+        # _pending_reward represents "reward accrued since this player's last
+        # recorded sample" -- must never survive env.reset(). Left uncleared,
+        # a player whose on_kick/on_tackle callback rarely fires (e.g. a
+        # neural-driven trainee with ~0% kick rate) would silently accumulate
+        # reward across MANY episodes without ever being drained, then dump
+        # the entire cross-episode backlog onto a single row the next time a
+        # callback happened to fire -- confirmed in real recorded data: one
+        # row carried reward=1474.952, and DemonstrationDataset.compute_
+        # returns()'s backward MC scan then propagated that single corrupted
+        # value across the whole episode (and, via prev_had_done resets,
+        # was at least contained to one episode -- but still produced
+        # "episode total reward" values in the hundreds/thousands from an
+        # episode whose real per-component rewards were all normal, single-
+        # digit values).
+        _pending_reward.clear()
 
         # Drive trainee with rules-based AI (or a neural checkpoint, when
         # driver_trainer is given -- env.reset() just above already assigned
@@ -501,7 +516,20 @@ def record_episodes(
             # player_id=None -> records BOTH trainee and opponent -> appends 2 rows.
             n_before = len(rewards)
             _recorded_ids = _record_now(reward=0.0, done=False)
-            n_appended = len(rewards) - n_before
+            # ABSOLUTE row indices, captured now (before env.step() can insert
+            # anything else) -- NOT a relative/negative-offset count. on_kick/
+            # on_tackle callbacks fire SYNCHRONOUSLY inside env.step() below
+            # and themselves call _record_now(player_id=pid), appending
+            # MORE rows to these same lists mid-call. A stale "how many did
+            # I append" count combined with negative indexing (rewards[-i])
+            # would then silently backfill the WRONG rows once any kick/
+            # tackle happens in the same decision interval as this timed
+            # sample -- confirmed in real recorded data: a trainee's genuine
+            # box-possession-terminal row ended up misattributed to the
+            # opponent's row (and vice versa for the loss penalty) this way.
+            # Absolute indices are immune to however many extra rows a
+            # callback inserts afterward.
+            _recorded_row_indices = list(range(n_before, n_before + len(_recorded_ids)))
             # Advance sim by sample_interval_s; kick/tackle callbacks fire inside
             _obs, _reward, done, last_info = env.step()
             # Per-player reward for this step: the trainee's own (env.step()'s
@@ -526,15 +554,14 @@ def record_episodes(
             _comp_by_pid = {env.trainee_player_id: env.last_reward_components}
             for _sec in env.last_secondary_results:
                 _comp_by_pid[_sec["player_id"]] = _sec.get("reward_components", {})
-            for _offset, _pid in enumerate(_recorded_ids):
-                _i = n_appended - _offset
-                rewards[-_i] = np.float32(_reward_by_pid.get(_pid, _reward))
+            for _pid, _row_idx in zip(_recorded_ids, _recorded_row_indices):
+                rewards[_row_idx] = np.float32(_reward_by_pid.get(_pid, _reward))
                 _pid_comps = _comp_by_pid.get(_pid, {})
-                reward_components[-_i] = np.array(
+                reward_components[_row_idx] = np.array(
                     [_pid_comps.get(k, 0.0) for k in _comp_key_order], dtype=np.float32,
                 )
                 if done:
-                    dones[-_i] = np.float32(1.0)
+                    dones[_row_idx] = np.float32(1.0)
             # Accrue each player's own reward for THEIR next kick/tackle
             # callback (if any) that fires before the next timed sample.
             for _pid, _r in _reward_by_pid.items():
@@ -779,7 +806,10 @@ def main() -> None:
                         help="Episodes per output .npz file (default: 8)")
     parser.add_argument("--output", type=str, required=True,
                         help="Output directory for .npz files")
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=None,
+                        help="RNG seed. Default: None -- draws a fresh random seed each run "
+                             "(logged so the run can be reproduced later). Pass an explicit "
+                             "value for reproducible/comparable recordings across runs.")
     _cfg = __import__("footballcoach.ai.config", fromlist=["load_ai_config"]).load_ai_config()
     _default_interval = float(_cfg.get("bc", {}).get("demo_sample_interval_s", 0.2))
     parser.add_argument("--sample-interval", type=float, default=_default_interval,
@@ -839,6 +869,9 @@ def main() -> None:
     args = parser.parse_args()
 
     import random
+    if args.seed is None:
+        args.seed = random.SystemRandom().randrange(2**31)
+        log.info(f"--seed not given: drew random seed {args.seed} for this run")
     np.random.seed(args.seed)
     random.seed(args.seed)
 
