@@ -18,6 +18,7 @@ Usage::
         --dataset physics_pretrain_data/ball/
 
     uv run python scripts/inspect_ball_pretrain.py ... --seed 0   # reproducible row sequence
+    uv run python scripts/inspect_ball_pretrain.py ... --alpha 0.5   # more transparent markers/lines
 """
 from __future__ import annotations
 
@@ -48,6 +49,7 @@ _C_GT = "#4090e8"
 _C_PRED = "#f5a623"
 _C_BG = "#1a1a2e"
 _GD = 2.45  # goal depth (visual only, not in physics config)
+_DEFAULT_ALPHA = 0.75  # marker/line transparency -- see --alpha; low enough that overlapping horizon dots don't fully occlude each other
 
 
 def _draw_pitch(ax, gen_params: BallEpisodeGenParams) -> None:
@@ -127,10 +129,10 @@ def _fmt_xy(x: float, y: float) -> str:
     return f"({x:.1f}, {y:.1f})"
 
 
-def _arrow(ax, p0: tuple[float, float], p1: tuple[float, float], color: str) -> None:
+def _arrow(ax, p0: tuple[float, float], p1: tuple[float, float], color: str, alpha: float) -> None:
     ax.annotate(
         "", xy=p1, xytext=p0,
-        arrowprops=dict(arrowstyle="-|>", color=color, lw=1.3, alpha=0.85),
+        arrowprops=dict(arrowstyle="-|>", color=color, lw=0.65, alpha=alpha),
         zorder=4,
     )
 
@@ -151,12 +153,14 @@ class Inspector:
     def __init__(
         self, ds: BallDynamicsDataset, model: BallDynamicsAutoencoder, cfg: dict,
         gen_params: BallEpisodeGenParams, normalize_by_base: bool, seed: int | None,
+        alpha: float = _DEFAULT_ALPHA,
     ):
         self.ds = ds
         self.model = model
         self.horizons_s = list(cfg["horizons_s"])
         self.gen_params = gen_params
         self.normalize_by_base = normalize_by_base
+        self.alpha = alpha
         self.rng = np.random.default_rng(seed)  # only ever touched by the prefetch thread -- single producer, no lock needed
 
         resting_min_start_speed_mps = float(cfg.get("resting_min_start_speed_mps", 1.5))
@@ -260,10 +264,10 @@ class Inspector:
 
         for pts, color, label in ((gt_pts, _C_GT, "ground truth"), (pred_pts, _C_PRED, "predicted")):
             xs, ys = zip(*pts)
-            ax.plot(xs, ys, "o", color=color, ms=6, zorder=5, mec="white", mew=0.5, label=label)
+            ax.plot(xs, ys, "o", color=color, ms=4.5, alpha=self.alpha, zorder=5, mec="white", mew=0.4, label=label)
             for i in range(len(pts) - 1):
-                _arrow(ax, pts[i], pts[i + 1], color)
-        ax.plot(*start_xy, "*", color="white", ms=14, zorder=6, mec="black", mew=0.5)
+                _arrow(ax, pts[i], pts[i + 1], color, self.alpha)
+        ax.plot(*start_xy, "o", color="white", ms=4.5, alpha=0.3, zorder=6, mec="white", mew=0.4)
         for h, (gx, gy) in enumerate(gt_pts[1:]):
             ax.text(gx + 0.8, gy + 0.8, f"t={self.horizons_s[h]:g}s", color="#cccccc", fontsize=6, zorder=7)
         ax.legend(loc="upper left", fontsize=8, facecolor=_C_BG, edgecolor="none", labelcolor="white", framealpha=0.75)
@@ -274,12 +278,12 @@ class Inspector:
         _draw_pitch(ax, gen_params)
         _draw_episode_boundary(ax, input_row, gen_params)
         _style_dark_ax(ax, "Crossing point: gt vs pred")
-        ax.plot(*start_xy, "*", color="white", ms=12, zorder=6, mec="black", mew=0.5)
+        ax.plot(*start_xy, "o", color="white", ms=4.5, alpha=0.3, zorder=6, mec="white", mew=0.4)
 
         pred_dt = float(crossing_pred[2])
         if pred_dt >= 0:
             pred_cross_xy = (crossing_pred[0] * div_x, crossing_pred[1] * div_y)
-            ax.plot(*pred_cross_xy, "^", color=_C_PRED, ms=13, zorder=6, mec="white", mew=0.6, label="predicted")
+            ax.plot(*pred_cross_xy, "^", color=_C_PRED, ms=10, alpha=self.alpha, zorder=6, mec="white", mew=0.5, label="predicted")
             ax.text(pred_cross_xy[0] + 0.8, pred_cross_xy[1] + 0.8, f"pred dt={pred_dt:.2f}s",
                     color=_C_PRED, fontsize=8, zorder=7)
         else:
@@ -289,7 +293,7 @@ class Inspector:
         if ds.crossing_mask is not None and ds.crossing_mask[idx]:
             gt_cross_xy = (ds.crossing_pos[idx, 0] * div_x, ds.crossing_pos[idx, 1] * div_y)
             gt_dt = float(ds.crossing_dt[idx])
-            ax.plot(*gt_cross_xy, "^", color=_C_GT, ms=13, zorder=6, mec="white", mew=0.6, label="ground truth")
+            ax.plot(*gt_cross_xy, "^", color=_C_GT, ms=10, alpha=self.alpha, zorder=6, mec="white", mew=0.5, label="ground truth")
             ax.text(gt_cross_xy[0] + 0.8, gt_cross_xy[1] - 1.6, f"gt dt={gt_dt:.2f}s",
                     color=_C_GT, fontsize=8, zorder=7)
         else:
@@ -303,14 +307,14 @@ class Inspector:
         _draw_pitch(ax, gen_params)
         _draw_episode_boundary(ax, input_row, gen_params)
         _style_dark_ax(ax, "Resting point: gt vs pred")
-        ax.plot(*start_xy, "*", color="white", ms=12, zorder=6, mec="black", mew=0.5)
+        ax.plot(*start_xy, "o", color="white", ms=4.5, alpha=0.3, zorder=6, mec="white", mew=0.4)
 
         pred_rest_xy = (resting_pred[0] * div_x, resting_pred[1] * div_y)
-        ax.plot(*pred_rest_xy, "s", color=_C_PRED, ms=11, zorder=6, mec="white", mew=0.6, label="predicted")
+        ax.plot(*pred_rest_xy, "s", color=_C_PRED, ms=9, alpha=self.alpha, zorder=6, mec="white", mew=0.5, label="predicted")
 
         if self.resting_mask_all[idx]:
             gt_rest_xy = (self.resting_pos_all[idx, 0] * div_x, self.resting_pos_all[idx, 1] * div_y)
-            ax.plot(*gt_rest_xy, "s", color=_C_GT, ms=11, zorder=6, mec="white", mew=0.6, label="ground truth")
+            ax.plot(*gt_rest_xy, "s", color=_C_GT, ms=9, alpha=self.alpha, zorder=6, mec="white", mew=0.5, label="ground truth")
         else:
             ax.text(0, -gen_params.base_pitch_width_m / 2 - 4.5, "ground truth: never comes to rest / too slow at start",
                     color=_C_GT, fontsize=8, ha="center")
@@ -361,6 +365,11 @@ def main() -> None:
     ap.add_argument("--checkpoint", required=True, type=Path, help="Full-model checkpoint (has model_state_dict), not the encoder-only final artifact.")
     ap.add_argument("--dataset", required=True, type=Path, help="Directory of .npz shards (e.g. physics_pretrain_data/ball/).")
     ap.add_argument("--seed", type=int, default=None, help="Seed for the random row sequence (omit for a fresh sequence each run).")
+    ap.add_argument(
+        "--alpha", type=float, default=_DEFAULT_ALPHA,
+        help=f"Marker/line transparency, 0 (invisible) to 1 (opaque) -- default {_DEFAULT_ALPHA}. "
+             "Lower it further if overlapping horizon dots still occlude each other.",
+    )
     args = ap.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
@@ -396,7 +405,7 @@ def main() -> None:
     gen_params = BallEpisodeGenParams.from_config()
     normalize_by_base = bool(cfg.get("normalize_kinematics_by_base_pitch", gen_params.normalize_kinematics_by_base_pitch))
 
-    inspector = Inspector(ds, model, cfg, gen_params, normalize_by_base, args.seed)
+    inspector = Inspector(ds, model, cfg, gen_params, normalize_by_base, args.seed, alpha=args.alpha)
     inspector.show()
 
 

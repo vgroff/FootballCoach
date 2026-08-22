@@ -45,6 +45,7 @@ Current notes:
         - try switching spin and bc weights back on - do we care though? Time/position of ball out could be useful though. could then go as an input for the proper network
         - consider - a tiny decoder trained to output the positions/velocities at some time horizons - then tacked on to the output in the proper network
             - maybe also have it predict time and crossing point for going out
+        - Cooked idea but could be fun for later - take the ball encoder and player encoder, run trials where both move and train a decoder (tiny hidden layer, like 8 or smth) on top of both encoders to predict player-ball distance at some future time t (e.g. 0.2 and 1s and 4s), and then you can change the move order in the player encoder, and "see" player-ball distance in the future. Could then be a learnable parameter for the (self-player) policy network to see what different move orders would do, and act on that basis/affect the attention etc...
     - !! generate a ton of demo data uisng vvgood immobile
         - !!!!! Does it have a random seed each time???
         - for value net pretraining + BC when we change a neural net

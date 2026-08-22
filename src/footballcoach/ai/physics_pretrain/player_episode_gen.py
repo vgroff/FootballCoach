@@ -14,14 +14,28 @@ section 4) as closely as the domain allows. Key differences from the ball
 version:
 
 - A player needs an ongoing "intent" (``desired_direction``/``speed_mode``)
-  to move at all -- unlike the ball's pure initial-condition-then-physics
-  rollout, intent is resampled at each recorded horizon boundary (piecewise
-  constant within a segment) -- see ``_sample_intent``/``generate_episode``.
+  to move at all, unlike the ball. Kept as close to the ball's
+  one-random-draw-then-deterministic-physics shape as possible: intent is
+  drawn ONCE at t=0 (independently of the player's own starting
+  velocity/heading -- a player can be moving one way while WANTING to go
+  another, e.g. mid-turn) and held FIXED for the entire episode, never
+  resampled at any horizon boundary -- see ``_sample_intent``/
+  ``generate_episode``. Earlier drafts of this pipeline resampled intent at
+  each horizon boundary (piecewise-constant per segment); that made every
+  horizon beyond the first genuinely unpredictable from the t=0 input alone
+  (the target depended on intent draws the network never saw), which isn't
+  a task a self-supervised encoder can actually learn to solve -- fixing
+  intent for the whole episode makes the target a deterministic function of
+  the input again, exactly like the ball task.
 - No freeze-on-event rule: ``out_of_bounds``/``goal_scored`` at each horizon
   are simply the INSTANTANEOUS state at that exact moment (matching the
   ball pipeline's CURRENT, non-latched convention -- see
   agent_plans/ball_physics_pretrain_plan.md's ``freeze_semantics`` config
   key, which now defaults to false). Physics is never frozen/stopped early.
+  A ``crossings``/``crossing_times`` side-channel IS recorded alongside the
+  per-horizon targets (mirroring ``ball_episode_gen``'s), but purely to
+  supervise ``PlayerDynamicsAutoencoder.crossing_head`` -- NOT to reconstruct
+  freeze semantics, which this pipeline has never had.
 - No spin/height (z) axis -- players are grounded (z=0 always), and there's
   no equivalent of ball spin.
 
@@ -99,8 +113,6 @@ class PlayerEpisodeGenParams:
     pitch_scale_range: tuple[float, float]
     out_of_bounds_start_frac: float
     possession_start_frac: float
-    intent_continue_prob: float
-    intent_continue_heading_jitter_std_rad: float
     speed_mode_weights: tuple[float, float, float]  # (standstill, jog, sprint)
     sim_dt_s: float
     base_pitch_length_m: float
@@ -122,8 +134,6 @@ class PlayerEpisodeGenParams:
             pitch_scale_range=tuple(float(s) for s in pp_cfg["pitch_scale_range"]),
             out_of_bounds_start_frac=float(pp_cfg["out_of_bounds_start_frac"]),
             possession_start_frac=float(pp_cfg["possession_start_frac"]),
-            intent_continue_prob=float(pp_cfg["intent_continue_prob"]),
-            intent_continue_heading_jitter_std_rad=float(pp_cfg["intent_continue_heading_jitter_std_rad"]),
             speed_mode_weights=tuple(float(w) for w in pp_cfg["speed_mode_weights"]),
             sim_dt_s=float(obs_cfg["sim_dt_s"]),
             base_pitch_length_m=float(pitch_cfg["length_m"]),
@@ -203,20 +213,13 @@ def _sample_speed_mode(rng: random.Random, weights: tuple[float, float, float]) 
     return SpeedMode.SPRINT
 
 
-def _sample_intent(
-    rng: random.Random, params: PlayerEpisodeGenParams,
-    previous_direction_rad: float | None, previous_speed_mode: "SpeedMode | None",
-) -> tuple[float, "SpeedMode"]:
-    """Draws a new (direction_rad, speed_mode) intent, per the intent-
-    generation policy: at t=0 (``previous_direction_rad is None``), always
-    draws fresh. Otherwise, with probability ``intent_continue_prob``, keeps
-    the same ``speed_mode`` and perturbs the previous direction by small
-    Gaussian noise ("continue in a straight line or almost"); otherwise
-    draws a fresh uniform direction and a fresh categorical speed_mode."""
-    if previous_direction_rad is not None and rng.random() < params.intent_continue_prob:
-        jitter = rng.gauss(0.0, params.intent_continue_heading_jitter_std_rad)
-        direction_rad = math.atan2(math.sin(previous_direction_rad + jitter), math.cos(previous_direction_rad + jitter))
-        return direction_rad, previous_speed_mode
+def _sample_intent(rng: random.Random, params: PlayerEpisodeGenParams) -> tuple[float, "SpeedMode"]:
+    """Draws this episode's ONE (direction_rad, speed_mode) intent -- a
+    fresh uniform direction and a fresh categorical speed_mode, drawn once
+    and held fixed for the whole episode (see the module docstring's
+    "Key differences from the ball version" for why: resampling this
+    mid-episode would make later horizons depend on information the t=0
+    input never carries)."""
     direction_rad = rng.uniform(-math.pi, math.pi)
     speed_mode = _sample_speed_mode(rng, params.speed_mode_weights)
     return direction_rad, speed_mode
@@ -354,10 +357,11 @@ def _encode_target(
 
 def generate_episode(
     rng: random.Random, params: PlayerEpisodeGenParams | None = None, movement_params: MovementParams | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, float]:
     """Draws one random player episode and returns ``(input[24],
-    target[n_horizons*9])`` -- see the module docstring and
-    agent_plans/player_physics_pretrain_plan.md for the full spec.
+    target[n_horizons*9], crossing[9], crossing_time_s)`` -- see the module
+    docstring and agent_plans/player_physics_pretrain_plan.md for the full
+    spec.
 
     Physics NEVER freezes/stops early -- the player is simulated with the
     same regular ``step_player_towards``/stamina-drain/stamina-regen update
@@ -374,9 +378,42 @@ def generate_episode(
     remainder is left), copying ``ball_episode_gen.generate_episode``'s
     technique precisely to avoid up-to-half-a-tick rounding error.
 
-    Intent (``desired_direction``/``speed_mode``) is resampled exactly at
-    t=0 and at each horizon boundary, held piecewise-constant within each
-    segment -- see ``_sample_intent``.
+    Intent (``desired_direction``/``speed_mode``) is drawn once at t=0 and
+    held FIXED for the whole episode -- see ``_sample_intent``.
+
+    ``crossing`` is a separate 9-field row (same layout/normalization as one
+    per-horizon target block, i.e. ``_encode_target``'s output) capturing the
+    FULL state at the moment ``out_of_bounds``/``goal_scored`` FIRST became
+    true, and ``crossing_time_s`` is the simulated time that happened at.
+    When no crossing is recorded, ``crossing`` is the FINAL simulated state
+    with both flags 0 and ``crossing_time_s`` is ``math.inf`` -- a sentinel
+    the dataset turns into ``crossing_mask=False`` (see
+    ``PlayerDynamicsDataset``). Together they supervise
+    ``PlayerDynamicsAutoencoder.crossing_head``; unlike the ball pipeline's
+    identically-shaped side-channel, they are NOT used to reconstruct
+    freeze-on-event semantics (this pipeline has none -- see the module
+    docstring).
+
+    Two deliberate rules about WHEN a crossing may be recorded, both
+    mirroring/extending ``ball_episode_gen.generate_episode``:
+
+    - The oob/goal check runs only from the FIRST physics step onward, never
+      against the raw un-stepped t=0 sampled state (``_step_and_check`` is
+      only ever called from inside the per-horizon stepping loop).
+    - Episodes that START already out of bounds (``_sample_position_already_
+      special``, i.e. ``out_of_bounds_start_frac`` of them) are forced to
+      ``crossing_time_s = math.inf`` -- "no crossing" -- regardless of what
+      the first-tick-onward tracking would otherwise detect. For such an
+      episode ``out_of_bounds`` is essentially already true before any
+      physics runs, so the "crossing" the tracker would record is a
+      degenerate near-t=0 point rather than the genuinely interesting "this
+      in-play player will leave the pitch at (x, y) in dt seconds"
+      prediction the head exists to learn. Reusing the existing ``inf``
+      sentinel means these rows fall out of ``crossing_mask`` for free,
+      exactly like episodes that legitimately never cross -- no extra mask
+      field needed. ``crossing``'s own CONTENT is unaffected by this
+      override (it's the final simulated state, both flags 0, same as any
+      other no-crossing episode).
     """
     params = params or PlayerEpisodeGenParams.from_config()
     movement_params = movement_params or MovementParams.from_config()
@@ -420,14 +457,21 @@ def generate_episode(
         stamina=stamina0,
     )
 
-    direction_rad, speed_mode = _sample_intent(rng, params, None, None)
+    direction_rad, speed_mode = _sample_intent(rng, params)
     input_row = _encode_input(player, pitch, params, has_possession, direction_rad, speed_mode)
 
     dt = params.sim_dt_s
     sim_time = 0.0
+    # See the docstring: an episode that is ALREADY out of bounds before any
+    # physics runs is excluded from the crossing head's supervision entirely
+    # (forced to the math.inf "no crossing" sentinel below), so its
+    # degenerate near-t=0 "crossing" never becomes a training target.
+    started_out_of_bounds = not pitch.is_in_bounds(player.position)
+    crossing_state: tuple[Vector3, Vector3, float, float, bool, bool] | None = None
+    crossing_time = math.inf
 
-    def _step_tick(dt_step: float) -> None:
-        nonlocal sim_time
+    def _step_and_check(dt_step: float) -> None:
+        nonlocal sim_time, crossing_state, crossing_time
         target_direction = Vector3.from_angle_xy(direction_rad, 1.0)
         step_player_towards(player, target_direction, speed_mode, dt_step, movement_params, has_possession)
         # Mirrors engine/match.py's _apply_movement/_update_state_timers
@@ -438,16 +482,26 @@ def generate_episode(
         player.stamina = drain_if_sprinting(movement_params, player, speed_mode is SpeedMode.SPRINT, dt_step)
         player.stamina = regen_stamina(movement_params, player.stamina, attrs.stamina, dt_step * 0.3)
         sim_time += dt_step
+        # Checked only from the first physics step onward, never against the
+        # raw un-stepped t=0 sampled state -- copied deliberately from
+        # ball_episode_gen._step_and_check (see the docstring).
+        oob_now = not pitch.is_in_bounds(player.position)
+        goal_now = has_possession and pitch.is_goal(player.position) is not None
+        if crossing_state is None and (oob_now or goal_now):
+            crossing_state = (
+                player.position, player.velocity, player.heading_rad, player.stamina, oob_now, goal_now,
+            )
+            crossing_time = sim_time
 
     horizons_sorted = sorted(range(len(params.horizons_s)), key=lambda i: params.horizons_s[i])
     recorded: list[np.ndarray | None] = [None] * len(params.horizons_s)
     for i in horizons_sorted:
         target_time = params.horizons_s[i]
         while sim_time + dt < target_time - 1e-9:
-            _step_tick(dt)
+            _step_and_check(dt)
         remainder = target_time - sim_time
         if remainder > 1e-9:
-            _step_tick(remainder)
+            _step_and_check(remainder)
             sim_time = target_time
         out_of_bounds = not pitch.is_in_bounds(player.position)
         goal_scored = has_possession and pitch.is_goal(player.position) is not None
@@ -455,19 +509,29 @@ def generate_episode(
             player.position, player.velocity, player.heading_rad, player.stamina,
             out_of_bounds, goal_scored, pitch, params,
         )
-        direction_rad, speed_mode = _sample_intent(rng, params, direction_rad, speed_mode)
 
     target_row = np.concatenate(recorded)
-    return input_row, target_row
+    if started_out_of_bounds:
+        crossing_state, crossing_time = None, math.inf
+    final_state = (
+        crossing_state if crossing_state is not None
+        else (player.position, player.velocity, player.heading_rad, player.stamina, False, False)
+    )
+    crossing_row = _encode_target(*final_state, pitch, params)
+    return input_row, target_row, crossing_row, crossing_time
 
 
 def generate_shard(
     n_episodes: int, seed: int, params: PlayerEpisodeGenParams | None = None,
-) -> tuple[np.ndarray, np.ndarray]:
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Generates ``n_episodes`` independent episodes with a seeded RNG.
 
-    Returns ``(inputs, targets)`` of shape ``(n_episodes, 24)`` /
-    ``(n_episodes, n_horizons*9)``. Each shard's episodes are fully
+    Returns ``(inputs, targets, crossings, crossing_times)`` of shape
+    ``(n_episodes, 24)`` / ``(n_episodes, n_horizons*9)`` /
+    ``(n_episodes, 9)`` / ``(n_episodes,)`` -- see ``generate_episode``'s
+    docstring for what ``crossings``/``crossing_times`` hold.
+    ``crossing_times`` is float64 so it can carry the ``math.inf`` "never
+    crossed (or excluded)" sentinel. Each shard's episodes are fully
     independent draws (no shared state), so this is safe to call from a
     separate worker process per shard -- see player_dataset.py's
     ``generate_dataset()``.
@@ -477,6 +541,8 @@ def generate_shard(
     rng = random.Random(seed)
     inputs = np.empty((n_episodes, N_INPUT_FIELDS), dtype=np.float32)
     targets = np.empty((n_episodes, len(params.horizons_s) * N_TARGET_FIELDS_PER_HORIZON), dtype=np.float32)
+    crossings = np.empty((n_episodes, N_TARGET_FIELDS_PER_HORIZON), dtype=np.float32)
+    crossing_times = np.empty((n_episodes,), dtype=np.float64)
     for i in range(n_episodes):
-        inputs[i], targets[i] = generate_episode(rng, params, movement_params)
-    return inputs, targets
+        inputs[i], targets[i], crossings[i], crossing_times[i] = generate_episode(rng, params, movement_params)
+    return inputs, targets, crossings, crossing_times

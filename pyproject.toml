@@ -33,4 +33,4 @@ ai = [
 testpaths = ["tests"]
 log_level = "WARNING"
 log_cli = false
-addopts = "-n auto"
+addopts = "-n 5"

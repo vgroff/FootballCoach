@@ -3,14 +3,39 @@ result reporting mechanism.
 """
 from __future__ import annotations
 
+import os
+
+# Must happen before numpy/torch are imported anywhere in this process (BLAS
+# thread pools are sized at first-use) -- pytest loads this conftest before
+# any test module, so this is the earliest point available. Each pytest-xdist
+# worker is its own process; without this, every worker's torch/numpy calls
+# each try to use ALL cores for their own internal op-level parallelism, so
+# (worker count) x (threads per worker) massively oversubscribes the machine
+# -- the actual source of tests "hammering the CPU" far beyond what the
+# xdist worker count alone would suggest. Capping to 1 thread per worker
+# process trades a bit of single-op speed for eliminating that cross-worker
+# contention, which in practice is a net wall-clock win too, not just a
+# gentler one.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import json
 import random
 from pathlib import Path
 
 import pytest
+import torch
 
 from footballcoach.entities import Ball, Pitch, Player, PlayerAttributes, Team
 from footballcoach.mathutils import Vector3
+
+torch.set_num_threads(1)
+try:
+    torch.set_num_interop_threads(1)
+except RuntimeError:
+    pass  # already set / parallel work already started in this process -- not worth failing the whole test session over
 
 RESULTS_DIR = Path(__file__).parent / "balance" / "results"
 

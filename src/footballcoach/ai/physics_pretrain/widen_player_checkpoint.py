@@ -1,4 +1,4 @@
-"""Widens a trained ``BallDynamicsAutoencoder`` checkpoint to bigger
+"""Widens a trained ``PlayerDynamicsAutoencoder`` checkpoint to bigger
 ``hidden_dim``/``encoder_bottleneck_dim``/``latent_dim``/``decoder_hidden_dim``
 without losing the existing training.
 
@@ -9,6 +9,28 @@ without losing the existing training.
 > documents, prompts, or other work-related files, always include this same
 > statement at the top of that file. Otherwise documentation goes stale and
 > confusion occurs.
+
+Direct port of ``widen_ball_checkpoint.py`` -- see that module's docstring
+for the full "zero the consuming side, never the producing side" rationale
+(identical here: this file only ever zeros a *consuming* side, and the
+seam fixups below exist for the exact same reasons). The port is almost
+entirely mechanical (``BallDynamicsAutoencoder`` -> ``PlayerDynamicsAutoencoder``,
+``ball_dynamics_net``/``ball_episode_gen`` -> ``player_dynamics_net``/
+``player_episode_gen``, ``physics_pretrain.ball`` -> ``physics_pretrain.
+player``). ``PlayerDynamicsAutoencoder``'s four auxiliary heads
+(``crossing_head``, ``goal_dist_delta_head``, ``short_horizon_head_0_2s``,
+``short_horizon_head_1_0s``) all read the latent directly, so all four are
+pure CONSUMERS of a widened ``latent_dim`` and get the same
+``_widen_linear_cols`` treatment ball gives its ``crossing_head``/
+``resting_head``; ``verify_widened_model`` checks all four reproduce
+exactly. Player has no equivalent of ball's
+``_migrate_crossing_head_state_dict`` shim (its ``crossing_head`` has had
+3 outputs since it existed, never 4) -- a checkpoint's ``model_state_dict``
+is loaded straight via plain ``strict=False``, which also covers a
+checkpoint saved BEFORE these heads existed (they simply show up as missing
+keys and keep their fresh init), mirroring the pattern
+train_player_dynamics.py's own ``--init-checkpoint`` resume path already
+uses for its non-widen loads.
 
 The core trick (see the identity-shortcut discovery in ``identity_shortcut.
 py``'s ``_init_identity_shortcut_decoder`` docstring for the failure mode
@@ -22,46 +44,28 @@ zeros mean the newly-added (live, random) units can't perturb an output
 that has to stay bit-identical, while the zeroed weight itself still gets a
 completely normal, immediate gradient (``d(loss)/d(zeroed weight) = d(loss)
 /d(preactivation) * producing_unit's_output``, which doesn't depend on the
-zeroed weight's own current value at all). Zeroing the wrong side --
-the producing side, feeding directly into a ReLU -- was the actual bug
-found and fixed in ``_init_identity_shortcut_decoder``: a unit whose
-INCOMING weights are zero has pre-activation exactly 0, and ``ReLU'(0) ==
-0`` by convention, so no gradient ever reaches it, a permanent dead unit
-(verified empirically there: identical output for every input after 50
-training steps). This module never repeats that mistake -- it only ever
-zeros a *consuming* side.
-
-One seam needs an EXTRA fixup on top of that rule: ``encoder.out``'s new
-rows, under ``identity_shortcut_enabled``, are hand-zeroed by ``_init_
-identity_shortcut_linear`` itself (it zeros the whole weight/bias before
-hand-setting only the identity block) -- so `new`'s own construction already
-leaves them at exact zero, not the random init "producing side, never
-zero" assumes. Combined with THIS module zeroing the consuming side too,
-both ends of that specific seam would land on zero simultaneously with
-nothing to bootstrap from -- a real bug this module hit once (see
-``_widen_encoder_out``'s docstring for the fix: explicitly re-randomizing
-those rows).
+zeroed weight's own current value at all).
 
 Two seams need special handling because widening shifts where a
 downstream, NEVER-widened block of columns lives: ``encoder.out``'s input
-is ``[bottleneck features (widens) ‖ raw-input concat features (fixed
-width)]`` -- growing the bottleneck moves the concat block's starting
-column. ``decoder.net[0]``'s input is ``[latent (widens) ‖ 3 horizon
-features (fixed width)]`` -- same shift for latent growth. Both are handled
-explicitly below (``_widen_encoder_out``/``_widen_decoder_net0``) rather
-than by the generic per-layer helpers.
+is ``[bottleneck (widens) ‖ raw-input concat features (fixed width)]`` --
+growing the bottleneck moves the concat block's starting column.
+``decoder.net[0]``'s input is ``[latent (widens) ‖ 3 horizon features (fixed
+width)]`` -- same shift for latent growth. Both are handled explicitly below
+(``_widen_encoder_out``/``_widen_decoder_net0``) rather than by the generic
+per-layer helpers.
 
 Usage::
 
     # after raising hidden_dim/encoder_bottleneck_dim/latent_dim/
-    # decoder_hidden_dim in ai_config.json's physics_pretrain.ball section:
-    uv run python -m footballcoach.ai.physics_pretrain.widen_ball_checkpoint \\
-        --checkpoint checkpoints/physics_pretrain/ball_encoder.midtrain_latest.pt \\
-        --output checkpoints/physics_pretrain/ball_encoder.widened.pt \\
-        --dataset physics_pretrain_data/ball/
+    # decoder_hidden_dim in ai_config.json's physics_pretrain.player section:
+    uv run python -m footballcoach.ai.physics_pretrain.widen_player_checkpoint \\
+        --checkpoint checkpoints/physics_pretrain/player_encoder.midtrain_latest.pt \\
+        --output checkpoints/physics_pretrain/player_encoder.widened.pt \\
+        --dataset physics_pretrain_data/player/
 
 The output is a normal phase checkpoint (same shape as ``_save_phase_
-checkpoint`` writes in train_ball_dynamics.py) -- pass it straight back in
+checkpoint`` writes in train_player_dynamics.py) -- pass it straight back in
 via ``--init-checkpoint`` to resume training with the new capacity.
 """
 from __future__ import annotations
@@ -73,13 +77,10 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 
-from footballcoach.ai.physics_pretrain.ball_dynamics_net import BallDynamicsAutoencoder
-from footballcoach.ai.physics_pretrain.train_ball_dynamics import (
-    _migrate_crossing_head_state_dict,
-    _physics_config_hash,
-)
+from footballcoach.ai.physics_pretrain.player_dynamics_net import PlayerDynamicsAutoencoder
+from footballcoach.ai.physics_pretrain.train_player_dynamics import _physics_config_hash
 
-log = logging.getLogger("footballcoach.ai.physics_pretrain.widen_ball_checkpoint")
+log = logging.getLogger("footballcoach.ai.physics_pretrain.widen_player_checkpoint")
 
 # cfg keys that must be IDENTICAL between old and new -- this module only
 # widens the four numeric capacity dims below; changing whether/how the
@@ -95,9 +96,15 @@ _STABLE_KEYS = (
 )
 _WIDEN_KEYS = ("hidden_dim", "encoder_bottleneck_dim", "latent_dim", "decoder_hidden_dim")
 
+# Every auxiliary head hanging directly off the latent (see
+# PlayerDynamicsAutoencoder's docstring) -- all pure latent consumers, so
+# widening and verification are identical for each, driven off this one list
+# rather than four near-identical copy-pasted lines in each place.
+_AUX_HEAD_NAMES = ("crossing_head", "goal_dist_delta_head", "short_horizon_head_0_2s", "short_horizon_head_1_0s")
 
-def _build_model(cfg: dict) -> BallDynamicsAutoencoder:
-    return BallDynamicsAutoencoder(
+
+def _build_model(cfg: dict) -> PlayerDynamicsAutoencoder:
+    return PlayerDynamicsAutoencoder(
         hidden_dim=cfg["hidden_dim"],
         latent_dim=cfg["latent_dim"],
         horizons_s=cfg["horizons_s"],
@@ -111,8 +118,8 @@ def _build_model(cfg: dict) -> BallDynamicsAutoencoder:
 
 
 def _concat_dim(cfg: dict) -> int:
-    from footballcoach.ai.physics_pretrain.ball_dynamics_net import N_IDENTITY_SHORTCUT_FIELDS
-    from footballcoach.ai.physics_pretrain.ball_episode_gen import N_INPUT_FIELDS
+    from footballcoach.ai.physics_pretrain.player_dynamics_net import N_IDENTITY_SHORTCUT_FIELDS
+    from footballcoach.ai.physics_pretrain.player_episode_gen import N_INPUT_FIELDS
     if not cfg.get("identity_shortcut_enabled", False):
         return 0
     return N_INPUT_FIELDS if cfg.get("encoder_concat_all_input_fields", False) else N_IDENTITY_SHORTCUT_FIELDS
@@ -146,11 +153,10 @@ def _widen_linear_rows(old: nn.Linear, new: nn.Linear, old_out: int) -> None:
 
 
 def _widen_linear_cols(old: nn.Linear, new: nn.Linear, old_in: int) -> None:
-    """Pure 'consuming' widen: only the INPUT grows, output unchanged (e.g.
-    crossing_head/resting_head reading a widened latent). Old columns
-    copied exactly for every (unchanged-count) output row; new columns
-    zeroed so those old outputs can't be perturbed by the newly-added,
-    live/random input units."""
+    """Pure 'consuming' widen: only the INPUT grows, output unchanged. Old
+    columns copied exactly for every (unchanged-count) output row; new
+    columns zeroed so those old outputs can't be perturbed by the newly-
+    added, live/random input units."""
     new.weight.data[:, :old_in] = old.weight.data
     new.weight.data[:, old_in:] = 0.0
     new.bias.data[:] = old.bias.data
@@ -173,10 +179,10 @@ def _widen_encoder_out(
     concat_dim: int, identity_shortcut_enabled: bool,
 ) -> None:
     """``encoder.out``'s input is ``[bottleneck ‖ raw-input concat]`` (see
-    ``BallDynamicsEncoder.forward``) -- growing the bottleneck shifts where
-    the (fixed-width, never-widened) concat block starts, so its weight
-    columns must move with it, values unchanged, not just get appended
-    after.
+    ``PlayerDynamicsEncoder.forward``) -- growing the bottleneck shifts
+    where the (fixed-width, never-widened) concat block starts, so its
+    weight columns must move with it, values unchanged, not just get
+    appended after.
 
     NEW output rows (the newly-added latent dims, ``[old_latent:new_
     latent)``) need explicit handling when ``identity_shortcut_enabled``:
@@ -187,21 +193,20 @@ def _widen_encoder_out(
     new latent row is, since old_latent is virtually always >=
     N_IDENTITY_SHORTCUT_FIELDS) at EXACT zero, not the random init the
     "producing side, never zero" rule assumes. In the ORIGINAL
-    (non-widened) model that's harmless -- the decoder/crossing_head/
-    resting_head/position_head/event_head consumers reading those spare latent columns were
-    themselves freshly, randomly initialized from scratch, so gradient can
-    reach encoder.out's zero row via the consumer's ALREADY-nonzero weight
-    (``d(loss)/d(latent[row])`` doesn't depend on ``latent[row]``'s own
-    current value, only on the consumer's weight and its own gradient).
-    But here, the CONSUMING side's new columns were JUST zeroed too (by
-    ``_widen_linear_cols``/``_widen_decoder_net0`` above, to protect old
-    outputs from a brand-new, initially-meaningless latent dim) -- so both
-    sides of the seam land on zero SIMULTANEOUSLY, a genuine two-sided dead
-    fixed point with nothing left to bootstrap from (confirmed empirically:
-    a real run's new latent rows were still EXACTLY zero, weight and bias,
-    after many further epochs of training). Explicitly re-randomizing these
-    rows breaks that lock the same way ``_init_identity_shortcut_decoder``'s
-    own spare-unit fix already does for the decoder's analogous case.
+    (non-widened) model that's harmless -- the decoder consumer reading
+    those spare latent columns was itself freshly, randomly initialized
+    from scratch, so gradient can reach encoder.out's zero row via the
+    consumer's ALREADY-nonzero weight (``d(loss)/d(latent[row])`` doesn't
+    depend on ``latent[row]``'s own current value, only on the consumer's
+    weight and its own gradient). But here, the CONSUMING side's new
+    columns were JUST zeroed too (by ``_widen_decoder_net0`` below, to
+    protect old outputs from a brand-new, initially-meaningless latent
+    dim) -- so both sides of the seam land on zero SIMULTANEOUSLY, a
+    genuine two-sided dead fixed point with nothing left to bootstrap from
+    (see ``widen_ball_checkpoint.py``'s identical seam for the real bug
+    this was caught from). Explicitly re-randomizing these rows breaks
+    that lock the same way ``_init_identity_shortcut_decoder``'s own
+    spare-unit fix already does for the decoder's analogous case.
     """
     new.weight.data[:old_latent, :old_bneck] = old.weight.data[:, :old_bneck]
     new.weight.data[:old_latent, old_bneck:new_bneck] = 0.0
@@ -217,7 +222,7 @@ def _widen_encoder_out(
 
 def _widen_decoder_net0(old: nn.Linear, new: nn.Linear, old_latent: int, new_latent: int, old_dhidden: int) -> None:
     """``decoder.net[0]``'s input is ``[latent ‖ 3 horizon features]`` (see
-    ``BallDynamicsDecoder.forward``) -- growing latent_dim shifts where the
+    ``PlayerDynamicsDecoder.forward``) -- growing latent_dim shifts where the
     3 (fixed-width) horizon-feature columns start, same shape of surgery as
     ``_widen_encoder_out``."""
     new.weight.data[:old_dhidden, :old_latent] = old.weight.data[:, :old_latent]
@@ -226,13 +231,18 @@ def _widen_decoder_net0(old: nn.Linear, new: nn.Linear, old_latent: int, new_lat
     new.bias.data[:old_dhidden] = old.bias.data
 
 
-def widen_model_(old_model: BallDynamicsAutoencoder, new_model: BallDynamicsAutoencoder, old_cfg: dict, new_cfg: dict) -> None:
+def widen_model_(old_model: PlayerDynamicsAutoencoder, new_model: PlayerDynamicsAutoencoder, old_cfg: dict, new_cfg: dict) -> None:
     """Mutates ``new_model`` (already constructed with its own fresh/
     identity-shortcut init, per ``new_cfg``) in place so it computes the
     EXACT same function as ``old_model`` for its old capacity, plus fresh,
     immediately-trainable capacity for whatever grew. See module docstring
     for the general "zero the consuming side, never the producing side"
     rule and why the two seams below need to also handle a column shift.
+
+    The four auxiliary heads (crossing/goal_dist_delta/both short-horizon
+    probes) are plain consumers of the latent -- old columns copied, new
+    columns zeroed, output width unchanged -- exactly like ball's
+    crossing_head/resting_head.
     """
     old_hidden, new_hidden = old_cfg["hidden_dim"], new_cfg["hidden_dim"]
     old_bneck = old_cfg.get("encoder_bottleneck_dim", 32)
@@ -249,86 +259,32 @@ def widen_model_(old_model: BallDynamicsAutoencoder, new_model: BallDynamicsAuto
             old_model.encoder.out, new_model.encoder.out, old_bneck, new_bneck, old_latent, new_latent,
             concat_dim, old_cfg.get("identity_shortcut_enabled", False),
         )
-        _widen_linear_cols(old_model.crossing_head, new_model.crossing_head, old_latent)
-        _widen_linear_cols(old_model.resting_head, new_model.resting_head, old_latent)
-        _widen_linear_cols(old_model.position_head, new_model.position_head, old_latent)
-        _widen_linear_cols(old_model.event_head, new_model.event_head, old_latent)
         _widen_decoder_net0(old_model.decoder.net[0], new_model.decoder.net[0], old_latent, new_latent, old_dhidden)
         _widen_linear_cols(old_model.decoder.net[2], new_model.decoder.net[2], old_dhidden)
+        for head_name in _AUX_HEAD_NAMES:
+            _widen_linear_cols(getattr(old_model, head_name), getattr(new_model, head_name), old_latent)
 
 
-def verify_widened_model(old_model: BallDynamicsAutoencoder, new_model: BallDynamicsAutoencoder, x: torch.Tensor, atol: float = 1e-4) -> None:
+def verify_widened_model(old_model: PlayerDynamicsAutoencoder, new_model: PlayerDynamicsAutoencoder, x: torch.Tensor, atol: float = 1e-4) -> None:
     """Asserts ``new_model`` reproduces ``old_model`` EXACTLY on ``x`` --
-    every decoder horizon, plus crossing_head/resting_head. Raises
+    every decoder horizon, plus all four auxiliary latent heads. Raises
     AssertionError (with the worst-offending max-diff) if not, so a bug in
-    the seam surgery above is caught here rather than silently shipped into
-    a training run."""
+    the seam surgery above is caught here rather than silently shipped into a
+    training run."""
     old_model.eval()
     new_model.eval()
     with torch.no_grad():
         latent_old, decoder_old = old_model(x)
         latent_new, decoder_new = new_model(x)
-        crossing_old, crossing_new = old_model.crossing_head(latent_old), new_model.crossing_head(latent_new)
-        resting_old, resting_new = old_model.resting_head(latent_old), new_model.resting_head(latent_new)
-        position_old, position_new = old_model.position_head(latent_old), new_model.position_head(latent_new)
-        event_old, event_new = old_model.event_head(latent_old), new_model.event_head(latent_new)
+        aux_old = {n: getattr(old_model, n)(latent_old) for n in _AUX_HEAD_NAMES}
+        aux_new = {n: getattr(new_model, n)(latent_new) for n in _AUX_HEAD_NAMES}
 
     for h, (do, dn) in enumerate(zip(decoder_old, decoder_new)):
         diff = (do - dn).abs().max().item()
         assert diff < atol, f"decoder horizon {h} diverged after widening (max abs diff {diff:.6g})"
-    diff = (crossing_old - crossing_new).abs().max().item()
-    assert diff < atol, f"crossing_head diverged after widening (max abs diff {diff:.6g})"
-    diff = (resting_old - resting_new).abs().max().item()
-    assert diff < atol, f"resting_head diverged after widening (max abs diff {diff:.6g})"
-    diff = (position_old - position_new).abs().max().item()
-    assert diff < atol, f"position_head diverged after widening (max abs diff {diff:.6g})"
-    diff = (event_old - event_new).abs().max().item()
-    assert diff < atol, f"event_head diverged after widening (max abs diff {diff:.6g})"
-
-
-def repair_dead_encoder_out_rows(
-    checkpoint_path: str | Path, output_path: str | Path, row_start: int, row_end: int,
-) -> None:
-    """One-off repair for a checkpoint produced by the (now-fixed)
-    ``_widen_encoder_out`` bug: re-randomizes ``encoder.out``'s weight/bias
-    for latent rows ``[row_start:row_end)`` IN PLACE on an already-widened,
-    already-further-trained checkpoint, leaving every other parameter --
-    including that same checkpoint's crossing_head/resting_head/decoder.
-    net[0] weights reading those latent columns, which were also stuck at
-    zero for the same reason -- untouched. Those consuming weights don't
-    need manual repair: once encoder.out's rows produce a real, input-
-    dependent value again, their own gradient (``d(loss)/d(weight) = d(loss)
-    /d(preactivation) * latent[row]``) stops being multiplied by zero, so
-    they resume learning normally on the very next training step.
-
-    Refuses to touch rows that AREN'T all-zero (real trained values would
-    silently be destroyed otherwise) -- only for checkpoints predating the
-    fix in ``_widen_encoder_out`` above; a freshly-``widen_checkpoint()``'d
-    one never needs this.
-    """
-    ckpt = torch.load(checkpoint_path, map_location="cpu")
-    if "model_state_dict" not in ckpt:
-        raise ValueError(f"{checkpoint_path} has no 'model_state_dict' (only an encoder) -- nothing to repair.")
-    sd = ckpt["model_state_dict"]
-    w, b = sd["encoder.out.weight"], sd["encoder.out.bias"]
-    dead_w, dead_b = w[row_start:row_end, :], b[row_start:row_end]
-    if dead_w.abs().sum().item() > 0 or dead_b.abs().sum().item() > 0:
-        raise ValueError(
-            f"encoder.out rows [{row_start}:{row_end}) aren't all-zero -- refusing to overwrite what "
-            "might be real trained weights (this repair is only for the specific dead-row bug)."
-        )
-    with torch.no_grad():
-        nn.init.kaiming_uniform_(w[row_start:row_end, :], a=5 ** 0.5)
-        fan_in = w.shape[1]
-        bound = 1 / fan_in ** 0.5 if fan_in > 0 else 0.0
-        b[row_start:row_end].uniform_(-bound, bound)
-    sd["encoder.out.weight"], sd["encoder.out.bias"] = w, b
-    ckpt["model_state_dict"] = sd
-    ckpt["encoder_state_dict"] = {k[len("encoder."):]: v for k, v in sd.items() if k.startswith("encoder.")}
-    output_path = Path(output_path)
-    output_path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(ckpt, output_path)
-    log.info(f"Repaired encoder.out rows [{row_start}:{row_end}) and saved to {output_path}")
+    for name in _AUX_HEAD_NAMES:
+        diff = (aux_old[name] - aux_new[name]).abs().max().item()
+        assert diff < atol, f"{name} diverged after widening (max abs diff {diff:.6g})"
 
 
 def widen_checkpoint(
@@ -344,22 +300,20 @@ def widen_checkpoint(
     old_cfg = ckpt["config_snapshot"]
     if new_cfg is None:
         from footballcoach.ai.config import load_ai_config
-        new_cfg = load_ai_config()["physics_pretrain"]["ball"]
+        new_cfg = load_ai_config()["physics_pretrain"]["player"]
     _validate_widen_cfgs(old_cfg, new_cfg)
 
     old_model = _build_model(old_cfg)
-    missing, unexpected = old_model.load_state_dict(
-        _migrate_crossing_head_state_dict(ckpt["model_state_dict"], old_model), strict=False,
-    )
+    missing, unexpected = old_model.load_state_dict(ckpt["model_state_dict"], strict=False)
     if missing or unexpected:
         log.info(f"Loading old checkpoint: missing={missing} unexpected={unexpected}")
     new_model = _build_model(new_cfg)
     widen_model_(old_model, new_model, old_cfg, new_cfg)
 
-    from footballcoach.ai.physics_pretrain.ball_episode_gen import N_INPUT_FIELDS
+    from footballcoach.ai.physics_pretrain.player_episode_gen import N_INPUT_FIELDS
     if dataset_dir is not None:
-        from footballcoach.ai.physics_pretrain.ball_dataset import BallDynamicsDataset
-        ds = BallDynamicsDataset.from_directory(dataset_dir)
+        from footballcoach.ai.physics_pretrain.player_dataset import PlayerDynamicsDataset
+        ds = PlayerDynamicsDataset.from_directory(dataset_dir)
         n = min(verify_n, len(ds))
         idx = torch.randperm(len(ds))[:n].numpy()
         x = torch.from_numpy(ds.inputs[idx].astype("float32"))
@@ -373,9 +327,9 @@ def widen_checkpoint(
         if new_v != old_v:
             log.info(f"  {key}: {old_v} -> {new_v}")
 
-    from footballcoach.ai.physics_pretrain.ball_episode_gen import BALL_SPIN_NORM_DIVISOR_RAD_S, BallEpisodeGenParams
     import math
-    gen_params = BallEpisodeGenParams.from_config()
+    from footballcoach.ai.physics_pretrain.player_episode_gen import PlayerEpisodeGenParams
+    gen_params = PlayerEpisodeGenParams.from_config()
     pitch_half_diag_m = math.hypot(gen_params.base_pitch_length_m / 2, gen_params.base_pitch_width_m / 2)
 
     output_path = Path(output_path)
@@ -386,8 +340,6 @@ def widen_checkpoint(
         "config_snapshot": new_cfg,
         "normalization": {
             "pitch_half_diag_m": pitch_half_diag_m,
-            "height_norm_m": gen_params.height_norm_m,
-            "ball_spin_norm_max_rad_s": BALL_SPIN_NORM_DIVISOR_RAD_S,
         },
         "physics_config_hash": _physics_config_hash(),
         "phase": "widened",

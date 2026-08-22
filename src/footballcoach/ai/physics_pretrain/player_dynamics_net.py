@@ -159,10 +159,45 @@ class PlayerDynamicsDecoder(nn.Module):
 
 
 class PlayerDynamicsAutoencoder(nn.Module):
-    """Thin training-only wrapper composing encoder + the shared decoder.
+    """Thin training-only wrapper composing encoder + the shared decoder +
+    four auxiliary linear heads reading the latent directly.
 
     Not itself a saved artifact -- only ``encoder.state_dict()`` becomes the
     real, permanent output, exactly mirroring ``BallDynamicsAutoencoder``.
+    Every auxiliary head below is a single ``nn.Linear`` off the RAW latent
+    (no hidden layer, no ReLU, no horizon conditioning) and is ALWAYS
+    constructed -- they're a handful of parameters each, and whether they
+    actually train is controlled purely by their config loss weight, never
+    by a constructor flag (same convention as ``BallDynamicsAutoencoder``'s
+    ``crossing_head``/``resting_head``). Being linear-off-the-latent is the
+    point: whatever they predict, the latent is forced to encode LINEARLY.
+
+    ``crossing_head``: ``Linear(latent_dim, 3)`` -> ``(pos_x, pos_y,
+    delta_t)`` of the first out_of_bounds/goal_scored crossing (normalized
+    position; ``delta_t`` in seconds with a ``-1`` "no crossing" sentinel) --
+    the direct player analogue of the ball's identically-shaped head. See
+    ``PlayerDynamicsDataset``'s ``crossing_pos``/``crossing_dt``/
+    ``crossing_mask`` and ``physics_pretrain.player.crossing_loss_weight``.
+
+    ``goal_dist_delta_head``: ``Linear(latent_dim, 2)`` -> the CHANGE in
+    distance-to-the-closest-point-of-each-goal-mouth between t=0 and t=3.0s,
+    one output per goal (index 0 = left goal at ``x = -half_length``, index
+    1 = right goal at ``x = +half_length``). Negative = the player got
+    closer to that goal. No ball equivalent. See
+    ``train_player_dynamics._goal_dist_delta_targets`` and
+    ``physics_pretrain.player.goal_dist_delta_loss_weight``.
+
+    ``short_horizon_head_0_2s``/``short_horizon_head_1_0s``: two
+    ``Linear(latent_dim, 4)`` diagnostic PROBES -> ``(pos_x, pos_y, vel_x,
+    vel_y)`` at exactly 0.2s and 1.0s respectively. Deliberately duplicate
+    what the shared, horizon-conditioned decoder already predicts at those
+    horizons, with NO horizon/time features involved -- an extra, purely
+    additive gradient path forcing the raw latent to encode short-horizon
+    state linearly. Motivated by ``pos_rmse`` being anomalously bad at
+    exactly those two shortest horizons relative to a trivial persistence
+    baseline. The decoder's own per-horizon predictions (what the report,
+    inspector and main loss all use) are completely unaffected by these.
+    See ``physics_pretrain.player.short_horizon_probe_loss_weight``.
     """
 
     def __init__(
@@ -189,6 +224,12 @@ class PlayerDynamicsAutoencoder(nn.Module):
             latent_dim=latent_dim, horizons_s=horizons_s, hidden_dim=decoder_hidden_dim,
             identity_shortcut=decoder_identity_shortcut, identity_shortcut_noise_std=identity_shortcut_noise_std,
         )
+        # Auxiliary linear heads off the raw latent -- see the class
+        # docstring. Always present; trained iff their config weight != 0.
+        self.crossing_head = nn.Linear(latent_dim, 3)
+        self.goal_dist_delta_head = nn.Linear(latent_dim, 2)
+        self.short_horizon_head_0_2s = nn.Linear(latent_dim, 4)
+        self.short_horizon_head_1_0s = nn.Linear(latent_dim, 4)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         latent = self.encoder(x)

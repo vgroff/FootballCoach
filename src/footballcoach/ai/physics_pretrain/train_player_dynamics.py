@@ -261,6 +261,261 @@ def _single_target_per_episode_loss(
     return pos_sq + vel_sq + heading_sq + stamina_sq + bce_weight * (oob_bce + goal_bce)
 
 
+def _require_horizon_index(horizons_s, value: float, purpose: str) -> int:
+    """Index of the horizon EXACTLY equal to ``value`` in ``horizons_s``, or
+    a clear startup ``ValueError`` naming what needed it. Auxiliary heads
+    that are pinned to one specific wall-clock horizon (see
+    ``goal_dist_delta_head``/the short-horizon probes) must never guess a
+    position in ``horizons_s`` -- that list is config-driven and reorderable,
+    so a hardcoded index would silently start supervising the wrong horizon
+    the moment someone edited it."""
+    for i, h in enumerate(horizons_s):
+        if float(h) == value:
+            return i
+    raise ValueError(
+        f"physics_pretrain.player.horizons_s must contain {value} exactly -- {purpose} is defined at "
+        f"that horizon and there is no sensible substitute. Got horizons_s={[float(h) for h in horizons_s]}. "
+        "Either add that horizon or set the corresponding loss weight to 0.0 to disable the head."
+    )
+
+
+def _goal_mouth_distance_m(
+    pos_x_m: np.ndarray, pos_y_m: np.ndarray, goal_line_x_m: np.ndarray, half_goal_width_m: np.ndarray,
+) -> np.ndarray:
+    """Vectorized 2D distance (metres) from a player at ``(pos_x_m,
+    pos_y_m)`` to the CLOSEST POINT of a goal mouth -- the line segment
+    ``x = goal_line_x_m``, ``y in [-half_goal_width_m, +half_goal_width_m]``
+    (see ``Pitch.is_goal``: the left goal sits at ``x = -half_length``, the
+    right at ``x = +half_length``, both spanning ``goal_width_m`` centred on
+    ``y = 0``).
+
+    Standard point-to-segment distance, specialized to an axis-aligned
+    segment: the x-offset always counts; the y-offset only counts by however
+    far the player is OUTSIDE the mouth's y-span (0 when level with the
+    mouth, in which case the distance is just ``|pos_x - goal_line_x|``).
+    Everything is elementwise, so each row may carry its own randomized
+    pitch/goal dims.
+    """
+    dx = np.abs(pos_x_m - goal_line_x_m)
+    dy = np.maximum(np.abs(pos_y_m) - half_goal_width_m, 0.0)
+    return np.hypot(dx, dy)
+
+
+def _goal_dist_delta_targets(
+    ds: PlayerDynamicsDataset, params, horizon_idx_3s: int, pitch_half_diag_m: float,
+) -> np.ndarray:
+    """``(N, 2)`` float32 training targets for ``goal_dist_delta_head``:
+    per goal, ``dist_to_closest_point_of_goal(pos_at_t=3.0s) -
+    dist_to_closest_point_of_goal(pos_at_t=0)``. Column 0 = LEFT goal
+    (``x = -half_length``), column 1 = RIGHT goal (``x = +half_length``).
+    Negative = the player got closer to that goal over those 3 seconds.
+
+    Computed at TRAIN time from data the dataset already carries (t=0
+    position from ``ds.inputs`` fields 0/1, t=3.0s position from
+    ``ds.targets``' horizon-3.0s block, per-episode pitch/goal dims from
+    input fields 17/19) -- nothing new is recorded at dataset-generation
+    time, so this needs no schema change and works on any player dataset.
+
+    The distances themselves are computed in REAL METRES (the goal-mouth
+    geometry isn't scale-invariant, and under
+    ``normalize_kinematics_by_base_pitch=false`` pos_x and pos_y don't even
+    share a divisor, so a "distance" in raw normalized units would be a
+    meaningless anisotropic mix), then the resulting delta is divided by
+    ``pitch_half_diag_m`` to land on the same normalized scale as every
+    other quantity the network regresses. It stays a RAW (signed, absolute)
+    delta -- deliberately NOT expressed as a fraction of the initial
+    distance, which would blow up for a player who starts on the goal line.
+    """
+    inputs = ds.inputs
+    n = len(inputs)
+    # Actual pitch/goal geometry -- fields 17/19 are always a plain
+    # ratio-to-base regardless of normalize_kinematics_by_base_pitch (see
+    # player_episode_gen._encode_input).
+    half_length_m = inputs[:, 17].astype(np.float64) * params.base_pitch_length_m / 2.0
+    half_goal_width_m = inputs[:, 19].astype(np.float64) * params.base_goal_width_m / 2.0
+    # Divisors position was ENCODED with -- same branch as
+    # player_episode_gen._kinematics_divisors / _kinematics_denorm_scales
+    # above, vectorized over rows.
+    if params.normalize_kinematics_by_base_pitch:
+        half_diag = math.hypot(params.base_pitch_length_m / 2, params.base_pitch_width_m / 2)
+        div_x = np.full(n, half_diag, dtype=np.float64)
+        div_y = np.full(n, half_diag, dtype=np.float64)
+    else:
+        div_x = half_length_m
+        div_y = inputs[:, 18].astype(np.float64) * params.base_pitch_width_m / 2.0
+
+    base = horizon_idx_3s * N_TARGET_FIELDS_PER_HORIZON
+    pos0_x, pos0_y = inputs[:, 0] * div_x, inputs[:, 1] * div_y
+    pos3_x, pos3_y = ds.targets[:, base] * div_x, ds.targets[:, base + 1] * div_y
+
+    out = np.zeros((n, 2), dtype=np.float32)
+    for col, side in enumerate((-1.0, 1.0)):  # 0 = left goal, 1 = right goal
+        goal_line_x_m = side * half_length_m
+        d0 = _goal_mouth_distance_m(pos0_x, pos0_y, goal_line_x_m, half_goal_width_m)
+        d3 = _goal_mouth_distance_m(pos3_x, pos3_y, goal_line_x_m, half_goal_width_m)
+        out[:, col] = (d3 - d0) / pitch_half_diag_m
+    return out
+
+
+def _crossing_head_loss(
+    model: PlayerDynamicsAutoencoder, latent: torch.Tensor, pos_all: np.ndarray, dt_all: np.ndarray,
+    mask_all: np.ndarray, row_idx: np.ndarray, device: str,
+) -> tuple[torch.Tensor, float, float]:
+    """``model.crossing_head``'s loss for one batch: position MSE (x/y,
+    MASKED to rows where ``mask_all`` is True -- an episode with no crossing
+    AHEAD of whichever pseudo-start these targets were built relative to, or
+    one excluded for starting already out of bounds, has no meaningful
+    crossing position to regress toward) plus delta_t MSE (UNMASKED, against
+    ``dt_all``'s -1 sentinel for those same rows -- see
+    ``PlayerDynamicsDataset``'s docstring for why delta_t is trained on the
+    sentinel directly rather than also being masked).
+
+    Near-verbatim port of ``train_ball_dynamics._crossing_head_loss``, minus
+    its height-exclusion note (a player has no height axis to exclude).
+    ``pos_all``/``dt_all``/``mask_all`` are plain arrays (not tied to a
+    specific dataset attribute) so this same function serves BOTH the main
+    task's t=0 crossing target (``ds.crossing_pos``/``crossing_dt``/
+    ``crossing_mask``, indexed by ``row_idx`` = original dataset row indices)
+    AND the per-horizon pseudo-start generalization (see
+    ``_build_horizon_bundle`` -- ``crossing_time - horizons_s[h]``, reindexed
+    to whichever row order the caller's arrays use). Callers must ensure
+    ``pos_all``/``dt_all``/``mask_all`` and ``row_idx`` share the same
+    indexing convention; this function doesn't care which one it is.
+
+    Returns ``(loss, pos_dist_mean, dt_mae_mean)`` -- the last two are plain
+    floats (not backpropagated) for per-epoch reporting: mean Euclidean
+    crossing-position error over the rows that actually crossed (0.0 if none
+    did, matching the masked loss's own 0-numerator/1-denominator
+    convention), and mean absolute delta_t error over ALL rows (sentinel
+    included, since that's what the loss itself trains against).
+    """
+    crossing_pred = model.crossing_head(latent)
+    c_pos = torch.from_numpy(pos_all[row_idx]).to(device)
+    c_dt = torch.from_numpy(dt_all[row_idx]).to(device)
+    c_mask = torch.from_numpy(mask_all[row_idx]).to(device)
+    mask_f = c_mask.float()
+    denom = mask_f.sum().clamp_min(1.0)
+    pos_err = crossing_pred[:, 0:2] - c_pos
+    pos_loss = (pos_err.pow(2).sum(dim=-1) * mask_f).sum() / denom
+    dt_loss = F.mse_loss(crossing_pred[:, 2], c_dt)
+    loss = pos_loss + dt_loss
+    with torch.no_grad():
+        pos_dist_mean = float((torch.linalg.norm(pos_err, dim=-1) * mask_f).sum().item() / float(denom.item()))
+        dt_mae_mean = float((crossing_pred[:, 2] - c_dt).abs().mean().item())
+    return loss, pos_dist_mean, dt_mae_mean
+
+
+def _goal_dist_delta_head_loss(
+    model: PlayerDynamicsAutoencoder, latent: torch.Tensor, targets_all: np.ndarray,
+    row_idx: np.ndarray, device: str,
+) -> tuple[torch.Tensor, float, float]:
+    """``model.goal_dist_delta_head``'s loss for one batch -- plain UNMASKED
+    MSE over both goals. Unlike the crossing head there's nothing to mask:
+    every row has a well-defined position at t=0 and at t=3.0s, so every row
+    has a well-defined distance delta to each goal.
+
+    MAIN-ROWS-ONLY by design (never called from the "horizon" pass): this
+    head is about one FIXED wall-clock horizon (t=3.0s from the episode's
+    real start), and a mid-trajectory pseudo-start's own "3 seconds from
+    here" is a different quantity entirely -- supervising both against the
+    same head would train it on two incompatible targets.
+
+    Returns ``(loss, mae_left, mae_right)`` -- the two diagnostics are the
+    per-goal mean absolute error in the same normalized units the targets
+    use (callers scale by ``pitch_half_diag_m`` to report metres).
+    """
+    pred = model.goal_dist_delta_head(latent)
+    tgt = torch.from_numpy(targets_all[row_idx]).to(device)
+    loss = F.mse_loss(pred, tgt)
+    with torch.no_grad():
+        mae = (pred - tgt).abs().mean(dim=0)
+    return loss, float(mae[0].item()), float(mae[1].item())
+
+
+def _short_horizon_probe_loss(
+    model: PlayerDynamicsAutoencoder, latent: torch.Tensor,
+    targets_0_2s: np.ndarray, targets_1_0s: np.ndarray, row_idx: np.ndarray, device: str,
+) -> tuple[torch.Tensor, float, float]:
+    """The two short-horizon PROBE heads' combined loss for one batch --
+    plain UNMASKED MSE of each head's ``(pos_x, pos_y, vel_x, vel_y)``
+    prediction against the recorded target block at exactly 0.2s / 1.0s,
+    SUMMED across the two heads (matching how every other multi-component
+    loss in this file combines its parts -- ``compute_loss`` sums pos/vel/
+    heading/stamina rather than averaging them, so one shared config weight
+    scales the pair as a unit).
+
+    MAIN-ROWS-ONLY, same reasoning as ``_goal_dist_delta_head_loss``: each
+    head is pinned to one literal horizon value, which a mid-trajectory
+    pseudo-start doesn't share.
+
+    Returns ``(loss, rmse_0_2s, rmse_1_0s)`` -- per-head RMSE in normalized
+    units, for reporting only.
+    """
+    total = latent.new_zeros(())
+    rmses: list[float] = []
+    for head, targets_all in (
+        (model.short_horizon_head_0_2s, targets_0_2s),
+        (model.short_horizon_head_1_0s, targets_1_0s),
+    ):
+        pred = head(latent)
+        tgt = torch.from_numpy(targets_all[row_idx]).to(device)
+        mse = F.mse_loss(pred, tgt)
+        total = total + mse
+        rmses.append(float(mse.item()) ** 0.5)
+    return total, rmses[0], rmses[1]
+
+
+_AUX_METRIC_KEYS = (
+    "crossing_loss", "crossing_pos_dist", "crossing_dt_mae",
+    "goal_dist_delta_loss", "goal_dist_delta_mae_left", "goal_dist_delta_mae_right",
+    "short_horizon_probe_loss", "short_horizon_rmse_0_2s", "short_horizon_rmse_1_0s",
+)
+
+
+class _AuxAccumulator:
+    """Per-epoch accumulator for the three auxiliary latent heads'
+    diagnostics, shared by the train and eval passes so the two can't drift
+    apart in what they measure or how they average it.
+
+    Every metric is a plain per-batch mean averaged over the epoch's batches
+    (never merged into ``train_loss``/``val_loss``, same convention as
+    pair/t0 -- see the ``backprop_loss`` comment in
+    ``_run_interleaved_train_epoch``). ``summary()`` returns NaN for any head
+    that contributed no batches (i.e. is disabled), which the log lines and
+    ``.history.npz`` both carry through unchanged rather than pretending a
+    disabled head scored 0.
+
+    Note the crossing accumulators deliberately pool the main pass's t=0
+    usage AND the horizon pass's per-pseudo-start usage into one number
+    (matching train_ball_dynamics.py) -- the two are the same head learning
+    the same task from different start points.
+    """
+
+    def __init__(self):
+        self._values: dict[str, list[float]] = {k: [] for k in _AUX_METRIC_KEYS}
+
+    def add_crossing(self, loss: torch.Tensor, pos_dist: float, dt_mae: float) -> None:
+        self._values["crossing_loss"].append(float(loss.item()))
+        self._values["crossing_pos_dist"].append(pos_dist)
+        self._values["crossing_dt_mae"].append(dt_mae)
+
+    def add_goal_dist(self, loss: torch.Tensor, mae_left: float, mae_right: float) -> None:
+        self._values["goal_dist_delta_loss"].append(float(loss.item()))
+        self._values["goal_dist_delta_mae_left"].append(mae_left)
+        self._values["goal_dist_delta_mae_right"].append(mae_right)
+
+    def add_probe(self, loss: torch.Tensor, rmse_0_2s: float, rmse_1_0s: float) -> None:
+        self._values["short_horizon_probe_loss"].append(float(loss.item()))
+        self._values["short_horizon_rmse_0_2s"].append(rmse_0_2s)
+        self._values["short_horizon_rmse_1_0s"].append(rmse_1_0s)
+
+    def summary(self) -> dict[str, float]:
+        return {
+            k: (float(np.mean(v)) if v else float("nan"))
+            for k, v in self._values.items()
+        }
+
+
 def _summary_stats(values: list[float]) -> dict[str, float]:
     """``{mean, std, min, max}`` of ``values`` -- ``nan`` for all four if
     empty, ``std=0.0`` (not ``nan``) for a single value (a degenerate but
@@ -308,17 +563,19 @@ def _interleaved_horizon_batches(
 
 
 def _build_horizon_bundle(
-    ds: PlayerDynamicsDataset, indices: np.ndarray, n_horizons: int,
+    ds: PlayerDynamicsDataset, indices: np.ndarray, n_horizons: int, horizons_s: list[float],
     pair_enabled: bool, pair_max_skip: int, pair_min_start_speed_norm: float,
+    has_crossing_data: bool,
 ) -> dict:
     """Precomputes, per recorded horizon ``h``, everything the shared
     "horizon" training step (see ``_run_interleaved_train_epoch``'s
     "horizon" branch) needs beyond the already-built ``autoencode_train_
     data[h]``/``autoencode_val_data[h]`` input/self-target pair (built
     separately via ``ds.build_autoencoding_data`` -- this function only adds
-    what pair training needs ON TOP of that same shared row set). Directly
-    mirrors ``train_ball_dynamics._build_horizon_bundle``, minus the
-    crossing/resting pieces (no equivalents on the player side).
+    what pair AND crossing-head training need ON TOP of that same shared row
+    set). Directly mirrors ``train_ball_dynamics._build_horizon_bundle``,
+    minus the resting pieces (no player equivalent of "where does the ball
+    come to rest").
 
     ``pair_mask`` (boolean array, one entry per row in ``indices``, True =
     eligible for pair training at this horizon) is a MASK now, not a row
@@ -337,13 +594,35 @@ def _build_horizon_bundle(
     each ``target_array`` being that later horizon's full target block in
     the SAME row order as ``indices``.
 
+    ``crossing_dt``/``crossing_valid`` are the HORIZON-ADJUSTED crossing
+    targets, exactly mirroring ball's: for a pseudo-start at horizon ``h``,
+    ``delta_t = crossing_time - horizons_s[h]`` (the crossing POSITION needs
+    no adjustment at all -- it's the same fixed (x, y) whichever horizon you
+    predict it from, so callers pass ``ds.crossing_pos`` unchanged).
+    Physics isn't latched here either (a player who goes out of bounds keeps
+    walking and can come back in), so ``crossing_time < horizons_s[h]`` is
+    possible even when horizon h's own flags read false; that yields a
+    negative delta_t, which isn't meaningful ("time until a FUTURE crossing"
+    can't be negative) and is folded into the same -1 sentinel / invalid
+    treatment as an episode that never crossed at all (or was excluded for
+    starting out of bounds -- see ``player_episode_gen.generate_episode``).
+
+    Everything returned is indexed in the SAME row order as ``indices``
+    itself (matching ``autoencode_train_data[h]``'s convention: position i
+    corresponds to original dataset row ``indices[i]``), so one local
+    ``row_idx`` indexes all of them.
+
     Returns a dict with per-horizon (length ``n_horizons``) lists:
-    ``pair_mask``, ``pair_targets``.
+    ``pair_mask``, ``pair_targets``, ``crossing_dt``, ``crossing_valid``
+    (the last two hold ``None`` entries when ``has_crossing_data`` is False).
     """
     n = len(indices)
     pair_mask: list[np.ndarray] = []
     pair_targets: list[list[tuple[int, np.ndarray]]] = []
+    crossing_dt: list[np.ndarray | None] = []
+    crossing_valid: list[np.ndarray | None] = []
 
+    crossing_times_here = ds.crossing_times[indices] if has_crossing_data else None
     for h in range(n_horizons):
         base_h = h * N_TARGET_FIELDS_PER_HORIZON
         block_h = ds.targets[indices, base_h:base_h + N_TARGET_FIELDS_PER_HORIZON]
@@ -365,7 +644,19 @@ def _build_horizon_bundle(
         pair_mask.append(mask_h)
         pair_targets.append(targets_h)
 
-    return {"pair_mask": pair_mask, "pair_targets": pair_targets}
+        if has_crossing_data:
+            adj_dt = crossing_times_here - horizons_s[h]
+            adj_valid = np.isfinite(crossing_times_here) & (adj_dt >= 0)
+            crossing_dt.append(np.where(adj_valid, adj_dt, -1.0).astype(np.float32))
+            crossing_valid.append(adj_valid)
+        else:
+            crossing_dt.append(None)
+            crossing_valid.append(None)
+
+    return {
+        "pair_mask": pair_mask, "pair_targets": pair_targets,
+        "crossing_dt": crossing_dt, "crossing_valid": crossing_valid,
+    }
 
 
 def compute_group_sq_err(
@@ -514,6 +805,39 @@ def train(
         "vel_rmse": (pitch_half_diag_m, "m/s"), "vel_dist": (pitch_half_diag_m, "m/s"),
     }
 
+    # ------------------------------------------------------------------
+    # Auxiliary latent heads (see PlayerDynamicsAutoencoder's docstring).
+    # Each has ONE config weight; 0.0 disables that head entirely (no
+    # gradient, no diagnostics, and -- for the two horizon-pinned heads --
+    # no horizons_s validation either, so an unusual horizon set stays
+    # usable as long as you're not asking for the head that needs it).
+    # ------------------------------------------------------------------
+    crossing_weight = float(cfg.get("crossing_loss_weight", 0.0))
+    # A dataset built by hand (e.g. in a unit test) may carry no
+    # crossings/crossing_times at all -- guard every crossing call site with
+    # this rather than crashing, same convention as train_ball_dynamics.py.
+    has_crossing_data = ds.crossing_pos is not None and crossing_weight != 0.0
+    if crossing_weight != 0.0 and ds.crossing_pos is None:
+        log.warning("crossing_loss_weight != 0 but this dataset carries no crossings/crossing_times -- crossing_head will not be trained.")
+
+    goal_dist_delta_weight = float(cfg.get("goal_dist_delta_loss_weight", 0.0))
+    goal_dist_delta_targets = None
+    if goal_dist_delta_weight != 0.0:
+        h_idx_3s = _require_horizon_index(cfg["horizons_s"], 3.0, "goal_dist_delta_head's t=3.0s target")
+        goal_dist_delta_targets = _goal_dist_delta_targets(ds, gen_params, h_idx_3s, pitch_half_diag_m)
+
+    short_horizon_probe_weight = float(cfg.get("short_horizon_probe_loss_weight", 0.0))
+    probe_targets_0_2s = probe_targets_1_0s = None
+    if short_horizon_probe_weight != 0.0:
+        # Columns 0:4 (pos_x, pos_y, vel_x, vel_y) of each probe horizon's
+        # own 9-wide recorded target block -- exactly what the probe heads
+        # predict, in the units they're already stored in.
+        h_idx_0_2s = _require_horizon_index(cfg["horizons_s"], 0.2, "short_horizon_head_0_2s' target")
+        h_idx_1_0s = _require_horizon_index(cfg["horizons_s"], 1.0, "short_horizon_head_1_0s' target")
+        b0, b1 = h_idx_0_2s * N_TARGET_FIELDS_PER_HORIZON, h_idx_1_0s * N_TARGET_FIELDS_PER_HORIZON
+        probe_targets_0_2s = ds.targets[:, b0:b0 + 4].astype(np.float32, copy=False)
+        probe_targets_1_0s = ds.targets[:, b1:b1 + 4].astype(np.float32, copy=False)
+
     def _log_component(prefix: str, c: str, values: np.ndarray) -> None:
         if c in _RMSE_UNIT_SCALE:
             scale, unit = _RMSE_UNIT_SCALE[c]
@@ -563,7 +887,38 @@ def train(
 
     if init_checkpoint:
         ckpt = torch.load(init_checkpoint, map_location=device)
-        if "model_state_dict" in ckpt:
+        old_cfg = ckpt.get("config_snapshot")
+        # If hidden_dim/encoder_bottleneck_dim/latent_dim/decoder_hidden_dim
+        # in the CURRENT config don't match what this checkpoint was saved
+        # with, a plain load_state_dict can't work at all -- those are real
+        # shape mismatches on EXISTING keys, which strict=False doesn't
+        # help with (it only tolerates keys missing/extra, never a keeping
+        # key whose shape changed). Route through widen_player_checkpoint.
+        # py's seam-preserving surgery instead of failing, so bumping those
+        # config values and resuming from an old checkpoint just works --
+        # see that module's docstring for why this exactly preserves old
+        # training rather than approximating it. Mirrors train_ball_
+        # dynamics.py's identical widen_needed check.
+        widen_needed = old_cfg is not None and any(
+            old_cfg.get(k, 32) != cfg.get(k, 32)
+            for k in ("hidden_dim", "encoder_bottleneck_dim", "latent_dim", "decoder_hidden_dim")
+        )
+        if widen_needed:
+            from footballcoach.ai.physics_pretrain.widen_player_checkpoint import _build_model, _validate_widen_cfgs, widen_model_
+            _validate_widen_cfgs(old_cfg, cfg)
+            old_model = _build_model(old_cfg).to(device)
+            if "model_state_dict" in ckpt:
+                old_model.load_state_dict(ckpt["model_state_dict"], strict=False)
+            else:
+                old_model.encoder.load_state_dict(ckpt["encoder_state_dict"])
+            widen_model_(old_model, model, old_cfg, cfg)
+            dims = ", ".join(
+                f"{k}: {old_cfg.get(k, 32)}->{cfg.get(k, 32)}"
+                for k in ("hidden_dim", "encoder_bottleneck_dim", "latent_dim", "decoder_hidden_dim")
+                if old_cfg.get(k, 32) != cfg.get(k, 32)
+            )
+            log.info(f"Widened checkpoint from {init_checkpoint} to current config dims ({dims}); resumed (phase={ckpt.get('phase', '?')})")
+        elif "model_state_dict" in ckpt:
             # strict=False: tolerates a checkpoint saved before a param
             # existed at all (e.g. a future new head) -- those params are
             # simply missing from the old state_dict and left at their
@@ -649,12 +1004,22 @@ def train(
     horizon_bundle_val: dict = {}
     if horizon_pass_enabled:
         horizon_bundle_train = _build_horizon_bundle(
-            ds, train_idx, n_horizons, adjacent_pair_enabled, adjacent_pair_max_skip, pair_min_start_speed_norm,
+            ds, train_idx, n_horizons, cfg["horizons_s"],
+            adjacent_pair_enabled, adjacent_pair_max_skip, pair_min_start_speed_norm, has_crossing_data,
         )
         if len(val_idx) > 0:
             horizon_bundle_val = _build_horizon_bundle(
-                ds, val_idx, n_horizons, adjacent_pair_enabled, adjacent_pair_max_skip, pair_min_start_speed_norm,
+                ds, val_idx, n_horizons, cfg["horizons_s"],
+                adjacent_pair_enabled, adjacent_pair_max_skip, pair_min_start_speed_norm, has_crossing_data,
             )
+
+    # crossing_head's per-horizon POSITION target is the same fixed (x, y)
+    # at every pseudo-start (only delta_t shifts -- see
+    # _build_horizon_bundle), pre-sliced into the horizon pass's own row
+    # order once here rather than re-slicing ds.crossing_pos by absolute row
+    # on every batch. Mirrors train_ball_dynamics.py's identical pair.
+    crossing_pos_train = ds.crossing_pos[train_idx] if has_crossing_data else None
+    crossing_pos_val = ds.crossing_pos[val_idx] if has_crossing_data and len(val_idx) > 0 else None
 
     # Row-count summary: how many training EXAMPLES each source contributes
     # this run, logged once up front (after every source above has been
@@ -665,8 +1030,12 @@ def train(
     # `_run_interleaved_train_epoch`'s "horizon" branch docstrings)
     # processes ONE set of rows per recorded horizon, with pair masking its
     # OWN eligible subset of that same shared set rather than adding
-    # separate rows. Mirrors train_ball_dynamics.py's identical summary,
-    # minus the crossing_head/resting_head lines (no equivalents here).
+    # separate rows. crossing_head at t=0 (used only by "main") and at each
+    # horizon (used only by the horizon pass) both ride latents those passes
+    # already computed. goal_dist_delta_head/the short-horizon probes are
+    # MAIN-ROWS-ONLY by design (see their loss functions' docstrings), so
+    # they have no horizon-pass line at all. Mirrors train_ball_dynamics.py's
+    # identical summary, minus resting_head (no equivalent here).
     n_autoencode_train = sum(len(inp) for inp, _ in autoencode_train_data) if autoencode_train_data else 0
     horizon_lines = ""
     if horizon_pass_enabled:
@@ -680,10 +1049,27 @@ def train(
             f"    adjacent-pair (dynamics)        : {n_pair_eligible:,}/{n_autoencode_train:,} horizon-pass rows mask-eligible -- "
             f"shares the horizon pass's own latent, no extra rows/batches\n"
         )
+        if has_crossing_data:
+            n_crossing_h_valid = int(sum(v.sum() for v in horizon_bundle_train["crossing_valid"]))
+            horizon_lines += (
+                f"    crossing_head (at each horizon) : {n_crossing_h_valid:,}/{n_autoencode_train:,} horizon-pass rows mask-eligible -- "
+                f"shares the horizon pass's own latent, no extra rows/batches\n"
+            )
+    aux_lines = ""
+    if has_crossing_data:
+        n_crossing_valid = int(ds.crossing_mask[train_idx].sum())
+        aux_lines += (
+            f"    crossing_head (at t=0, in main) : {n_crossing_valid:,}/{len(train_idx):,} main rows masked-valid (position term only; "
+            f"delta_t trains unmasked on the -1 sentinel) -- shares main's own latent\n"
+        )
+    if goal_dist_delta_weight != 0.0:
+        aux_lines += f"    goal_dist_delta_head (main only): {len(train_idx):,} main rows, unmasked -- shares main's own latent\n"
+    if short_horizon_probe_weight != 0.0:
+        aux_lines += f"    short-horizon probes (main only): {len(train_idx):,} main rows x 2 heads, unmasked -- shares main's own latent\n"
     log.info(
         "Training row-count summary (train split):\n"
         f"    main (per-horizon heads)        : {len(train_idx):,} rows -- own batches\n"
-        f"{horizon_lines}".rstrip("\n")
+        f"{horizon_lines}{aux_lines}".rstrip("\n")
     )
 
     # ------------------------------------------------------------------
@@ -692,8 +1078,17 @@ def train(
     # ------------------------------------------------------------------
     if autoencode_pretrain_epochs > 0:
         autoencode_lr = float(cfg.get("autoencode_lr", lr))
-        autoencode_optimizer = torch.optim.Adam(model.parameters(), lr=autoencode_lr)
-        log.info(f"Autoencode pretraining: {autoencode_pretrain_epochs} epoch(s), lr={autoencode_lr:.2e}")
+        autoencode_optimizer_type = str(cfg.get("autoencode_optimizer_type", "adam")).lower()
+        if autoencode_optimizer_type == "sgd":
+            autoencode_sgd_momentum = float(cfg.get("autoencode_sgd_momentum", 0.9))
+            autoencode_optimizer = torch.optim.SGD(model.parameters(), lr=autoencode_lr, momentum=autoencode_sgd_momentum)
+        elif autoencode_optimizer_type == "adam":
+            autoencode_optimizer = torch.optim.Adam(model.parameters(), lr=autoencode_lr)
+        else:
+            raise ValueError(
+                f"Unknown physics_pretrain.player.autoencode_optimizer_type: {autoencode_optimizer_type!r} (expected 'adam' or 'sgd')"
+            )
+        log.info(f"Autoencode pretraining: {autoencode_pretrain_epochs} epoch(s), lr={autoencode_lr:.2e}, optimizer={autoencode_optimizer_type}")
 
         def _eval_autoencode_pass(data_list):
             losses, breakdowns_by_h = [], [[] for _ in range(n_horizons)]
@@ -747,86 +1142,18 @@ def train(
         _save_phase_checkpoint("after_autoencode")
 
     # ------------------------------------------------------------------
-    # PHASE: decoder-only pretraining (optional, own best-val/early-stop,
-    # disabled by default) -- see train_ball_dynamics.py's identical phase.
+    # Interleaved main + adjacent-pair + t0-autoencode passes (+ crossing/
+    # goal-dist-delta/short-horizon-probe heads on "main" rows), built as
+    # one combined/shuffled loop from day one (see agent_plans/
+    # ball_physics_pretrain_plan.md §12.6's "interleave from the start"
+    # lesson). Takes `optimizer` as a parameter (not closed over) so BOTH
+    # the main loop below AND decoder-only-pretrain above can share this
+    # exact same loop body against their own separate optimizer -- mirrors
+    # train_ball_dynamics.py's identical parameterization, which is what
+    # lets decoder-only-pretrain there train crossing_head/resting_head too
+    # instead of leaving them untouched for that whole phase.
     # ------------------------------------------------------------------
-    decoder_only_pretrain_epochs = int(cfg.get("decoder_only_pretrain_epochs", 0))
-    if decoder_only_pretrain_epochs > 0:
-        decoder_only_lr = float(cfg.get("decoder_only_pretrain_lr", lr))
-        freeze_latent = bool(cfg.get("decoder_only_pretrain_freeze_latent", True))
-        do_early_stop_patience = int(cfg.get("decoder_only_early_stop_patience", 0))
-        do_early_stop_min_delta = float(cfg.get("decoder_only_early_stop_min_delta", 1e-6))
-
-        for p in model.encoder.trunk.parameters():
-            p.requires_grad_(False)
-        identity_mask_hook = None
-        if freeze_latent:
-            for p in model.encoder.out.parameters():
-                p.requires_grad_(False)
-            decoder_only_params = list(model.decoder.parameters())
-        else:
-            n_id = N_IDENTITY_SHORTCUT_FIELDS
-            id_mask = torch.ones_like(model.encoder.out.weight)
-            id_mask[:n_id, :] = 0.0
-            identity_mask_hook = model.encoder.out.weight.register_hook(lambda grad: grad * id_mask)
-            decoder_only_params = list(model.decoder.parameters()) + list(model.encoder.out.parameters())
-        decoder_only_optimizer = torch.optim.Adam(decoder_only_params, lr=decoder_only_lr)
-        log.info(
-            f"Decoder-only pretraining: {decoder_only_pretrain_epochs} epoch(s), lr={decoder_only_lr:.2e}, "
-            f"freeze_latent={freeze_latent}"
-        )
-
-        best_val_loss_do, best_state_do, patience_ctr_do = float("inf"), None, 0
-        for do_epoch in range(decoder_only_pretrain_epochs):
-            model.train()
-            train_losses_do, train_breakdowns_by_h = [], [[] for _ in range(n_horizons)]
-            for x, y in ds.iterate_minibatches(batch_size, train_idx, shuffle=True, device=device, rng=rng):
-                latent, pred_heads = model(x)
-                loss, breakdown = compute_loss(pred_heads, y, x, pos_weight, bce_weight)
-                decoder_only_optimizer.zero_grad()
-                loss.backward()
-                decoder_only_optimizer.step()
-                train_losses_do.append(float(loss.item()))
-                for h in range(n_horizons):
-                    train_breakdowns_by_h[h].append({c: getattr(breakdown, c)[h] for c in _COMPONENTS})
-            mean_train_loss_do = float(np.mean(train_losses_do)) if train_losses_do else float("nan")
-
-            model.eval()
-            val_losses_do = []
-            with torch.no_grad():
-                for x, y in ds.iterate_minibatches(batch_size, val_idx, shuffle=False, device=device):
-                    _, pred_heads = model(x)
-                    loss, _ = compute_loss(pred_heads, y, x, pos_weight, bce_weight)
-                    val_losses_do.append(float(loss.item()))
-            mean_val_loss_do = float(np.mean(val_losses_do)) if val_losses_do else float("inf")
-            log.info(f"  decoder-only pretrain epoch {do_epoch + 1}/{decoder_only_pretrain_epochs}: train_loss={mean_train_loss_do:.4f}  val_loss={mean_val_loss_do:.4f}")
-
-            if mean_val_loss_do < best_val_loss_do - do_early_stop_min_delta:
-                best_val_loss_do = mean_val_loss_do
-                best_state_do = copy.deepcopy(model.state_dict())
-                patience_ctr_do = 0
-            else:
-                patience_ctr_do += 1
-                if do_early_stop_patience > 0 and patience_ctr_do >= do_early_stop_patience:
-                    log.info(f"  decoder-only pretrain: early stopping after {do_epoch + 1} epochs (patience={do_early_stop_patience})")
-                    break
-        if best_state_do is not None:
-            model.load_state_dict(best_state_do)
-            log.info(f"Decoder-only pretraining: restored best-val weights (val_loss={best_val_loss_do:.4f})")
-
-        if identity_mask_hook is not None:
-            identity_mask_hook.remove()
-        for p in model.encoder.parameters():
-            p.requires_grad_(True)
-        _save_phase_checkpoint("after_decoder_pretrain")
-
-    # ------------------------------------------------------------------
-    # MAIN LOOP: interleaved main + adjacent-pair + t0-autoencode passes
-    # sharing one optimizer, built as one combined/shuffled loop from day
-    # one (see agent_plans/ball_physics_pretrain_plan.md §12.6's
-    # "interleave from the start" lesson).
-    # ------------------------------------------------------------------
-    def _run_interleaved_train_epoch() -> dict:
+    def _run_interleaved_train_epoch(optimizer: torch.optim.Optimizer) -> dict:
         model.train()
         chunks: list[tuple[str, int, np.ndarray]] = []
         for h_idx in range(n_horizons):
@@ -848,6 +1175,7 @@ def train(
         sq_err = {g: np.zeros(n_horizons) for g in GROUPS}
         n_elem = {g: np.zeros(n_horizons, dtype=np.int64) for g in GROUPS}
         train_grad_norms: list[float] = []
+        aux = _AuxAccumulator()
 
         for kind, h_idx, row_idx in chunks:
             if kind == "main":
@@ -855,8 +1183,37 @@ def train(
                 y = torch.from_numpy(ds.targets[row_idx].astype(np.float32, copy=False)).to(device)
                 latent, pred_heads = model(x)
                 loss, breakdown = compute_loss(pred_heads, y, x, pos_weight, bce_weight)
+                # `backprop_loss` (not `loss`) is what actually gets stepped
+                # -- it folds in every auxiliary latent head's term for a
+                # single combined backward pass (cheaper than separate steps,
+                # and the encoder/latent is shared anyway). `losses` below
+                # keeps reporting the main per-horizon `loss` ALONE, same
+                # convention as pair/t0 and as train_ball_dynamics.py:
+                # otherwise train_loss would carry the aux terms while
+                # val_loss (computed independently) doesn't, making the two
+                # look wildly divergent for reasons unrelated to
+                # over/underfitting.
+                backprop_loss = loss
+                if has_crossing_data:
+                    crossing_loss, c_pos_dist, c_dt_mae = _crossing_head_loss(
+                        model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, row_idx, device,
+                    )
+                    backprop_loss = backprop_loss + crossing_weight * crossing_loss
+                    aux.add_crossing(crossing_loss, c_pos_dist, c_dt_mae)
+                if goal_dist_delta_targets is not None:
+                    gdd_loss, gdd_mae_left, gdd_mae_right = _goal_dist_delta_head_loss(
+                        model, latent, goal_dist_delta_targets, row_idx, device,
+                    )
+                    backprop_loss = backprop_loss + goal_dist_delta_weight * gdd_loss
+                    aux.add_goal_dist(gdd_loss, gdd_mae_left, gdd_mae_right)
+                if probe_targets_0_2s is not None:
+                    probe_loss, probe_rmse_0_2, probe_rmse_1_0 = _short_horizon_probe_loss(
+                        model, latent, probe_targets_0_2s, probe_targets_1_0s, row_idx, device,
+                    )
+                    backprop_loss = backprop_loss + short_horizon_probe_weight * probe_loss
+                    aux.add_probe(probe_loss, probe_rmse_0_2, probe_rmse_1_0)
                 optimizer.zero_grad()
-                loss.backward()
+                backprop_loss.backward()
                 # Total gradient norm across every trainable param, BEFORE
                 # optimizer.step() consumes it -- a direct read of how
                 # large this step's raw update direction is, independent
@@ -917,11 +1274,25 @@ def train(
                     combined_loss = combined_loss + pair_loss
                     pair_losses.append(float(pair_loss.item()))
 
+                if has_crossing_data:
+                    # Horizon-generalized crossing: same head, same fixed
+                    # (x, y) target, delta_t re-based on this pseudo-start
+                    # (see _build_horizon_bundle). goal_dist_delta/the
+                    # short-horizon probes deliberately have NO horizon-pass
+                    # counterpart -- see their loss docstrings.
+                    crossing_loss_h, c_pos_dist_h, c_dt_mae_h = _crossing_head_loss(
+                        model, latent, crossing_pos_train, horizon_bundle_train["crossing_dt"][h_idx],
+                        horizon_bundle_train["crossing_valid"][h_idx], row_idx, device,
+                    )
+                    combined_loss = combined_loss + crossing_weight * crossing_loss_h
+                    aux.add_crossing(crossing_loss_h, c_pos_dist_h, c_dt_mae_h)
+
                 optimizer.zero_grad()
                 combined_loss.backward()
                 optimizer.step()
 
         return {
+            "aux": aux.summary(),
             "mean_loss": float(np.mean(losses)) if losses else float("nan"),
             "breakdowns": _mean_breakdown_by_horizon(breakdowns_by_h),
             "oob_counts": oob_counts, "goal_counts": goal_counts,
@@ -943,11 +1314,34 @@ def train(
         goal_counts = np.zeros((n_horizons, 4), dtype=np.int64)
         sq_err = {g: np.zeros(n_horizons) for g in GROUPS}
         n_elem = {g: np.zeros(n_horizons, dtype=np.int64) for g in GROUPS}
+        aux = _AuxAccumulator()
         with torch.no_grad():
-            for x, y in ds.iterate_minibatches(batch_size, indices, shuffle=False, device=device):
+            # Batched by hand rather than via ds.iterate_minibatches (same
+            # unshuffled contiguous chunks it would yield) purely so the
+            # auxiliary heads can index their own per-row targets by the
+            # batch's dataset row indices, which that generator doesn't
+            # expose.
+            for start in range(0, len(indices), batch_size):
+                batch_idx = indices[start:start + batch_size]
+                if len(batch_idx) == 0:
+                    continue
+                x = torch.from_numpy(ds.inputs[batch_idx].astype(np.float32, copy=False)).to(device)
+                y = torch.from_numpy(ds.targets[batch_idx].astype(np.float32, copy=False)).to(device)
                 latent, pred_heads = model(x)
                 loss, breakdown = compute_loss(pred_heads, y, x, pos_weight, bce_weight)
                 losses.append(float(loss.item()))
+                if has_crossing_data:
+                    aux.add_crossing(*_crossing_head_loss(
+                        model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
+                    ))
+                if goal_dist_delta_targets is not None:
+                    aux.add_goal_dist(*_goal_dist_delta_head_loss(
+                        model, latent, goal_dist_delta_targets, batch_idx, device,
+                    ))
+                if probe_targets_0_2s is not None:
+                    aux.add_probe(*_short_horizon_probe_loss(
+                        model, latent, probe_targets_0_2s, probe_targets_1_0s, batch_idx, device,
+                    ))
                 for h in range(n_horizons):
                     breakdowns_by_h[h].append({c: getattr(breakdown, c)[h] for c in _COMPONENTS})
                 counts = compute_confusion_counts(pred_heads, y, x)
@@ -997,7 +1391,14 @@ def train(
                                 pair_loss = pair_loss + (per_ex_loss * mask_f).sum() / denom
                             pair_losses.append(float(pair_loss.item()))
 
+                        if has_crossing_data:
+                            aux.add_crossing(*_crossing_head_loss(
+                                model, latent, crossing_pos_val, horizon_bundle_val["crossing_dt"][h_idx],
+                                horizon_bundle_val["crossing_valid"][h_idx], row_idx, device,
+                            ))
+
         return {
+            "aux": aux.summary(),
             "mean_loss": float(np.mean(losses)) if losses else float("nan"),
             "breakdowns": _mean_breakdown_by_horizon(breakdowns_by_h),
             "oob_counts": oob_counts, "goal_counts": goal_counts,
@@ -1005,6 +1406,132 @@ def train(
             "mean_pair_loss": float(np.mean(pair_losses)) if pair_losses else float("nan"),
             "mean_t0_loss": float(np.mean(t0_losses)) if t0_losses else float("nan"),
         }
+
+    def _log_aux_diagnostics(train_aux: dict, val_aux: dict) -> None:
+        """Shared by the main loop and decoder-only-pretrain -- one log
+        line per ENABLED auxiliary latent head (a disabled head's metrics
+        are all NaN and its line is skipped entirely rather than printing
+        a row of nans every epoch). crossing_pos_dist and the goal-distance
+        MAEs are in normalized position units, so both are also shown in
+        metres via pitch_half_diag_m; crossing_dt_mae is already in
+        seconds."""
+        if has_crossing_data:
+            log.info(
+                f"    crossing_head: train loss={train_aux['crossing_loss']:.4f} "
+                f"pos_dist={train_aux['crossing_pos_dist'] * pitch_half_diag_m:.3f}m "
+                f"dt_mae={train_aux['crossing_dt_mae']:.3f}s | "
+                f"val loss={val_aux['crossing_loss']:.4f} "
+                f"pos_dist={val_aux['crossing_pos_dist'] * pitch_half_diag_m:.3f}m "
+                f"dt_mae={val_aux['crossing_dt_mae']:.3f}s"
+            )
+        if goal_dist_delta_weight != 0.0:
+            log.info(
+                f"    goal_dist_delta_head: train loss={train_aux['goal_dist_delta_loss']:.5f} "
+                f"mae=(left {train_aux['goal_dist_delta_mae_left'] * pitch_half_diag_m:.3f}m, "
+                f"right {train_aux['goal_dist_delta_mae_right'] * pitch_half_diag_m:.3f}m) | "
+                f"val loss={val_aux['goal_dist_delta_loss']:.5f} "
+                f"mae=(left {val_aux['goal_dist_delta_mae_left'] * pitch_half_diag_m:.3f}m, "
+                f"right {val_aux['goal_dist_delta_mae_right'] * pitch_half_diag_m:.3f}m)"
+            )
+        if short_horizon_probe_weight != 0.0:
+            log.info(
+                # RMSE left in NORMALIZED units here (unlike the two heads
+                # above): each probe's 4 outputs mix position and velocity,
+                # which don't share a real-world unit, so a single
+                # metres-scaled number would be actively misleading.
+                f"    short_horizon_probes: train loss={train_aux['short_horizon_probe_loss']:.5f} "
+                f"rmse_norm=(0.2s {train_aux['short_horizon_rmse_0_2s']:.4f}, "
+                f"1.0s {train_aux['short_horizon_rmse_1_0s']:.4f}) | "
+                f"val loss={val_aux['short_horizon_probe_loss']:.5f} "
+                f"rmse_norm=(0.2s {val_aux['short_horizon_rmse_0_2s']:.4f}, "
+                f"1.0s {val_aux['short_horizon_rmse_1_0s']:.4f})"
+            )
+
+    # ------------------------------------------------------------------
+    # PHASE: decoder-only pretraining (optional, own best-val/early-stop,
+    # disabled by default) -- see train_ball_dynamics.py's identical phase.
+    # ------------------------------------------------------------------
+    decoder_only_pretrain_epochs = int(cfg.get("decoder_only_pretrain_epochs", 0))
+    if decoder_only_pretrain_epochs > 0:
+        decoder_only_lr = float(cfg.get("decoder_only_pretrain_lr", lr))
+        freeze_latent = bool(cfg.get("decoder_only_pretrain_freeze_latent", True))
+        do_early_stop_patience = int(cfg.get("decoder_only_early_stop_patience", 0))
+        do_early_stop_min_delta = float(cfg.get("decoder_only_early_stop_min_delta", 1e-6))
+
+        for p in model.encoder.trunk.parameters():
+            p.requires_grad_(False)
+        identity_mask_hook = None
+        # The 4 auxiliary latent heads (crossing_head/goal_dist_delta_head/
+        # short_horizon_head_0_2s/short_horizon_head_1_0s) are included here
+        # regardless of freeze_latent -- they read the latent directly, same
+        # as the decoder does, so there's nothing latent-frozen about
+        # training THEM even when the encoder itself is fully frozen this
+        # phase. Mirrors train_ball_dynamics.py's decoder_only_params, which
+        # includes crossing_head/resting_head/position_head the same way.
+        aux_head_params = (
+            list(model.crossing_head.parameters()) + list(model.goal_dist_delta_head.parameters())
+            + list(model.short_horizon_head_0_2s.parameters()) + list(model.short_horizon_head_1_0s.parameters())
+        )
+        if freeze_latent:
+            for p in model.encoder.out.parameters():
+                p.requires_grad_(False)
+            decoder_only_params = list(model.decoder.parameters()) + aux_head_params
+        else:
+            n_id = N_IDENTITY_SHORTCUT_FIELDS
+            id_mask = torch.ones_like(model.encoder.out.weight)
+            id_mask[:n_id, :] = 0.0
+            identity_mask_hook = model.encoder.out.weight.register_hook(lambda grad: grad * id_mask)
+            decoder_only_params = list(model.decoder.parameters()) + list(model.encoder.out.parameters()) + aux_head_params
+        decoder_only_optimizer_type = str(cfg.get("decoder_only_optimizer_type", "adam")).lower()
+        if decoder_only_optimizer_type == "sgd":
+            decoder_only_sgd_momentum = float(cfg.get("decoder_only_sgd_momentum", 0.9))
+            decoder_only_optimizer = torch.optim.SGD(decoder_only_params, lr=decoder_only_lr, momentum=decoder_only_sgd_momentum)
+        elif decoder_only_optimizer_type == "adam":
+            decoder_only_optimizer = torch.optim.Adam(decoder_only_params, lr=decoder_only_lr)
+        else:
+            raise ValueError(
+                f"Unknown physics_pretrain.player.decoder_only_optimizer_type: {decoder_only_optimizer_type!r} (expected 'adam' or 'sgd')"
+            )
+        log.info(
+            f"Decoder-only pretraining: {decoder_only_pretrain_epochs} epoch(s), lr={decoder_only_lr:.2e}, "
+            f"optimizer={decoder_only_optimizer_type}, freeze_latent={freeze_latent}"
+        )
+
+        best_val_loss_do, best_state_do, patience_ctr_do = float("inf"), None, 0
+        for do_epoch in range(decoder_only_pretrain_epochs):
+            # Reuses the exact same interleaved-epoch/eval-pass functions
+            # the main loop below uses (see their shared definition's
+            # docstring) -- this is what lets crossing_head/goal_dist_
+            # delta_head/the short-horizon probes actually train during
+            # this phase instead of sitting untouched until the main loop,
+            # mirroring train_ball_dynamics.py's identical reuse for
+            # crossing_head/resting_head/position_head.
+            train_res_do = _run_interleaved_train_epoch(decoder_only_optimizer)
+            val_res_do = _run_eval_pass(val_idx) if len(val_idx) > 0 else train_res_do
+            mean_train_loss_do = train_res_do["mean_loss"]
+            mean_val_loss_do = val_res_do["mean_loss"] if len(val_idx) > 0 else float("inf")
+            log.info(f"  decoder-only pretrain epoch {do_epoch + 1}/{decoder_only_pretrain_epochs}: train_loss={mean_train_loss_do:.4f}  val_loss={mean_val_loss_do:.4f}")
+            _log_aux_diagnostics(train_res_do["aux"], val_res_do["aux"])
+
+            if mean_val_loss_do < best_val_loss_do - do_early_stop_min_delta:
+                best_val_loss_do = mean_val_loss_do
+                best_state_do = copy.deepcopy(model.state_dict())
+                patience_ctr_do = 0
+            else:
+                patience_ctr_do += 1
+                if do_early_stop_patience > 0 and patience_ctr_do >= do_early_stop_patience:
+                    log.info(f"  decoder-only pretrain: early stopping after {do_epoch + 1} epochs (patience={do_early_stop_patience})")
+                    break
+        if best_state_do is not None:
+            model.load_state_dict(best_state_do)
+            log.info(f"Decoder-only pretraining: restored best-val weights (val_loss={best_val_loss_do:.4f})")
+
+        if identity_mask_hook is not None:
+            identity_mask_hook.remove()
+        for p in model.encoder.parameters():
+            p.requires_grad_(True)
+        _save_phase_checkpoint("after_decoder_pretrain")
+
 
     early_stop_patience = int(cfg.get("early_stop_patience", 0))
     early_stop_min_delta = float(cfg.get("early_stop_min_delta", 1e-4))
@@ -1014,12 +1541,11 @@ def train(
     best_val_loss = float("inf")
     best_state = None
     patience_ctr = 0
-    stopped_early = False
     n_epochs_run = 0
     prev_val_loss = float("nan")
 
     for epoch in range(epochs):
-        train_res = _run_interleaved_train_epoch()
+        train_res = _run_interleaved_train_epoch(optimizer)
         val_res = _run_eval_pass(val_idx) if len(val_idx) > 0 else train_res
         n_epochs_run += 1
 
@@ -1057,6 +1583,8 @@ def train(
             f"    train_loss_delta (batch-to-batch): mean={loss_delta_stats['mean']:.6f} std={loss_delta_stats['std']:.6f} "
             f"min={loss_delta_stats['min']:.6f} max={loss_delta_stats['max']:.6f}"
         )
+        train_aux, val_aux = train_res["aux"], val_res["aux"]
+        _log_aux_diagnostics(train_aux, val_aux)
         val_loss_delta = float("nan")
         if len(val_idx) > 0:
             # Epoch-over-epoch change in val_loss (negative = improved) --
@@ -1091,6 +1619,9 @@ def train(
                          "train_loss_delta_mean": loss_delta_stats["mean"], "train_loss_delta_std": loss_delta_stats["std"],
                          "train_loss_delta_min": loss_delta_stats["min"], "train_loss_delta_max": loss_delta_stats["max"],
                          "val_loss_delta": val_loss_delta}
+        for k in _AUX_METRIC_KEYS:
+            epoch_record[f"train_{k}"] = train_aux[k]
+            epoch_record[f"val_{k}"] = val_aux[k]
         for c in _COMPONENTS:
             epoch_record[f"train_{c}"] = train_res["breakdowns"][c]
             epoch_record[f"val_{c}"] = val_res["breakdowns"][c]
@@ -1107,19 +1638,28 @@ def train(
 
         if improved:
             best_val_loss = val_loss
+            # Captured unconditionally (not gated behind early_stop_enabled)
+            # -- matches this file's own autoencode/decoder-only phases,
+            # which always track+restore best-val weights regardless of
+            # whether their own early-stop patience is on. Leaving this
+            # gated meant early_stop_patience=0 silently kept whatever the
+            # LAST epoch happened to be instead of the best-val one, with
+            # no cutoff to warn you epoch count and generalization had
+            # diverged -- turning off the early CUTOFF shouldn't also turn
+            # off restoring the best weights found along the way.
+            best_state = copy.deepcopy(model.state_dict())
             if early_stop_enabled:
-                best_state = copy.deepcopy(model.state_dict())
                 patience_ctr = 0
             _save_phase_checkpoint("midtrain_latest")
         elif early_stop_enabled:
             patience_ctr += 1
             if patience_ctr >= early_stop_patience:
                 log.info(f"Early stopping after {epoch + 1} epochs (patience={early_stop_patience})")
-                stopped_early = True
                 break
 
-    if stopped_early and best_state is not None:
+    if best_state is not None:
         model.load_state_dict(best_state)
+        log.info(f"Restored best-val weights (val_loss={best_val_loss:.4f})")
     _save_phase_checkpoint("after_training")
 
     # ------------------------------------------------------------------
@@ -1180,6 +1720,13 @@ def train(
         "horizons_s": np.array(cfg["horizons_s"]),
         "pitch_half_diag_m": np.array(pitch_half_diag_m),
     }
+    # Auxiliary latent-head metrics: one scalar per epoch each (unlike the
+    # per-horizon _COMPONENTS below, which stack into (n_epochs, n_horizons)
+    # arrays) -- these heads are not horizon-conditioned. NaN for a disabled
+    # head, carried through as-is.
+    for k in _AUX_METRIC_KEYS:
+        for split in ("train", "val"):
+            history_arrays[f"{split}_{k}"] = np.array([h[f"{split}_{k}"] for h in history])
     stacked_keys = [f"{split}_{c}" for c in _COMPONENTS for split in ("train", "val")]
     stacked_keys += [f"{split}_r2_{g}" for g in GROUPS for split in ("train", "val")]
     stacked_keys += [f"{split}_pctd_{g}" for g in GROUPS for split in ("train", "val")]
@@ -1283,7 +1830,7 @@ def main() -> None:
     from footballcoach.ai.config import load_ai_config
     cfg = load_ai_config()["physics_pretrain"]["player"]
 
-    logging.basicConfig(level=logging.INFO, format="%(message)s")
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     parser = argparse.ArgumentParser(description="Train the player-dynamics encoder.")
     parser.add_argument("--dataset", required=True)
     parser.add_argument("--output", required=True)

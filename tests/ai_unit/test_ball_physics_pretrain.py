@@ -590,6 +590,33 @@ def test_compute_per_episode_loss_matches_batch_mean_and_identifies_rows():
     assert per_row.mean().item() == pytest.approx(float(total.item()), abs=1e-5)
 
 
+def test_position_head_loss_targets_current_input_position():
+    from footballcoach.ai.physics_pretrain.ball_dynamics_net import BallDynamicsAutoencoder
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import _position_head_loss
+
+    model = BallDynamicsAutoencoder(latent_dim=16, horizons_s=[0.5])
+    x = torch.zeros(4, model.encoder.trunk[0].in_features)
+    x[:, 0] = torch.tensor([0.1, -0.2, 0.3, 0.0])
+    x[:, 1] = torch.tensor([0.4, 0.0, -0.1, 0.2])
+    latent = model.encoder(x)
+
+    with torch.no_grad():
+        pred = model.position_head(latent)
+    loss, pos_dist_mean = _position_head_loss(model, latent, x)
+
+    expected_err = pred - x[:, 0:2]
+    expected_loss = expected_err.pow(2).sum(dim=-1).mean()
+    expected_dist = torch.linalg.norm(expected_err, dim=-1).mean()
+    assert loss.item() == pytest.approx(expected_loss.item(), abs=1e-5)
+    assert pos_dist_mean == pytest.approx(expected_dist.item(), abs=1e-5)
+
+    # Unmasked: every row contributes, unlike crossing/resting head losses.
+    assert loss.requires_grad
+    loss.backward()
+    assert model.position_head.weight.grad is not None
+    assert model.position_head.weight.grad.abs().sum().item() > 0
+
+
 def test_describe_input_row_denormalizes_correctly(gen_params):
     from footballcoach.ai.physics_pretrain.ball_episode_gen import _encode_input
     from footballcoach.ai.physics_pretrain.train_ball_dynamics import describe_input_row
@@ -893,6 +920,152 @@ def test_build_adjacent_pair_data_excludes_resolved_and_reencodes_correctly(tmp_
     assert pair_idx < n_horizons - 1  # sanity: this pair index is actually valid
 
 
+def test_compute_already_out_of_bounds_at_start_mask_matches_sampling_fraction(gen_params, tmp_path):
+    """Roughly out_of_bounds_start_frac of episodes should be flagged, and
+    every flagged row's t=0 position must genuinely be outside the pitch
+    or inside a goal mouth when checked against THIS episode's own
+    (possibly randomized) pitch/goal dims."""
+    generate_dataset(n_episodes=3000, output_dir=tmp_path, seed=21, shard_size=3000, n_workers=1)
+    ds = BallDynamicsDataset.from_directory(tmp_path)
+    mask = ds.compute_already_out_of_bounds_at_start_mask(gen_params)
+
+    assert mask.mean() == pytest.approx(gen_params.out_of_bounds_start_frac, abs=0.02)
+
+    div = math.hypot(gen_params.base_pitch_length_m / 2, gen_params.base_pitch_width_m / 2) \
+        if gen_params.normalize_kinematics_by_base_pitch else None
+    for i in np.nonzero(mask)[0][:50]:
+        row = ds.inputs[i]
+        length_m = row[10] * gen_params.base_pitch_length_m
+        width_m = row[11] * gen_params.base_pitch_width_m
+        goal_w_m = row[12] * gen_params.base_goal_width_m
+        goal_h_m = row[13] * gen_params.base_goal_height_m
+        pitch = Pitch(
+            length_m=length_m, width_m=width_m, goal_width_m=goal_w_m, goal_height_m=goal_h_m,
+            goal_depth_m=2.0, box_length_m=16.5, box_width_m=40.32,
+            six_yard_length_m=5.5, six_yard_width_m=18.32,
+            penalty_spot_distance_m=11.0, centre_circle_radius_m=9.15,
+        )
+        if div is None:
+            div_x, div_y, div_z = length_m / 2, width_m / 2, gen_params.height_norm_m
+        else:
+            div_x = div_y = div_z = div
+        pos = Vector3(row[0] * div_x, row[1] * div_y, row[2] * div_z)
+        assert (not pitch.is_in_bounds(pos)) or (pitch.is_goal(pos) is not None)
+
+
+def test_compute_event_ever_masks_matches_manual_oob_and_goal_scan(gen_params, tmp_path):
+    """ever_oob/ever_goal must each be True wherever EITHER the episode
+    already started oob/in-goal OR any recorded horizon's own (raw,
+    un-latched) target flag (column 9 for oob, 10 for goal) is set -- a
+    plain manual OR-scan over ds.targets, independent of crossings/
+    crossing_times."""
+    generate_dataset(n_episodes=1500, output_dir=tmp_path, seed=37, shard_size=1500, n_workers=1)
+    ds = BallDynamicsDataset.from_directory(tmp_path)
+
+    ever_oob, ever_goal = ds.compute_event_ever_masks(gen_params)
+    already_oob_or_goal = ds.compute_already_out_of_bounds_at_start_mask(gen_params)
+
+    n_horizons = ds.targets.shape[1] // N_TARGET_FIELDS_PER_HORIZON
+    targets_by_h = ds.targets.reshape(len(ds), n_horizons, N_TARGET_FIELDS_PER_HORIZON)
+    # Every already-flagged-either-way (at t=0) row must be covered by at
+    # least one of ever_oob/ever_goal.
+    assert np.all(already_oob_or_goal <= (ever_oob | ever_goal))
+
+    manual_oob_ever = (targets_by_h[:, :, 9] >= 0.5).any(axis=1)
+    manual_goal_ever = (targets_by_h[:, :, 10] >= 0.5).any(axis=1)
+    # ever_oob/ever_goal must be a superset of the pure horizon-scan (the
+    # already-at-t=0 case can only ADD more True rows, never remove any).
+    assert np.all(manual_oob_ever <= ever_oob)
+    assert np.all(manual_goal_ever <= ever_goal)
+    # And every ever_oob/ever_goal row must be explained by one of the two
+    # sources (horizon scan OR already-at-start) -- no unexplained True.
+    already_oob, already_goal = ds._already_oob_and_goal_at_start(gen_params, np.arange(len(ds)))
+    assert np.array_equal(ever_oob, manual_oob_ever | already_oob)
+    assert np.array_equal(ever_goal, manual_goal_ever | already_goal)
+
+
+def test_event_head_loss_matches_manual_bce():
+    from footballcoach.ai.physics_pretrain.ball_dynamics_net import BallDynamicsAutoencoder
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import _event_head_loss
+
+    model = BallDynamicsAutoencoder(latent_dim=16, horizons_s=[0.5])
+    x = torch.zeros(5, model.encoder.trunk[0].in_features)
+    latent = model.encoder(x)
+    ever_oob = np.array([True, False, True, False, True])
+    ever_goal = np.array([False, False, True, True, False])
+    row_idx = np.array([0, 1, 2, 3, 4])
+
+    loss, oob_acc, goal_acc = _event_head_loss(model, latent, ever_oob, ever_goal, row_idx, torch.device("cpu"))
+
+    with torch.no_grad():
+        pred = model.event_head(latent)
+    oob_t = torch.from_numpy(ever_oob.astype(np.float32))
+    goal_t = torch.from_numpy(ever_goal.astype(np.float32))
+    expected = F.binary_cross_entropy_with_logits(pred[:, 0], oob_t) + F.binary_cross_entropy_with_logits(pred[:, 1], goal_t)
+    assert loss.item() == pytest.approx(expected.item(), abs=1e-5)
+    assert 0.0 <= oob_acc <= 1.0
+    assert 0.0 <= goal_acc <= 1.0
+
+    assert loss.requires_grad
+    loss.backward()
+    assert model.event_head.weight.grad is not None
+    assert model.event_head.weight.grad.abs().sum().item() > 0
+
+
+def test_train_excludes_already_out_of_bounds_starts_from_crossing_supervision(tmp_path, monkeypatch):
+    """train() must AND compute_already_out_of_bounds_at_start_mask into
+    ds.crossing_mask and force those rows' crossing_dt to the -1 sentinel
+    -- i.e. after setup, no already-out-of-bounds-at-start row should still
+    have crossing_mask=True."""
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
+    from footballcoach.ai.physics_pretrain.ball_dataset import BallDynamicsDataset
+    import footballcoach.ai.config as ai_config_mod
+
+    orig_load_ai_config = ai_config_mod.load_ai_config
+
+    def _patched():
+        cfg = orig_load_ai_config()
+        # This test isn't checking optimizer-type behaviour -- force known-
+        # good values regardless of the live config (see test_train_smoke's
+        # identical rationale).
+        cfg["physics_pretrain"]["ball"]["optimizer_type"] = "adam"
+        cfg["physics_pretrain"]["ball"]["autoencode_optimizer_type"] = "adam"
+        cfg["physics_pretrain"]["ball"]["decoder_only_optimizer_type"] = "adam"
+        return cfg
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _patched)
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=2000, output_dir=dataset_dir, seed=13, shard_size=2000, n_workers=1)
+
+    # Monkeypatch BallDynamicsDataset.from_directory to capture the `ds`
+    # object train() actually builds/mutates, so we can inspect it after
+    # the (short) run completes.
+    captured = {}
+    orig_from_directory = BallDynamicsDataset.from_directory.__func__
+
+    def _patched(cls, *a, **kw):
+        ds = orig_from_directory(cls, *a, **kw)
+        captured["ds"] = ds
+        return ds
+
+    monkeypatch.setattr(BallDynamicsDataset, "from_directory", classmethod(_patched))
+
+    output_path = tmp_path / "ball_encoder.pt"
+    train(
+        dataset_dir=str(dataset_dir), output_path=str(output_path),
+        epochs=1, batch_size=64, lr=1e-2, val_frac=0.2, seed=0,
+    )
+
+    ds = captured["ds"]
+    from footballcoach.ai.config import load_ai_config
+    from footballcoach.ai.physics_pretrain.ball_episode_gen import BallEpisodeGenParams
+    gen_params = BallEpisodeGenParams.from_config()
+    already_oob = ds.compute_already_out_of_bounds_at_start_mask(gen_params)
+    assert not np.any(ds.crossing_mask[already_oob])
+    assert np.all(ds.crossing_dt[already_oob] == -1.0)
+
+
 def test_build_autoencoding_data_no_filtering_and_reencodes_correctly(tmp_path):
     generate_dataset(n_episodes=60, output_dir=tmp_path, seed=12, shard_size=60, n_workers=1)
     ds = BallDynamicsDataset.from_directory(tmp_path)
@@ -1015,6 +1188,11 @@ def test_train_smoke_with_decoder_only_pretraining(tmp_path, monkeypatch, caplog
         # This test specifically checks the encoder.out-trainable log
         # message -- force the flag regardless of the live config's value.
         cfg["physics_pretrain"]["ball"]["decoder_only_pretrain_freeze_latent"] = False
+        # Not checking optimizer-type behaviour -- force known-good values
+        # regardless of the live config (see test_train_smoke).
+        cfg["physics_pretrain"]["ball"]["optimizer_type"] = "adam"
+        cfg["physics_pretrain"]["ball"]["autoencode_optimizer_type"] = "adam"
+        cfg["physics_pretrain"]["ball"]["decoder_only_optimizer_type"] = "adam"
         return cfg
 
     monkeypatch.setattr(ai_config_mod, "load_ai_config", _patched)
@@ -1050,6 +1228,11 @@ def test_train_smoke_with_decoder_only_pretrain_freeze_latent(tmp_path, monkeypa
         cfg = orig_load_ai_config()
         cfg["physics_pretrain"]["ball"]["decoder_only_pretrain_epochs"] = 1
         cfg["physics_pretrain"]["ball"]["decoder_only_pretrain_freeze_latent"] = True
+        # Not checking optimizer-type behaviour -- force known-good values
+        # regardless of the live config (see test_train_smoke).
+        cfg["physics_pretrain"]["ball"]["optimizer_type"] = "adam"
+        cfg["physics_pretrain"]["ball"]["autoencode_optimizer_type"] = "adam"
+        cfg["physics_pretrain"]["ball"]["decoder_only_optimizer_type"] = "adam"
         return cfg
 
     monkeypatch.setattr(ai_config_mod, "load_ai_config", _patched)
@@ -1151,11 +1334,15 @@ def test_train_auto_widens_init_checkpoint_on_dim_mismatch(tmp_path, monkeypatch
         cfg = orig_load_ai_config()
         pp = cfg["physics_pretrain"]["ball"]
         pp["hidden_dim"], pp["encoder_bottleneck_dim"], pp["latent_dim"], pp["decoder_hidden_dim"] = 24, 12, 16, 10
+        # Not checking optimizer-type behaviour -- force known-good values
+        # regardless of the live config (see test_train_smoke).
+        pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "adam"
         return cfg
 
     def _bigger_cfg():
         cfg = orig_load_ai_config()
         pp = cfg["physics_pretrain"]["ball"]
+        pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "adam"
         pp["hidden_dim"], pp["encoder_bottleneck_dim"], pp["latent_dim"], pp["decoder_hidden_dim"] = 40, 20, 24, 18
         return cfg
 
@@ -1276,8 +1463,24 @@ def test_iterate_minibatches_covers_all_rows(tmp_path):
 # Training script smoke test
 # ---------------------------------------------------------------------------
 
-def test_train_smoke(tmp_path, caplog):
+def test_train_smoke(tmp_path, caplog, monkeypatch):
     from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
+    import footballcoach.ai.config as ai_config_mod
+
+    orig_load_ai_config = ai_config_mod.load_ai_config
+
+    def _patched():
+        cfg = orig_load_ai_config()
+        # This test isn't checking optimizer-type behaviour -- force known-
+        # good values regardless of the live config, so it stays independent
+        # of whatever's currently set there (see test_train_rejects_unknown_
+        # optimizer_type for the dedicated rejection-path coverage).
+        cfg["physics_pretrain"]["ball"]["optimizer_type"] = "adam"
+        cfg["physics_pretrain"]["ball"]["autoencode_optimizer_type"] = "adam"
+        cfg["physics_pretrain"]["ball"]["decoder_only_optimizer_type"] = "adam"
+        return cfg
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _patched)
 
     dataset_dir = tmp_path / "data"
     generate_dataset(n_episodes=80, output_dir=dataset_dir, seed=5, shard_size=80, n_workers=1)
@@ -1456,6 +1659,75 @@ def test_widen_model_reproduces_old_model_exactly_single_dim():
     new_model = _build_model(new_cfg)
     widen_model_(old_model, new_model, old_cfg, new_cfg)
     verify_widened_model(old_model, new_model, torch.randn(16, N_INPUT_FIELDS) * 0.3)
+
+
+def test_widen_model_new_latent_rows_are_not_dead_under_identity_shortcut():
+    """Regression test: encoder.out's NEW latent rows must not be left at
+    exact zero when identity_shortcut_enabled -- _init_identity_shortcut_
+    linear zeros the WHOLE weight/bias before hand-setting only the
+    identity block, so a fresh model's "spare" rows (which is exactly what
+    a new latent row is) start at zero too. Combined with this module also
+    zeroing the CONSUMING side's new columns (crossing_head/resting_head/
+    decoder.net[0] reading the new latent dims), both ends of that seam
+    would land on zero simultaneously with nothing to bootstrap gradient
+    from -- a real bug caught by inspecting an actual trained checkpoint,
+    where the new latent dims were still exactly zero after many epochs of
+    further training. Every one of the new latent rows/consuming columns
+    must be genuinely alive (nonzero) right after widening."""
+    from footballcoach.ai.physics_pretrain.widen_ball_checkpoint import _build_model, verify_widened_model, widen_model_
+
+    old_cfg = _widen_test_cfg()  # identity_shortcut_enabled=True, old latent_dim=16 (> the 9-field identity block)
+    new_cfg = dict(old_cfg, latent_dim=20)
+    old_model = _build_model(old_cfg)
+    _perturb(old_model)
+    new_model = _build_model(new_cfg)
+    widen_model_(old_model, new_model, old_cfg, new_cfg)
+    verify_widened_model(old_model, new_model, torch.randn(16, N_INPUT_FIELDS) * 0.3)
+
+    new_rows = new_model.encoder.out.weight.data[16:20, :]
+    new_bias = new_model.encoder.out.bias.data[16:20]
+    assert new_rows.abs().sum().item() > 0, "encoder.out's new latent rows are dead (all-zero weight)"
+    assert new_bias.abs().sum().item() > 0, "encoder.out's new latent rows are dead (all-zero bias)"
+
+
+def test_repair_dead_encoder_out_rows(tmp_path):
+    from footballcoach.ai.physics_pretrain.widen_ball_checkpoint import _build_model, repair_dead_encoder_out_rows
+
+    cfg = _widen_test_cfg(latent_dim=20)
+    model = _build_model(cfg)
+    _perturb(model)
+    with torch.no_grad():
+        model.encoder.out.weight.data[16:20, :] = 0.0
+        model.encoder.out.bias.data[16:20] = 0.0
+    ckpt_path = tmp_path / "dead.pt"
+    torch.save({"model_state_dict": model.state_dict(), "config_snapshot": cfg}, ckpt_path)
+
+    out_path = tmp_path / "repaired.pt"
+    repair_dead_encoder_out_rows(ckpt_path, out_path, row_start=16, row_end=20)
+
+    repaired = torch.load(out_path, map_location="cpu")
+    w = repaired["model_state_dict"]["encoder.out.weight"][16:20, :]
+    b = repaired["model_state_dict"]["encoder.out.bias"][16:20]
+    assert w.abs().sum().item() > 0
+    assert b.abs().sum().item() > 0
+    # everything else must be untouched
+    assert torch.equal(repaired["model_state_dict"]["encoder.out.weight"][:16, :], model.encoder.out.weight.data[:16, :])
+    assert torch.equal(repaired["model_state_dict"]["encoder.trunk.0.weight"], model.encoder.trunk[0].weight.data)
+    # encoder_state_dict stays consistent with model_state_dict
+    assert torch.equal(repaired["encoder_state_dict"]["out.weight"], repaired["model_state_dict"]["encoder.out.weight"])
+
+
+def test_repair_dead_encoder_out_rows_refuses_nonzero_rows(tmp_path):
+    from footballcoach.ai.physics_pretrain.widen_ball_checkpoint import _build_model, repair_dead_encoder_out_rows
+
+    cfg = _widen_test_cfg(latent_dim=20)
+    model = _build_model(cfg)
+    _perturb(model)  # rows [16:20) are NOT all-zero
+    ckpt_path = tmp_path / "not_dead.pt"
+    torch.save({"model_state_dict": model.state_dict(), "config_snapshot": cfg}, ckpt_path)
+
+    with pytest.raises(ValueError, match="aren't all-zero"):
+        repair_dead_encoder_out_rows(ckpt_path, tmp_path / "out.pt", row_start=16, row_end=20)
 
 
 def test_widen_checkpoint_rejects_shrinking():

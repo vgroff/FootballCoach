@@ -12,10 +12,19 @@ pretraining.
 Directly mirrors ``ball_dataset.py`` (agent_plans/ball_physics_pretrain_plan.md
 section 4.4) -- append-by-default/randomly-seeded-by-default shard
 generation, ``ProgressReporter``-driven progress, the same ``.npz`` shard
-convention. Simpler than the ball version in one respect: there's no
-freeze-on-event rule for player episodes (see player_episode_gen.py's module
-docstring), so there's no ``crossings``/``crossing_times`` side-channel to
-carry alongside ``inputs``/``targets``.
+convention, including the ``crossings``/``crossing_times`` side-channel that
+supervises ``PlayerDynamicsAutoencoder.crossing_head``. Unlike the ball
+version, that side-channel is NOT also used to reconstruct freeze-on-event
+semantics (the player pipeline has no freeze rule at all -- see
+player_episode_gen.py's module docstring), so there is no
+``targets_with_freeze_semantics`` equivalent here.
+
+``crossings``/``crossing_times`` are REQUIRED fields of every ``.npz``
+shard -- there is deliberately no optional/backward-compat path for shards
+generated before they existed. This pipeline's established convention on a
+dataset schema change is "delete and regenerate", not "tolerate both
+shapes"; a silently-half-supervised head would be far more expensive to
+notice than a loud ``KeyError`` on a stale shard.
 """
 from __future__ import annotations
 
@@ -49,10 +58,10 @@ log = logging.getLogger("footballcoach.ai.physics_pretrain.player_dataset")
 GROUPS = {"pos": (0, 2), "vel": (2, 4), "heading": (4, 6), "stamina": (6, 7)}
 
 
-def _generate_shard_worker(args: tuple[int, int, int]) -> tuple[int, np.ndarray, np.ndarray]:
+def _generate_shard_worker(args: tuple[int, int, int]) -> tuple[int, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     local_idx, n_episodes, seed = args
-    inputs, targets = generate_shard(n_episodes, seed, PlayerEpisodeGenParams.from_config())
-    return local_idx, inputs, targets
+    inputs, targets, crossings, crossing_times = generate_shard(n_episodes, seed, PlayerEpisodeGenParams.from_config())
+    return local_idx, inputs, targets, crossings, crossing_times
 
 
 def generate_dataset(
@@ -99,22 +108,24 @@ def generate_dataset(
     paths_by_idx: dict[int, Path] = {}
     completed_episodes = 0
 
-    def _write_shard(local_idx: int, inputs: np.ndarray, targets: np.ndarray) -> None:
+    def _write_shard(
+        local_idx: int, inputs: np.ndarray, targets: np.ndarray, crossings: np.ndarray, crossing_times: np.ndarray,
+    ) -> None:
         nonlocal completed_episodes
         path = output_dir / f"shard_{start_idx + local_idx:05d}.npz"
-        np.savez_compressed(path, inputs=inputs, targets=targets)
+        np.savez_compressed(path, inputs=inputs, targets=targets, crossings=crossings, crossing_times=crossing_times)
         paths_by_idx[local_idx] = path
         completed_episodes += len(inputs)
         progress.update(completed_episodes)
 
     if n_workers > 1:
         with mp.Pool(n_workers) as pool:
-            for local_idx, inputs, targets in pool.imap_unordered(_generate_shard_worker, shard_specs):
-                _write_shard(local_idx, inputs, targets)
+            for local_idx, inputs, targets, crossings, crossing_times in pool.imap_unordered(_generate_shard_worker, shard_specs):
+                _write_shard(local_idx, inputs, targets, crossings, crossing_times)
     else:
         for spec in shard_specs:
-            local_idx, inputs, targets = _generate_shard_worker(spec)
-            _write_shard(local_idx, inputs, targets)
+            local_idx, inputs, targets, crossings, crossing_times = _generate_shard_worker(spec)
+            _write_shard(local_idx, inputs, targets, crossings, crossing_times)
 
     progress.finish(completed_episodes)
     paths = [paths_by_idx[i] for i in range(n_shards)]
@@ -129,15 +140,56 @@ class PlayerDynamicsDataset:
     ``inputs``: ``(N, 24)`` float32, ``targets``: ``(N, n_horizons*9)``
     float32 -- see player_episode_gen.py's ``N_INPUT_FIELDS``/``N_TARGET_
     FIELDS_PER_HORIZON``. Directly mirrors ``BallDynamicsDataset``, minus
-    the ``crossings``/``crossing_times`` side-channel (no freeze-on-event
-    rule here -- see the module docstring).
+    ``targets_with_freeze_semantics`` (no freeze-on-event rule here -- see
+    the module docstring).
+
+    ``crossings``/``crossing_times``: ``(N, 9)``/``(N,)``, the full state at
+    the moment out_of_bounds/goal_scored FIRST became true and when -- always
+    present on a dataset loaded via ``from_directory`` (a required ``.npz``
+    field), and optional here only so callers that build a dataset BY HAND
+    (e.g. a unit test that doesn't care about the crossing head) can pass
+    ``None`` -- same convention as ``BallDynamicsDataset``.
+
+    ``crossing_pos``/``crossing_dt``/``crossing_mask`` (derived from the two
+    above, ``None`` iff those are ``None``): the ready-to-train targets for
+    ``PlayerDynamicsAutoencoder.crossing_head``. ``crossing_pos`` is
+    ``crossings[:, 0:2]`` (the normalized pos_x/pos_y at the crossing -- a
+    player has no height axis, so unlike the ball's there's nothing to
+    exclude here); ``crossing_mask`` is ``True`` where ``crossing_times`` is
+    finite (this episode actually crossed within the simulated window AND
+    wasn't excluded for starting already out of bounds -- see
+    ``player_episode_gen.generate_episode``'s docstring) and ``False`` where
+    it's ``inf``; ``crossing_dt`` is ``crossing_times`` with those ``inf``
+    entries replaced by ``-1.0``. Callers mask the POSITION loss by
+    ``crossing_mask`` (a never-crossed/excluded episode has no meaningful
+    crossing position to regress toward) but train the DELTA_T loss unmasked
+    against the ``-1`` sentinel, so the head itself learns to predict "no
+    crossing" rather than relying on a separate classifier -- identical
+    convention to ``BallDynamicsDataset``'s.
     """
 
-    def __init__(self, inputs: np.ndarray, targets: np.ndarray):
+    def __init__(
+        self, inputs: np.ndarray, targets: np.ndarray,
+        crossings: np.ndarray | None = None, crossing_times: np.ndarray | None = None,
+    ):
         if len(inputs) != len(targets):
             raise ValueError(f"inputs/targets length mismatch: {len(inputs)} vs {len(targets)}")
+        if crossings is not None and len(crossings) != len(inputs):
+            raise ValueError(f"inputs/crossings length mismatch: {len(inputs)} vs {len(crossings)}")
+        if crossing_times is not None and len(crossing_times) != len(inputs):
+            raise ValueError(f"inputs/crossing_times length mismatch: {len(inputs)} vs {len(crossing_times)}")
         self.inputs = inputs
         self.targets = targets
+        self.crossings = crossings
+        self.crossing_times = crossing_times
+        if crossings is not None and crossing_times is not None:
+            self.crossing_pos = crossings[:, 0:2].astype(np.float32, copy=False)
+            self.crossing_mask = np.isfinite(crossing_times)
+            self.crossing_dt = np.where(self.crossing_mask, crossing_times, -1.0).astype(np.float32)
+        else:
+            self.crossing_pos = None
+            self.crossing_mask = None
+            self.crossing_dt = None
 
     def __len__(self) -> int:
         return len(self.inputs)
@@ -147,13 +199,20 @@ class PlayerDynamicsDataset:
         paths = sorted(Path(directory).glob(pattern))
         if not paths:
             raise FileNotFoundError(f"No .npz shards found in {directory}")
-        inputs_parts, targets_parts = [], []
+        inputs_parts, targets_parts, crossings_parts, crossing_times_parts = [], [], [], []
         for p in paths:
             data = np.load(p)
             inputs_parts.append(data["inputs"])
             targets_parts.append(data["targets"])
+            # Required fields -- a stale shard predating them raises KeyError
+            # here on purpose. See the module docstring.
+            crossings_parts.append(data["crossings"])
+            crossing_times_parts.append(data["crossing_times"])
         log.info(f"Loaded {len(paths)} shard(s) from {directory}")
-        return cls(np.concatenate(inputs_parts), np.concatenate(targets_parts))
+        return cls(
+            np.concatenate(inputs_parts), np.concatenate(targets_parts),
+            np.concatenate(crossings_parts), np.concatenate(crossing_times_parts),
+        )
 
     def split_train_val(self, val_frac: float = 0.15, seed: int = 0) -> tuple[np.ndarray, np.ndarray]:
         """Random train/val row-index split -- see
@@ -260,12 +319,12 @@ class PlayerDynamicsDataset:
         The non-identity context fields (attributes, has_possession,
         desired_direction, speed_mode, pitch/goal dims -- input columns
         7:21) are copied UNCHANGED from the ORIGINAL episode's t=0 input
-        row, since a mid-trajectory recorded state carries no record of
-        "what the intent was at that instant" beyond the identity fields
-        themselves (intent is resampled at every horizon boundary in the
-        underlying simulation, not part of the recorded per-horizon state)
-        -- a deliberate simplification, see
-        agent_plans/player_physics_pretrain_plan.md for the full discussion.
+        row. This is now EXACT, not an approximation: intent
+        (desired_direction/speed_mode) is drawn once per episode and held
+        FIXED for its entire duration (see player_episode_gen.
+        generate_episode's docstring), so whatever it was at t=0 is still
+        exactly what it is at horizon ``pair_idx`` too -- there is nothing
+        to lose by copying it forward.
         """
         idx = indices if indices is not None else np.arange(len(self))
         base_i = pair_idx * N_TARGET_FIELDS_PER_HORIZON
@@ -333,7 +392,7 @@ def _main() -> None:
     parser = argparse.ArgumentParser(description="Generate the player-dynamics pretraining dataset.")
     parser.add_argument("--output", required=True, help="Output directory for .npz shards.")
     parser.add_argument("--n-episodes", type=int, default=cfg["n_episodes"])
-    parser.add_argument("--shard-size", type=int, default=10_000)
+    parser.add_argument("--shard-size", type=int, default=1_000)
     parser.add_argument("--seed", type=int, default=None, help="Omit for a fresh random seed each run (recommended).")
     parser.add_argument("--n-workers", type=int, default=1)
     args = parser.parse_args()

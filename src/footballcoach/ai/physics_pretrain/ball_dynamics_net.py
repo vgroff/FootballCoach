@@ -275,6 +275,35 @@ class BallDynamicsAutoencoder(nn.Module):
     crosses a boundary -- see ``BallDynamicsDataset.compute_resting_
     targets``. Controlled by ``physics_pretrain.ball.resting_loss_weight``,
     same convention as ``crossing_loss_weight``.
+
+    ``position_head``: same shape/idea again (``Linear(latent_dim, 2)``, no
+    hidden layer, off the latent) but predicts the ball's CURRENT (t=0 of
+    whichever pseudo-start the latent was encoded from) ``pos_x, pos_y`` --
+    unlike ``crossing_head``/``resting_head`` there's no mask and no
+    separate recorded target: the target is simply the model's own input
+    fields 0:2, so this head is a cheap probe of how well the latent
+    retains the position it was literally given, always fully defined.
+    Controlled by ``physics_pretrain.ball.position_loss_weight``, same
+    0.0-disables convention as the other two heads.
+
+    ``event_head``: ``Linear(latent_dim, 2)``, no hidden layer, off the
+    latent, NO horizon/time conditioning at all (unlike the shared
+    decoder's own per-horizon oob/goal BCE heads, which take a horizon as
+    input and predict the INSTANTANEOUS flag at that specific time) --
+    predicts, as of t=0, whether the episode EVER goes out of bounds
+    (logit 0) / EVER scores a goal (logit 1) across the whole recorded
+    window, including "already true at t=0" -- see
+    ``BallDynamicsDataset.compute_event_ever_masks``. Entirely separate
+    ``nn.Linear`` parameters from the decoder's own oob/goal heads (own
+    weights, own gradient, never shares a layer with them) despite
+    predicting a related quantity -- this head asks "will/does it happen
+    at all," the decoder's asks "is it true AT THIS TIME." Controlled by
+    ``physics_pretrain.ball.event_loss_weight``, same 0.0-disables
+    convention as the other auxiliary heads. Trained ONLY on t=0 (the
+    "main" pass) -- unlike crossing_head/resting_head/position_head, it is
+    NOT also applied at every recorded horizon as a pseudo-start, since
+    "ever, from here to the end of the recorded window" is only a
+    well-defined quantity relative to the ORIGINAL episode's own t=0.
     """
 
     def __init__(
@@ -312,6 +341,8 @@ class BallDynamicsAutoencoder(nn.Module):
         )
         self.crossing_head = nn.Linear(latent_dim, 3)
         self.resting_head = nn.Linear(latent_dim, 2)
+        self.position_head = nn.Linear(latent_dim, 2)
+        self.event_head = nn.Linear(latent_dim, 2)
 
     def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, list[torch.Tensor]]:
         latent = self.encoder(x)

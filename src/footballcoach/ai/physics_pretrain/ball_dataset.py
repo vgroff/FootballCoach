@@ -433,6 +433,109 @@ class BallDynamicsDataset:
             out["spin"][h] = ((targets[:, base + 6:base + 9] - inputs[:, 6:9]) ** 2).mean()
         return out
 
+    def _already_oob_and_goal_at_start(
+        self, gen_params: BallEpisodeGenParams, idx: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Shared real-unit recovery behind ``compute_already_out_of_bounds_
+        at_start_mask`` and ``compute_event_ever_masks`` -- returns the two
+        boolean ``(len(idx),)`` components SEPARATELY (``already out of
+        bounds``, ``already in a goal mouth``) rather than pre-OR'd, so
+        callers needing them apart (event_head's separate oob/goal targets)
+        don't have to re-derive real-unit position/pitch dims a second time.
+        """
+        inputs = self.inputs[idx]
+
+        half_length_ep = inputs[:, 10] * gen_params.base_pitch_length_m / 2
+        half_width_ep = inputs[:, 11] * gen_params.base_pitch_width_m / 2
+        goal_width_ep = inputs[:, 12] * gen_params.base_goal_width_m
+        goal_height_ep = inputs[:, 13] * gen_params.base_goal_height_m
+
+        if gen_params.normalize_kinematics_by_base_pitch:
+            base_half_length = gen_params.base_pitch_length_m / 2
+            base_half_width = gen_params.base_pitch_width_m / 2
+            div_x = div_y = div_z = math.hypot(base_half_length, base_half_width)
+        else:
+            div_x, div_y, div_z = half_length_ep, half_width_ep, gen_params.height_norm_m
+
+        pos_x = inputs[:, 0] * div_x
+        pos_y = inputs[:, 1] * div_y
+        pos_z = inputs[:, 2] * div_z
+
+        in_bounds = (np.abs(pos_x) <= half_length_ep) & (np.abs(pos_y) <= half_width_ep)
+        in_goal_mouth = (
+            (np.abs(pos_y) <= goal_width_ep / 2) & (pos_z <= goal_height_ep)
+            & ((pos_x <= -half_length_ep) | (pos_x >= half_length_ep))
+        )
+        return ~in_bounds, in_goal_mouth
+
+    def compute_already_out_of_bounds_at_start_mask(
+        self, gen_params: BallEpisodeGenParams, indices: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Returns a boolean ``(len(indices),)`` mask, ``True`` where this
+        episode's OWN raw t=0 ``self.inputs`` row was already out of the
+        pitch bounds or already inside a goal mouth BEFORE any physics ran
+        -- i.e. it came from ``ball_episode_gen.py``'s ``_sample_position_
+        already_special`` branch (``physics_pretrain.ball.out_of_bounds_
+        start_frac``). Reconstructed from stored input fields (position 0-2,
+        this episode's own pitch/goal dims as a ratio-to-base in fields
+        10-13) via the same real-unit recovery ``compute_ballistic_
+        baseline_mse`` uses, rather than needing a dedicated recorded flag
+        -- no dataset regeneration required, works on any already-generated
+        shard.
+
+        Exists because ``generate_episode``'s crossing-detection loop never
+        checks the raw t=0 position -- ``oob_now``/``goal_now`` only update
+        AFTER the first physics tick (see its docstring) -- so an episode
+        that starts already out of bounds still gets a "real" (small,
+        nonzero) ``crossing_dt``/``crossing_pos`` recorded rather than being
+        treated as having no meaningful crossing to predict. Predicting
+        "crosses almost immediately" purely because the ball was SPAWNED
+        already out of bounds/in a goal mouth is a near-trivial function of
+        the raw input (re-deriving the same in-bounds check the physics
+        engine itself applies), diluting the more informative "will an
+        in-play ball actually go out/score" signal the head exists to
+        predict -- same rationale as ``build_adjacent_pair_data``'s
+        already-resolved-state exclusion. Callers should exclude these rows
+        from ``crossing_mask``/force their ``crossing_dt`` to the ``-1``
+        sentinel, same treatment as "never crosses".
+        """
+        idx = indices if indices is not None else np.arange(len(self))
+        already_oob, already_goal = self._already_oob_and_goal_at_start(gen_params, idx)
+        return already_oob | already_goal
+
+    def compute_event_ever_masks(
+        self, gen_params: BallEpisodeGenParams, indices: np.ndarray | None = None,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Returns two boolean ``(len(indices),)`` masks -- ``(ever_oob,
+        ever_goal)`` -- ``True`` where the episode is out of bounds / has
+        scored a goal AT ANY POINT covered by this dataset row: either
+        already at the raw t=0 input (via ``_already_oob_and_goal_at_
+        start``, same real-unit recovery as ``compute_already_out_of_
+        bounds_at_start_mask``) OR at any RECORDED horizon (``self.targets``
+        columns 9/10, per horizon -- see ``ball_episode_gen.py``'s
+        ``_encode_target``).
+
+        Deliberately NOT derived from ``self.crossings``/``crossing_times``:
+        those only latch state at the FIRST oob/goal event and then stop
+        updating (see ``generate_episode``'s docstring), so an episode that
+        goes out of bounds first and only scores later (or vice versa) would
+        have the SECOND event's flag silently lost if read from ``crossings``
+        alone. Reading oob/goal straight off every recorded horizon's own
+        (un-frozen, un-latched) target flags instead makes each mask a
+        simple "was this flag ever 1 anywhere in this row's data" query,
+        correct regardless of which event happened first or whether the ball
+        later bounced back in/out. Needs no ``crossings``/``crossing_times``
+        at all, so -- like ``compute_resting_targets`` -- there's no
+        has_crossing_data-style guard: always computable from ``inputs``/
+        ``targets`` alone.
+        """
+        idx = indices if indices is not None else np.arange(len(self))
+        already_oob, already_goal = self._already_oob_and_goal_at_start(gen_params, idx)
+        targets = self.targets[idx].reshape(len(idx), -1, N_TARGET_FIELDS_PER_HORIZON)
+        horizon_oob = (targets[:, :, 9] >= 0.5).any(axis=1)
+        horizon_goal = (targets[:, :, 10] >= 0.5).any(axis=1)
+        return already_oob | horizon_oob, already_goal | horizon_goal
+
     def build_adjacent_pair_data(
         self, pair_idx: int, max_skip: int = 1, indices: np.ndarray | None = None,
         min_start_speed_norm: float = 0.0,

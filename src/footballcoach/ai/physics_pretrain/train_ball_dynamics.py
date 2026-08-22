@@ -256,6 +256,63 @@ def _resting_head_loss(
     return loss, pos_dist_mean
 
 
+def _position_head_loss(
+    model: BallDynamicsAutoencoder, latent: torch.Tensor, x: torch.Tensor,
+) -> tuple[torch.Tensor, float]:
+    """``model.position_head``'s loss for one batch -- plain (unmasked) MSE
+    against the CURRENT position, i.e. ``x[:, 0:2]``: the very fields the
+    encoder was just given as input to produce ``latent``. Unlike
+    ``_crossing_head_loss``/``_resting_head_loss`` there's no mask and no
+    separate target array to pass in -- every row has a well-defined
+    current position by construction, so the target is read directly off
+    the same input tensor the caller already has on hand (works
+    identically for the "main" t=0 batch and the "horizon" pseudo-start
+    batches, since ``x`` is each pass's own current-state input either
+    way).
+
+    Returns ``(loss, pos_dist_mean)`` -- the mean Euclidean position error
+    over the whole batch (never masked, unlike crossing/resting).
+    """
+    pred = model.position_head(latent)
+    err = pred - x[:, 0:2]
+    loss = err.pow(2).sum(dim=-1).mean()
+    with torch.no_grad():
+        pos_dist_mean = float(torch.linalg.norm(err, dim=-1).mean().item())
+    return loss, pos_dist_mean
+
+
+def _event_head_loss(
+    model: BallDynamicsAutoencoder, latent: torch.Tensor, ever_oob: np.ndarray, ever_goal: np.ndarray,
+    row_idx: np.ndarray, device: torch.device,
+) -> tuple[torch.Tensor, float, float]:
+    """``model.event_head``'s loss for one batch -- plain (unmasked) BCE,
+    summed, for two INDEPENDENT binary targets: whether the episode EVER
+    goes out of bounds (logit 0) / EVER scores (logit 1) across the whole
+    recorded window, as of t=0 -- see ``BallDynamicsDataset.
+    compute_event_ever_masks``. No time/horizon conditioning (unlike the
+    shared decoder's own per-horizon oob/goal BCE heads) and entirely
+    separate parameters from them -- see ``BallDynamicsAutoencoder.
+    event_head``'s docstring for why the two are kept apart despite
+    predicting a related quantity. Unlike ``_crossing_head_loss``/
+    ``_resting_head_loss`` there's no masking: "does this ever happen" is
+    always a well-defined 0/1 target for every row.
+
+    Returns ``(loss, oob_acc, goal_acc)`` -- the last two are plain floats
+    (not backpropagated), the fraction of this batch's rows where the
+    thresholded (>0) logit matches the target, for per-epoch reporting.
+    """
+    pred = model.event_head(latent)
+    oob_t = torch.from_numpy(ever_oob[row_idx].astype(np.float32, copy=False)).to(device)
+    goal_t = torch.from_numpy(ever_goal[row_idx].astype(np.float32, copy=False)).to(device)
+    oob_loss = F.binary_cross_entropy_with_logits(pred[:, 0], oob_t)
+    goal_loss = F.binary_cross_entropy_with_logits(pred[:, 1], goal_t)
+    loss = oob_loss + goal_loss
+    with torch.no_grad():
+        oob_acc = float(((pred[:, 0] > 0) == (oob_t > 0.5)).float().mean().item())
+        goal_acc = float(((pred[:, 1] > 0) == (goal_t > 0.5)).float().mean().item())
+    return loss, oob_acc, goal_acc
+
+
 def _build_horizon_bundle(
     ds: BallDynamicsDataset, indices: np.ndarray, n_horizons: int, horizons_s: list[float],
     pair_enabled: bool, pair_max_skip: int, pair_min_start_speed_norm: float,
@@ -974,6 +1031,17 @@ def train(
     # the head entirely rather than crashing on a None array.
     crossing_weight = float(cfg.get("crossing_loss_weight", 1.0))
     has_crossing_data = ds.crossing_pos is not None
+    if has_crossing_data:
+        # Episodes that started ALREADY out of bounds/in a goal mouth (see
+        # compute_already_out_of_bounds_at_start_mask's docstring) get a
+        # "crosses almost immediately" crossing_dt/crossing_pos recorded --
+        # a near-trivial function of the raw t=0 input, not the "will an
+        # in-play ball actually go out/score" signal the head exists to
+        # predict. Excluded the same way "never crosses" already is: mask
+        # dropped, delta_t forced to the -1 sentinel.
+        already_oob_at_start = ds.compute_already_out_of_bounds_at_start_mask(gen_params)
+        ds.crossing_mask = ds.crossing_mask & ~already_oob_at_start
+        ds.crossing_dt = np.where(already_oob_at_start, -1.0, ds.crossing_dt).astype(np.float32)
 
     # Weight on model.resting_head's own loss (see BallDynamicsDataset.
     # compute_resting_targets / BallDynamicsAutoencoder.resting_head's
@@ -991,6 +1059,23 @@ def train(
         min_start_speed_norm=resting_min_start_speed_mps / pitch_half_diag_m,
         rest_speed_norm=resting_speed_threshold_mps / pitch_half_diag_m,
     )
+
+    # Weight on model.position_head's own loss (current x/y position,
+    # unmasked -- see BallDynamicsAutoencoder.position_head's docstring).
+    # Same 0.0-disables convention as crossing_weight/resting_weight above.
+    # Unlike either of those, there's no dataset-derived target/mask at
+    # all: the target is always just the batch's own input fields 0:2.
+    position_weight = float(cfg.get("position_loss_weight", 1.0))
+
+    # Weight on model.event_head's own loss (two independent unmasked BCE
+    # terms -- "does the episode EVER go out of bounds", "does it EVER
+    # score" -- see BallDynamicsAutoencoder.event_head's docstring). Same
+    # 0.0-disables convention. t=0 ONLY (no horizon-pass generalization --
+    # see event_head's docstring for why), so ever_oob/ever_goal are
+    # precomputed ONCE here over the full dataset rather than per-horizon
+    # like crossing/resting.
+    event_weight = float(cfg.get("event_loss_weight", 1.0))
+    ever_oob, ever_goal = ds.compute_event_ever_masks(gen_params)
 
     # Per-epoch diagnostic printing skips a component entirely once its
     # weight is 0 -- it's not receiving gradient, so its (raw, unweighted)
@@ -1522,6 +1607,8 @@ def train(
         crossing_dt_maes: list[float] = []
         resting_losses: list[float] = []
         resting_pos_dists: list[float] = []
+        position_losses: list[float] = []
+        position_pos_dists: list[float] = []
 
         with torch.no_grad():
             for h_idx, (ae_inputs, ae_targets) in enumerate(autoencode_data):
@@ -1577,6 +1664,10 @@ def train(
                     resting_losses.append(float(resting_loss_h.item()))
                     resting_pos_dists.append(resting_pos_dist_mean_h)
 
+                    position_loss_h, position_pos_dist_mean_h = _position_head_loss(model, latent, x)
+                    position_losses.append(float(position_loss_h.item()))
+                    position_pos_dists.append(position_pos_dist_mean_h)
+
         return {
             "mean_t0_loss": float(np.mean(losses_t0)) if losses_t0 else float("nan"),
             "t0_means": _mean_breakdown_by_horizon(breakdowns_by_h),
@@ -1588,6 +1679,8 @@ def train(
             "crossing_dt_maes": crossing_dt_maes,
             "resting_losses": resting_losses,
             "resting_pos_dists": resting_pos_dists,
+            "position_losses": position_losses,
+            "position_pos_dists": position_pos_dists,
         }
 
     def _log_t0_diagnostics(label: str, means: dict[str, np.ndarray], r2: dict[str, np.ndarray], cls: dict[str, np.ndarray] | None) -> None:
@@ -1643,6 +1736,11 @@ def train(
         train_crossing_dt_mae: list[float] = []
         train_resting_losses: list[float] = []
         train_resting_pos_dist: list[float] = []
+        train_position_losses: list[float] = []
+        train_position_pos_dist: list[float] = []
+        train_event_losses: list[float] = []
+        train_event_oob_acc: list[float] = []
+        train_event_goal_acc: list[float] = []
         train_backprop_losses: list[float] = []
         train_grad_norms: list[float] = []
         train_sq_err = {g: np.zeros(n_h) for g in _GROUPS}
@@ -1708,6 +1806,21 @@ def train(
                 backprop_loss = backprop_loss + resting_weight * resting_loss
                 train_resting_losses.append(float(resting_loss.item()))
                 train_resting_pos_dist.append(resting_pos_dist_mean)
+                # position_head reuses the SAME `latent`/`x` as everything
+                # else above -- no dataset lookup, no extra encoder call.
+                position_loss, position_pos_dist_mean = _position_head_loss(model, latent, x)
+                backprop_loss = backprop_loss + position_weight * position_loss
+                train_position_losses.append(float(position_loss.item()))
+                train_position_pos_dist.append(position_pos_dist_mean)
+                # event_head is t=0 ONLY -- no horizon-branch counterpart,
+                # see event_head's docstring.
+                event_loss, event_oob_acc, event_goal_acc = _event_head_loss(
+                    model, latent, ever_oob, ever_goal, batch_idx, device,
+                )
+                backprop_loss = backprop_loss + event_weight * event_loss
+                train_event_losses.append(float(event_loss.item()))
+                train_event_oob_acc.append(event_oob_acc)
+                train_event_goal_acc.append(event_goal_acc)
                 optimizer.zero_grad()
                 backprop_loss.backward()
                 # Total gradient norm across every trainable param, BEFORE
@@ -1799,6 +1912,11 @@ def train(
                 train_resting_losses.append(float(resting_loss_h.item()))
                 train_resting_pos_dist.append(resting_pos_dist_mean_h)
 
+                position_loss_h, position_pos_dist_mean_h = _position_head_loss(model, latent, x)
+                combined_loss = combined_loss + position_weight * position_loss_h
+                train_position_losses.append(float(position_loss_h.item()))
+                train_position_pos_dist.append(position_pos_dist_mean_h)
+
                 optimizer.zero_grad()
                 combined_loss.backward()
                 optimizer.step()
@@ -1819,6 +1937,11 @@ def train(
             "crossing_dt_mae": float(np.mean(train_crossing_dt_mae)) if train_crossing_dt_mae else float("nan"),
             "mean_resting_loss": float(np.mean(train_resting_losses)) if train_resting_losses else float("nan"),
             "resting_pos_dist": float(np.mean(train_resting_pos_dist)) if train_resting_pos_dist else float("nan"),
+            "mean_position_loss": float(np.mean(train_position_losses)) if train_position_losses else float("nan"),
+            "position_pos_dist": float(np.mean(train_position_pos_dist)) if train_position_pos_dist else float("nan"),
+            "mean_event_loss": float(np.mean(train_event_losses)) if train_event_losses else float("nan"),
+            "event_oob_acc": float(np.mean(train_event_oob_acc)) if train_event_oob_acc else float("nan"),
+            "event_goal_acc": float(np.mean(train_event_goal_acc)) if train_event_goal_acc else float("nan"),
             "mean_backprop_loss": float(np.mean(train_backprop_losses)) if train_backprop_losses else float("nan"),
             "grad_norm_stats": _summary_stats(train_grad_norms),
             # Batch-to-batch CHANGE in the main task's own per-batch loss,
@@ -1923,6 +2046,7 @@ def train(
             encoder_out_hook_handles.append(model.encoder.out.bias.register_hook(lambda grad: grad * bias_mask))
         decoder_only_params = (
             list(model.decoder.parameters()) + list(model.crossing_head.parameters()) + list(model.resting_head.parameters())
+            + list(model.position_head.parameters()) + list(model.event_head.parameters())
         )
         if not freeze_latent:
             decoder_only_params += list(model.encoder.out.parameters())
@@ -1980,6 +2104,11 @@ def train(
             train_crossing_dt_mae_do = epoch_result_do["crossing_dt_mae"]
             mean_train_resting_loss_do = epoch_result_do["mean_resting_loss"]
             train_resting_pos_dist_do = epoch_result_do["resting_pos_dist"]
+            mean_train_position_loss_do = epoch_result_do["mean_position_loss"]
+            train_position_pos_dist_do = epoch_result_do["position_pos_dist"]
+            mean_train_event_loss_do = epoch_result_do["mean_event_loss"]
+            train_event_oob_acc_do = epoch_result_do["event_oob_acc"]
+            train_event_goal_acc_do = epoch_result_do["event_goal_acc"]
             mean_train_backprop_loss_do = epoch_result_do["mean_backprop_loss"]
 
             train_means_do = _mean_breakdown(epoch_result_do["breakdowns"])
@@ -1996,6 +2125,11 @@ def train(
             val_crossing_dt_mae_do = float("nan")
             mean_val_resting_loss_do = float("nan")
             val_resting_pos_dist_do = float("nan")
+            mean_val_position_loss_do = float("nan")
+            val_position_pos_dist_do = float("nan")
+            mean_val_event_loss_do = float("nan")
+            val_event_oob_acc_do = float("nan")
+            val_event_goal_acc_do = float("nan")
             mean_val_backprop_loss_do = float("nan")
             val_means_do = _mean_breakdown([])
             val_cls_do = _classification_from_counts(np.zeros((n_h, 4), dtype=np.int64), np.zeros((n_h, 4), dtype=np.int64))
@@ -2015,6 +2149,11 @@ def train(
                 val_crossing_dt_maes_do: list[float] = []
                 val_resting_losses_do: list[float] = []
                 val_resting_pos_dists_do: list[float] = []
+                val_position_losses_do: list[float] = []
+                val_position_pos_dists_do: list[float] = []
+                val_event_losses_do: list[float] = []
+                val_event_oob_accs_do: list[float] = []
+                val_event_goal_accs_do: list[float] = []
                 _val_pos_do = 0
                 with torch.no_grad():
                     for x, y in ds.iterate_minibatches(batch_size, val_idx, shuffle=False, device=device):
@@ -2043,6 +2182,15 @@ def train(
                         )
                         val_resting_losses_do.append(float(resting_loss.item()))
                         val_resting_pos_dists_do.append(resting_pos_dist_mean)
+                        position_loss, position_pos_dist_mean = _position_head_loss(model, latent, x)
+                        val_position_losses_do.append(float(position_loss.item()))
+                        val_position_pos_dists_do.append(position_pos_dist_mean)
+                        event_loss, event_oob_acc, event_goal_acc = _event_head_loss(
+                            model, latent, ever_oob, ever_goal, batch_idx, device,
+                        )
+                        val_event_losses_do.append(float(event_loss.item()))
+                        val_event_oob_accs_do.append(event_oob_acc)
+                        val_event_goal_accs_do.append(event_goal_acc)
                         _val_pos_do += x.shape[0]
 
                 # Horizon-generalized pair/t0/crossing/resting -- one shared
@@ -2062,6 +2210,8 @@ def train(
                     val_crossing_dt_maes_do.extend(horizon_result_do["crossing_dt_maes"])
                     val_resting_losses_do.extend(horizon_result_do["resting_losses"])
                     val_resting_pos_dists_do.extend(horizon_result_do["resting_pos_dists"])
+                    val_position_losses_do.extend(horizon_result_do["position_losses"])
+                    val_position_pos_dists_do.extend(horizon_result_do["position_pos_dists"])
 
                 mean_val_loss_do = float(np.mean(val_losses_do))
                 mean_val_crossing_loss_do = float(np.mean(val_crossing_losses_do)) if val_crossing_losses_do else float("nan")
@@ -2069,7 +2219,15 @@ def train(
                 val_crossing_dt_mae_do = float(np.mean(val_crossing_dt_maes_do)) if val_crossing_dt_maes_do else float("nan")
                 mean_val_resting_loss_do = float(np.mean(val_resting_losses_do)) if val_resting_losses_do else float("nan")
                 val_resting_pos_dist_do = float(np.mean(val_resting_pos_dists_do)) if val_resting_pos_dists_do else float("nan")
-                mean_val_backprop_loss_do = mean_val_loss_do + resting_weight * mean_val_resting_loss_do
+                mean_val_position_loss_do = float(np.mean(val_position_losses_do)) if val_position_losses_do else float("nan")
+                val_position_pos_dist_do = float(np.mean(val_position_pos_dists_do)) if val_position_pos_dists_do else float("nan")
+                mean_val_event_loss_do = float(np.mean(val_event_losses_do)) if val_event_losses_do else float("nan")
+                val_event_oob_acc_do = float(np.mean(val_event_oob_accs_do)) if val_event_oob_accs_do else float("nan")
+                val_event_goal_acc_do = float(np.mean(val_event_goal_accs_do)) if val_event_goal_accs_do else float("nan")
+                mean_val_backprop_loss_do = (
+                    mean_val_loss_do + resting_weight * mean_val_resting_loss_do + position_weight * mean_val_position_loss_do
+                    + event_weight * mean_val_event_loss_do
+                )
                 if has_crossing_data:
                     mean_val_backprop_loss_do += crossing_weight * mean_val_crossing_loss_do
                 improved_do = mean_val_loss_do < (best_val_loss_do - decoder_only_early_stop_min_delta)
@@ -2141,11 +2299,15 @@ def train(
                     )
             crossing_line_do += (
                 f"  train_resting_loss={mean_train_resting_loss_do:.4f} (pos_dist={train_resting_pos_dist_do:.4f})"
+                f"  train_position_loss={mean_train_position_loss_do:.4f} (pos_dist={train_position_pos_dist_do:.4f})"
+                f"  train_event_loss={mean_train_event_loss_do:.4f} (oob_acc={train_event_oob_acc_do:.4f}, goal_acc={train_event_goal_acc_do:.4f})"
                 f"  train_backprop_loss={mean_train_backprop_loss_do:.4f}"
             )
             if len(val_idx) > 0:
                 crossing_line_do += (
                     f"  val_resting_loss={mean_val_resting_loss_do:.4f} (pos_dist={val_resting_pos_dist_do:.4f})"
+                    f"  val_position_loss={mean_val_position_loss_do:.4f} (pos_dist={val_position_pos_dist_do:.4f})"
+                    f"  val_event_loss={mean_val_event_loss_do:.4f} (oob_acc={val_event_oob_acc_do:.4f}, goal_acc={val_event_goal_acc_do:.4f})"
                     f"  val_backprop_loss={mean_val_backprop_loss_do:.4f}"
                 )
             log.info(
@@ -2210,6 +2372,11 @@ def train(
         train_crossing_dt_mae = epoch_result["crossing_dt_mae"]
         mean_train_resting_loss = epoch_result["mean_resting_loss"]
         train_resting_pos_dist = epoch_result["resting_pos_dist"]
+        mean_train_position_loss = epoch_result["mean_position_loss"]
+        train_position_pos_dist = epoch_result["position_pos_dist"]
+        mean_train_event_loss = epoch_result["mean_event_loss"]
+        train_event_oob_acc = epoch_result["event_oob_acc"]
+        train_event_goal_acc = epoch_result["event_goal_acc"]
         mean_train_backprop_loss = epoch_result["mean_backprop_loss"]
         grad_norm_stats = epoch_result["grad_norm_stats"]
         loss_delta_stats = epoch_result["loss_delta_stats"]
@@ -2229,6 +2396,11 @@ def train(
         val_crossing_dt_mae = float("nan")
         mean_val_resting_loss = float("nan")
         val_resting_pos_dist = float("nan")
+        mean_val_position_loss = float("nan")
+        val_position_pos_dist = float("nan")
+        mean_val_event_loss = float("nan")
+        val_event_oob_acc = float("nan")
+        val_event_goal_acc = float("nan")
         mean_val_backprop_loss = float("nan")
         val_loss_delta = float("nan")
         val_means = _mean_breakdown([])
@@ -2249,6 +2421,11 @@ def train(
             val_crossing_dt_maes: list[float] = []
             val_resting_losses: list[float] = []
             val_resting_pos_dists: list[float] = []
+            val_position_losses: list[float] = []
+            val_position_pos_dists: list[float] = []
+            val_event_losses: list[float] = []
+            val_event_oob_accs: list[float] = []
+            val_event_goal_accs: list[float] = []
             _val_pos = 0
             with torch.no_grad():
                 for x, y in ds.iterate_minibatches(batch_size, val_idx, shuffle=False, device=device):
@@ -2282,6 +2459,15 @@ def train(
                     )
                     val_resting_losses.append(float(resting_loss.item()))
                     val_resting_pos_dists.append(resting_pos_dist_mean)
+                    position_loss, position_pos_dist_mean = _position_head_loss(model, latent, x)
+                    val_position_losses.append(float(position_loss.item()))
+                    val_position_pos_dists.append(position_pos_dist_mean)
+                    event_loss, event_oob_acc, event_goal_acc = _event_head_loss(
+                        model, latent, ever_oob, ever_goal, batch_idx, device,
+                    )
+                    val_event_losses.append(float(event_loss.item()))
+                    val_event_oob_accs.append(event_oob_acc)
+                    val_event_goal_accs.append(event_goal_acc)
                     _val_pos += x.shape[0]
 
             # Horizon-generalized pair/t0/crossing/resting -- one shared
@@ -2301,6 +2487,8 @@ def train(
                 val_crossing_dt_maes.extend(horizon_result["crossing_dt_maes"])
                 val_resting_losses.extend(horizon_result["resting_losses"])
                 val_resting_pos_dists.extend(horizon_result["resting_pos_dists"])
+                val_position_losses.extend(horizon_result["position_losses"])
+                val_position_pos_dists.extend(horizon_result["position_pos_dists"])
 
             val_loss = float(np.mean(val_losses))
             mean_val_crossing_loss = float(np.mean(val_crossing_losses)) if val_crossing_losses else float("nan")
@@ -2308,13 +2496,21 @@ def train(
             val_crossing_dt_mae = float(np.mean(val_crossing_dt_maes)) if val_crossing_dt_maes else float("nan")
             mean_val_resting_loss = float(np.mean(val_resting_losses)) if val_resting_losses else float("nan")
             val_resting_pos_dist = float(np.mean(val_resting_pos_dists)) if val_resting_pos_dists else float("nan")
+            mean_val_position_loss = float(np.mean(val_position_losses)) if val_position_losses else float("nan")
+            val_position_pos_dist = float(np.mean(val_position_pos_dists)) if val_position_pos_dists else float("nan")
+            mean_val_event_loss = float(np.mean(val_event_losses)) if val_event_losses else float("nan")
+            val_event_oob_acc = float(np.mean(val_event_oob_accs)) if val_event_oob_accs else float("nan")
+            val_event_goal_acc = float(np.mean(val_event_goal_accs)) if val_event_goal_accs else float("nan")
             # Same combined-objective value as `mean_backprop_loss` above,
             # computed post-hoc rather than accumulated per-batch (val has
-            # no backward pass to piggyback the crossing/resting terms onto)
-            # -- valid because every term is already a batch-size-weighted
-            # mean over the SAME val batches, so summing the means equals
-            # the mean of the sums.
-            mean_val_backprop_loss = val_loss + resting_weight * mean_val_resting_loss
+            # no backward pass to piggyback the crossing/resting/position/
+            # event terms onto) -- valid because every term is already a
+            # batch-size-weighted mean over the SAME val batches, so summing
+            # the means equals the mean of the sums.
+            mean_val_backprop_loss = (
+                val_loss + resting_weight * mean_val_resting_loss + position_weight * mean_val_position_loss
+                + event_weight * mean_val_event_loss
+            )
             if has_crossing_data:
                 mean_val_backprop_loss += crossing_weight * mean_val_crossing_loss
 
@@ -2382,11 +2578,15 @@ def train(
                 )
         crossing_line += (
             f"  train_resting_loss={mean_train_resting_loss:.4f} (pos_dist={train_resting_pos_dist:.4f})"
+            f"  train_position_loss={mean_train_position_loss:.4f} (pos_dist={train_position_pos_dist:.4f})"
+            f"  train_event_loss={mean_train_event_loss:.4f} (oob_acc={train_event_oob_acc:.4f}, goal_acc={train_event_goal_acc:.4f})"
             f"  train_backprop_loss={mean_train_backprop_loss:.4f}"
         )
         if len(val_idx) > 0:
             crossing_line += (
                 f"  val_resting_loss={mean_val_resting_loss:.4f} (pos_dist={val_resting_pos_dist:.4f})"
+                f"  val_position_loss={mean_val_position_loss:.4f} (pos_dist={val_position_pos_dist:.4f})"
+                f"  val_event_loss={mean_val_event_loss:.4f} (oob_acc={val_event_oob_acc:.4f}, goal_acc={val_event_goal_acc:.4f})"
                 f"  val_backprop_loss={mean_val_backprop_loss:.4f}"
             )
         log.info(
@@ -2459,6 +2659,16 @@ def train(
             "val_resting_loss": mean_val_resting_loss,
             "train_resting_pos_dist": train_resting_pos_dist,
             "val_resting_pos_dist": val_resting_pos_dist,
+            "train_position_loss": mean_train_position_loss,
+            "val_position_loss": mean_val_position_loss,
+            "train_position_pos_dist": train_position_pos_dist,
+            "val_position_pos_dist": val_position_pos_dist,
+            "train_event_loss": mean_train_event_loss,
+            "val_event_loss": mean_val_event_loss,
+            "train_event_oob_acc": train_event_oob_acc,
+            "val_event_oob_acc": val_event_oob_acc,
+            "train_event_goal_acc": train_event_goal_acc,
+            "val_event_goal_acc": val_event_goal_acc,
             "train_backprop_loss": mean_train_backprop_loss,
             "val_backprop_loss": mean_val_backprop_loss,
             "grad_norm_mean": grad_norm_stats["mean"],

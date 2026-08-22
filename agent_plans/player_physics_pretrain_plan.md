@@ -151,16 +151,29 @@ there is no `crossings`/`crossing_times` side-channel to carry (a genuine
 simplification vs. the ball pipeline, not a missing feature — see
 `player_episode_gen.py`'s module docstring).
 
-### 5.2 Intent resampling
+### 5.2 Intent — drawn once, fixed for the whole episode
 
 A player needs an ongoing "intent" (`desired_direction`, `speed_mode`) to
 move at all — the ball has none of this (pure physics from one initial
-condition). Resampled exactly at t=0 and at each `horizons_s[i]` boundary
-(piecewise-constant within a segment), per the brief's spec: with
-probability `intent_continue_prob` (default 0.5), keep `speed_mode` and
-jitter the direction by small Gaussian noise; otherwise draw a fresh
-direction (uniform) and `speed_mode` (categorical, `speed_mode_weights`).
-At t=0, always fresh (no "previous" intent to continue).
+condition). The original brief for this pipeline had intent RESAMPLED at
+each `horizons_s[i]` boundary (piecewise-constant per segment, with a
+`intent_continue_prob` chance of continuing roughly the same direction).
+That was a real design bug, caught after the fact: the encoder only ever
+sees the t=0 input row, but a target at horizon `i > 0` under that scheme
+depended on intent draws that happened strictly AFTER t=0 and were never
+part of the input — i.e. the task was only a deterministic function of the
+input for the FIRST horizon, and genuinely unpredictable-from-input beyond
+that (the network would have needed to guess future random draws it had no
+way to observe). Fixed by drawing intent ONCE per episode — a fresh
+uniform `direction_rad` and a fresh categorical `speed_mode`
+(`speed_mode_weights`) — and holding it FIXED for the entire simulated
+horizon window, exactly mirroring the ball task's shape (one random draw,
+then fully deterministic physics forward). `intent_continue_prob`/
+`intent_continue_heading_jitter_std_rad` were removed (config and code) as
+part of this fix — they no longer apply to anything. Note this also makes
+`build_adjacent_pair_data`'s context-field-copying (§ below / `player_
+dataset.py`) EXACT rather than an approximation, since intent at any
+mid-trajectory horizon is now provably identical to intent at t=0.
 
 ### 5.3 Per-tick physics — exact match to `Match._apply_movement`/`_update_state_timers`
 
