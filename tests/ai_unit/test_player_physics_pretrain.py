@@ -814,7 +814,8 @@ def test_decoder_only_pretraining_trains_auxiliary_heads_too(tmp_path, monkeypat
         pp = cfg["physics_pretrain"]["player"]
         pp["decoder_only_pretrain_epochs"] = 3
         pp["decoder_only_pretrain_freeze_latent"] = True
-        pp["crossing_loss_weight"] = 0.005
+        pp["crossing_pos_loss_weight"] = 0.005
+        pp["crossing_dt_loss_weight"] = 0.005
         pp["goal_dist_delta_loss_weight"] = 0.05
         pp["short_horizon_probe_loss_weight"] = 0.1
         pp["epochs"] = 0  # isolate to just the decoder-only phase
@@ -865,7 +866,8 @@ def test_train_smoke_with_all_auxiliary_heads(tmp_path, monkeypatch, caplog):
     def _patched():
         cfg = orig_load_ai_config()
         pp = cfg["physics_pretrain"]["player"]
-        pp["crossing_loss_weight"] = 0.005
+        pp["crossing_pos_loss_weight"] = 0.005
+        pp["crossing_dt_loss_weight"] = 0.005
         pp["goal_dist_delta_loss_weight"] = 0.05
         pp["short_horizon_probe_loss_weight"] = 0.1
         return cfg

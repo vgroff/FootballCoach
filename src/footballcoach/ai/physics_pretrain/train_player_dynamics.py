@@ -360,6 +360,7 @@ def _goal_dist_delta_targets(
 def _crossing_head_loss(
     model: PlayerDynamicsAutoencoder, latent: torch.Tensor, pos_all: np.ndarray, dt_all: np.ndarray,
     mask_all: np.ndarray, row_idx: np.ndarray, device: str,
+    pos_loss_weight: float = 1.0, dt_loss_weight: float = 1.0,
 ) -> tuple[torch.Tensor, float, float]:
     """``model.crossing_head``'s loss for one batch: position MSE (x/y,
     MASKED to rows where ``mask_all`` is True -- an episode with no crossing
@@ -369,6 +370,20 @@ def _crossing_head_loss(
     ``dt_all``'s -1 sentinel for those same rows -- see
     ``PlayerDynamicsDataset``'s docstring for why delta_t is trained on the
     sentinel directly rather than also being masked).
+
+    ``pos_loss_weight``/``dt_loss_weight`` (both default 1.0, i.e. plain sum,
+    the original behaviour) scale the two terms BEFORE they're combined into
+    the returned ``loss`` -- split out because the two terms sit on very
+    different natural scales: position error is in normalized (roughly
+    O(1)) units like everything else in this pipeline, but delta_t is RAW,
+    UNNORMALIZED seconds (spanning [-1, max(horizons_s)]), so its squared
+    error can dominate the combined loss purely from unit choice, not actual
+    difficulty -- see physics_pretrain.player.crossing_dt_loss_weight's
+    config comment. Callers apply these as `crossing_pos_loss_weight`/
+    `crossing_dt_loss_weight` from config; there's no longer a separate
+    OUTER weight multiplying the whole head's loss (see call sites -- the
+    weighting now happens in here, once, rather than an outer multiply on
+    top of an inner unweighted sum).
 
     Near-verbatim port of ``train_ball_dynamics._crossing_head_loss``, minus
     its height-exclusion note (a player has no height axis to exclude).
@@ -383,11 +398,12 @@ def _crossing_head_loss(
     indexing convention; this function doesn't care which one it is.
 
     Returns ``(loss, pos_dist_mean, dt_mae_mean)`` -- the last two are plain
-    floats (not backpropagated) for per-epoch reporting: mean Euclidean
-    crossing-position error over the rows that actually crossed (0.0 if none
-    did, matching the masked loss's own 0-numerator/1-denominator
-    convention), and mean absolute delta_t error over ALL rows (sentinel
-    included, since that's what the loss itself trains against).
+    floats (not backpropagated) for per-epoch reporting, UNWEIGHTED (so they
+    stay directly comparable across different weight settings): mean
+    Euclidean crossing-position error over the rows that actually crossed
+    (0.0 if none did, matching the masked loss's own 0-numerator/1-
+    denominator convention), and mean absolute delta_t error over ALL rows
+    (sentinel included, since that's what the loss itself trains against).
     """
     crossing_pred = model.crossing_head(latent)
     c_pos = torch.from_numpy(pos_all[row_idx]).to(device)
@@ -398,7 +414,7 @@ def _crossing_head_loss(
     pos_err = crossing_pred[:, 0:2] - c_pos
     pos_loss = (pos_err.pow(2).sum(dim=-1) * mask_f).sum() / denom
     dt_loss = F.mse_loss(crossing_pred[:, 2], c_dt)
-    loss = pos_loss + dt_loss
+    loss = pos_loss_weight * pos_loss + dt_loss_weight * dt_loss
     with torch.no_grad():
         pos_dist_mean = float((torch.linalg.norm(pos_err, dim=-1) * mask_f).sum().item() / float(denom.item()))
         dt_mae_mean = float((crossing_pred[:, 2] - c_dt).abs().mean().item())
@@ -812,13 +828,24 @@ def train(
     # no horizons_s validation either, so an unusual horizon set stays
     # usable as long as you're not asking for the head that needs it).
     # ------------------------------------------------------------------
-    crossing_weight = float(cfg.get("crossing_loss_weight", 0.0))
+    # Split into separate position/delta_t weights (rather than one weight
+    # on the combined pos_loss+dt_loss sum) because the two terms sit on
+    # very different natural scales -- delta_t is raw, unnormalized seconds
+    # (not the roughly-O(1) normalized units everything else uses), so its
+    # squared error can dominate the combined loss purely from unit choice.
+    # See _crossing_head_loss's docstring and crossing_dt_loss_weight's
+    # config comment.
+    crossing_pos_weight = float(cfg.get("crossing_pos_loss_weight", 0.0))
+    crossing_dt_weight = float(cfg.get("crossing_dt_loss_weight", 0.0))
     # A dataset built by hand (e.g. in a unit test) may carry no
     # crossings/crossing_times at all -- guard every crossing call site with
     # this rather than crashing, same convention as train_ball_dynamics.py.
-    has_crossing_data = ds.crossing_pos is not None and crossing_weight != 0.0
-    if crossing_weight != 0.0 and ds.crossing_pos is None:
-        log.warning("crossing_loss_weight != 0 but this dataset carries no crossings/crossing_times -- crossing_head will not be trained.")
+    has_crossing_data = ds.crossing_pos is not None and (crossing_pos_weight != 0.0 or crossing_dt_weight != 0.0)
+    if (crossing_pos_weight != 0.0 or crossing_dt_weight != 0.0) and ds.crossing_pos is None:
+        log.warning(
+            "crossing_pos_loss_weight/crossing_dt_loss_weight != 0 but this dataset carries no "
+            "crossings/crossing_times -- crossing_head will not be trained."
+        )
 
     goal_dist_delta_weight = float(cfg.get("goal_dist_delta_loss_weight", 0.0))
     goal_dist_delta_targets = None
@@ -1197,8 +1224,9 @@ def train(
                 if has_crossing_data:
                     crossing_loss, c_pos_dist, c_dt_mae = _crossing_head_loss(
                         model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, row_idx, device,
+                        pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight,
                     )
-                    backprop_loss = backprop_loss + crossing_weight * crossing_loss
+                    backprop_loss = backprop_loss + crossing_loss
                     aux.add_crossing(crossing_loss, c_pos_dist, c_dt_mae)
                 if goal_dist_delta_targets is not None:
                     gdd_loss, gdd_mae_left, gdd_mae_right = _goal_dist_delta_head_loss(
@@ -1283,8 +1311,9 @@ def train(
                     crossing_loss_h, c_pos_dist_h, c_dt_mae_h = _crossing_head_loss(
                         model, latent, crossing_pos_train, horizon_bundle_train["crossing_dt"][h_idx],
                         horizon_bundle_train["crossing_valid"][h_idx], row_idx, device,
+                        pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight,
                     )
-                    combined_loss = combined_loss + crossing_weight * crossing_loss_h
+                    combined_loss = combined_loss + crossing_loss_h
                     aux.add_crossing(crossing_loss_h, c_pos_dist_h, c_dt_mae_h)
 
                 optimizer.zero_grad()
@@ -1333,6 +1362,7 @@ def train(
                 if has_crossing_data:
                     aux.add_crossing(*_crossing_head_loss(
                         model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
+                        pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight,
                     ))
                 if goal_dist_delta_targets is not None:
                     aux.add_goal_dist(*_goal_dist_delta_head_loss(
@@ -1395,6 +1425,7 @@ def train(
                             aux.add_crossing(*_crossing_head_loss(
                                 model, latent, crossing_pos_val, horizon_bundle_val["crossing_dt"][h_idx],
                                 horizon_bundle_val["crossing_valid"][h_idx], row_idx, device,
+                                pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight,
                             ))
 
         return {

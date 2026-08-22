@@ -177,7 +177,10 @@ class PlayerDynamicsAutoencoder(nn.Module):
     position; ``delta_t`` in seconds with a ``-1`` "no crossing" sentinel) --
     the direct player analogue of the ball's identically-shaped head. See
     ``PlayerDynamicsDataset``'s ``crossing_pos``/``crossing_dt``/
-    ``crossing_mask`` and ``physics_pretrain.player.crossing_loss_weight``.
+    ``crossing_mask`` and ``physics_pretrain.player.crossing_pos_loss_weight``/
+    ``crossing_dt_loss_weight`` (split, unlike the ball's single combined
+    weight, since position and delta_t sit on very different natural
+    scales -- delta_t is raw unnormalized seconds).
 
     ``goal_dist_delta_head``: ``Linear(latent_dim, 2)`` -> the CHANGE in
     distance-to-the-closest-point-of-each-goal-mouth between t=0 and t=3.0s,
