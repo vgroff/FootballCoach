@@ -11,6 +11,12 @@ pt``, or any other ``_save_phase_checkpoint`` output from
 has ``encoder_state_dict`` (the decoder/heads are discarded, see
 ``ball_dynamics_net.py``'s module docstring) and can't be used here.
 
+Closing the window runs a one-off error/input-correlation analysis: samples
+``--error-samples`` (default 20,000) random episodes, predicts all of them
+in one batch, and prints (to the TERMINAL, not a plot) which raw initial-
+condition input variables correlate most strongly with high prediction
+error -- see ``_correlate_errors_with_inputs``'s docstring.
+
 Usage::
 
     uv run python scripts/inspect_ball_pretrain.py \\
@@ -40,8 +46,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src"))
 
 from footballcoach.ai.physics_pretrain.ball_dataset import BallDynamicsDataset
 from footballcoach.ai.physics_pretrain.ball_dynamics_net import BallDynamicsAutoencoder
-from footballcoach.ai.physics_pretrain.ball_episode_gen import BallEpisodeGenParams, N_TARGET_FIELDS_PER_HORIZON
-from footballcoach.ai.physics_pretrain.train_ball_dynamics import _migrate_crossing_head_state_dict
+from footballcoach.ai.physics_pretrain.ball_episode_gen import (
+    BALL_SPIN_NORM_DIVISOR_RAD_S, BallEpisodeGenParams, N_TARGET_FIELDS_PER_HORIZON,
+)
+from footballcoach.ai.physics_pretrain.train_ball_dynamics import _migrate_crossing_head_state_dict, compute_per_episode_loss
 
 _C_PITCH = "#227832"
 _C_LINE = "white"
@@ -137,6 +145,225 @@ def _arrow(ax, p0: tuple[float, float], p1: tuple[float, float], color: str, alp
     )
 
 
+def _correlate_errors_with_inputs(
+    ds: BallDynamicsDataset, model: BallDynamicsAutoencoder, gen_params: BallEpisodeGenParams,
+    normalize_by_base: bool, cfg: dict, n_samples: int, seed: int | None,
+) -> None:
+    """Samples ``min(n_samples, len(ds))`` random episodes, runs them
+    through the model in one batch, computes two per-episode error
+    measures, and prints (ranked by ``|Pearson r|``, most correlated
+    first) which raw t=0 input variables -- in real physical units, not
+    the normalized encoded ones -- correlate most strongly with each.
+
+    The two error measures:
+
+    - ``mean position error (m)``: average, across all recorded horizons,
+      of the Euclidean (x/y only, real metres) gap between predicted and
+      ground-truth position -- the same quantity the interactive
+      "Trajectory" panel prints per-row, just averaged here instead of
+      shown per-horizon. The most physically direct "how wrong is this
+      prediction" signal.
+    - ``combined per-episode training loss``: ``train_ball_dynamics.
+      compute_per_episode_loss``, called with THIS run's actual ``cfg``
+      ``bce_loss_weight``/``spin_loss_weight`` (NOT the function's own
+      1.0/1.0 defaults) -- the exact per-row quantity the main training
+      loop's batched loss is the MEAN of. Matching the real weights
+      matters: at ``bce_loss_weight=0`` the oob/goal classification head
+      never received gradient during training, so its logits are
+      essentially arbitrary/uncalibrated noise -- using the default
+      weight=1.0 here would silently mix a meaningless BCE term into
+      "the loss", which can dominate the correlation ranking for reasons
+      that have NOTHING to do with what the model actually learned (e.g.
+      a systematically mislabeled-feeling BCE term on whichever rows
+      happen to have the rarer label).
+
+    Also runs the SAME correlation, TOP 5 only, for each of the 4
+    auxiliary heads that read straight off the latent (see
+    ``BallDynamicsAutoencoder``'s docstring for what each predicts):
+    ``crossing_head`` (position error in metres, MASKED to rows that
+    actually cross -- same masking convention as its own training loss;
+    and delta_t absolute error in seconds, unmasked), ``resting_head``
+    (position error in metres, masked to rows with a defined resting
+    target), ``position_head`` (position error in metres, unmasked --
+    always defined), ``event_head`` (summed oob+goal BCE, unmasked,
+    computed with numerically-stable ``logaddexp`` -- always trained
+    since it has no separate weight-gating in this analysis, unlike the
+    decoder's own oob/goal BCE above).
+
+    Input features are read straight off ``ds.inputs``' raw normalized
+    fields and denormalized to real units the same way ``describe_input_
+    row``/``_episode_divisors`` do (episode-own pitch scale when
+    ``normalize_by_base`` is false, the fixed base pitch otherwise) --
+    deliberately NOT the already-computed ``engineered features`` (input
+    fields 14:19), which are themselves in normalized units and less
+    directly interpretable in a printed correlation table. Also includes
+    ``dist_to_x/y_boundary`` (how close to the pitch edge the episode
+    starts) and ``already_oob_or_goal_at_start`` (0/1, via
+    ``compute_already_out_of_bounds_at_start_mask`` -- Pearson correlation
+    against a 0/1 indicator is the point-biserial correlation, a standard
+    and valid special case) since both are plausible error drivers not
+    literally present as a single raw input field.
+
+    NOTE on reading the printed ``r`` values: Pearson's r is a unitless
+    measure of LINEAR association strength (-1..1), NOT a regression
+    slope -- "r=0.6 for speed" does NOT mean "0.6m of extra error per
+    extra m/s of speed". The actual slope (in the error metric's own
+    units per unit of the feature) is ``r * std(error) / std(feature)``;
+    r alone only tells you how tight/strong the linear relationship is
+    (``r^2`` = fraction of the error's variance linearly explained by
+    that one feature).
+
+    Pure diagnostic printout -- returns nothing, mutates nothing.
+    """
+    rng = np.random.default_rng(seed)
+    n = len(ds)
+    sample_size = min(n_samples, n)
+    idx = rng.choice(n, size=sample_size, replace=False)
+
+    inputs = ds.inputs[idx]
+    targets = ds.targets[idx]
+    n_horizons = len(cfg["horizons_s"])
+    # Match the ACTUAL trained weights, not compute_per_episode_loss's own
+    # 1.0/1.0 defaults -- see this function's docstring.
+    bce_weight = float(cfg.get("bce_loss_weight", 1.0))
+    spin_weight = float(cfg.get("spin_loss_weight", 1.0))
+
+    with torch.no_grad():
+        x = torch.from_numpy(inputs.astype(np.float32, copy=False))
+        latent = model.encoder(x)
+        decoder_outs = model.decoder(latent)
+        crossing_pred = model.crossing_head(latent).numpy()
+        resting_pred = model.resting_head(latent).numpy()
+        position_pred = model.position_head(latent).numpy()
+        event_pred = model.event_head(latent).numpy()
+
+    if normalize_by_base:
+        half_diag = math.hypot(gen_params.base_pitch_length_m / 2, gen_params.base_pitch_width_m / 2)
+        half_length = np.full(sample_size, gen_params.base_pitch_length_m / 2)
+        half_width = np.full(sample_size, gen_params.base_pitch_width_m / 2)
+        height_div = np.full(sample_size, half_diag)
+        vel_div = np.full(sample_size, half_diag)
+    else:
+        half_length = inputs[:, 10] * gen_params.base_pitch_length_m / 2
+        half_width = inputs[:, 11] * gen_params.base_pitch_width_m / 2
+        height_div = np.full(sample_size, gen_params.height_norm_m)
+        vel_div = np.hypot(half_length, half_width)
+
+    pos_err_m = np.zeros(sample_size)
+    for h, out in enumerate(decoder_outs):
+        out_np = out.numpy()
+        base = h * N_TARGET_FIELDS_PER_HORIZON
+        gt = targets[:, base:base + N_TARGET_FIELDS_PER_HORIZON]
+        dx = (out_np[:, 0] - gt[:, 0]) * half_length
+        dy = (out_np[:, 1] - gt[:, 1]) * half_width
+        pos_err_m += np.hypot(dx, dy)
+    pos_err_m /= n_horizons
+
+    pos_weight = torch.from_numpy(ds.compute_pos_weights(n_horizons, indices=idx))
+    target_t = torch.from_numpy(targets.astype(np.float32, copy=False))
+    combined_loss = compute_per_episode_loss(
+        list(decoder_outs), target_t, pos_weight, bce_weight=bce_weight, spin_weight=spin_weight,
+    ).numpy()
+
+    pos_x = inputs[:, 0] * half_length
+    pos_y = inputs[:, 1] * half_width
+    pos_z = inputs[:, 2] * height_div
+    vel_x = inputs[:, 3] * vel_div
+    vel_y = inputs[:, 4] * vel_div
+    vel_z = inputs[:, 5] * vel_div
+    speed = np.sqrt(vel_x ** 2 + vel_y ** 2 + vel_z ** 2)
+    spin_x = inputs[:, 6] * BALL_SPIN_NORM_DIVISOR_RAD_S
+    spin_y = inputs[:, 7] * BALL_SPIN_NORM_DIVISOR_RAD_S
+    spin_z = inputs[:, 8] * BALL_SPIN_NORM_DIVISOR_RAD_S
+    spin_mag = np.sqrt(spin_x ** 2 + spin_y ** 2 + spin_z ** 2)
+    already_oob_or_goal = ds.compute_already_out_of_bounds_at_start_mask(gen_params, indices=idx).astype(np.float64)
+
+    features = {
+        "pos_x (m)": pos_x, "pos_y (m)": pos_y, "height/pos_z (m)": pos_z,
+        "vel_x (m/s)": vel_x, "vel_y (m/s)": vel_y, "vel_z (m/s)": vel_z, "speed (m/s)": speed,
+        "spin_x (rad/s)": spin_x, "spin_y (rad/s)": spin_y, "spin_z (rad/s)": spin_z, "spin_mag (rad/s)": spin_mag,
+        "restitution": inputs[:, 9].astype(np.float64),
+        "pitch_length (m)": inputs[:, 10] * gen_params.base_pitch_length_m,
+        "pitch_width (m)": inputs[:, 11] * gen_params.base_pitch_width_m,
+        "goal_width (m)": inputs[:, 12] * gen_params.base_goal_width_m,
+        "goal_height (m)": inputs[:, 13] * gen_params.base_goal_height_m,
+        "dist_to_x_boundary (m)": half_length - np.abs(pos_x),
+        "dist_to_y_boundary (m)": half_width - np.abs(pos_y),
+        "dist_to_center (m)": np.hypot(pos_x, pos_y),
+        "already_oob_or_goal_at_start": already_oob_or_goal,
+    }
+
+    def _print_ranked(label: str, err: np.ndarray, mask: np.ndarray | None = None, top_k: int | None = None) -> None:
+        if mask is not None:
+            feats = {name: vals[mask] for name, vals in features.items()}
+            err = err[mask]
+            n_used = int(mask.sum())
+        else:
+            feats = features
+            n_used = sample_size
+        print(f"\n--- correlates with {label} (n={n_used:,}) ---")
+        if n_used < 2:
+            print("    (too few valid rows to correlate)")
+            return
+        rows = []
+        for name, vals in feats.items():
+            if np.std(vals) < 1e-12 or np.std(err) < 1e-12:
+                continue  # a constant feature/error this sample has no defined correlation
+            r = float(np.corrcoef(vals, err)[0, 1])
+            rows.append((name, r))
+        rows.sort(key=lambda t: -abs(t[1]))
+        if top_k is not None:
+            rows = rows[:top_k]
+        for name, r in rows:
+            bar = "#" * int(round(abs(r) * 40))
+            print(f"    {name:24s} r={r:+.3f}  {bar}")
+
+    print(f"\n========== error / input correlation analysis ({sample_size:,} random episodes) ==========")
+    _print_ranked("mean position error (m, averaged over horizons)", pos_err_m)
+    _print_ranked(f"combined per-episode training loss (bce_weight={bce_weight:g}, spin_weight={spin_weight:g})", combined_loss)
+
+    print("\n---------- auxiliary heads (own separate parameters, top 5 correlates each) ----------")
+    if ds.crossing_pos is not None:
+        c_mask = ds.crossing_mask[idx]
+        c_pos = ds.crossing_pos[idx]
+        c_dt = ds.crossing_dt[idx]
+        crossing_pos_err_m = np.hypot(
+            (crossing_pred[:, 0] - c_pos[:, 0]) * half_length, (crossing_pred[:, 1] - c_pos[:, 1]) * half_width,
+        )
+        crossing_dt_err_s = np.abs(crossing_pred[:, 2] - c_dt)
+        _print_ranked("crossing_head position error (m, rows that actually cross only)", crossing_pos_err_m, mask=c_mask, top_k=5)
+        _print_ranked("crossing_head delta_t error (s, all rows incl. -1 sentinel)", crossing_dt_err_s, top_k=5)
+
+    resting_min_start_speed_mps = float(cfg.get("resting_min_start_speed_mps", 1.5))
+    resting_speed_threshold_mps = float(cfg.get("resting_speed_threshold_mps", 0.01))
+    pitch_half_diag_m = math.hypot(gen_params.base_pitch_length_m / 2, gen_params.base_pitch_width_m / 2)
+    resting_pos_all, resting_mask_all = ds.compute_resting_targets(
+        min_start_speed_norm=resting_min_start_speed_mps / pitch_half_diag_m,
+        rest_speed_norm=resting_speed_threshold_mps / pitch_half_diag_m,
+    )
+    r_mask = resting_mask_all[idx]
+    r_pos = resting_pos_all[idx]
+    resting_pos_err_m = np.hypot(
+        (resting_pred[:, 0] - r_pos[:, 0]) * half_length, (resting_pred[:, 1] - r_pos[:, 1]) * half_width,
+    )
+    _print_ranked("resting_head position error (m, rows with a defined resting target only)", resting_pos_err_m, mask=r_mask, top_k=5)
+
+    position_err_m = np.hypot((position_pred[:, 0] - inputs[:, 0]) * half_length, (position_pred[:, 1] - inputs[:, 1]) * half_width)
+    _print_ranked("position_head position error (m, current t=0 position)", position_err_m, top_k=5)
+
+    ever_oob, ever_goal = ds.compute_event_ever_masks(gen_params, indices=idx)
+
+    def _bce_with_logits(logit: np.ndarray, target: np.ndarray) -> np.ndarray:
+        return np.logaddexp(0.0, logit) - target * logit
+
+    event_bce = (
+        _bce_with_logits(event_pred[:, 0], ever_oob.astype(np.float64))
+        + _bce_with_logits(event_pred[:, 1], ever_goal.astype(np.float64))
+    )
+    _print_ranked("event_head BCE (ever-oob + ever-goal, unmasked)", event_bce, top_k=5)
+    print()
+
+
 class Inspector:
     """``_prefetch_loop`` runs on a background daemon thread, pulling random
     rows through the model (encoder + decoder + crossing/resting heads --
@@ -153,14 +380,16 @@ class Inspector:
     def __init__(
         self, ds: BallDynamicsDataset, model: BallDynamicsAutoencoder, cfg: dict,
         gen_params: BallEpisodeGenParams, normalize_by_base: bool, seed: int | None,
-        alpha: float = _DEFAULT_ALPHA,
+        alpha: float = _DEFAULT_ALPHA, error_samples: int = 20_000,
     ):
         self.ds = ds
         self.model = model
+        self.cfg = cfg
         self.horizons_s = list(cfg["horizons_s"])
         self.gen_params = gen_params
         self.normalize_by_base = normalize_by_base
         self.alpha = alpha
+        self.error_samples = error_samples
         self.rng = np.random.default_rng(seed)  # only ever touched by the prefetch thread -- single producer, no lock needed
 
         resting_min_start_speed_mps = float(cfg.get("resting_min_start_speed_mps", 1.5))
@@ -187,12 +416,24 @@ class Inspector:
         self.btn.label.set_color("white")
         self.btn.on_clicked(lambda _event: self.next_row())
         self.fig.canvas.mpl_connect("key_press_event", self._on_key)
+        self.fig.canvas.mpl_connect("close_event", self._on_close)
 
         self.next_row()
 
     def _on_key(self, event) -> None:
         if event.key in ("n", " ", "right"):
             self.next_row()
+
+    def _on_close(self, _event) -> None:
+        # Runs synchronously as the window tears down -- fine here since
+        # this only reads (never touches the plot), and the prefetch
+        # thread's own model calls don't overlap with this one in any way
+        # that shares mutable state (torch inference has none here).
+        print(f"\nWindow closed -- running error/input correlation analysis on {self.error_samples:,} random episodes...")
+        _correlate_errors_with_inputs(
+            self.ds, self.model, self.gen_params, self.normalize_by_base, self.cfg,
+            n_samples=self.error_samples, seed=None,
+        )
 
     def _prefetch_loop(self) -> None:
         while True:
@@ -370,6 +611,10 @@ def main() -> None:
         help=f"Marker/line transparency, 0 (invisible) to 1 (opaque) -- default {_DEFAULT_ALPHA}. "
              "Lower it further if overlapping horizon dots still occlude each other.",
     )
+    ap.add_argument(
+        "--error-samples", type=int, default=20_000,
+        help="How many random episodes to sample for the on-close error/input correlation analysis (default 20,000).",
+    )
     args = ap.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
@@ -405,7 +650,9 @@ def main() -> None:
     gen_params = BallEpisodeGenParams.from_config()
     normalize_by_base = bool(cfg.get("normalize_kinematics_by_base_pitch", gen_params.normalize_kinematics_by_base_pitch))
 
-    inspector = Inspector(ds, model, cfg, gen_params, normalize_by_base, args.seed, alpha=args.alpha)
+    inspector = Inspector(
+        ds, model, cfg, gen_params, normalize_by_base, args.seed, alpha=args.alpha, error_samples=args.error_samples,
+    )
     inspector.show()
 
 

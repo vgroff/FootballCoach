@@ -1498,6 +1498,7 @@ def test_train_smoke(tmp_path, caplog, monkeypatch):
         )
     assert "Median val episode" in caplog.text
     assert "Worst (max loss) val episode" in caplog.text
+    assert "Latent diagnostics" in caplog.text
     assert output_path.exists()
     assert "encoder_state_dict" in artifact
     assert "physics_config_hash" in artifact
@@ -1548,6 +1549,66 @@ def test_train_smoke(tmp_path, caplog, monkeypatch):
     encoder.load_state_dict(loaded["encoder_state_dict"])
     for p1, p2 in zip(encoder.state_dict().values(), artifact["encoder_state_dict"].values()):
         torch.testing.assert_close(p1, p2)
+
+
+# ---------------------------------------------------------------------------
+# latent_stats.py
+# ---------------------------------------------------------------------------
+
+def test_compute_latent_stats_flags_dead_dims_and_identity_block_variance():
+    """A fresh identity_shortcut encoder: dims [0:9) are the hand-init
+    identity block (real variance, driven by the random inputs) and dims
+    [9:latent_dim) are the zeroed 'spare' rows (see widen_ball_checkpoint.py's
+    dead-lock bug docstring) -- exactly the case this diagnostic exists to
+    surface, so it doubles as a regression check that dead-dim detection
+    actually catches that known failure mode."""
+    from footballcoach.ai.physics_pretrain.latent_stats import compute_latent_stats
+    from footballcoach.ai.physics_pretrain.ball_dynamics_net import BallDynamicsEncoder, N_IDENTITY_SHORTCUT_FIELDS
+
+    latent_dim = 16
+    enc = BallDynamicsEncoder(latent_dim=latent_dim, identity_shortcut=True)
+    rng = np.random.default_rng(0)
+    inputs = rng.standard_normal((500, enc.trunk[0].in_features)).astype(np.float32)
+
+    stats = compute_latent_stats(enc, inputs, torch.device("cpu"))
+    assert stats["n_rows"] == 500
+    assert stats["latent_dim"] == latent_dim
+    assert set(stats["dead_dims"].tolist()) == set(range(N_IDENTITY_SHORTCUT_FIELDS, latent_dim))
+    assert stats["n_dead_dims"] == latent_dim - N_IDENTITY_SHORTCUT_FIELDS
+    assert np.all(stats["std"][:N_IDENTITY_SHORTCUT_FIELDS] > 1e-3)
+    # cov/corr must be exactly latent_dim x latent_dim and symmetric.
+    assert stats["cov"].shape == (latent_dim, latent_dim)
+    assert stats["corr"].shape == (latent_dim, latent_dim)
+    np.testing.assert_allclose(stats["corr"], stats["corr"].T)
+    assert not np.any(np.isnan(stats["corr"]))
+    # Effective rank can't exceed the nominal latent_dim, and with 7 fully
+    # dead dims must land meaningfully below it.
+    assert 0 < stats["effective_rank_participation_ratio"] <= latent_dim
+    assert stats["effective_rank_participation_ratio"] < N_IDENTITY_SHORTCUT_FIELDS + 1
+
+
+def test_compute_latent_stats_subsamples_when_over_max_rows():
+    from footballcoach.ai.physics_pretrain.latent_stats import compute_latent_stats
+    from footballcoach.ai.physics_pretrain.ball_dynamics_net import BallDynamicsEncoder
+
+    enc = BallDynamicsEncoder(latent_dim=8, identity_shortcut=False)
+    inputs = np.random.default_rng(1).standard_normal((300, enc.trunk[0].in_features)).astype(np.float32)
+    stats = compute_latent_stats(enc, inputs, torch.device("cpu"), max_rows=50)
+    assert stats["n_rows"] == 50
+
+
+def test_format_latent_stats_is_a_readable_multiline_string():
+    from footballcoach.ai.physics_pretrain.latent_stats import compute_latent_stats, format_latent_stats
+    from footballcoach.ai.physics_pretrain.ball_dynamics_net import BallDynamicsEncoder
+
+    enc = BallDynamicsEncoder(latent_dim=8, identity_shortcut=False)
+    inputs = np.random.default_rng(2).standard_normal((200, enc.trunk[0].in_features)).astype(np.float32)
+    stats = compute_latent_stats(enc, inputs, torch.device("cpu"))
+    text = format_latent_stats(stats)
+    assert "Latent diagnostics" in text
+    assert "effective rank" in text
+    assert "most-correlated pairs" in text
+    assert text.count("\n") >= 5
 
 
 # ---------------------------------------------------------------------------

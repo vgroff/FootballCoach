@@ -1151,6 +1151,19 @@ def train(
             model.encoder.load_state_dict(ckpt["encoder_state_dict"])
             log.info(f"Resumed encoder only from {init_checkpoint} (decoder left at fresh init)")
 
+    # Latent-space diagnostic snapshot at "epoch 0" -- i.e. exactly the
+    # state above, BEFORE any training this run happens (whether that's a
+    # fresh random init or weights just resumed from init_checkpoint). Pure
+    # logging, nothing here feeds back into training -- see
+    # latent_stats.compute_latent_stats's docstring for what each figure
+    # means and why (dead dims, off-diagonal correlation/redundancy,
+    # effective rank via the covariance eigenspectrum, etc.) -- a quick way
+    # to eyeball whether the latent space is "well-behaved" without waiting
+    # for a full run to see it in the loss curves.
+    from footballcoach.ai.physics_pretrain.latent_stats import compute_latent_stats, format_latent_stats
+    latent_stats_at_init = compute_latent_stats(model.encoder, ds.inputs[train_idx], device)
+    log.info(format_latent_stats(latent_stats_at_init))
+
     def _save_phase_checkpoint(phase: str) -> None:
         """Full model (encoder+decoder) checkpoint written either after a
         given phase completes or (phase="midtrain_latest") on every new
@@ -2230,7 +2243,8 @@ def train(
                 )
                 if has_crossing_data:
                     mean_val_backprop_loss_do += crossing_weight * mean_val_crossing_loss_do
-                improved_do = mean_val_loss_do < (best_val_loss_do - decoder_only_early_stop_min_delta)
+                raw_drop_do = best_val_loss_do - mean_val_loss_do
+                improved_do = raw_drop_do > decoder_only_early_stop_min_delta
                 # "best" only moves on a genuine (>=min_delta) improvement --
                 # otherwise best_val_loss_do/the printed "best=" ratchets down
                 # on every tiny (<min_delta) decrease while the patience
@@ -2271,10 +2285,13 @@ def train(
                 val_pct_ballistic_do = _pct_ballistic_from_group_sums(val_sq_err_do, val_n_do)
                 val_line_do = f"  val_loss={mean_val_loss_do:.4f}  best={best_val_loss_do:.4f}"
                 if decoder_only_early_stop_enabled:
-                    val_line_do += (
-                        "  (improved)" if improved_do
-                        else f"  (patience {decoder_only_patience_ctr}/{decoder_only_early_stop_patience})"
-                    )
+                    if improved_do:
+                        val_line_do += f"  (improved by {raw_drop_do:.6f} > min_delta={decoder_only_early_stop_min_delta:.1e})"
+                    else:
+                        val_line_do += (
+                            f"  (patience {decoder_only_patience_ctr}/{decoder_only_early_stop_patience}, "
+                            f"raw_drop={raw_drop_do:.6f} <= min_delta={decoder_only_early_stop_min_delta:.1e})"
+                        )
 
             pair_line_do = ""
             if adjacent_pair_training_enabled and n_horizons > 1:
@@ -2531,10 +2548,21 @@ def train(
             val_r2 = _r2_from_group_sums(val_sq_err, val_n)
             val_pct_disp = _pct_disp_from_group_sums(val_sq_err, val_n)
             val_pct_ballistic = _pct_ballistic_from_group_sums(val_sq_err, val_n)
-            improved = val_loss < (best_val_loss - early_stop_min_delta)
+            # raw_drop is the plain best_val_loss - val_loss difference, before
+            # the min_delta bar is applied -- logged alongside the pass/fail
+            # verdict so "why didn't patience reset" is answerable from this
+            # line alone instead of needing to cross-reference the config.
+            raw_drop = best_val_loss - val_loss
+            improved = raw_drop > early_stop_min_delta
             val_line = f"  val_loss={val_loss:.4f}  best={min(best_val_loss, val_loss):.4f}"
             if early_stop_enabled:
-                val_line += "  (improved)" if improved else f"  (patience {patience_ctr + 1}/{early_stop_patience})"
+                if improved:
+                    val_line += f"  (improved by {raw_drop:.6f} > min_delta={early_stop_min_delta:.1e})"
+                else:
+                    val_line += (
+                        f"  (patience {patience_ctr + 1}/{early_stop_patience}, "
+                        f"raw_drop={raw_drop:.6f} <= min_delta={early_stop_min_delta:.1e})"
+                    )
             if improved:
                 best_val_loss = val_loss
                 if early_stop_enabled:
@@ -2906,6 +2934,11 @@ def train(
 
 def main() -> None:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+    # Caps torch's own op-level thread pool -- otherwise it defaults to
+    # using every available core for a single training process, which is
+    # more than this workload benefits from and leaves nothing for the rest
+    # of the machine while a long run is going.
+    torch.set_num_threads(5)
     from footballcoach.ai.config import load_ai_config
     cfg = load_ai_config()["physics_pretrain"]["ball"]
 

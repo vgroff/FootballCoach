@@ -967,6 +967,16 @@ def train(
                 log.info(f"Checkpoint had {len(unexpected)} unexpected encoder param(s), ignored: {unexpected}")
             log.info(f"Resumed encoder only from {init_checkpoint} (decoder left at fresh init)")
 
+    # Latent-space diagnostic snapshot at "epoch 0" -- see
+    # train_ball_dynamics.py's identical call site / latent_stats.
+    # compute_latent_stats's docstring for what each figure means (dead
+    # dims, off-diagonal correlation/redundancy, effective rank via the
+    # covariance eigenspectrum, etc.). Pure logging, nothing here feeds
+    # back into training.
+    from footballcoach.ai.physics_pretrain.latent_stats import compute_latent_stats, format_latent_stats
+    latent_stats_at_init = compute_latent_stats(model.encoder, ds.inputs[train_idx], device)
+    log.info(format_latent_stats(latent_stats_at_init))
+
     normalization = {"pitch_half_diag_m": pitch_half_diag_m}
 
     def _save_phase_checkpoint(phase: str) -> None:
@@ -1541,10 +1551,19 @@ def train(
             val_res_do = _run_eval_pass(val_idx) if len(val_idx) > 0 else train_res_do
             mean_train_loss_do = train_res_do["mean_loss"]
             mean_val_loss_do = val_res_do["mean_loss"] if len(val_idx) > 0 else float("inf")
-            log.info(f"  decoder-only pretrain epoch {do_epoch + 1}/{decoder_only_pretrain_epochs}: train_loss={mean_train_loss_do:.4f}  val_loss={mean_val_loss_do:.4f}")
+            raw_drop_do = best_val_loss_do - mean_val_loss_do
+            improved_do = raw_drop_do > do_early_stop_min_delta
+            do_verdict = (
+                f"(improved by {raw_drop_do:.6f} > min_delta={do_early_stop_min_delta:.1e})" if improved_do
+                else f"(patience {patience_ctr_do + 1}/{do_early_stop_patience}, raw_drop={raw_drop_do:.6f} <= min_delta={do_early_stop_min_delta:.1e})"
+            )
+            log.info(
+                f"  decoder-only pretrain epoch {do_epoch + 1}/{decoder_only_pretrain_epochs}: "
+                f"train_loss={mean_train_loss_do:.4f}  val_loss={mean_val_loss_do:.4f}  {do_verdict}"
+            )
             _log_aux_diagnostics(train_res_do["aux"], val_res_do["aux"])
 
-            if mean_val_loss_do < best_val_loss_do - do_early_stop_min_delta:
+            if improved_do:
                 best_val_loss_do = mean_val_loss_do
                 best_state_do = copy.deepcopy(model.state_dict())
                 patience_ctr_do = 0
@@ -1594,10 +1613,21 @@ def train(
         loss_delta_stats = train_res["loss_delta_stats"]
 
         val_loss = val_res["mean_loss"]
-        improved = val_loss < (best_val_loss - early_stop_min_delta)
+        # raw_drop is the plain best_val_loss - val_loss difference, before
+        # the min_delta bar is applied -- logged alongside the pass/fail
+        # verdict so "why didn't patience reset" is answerable from this
+        # line alone instead of needing to cross-reference the config.
+        raw_drop = best_val_loss - val_loss
+        improved = raw_drop > early_stop_min_delta
         val_line = f"  val_loss={val_loss:.4f}  best={min(best_val_loss, val_loss):.4f}"
         if early_stop_enabled:
-            val_line += "  (improved)" if improved else f"  (patience {patience_ctr + 1}/{early_stop_patience})"
+            if improved:
+                val_line += f"  (improved by {raw_drop:.6f} > min_delta={early_stop_min_delta:.1e})"
+            else:
+                val_line += (
+                    f"  (patience {patience_ctr + 1}/{early_stop_patience}, "
+                    f"raw_drop={raw_drop:.6f} <= min_delta={early_stop_min_delta:.1e})"
+                )
         log.info(
             f"epoch {epoch + 1}/{epochs}: train_loss={train_res['mean_loss']:.4f}  "
             f"pair_loss={train_res['mean_pair_loss']:.4f}  t0_loss={train_res['mean_t0_loss']:.4f}{val_line}"
@@ -1858,6 +1888,12 @@ def train(
 
 
 def main() -> None:
+    # Caps torch's own op-level thread pool -- otherwise it defaults to
+    # using every available core for a single training process, which is
+    # more than this workload benefits from and leaves nothing for the rest
+    # of the machine while a long run is going. Same cap as train_ball_
+    # dynamics.py.
+    torch.set_num_threads(5)
     from footballcoach.ai.config import load_ai_config
     cfg = load_ai_config()["physics_pretrain"]["player"]
 

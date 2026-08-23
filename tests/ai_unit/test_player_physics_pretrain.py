@@ -737,6 +737,7 @@ def test_train_smoke(tmp_path, caplog):
     assert "physics_config_hash" in artifact
     assert "normalization" in artifact
     assert artifact["normalization"]["pitch_half_diag_m"] > 0
+    assert "Latent diagnostics" in caplog.text
 
     report_path = output_path.with_suffix(".report.html")
     assert report_path.exists()
