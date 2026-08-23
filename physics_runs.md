@@ -56,3 +56,30 @@
 2026-08-23 12:03:44,918 INFO     val   t0 pos_rmse  by horizon (m): [0.6156 0.3786 0.2395 0.1931 0.1653 0.1166 0.087  0.08  ], mean: 0.2345 m
 2026-08-23 12:03:44,918 INFO     val   pos_err_pct_ballistic by horizon: [254.7188  66.9368  39.1757  21.5881   9.217    4.9073   2.9194   1.8967], mean: 50.1700
 2026-08-23 12:03:44,918 INFO     val   vel_err_pct_ballistic by horizon: [10.6536  7.6708  8.4158 11.0859  7.9649  5.3777  3.6574  2.5205], mean: 7.1683
+2026-08-23 12:19:51,887 INFO Saved 'midtrain_latest' checkpoint to checkpoints/physics_pretrain/ball_encoder_38.midtrain_latest.pt
+2026-08-23 12:19:51,888 INFO epoch 2/1000: train_loss=0.0059  val_loss=0.0059  best=0.0059  (improved by 0.000054 > min_delta=1.0e-07)  lr=4.99e-05  train_pair_loss=0.0006  val_pair_loss=0.0006  train_t0_loss=0.0000  val_t0_loss=0.0000  train_crossing_loss=0.1801 (pos_dist=0.0206, dt_mae=0.1058)  val_crossing_loss=0.2767 (pos_dist=0.0205, dt_mae=0.1165)  train_resting_loss=0.0005 (pos_dist=0.0130)  train_position_loss=0.0000 (pos_dist=0.0005)  train_event_loss=0.0889 (oob_acc=0.9918, goal_acc=0.9736)  train_backprop_loss=0.0078  val_resting_loss=0.0005 (pos_dist=0.0129)  val_position_loss=0.0000 (pos_dist=0.0003)  val_event_loss=0.0980 (oob_acc=0.9877, goal_acc=0.9729)  val_backprop_loss=0.0076
+2026-08-23 12:19:51,888 INFO     grad_norm: mean=0.155038 std=0.085452 min=0.064146 max=0.886743
+2026-08-23 12:19:51,888 INFO     train_loss_delta (batch-to-batch): mean=-0.000000 std=0.000224 min=-0.001586 max=0.002176
+2026-08-23 12:19:51,888 INFO     val_loss_delta (epoch-over-epoch): -0.000054
+2026-08-23 12:19:51,888 INFO     train pos_rmse  by horizon (m): [0.9003 0.8403 1.0037 1.213  1.2266 1.1199 1.0989 1.1987], mean: 1.0752 m
+2026-08-23 12:19:51,888 INFO     train pos_dist  by horizon (m): [1.3816 1.3242 1.4875 1.6986 1.6306 1.5097 1.4598 1.5102], mean: 1.5003 m
+2026-08-23 12:19:51,888 INFO     train vel_rmse  by horizon (m/s): [0.7971 0.6387 0.7744 1.4633 1.7093 1.5978 1.4931 1.4497], mean: 1.2404 m/s
+2026-08-23 12:19:51,889 INFO     train vel_dist  by horizon (m/s): [1.0216 0.8624 1.0331 2.0144 2.258  2.0406 1.9383 1.9605], mean: 1.6411 m/s
+2026-08-23 12:19:51,889 INFO     train pos_r2    by horizon: [0.9982 0.9985 0.998  0.9976 0.998  0.9986 0.9988 0.9987], mean: 0.9983
+2026-08-23 12:19:51,889 INFO     train vel_r2    by horizon: [ 0.9921  0.9932  0.9859  0.9192  0.8149  0.6291  0.3601 -0.4607], mean: 0.6542
+2026-08-23 12:19:51,889 INFO     train pos_err_pct_disp by horizon: [47.5629 19.3863 12.8569  9.3438  6.8119  5.2689  4.6269  4.7192], mean: 13.8221
+2026-08-23 12:19:51,889 INFO     train vel_err_pct_disp by horizon: [10.8194  8.7351 11.1448 18.3467 18.0609 16.6417 14.5582 13.7447], mean: 14.0064
+2026-08-23 12:19:51,889 INFO     train pos_err_pct_ballistic by horizon: [251.0517  67.2841  38.9903  21.5449   9.2414   4.8256   2.8681   1.9054], mean: 49.7140
+2026-08-23 12:19:51,890 INFO     train vel_err_pct_ballistic by horizon: [10.2202  7.5149  8.3653 11.0153  7.8786  5.3458  3.6512  2.5159], mean: 7.0634
+2026-08-23 12:19:51,890 INFO     train t0 pos_rmse  by horizon (m): [0.6105 0.3784 0.2348 0.1869 0.1584 0.1128 0.0715 0.0682], mean: 0.2277 m
+2026-08-23 12:19:51,890 INFO     val   pos_rmse  by horizon (m): [0.9005 0.8358 0.9933 1.2066 1.2306 1.1276 1.105  1.2018], mean: 1.0752 m
+2026-08-23 12:19:51,890 INFO     val   pos_dist  by horizon (m): [1.3833 1.3159 1.4714 1.6887 1.6315 1.5119 1.4432 1.485 ], mean: 1.4914 m
+2026-08-23 12:19:51,890 INFO     val   vel_rmse  by horizon (m/s): [0.7989 0.6345 0.7703 1.4745 1.7175 1.605  1.4941 1.4587], mean: 1.2442 m/s
+2026-08-23 12:19:51,890 INFO     val   vel_dist  by horizon (m/s): [1.0237 0.8601 1.0276 2.026  2.2629 2.044  1.9353 1.9674], mean: 1.6434 m/s
+2026-08-23 12:19:51,890 INFO     val   pos_r2    by horizon: [0.9982 0.9985 0.998  0.9976 0.998  0.9986 0.9988 0.9987], mean: 0.9983
+2026-08-23 12:19:51,890 INFO     val   vel_r2    by horizon: [ 0.992   0.9933  0.986   0.9179  0.8131  0.6258  0.3593 -0.4788], mean: 0.6511
+2026-08-23 12:19:51,891 INFO     val   pos_err_pct_disp by horizon: [47.5611 19.2768 12.7218  9.2943  6.8334  5.3038  4.6492  4.7264], mean: 13.7958
+2026-08-23 12:19:51,891 INFO     val   vel_err_pct_disp by horizon: [10.8422  8.676  11.0843 18.4876 18.1484 16.7164 14.5673 13.8299], mean: 14.0440
+2026-08-23 12:19:51,891 INFO     val   t0 pos_rmse  by horizon (m): [0.5982 0.3642 0.2258 0.1786 0.1533 0.1018 0.068  0.0582], mean: 0.2185 m
+2026-08-23 12:19:51,891 INFO     val   pos_err_pct_ballistic by horizon: [251.0423  66.9041  38.5808  21.4306   9.2705   4.8576   2.8819   1.9083], mean: 49.6095
+2026-08-23 12:19:51,891 INFO     val   vel_err_pct_ballistic by horizon: [10.2418  7.4639  8.32   11.0999  7.9168  5.3697  3.6535  2.5315], mean: 7.0747

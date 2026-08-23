@@ -204,14 +204,23 @@ def _correlate_errors_with_inputs(
     and valid special case) since both are plausible error drivers not
     literally present as a single raw input field.
 
-    NOTE on reading the printed ``r`` values: Pearson's r is a unitless
-    measure of LINEAR association strength (-1..1), NOT a regression
-    slope -- "r=0.6 for speed" does NOT mean "0.6m of extra error per
-    extra m/s of speed". The actual slope (in the error metric's own
-    units per unit of the feature) is ``r * std(error) / std(feature)``;
-    r alone only tells you how tight/strong the linear relationship is
-    (``r^2`` = fraction of the error's variance linearly explained by
-    that one feature).
+    NOTE on reading the printed ``r``/``slope`` values: Pearson's r is a
+    unitless measure of LINEAR association strength (-1..1), NOT a
+    regression slope -- "r=0.6 for speed" does NOT mean "0.6m of extra
+    error per extra m/s of speed" (``r^2`` is the fraction of the error's
+    variance linearly explained by that one feature, which is the closest
+    r itself gets to a directly-interpretable number). The separately
+    printed ``slope`` IS that "extra [error unit] per [feature unit]"
+    figure -- the ordinary-least-squares slope of error regressed on the
+    feature ALONE (``cov(feature, error) / var(feature)``, equivalently
+    ``r * std(error) / std(feature)``) -- read its units as (whatever this
+    section's error is measured in) per (whatever that feature's own
+    listed unit is), e.g. "slope=+0.842/unit" under "speed (m/s)" in the
+    "mean position error (m, ...)" section means +0.842m of error per
+    extra m/s of speed. A univariate slope like this doesn't account for
+    other correlated features (e.g. speed and vel_z moving together) --
+    it's "how error trends with this feature alone," not an isolated
+    causal effect.
 
     Pure diagnostic printout -- returns nothing, mutates nothing.
     """
@@ -307,16 +316,23 @@ def _correlate_errors_with_inputs(
             return
         rows = []
         for name, vals in feats.items():
-            if np.std(vals) < 1e-12 or np.std(err) < 1e-12:
+            var = float(np.var(vals))
+            if var < 1e-24 or np.std(err) < 1e-12:
                 continue  # a constant feature/error this sample has no defined correlation
             r = float(np.corrcoef(vals, err)[0, 1])
-            rows.append((name, r))
+            # OLS slope of err ~ vals (Delta-error per unit Delta-feature) --
+            # NOT the same thing as r (see this function's docstring): r is
+            # unitless strength/direction, slope = cov(vals,err)/var(vals)
+            # = r * std(err)/std(vals) is the actual "how many
+            # [error units] per [feature unit]" a reader would want.
+            slope = float(np.cov(vals, err, ddof=1)[0, 1] / var)
+            rows.append((name, r, slope))
         rows.sort(key=lambda t: -abs(t[1]))
         if top_k is not None:
             rows = rows[:top_k]
-        for name, r in rows:
+        for name, r, slope in rows:
             bar = "#" * int(round(abs(r) * 40))
-            print(f"    {name:24s} r={r:+.3f}  {bar}")
+            print(f"    {name:24s} r={r:+.3f}  slope={slope:+.4g}/unit  {bar}")
 
     print(f"\n========== error / input correlation analysis ({sample_size:,} random episodes) ==========")
     _print_ranked("mean position error (m, averaged over horizons)", pos_err_m)

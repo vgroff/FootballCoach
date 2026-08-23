@@ -1014,9 +1014,11 @@ def test_event_head_loss_matches_manual_bce():
 
 def test_train_excludes_already_out_of_bounds_starts_from_crossing_supervision(tmp_path, monkeypatch):
     """train() must AND compute_already_out_of_bounds_at_start_mask into
-    ds.crossing_mask and force those rows' crossing_dt to the -1 sentinel
-    -- i.e. after setup, no already-out-of-bounds-at-start row should still
-    have crossing_mask=True."""
+    ds.crossing_mask (excluding those rows from crossing_mask, so no
+    already-out-of-bounds-at-start row should still have crossing_mask=
+    True) and force those rows' crossing_dt to 0.0 (already crossed as of
+    t=0) -- NOT the -1.0 "never crosses" sentinel, which would be a
+    factually wrong target for a row that genuinely did cross."""
     from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
     from footballcoach.ai.physics_pretrain.ball_dataset import BallDynamicsDataset
     import footballcoach.ai.config as ai_config_mod
@@ -1063,7 +1065,11 @@ def test_train_excludes_already_out_of_bounds_starts_from_crossing_supervision(t
     gen_params = BallEpisodeGenParams.from_config()
     already_oob = ds.compute_already_out_of_bounds_at_start_mask(gen_params)
     assert not np.any(ds.crossing_mask[already_oob])
-    assert np.all(ds.crossing_dt[already_oob] == -1.0)
+    # 0.0 ("already crossed as of t=0"), NOT the -1.0 "never crosses"
+    # sentinel -- these rows genuinely did cross, immediately, so -1.0
+    # would be a factually wrong target (see train_ball_dynamics.py's call
+    # site for the full reasoning).
+    assert np.all(ds.crossing_dt[already_oob] == 0.0)
 
 
 def test_build_autoencoding_data_no_filtering_and_reencodes_correctly(tmp_path):

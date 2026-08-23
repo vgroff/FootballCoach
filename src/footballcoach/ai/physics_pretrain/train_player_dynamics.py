@@ -846,6 +846,24 @@ def train(
             "crossing_pos_loss_weight/crossing_dt_loss_weight != 0 but this dataset carries no "
             "crossings/crossing_times -- crossing_head will not be trained."
         )
+    if has_crossing_data:
+        # Episodes that started ALREADY out of bounds/in a goal mouth (see
+        # compute_already_out_of_bounds_at_start_mask's docstring) get the
+        # POSITION term excluded (same treatment as "never crosses" -- a
+        # near-trivial function of the raw t=0 input, not the "will an
+        # in-play player actually leave the pitch/score" signal the head
+        # exists to predict) but delta_t forced to 0.0 ("already crossed
+        # as of t=0"), NOT the -1.0 "never crosses" sentinel -- these
+        # episodes genuinely did cross, immediately, so -1.0 would train
+        # the (unmasked) delta_t term against a factually wrong target.
+        # Mirrors train_ball_dynamics.py's identical train-time patch --
+        # see its call site for the full reasoning. Applying this here
+        # (rather than relying solely on generate_episode's own
+        # generation-time exclusion) means it also fixes any dataset
+        # generated before that exclusion existed, no regeneration needed.
+        already_oob_at_start = ds.compute_already_out_of_bounds_at_start_mask(gen_params)
+        ds.crossing_mask = ds.crossing_mask & ~already_oob_at_start
+        ds.crossing_dt = np.where(already_oob_at_start, 0.0, ds.crossing_dt).astype(np.float32)
 
     goal_dist_delta_weight = float(cfg.get("goal_dist_delta_loss_weight", 0.0))
     goal_dist_delta_targets = None

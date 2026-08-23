@@ -228,6 +228,64 @@ class PlayerDynamicsDataset:
         n_val = max(1, int(round(n * val_frac)))
         return idx[n_val:], idx[:n_val]
 
+    def compute_already_out_of_bounds_at_start_mask(
+        self, gen_params, indices: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Returns a boolean ``(len(indices),)`` mask, ``True`` where this
+        episode's OWN raw t=0 ``self.inputs`` row was already out of the
+        pitch bounds, or already inside a goal mouth WHILE carrying the
+        ball (``has_possession``, field 11), before any physics ran --
+        i.e. it came from ``player_episode_gen.py``'s ``_sample_position_
+        already_special`` branch (``physics_pretrain.player.out_of_
+        bounds_start_frac``). Mirrors ``BallDynamicsDataset.compute_
+        already_out_of_bounds_at_start_mask`` (see its docstring for the
+        full rationale), adapted for this pipeline's field layout (2D
+        position, no height; pitch/goal dims at fields 17-20 instead of
+        10-13) and gating the goal-mouth check on ``has_possession`` --
+        matching ``generate_episode``'s own ``goal_now = has_possession
+        and pitch.is_goal(...)`` rule, since a non-possessing player can't
+        "score" by standing in the goal mouth (``out_of_bounds`` has no
+        such gating, matching ``oob_now = not pitch.is_in_bounds(...)``).
+
+        Unlike the ball pipeline, ``generate_episode`` ALREADY forces
+        ``crossing_time_s = math.inf`` for these rows at GENERATION time
+        (see its docstring), so on a freshly-generated dataset they're
+        already excluded from ``crossing_mask`` for free. This method
+        exists so a caller can still IDENTIFY them independent of what
+        ``crossing_mask``/``crossing_dt`` already say -- needed to fix
+        ``crossing_dt`` to the physically correct ``0.0`` ("already
+        crossed as of t=0") rather than generation's ``-1.0`` ("never
+        crosses", factually wrong for these rows) purely from the raw
+        input row, with no dataset regeneration required -- and works
+        identically on a dataset generated BEFORE the generation-time
+        exclusion existed at all (where these rows are still sitting with
+        ``crossing_mask=True`` and a degenerate near-t=0 crossing
+        recorded, exactly like the ball pipeline's original bug).
+        """
+        idx = indices if indices is not None else np.arange(len(self))
+        inputs = self.inputs[idx]
+
+        half_length_ep = inputs[:, 17] * gen_params.base_pitch_length_m / 2
+        half_width_ep = inputs[:, 18] * gen_params.base_pitch_width_m / 2
+        goal_width_ep = inputs[:, 19] * gen_params.base_goal_width_m
+        has_possession = inputs[:, 11] >= 0.5
+
+        if gen_params.normalize_kinematics_by_base_pitch:
+            base_half_length = gen_params.base_pitch_length_m / 2
+            base_half_width = gen_params.base_pitch_width_m / 2
+            div_x = div_y = math.hypot(base_half_length, base_half_width)
+        else:
+            div_x, div_y = half_length_ep, half_width_ep
+
+        pos_x = inputs[:, 0] * div_x
+        pos_y = inputs[:, 1] * div_y
+
+        in_bounds = (np.abs(pos_x) <= half_length_ep) & (np.abs(pos_y) <= half_width_ep)
+        in_goal_mouth = (
+            (np.abs(pos_y) <= goal_width_ep / 2) & ((pos_x <= -half_length_ep) | (pos_x >= half_length_ep))
+        )
+        return (~in_bounds) | (has_possession & in_goal_mouth)
+
     def compute_pos_weights(
         self, n_horizons: int, indices: np.ndarray | None = None, max_weight: float | None = None,
     ) -> np.ndarray:

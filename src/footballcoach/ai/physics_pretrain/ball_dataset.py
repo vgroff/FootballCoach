@@ -496,8 +496,13 @@ class BallDynamicsDataset:
         in-play ball actually go out/score" signal the head exists to
         predict -- same rationale as ``build_adjacent_pair_data``'s
         already-resolved-state exclusion. Callers should exclude these rows
-        from ``crossing_mask``/force their ``crossing_dt`` to the ``-1``
-        sentinel, same treatment as "never crosses".
+        from ``crossing_mask`` (same treatment as "never crosses", for the
+        POSITION term only) but force their ``crossing_dt`` to ``0.0``, NOT
+        the ``-1`` "never crosses" sentinel -- these episodes genuinely did
+        cross, immediately, so ``-1`` would train the (unmasked) delta_t
+        term against a target that's factually wrong, not just
+        uninteresting. See ``train_ball_dynamics.py``'s call site for the
+        full reasoning.
         """
         idx = indices if indices is not None else np.arange(len(self))
         already_oob, already_goal = self._already_oob_and_goal_at_start(gen_params, idx)

@@ -763,6 +763,81 @@ def test_train_smoke(tmp_path, caplog):
         torch.testing.assert_close(p1, p2)
 
 
+def test_compute_already_out_of_bounds_at_start_mask_matches_sampling_fraction(gen_params, tmp_path):
+    """Roughly out_of_bounds_start_frac of episodes should be flagged, and
+    every flagged row's t=0 position must genuinely be outside the pitch
+    or (while carrying the ball) inside a goal mouth, checked against
+    THIS episode's own (possibly randomized) pitch/goal dims -- mirrors
+    test_ball_physics_pretrain.py's identical test."""
+    generate_dataset(n_episodes=3000, output_dir=tmp_path, seed=21, shard_size=3000, n_workers=1)
+    ds = PlayerDynamicsDataset.from_directory(tmp_path)
+    mask = ds.compute_already_out_of_bounds_at_start_mask(gen_params)
+
+    assert mask.mean() == pytest.approx(gen_params.out_of_bounds_start_frac, abs=0.02)
+
+    for i in np.nonzero(mask)[0][:50]:
+        row = ds.inputs[i]
+        length_m = row[17] * gen_params.base_pitch_length_m
+        width_m = row[18] * gen_params.base_pitch_width_m
+        goal_w_m = row[19] * gen_params.base_goal_width_m
+        goal_h_m = row[20] * gen_params.base_goal_height_m
+        pitch = Pitch(
+            length_m=length_m, width_m=width_m, goal_width_m=goal_w_m, goal_height_m=goal_h_m,
+            goal_depth_m=2.0, box_length_m=16.5, box_width_m=40.32,
+            six_yard_length_m=5.5, six_yard_width_m=18.32,
+            penalty_spot_distance_m=11.0, centre_circle_radius_m=9.15,
+        )
+        if gen_params.normalize_kinematics_by_base_pitch:
+            div = math.hypot(gen_params.base_pitch_length_m / 2, gen_params.base_pitch_width_m / 2)
+            div_x = div_y = div
+        else:
+            div_x, div_y = length_m / 2, width_m / 2
+        from footballcoach.mathutils import Vector3
+        pos = Vector3(row[0] * div_x, row[1] * div_y, 0.0)
+        has_possession = row[11] >= 0.5
+        assert (not pitch.is_in_bounds(pos)) or (has_possession and pitch.is_goal(pos) is not None)
+
+
+def test_train_excludes_already_out_of_bounds_starts_from_crossing_supervision(tmp_path, monkeypatch):
+    """train() must AND compute_already_out_of_bounds_at_start_mask into
+    ds.crossing_mask (excluding those rows from crossing_mask) and force
+    those rows' crossing_dt to 0.0 (already crossed as of t=0) -- NOT the
+    -1.0 "never crosses" sentinel, which would be a factually wrong target
+    for a row that genuinely did cross. Mirrors test_ball_physics_
+    pretrain.py's identical test; unlike the ball pipeline this is
+    ALREADY true for a freshly-generated player dataset too (generate_
+    episode bakes the same exclusion in at generation time), so this
+    mainly confirms train()'s own patch doesn't disagree with it."""
+    from footballcoach.ai.physics_pretrain.train_player_dynamics import train
+    from footballcoach.ai.physics_pretrain.player_episode_gen import PlayerEpisodeGenParams
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=2000, output_dir=dataset_dir, seed=13, shard_size=2000, n_workers=1)
+
+    captured = {}
+    orig_from_directory = PlayerDynamicsDataset.from_directory.__func__
+
+    def _patched(cls, *a, **kw):
+        ds = orig_from_directory(cls, *a, **kw)
+        captured["ds"] = ds
+        return ds
+
+    monkeypatch.setattr(PlayerDynamicsDataset, "from_directory", classmethod(_patched))
+
+    output_path = tmp_path / "player_encoder.pt"
+    train(
+        dataset_dir=str(dataset_dir), output_path=str(output_path),
+        epochs=1, batch_size=64, lr=1e-2, val_frac=0.2, seed=0,
+    )
+
+    ds = captured["ds"]
+    gen_params = PlayerEpisodeGenParams.from_config()
+    already_oob = ds.compute_already_out_of_bounds_at_start_mask(gen_params)
+    assert already_oob.any()  # sanity: the sample actually contains some
+    assert not np.any(ds.crossing_mask[already_oob])
+    assert np.all(ds.crossing_dt[already_oob] == 0.0)
+
+
 def test_train_smoke_with_decoder_only_and_autoencode_pretraining(tmp_path, monkeypatch, caplog):
     from footballcoach.ai.physics_pretrain.train_player_dynamics import train
     import footballcoach.ai.config as ai_config_mod

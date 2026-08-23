@@ -1037,11 +1037,22 @@ def train(
         # "crosses almost immediately" crossing_dt/crossing_pos recorded --
         # a near-trivial function of the raw t=0 input, not the "will an
         # in-play ball actually go out/score" signal the head exists to
-        # predict. Excluded the same way "never crosses" already is: mask
-        # dropped, delta_t forced to the -1 sentinel.
+        # predict, so the POSITION term is excluded the same way "never
+        # crosses" is: mask dropped. delta_t is NOT masked (no masked-loss
+        # path for it, see _crossing_head_loss's docstring), so it still
+        # needs SOME target -- 0.0 ("already crossed as of t=0"), not the
+        # -1.0 "never crosses" sentinel: these episodes genuinely DID
+        # cross, immediately, so -1.0 would be training the head against a
+        # target that's factually false (actively teaches "already out of
+        # bounds/in goal" -> "won't cross"), not just an uninteresting one.
+        # 0.0 is the honest answer AND (unlike the position term) a
+        # legitimate, learnable pattern -- "is the raw input already
+        # oob/in-goal" is a real function of the input the head can pick up
+        # on, not a data artifact like the ~1-tick-late position/dt used
+        # to be before this mask/sentinel handling existed at all.
         already_oob_at_start = ds.compute_already_out_of_bounds_at_start_mask(gen_params)
         ds.crossing_mask = ds.crossing_mask & ~already_oob_at_start
-        ds.crossing_dt = np.where(already_oob_at_start, -1.0, ds.crossing_dt).astype(np.float32)
+        ds.crossing_dt = np.where(already_oob_at_start, 0.0, ds.crossing_dt).astype(np.float32)
 
     # Weight on model.resting_head's own loss (see BallDynamicsDataset.
     # compute_resting_targets / BallDynamicsAutoencoder.resting_head's
