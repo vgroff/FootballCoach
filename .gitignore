@@ -5,7 +5,6 @@ results/
 demonstrations/
 physics_pretrain_data/
 /tmp/
-debug_*.py
 *.py[oc]
 build/
 dist/
