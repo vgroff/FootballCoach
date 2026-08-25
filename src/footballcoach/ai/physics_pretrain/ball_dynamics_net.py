@@ -45,8 +45,24 @@ Z_FIELD_INDEX = 2
 
 
 class BallDynamicsEncoder(nn.Module):
-    """``input(N_INPUT_FIELDS) -> Linear(hidden) -> ReLU -> Linear(hidden) -> ReLU ->
-    Linear(bottleneck) -> ReLU -> [concat raw input[0:9] if identity_shortcut] -> Linear(latent_dim)``.
+    """``input(N_INPUT_FIELDS) -> Linear(hidden) -> LeakyReLU -> Linear(hidden) -> LeakyReLU ->
+    Linear(bottleneck) -> LeakyReLU -> [concat raw input[0:9] if identity_shortcut] -> Linear(latent_dim)``.
+
+    ``leaky_relu_negative_slope`` (default ``0.0``, i.e. plain ``ReLU`` --
+    ``nn.LeakyReLU(negative_slope=0.0)`` is mathematically identical to
+    ``nn.ReLU()``) is the trunk's activation slope for negative
+    preactivations. A unit whose preactivation is negative for every example
+    in the dataset is a "dead" ReLU unit: it outputs exactly 0 always, and
+    (since ``ReLU'(0) == 0`` by convention) gets exactly zero gradient
+    forever, with no way to recover on its own -- see ``compute_latent_
+    stats``'s dead-dim detection, which this directly addresses. A nonzero
+    slope keeps a small but nonzero gradient flowing even when a unit's
+    preactivation goes negative, so it can't get permanently stuck. Only
+    applied to the TRUNK (this class) -- deliberately NOT threaded into
+    ``BallDynamicsDecoder``'s own hidden ReLU, since ``_init_identity_
+    shortcut_decoder`` relies on the EXACT identity ``ReLU(x) - ReLU(-x) ==
+    x`` (a nonzero slope ``s`` would scale that to ``x*(1+s)`` instead,
+    corrupting the hand-initialized reconstruction path).
 
     The extra ``bottleneck`` layer compresses more gradually than going
     straight from ``hidden_dim`` to ``latent_dim`` in one step (e.g.
@@ -87,7 +103,7 @@ class BallDynamicsEncoder(nn.Module):
     def __init__(
         self, input_dim: int = N_INPUT_FIELDS, hidden_dim: int = 64, latent_dim: int = 16, bottleneck_dim: int = 32,
         identity_shortcut: bool = False, identity_shortcut_noise_std: float = 0.0,
-        concat_all_input_fields: bool = False,
+        concat_all_input_fields: bool = False, leaky_relu_negative_slope: float = 0.0,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -106,9 +122,9 @@ class BallDynamicsEncoder(nn.Module):
         # ordinary gradient reaches them from the very first backward pass.
         self.concat_all_input_fields = concat_all_input_fields
         self.trunk = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, bottleneck_dim), nn.ReLU(),
+            nn.Linear(input_dim, hidden_dim), nn.LeakyReLU(negative_slope=leaky_relu_negative_slope),
+            nn.Linear(hidden_dim, hidden_dim), nn.LeakyReLU(negative_slope=leaky_relu_negative_slope),
+            nn.Linear(hidden_dim, bottleneck_dim), nn.LeakyReLU(negative_slope=leaky_relu_negative_slope),
         )
         if identity_shortcut:
             concat_dim = input_dim if concat_all_input_fields else N_IDENTITY_SHORTCUT_FIELDS
@@ -246,6 +262,110 @@ class BallDynamicsDecoder(nn.Module):
         feat = latent.new_tensor([t_norm, t_norm ** 2, math.log1p(horizon_s)])
         return self.net(torch.cat([latent, feat.expand(batch, 3)], dim=-1))
 
+    def has_horizon(self, horizon_s: float) -> bool:
+        """Always True -- this decoder is a continuous function of time
+        (``forward_at`` above), so any horizon is queryable. Exists purely
+        for interface parity with ``BallDynamicsLinearDecoder.has_horizon``
+        (which is NOT always True), so callers (e.g. train_ball_dynamics.
+        py's adjacent-pair-combo filtering) can check availability uniformly
+        regardless of which decoder is in use."""
+        return True
+
+
+# pos_x, pos_y, pos_z, vel_x, vel_y, vel_z -- see BallDynamicsLinearDecoder.
+N_LINEAR_DECODER_TARGET_FIELDS = 6
+
+# Absolute tolerance (seconds) for matching a query horizon to one of
+# BallDynamicsLinearDecoder's registered heads. horizons_s values and
+# adjacent-pair deltas are both plain float subtraction/config literals, so
+# exact matches are the common case, but this guards against harmless float
+# noise (e.g. 3.5 - 2.0 vs 1.5 differing in the last bit).
+_LINEAR_DECODER_HORIZON_ATOL = 1e-6
+
+
+class BallDynamicsLinearDecoder(nn.Module):
+    """Alternative to ``BallDynamicsDecoder``: instead of one shared
+    nonlinear function of ``[latent; horizon features]``, this is
+    ``n_horizons + 1`` (the configured ``horizons_s``, plus ``0.0``)
+    INDEPENDENT ``Linear(latent_dim, 6)`` heads -- one dedicated weight
+    matrix per registered horizon, no horizon/time INPUT at all.
+
+    Motivation (see the physics-pretrain overfitting-diagnosis discussion in
+    train_ball_dynamics.py's module docs / agent_plans): a shared decoder
+    conditioned on a continuous time feature can only combine ``latent`` and
+    ``horizon_feats`` through a genuine nonlinearity (a ReLU layer that sees
+    both together) -- an AFFINE combination of the two can never represent
+    "position = velocity * t" (a product of an episode-specific, latent-
+    derived quantity and a horizon-derived one), since affine functions of
+    ``[a; b]`` are always ``Ma + Nb + c``, never ``a*b``. Giving each
+    horizon its OWN linear map sidesteps this entirely: the horizon-
+    dependence lives in WHICH matrix is used, not in a runtime
+    multiplication, so there's no "time" input to combine at all. This is
+    also strictly more expressive per horizon than a shared narrow hidden
+    layer (each head gets full, uncontested linear access to every latent
+    dim), at the cost of losing the ability to query horizons that aren't
+    exactly one of the registered ones -- no interpolation/extrapolation,
+    unlike ``BallDynamicsDecoder.forward_at``.
+
+    Predicts position + velocity ONLY (6 fields: ``pos_x, pos_y, pos_z,
+    vel_x, vel_y, vel_z``) -- no spin, no out_of_bounds/goal_scored logits.
+    ``forward``/``forward_at`` still return the SAME 11-wide-per-horizon
+    shape ``BallDynamicsDecoder`` does (zero-padding the missing spin/logit
+    columns) so every downstream loss/breakdown/logging function in
+    train_ball_dynamics.py works completely unchanged -- those constant-zero
+    columns carry no gradient (they're plain ``torch.zeros``, not connected
+    to any parameter), so ``spin_loss_weight``/``bce_loss_weight`` should be
+    left at 0.0 when this decoder is active (train_ball_dynamics.py logs a
+    note and the logged spin_rmse/oob_bce/goal_bce numbers, if those weights
+    are nonzero anyway, are meaningless diagnostics only -- not real
+    training signal).
+
+    ``0.0`` is ALWAYS included as a registered horizon (in addition to
+    ``horizons_s``) specifically so the t=0 autoencoding sanity check
+    (``forward_at(latent, 0.0)`` in train_ball_dynamics.py) has a head to
+    query -- it is NOT included in ``forward()``'s returned list (which
+    matches the dataset's own per-horizon targets, none of which is at
+    t=0).
+    """
+
+    def __init__(self, latent_dim: int, horizons_s: list[float] | None = None):
+        super().__init__()
+        horizons_s = horizons_s if horizons_s is not None else [0.2, 0.5, 1.0, 2.0, 3.0]
+        self.n_horizons = len(horizons_s)
+        self.latent_dim = latent_dim
+        # Index 0 is the extra t=0 head; indices [1:] mirror horizons_s's
+        # own order, so forward()'s returned list (which must match dataset
+        # target order) is simply self._heads_out(latent)[:, 1:, :].
+        self._horizons = (0.0,) + tuple(horizons_s)
+        self.net = nn.Linear(latent_dim, len(self._horizons) * N_LINEAR_DECODER_TARGET_FIELDS)
+
+    def _heads_out(self, latent: torch.Tensor) -> torch.Tensor:
+        batch = latent.shape[0]
+        return self.net(latent).view(batch, len(self._horizons), N_LINEAR_DECODER_TARGET_FIELDS)
+
+    def _pad(self, out6: torch.Tensor) -> torch.Tensor:
+        """Zero-pads a ``(batch, 6)`` pos+vel prediction out to the full
+        ``(batch, N_TARGET_FIELDS_PER_HORIZON)`` shape every loss/breakdown
+        function in train_ball_dynamics.py expects -- see class docstring."""
+        pad = out6.new_zeros(out6.shape[0], N_TARGET_FIELDS_PER_HORIZON - N_LINEAR_DECODER_TARGET_FIELDS)
+        return torch.cat([out6, pad], dim=-1)
+
+    def forward(self, latent: torch.Tensor) -> list[torch.Tensor]:
+        all_out = self._heads_out(latent)
+        return [self._pad(all_out[:, i, :]) for i in range(1, len(self._horizons))]
+
+    def has_horizon(self, horizon_s: float) -> bool:
+        return any(abs(horizon_s - h) <= _LINEAR_DECODER_HORIZON_ATOL for h in self._horizons)
+
+    def forward_at(self, latent: torch.Tensor, horizon_s: float) -> torch.Tensor:
+        for i, h in enumerate(self._horizons):
+            if abs(horizon_s - h) <= _LINEAR_DECODER_HORIZON_ATOL:
+                return self._pad(self._heads_out(latent)[:, i, :])
+        raise ValueError(
+            f"BallDynamicsLinearDecoder has no head registered for horizon_s={horizon_s} "
+            f"(registered: {self._horizons}) -- callers must check has_horizon() first."
+        )
+
 
 class BallDynamicsAutoencoder(nn.Module):
     """Thin training-only wrapper composing encoder + the shared decoder.
@@ -264,17 +384,21 @@ class BallDynamicsAutoencoder(nn.Module):
     horizon. Always present (cheap: 3*(latent_dim+1) params) so a
     checkpoint's shape doesn't depend on whether this head was ever trained;
     trained/not is entirely controlled by ``physics_pretrain.ball.
-    crossing_loss_weight`` (0.0 = no gradient reaches it, same convention as
-    ``bce_loss_weight``/``spin_loss_weight``) -- not a constructor flag, so
-    there's nothing to keep in sync between "does the head exist" and "does
-    it get supervision".
+    crossing_pos_loss_weight``/``crossing_dt_loss_weight`` (split, since
+    position and delta_t sit on very different natural scales -- see
+    ``train_ball_dynamics._crossing_head_loss``'s docstring; both 0.0 = no
+    gradient reaches it, same convention as ``bce_loss_weight``/
+    ``spin_loss_weight``) -- not a constructor flag, so there's nothing to
+    keep in sync between "does the head exist" and "does it get
+    supervision".
 
     ``resting_head``: same shape/idea as ``crossing_head`` (``Linear(latent_
     dim, 2)``, no hidden layer, off the latent) but predicts where the ball
     FINALLY comes to rest (``pos_x, pos_y`` only) rather than where it first
     crosses a boundary -- see ``BallDynamicsDataset.compute_resting_
     targets``. Controlled by ``physics_pretrain.ball.resting_loss_weight``,
-    same convention as ``crossing_loss_weight``.
+    same 0.0-disables convention as ``crossing_pos_loss_weight``/
+    ``crossing_dt_loss_weight``.
 
     ``position_head``: same shape/idea again (``Linear(latent_dim, 2)``, no
     hidden layer, off the latent) but predicts the ball's CURRENT (t=0 of
@@ -318,27 +442,41 @@ class BallDynamicsAutoencoder(nn.Module):
         identity_shortcut_noise_std: float = 0.0,
         encoder_concat_all_input_fields: bool = False,
         decoder_identity_shortcut: bool | None = None,
+        linear_decoder: bool = False,
+        leaky_relu_negative_slope: float = 0.0,
     ):
         super().__init__()
         self.encoder = BallDynamicsEncoder(
             input_dim=input_dim, hidden_dim=hidden_dim, latent_dim=latent_dim, bottleneck_dim=encoder_bottleneck_dim,
             identity_shortcut=identity_shortcut, identity_shortcut_noise_std=identity_shortcut_noise_std,
             concat_all_input_fields=encoder_concat_all_input_fields,
+            leaky_relu_negative_slope=leaky_relu_negative_slope,
         )
-        # `decoder_identity_shortcut` defaults to mirroring `identity_shortcut`
-        # (the historical, single-flag behaviour) but can be set independently
-        # -- e.g. keep the encoder's concat+hand-init (needed to reuse an
-        # encoder checkpoint trained with it on) while giving the decoder a
-        # plain random init with no hand-initialized persistence path and no
-        # permanent gradient-masking protection on its dedicated units (see
-        # `_init_identity_shortcut_decoder`'s docstring for what that
-        # protection does), letting the decoder learn from scratch whatever
-        # it actually finds useful instead of starting anchored to identity.
-        decoder_identity_shortcut = identity_shortcut if decoder_identity_shortcut is None else decoder_identity_shortcut
-        self.decoder = BallDynamicsDecoder(
-            latent_dim=latent_dim, horizons_s=horizons_s, hidden_dim=decoder_hidden_dim,
-            identity_shortcut=decoder_identity_shortcut, identity_shortcut_noise_std=identity_shortcut_noise_std,
-        )
+        self.linear_decoder = linear_decoder
+        if linear_decoder:
+            # decoder_hidden_dim/decoder_identity_shortcut/
+            # identity_shortcut_noise_std don't apply to this decoder -- see
+            # BallDynamicsLinearDecoder's own docstring. Silently ignored
+            # here; train_ball_dynamics.py logs a note if the config sets
+            # decoder-identity-shortcut-related keys while this is active.
+            self.decoder = BallDynamicsLinearDecoder(latent_dim=latent_dim, horizons_s=horizons_s)
+        else:
+            # `decoder_identity_shortcut` defaults to mirroring
+            # `identity_shortcut` (the historical, single-flag behaviour)
+            # but can be set independently -- e.g. keep the encoder's
+            # concat+hand-init (needed to reuse an encoder checkpoint
+            # trained with it on) while giving the decoder a plain random
+            # init with no hand-initialized persistence path and no
+            # permanent gradient-masking protection on its dedicated units
+            # (see `_init_identity_shortcut_decoder`'s docstring for what
+            # that protection does), letting the decoder learn from scratch
+            # whatever it actually finds useful instead of starting
+            # anchored to identity.
+            decoder_identity_shortcut = identity_shortcut if decoder_identity_shortcut is None else decoder_identity_shortcut
+            self.decoder = BallDynamicsDecoder(
+                latent_dim=latent_dim, horizons_s=horizons_s, hidden_dim=decoder_hidden_dim,
+                identity_shortcut=decoder_identity_shortcut, identity_shortcut_noise_std=identity_shortcut_noise_std,
+            )
         self.crossing_head = nn.Linear(latent_dim, 3)
         self.resting_head = nn.Linear(latent_dim, 2)
         self.position_head = nn.Linear(latent_dim, 2)
@@ -362,4 +500,6 @@ class BallDynamicsAutoencoder(nn.Module):
             identity_shortcut_noise_std=cfg.get("identity_shortcut_noise_std", 0.0),
             encoder_concat_all_input_fields=cfg.get("encoder_concat_all_input_fields", False),
             decoder_identity_shortcut=cfg.get("decoder_identity_shortcut_enabled"),
+            linear_decoder=cfg.get("linear_decoder_enabled", False),
+            leaky_relu_negative_slope=cfg.get("encoder_leaky_relu_negative_slope", 0.0),
         )

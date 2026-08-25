@@ -194,6 +194,16 @@ class PlayerDynamicsDataset:
     def __len__(self) -> int:
         return len(self.inputs)
 
+    def subset(self, indices: np.ndarray) -> "PlayerDynamicsDataset":
+        """See ``BallDynamicsDataset.subset``'s identical docstring/
+        rationale (e.g. for ``--max-episodes`` in train_player_dynamics.py's
+        ``train()``)."""
+        return PlayerDynamicsDataset(
+            self.inputs[indices], self.targets[indices],
+            self.crossings[indices] if self.crossings is not None else None,
+            self.crossing_times[indices] if self.crossing_times is not None else None,
+        )
+
     @classmethod
     def from_directory(cls, directory: str | Path, pattern: str = "*.npz") -> "PlayerDynamicsDataset":
         paths = sorted(Path(directory).glob(pattern))
@@ -356,6 +366,60 @@ class PlayerDynamicsDataset:
                 diff = targets[:, base + lo:base + hi] - inputs[:, lo:hi]
                 out[g][h] = (diff ** 2).mean()
         return out
+
+    def compute_already_out_of_bounds_at_start_mask(
+        self, gen_params: PlayerEpisodeGenParams, indices: np.ndarray | None = None,
+    ) -> np.ndarray:
+        """Returns a boolean ``(len(indices),)`` mask, ``True`` where this
+        episode's OWN raw t=0 ``self.inputs`` row is already out of the
+        pitch bounds, or already inside a goal mouth WHILE having
+        possession -- reconstructed purely from stored input fields
+        (position 0-1, ``has_possession`` 11, this episode's own pitch/goal
+        dims as a ratio-to-base in fields 17-19) -- no dataset regeneration
+        required, works on any already-generated shard. Direct port of
+        ``BallDynamicsDataset.compute_already_out_of_bounds_at_start_mask``,
+        minus the height/goal-height axis (no z axis for a player) and with
+        the goal-mouth check additionally gated on ``has_possession`` --
+        player_episode_gen.generate_episode's own crossing detector only
+        ever counts ``goal_now`` when ``has_possession`` is true (a player
+        without the ball can't "score" just by standing in the goal mouth).
+
+        Unlike ball, ``player_episode_gen.generate_episode`` already forces
+        ``crossing_time = math.inf`` for episodes that start out of bounds
+        (``started_out_of_bounds``) -- baking "started already out of
+        bounds" and "genuinely never crosses" into the SAME recorded
+        sentinel at generation time, so callers can't tell the two apart
+        from ``crossing_times``/``crossing_dt`` alone. This mask recovers
+        that distinction retroactively from the input row instead, so
+        callers can still give the two cases different treatment (dt=0 vs
+        dt=-1) without regenerating the dataset.
+        """
+        idx = indices if indices is not None else np.arange(len(self))
+        inputs = self.inputs[idx]
+
+        half_length_ep = inputs[:, 17] * gen_params.base_pitch_length_m / 2
+        half_width_ep = inputs[:, 18] * gen_params.base_pitch_width_m / 2
+        goal_width_ep = inputs[:, 19] * gen_params.base_goal_width_m
+        has_possession = inputs[:, 11] > 0.5
+
+        if gen_params.normalize_kinematics_by_base_pitch:
+            base_half_length = gen_params.base_pitch_length_m / 2
+            base_half_width = gen_params.base_pitch_width_m / 2
+            div_x = div_y = math.hypot(base_half_length, base_half_width)
+        else:
+            div_x, div_y = half_length_ep, half_width_ep
+
+        pos_x = inputs[:, 0] * div_x
+        pos_y = inputs[:, 1] * div_y
+
+        in_bounds = (np.abs(pos_x) <= half_length_ep) & (np.abs(pos_y) <= half_width_ep)
+        in_goal_mouth = (
+            (np.abs(pos_y) <= goal_width_ep / 2)
+            & ((pos_x <= -half_length_ep) | (pos_x >= half_length_ep))
+        )
+        already_oob = ~in_bounds
+        already_goal = in_goal_mouth & has_possession
+        return already_oob | already_goal
 
     def build_adjacent_pair_data(
         self, pair_idx: int, indices: np.ndarray | None = None,

@@ -120,6 +120,24 @@ class PlayerEpisodeGenParams:
     base_goal_width_m: float
     base_goal_height_m: float
     normalize_kinematics_by_base_pitch: bool
+    # Exponents on 4 of this module's t=0 uniform(0,1) draws (top_speed
+    # attribute, stamina attribute, starting stamina LEVEL, and starting
+    # speed as a fraction of that episode's own v_top0) -- see
+    # _sample_biased_unit's docstring for the math. All default to 1.0
+    # (plain uniform, no behaviour change). A value < 1.0 biases sampling
+    # toward the HIGH end of the range (e.g. 0.5 -> more fast/high-stamina
+    # episodes); > 1.0 biases toward the LOW end. Motivated by wanting more
+    # high-speed training examples than a plain uniform(0, v_top0) produces
+    # -- v_top0 itself is already capped by two independently-uniform
+    # attributes (top_speed, and indirectly stamina), so a plain-uniform
+    # speed0 on top of THAT compounds into a fairly low-speed-heavy
+    # aggregate distribution (median ~2.3 m/s measured on a real generated
+    # dataset) even though real matches surely have more sustained
+    # higher-speed running than that.
+    top_speed_attr_sample_exponent: float = 1.0
+    stamina_attr_sample_exponent: float = 1.0
+    stamina0_sample_exponent: float = 1.0
+    speed0_sample_exponent: float = 1.0
 
     @staticmethod
     def from_config() -> "PlayerEpisodeGenParams":
@@ -141,6 +159,10 @@ class PlayerEpisodeGenParams:
             base_goal_width_m=float(pitch_cfg["goal_width_m"]),
             base_goal_height_m=float(pitch_cfg["goal_height_m"]),
             normalize_kinematics_by_base_pitch=bool(pp_cfg.get("normalize_kinematics_by_base_pitch", False)),
+            top_speed_attr_sample_exponent=float(pp_cfg.get("top_speed_attr_sample_exponent", 1.0)),
+            stamina_attr_sample_exponent=float(pp_cfg.get("stamina_attr_sample_exponent", 1.0)),
+            stamina0_sample_exponent=float(pp_cfg.get("stamina0_sample_exponent", 1.0)),
+            speed0_sample_exponent=float(pp_cfg.get("speed0_sample_exponent", 1.0)),
         )
 
 
@@ -198,6 +220,22 @@ def _sample_position_already_special(rng: random.Random, pitch: Pitch) -> Vector
         x = rng.uniform(-pitch.half_length, pitch.half_length)
         y = side * (pitch.half_width + rng.uniform(0.2, 5.0))
     return Vector3(x, y, 0.0)
+
+
+def _sample_biased_unit(rng: random.Random, exponent: float) -> float:
+    """``rng.random() ** exponent`` -- a biased draw on ``[0, 1)``, same
+    support as plain ``rng.uniform(0.0, 1.0)`` but a different density.
+
+    ``exponent == 1.0`` (the default everywhere this is used) is EXACTLY
+    ``rng.random()``, i.e. no behaviour change. For ``u ~ Uniform(0, 1)``,
+    ``u**e``'s CDF at ``x`` is ``x**(1/e)`` -- for ``e < 1`` that's convex
+    (density rises toward 1), pulling mass toward the HIGH end of the
+    range; for ``e > 1`` it's concave, pulling mass toward the LOW end.
+    e.g. ``e=0.5`` (a square root) has a median of ``0.5**0.5 ≈ 0.71``
+    instead of plain uniform's ``0.5``. Multiply by ``(hi - lo)`` and add
+    ``lo`` for a biased draw on an arbitrary ``[lo, hi)`` range, same as you
+    would for a plain uniform draw."""
+    return rng.random() ** exponent
 
 
 def _sample_speed_mode(rng: random.Random, weights: tuple[float, float, float]) -> "SpeedMode":
@@ -427,13 +465,13 @@ def generate_episode(
     has_possession = rng.random() < params.possession_start_frac
 
     attrs = PlayerAttributes(
-        top_speed=rng.uniform(0.0, 1.0),
+        top_speed=_sample_biased_unit(rng, params.top_speed_attr_sample_exponent),
         acceleration=rng.uniform(0.0, 1.0),
-        stamina=rng.uniform(0.0, 1.0),
+        stamina=_sample_biased_unit(rng, params.stamina_attr_sample_exponent),
         kick_precision=0.5, kick_power=0.5, dribbling=0.5, tackling=0.5,  # not used by movement physics
         ball_control=rng.uniform(0.0, 1.0),
     )
-    stamina0 = rng.uniform(0.0, 1.0)
+    stamina0 = _sample_biased_unit(rng, params.stamina0_sample_exponent)
 
     # Physical-plausibility invariant (see the plan doc's initial-condition
     # sampling section): velocity must always equal speed*(cos(heading),
@@ -444,7 +482,7 @@ def generate_episode(
     v_top0 = effective_top_speed(
         movement_params, attrs.top_speed, stamina0, has_possession, attrs.ball_control, is_goalkeeper=False,
     )
-    speed0 = rng.uniform(0.0, v_top0)
+    speed0 = v_top0 * _sample_biased_unit(rng, params.speed0_sample_exponent)
 
     player = Player(
         player_id="physics_pretrain",

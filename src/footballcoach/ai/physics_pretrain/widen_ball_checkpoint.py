@@ -92,8 +92,18 @@ _STABLE_KEYS = (
     "identity_shortcut_noise_std",
     "encoder_concat_all_input_fields",
     "decoder_identity_shortcut_enabled",
+    "linear_decoder_enabled",
 )
 _WIDEN_KEYS = ("hidden_dim", "encoder_bottleneck_dim", "latent_dim", "decoder_hidden_dim")
+# Subset of the two lists above that matters when the DECODER isn't being
+# touched at all (train_ball_dynamics.py's horizons_s-changed-AND-dims-
+# changed fallback -- see widen_model_'s `widen_decoder` param): only the
+# encoder's own layout (identity-shortcut wiring) has to stay stable for its
+# seam surgery to be valid; horizons_s/decoder_identity_shortcut_enabled/
+# linear_decoder_enabled are decoder-only concerns, and decoder_hidden_dim
+# isn't relevant if the decoder is getting a fresh init regardless.
+_ENCODER_STABLE_KEYS = ("identity_shortcut_enabled", "identity_shortcut_noise_std", "encoder_concat_all_input_fields")
+_ENCODER_WIDEN_KEYS = ("hidden_dim", "encoder_bottleneck_dim", "latent_dim")
 
 
 def _build_model(cfg: dict) -> BallDynamicsAutoencoder:
@@ -107,6 +117,8 @@ def _build_model(cfg: dict) -> BallDynamicsAutoencoder:
         identity_shortcut_noise_std=cfg.get("identity_shortcut_noise_std", 0.0),
         encoder_concat_all_input_fields=cfg.get("encoder_concat_all_input_fields", False),
         decoder_identity_shortcut=cfg.get("decoder_identity_shortcut_enabled"),
+        linear_decoder=cfg.get("linear_decoder_enabled", False),
+        leaky_relu_negative_slope=cfg.get("encoder_leaky_relu_negative_slope", 0.0),
     )
 
 
@@ -118,8 +130,34 @@ def _concat_dim(cfg: dict) -> int:
     return N_INPUT_FIELDS if cfg.get("encoder_concat_all_input_fields", False) else N_IDENTITY_SHORTCUT_FIELDS
 
 
-def _validate_widen_cfgs(old_cfg: dict, new_cfg: dict) -> None:
-    for key in _STABLE_KEYS:
+def _validate_widen_cfgs(old_cfg: dict, new_cfg: dict, check_decoder: bool = True) -> None:
+    """``check_decoder=False`` (see ``widen_model_``'s identical param):
+    skips every decoder-specific check -- the ``horizons_s``/
+    ``decoder_identity_shortcut_enabled``/``linear_decoder_enabled``
+    stability requirements -- validating only what the ENCODER's own seam
+    surgery needs (``_ENCODER_STABLE_KEYS``/``_ENCODER_WIDEN_KEYS``). Used
+    by train_ball_dynamics.py's ``--init-checkpoint`` resume when
+    horizons_s changed at the same time as encoder dims grew: the decoder
+    is getting a fresh init regardless (its old weights are incompatible
+    with the new horizons_s either way), so none of the decoder-shape
+    assumptions below apply.
+
+    ``linear_decoder_enabled`` (when ``check_decoder`` is True, i.e. BOTH
+    configs must agree via ``_STABLE_KEYS`` below) is fully supported --
+    ``BallDynamicsLinearDecoder.net`` is a single ``Linear(latent_dim, ...)``
+    whose INPUT is the only thing that can widen (its output width depends
+    only on ``horizons_s``, already required stable), so it gets the exact
+    same ``_widen_linear_cols`` treatment as ``crossing_head``/
+    ``resting_head`` -- see ``widen_model_``. ``decoder_hidden_dim`` is
+    meaningless in this mode (``BallDynamicsLinearDecoder`` has no hidden
+    layer at all) so it's excluded from the growth check below rather than
+    comparing a value the model doesn't even use.
+    """
+    stable_keys = _ENCODER_STABLE_KEYS if not check_decoder else _STABLE_KEYS
+    widen_keys = _ENCODER_WIDEN_KEYS if not check_decoder else _WIDEN_KEYS
+    if check_decoder and new_cfg.get("linear_decoder_enabled", False):
+        widen_keys = tuple(k for k in widen_keys if k != "decoder_hidden_dim")
+    for key in stable_keys:
         old_v, new_v = old_cfg.get(key), new_cfg.get(key)
         if old_v != new_v:
             raise ValueError(
@@ -127,12 +165,12 @@ def _validate_widen_cfgs(old_cfg: dict, new_cfg: dict) -> None:
                 "this tool only widens hidden_dim/encoder_bottleneck_dim/latent_dim/decoder_hidden_dim, "
                 "not shortcut wiring or horizons."
             )
-    for key in _WIDEN_KEYS:
+    for key in widen_keys:
         old_v, new_v = old_cfg.get(key, 32), new_cfg.get(key, 32)
         if new_v < old_v:
             raise ValueError(f"'{key}' shrank ({old_v} -> {new_v}) -- this tool only supports growing dims.")
-    if all(new_cfg.get(k, 32) == old_cfg.get(k, 32) for k in _WIDEN_KEYS):
-        log.warning("No dims actually grew (old and new config match on all four) -- output will be a plain copy.")
+    if all(new_cfg.get(k, 32) == old_cfg.get(k, 32) for k in widen_keys):
+        log.warning("No dims actually grew -- output will be a plain copy.")
 
 
 def _widen_linear_rows(old: nn.Linear, new: nn.Linear, old_out: int) -> None:
@@ -226,13 +264,25 @@ def _widen_decoder_net0(old: nn.Linear, new: nn.Linear, old_latent: int, new_lat
     new.bias.data[:old_dhidden] = old.bias.data
 
 
-def widen_model_(old_model: BallDynamicsAutoencoder, new_model: BallDynamicsAutoencoder, old_cfg: dict, new_cfg: dict) -> None:
+def widen_model_(
+    old_model: BallDynamicsAutoencoder, new_model: BallDynamicsAutoencoder, old_cfg: dict, new_cfg: dict,
+    widen_decoder: bool = True,
+) -> None:
     """Mutates ``new_model`` (already constructed with its own fresh/
     identity-shortcut init, per ``new_cfg``) in place so it computes the
     EXACT same function as ``old_model`` for its old capacity, plus fresh,
     immediately-trainable capacity for whatever grew. See module docstring
     for the general "zero the consuming side, never the producing side"
     rule and why the two seams below need to also handle a column shift.
+
+    ``widen_decoder=False``: skips the decoder seam entirely, leaving
+    ``new_model.decoder`` exactly as its own fresh construction left it --
+    for train_ball_dynamics.py's ``--init-checkpoint`` resume when
+    ``horizons_s`` also changed, making the old decoder's weights
+    incompatible (shape and/or meaning) regardless of any widening. The
+    encoder and every auxiliary head (crossing_head/resting_head/
+    position_head/event_head, all pure latent consumers) still get widened
+    normally -- only the decoder's own seam is conditional.
     """
     old_hidden, new_hidden = old_cfg["hidden_dim"], new_cfg["hidden_dim"]
     old_bneck = old_cfg.get("encoder_bottleneck_dim", 32)
@@ -253,8 +303,17 @@ def widen_model_(old_model: BallDynamicsAutoencoder, new_model: BallDynamicsAuto
         _widen_linear_cols(old_model.resting_head, new_model.resting_head, old_latent)
         _widen_linear_cols(old_model.position_head, new_model.position_head, old_latent)
         _widen_linear_cols(old_model.event_head, new_model.event_head, old_latent)
-        _widen_decoder_net0(old_model.decoder.net[0], new_model.decoder.net[0], old_latent, new_latent, old_dhidden)
-        _widen_linear_cols(old_model.decoder.net[2], new_model.decoder.net[2], old_dhidden)
+        if widen_decoder:
+            if old_model.linear_decoder:
+                # BallDynamicsLinearDecoder.net is a single Linear(latent_
+                # dim, n_horizons*6) -- output width depends only on
+                # horizons_s (required stable, see _validate_widen_cfgs),
+                # so growing latent_dim is a pure "consuming" widen, exactly
+                # like crossing_head/resting_head above.
+                _widen_linear_cols(old_model.decoder.net, new_model.decoder.net, old_latent)
+            else:
+                _widen_decoder_net0(old_model.decoder.net[0], new_model.decoder.net[0], old_latent, new_latent, old_dhidden)
+                _widen_linear_cols(old_model.decoder.net[2], new_model.decoder.net[2], old_dhidden)
 
 
 def verify_widened_model(old_model: BallDynamicsAutoencoder, new_model: BallDynamicsAutoencoder, x: torch.Tensor, atol: float = 1e-4) -> None:
@@ -346,6 +405,14 @@ def widen_checkpoint(
         from footballcoach.ai.config import load_ai_config
         new_cfg = load_ai_config()["physics_pretrain"]["ball"]
     _validate_widen_cfgs(old_cfg, new_cfg)
+    # encoder_leaky_relu_negative_slope isn't part of the saved weights
+    # (LeakyReLU has no learnable params) -- old_model only exists so
+    # widen_model_ can copy FROM it, so build it with new_cfg's slope (the
+    # value this checkpoint will actually run with going forward), not
+    # whatever old_cfg says. This is also what makes resuming a checkpoint
+    # trained under plain ReLU (slope 0.0) with a newly-nonzero slope "just
+    # work" without any explicit migration step.
+    old_cfg = {**old_cfg, "encoder_leaky_relu_negative_slope": new_cfg.get("encoder_leaky_relu_negative_slope", 0.0)}
 
     old_model = _build_model(old_cfg)
     missing, unexpected = old_model.load_state_dict(

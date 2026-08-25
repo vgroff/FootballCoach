@@ -29,6 +29,7 @@ from footballcoach.ai.physics_pretrain.ball_dynamics_net import (
     BallDynamicsAutoencoder,
     BallDynamicsDecoder,
     BallDynamicsEncoder,
+    BallDynamicsLinearDecoder,
 )
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.pitch import Pitch
@@ -995,7 +996,9 @@ def test_event_head_loss_matches_manual_bce():
     ever_goal = np.array([False, False, True, True, False])
     row_idx = np.array([0, 1, 2, 3, 4])
 
-    loss, oob_acc, goal_acc = _event_head_loss(model, latent, ever_oob, ever_goal, row_idx, torch.device("cpu"))
+    loss, oob_acc, goal_acc, oob_counts, goal_counts = _event_head_loss(
+        model, latent, ever_oob, ever_goal, row_idx, torch.device("cpu"),
+    )
 
     with torch.no_grad():
         pred = model.event_head(latent)
@@ -1005,6 +1008,15 @@ def test_event_head_loss_matches_manual_bce():
     assert loss.item() == pytest.approx(expected.item(), abs=1e-5)
     assert 0.0 <= oob_acc <= 1.0
     assert 0.0 <= goal_acc <= 1.0
+    # oob_counts/goal_counts are (tp, fp, fn, tn) -- must sum to the batch
+    # size (every row falls into exactly one bucket) and must reproduce
+    # the SAME accuracy _event_head_loss already returned, computed the
+    # other way ((tp+tn)/total), confirming the two are consistent.
+    for counts, acc, actual in ((oob_counts, oob_acc, ever_oob), (goal_counts, goal_acc, ever_goal)):
+        tp, fp, fn, tn = counts
+        assert tp + fp + fn + tn == len(actual)
+        assert tp + fn == int(actual.sum())  # actual positives
+        assert (tp + tn) / len(actual) == pytest.approx(acc, abs=1e-6)
 
     assert loss.requires_grad
     loss.backward()
@@ -1014,11 +1026,10 @@ def test_event_head_loss_matches_manual_bce():
 
 def test_train_excludes_already_out_of_bounds_starts_from_crossing_supervision(tmp_path, monkeypatch):
     """train() must AND compute_already_out_of_bounds_at_start_mask into
-    ds.crossing_mask (excluding those rows from crossing_mask, so no
-    already-out-of-bounds-at-start row should still have crossing_mask=
-    True) and force those rows' crossing_dt to 0.0 (already crossed as of
-    t=0) -- NOT the -1.0 "never crosses" sentinel, which would be a
-    factually wrong target for a row that genuinely did cross."""
+    ds.crossing_mask and force those rows' crossing_dt to the 0.0 sentinel
+    ("already there right now", distinct from the -1.0 "never happens"
+    sentinel a genuinely crossing-free row gets) -- i.e. after setup, no
+    already-out-of-bounds-at-start row should still have crossing_mask=True."""
     from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
     from footballcoach.ai.physics_pretrain.ball_dataset import BallDynamicsDataset
     import footballcoach.ai.config as ai_config_mod
@@ -1065,10 +1076,6 @@ def test_train_excludes_already_out_of_bounds_starts_from_crossing_supervision(t
     gen_params = BallEpisodeGenParams.from_config()
     already_oob = ds.compute_already_out_of_bounds_at_start_mask(gen_params)
     assert not np.any(ds.crossing_mask[already_oob])
-    # 0.0 ("already crossed as of t=0"), NOT the -1.0 "never crosses"
-    # sentinel -- these rows genuinely did cross, immediately, so -1.0
-    # would be a factually wrong target (see train_ball_dynamics.py's call
-    # site for the full reasoning).
     assert np.all(ds.crossing_dt[already_oob] == 0.0)
 
 
@@ -1213,8 +1220,8 @@ def test_train_smoke_with_decoder_only_pretraining(tmp_path, monkeypatch, caplog
         )
     assert "Decoder-only pretraining: 1 epoch(s), encoder TRUNK frozen" in caplog.text
     assert "decoder-only pretrain epoch 1/1" in caplog.text
-    assert "train pos_rmse" in caplog.text
-    assert "val   pos_rmse" in caplog.text
+    assert "train pos_dist" in caplog.text
+    assert "val   pos_dist" in caplog.text
     assert "val   oob_accuracy" in caplog.text
     assert output_path.exists()
 
@@ -1343,6 +1350,13 @@ def test_train_auto_widens_init_checkpoint_on_dim_mismatch(tmp_path, monkeypatch
         # Not checking optimizer-type behaviour -- force known-good values
         # regardless of the live config (see test_train_smoke).
         pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "adam"
+        # widen_ball_checkpoint.py doesn't support widening under
+        # linear_decoder_enabled yet (its seam surgery assumes the old MLP
+        # decoder's net[0]/net[2] layout, which BallDynamicsLinearDecoder
+        # doesn't have) -- force it off regardless of the live config's
+        # default, since this test is specifically exercising the widen
+        # path, not the linear decoder.
+        pp["linear_decoder_enabled"] = False
         return cfg
 
     def _bigger_cfg():
@@ -1350,6 +1364,7 @@ def test_train_auto_widens_init_checkpoint_on_dim_mismatch(tmp_path, monkeypatch
         pp = cfg["physics_pretrain"]["ball"]
         pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "adam"
         pp["hidden_dim"], pp["encoder_bottleneck_dim"], pp["latent_dim"], pp["decoder_hidden_dim"] = 40, 20, 24, 18
+        pp["linear_decoder_enabled"] = False
         return cfg
 
     dataset_dir = tmp_path / "data"
@@ -1377,6 +1392,339 @@ def test_train_auto_widens_init_checkpoint_on_dim_mismatch(tmp_path, monkeypatch
     assert big_output.exists()
     big_ckpt = torch.load(big_output.with_suffix(".after_training.pt"), map_location="cpu")
     assert big_ckpt["config_snapshot"]["latent_dim"] == 24
+
+
+def test_train_sgd_never_resumes_optimizer_state(tmp_path, monkeypatch, caplog):
+    """SGD is a deliberate "always fresh" optimizer on resume (see
+    optimizer_type's config comment: meant for a late-stage fine-tune run
+    compared against continuing under Adam, not for carrying SGD's own
+    momentum across resumes) -- train() must never attempt an
+    optimizer_state_dict restore when optimizer_type='sgd', regardless of
+    what the checkpoint contains (this also sidesteps the Adam<->SGD
+    state_dict incompatibility that used to crash SGD.step() with
+    KeyError('momentum') the first time it ran after a mismatched resume)."""
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
+    import footballcoach.ai.config as ai_config_mod
+
+    orig_load_ai_config = ai_config_mod.load_ai_config
+
+    def _adam_cfg():
+        cfg = orig_load_ai_config()
+        pp = cfg["physics_pretrain"]["ball"]
+        pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "adam"
+        return cfg
+
+    def _sgd_cfg():
+        cfg = orig_load_ai_config()
+        pp = cfg["physics_pretrain"]["ball"]
+        pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "sgd"
+        pp["sgd_momentum"] = 0.8
+        return cfg
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=60, output_dir=dataset_dir, seed=5, shard_size=60, n_workers=1)
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _adam_cfg)
+    adam_output = tmp_path / "adam.pt"
+    train(
+        dataset_dir=str(dataset_dir), output_path=str(adam_output),
+        epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=0,
+    )
+    adam_ckpt = adam_output.with_suffix(".after_training.pt")
+    assert adam_ckpt.exists()
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _sgd_cfg)
+    sgd_output = tmp_path / "sgd.pt"
+    with caplog.at_level("INFO", logger="footballcoach.ai.physics_pretrain.train_ball_dynamics"):
+        train(
+            dataset_dir=str(dataset_dir), output_path=str(sgd_output),
+            epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=0,
+            init_checkpoint=str(adam_ckpt),
+        )
+    assert "optimizer_type='sgd' -- optimizer always starts fresh on resume" in caplog.text
+    assert sgd_output.with_suffix(".after_training.pt").exists()
+
+
+def test_train_adam_resume_keeps_this_runs_lr_not_checkpoints(tmp_path, monkeypatch, caplog):
+    """Adam resume restores ONLY the per-parameter moment buffers
+    (exp_avg/exp_avg_sq/step), never param_groups -- so a checkpoint saved
+    with one lr, resumed by a run configured with a DIFFERENT lr, must
+    train at the NEW run's lr, not silently inherit the checkpoint's
+    (optimizer.load_state_dict() overwrites param_groups wholesale by
+    default, which would otherwise clobber the current run's configured
+    lr with whatever the old cosine schedule had annealed down to)."""
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
+    import footballcoach.ai.config as ai_config_mod
+
+    orig_load_ai_config = ai_config_mod.load_ai_config
+
+    def _adam_cfg():
+        cfg = orig_load_ai_config()
+        pp = cfg["physics_pretrain"]["ball"]
+        pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "adam"
+        return cfg
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=60, output_dir=dataset_dir, seed=5, shard_size=60, n_workers=1)
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _adam_cfg)
+    first_output = tmp_path / "first.pt"
+    train(
+        dataset_dir=str(dataset_dir), output_path=str(first_output),
+        epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=0,
+    )
+    first_ckpt = first_output.with_suffix(".after_training.pt")
+
+    second_output = tmp_path / "second.pt"
+    with caplog.at_level("INFO", logger="footballcoach.ai.physics_pretrain.train_ball_dynamics"):
+        train(
+            dataset_dir=str(dataset_dir), output_path=str(second_output),
+            epochs=1, batch_size=16, lr=3e-4, val_frac=0.2, seed=0,
+            init_checkpoint=str(first_ckpt),
+        )
+    assert "Resumed Adam moment state" in caplog.text
+    assert "lr/betas/weight_decay kept at this run's configured values" in caplog.text
+    second_ckpt = torch.load(second_output.with_suffix(".after_training.pt"), map_location="cpu")
+    # If param_groups had been overwritten by the checkpoint's, this would
+    # be ~1e-2 (the FIRST run's lr) instead of ~3e-4 (this run's own) --
+    # rel=0.1 tolerance accounts for the cosine schedule's own small
+    # within-epoch drift away from the exact configured peak.
+    assert second_ckpt["optimizer_state_dict"]["param_groups"][0]["lr"] == pytest.approx(3e-4, rel=0.1)
+
+
+def test_train_adam_resume_skips_non_adam_shaped_state(tmp_path, monkeypatch, caplog):
+    """Adam resuming from a checkpoint whose saved optimizer state isn't
+    Adam-shaped (e.g. saved by SGD -- momentum_buffer only, no exp_avg)
+    must skip the restore gracefully rather than feeding incompatible
+    state into Adam.step()."""
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
+    import footballcoach.ai.config as ai_config_mod
+
+    orig_load_ai_config = ai_config_mod.load_ai_config
+
+    def _sgd_cfg():
+        cfg = orig_load_ai_config()
+        pp = cfg["physics_pretrain"]["ball"]
+        pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "sgd"
+        pp["sgd_momentum"] = 0.8
+        return cfg
+
+    def _adam_cfg():
+        cfg = orig_load_ai_config()
+        pp = cfg["physics_pretrain"]["ball"]
+        pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "adam"
+        return cfg
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=60, output_dir=dataset_dir, seed=5, shard_size=60, n_workers=1)
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _sgd_cfg)
+    sgd_output = tmp_path / "sgd.pt"
+    train(
+        dataset_dir=str(dataset_dir), output_path=str(sgd_output),
+        epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=0,
+    )
+    sgd_ckpt = sgd_output.with_suffix(".after_training.pt")
+    assert sgd_ckpt.exists()
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _adam_cfg)
+    adam_output = tmp_path / "adam.pt"
+    with caplog.at_level("INFO", logger="footballcoach.ai.physics_pretrain.train_ball_dynamics"):
+        train(
+            dataset_dir=str(dataset_dir), output_path=str(adam_output),
+            epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=0,
+            init_checkpoint=str(sgd_ckpt),
+        )
+    assert "isn't Adam-shaped" in caplog.text
+    assert adam_output.with_suffix(".after_training.pt").exists()
+
+
+def test_train_max_episodes_limits_dataset(tmp_path, monkeypatch, caplog):
+    """--max-episodes randomly subsamples the loaded dataset down to at
+    most that many episodes before the train/val split."""
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
+    import footballcoach.ai.config as ai_config_mod
+
+    orig_load_ai_config = ai_config_mod.load_ai_config
+
+    def _patched():
+        cfg = orig_load_ai_config()
+        pp = cfg["physics_pretrain"]["ball"]
+        pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "adam"
+        return cfg
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _patched)
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=100, output_dir=dataset_dir, seed=5, shard_size=100, n_workers=1)
+    output_path = tmp_path / "ball_encoder.pt"
+    with caplog.at_level("INFO", logger="footballcoach.ai.physics_pretrain.train_ball_dynamics"):
+        train(
+            dataset_dir=str(dataset_dir), output_path=str(output_path),
+            epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=0,
+            max_episodes=30,
+        )
+    assert "--max-episodes: limited dataset from 100 to 30 episodes" in caplog.text
+    assert "Dataset: 30 episodes" in caplog.text
+    assert output_path.exists()
+
+
+def test_train_max_episodes_noop_when_dataset_already_smaller(tmp_path, monkeypatch, caplog):
+    """--max-episodes larger than the actual dataset is a no-op (no
+    subsetting, no misleading log line) rather than an error."""
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
+    import footballcoach.ai.config as ai_config_mod
+
+    orig_load_ai_config = ai_config_mod.load_ai_config
+
+    def _patched():
+        cfg = orig_load_ai_config()
+        pp = cfg["physics_pretrain"]["ball"]
+        pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "adam"
+        return cfg
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _patched)
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=40, output_dir=dataset_dir, seed=5, shard_size=40, n_workers=1)
+    output_path = tmp_path / "ball_encoder.pt"
+    with caplog.at_level("INFO", logger="footballcoach.ai.physics_pretrain.train_ball_dynamics"):
+        train(
+            dataset_dir=str(dataset_dir), output_path=str(output_path),
+            epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=0,
+            max_episodes=1000,
+        )
+    assert "--max-episodes" not in caplog.text
+    assert "Dataset: 40 episodes" in caplog.text
+    assert output_path.exists()
+
+
+def test_linear_decoder_forward_matches_horizons_s_order():
+    """forward() returns exactly len(horizons_s) tensors, in horizons_s's
+    own order (NOT including the extra t=0 head) -- matching the dataset's
+    own per-horizon target layout, same convention as BallDynamicsDecoder."""
+    horizons_s = [0.2, 0.5, 1.0, 2.0]
+    decoder = BallDynamicsLinearDecoder(latent_dim=16, horizons_s=horizons_s)
+    latent = torch.randn(5, 16)
+    out = decoder(latent)
+    assert len(out) == len(horizons_s)
+    for t in out:
+        assert t.shape == (5, N_TARGET_FIELDS_PER_HORIZON)
+        # spin (6:9) and oob/goal logits (9:11) are zero-padded, no gradient source.
+        assert torch.all(t[:, 6:] == 0.0)
+
+
+def test_linear_decoder_has_horizon_and_forward_at():
+    horizons_s = [0.2, 0.5, 1.0, 2.0]
+    decoder = BallDynamicsLinearDecoder(latent_dim=16, horizons_s=horizons_s)
+    latent = torch.randn(3, 16)
+    # 0.0 is always registered in addition to horizons_s.
+    assert decoder.has_horizon(0.0)
+    for h in horizons_s:
+        assert decoder.has_horizon(h)
+    assert not decoder.has_horizon(0.8)
+    assert not decoder.has_horizon(1.5)
+
+    pred0 = decoder.forward_at(latent, 0.0)
+    assert pred0.shape == (3, N_TARGET_FIELDS_PER_HORIZON)
+    with pytest.raises(ValueError):
+        decoder.forward_at(latent, 0.8)
+
+
+def test_linear_decoder_forward_at_matches_forward():
+    """forward_at() at a registered non-zero horizon must read off the SAME
+    per-head weights forward() uses for that horizon -- not a separately
+    (re-)initialized computation."""
+    horizons_s = [0.2, 0.5, 1.0]
+    decoder = BallDynamicsLinearDecoder(latent_dim=8, horizons_s=horizons_s)
+    latent = torch.randn(4, 8)
+    forward_out = decoder(latent)
+    for i, h in enumerate(horizons_s):
+        assert torch.allclose(decoder.forward_at(latent, h), forward_out[i])
+
+
+def test_train_linear_decoder_smoke(tmp_path, monkeypatch, caplog):
+    """--linear-decoder swaps in BallDynamicsLinearDecoder, trains without
+    crashing, and logs both the mode-switch note and the adjacent-pair
+    kept/dropped counts."""
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
+    import footballcoach.ai.config as ai_config_mod
+
+    orig_load_ai_config = ai_config_mod.load_ai_config
+
+    def _patched():
+        cfg = orig_load_ai_config()
+        pp = cfg["physics_pretrain"]["ball"]
+        pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "adam"
+        pp["adjacent_pair_training_enabled"] = True
+        pp["adjacent_pair_max_skip"] = 2
+        return cfg
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _patched)
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=60, output_dir=dataset_dir, seed=5, shard_size=60, n_workers=1)
+    output_path = tmp_path / "ball_encoder.pt"
+    with caplog.at_level("INFO", logger="footballcoach.ai.physics_pretrain.train_ball_dynamics"):
+        train(
+            dataset_dir=str(dataset_dir), output_path=str(output_path),
+            epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=0,
+            linear_decoder=True,
+        )
+    assert "linear_decoder_enabled" in caplog.text
+    assert "kept" in caplog.text and "dropped" in caplog.text
+    assert output_path.exists()
+
+
+def test_train_reset_decoder_weights_keeps_encoder_resets_decoder(tmp_path, monkeypatch, caplog):
+    """--reset-decoder-weights must leave the encoder exactly as loaded
+    from --init-checkpoint, but reinitialize every decoder-side module
+    (decoder + crossing_head/resting_head/position_head/event_head) to a
+    DIFFERENT random init, and must also drop those parameters' Adam
+    moment state (so stale exp_avg/exp_avg_sq from the old decoder weights
+    doesn't get applied to the freshly-random ones)."""
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
+    import footballcoach.ai.config as ai_config_mod
+
+    orig_load_ai_config = ai_config_mod.load_ai_config
+
+    def _adam_cfg():
+        cfg = orig_load_ai_config()
+        pp = cfg["physics_pretrain"]["ball"]
+        pp["optimizer_type"] = pp["autoencode_optimizer_type"] = pp["decoder_only_optimizer_type"] = "adam"
+        return cfg
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=60, output_dir=dataset_dir, seed=5, shard_size=60, n_workers=1)
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _adam_cfg)
+    first_output = tmp_path / "first.pt"
+    train(
+        dataset_dir=str(dataset_dir), output_path=str(first_output),
+        epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=0,
+    )
+    first_ckpt_path = first_output.with_suffix(".after_training.pt")
+    first_ckpt = torch.load(first_ckpt_path, map_location="cpu")
+
+    second_output = tmp_path / "second.pt"
+    with caplog.at_level("INFO", logger="footballcoach.ai.physics_pretrain.train_ball_dynamics"):
+        train(
+            dataset_dir=str(dataset_dir), output_path=str(second_output),
+            epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=1,
+            init_checkpoint=str(first_ckpt_path), reset_decoder_weights=True,
+        )
+    assert "Reset decoder-side weights to fresh init" in caplog.text
+    second_ckpt = torch.load(second_output.with_suffix(".after_training.pt"), map_location="cpu")
+
+    first_sd, second_sd = first_ckpt["model_state_dict"], second_ckpt["model_state_dict"]
+    decoder_side_prefixes = ("decoder.", "crossing_head.", "resting_head.", "position_head.", "event_head.")
+    decoder_side_keys = [k for k in first_sd if k.startswith(decoder_side_prefixes)]
+    assert decoder_side_keys  # sanity: the prefix set actually matched something
+    # At least one decoder-side tensor must differ after the reset -- NOT
+    # every key, since some (e.g. decoder.t_norm) are fixed/deterministic
+    # buffers rather than randomly-initialized learnable weights, and
+    # would legitimately be identical regardless of the reset.
+    assert any(not torch.equal(first_sd[k], second_sd[k]) for k in decoder_side_keys)
 
 
 def test_train_rejects_unknown_optimizer_type(tmp_path, monkeypatch):

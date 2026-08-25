@@ -28,6 +28,7 @@ from footballcoach.ai.physics_pretrain.player_dynamics_net import (
     PlayerDynamicsAutoencoder,
     PlayerDynamicsDecoder,
     PlayerDynamicsEncoder,
+    PlayerDynamicsLinearDecoder,
 )
 from footballcoach.entities.pitch import Pitch
 
@@ -240,6 +241,46 @@ def test_decoder_forward_at_zero_horizon_finite():
     latent = torch.randn(4, 16)
     out = decoder.forward_at(latent, 0.0)
     assert torch.isfinite(out).all()
+
+
+def test_linear_decoder_forward_matches_horizons_s_order():
+    """forward() returns exactly len(horizons_s) tensors, in horizons_s's
+    own order (NOT including the extra t=0 head) -- mirrors
+    test_ball_physics_pretrain.py's identical test."""
+    horizons_s = [0.2, 1.0, 3.0]
+    decoder = PlayerDynamicsLinearDecoder(latent_dim=16, horizons_s=horizons_s)
+    latent = torch.randn(5, 16)
+    out = decoder(latent)
+    assert len(out) == len(horizons_s)
+    for t in out:
+        assert t.shape == (5, N_TARGET_FIELDS_PER_HORIZON)
+        # heading/stamina (4:7) and oob/goal logits (7:9) are zero-padded, no gradient source.
+        assert torch.all(t[:, 4:] == 0.0)
+
+
+def test_linear_decoder_has_horizon_and_forward_at():
+    horizons_s = [0.2, 1.0, 3.0]
+    decoder = PlayerDynamicsLinearDecoder(latent_dim=16, horizons_s=horizons_s)
+    latent = torch.randn(3, 16)
+    assert decoder.has_horizon(0.0)
+    for h in horizons_s:
+        assert decoder.has_horizon(h)
+    assert not decoder.has_horizon(0.5)
+    assert not decoder.has_horizon(2.0)
+
+    pred0 = decoder.forward_at(latent, 0.0)
+    assert pred0.shape == (3, N_TARGET_FIELDS_PER_HORIZON)
+    with pytest.raises(ValueError):
+        decoder.forward_at(latent, 0.5)
+
+
+def test_linear_decoder_forward_at_matches_forward():
+    horizons_s = [0.2, 1.0, 3.0]
+    decoder = PlayerDynamicsLinearDecoder(latent_dim=8, horizons_s=horizons_s)
+    latent = torch.randn(4, 8)
+    forward_out = decoder(latent)
+    for i, h in enumerate(horizons_s):
+        assert torch.allclose(decoder.forward_at(latent, h), forward_out[i])
 
 
 def test_identity_shortcut_zero_noise_gives_exact_round_trip():
@@ -522,16 +563,18 @@ def _aux_test_model(latent_dim: int = 8) -> PlayerDynamicsAutoencoder:
 
 def test_aux_heads_exist_with_expected_shapes():
     model = _aux_test_model(latent_dim=9)
-    assert model.crossing_head.weight.shape == (3, 9)
+    assert model.crossing_head.weight.shape == (4, 9)
     assert model.goal_dist_delta_head.weight.shape == (2, 9)
     assert model.short_horizon_head_0_2s.weight.shape == (4, 9)
     assert model.short_horizon_head_1_0s.weight.shape == (4, 9)
 
 
-def test_crossing_head_loss_masks_position_but_not_delta_t():
+def test_crossing_head_loss_masks_position_but_not_crosses():
     """The position term must ignore masked-out rows entirely (never-crossed
-    OR excluded already-out-of-bounds starts), while delta_t stays unmasked
-    against the -1 sentinel -- see _crossing_head_loss's docstring."""
+    OR excluded already-out-of-bounds starts, i.e. mask_all=False), while
+    crosses_logit's BCE target is derived from crossing_dt != -1 and is
+    UNMASKED -- every row has a well-defined yes/no answer -- see
+    _crossing_head_loss's docstring."""
     from footballcoach.ai.physics_pretrain.train_player_dynamics import _crossing_head_loss
 
     model = _aux_test_model()
@@ -541,41 +584,88 @@ def test_crossing_head_loss_masks_position_but_not_delta_t():
     mask = np.array([False, True, False, True])
     row_idx = np.arange(4)
 
-    loss_a, pos_dist_a, dt_mae_a = _crossing_head_loss(model, latent, pos, dt, mask, row_idx, "cpu")
-    # Corrupting a MASKED row's position target must not move the loss at all.
+    loss_a, pos_dist_a, dt_mae_a, pos_loss_a, crosses_loss_a, dt_loss_a, crosses_acc_a = _crossing_head_loss(
+        model, latent, pos, dt, mask, row_idx, "cpu",
+    )
+    assert loss_a.item() == pytest.approx(pos_loss_a + crosses_loss_a + dt_loss_a, abs=1e-6)
+
+    # Corrupting a MASKED-OUT row's position target must not move pos_loss.
     pos_corrupt = pos.copy()
     pos_corrupt[0] = [50.0, -50.0]
     pos_corrupt[2] = [-30.0, 30.0]
-    loss_b, pos_dist_b, dt_mae_b = _crossing_head_loss(model, latent, pos_corrupt, dt, mask, row_idx, "cpu")
-    assert loss_a.item() == pytest.approx(loss_b.item(), abs=1e-6)
+    _, pos_dist_b, _, pos_loss_b, _, _, _ = _crossing_head_loss(model, latent, pos_corrupt, dt, mask, row_idx, "cpu")
     assert pos_dist_a == pytest.approx(pos_dist_b, abs=1e-6)
+    assert pos_loss_a == pytest.approx(pos_loss_b, abs=1e-6)
+
     # ...but corrupting an UNMASKED row's position target must.
     pos_corrupt2 = pos.copy()
     pos_corrupt2[1] = [50.0, -50.0]
-    loss_c, _, _ = _crossing_head_loss(model, latent, pos_corrupt2, dt, mask, row_idx, "cpu")
-    assert loss_c.item() > loss_a.item() + 1.0
-    # delta_t is unmasked: changing a MASKED row's dt target does move it.
+    _, _, _, pos_loss_c, _, _, _ = _crossing_head_loss(model, latent, pos_corrupt2, dt, mask, row_idx, "cpu")
+    assert pos_loss_c > pos_loss_a + 1.0
+
+    # crosses_logit's target flips from 0 to 1 if a "never" row (dt=-1)
+    # becomes a real crossing (dt>=0), even though mask_all (position) for
+    # that row is still False -- the classifier target is independent of
+    # the position mask.
+    dt_flip = dt.copy()
+    dt_flip[0] = 3.0  # was -1.0 (never) -> now a real crossing
+    _, _, _, _, crosses_loss_d, _, crosses_acc_d = _crossing_head_loss(model, latent, pos, dt_flip, mask, row_idx, "cpu")
+    assert crosses_loss_d != pytest.approx(crosses_loss_a, abs=1e-6)
+
+
+def test_crossing_head_loss_dt_masked_by_crosses_not_position_mask():
+    """dt's mask is (crossing_dt != -1), NOT mask_all (the position mask) --
+    an 'already crossed' row (dt=0) has no meaningful crossing POSITION
+    (mask_all=False there) but DOES have a meaningful dt (0.0, included in
+    the regression) -- verifies the two masks are genuinely independent,
+    which is the whole point of splitting crosses_logit out from delta_t."""
+    from footballcoach.ai.physics_pretrain.train_player_dynamics import _crossing_head_loss
+
+    model = _aux_test_model()
+    latent = torch.randn(4, 8)
+    pos = np.zeros((4, 2), dtype=np.float32)
+    # row 0: already-crossed (dt=0, position mask False)
+    # row 1: real future crossing (dt=2, position mask True)
+    # row 2: never crosses (dt=-1, position mask False)
+    # row 3: real future crossing (dt=4, position mask True)
+    dt = np.array([0.0, 2.0, -1.0, 4.0], dtype=np.float32)
+    pos_mask = np.array([False, True, False, True])
+    row_idx = np.arange(4)
+
+    _, _, _, pos_loss_a, _, dt_loss_a, _ = _crossing_head_loss(model, latent, pos, dt, pos_mask, row_idx, "cpu")
+
+    # Corrupting row 0's dt value moves dt_loss, even though mask_all[0] is
+    # False -- row 0 IS in the dt-regression's own mask (dt != -1).
     dt_corrupt = dt.copy()
-    dt_corrupt[0] = 25.0
-    loss_d, _, dt_mae_d = _crossing_head_loss(model, latent, pos, dt_corrupt, mask, row_idx, "cpu")
-    assert loss_d.item() > loss_a.item() + 1.0
-    assert dt_mae_d > dt_mae_a
+    dt_corrupt[0] = 9.0
+    _, _, _, _, _, dt_loss_b, _ = _crossing_head_loss(model, latent, pos, dt_corrupt, pos_mask, row_idx, "cpu")
+    assert dt_loss_b != pytest.approx(dt_loss_a, abs=1e-6)
+
+    # But corrupting row 0's POSITION target must not move pos_loss, since
+    # mask_all[0] is False regardless of dt.
+    pos_corrupt = pos.copy()
+    pos_corrupt[0] = [50.0, -50.0]
+    _, _, _, pos_loss_c, _, _, _ = _crossing_head_loss(model, latent, pos_corrupt, dt, pos_mask, row_idx, "cpu")
+    assert pos_loss_c == pytest.approx(pos_loss_a, abs=1e-6)
 
 
 def test_crossing_head_loss_all_masked_is_finite():
-    """No row in the batch crossed -- the masked position mean must fall back
-    to 0/1 rather than dividing by zero."""
+    """No row in the batch crossed -- the masked position/dt means must fall
+    back to 0/1 rather than dividing by zero."""
     from footballcoach.ai.physics_pretrain.train_player_dynamics import _crossing_head_loss
 
     model = _aux_test_model()
     latent = torch.randn(3, 8)
-    loss, pos_dist, dt_mae = _crossing_head_loss(
+    loss, pos_dist, dt_mae, pos_loss, crosses_loss, dt_loss, crosses_acc = _crossing_head_loss(
         model, latent, np.zeros((3, 2), dtype=np.float32), np.full(3, -1.0, dtype=np.float32),
         np.zeros(3, dtype=bool), np.arange(3), "cpu",
     )
     assert torch.isfinite(loss).all()
     assert pos_dist == pytest.approx(0.0, abs=1e-9)
-    assert math.isfinite(dt_mae)
+    assert dt_mae == pytest.approx(0.0, abs=1e-9)  # no row has dt != -1, so the dt regression's mask is also all-empty
+    assert math.isfinite(pos_loss) and math.isfinite(crosses_loss) and math.isfinite(dt_loss)
+    assert 0.0 <= crosses_acc <= 1.0
+    assert loss.item() == pytest.approx(pos_loss + crosses_loss + dt_loss, abs=1e-6)
 
 
 def test_goal_mouth_distance_hand_computed():
@@ -680,9 +770,12 @@ def test_short_horizon_probe_loss_sums_both_heads():
 
 def test_build_horizon_bundle_crossing_dt_is_rebased_per_horizon(tmp_path):
     """A pseudo-start at horizon h sees delta_t = crossing_time -
-    horizons_s[h]; a crossing that already happened BEFORE h (negative
-    delta_t) is folded into the same -1 sentinel / invalid treatment as an
-    episode that never crossed."""
+    horizons_s[h] when a real FUTURE crossing is still ahead (valid=True).
+    Otherwise, delta_t gets one of two distinct sentinels depending on
+    horizon h's OWN recorded oob/goal flags: 0.0 if the player is already
+    out of bounds/scored right at h (a crossing that already happened, or
+    an episode excluded at generation for starting oob), -1.0 if they
+    genuinely never cross AND aren't currently out either."""
     from footballcoach.ai.physics_pretrain.train_player_dynamics import _build_horizon_bundle
 
     generate_dataset(n_episodes=80, output_dir=tmp_path, seed=13, shard_size=80, n_workers=1)
@@ -696,7 +789,11 @@ def test_build_horizon_bundle_crossing_dt_is_rebased_per_horizon(tmp_path):
     for h, t in enumerate(horizons):
         valid, dt = bundle["crossing_valid"][h], bundle["crossing_dt"][h]
         assert valid.shape == (len(ds),) and dt.shape == (len(ds),)
-        assert (dt[~valid] == -1.0).all()
+        base_h = h * N_TARGET_FIELDS_PER_HORIZON
+        block_h = ds.targets[idx, base_h:base_h + N_TARGET_FIELDS_PER_HORIZON]
+        already_there_h = (block_h[:, 7] >= 0.5) | (block_h[:, 8] >= 0.5)
+        assert (dt[~valid & already_there_h] == 0.0).all()
+        assert (dt[~valid & ~already_there_h] == -1.0).all()
         assert (dt[valid] >= 0).all()
         np.testing.assert_allclose(dt[valid], (ds.crossing_times[valid] - t).astype(np.float32), atol=1e-5)
         # Validity can only shrink as the pseudo-start moves later.
@@ -714,6 +811,27 @@ def test_build_horizon_bundle_crossing_dt_is_rebased_per_horizon(tmp_path):
 # ---------------------------------------------------------------------------
 # train_player_dynamics: end-to-end smoke
 # ---------------------------------------------------------------------------
+
+def test_train_linear_decoder_smoke(tmp_path, caplog):
+    """--linear-decoder swaps in PlayerDynamicsLinearDecoder, trains without
+    crashing, and logs both the mode-switch note and the adjacent-pair
+    kept/dropped counts -- mirrors test_ball_physics_pretrain.py's
+    identical test."""
+    from footballcoach.ai.physics_pretrain.train_player_dynamics import train
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=60, output_dir=dataset_dir, seed=5, shard_size=60, n_workers=1)
+    output_path = tmp_path / "player_encoder.pt"
+    with caplog.at_level("INFO", logger="footballcoach.ai.physics_pretrain.train_player_dynamics"):
+        train(
+            dataset_dir=str(dataset_dir), output_path=str(output_path),
+            epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=0,
+            linear_decoder=True,
+        )
+    assert "linear_decoder_enabled" in caplog.text
+    assert "kept" in caplog.text and "dropped" in caplog.text
+    assert output_path.exists()
+
 
 def test_train_smoke(tmp_path, caplog):
     from footballcoach.ai.physics_pretrain.train_player_dynamics import train
@@ -1035,12 +1153,21 @@ def test_train_auto_widens_init_checkpoint_on_dim_mismatch(tmp_path, monkeypatch
         # is null (mirrors identity_shortcut_enabled=true) -- unlike ball's
         # ai_config.json, which sets it explicitly False.
         pp["hidden_dim"], pp["encoder_bottleneck_dim"], pp["latent_dim"], pp["decoder_hidden_dim"] = 24, 12, 16, 16
+        # widen_player_checkpoint.py doesn't support widening under
+        # linear_decoder_enabled yet (its seam surgery assumes the old MLP
+        # decoder's net[0]/net[2] layout, which PlayerDynamicsLinearDecoder
+        # doesn't have) -- force it off regardless of the live config's
+        # default, since this test is specifically exercising the widen
+        # path, not the linear decoder. See test_ball_physics_pretrain.py's
+        # identical fix.
+        pp["linear_decoder_enabled"] = False
         return cfg
 
     def _bigger_cfg():
         cfg = orig_load_ai_config()
         pp = cfg["physics_pretrain"]["player"]
         pp["hidden_dim"], pp["encoder_bottleneck_dim"], pp["latent_dim"], pp["decoder_hidden_dim"] = 40, 20, 24, 20
+        pp["linear_decoder_enabled"] = False
         return cfg
 
     dataset_dir = tmp_path / "data"

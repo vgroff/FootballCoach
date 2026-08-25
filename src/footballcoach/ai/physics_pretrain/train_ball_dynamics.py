@@ -28,6 +28,8 @@ import copy
 import hashlib
 import json
 import logging
+import math
+from collections.abc import Callable
 from pathlib import Path
 
 import numpy as np
@@ -35,6 +37,7 @@ import torch
 import torch.nn.functional as F
 
 from footballcoach.ai.physics_pretrain.ball_dataset import BallDynamicsDataset
+from footballcoach.ai.progress import ProgressReporter
 from footballcoach.ai.physics_pretrain.ball_dynamics_net import N_IDENTITY_SHORTCUT_FIELDS, BallDynamicsAutoencoder
 from footballcoach.ai.physics_pretrain.ball_episode_gen import BALL_SPIN_NORM_DIVISOR_RAD_S, N_TARGET_FIELDS_PER_HORIZON
 
@@ -182,7 +185,8 @@ def compute_per_episode_loss(
 def _crossing_head_loss(
     model: BallDynamicsAutoencoder, latent: torch.Tensor, pos_all: np.ndarray, dt_all: np.ndarray,
     mask_all: np.ndarray, row_idx: np.ndarray, device: torch.device,
-) -> tuple[torch.Tensor, float, float]:
+    pos_loss_weight: float = 1.0, dt_loss_weight: float = 1.0, trust_negatives: bool = True,
+) -> tuple[torch.Tensor, float, float, float, float]:
     """``model.crossing_head``'s loss for one batch: position MSE (summed
     over x/y ONLY -- height is deliberately excluded, MASKED to rows where
     ``mask_all`` is True -- an episode with no crossing AHEAD of whichever
@@ -191,6 +195,21 @@ def _crossing_head_loss(
     ``dt_all``'s -1 sentinel for those same rows -- see ``BallDynamicsDataset``'s
     docstring for why delta_t is trained on the sentinel directly rather
     than also being masked).
+
+    ``pos_loss_weight``/``dt_loss_weight`` (both default 1.0, i.e. plain
+    sum, the original behaviour) scale the two terms BEFORE they're combined
+    into the returned ``loss`` -- split out because the two terms sit on
+    very different natural scales: position error is in normalized (roughly
+    O(1)) units like everything else in this pipeline, but delta_t is RAW,
+    UNNORMALIZED seconds (spanning ``[-1, max(horizons_s)]``), so its
+    squared error can dominate the combined loss purely from unit choice,
+    not actual difficulty -- see ``physics_pretrain.ball.crossing_dt_loss_
+    weight``'s config comment. Callers apply these as ``crossing_pos_loss_
+    weight``/``crossing_dt_loss_weight`` from config; there's no longer a
+    separate OUTER weight multiplying the whole head's loss (the weighting
+    happens in here, once). Direct port of ``train_player_dynamics.
+    _crossing_head_loss``'s identical split -- see its docstring for the
+    original rationale.
 
     ``pos_all``/``dt_all``/``mask_all`` are plain arrays (not tied to a
     specific dataset attribute) so this same function serves BOTH the main
@@ -202,12 +221,49 @@ def _crossing_head_loss(
     ensure ``pos_all``/``dt_all``/``mask_all`` and ``row_idx`` share the same
     indexing convention; this function doesn't care which one it is.
 
+    ``trust_negatives`` (default True -- unchanged behaviour): whether a
+    NEGATIVE ``dt_all`` entry (the ``-1.0`` "never crosses" sentinel) is
+    trustworthy enough to train ``dt_loss`` against. ``ball_episode_gen.
+    generate_episode`` only simulates each episode for ``max(horizons_s)``
+    seconds -- if no out-of-bounds/goal event happens in that fixed window,
+    ``crossing_time_s`` (and therefore ``dt_all``) gets the ``-1.0``/inf
+    "never" sentinel regardless of whether a real event would have
+    happened just PAST the window. That's a RIGHT-CENSORED observation,
+    not a verified "never": at t=0 it's a complete, uncensored fact (the
+    full ``max(horizons_s)``-second window was observed), but at a
+    horizon-pass pseudo-start ``h`` the REMAINING observed window is only
+    ``max(horizons_s) - horizons_s[h]`` seconds -- shorter, and shrinking
+    as ``h`` grows -- while ``crossing_head`` has no input telling it which
+    pseudo-start it's being asked from (it only sees the latent, i.e.
+    current position/velocity/etc.). A ball whose true exit happens just
+    after the recording ends gets trained toward ``-1.0`` at EVERY
+    pseudo-start, contradicting a possibly-correct physical extrapolation
+    purely because the recording stopped first. POSITIVE rows (``dt_all !=
+    -1.0`` -- a genuine future crossing or an already-out/scored row) stay
+    hard, unconditionally verified facts at any horizon and are never
+    affected by this. Set False (only ever passed by horizon-pass call
+    sites; t=0 stays at the default True) to exclude negative rows from
+    ``dt_loss`` entirely rather than training against a possibly-wrong
+    censored target -- positive rows there are untouched. Does not affect
+    ``pos_loss``, which is already masked to positive-only rows (``mask_
+    all``) regardless of this flag, so it was never exposed to this
+    censoring issue.
+
     Returns ``(loss, pos_dist_mean, dt_mae_mean)`` -- the last two are
     plain floats (not backpropagated) for per-epoch reporting: mean
     Euclidean crossing-position error (x/y only) over the rows that actually
     crossed (0.0 if none did, matching the masked loss's own 0-numerator/
     1-denominator convention), and mean absolute delta_t error over ALL rows
     (sentinel included, since that's what the loss itself trains against).
+    ``loss`` itself is the WEIGHTED sum (unlike ``pos_dist_mean``/``dt_mae_
+    mean``, which stay raw/unweighted so they're directly comparable across
+    different weight settings) -- so the logged ``train_crossing_loss=``/
+    ``val_crossing_loss=`` fields now reflect ``pos_loss_weight``/``dt_loss_
+    weight`` too, same as ``train_player_dynamics.py``'s identical field.
+    ``pos_loss_val``/``dt_loss_val`` are the two WEIGHTED sub-terms that sum
+    to ``loss`` (as plain floats), letting callers report how much of
+    ``crossing_head``'s own loss comes from each half -- see
+    ``_log_aux_diagnostics``'s per-head pos/dt breakdown line.
     """
     crossing_pred = model.crossing_head(latent)
     c_pos = torch.from_numpy(pos_all[row_idx]).to(device)
@@ -217,12 +273,34 @@ def _crossing_head_loss(
     denom = mask_f.sum().clamp_min(1.0)
     pos_err = crossing_pred[:, 0:2] - c_pos
     pos_loss = (pos_err.pow(2).sum(dim=-1) * mask_f).sum() / denom
-    dt_loss = F.mse_loss(crossing_pred[:, 2], c_dt)
-    loss = pos_loss + dt_loss
+    if trust_negatives:
+        dt_loss = F.mse_loss(crossing_pred[:, 2], c_dt)
+    else:
+        # See this function's own trust_negatives docstring -- a -1.0
+        # ("never crosses") target here is right-censored, not verified,
+        # so it's excluded from dt_loss entirely rather than trained
+        # against. Positive rows (c_dt != -1.0) are untouched.
+        dt_target_mask = (c_dt != -1.0).float()
+        dt_target_denom = dt_target_mask.sum().clamp_min(1.0)
+        dt_loss = ((crossing_pred[:, 2] - c_dt).pow(2) * dt_target_mask).sum() / dt_target_denom
+    weighted_pos_loss = pos_loss_weight * pos_loss
+    weighted_dt_loss = dt_loss_weight * dt_loss
+    loss = weighted_pos_loss + weighted_dt_loss
     with torch.no_grad():
         pos_dist_mean = float((torch.linalg.norm(pos_err, dim=-1) * mask_f).sum().item() / float(denom.item()))
-        dt_mae_mean = float((crossing_pred[:, 2] - c_dt).abs().mean().item())
-    return loss, pos_dist_mean, dt_mae_mean
+        # Masked to match whatever dt_loss actually trained on above --
+        # unmasked (all rows) when trust_negatives=True, positive-rows-only
+        # when False, so a caller watching this metric sees error over the
+        # SAME population the gradient came from rather than a figure
+        # diluted by rows deliberately excluded from training (see
+        # trust_negatives's own docstring for why those are excluded).
+        if trust_negatives:
+            dt_mae_mean = float((crossing_pred[:, 2] - c_dt).abs().mean().item())
+        else:
+            dt_mae_mean = float(((crossing_pred[:, 2] - c_dt).abs() * dt_target_mask).sum().item() / float(dt_target_denom.item()))
+        pos_loss_val = float(weighted_pos_loss.item())
+        dt_loss_val = float(weighted_dt_loss.item())
+    return loss, pos_dist_mean, dt_mae_mean, pos_loss_val, dt_loss_val
 
 
 def _resting_head_loss(
@@ -284,7 +362,7 @@ def _position_head_loss(
 def _event_head_loss(
     model: BallDynamicsAutoencoder, latent: torch.Tensor, ever_oob: np.ndarray, ever_goal: np.ndarray,
     row_idx: np.ndarray, device: torch.device,
-) -> tuple[torch.Tensor, float, float]:
+) -> tuple[torch.Tensor, float, float, tuple[int, int, int, int], tuple[int, int, int, int]]:
     """``model.event_head``'s loss for one batch -- plain (unmasked) BCE,
     summed, for two INDEPENDENT binary targets: whether the episode EVER
     goes out of bounds (logit 0) / EVER scores (logit 1) across the whole
@@ -297,9 +375,16 @@ def _event_head_loss(
     ``_resting_head_loss`` there's no masking: "does this ever happen" is
     always a well-defined 0/1 target for every row.
 
-    Returns ``(loss, oob_acc, goal_acc)`` -- the last two are plain floats
-    (not backpropagated), the fraction of this batch's rows where the
-    thresholded (>0) logit matches the target, for per-epoch reporting.
+    Returns ``(loss, oob_acc, goal_acc, oob_counts, goal_counts)`` --
+    ``oob_acc``/``goal_acc`` are plain floats (not backpropagated), the
+    fraction of this batch's rows where the thresholded (>0) logit matches
+    the target. ``oob_counts``/``goal_counts`` are raw per-batch
+    ``(tp, fp, fn, tn)`` tuples, same convention as ``compute_confusion_
+    counts`` -- callers must SUM these across a full epoch (not average
+    per-batch recall/precision) before computing recall, for the same
+    reason ``compute_confusion_counts``'s docstring gives: a small batch
+    can easily have zero actual positives for a rare event, making that
+    batch's recall undefined.
     """
     pred = model.event_head(latent)
     oob_t = torch.from_numpy(ever_oob[row_idx].astype(np.float32, copy=False)).to(device)
@@ -308,15 +393,28 @@ def _event_head_loss(
     goal_loss = F.binary_cross_entropy_with_logits(pred[:, 1], goal_t)
     loss = oob_loss + goal_loss
     with torch.no_grad():
-        oob_acc = float(((pred[:, 0] > 0) == (oob_t > 0.5)).float().mean().item())
-        goal_acc = float(((pred[:, 1] > 0) == (goal_t > 0.5)).float().mean().item())
-    return loss, oob_acc, goal_acc
+        oob_pred, goal_pred = pred[:, 0] > 0, pred[:, 1] > 0
+        oob_actual, goal_actual = oob_t > 0.5, goal_t > 0.5
+        oob_acc = float((oob_pred == oob_actual).float().mean().item())
+        goal_acc = float((goal_pred == goal_actual).float().mean().item())
+
+        def _counts(p: torch.Tensor, a: torch.Tensor) -> tuple[int, int, int, int]:
+            tp = int((p & a).sum().item())
+            fp = int((p & ~a).sum().item())
+            fn = int((~p & a).sum().item())
+            tn = int((~p & ~a).sum().item())
+            return tp, fp, fn, tn
+
+        oob_counts = _counts(oob_pred, oob_actual)
+        goal_counts = _counts(goal_pred, goal_actual)
+    return loss, oob_acc, goal_acc, oob_counts, goal_counts
 
 
 def _build_horizon_bundle(
     ds: BallDynamicsDataset, indices: np.ndarray, n_horizons: int, horizons_s: list[float],
     pair_enabled: bool, pair_max_skip: int, pair_min_start_speed_norm: float,
     has_crossing_data: bool, resting_min_start_speed_norm: float, resting_speed_norm: float,
+    pair_delta_ok: Callable[[float], bool] | None = None,
 ) -> dict:
     """Precomputes, per recorded horizon ``h``, everything the shared
     "horizon" training step (see ``_run_interleaved_train_epoch``'s
@@ -335,14 +433,21 @@ def _build_horizon_bundle(
     - the horizon-adjusted crossing delta_t/validity: for a pseudo-start at
       horizon h, ``delta_t = crossing_time - horizons_s[h]`` (the crossing
       POSITION needs no adjustment at all -- it's the same fixed (x, y)
-      regardless of which horizon you're predicting from). Physics isn't
-      latched (see ``ball_episode_gen.generate_episode``'s docstring -- a
-      ball that goes oob can bounce back in bounds), so it's possible for
-      ``crossing_time < horizons_s[h]`` even when horizon h's own oob/goal
-      flags read false; that produces a negative delta_t, which isn't
-      meaningful ("time until a FUTURE crossing" can't be negative) and is
-      folded into the same -1 "no crossing" sentinel/mask treatment as a
-      genuinely crossing-free episode, rather than fed to the loss as-is.
+      regardless of which horizon you're predicting from) when there's a
+      genuine FUTURE crossing still ahead. Three distinct cases, three
+      distinct treatments: a still-ahead crossing gets the real (masked=
+      valid) delta_t; horizon h's own recorded oob/goal flags being true
+      right now (``already_there_h``) gets delta_t=0.0, masked=invalid
+      (nothing left to predict, but it's a different fact from "never
+      happens" so it gets its own sentinel); neither (genuinely never
+      crosses AND isn't currently out either) gets delta_t=-1.0, masked=
+      invalid. Checked via horizon h's own flags rather than inferring
+      "already crossed by h" from comparing ``crossing_time`` against
+      ``horizons_s[h]`` because physics isn't latched (see ``ball_episode_
+      gen.generate_episode``'s docstring -- a ball that goes oob can bounce
+      back in bounds), so a ball that crossed once and returned in bounds
+      by h is correctly NOT "already there" even though its recorded
+      FIRST-ever ``crossing_time`` is still ``< horizons_s[h]``.
     - the horizon-adjusted resting-position target/validity, via
       ``ds.compute_resting_targets(..., start_horizon_idx=h)``.
 
@@ -352,10 +457,20 @@ def _build_horizon_bundle(
     index all of them with the same local ``row_idx`` already used for
     ``autoencode_train_data[h]``.
 
+    ``pair_delta_ok`` (default ``None`` = keep everything, the historical
+    behaviour): optional predicate on a candidate combo's ``delta =
+    horizons_s[h+skip] - horizons_s[h]`` -- combos it rejects are dropped
+    from ``pair_targets``/excluded from ``n_pair_dropped`` entirely (not
+    just masked), since there is no way to train on a horizon the decoder
+    can't be queried at (see ``BallDynamicsLinearDecoder.has_horizon`` --
+    the only current caller that passes a non-None predicate). ``None`` for
+    the (unrestricted, continuous-time) ``BallDynamicsDecoder``.
+
     Returns a dict with per-horizon (length ``n_horizons``) lists:
     ``pair_mask``, ``pair_targets`` (list of ``(skip, target_array)`` per
     horizon), ``crossing_dt``, ``crossing_valid`` (``None`` entries when
-    ``has_crossing_data`` is False), ``resting_pos``, ``resting_mask``.
+    ``has_crossing_data`` is False), ``resting_pos``, ``resting_mask`` --
+    plus scalar ``n_pair_kept``/``n_pair_dropped`` counts.
     """
     n = len(indices)
     pair_mask: list[np.ndarray] = []
@@ -364,6 +479,8 @@ def _build_horizon_bundle(
     crossing_valid: list[np.ndarray | None] = []
     resting_pos: list[np.ndarray] = []
     resting_mask: list[np.ndarray] = []
+    n_pair_kept = 0
+    n_pair_dropped = 0
 
     crossing_times_here = ds.crossing_times[indices] if has_crossing_data else None
     for h in range(n_horizons):
@@ -377,6 +494,10 @@ def _build_horizon_bundle(
                 j = h + skip
                 if j >= n_horizons:
                     break
+                if pair_delta_ok is not None and not pair_delta_ok(horizons_s[j] - horizons_s[h]):
+                    n_pair_dropped += 1
+                    continue
+                n_pair_kept += 1
                 base_j = j * N_TARGET_FIELDS_PER_HORIZON
                 targets_h.append((
                     skip, ds.targets[indices, base_j:base_j + N_TARGET_FIELDS_PER_HORIZON].astype(np.float32, copy=False),
@@ -388,10 +509,30 @@ def _build_horizon_bundle(
         pair_targets.append(targets_h)
 
         if has_crossing_data:
+            # `already_there_h` reads horizon h's OWN recorded oob/goal
+            # flags (block_h -- already computed above for pair's mask_h)
+            # directly, rather than inferring "already crossed by h" from
+            # comparing crossing_times_here against horizons_s[h]: physics
+            # isn't latched (see this function's docstring), so a ball that
+            # crossed once and bounced back in bounds by h is NOT "already
+            # there" even though its recorded (FIRST-ever) crossing_time is
+            # still < horizons_s[h] -- checking the flag directly gets this
+            # right in every case, including the boundary case where the
+            # first crossing lands EXACTLY at horizons_s[h] (block_h's flag
+            # there is unambiguous either way). `future_valid` (a real,
+            # still-ahead crossing to predict) is masked=True and gets the
+            # real delta_t; `already_there_h` (masked=False, since there's
+            # nothing left to predict) gets delta_t=0.0 ("already there
+            # right now"); neither applies (genuinely never crosses, and
+            # isn't currently there either) falls back to -1.0 ("never
+            # happens") -- three genuinely different facts, three distinct
+            # values, rather than the old scheme's two (which conflated
+            # "already there" with "never happens").
+            already_there_h = (block_h[:, 9] >= 0.5) | (block_h[:, 10] >= 0.5)
             adj_dt = crossing_times_here - horizons_s[h]
-            adj_valid = np.isfinite(crossing_times_here) & (adj_dt >= 0)
-            crossing_dt.append(np.where(adj_valid, adj_dt, -1.0).astype(np.float32))
-            crossing_valid.append(adj_valid)
+            future_valid = np.isfinite(crossing_times_here) & (adj_dt >= 0) & ~already_there_h
+            crossing_dt.append(np.where(future_valid, adj_dt, np.where(already_there_h, 0.0, -1.0)).astype(np.float32))
+            crossing_valid.append(future_valid)
         else:
             crossing_dt.append(None)
             crossing_valid.append(None)
@@ -407,6 +548,7 @@ def _build_horizon_bundle(
         "pair_mask": pair_mask, "pair_targets": pair_targets,
         "crossing_dt": crossing_dt, "crossing_valid": crossing_valid,
         "resting_pos": resting_pos, "resting_mask": resting_mask,
+        "n_pair_kept": n_pair_kept, "n_pair_dropped": n_pair_dropped,
     }
 
 
@@ -723,14 +865,27 @@ def _interleaved_horizon_batches(
     being processed first. Eval-only passes (no optimizer) don't need
     this -- no gradient updates happen, so a fixed order can't bias
     anything there.
+
+    DROPS the trailing under-``batch_size`` remainder chunk (if any) for
+    each horizon -- a partial batch is a noisier (higher-variance)
+    gradient step than the rest of the epoch's batches, and this dataset
+    is large enough that dropping up to ``batch_size - 1`` rows per
+    horizon per epoch is negligible (a different, re-shuffled subset gets
+    dropped each epoch, so no row is permanently excluded). Exception:
+    if a horizon's OWN row count is smaller than ``batch_size`` (so
+    EVERY chunk would be partial), that horizon's one partial chunk is
+    kept anyway -- dropping it would silently train that horizon on zero
+    rows every single epoch, worse than one noisier-than-usual step.
     """
     batches: list[tuple[int, np.ndarray]] = []
     for h_idx, (h_inputs, _h_targets) in enumerate(data):
         order = rng.permutation(len(h_inputs))
+        h_chunks: list[np.ndarray] = []
         for start in range(0, len(order), batch_size):
             chunk = order[start:start + batch_size]
-            if len(chunk) > 0:
-                batches.append((h_idx, chunk))
+            if len(chunk) == batch_size or not h_chunks:
+                h_chunks.append(chunk)
+        batches.extend((h_idx, c) for c in h_chunks)
     shuffle_order = rng.permutation(len(batches))
     return [batches[i] for i in shuffle_order]
 
@@ -795,6 +950,46 @@ def _safe_nanmean(arr: np.ndarray) -> float:
     return float(np.nanmean(arr))
 
 
+def _sum_counts(counts_list: list[tuple[int, int, int, int]]) -> tuple[int, int, int, int]:
+    """Sums a list of per-batch ``(tp, fp, fn, tn)`` tuples (from
+    ``_event_head_loss``) into one epoch-total tuple -- the raw-counts-
+    then-divide-once convention every other classification metric in this
+    module follows, see ``compute_confusion_counts``'s docstring for why."""
+    tp = sum(c[0] for c in counts_list)
+    fp = sum(c[1] for c in counts_list)
+    fn = sum(c[2] for c in counts_list)
+    tn = sum(c[3] for c in counts_list)
+    return tp, fp, fn, tn
+
+
+def _recall_from_counts(counts: tuple[int, int, int, int]) -> float:
+    """``recall = tp / (tp + fn)``, NaN if there were zero actual
+    positives this epoch (same "no positives to have missed" convention
+    as ``_classification_metrics``'s precision/recall, not a misleading
+    0.0)."""
+    tp, _fp, fn, _tn = counts
+    return float(tp / (tp + fn)) if (tp + fn) > 0 else float("nan")
+
+
+def _format_backprop_contrib(contrib: dict[str, float], total: float) -> str:
+    """Formats a ``{head_name: weighted_mean_contribution}`` dict (see
+    ``_run_interleaved_train_epoch``'s ``backprop_contrib`` return value)
+    as ``name=value (pct%)`` pairs, in descending order of |contribution| --
+    the diagnostic this exists for is "which head should I retune", so the
+    biggest levers should read first rather than in whatever fixed order the
+    dict happens to be built in. Heads with no data this run (NaN
+    contribution -- e.g. crossing_head when has_crossing_data is False) are
+    skipped entirely rather than printed as a confusing 'nan'. ``total`` is
+    ``mean_backprop_loss`` -- the percentages are of THAT, not of the sum of
+    just the printed heads, so they still make sense even if one head was
+    skipped for being NaN."""
+    items = [(name, val) for name, val in contrib.items() if not math.isnan(val)]
+    items.sort(key=lambda kv: abs(kv[1]), reverse=True)
+    if not items or total == 0.0 or math.isnan(total):
+        return "n/a"
+    return "  ".join(f"{name}={val:.4f} ({100.0 * val / total:5.1f}%)" for name, val in items)
+
+
 def _classification_metrics(counts: np.ndarray) -> dict[str, np.ndarray]:
     """``counts``: ``(n_horizons, 4)`` array of summed ``(tp, fp, fn, tn)``.
 
@@ -815,6 +1010,7 @@ def _classification_metrics(counts: np.ndarray) -> dict[str, np.ndarray]:
 
 def _build_phase_optimizer(
     params, lr: float, cfg: dict, type_key: str, momentum_key: str, log_label: str, weight_decay: float = 0.0,
+    beta1_key: str | None = None, beta2_key: str | None = None,
 ) -> torch.optim.Optimizer:
     """Builds this phase's own optimizer from its own ``cfg[type_key]``/
     ``cfg[momentum_key]`` -- each of the main loop, autoencode-pretrain, and
@@ -823,15 +1019,29 @@ def _build_phase_optimizer(
     ``sgd_momentum`` for the SGD case, while autoencode/decoder-only were
     silently always Adam regardless of what the main loop was set to).
     Logs which one it picked either way, so a run's log makes clear which
-    of the (now 3) independent choices actually took effect."""
+    of the (now 3) independent choices actually took effect.
+
+    ``beta1_key``/``beta2_key`` (Adam only, ignored for SGD): same
+    per-phase-independent-key convention as ``momentum_key``. Left at
+    PyTorch's own defaults (0.9/0.999) when the key is absent from cfg or
+    ``beta1_key``/``beta2_key`` themselves are None (SGD-only callers don't
+    pass them). Worth retuning away from the defaults with a large
+    ``batch_size``: beta2's effective EMA window is ~1/(1-beta2) STEPS
+    (~1000 for the 0.999 default), and a big batch means far fewer steps
+    per epoch -- so how many epochs' worth of data that window actually
+    spans (and thus how stale/smeared the second-moment estimate is
+    relative to one LR-schedule cycle) depends heavily on batch_size. See
+    physics_runs.md for the batch_size=12000 worked example."""
     optimizer_type = str(cfg.get(type_key, "adam")).lower()
     if optimizer_type == "sgd":
         momentum = float(cfg.get(momentum_key, 0.9))
         log.info(f"{log_label} optimizer: SGD (momentum={momentum}, lr={lr:.2e}, weight_decay={weight_decay})")
         return torch.optim.SGD(params, lr=lr, momentum=momentum, weight_decay=weight_decay)
     elif optimizer_type == "adam":
-        log.info(f"{log_label} optimizer: Adam (lr={lr:.2e}, weight_decay={weight_decay})")
-        return torch.optim.Adam(params, lr=lr, weight_decay=weight_decay)
+        beta1 = float(cfg.get(beta1_key, 0.9)) if beta1_key else 0.9
+        beta2 = float(cfg.get(beta2_key, 0.999)) if beta2_key else 0.999
+        log.info(f"{log_label} optimizer: Adam (lr={lr:.2e}, betas=({beta1}, {beta2}), weight_decay={weight_decay})")
+        return torch.optim.Adam(params, lr=lr, betas=(beta1, beta2), weight_decay=weight_decay)
     raise ValueError(f"Unknown physics_pretrain.ball.{type_key}: {optimizer_type!r} (expected 'adam' or 'sgd')")
 
 
@@ -856,11 +1066,45 @@ def train(
     device: str = "cpu",
     open_browser: bool = False,
     init_checkpoint: str | None = None,
+    reset_decoder_weights: bool = False,
+    reset_optimizer_state: bool = False,
+    max_episodes: int | None = None,
+    linear_decoder: bool | None = None,
 ) -> dict:
     from footballcoach.ai.config import load_ai_config
-    cfg = load_ai_config()["physics_pretrain"]["ball"]
+    # Shallow copy -- load_ai_config() is @lru_cache'd (one shared dict for
+    # the whole process), so mutating the returned dict in place (see
+    # linear_decoder_enabled write-back below) would leak into every OTHER
+    # unrelated load_ai_config() call for the rest of the process's
+    # lifetime (a real bug this hit: a linear-decoder test run under
+    # pytest-xdist corrupted a later, unrelated test in the same worker).
+    cfg = dict(load_ai_config()["physics_pretrain"]["ball"])
+    linear_decoder = bool(cfg.get("linear_decoder_enabled", False)) if linear_decoder is None else bool(linear_decoder)
+    # Write the RESOLVED value back into cfg (not just the config file's own
+    # value) -- cfg is what gets saved verbatim as every checkpoint's
+    # "config_snapshot" below, and a --linear-decoder CLI override with no
+    # matching config-file edit would otherwise save a snapshot that lies
+    # about which decoder the checkpoint actually has, breaking any later
+    # resume/widen/inspect tool that trusts config_snapshot over re-deriving
+    # the architecture some other way. Safe now that cfg is our own copy.
+    cfg["linear_decoder_enabled"] = linear_decoder
 
     ds = BallDynamicsDataset.from_directory(dataset_dir)
+    if max_episodes is not None and max_episodes < len(ds):
+        # Deliberately random (not just "take the first N"), seeded off
+        # this run's own `seed` for reproducibility -- shards are written
+        # in generation order, and while each episode's own draw is
+        # independent, there's no guarantee against some subtle
+        # correlation across a shard/worker boundary (e.g. --n-workers>1
+        # dataset generation), so a random subset is the safer default.
+        # Typical use: --max-episodes to test whether the network can fit
+        # a small subset (e.g. 5k episodes) near-perfectly -- a sanity
+        # check on capacity/optimization separate from the full dataset's
+        # generalization question.
+        full_n = len(ds)
+        subset_idx = np.random.default_rng(seed).choice(full_n, size=max_episodes, replace=False)
+        ds = ds.subset(subset_idx)
+        log.info(f"--max-episodes: limited dataset from {full_n:,} to {len(ds):,} episodes (seed={seed})")
     # freeze_semantics (default true): reconstructs the OLD freeze-on-event
     # targets (state frozen at the first out_of_bounds/goal_scored crossing,
     # held + latched for every later horizon) from the dataset's always-
@@ -964,7 +1208,37 @@ def train(
         list(cfg["horizons_s"]), gen_params, gravity_mps2, indices=train_idx,
     )
 
-    model = BallDynamicsAutoencoder.from_config().to(device)
+    model = BallDynamicsAutoencoder(
+        hidden_dim=cfg["hidden_dim"],
+        latent_dim=cfg["latent_dim"],
+        horizons_s=cfg["horizons_s"],
+        decoder_hidden_dim=cfg.get("decoder_hidden_dim", 32),
+        encoder_bottleneck_dim=cfg.get("encoder_bottleneck_dim", 32),
+        identity_shortcut=cfg.get("identity_shortcut_enabled", False),
+        identity_shortcut_noise_std=cfg.get("identity_shortcut_noise_std", 0.0),
+        encoder_concat_all_input_fields=cfg.get("encoder_concat_all_input_fields", False),
+        decoder_identity_shortcut=cfg.get("decoder_identity_shortcut_enabled"),
+        linear_decoder=linear_decoder,
+        leaky_relu_negative_slope=cfg.get("encoder_leaky_relu_negative_slope", 0.0),
+    ).to(device)
+    if linear_decoder:
+        # spin_loss_weight/bce_loss_weight are harmless but meaningless in
+        # this mode (BallDynamicsLinearDecoder zero-pads those columns as a
+        # constant with no gradient -- see its docstring) -- flag it so a
+        # nonzero config value doesn't read as real training signal in the
+        # per-epoch logs.
+        _ignored = []
+        if float(cfg.get("spin_loss_weight", 0.0)) != 0.0:
+            _ignored.append("spin_loss_weight")
+        if float(cfg.get("bce_loss_weight", 0.0)) != 0.0:
+            _ignored.append("bce_loss_weight")
+        if cfg.get("decoder_identity_shortcut_enabled") is not None or cfg.get("decoder_hidden_dim") is not None:
+            _ignored.append("decoder_hidden_dim/decoder_identity_shortcut_enabled")
+        ignored_note = f" (configured but has no effect here: {', '.join(_ignored)})" if _ignored else ""
+        log.info(
+            "linear_decoder_enabled: decoder is now one independent Linear(latent_dim, 6) head per registered "
+            f"horizon (pos+vel only, no spin/oob/goal, no continuous-time interpolation){ignored_note}"
+        )
     # weight_decay (default 0.0) is deliberately applied ONLY to this main-
     # loop optimizer -- NOT autoencode_optimizer/decoder_only_optimizer
     # below. Uniform L2 decay pulls EVERY parameter toward 0 every step,
@@ -1004,7 +1278,14 @@ def train(
     # rather than reusing whatever worked for Adam.
     optimizer = _build_phase_optimizer(
         model.parameters(), lr, cfg, "optimizer_type", "sgd_momentum", "Main-loop", weight_decay=weight_decay,
+        beta1_key="adam_beta1", beta2_key="adam_beta2",
     )
+    # Mirrors _build_phase_optimizer's own internal computation for the
+    # "optimizer_type" key -- needed here too (not just inside that helper)
+    # so _save_phase_checkpoint/the init_checkpoint restore logic below can
+    # record/compare which optimizer class this run's checkpoint's
+    # optimizer_state_dict belongs to.
+    optimizer_type = str(cfg.get("optimizer_type", "adam")).lower()
 
     # Multiplies the oob/goal BCE terms' contribution to every backprop'd
     # loss in this run (main heads, adjacent-pair, autoencode-pretrain,
@@ -1024,12 +1305,19 @@ def train(
     # Weight on model.crossing_head's own loss (crossing position, masked to
     # episodes that actually went oob/scored within the simulated window,
     # plus unmasked delta_t against the ds.crossing_dt -1-sentinel target --
-    # see BallDynamicsDataset's docstring). 0.0 fully disables its gradient,
-    # same convention as bce_weight/spin_weight above. `has_crossing_data`
-    # guards every crossing-head call site below: a dataset built without
-    # crossings/crossing_times (e.g. a hand-built one in a test) simply skips
-    # the head entirely rather than crashing on a None array.
-    crossing_weight = float(cfg.get("crossing_loss_weight", 1.0))
+    # see BallDynamicsDataset's docstring). Split into separate position/
+    # delta_t weights (rather than one combined weight applied to both) --
+    # see _crossing_head_loss's docstring for why: delta_t is raw,
+    # unnormalized seconds, a very different natural scale from position's
+    # roughly-O(1) normalized units, so one shared weight can't tune them
+    # independently. Direct port of train_player_dynamics.py's identical
+    # split. 0.0 on BOTH fully disables the head's gradient, same convention
+    # as bce_weight/spin_weight above. `has_crossing_data` guards every
+    # crossing-head call site below: a dataset built without crossings/
+    # crossing_times (e.g. a hand-built one in a test) simply skips the head
+    # entirely rather than crashing on a None array.
+    crossing_pos_weight = float(cfg.get("crossing_pos_loss_weight", 1.0))
+    crossing_dt_weight = float(cfg.get("crossing_dt_loss_weight", 1.0))
     has_crossing_data = ds.crossing_pos is not None
     if has_crossing_data:
         # Episodes that started ALREADY out of bounds/in a goal mouth (see
@@ -1037,26 +1325,20 @@ def train(
         # "crosses almost immediately" crossing_dt/crossing_pos recorded --
         # a near-trivial function of the raw t=0 input, not the "will an
         # in-play ball actually go out/score" signal the head exists to
-        # predict, so the POSITION term is excluded the same way "never
-        # crosses" is: mask dropped. delta_t is NOT masked (no masked-loss
-        # path for it, see _crossing_head_loss's docstring), so it still
-        # needs SOME target -- 0.0 ("already crossed as of t=0"), not the
-        # -1.0 "never crosses" sentinel: these episodes genuinely DID
-        # cross, immediately, so -1.0 would be training the head against a
-        # target that's factually false (actively teaches "already out of
-        # bounds/in goal" -> "won't cross"), not just an uninteresting one.
-        # 0.0 is the honest answer AND (unlike the position term) a
-        # legitimate, learnable pattern -- "is the raw input already
-        # oob/in-goal" is a real function of the input the head can pick up
-        # on, not a data artifact like the ~1-tick-late position/dt used
-        # to be before this mask/sentinel handling existed at all.
+        # predict. Position stays excluded exactly like "never crosses"
+        # (mask dropped -- still a trivial/uninformative target either way),
+        # but delta_t gets its OWN distinct sentinel: 0.0 ("already there
+        # right now"), not -1.0 ("never happens") -- the two are genuinely
+        # different facts about the episode and shouldn't share one value.
+        # Same convention as _build_horizon_bundle's already_there_h below.
         already_oob_at_start = ds.compute_already_out_of_bounds_at_start_mask(gen_params)
         ds.crossing_mask = ds.crossing_mask & ~already_oob_at_start
         ds.crossing_dt = np.where(already_oob_at_start, 0.0, ds.crossing_dt).astype(np.float32)
 
     # Weight on model.resting_head's own loss (see BallDynamicsDataset.
     # compute_resting_targets / BallDynamicsAutoencoder.resting_head's
-    # docstrings) -- same 0.0-disables convention as crossing_weight above.
+    # docstrings) -- same 0.0-disables convention as crossing_pos_weight/
+    # crossing_dt_weight above.
     # Unlike crossing, resting targets are derivable from self.inputs/
     # self.targets alone (no extra recorded columns needed), so there's no
     # has_resting_data guard -- it's always computable, just possibly
@@ -1073,7 +1355,7 @@ def train(
 
     # Weight on model.position_head's own loss (current x/y position,
     # unmasked -- see BallDynamicsAutoencoder.position_head's docstring).
-    # Same 0.0-disables convention as crossing_weight/resting_weight above.
+    # Same 0.0-disables convention as crossing_pos_weight/resting_weight above.
     # Unlike either of those, there's no dataset-derived target/mask at
     # all: the target is always just the batch's own input fields 0:2.
     position_weight = float(cfg.get("position_loss_weight", 1.0))
@@ -1095,7 +1377,8 @@ def train(
     # dicts (e.g. `train_means`), which other code still reads by key.
     _LOG_COMPONENTS = tuple(
         c for c in _COMPONENTS
-        if not (c == "spin_rmse" and spin_weight == 0.0)
+        if c != "pos_rmse"
+        and not (c == "spin_rmse" and spin_weight == 0.0)
         and not (c in ("oob_bce", "goal_bce") and bce_weight == 0.0)
     )
 
@@ -1122,13 +1405,91 @@ def train(
         # values and resuming from an old checkpoint just works -- see that
         # module's docstring for why this exactly preserves old training
         # rather than approximating it.
+        # horizons_s changing (e.g. adding/removing recorded horizons and
+        # regenerating the dataset) makes the DECODER side of a saved
+        # checkpoint unusable, regardless of encoder dims: under
+        # linear_decoder_enabled, decoder.net is a single Linear whose
+        # output width is directly (len(horizons_s)+1)*6, a genuine shape
+        # mismatch on an existing key that strict=False does NOT tolerate
+        # (strict only skips keys that are missing/extra, never a shared key
+        # whose shape changed -- it still raises). Under the continuous
+        # decoder, the weight shapes are horizon-count-independent, but the
+        # registered t_norm/t_norm_sq/log_horizons buffers are (len(
+        # horizons_s),) and hit the exact same shape-mismatch wall.
+        # `widen_needed` (hidden_dim/latent_dim/etc growing) and
+        # `horizons_mismatch` are checked/handled INDEPENDENTLY -- either
+        # can happen alone, or both at once (see the combined branch below).
+        horizons_mismatch = old_cfg is not None and list(old_cfg.get("horizons_s", [])) != list(cfg.get("horizons_s", []))
         widen_needed = old_cfg is not None and any(
             old_cfg.get(k, 32) != cfg.get(k, 32)
             for k in ("hidden_dim", "encoder_bottleneck_dim", "latent_dim", "decoder_hidden_dim")
         )
-        if widen_needed:
+        if horizons_mismatch and widen_needed:
+            # BOTH changed at once: the decoder is unusable regardless (see
+            # above), so there's no seam to preserve for it -- but the
+            # encoder/aux heads still deserve real widening (not just a
+            # shape-mismatch crash) since growing hidden_dim/latent_dim etc
+            # has nothing to do with horizons_s. widen_model_'s
+            # `widen_decoder=False` skips the decoder seam entirely, leaving
+            # `model.decoder` at its own fresh (already-correct, new-
+            # horizons-shaped) construction, and `_validate_widen_cfgs`'s
+            # `check_decoder=False` skips every decoder-specific stability/
+            # rejection check (horizons_s itself, linear_decoder_enabled)
+            # since none of them apply when the decoder isn't being touched.
+            from footballcoach.ai.physics_pretrain.widen_ball_checkpoint import _build_model, _validate_widen_cfgs, widen_model_
+            _validate_widen_cfgs(old_cfg, cfg, check_decoder=False)
+            old_cfg = {**old_cfg, "encoder_leaky_relu_negative_slope": cfg.get("encoder_leaky_relu_negative_slope", 0.0)}
+            old_model = _build_model(old_cfg).to(device)
+            if "model_state_dict" in ckpt:
+                old_model.load_state_dict(_migrate_crossing_head_state_dict(ckpt["model_state_dict"], old_model), strict=False)
+            else:
+                old_model.encoder.load_state_dict(ckpt["encoder_state_dict"])
+            widen_model_(old_model, model, old_cfg, cfg, widen_decoder=False)
+            dims = ", ".join(
+                f"{k}: {old_cfg.get(k, 32)}->{cfg.get(k, 32)}"
+                for k in ("hidden_dim", "encoder_bottleneck_dim", "latent_dim")
+                if old_cfg.get(k, 32) != cfg.get(k, 32)
+            )
+            log.info(
+                f"horizons_s changed ({old_cfg.get('horizons_s')} -> {cfg.get('horizons_s')}) AND encoder dims widened "
+                f"({dims}) -- decoder weights are incompatible and were NOT restored (left at fresh init); encoder + "
+                f"crossing_head/resting_head/position_head/event_head widened to the new dims from {init_checkpoint} "
+                f"(phase={ckpt.get('phase', '?')})"
+            )
+        elif horizons_mismatch:
+            # Only `decoder.*` genuinely depends on horizons_s (shape and/or
+            # meaning). crossing_head/resting_head/position_head/event_head
+            # are all plain Linear(latent_dim, N) with N independent of
+            # horizons_s -- shape-compatible and safe to keep, same as the
+            # encoder -- so this filters out just the decoder's own keys
+            # rather than falling back to a plain encoder-only load, and
+            # preserves strictly more of the checkpoint's training.
+            source = ckpt.get("model_state_dict")
+            if source is None:
+                source = {f"encoder.{k}": v for k, v in ckpt["encoder_state_dict"].items()}
+            filtered = {k: v for k, v in source.items() if not k.startswith("decoder.")}
+            missing, unexpected = model.load_state_dict(
+                _migrate_crossing_head_state_dict(filtered, model), strict=False,
+            )
+            if missing:
+                log.info(f"Checkpoint missing {len(missing)} param(s) not present when it was saved (left at fresh init): {missing}")
+            if unexpected:
+                log.info(f"Checkpoint had {len(unexpected)} unexpected param(s), ignored: {unexpected}")
+            log.info(
+                f"horizons_s changed ({old_cfg.get('horizons_s')} -> {cfg.get('horizons_s')}) -- decoder weights are "
+                f"incompatible and were NOT restored (left at fresh init); everything else (encoder, crossing_head, "
+                f"resting_head, position_head, event_head) loaded from {init_checkpoint} (phase={ckpt.get('phase', '?')})"
+            )
+        elif widen_needed:
             from footballcoach.ai.physics_pretrain.widen_ball_checkpoint import _build_model, _validate_widen_cfgs, widen_model_
             _validate_widen_cfgs(old_cfg, cfg)
+            # encoder_leaky_relu_negative_slope isn't part of the saved
+            # weights (LeakyReLU has no learnable params) -- old_model is
+            # only a scratch scaffold for widen_model_'s seam surgery to
+            # copy FROM, so build it with THIS run's slope (not whatever
+            # old_cfg says) same as `model` above, rather than leaving it on
+            # a stale value that gets thrown away anyway.
+            old_cfg = {**old_cfg, "encoder_leaky_relu_negative_slope": cfg.get("encoder_leaky_relu_negative_slope", 0.0)}
             old_model = _build_model(old_cfg).to(device)
             if "model_state_dict" in ckpt:
                 old_model.load_state_dict(_migrate_crossing_head_state_dict(ckpt["model_state_dict"], old_model), strict=False)
@@ -1158,9 +1519,153 @@ def train(
             if unexpected:
                 log.info(f"Checkpoint had {len(unexpected)} unexpected param(s), ignored: {unexpected}")
             log.info(f"Resumed full model (encoder+decoder) from {init_checkpoint} (phase={ckpt.get('phase', '?')})")
+            # Optimizer-state resume is Adam-only, and even then only the
+            # per-parameter moment buffers (exp_avg/exp_avg_sq/step) --
+            # NEVER the param_groups (lr/betas/weight_decay). Two
+            # deliberate choices here, both to avoid ways this silently
+            # produced wrong behaviour before:
+            #
+            # 1. SGD NEVER resumes optimizer state, regardless of what the
+            #    checkpoint contains. Matches this codebase's own
+            #    optimizer_type convention (see its config comment): SGD is
+            #    for a fresh, late-stage fine-tune run compared against
+            #    continuing under Adam, not for carrying SGD's own momentum
+            #    across resumes -- and it sidesteps entirely the Adam<->SGD
+            #    state_dict incompatibility that used to crash SGD.step()
+            #    with KeyError('momentum') (state_dict shapes/param-group
+            #    keys genuinely differ between the two optimizer classes).
+            # 2. Adam restores ONLY `state` (the moment buffers) -- never
+            #    `param_groups`. optimizer.load_state_dict() normally
+            #    overwrites param_groups wholesale, which would silently
+            #    replace THIS run's configured lr/betas/weight_decay with
+            #    whatever the checkpoint's optimizer had at save time
+            #    (e.g. wherever the old cosine schedule had annealed down
+            #    to) -- surprising if you'd intentionally changed those in
+            #    config expecting them to take effect on resume. Achieved
+            #    by snapshotting this run's own hyperparams before the
+            #    load, then writing them back over whatever load_state_dict
+            #    just restored into param_groups -- reuses PyPI's own
+            #    (correct, tested) positional param<->state mapping inside
+            #    load_state_dict() rather than reimplementing it by hand.
+            ckpt_optimizer_type = ckpt.get("optimizer_type")
+            if optimizer_type == "sgd":
+                log.info("optimizer_type='sgd' -- optimizer always starts fresh on resume (never restores state from checkpoint)")
+            elif reset_optimizer_state:
+                # Skip restoring Adam's moment state entirely -- weights
+                # still resume normally above, only exp_avg/exp_avg_sq/step
+                # are left fresh. See train_player_dynamics.py's identical
+                # flag/rationale: exp_avg_sq (v) is an EMA of squared
+                # gradients with an effective memory of ~1/(1-beta2) steps
+                # (hundreds to 1000+), so after editing a loss weight and
+                # resuming, v stays calibrated to the OLD gradient scale
+                # until that many steps have passed -- throttling Adam's
+                # effective step size (m_hat/sqrt(v_hat), which is what
+                # actually gates how far a step moves, not the raw
+                # gradient) far below what the CURRENT gradient would
+                # support.
+                log.info(
+                    "--reset-optimizer-state: Adam moment state (exp_avg/exp_avg_sq/step) NOT restored from "
+                    "checkpoint -- starts fresh so a changed loss weight isn't throttled by a stale noise "
+                    "estimate (v) calibrated to the old regime"
+                )
+            elif "optimizer_state_dict" not in ckpt:
+                log.info("Checkpoint has no optimizer_state_dict (older artifact) -- optimizer starts fresh")
+            else:
+                # Guard on the checkpoint's saved state actually being
+                # Adam-shaped (has "exp_avg") before attempting a restore --
+                # an SGD-saved checkpoint's state (momentum_buffer only)
+                # isn't compatible, and feeding it to Adam would still
+                # crash Adam.step() looking for a missing "exp_avg" the
+                # same way the original SGD/Adam mismatch bug did.
+                ckpt_state = ckpt["optimizer_state_dict"].get("state", {})
+                is_adam_shaped = bool(ckpt_state) and all("exp_avg" in s for s in ckpt_state.values())
+                if not is_adam_shaped:
+                    log.info(
+                        f"Checkpoint's optimizer state isn't Adam-shaped (saved optimizer_type={ckpt_optimizer_type!r}) "
+                        "-- optimizer starts fresh"
+                    )
+                else:
+                    try:
+                        this_run_hparams = [dict(g) for g in optimizer.param_groups]
+                        optimizer.load_state_dict(ckpt["optimizer_state_dict"])
+                        for group, keep in zip(optimizer.param_groups, this_run_hparams):
+                            for key in ("lr", "betas", "weight_decay", "eps"):
+                                if key in keep:
+                                    group[key] = keep[key]
+                            # load_state_dict() can also import an
+                            # "initial_lr" key baked into the checkpoint's
+                            # param_groups by ITS OWN (earlier) scheduler.
+                            # Left in place, THIS run's scheduler (built
+                            # after this whole restore block) would find it
+                            # already present and skip setting its own via
+                            # setdefault('initial_lr', group['lr']) -- i.e.
+                            # the new scheduler would silently anchor its
+                            # peak LR to the OLD run's peak instead of this
+                            # run's just-restored lr above, even though
+                            # param_groups['lr'] itself is already correct
+                            # at this point. Only strip it if THIS run's
+                            # optimizer didn't have one of its own already
+                            # (it never should, this restore always runs
+                            # before any scheduler touches the optimizer,
+                            # but this stays correct even if that ordering
+                            # ever changes).
+                            if "initial_lr" not in keep:
+                                group.pop("initial_lr", None)
+                        log.info(
+                            "Resumed Adam moment state (exp_avg/exp_avg_sq/step) from checkpoint -- "
+                            "lr/betas/weight_decay kept at this run's configured values"
+                        )
+                    except (ValueError, RuntimeError, KeyError) as e:
+                        log.warning(f"Could not restore optimizer state from {init_checkpoint} (starting fresh): {e}")
         else:
             model.encoder.load_state_dict(ckpt["encoder_state_dict"])
             log.info(f"Resumed encoder only from {init_checkpoint} (decoder left at fresh init)")
+
+    if reset_decoder_weights:
+        # Reinitializes every decoder-SIDE module (the shared per-horizon
+        # decoder plus the 4 auxiliary latent-reading heads: crossing_head/
+        # resting_head/position_head/event_head -- everything except
+        # `model.encoder`) back to a fresh random init, regardless of what
+        # --init-checkpoint restored for them. Typical use: keep an
+        # already-good encoder's latent representation (loaded via
+        # --init-checkpoint above) but retrain the decoder side from
+        # scratch -- e.g. to test how much of the encoder's quality is
+        # actually load-bearing, or to recover from a decoder stuck in a
+        # bad basin without discarding encoder progress.
+        #
+        # Sources the fresh weights from a THROWAWAY model built via the
+        # same _build_model() helper widen_ball_checkpoint.py uses (same
+        # architecture/init logic as the real model -- including the
+        # identity-shortcut hand-init on the decoder side, if enabled --
+        # rather than hand-calling reset_parameters() per submodule, which
+        # wouldn't replicate that custom init), then copies each
+        # decoder-side submodule's fresh state_dict into the live model
+        # IN PLACE (load_state_dict copies VALUES into the EXISTING
+        # parameter tensors, it doesn't replace the tensor objects) so
+        # object identity is preserved for whatever comes next (encoder
+        # untouched either way).
+        from footballcoach.ai.physics_pretrain.widen_ball_checkpoint import _build_model
+        fresh_model = _build_model(cfg)
+        decoder_side_modules = ("decoder", "crossing_head", "resting_head", "position_head", "event_head")
+        for name in decoder_side_modules:
+            getattr(model, name).load_state_dict(getattr(fresh_model, name).state_dict())
+        # The optimizer's per-parameter Adam moment state (exp_avg/
+        # exp_avg_sq), if any was restored above, is keyed by parameter
+        # OBJECT IDENTITY -- since the decoder's tensors above were reset
+        # IN PLACE (same objects, new values), that old state is still
+        # structurally attachable but now describes a completely different
+        # (freshly-random) set of weights than whatever it was fit
+        # against. Left alone, Adam would apply a stale, likely-tiny
+        # v (second moment) from the OLD, likely-converged decoder to the
+        # NEW, far-from-converged one -- disproportionately amplifying the
+        # first few steps' updates. Dropping these entries makes Adam
+        # lazily reinitialize them (step=0, exp_avg=exp_avg_sq=0) the next
+        # time each parameter is touched, same as any genuinely fresh
+        # parameter -- see torch.optim.Adam's own lazy-init convention.
+        for name in decoder_side_modules:
+            for p in getattr(model, name).parameters():
+                optimizer.state.pop(p, None)
+        log.info(f"Reset decoder-side weights to fresh init ({', '.join(decoder_side_modules)}); encoder left as-is")
 
     # Latent-space diagnostic snapshot at "epoch 0" -- i.e. exactly the
     # state above, BEFORE any training this run happens (whether that's a
@@ -1177,16 +1682,34 @@ def train(
 
     def _save_phase_checkpoint(phase: str) -> None:
         """Full model (encoder+decoder) checkpoint written either after a
-        given phase completes or (phase="midtrain_latest") on every new
-        best-val epoch of the main loop, so a later run can resume from
-        exactly that point via `init_checkpoint` above -- distinct from the
-        encoder-only artifact saved at `output_path` at the very end of
-        training."""
+        given phase completes, (phase="midtrain_latest") on every new
+        best-val epoch of the main loop, or (phase="midtrain_latest_train")
+        on EVERY epoch of the main loop unconditionally (independent of val
+        AND of whether train loss itself improved that epoch -- a genuinely
+        "whatever the model looks like right now" snapshot, useful for
+        killing/resuming a run without losing more than the current epoch's
+        progress), so a later run can resume from exactly that point via
+        `init_checkpoint` above -- distinct from the encoder-only artifact
+        saved at `output_path` at the very end of training."""
         path = Path(output_path).with_suffix(f".{phase}.pt")
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save({
             "model_state_dict": model.state_dict(),
             "encoder_state_dict": model.encoder.state_dict(),
+            # Main-loop optimizer's state (Adam's per-parameter m/v, or SGD's
+            # momentum buffer) -- restored on resume (see the init_checkpoint
+            # handling above) so a later `--init-checkpoint` run continues
+            # the optimizer's adaptive state instead of rebuilding it cold on
+            # top of already-trained weights. Always the MAIN loop's
+            # `optimizer`, regardless of which phase this save came from --
+            # matches `_save_phase_checkpoint`'s own docstring ("so a later
+            # run can resume ... via init_checkpoint").
+            "optimizer_state_dict": optimizer.state_dict(),
+            # Which optimizer class the state_dict above belongs to
+            # ("adam"/"sgd") -- checked on resume so a state_dict saved
+            # under one optimizer type is never fed into a differently-
+            # shaped optimizer (see the init_checkpoint restore logic).
+            "optimizer_type": optimizer_type,
             "config_snapshot": cfg,
             "normalization": {
                 "pitch_half_diag_m": pitch_half_diag_m,
@@ -1242,6 +1765,7 @@ def train(
         autoencode_lr = float(cfg.get("autoencode_lr", lr))
         autoencode_optimizer = _build_phase_optimizer(
             model.parameters(), autoencode_lr, cfg, "autoencode_optimizer_type", "autoencode_sgd_momentum", "Autoencode-pretrain",
+            beta1_key="autoencode_adam_beta1", beta2_key="autoencode_adam_beta2",
         )
         log.info(
             f"Autoencode pretraining: {autoencode_pretrain_epochs} epoch(s) across all "
@@ -1300,7 +1824,11 @@ def train(
             model.train()
             train_losses_ae: list[float] = []
             train_breakdowns_by_h: list[list[dict]] = [[] for _ in range(n_horizons)]
-            for h_idx, row_idx in _interleaved_horizon_batches(autoencode_train_data, batch_size, rng):
+            ae_batches = list(_interleaved_horizon_batches(autoencode_train_data, batch_size, rng))
+            ae_progress = ProgressReporter(
+                total=len(ae_batches), prefix=f"  autoencode epoch {ae_epoch + 1}/{autoencode_pretrain_epochs} ", live=True,
+            )
+            for _ae_step_i, (h_idx, row_idx) in enumerate(ae_batches):
                 ae_inputs, ae_targets = autoencode_train_data[h_idx]
                 x = torch.from_numpy(ae_inputs[row_idx].astype(np.float32, copy=False)).to(device)
                 y = torch.from_numpy(ae_targets[row_idx].astype(np.float32, copy=False)).to(device)
@@ -1312,6 +1840,7 @@ def train(
                 autoencode_optimizer.step()
                 train_losses_ae.append(float(loss.item()))
                 train_breakdowns_by_h[h_idx].append(breakdown)
+                ae_progress.update(_ae_step_i + 1, postfix=f"loss={float(np.mean(train_losses_ae)):.5f}")
             mean_train_loss_ae = float(np.mean(train_losses_ae)) if train_losses_ae else float("nan")
             train_means_ae = _mean_breakdown_by_horizon(train_breakdowns_by_h)
 
@@ -1424,6 +1953,15 @@ def train(
     crossing_pos_train = ds.crossing_pos[train_idx] if has_crossing_data else None
     crossing_pos_val = ds.crossing_pos[val_idx] if has_crossing_data and len(val_idx) > 0 else None
 
+    # Linear-decoder mode can only be queried at its registered horizons
+    # (see BallDynamicsLinearDecoder.has_horizon) -- adjacent-pair combos
+    # whose delta doesn't land on one of them have nothing to train against
+    # and get dropped entirely at bundle-build time below (not just masked,
+    # since there's no way to even evaluate the decoder there). None for
+    # the (unrestricted, continuous-time) BallDynamicsDecoder -- every combo
+    # survives, same as before this mode existed.
+    pair_delta_ok = model.decoder.has_horizon if linear_decoder else None
+
     horizon_bundle_train: dict = {}
     horizon_bundle_val: dict = {}
     if horizon_pass_enabled:
@@ -1431,19 +1969,28 @@ def train(
             ds, train_idx, n_horizons, cfg["horizons_s"],
             adjacent_pair_training_enabled, adjacent_pair_max_skip, min_start_speed_norm,
             has_crossing_data, resting_min_start_speed_norm, resting_speed_norm,
+            pair_delta_ok=pair_delta_ok,
         )
         if len(val_idx) > 0:
             horizon_bundle_val = _build_horizon_bundle(
                 ds, val_idx, n_horizons, cfg["horizons_s"],
                 adjacent_pair_training_enabled, adjacent_pair_max_skip, min_start_speed_norm,
                 has_crossing_data, resting_min_start_speed_norm, resting_speed_norm,
+                pair_delta_ok=pair_delta_ok,
             )
         if adjacent_pair_training_enabled and n_horizons > 1:
             n_pair_eligible = int(sum(mask.sum() for mask in horizon_bundle_train["pair_mask"]))
             n_pair_combos = sum(len(targets_h) for targets_h in horizon_bundle_train["pair_targets"])
+            drop_line = ""
+            if pair_delta_ok is not None:
+                n_dropped = horizon_bundle_train["n_pair_dropped"]
+                drop_line = (
+                    f", {n_pair_combos} kept / {n_dropped} dropped (delta doesn't land on a registered "
+                    f"linear-decoder horizon)"
+                )
             log.info(
                 f"Adjacent-pair training enabled: {n_horizons - 1} start-horizon(s), max_skip={adjacent_pair_max_skip} "
-                f"({n_pair_combos} (start, skip) combos total), min_start_speed={adjacent_pair_min_start_speed_mps:.2f}m/s, "
+                f"({n_pair_combos} (start, skip) combos total{drop_line}), min_start_speed={adjacent_pair_min_start_speed_mps:.2f}m/s, "
                 f"{n_pair_eligible:,}/{len(train_idx) * (n_horizons - 1):,} (horizon, row) combos mask-eligible "
                 f"(shares rows/batches with autoencode/t0 -- no separate rows of its own anymore)"
             )
@@ -1541,6 +2088,8 @@ def train(
     patience_ctr = 0
     stopped_early = False
     prev_val_loss = float("nan")
+    prev_val_backprop_loss = float("nan")
+    prev_val_backprop_contrib: dict[str, float] | None = None
 
     # Full per-epoch history (every epoch, not just the log tail) -- saved
     # alongside the checkpoint below (as .history.npz) so it can be
@@ -1560,7 +2109,6 @@ def train(
     # reasoning as `_LOG_COMPONENTS` above: a head with no gradient has
     # nothing new to show epoch over epoch.
     _LOG_CLS_KEYS = _CLS_KEYS if bce_weight != 0.0 else ()
-    _LOG_R2_KEYS = tuple(c for c in _R2_KEYS if not (c == "spin_r2" and spin_weight == 0.0))
     _LOG_PCTD_KEYS = tuple(c for c in _PCTD_KEYS if not (c == "spin_err_pct_disp" and spin_weight == 0.0))
     _LOG_PCTB_KEYS = tuple(c for c in _PCTB_KEYS if not (c == "spin_err_pct_ballistic" and spin_weight == 0.0))
 
@@ -1629,6 +2177,8 @@ def train(
         crossing_losses: list[float] = []
         crossing_pos_dists: list[float] = []
         crossing_dt_maes: list[float] = []
+        crossing_pos_losses: list[float] = []
+        crossing_dt_losses: list[float] = []
         resting_losses: list[float] = []
         resting_pos_dists: list[float] = []
         position_losses: list[float] = []
@@ -1673,13 +2223,16 @@ def train(
                         pair_losses.append(float(pair_loss.item()))
 
                     if has_crossing_data:
-                        crossing_loss_h, pos_dist_mean_h, dt_mae_mean_h = _crossing_head_loss(
+                        crossing_loss_h, pos_dist_mean_h, dt_mae_mean_h, pos_loss_h, dt_loss_h = _crossing_head_loss(
                             model, latent, crossing_pos_here, horizon_bundle["crossing_dt"][h_idx],
                             horizon_bundle["crossing_valid"][h_idx], row_idx, device,
+                            pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight, trust_negatives=False,
                         )
                         crossing_losses.append(float(crossing_loss_h.item()))
                         crossing_pos_dists.append(pos_dist_mean_h)
                         crossing_dt_maes.append(dt_mae_mean_h)
+                        crossing_pos_losses.append(pos_loss_h)
+                        crossing_dt_losses.append(dt_loss_h)
 
                     resting_loss_h, resting_pos_dist_mean_h = _resting_head_loss(
                         model, latent, horizon_bundle["resting_pos"][h_idx], horizon_bundle["resting_mask"][h_idx],
@@ -1701,6 +2254,8 @@ def train(
             "crossing_losses": crossing_losses,
             "crossing_pos_dists": crossing_pos_dists,
             "crossing_dt_maes": crossing_dt_maes,
+            "crossing_pos_losses": crossing_pos_losses,
+            "crossing_dt_losses": crossing_dt_losses,
             "resting_losses": resting_losses,
             "resting_pos_dists": resting_pos_dists,
             "position_losses": position_losses,
@@ -1708,31 +2263,52 @@ def train(
         }
 
     def _log_t0_diagnostics(label: str, means: dict[str, np.ndarray], r2: dict[str, np.ndarray], cls: dict[str, np.ndarray] | None) -> None:
-        # Only pos_rmse gets logged (r2/cls args still accepted/computed by
+        # Only pos_dist gets logged (r2/cls args still accepted/computed by
         # callers via _run_t0_pass -- unused here, kept for the loss/scalar
         # returns those calls also need -- but no longer printed; the
-        # vel_rmse/spin_rmse/oob_bce/goal_bce/r2/classification breakdown
-        # was too much per-epoch noise to scan).
-        _log_component(f"{label} t0", "pos_rmse", means["pos_rmse"])
+        # pos_rmse/vel_rmse/spin_rmse/oob_bce/goal_bce/r2/classification
+        # breakdown was too much per-epoch noise to scan).
+        _log_component(f"{label} t0", "pos_dist", means["pos_dist"])
 
-    def _run_interleaved_train_epoch(optimizer: torch.optim.Optimizer) -> dict:
+    def _run_interleaved_train_epoch(optimizer: torch.optim.Optimizer, epoch_label: str = "") -> dict:
         """Runs ONE epoch's worth of TRAINING gradient steps, drawn from
         every enabled source -- "main" (the original t=0 episode inputs,
         predicting every recorded horizon + crossing/resting at t=0) and
         "horizon" (one shared encode per recorded horizon's pseudo-start,
         feeding t0 reconstruction, every pair skip, and the horizon-
         generalized crossing/resting -- see `_build_horizon_bundle`'s and
-        the "horizon" branch's own docstrings) -- in a single SHUFFLED
-        order, rather than as separate sequential passes. Under a fixed-
-        order structure, whichever pass ran LAST in the epoch was always
-        trained against a model every OTHER pass had already updated that
-        epoch, and whichever ran FIRST never benefited from the others'
-        updates -- the exact same systematic (not noise-averaging-out) bias
-        `_interleaved_horizon_batches` already fixes ACROSS HORIZONS within
-        one pass, just one level up: across PASS-TYPE too. Metrics are
-        still tracked and returned completely SEPARATELY per source
-        (main/pair/t0/crossing/resting) -- only the ORDER gradient steps
-        happen in is merged, not what they measure or how they're reported.
+        the "horizon" branch's own docstrings). Each gradient step PAIRS one
+        main batch with one horizon batch and sums both losses into a
+        SINGLE combined backward/step -- the standard multi-task pattern
+        for two objectives sharing one encoder+decoder. This replaced an
+        earlier design that alternated separate single-task steps in a
+        shuffled order (itself a fix for an even earlier bug: 3 fixed
+        SEQUENTIAL passes meant whichever pass ran LAST was always trained
+        against a model every OTHER pass had already updated that epoch,
+        while whichever ran FIRST never benefited from the others' updates
+        -- the same systematic bias `_interleaved_horizon_batches` already
+        fixes ACROSS HORIZONS within one pass, one level up). Pairing is a
+        STRICTLY stronger fix than shuffling: every step is symmetric (both
+        sources' contributions land in the exact same gradient, always),
+        not merely non-systematically-biased-in-expectation over many
+        epochs.
+
+        The two streams' batch COUNTS rarely match (horizon typically has
+        ~8x more rows than main at the same `batch_size`, since every
+        recorded horizon of every main episode becomes its own horizon-pass
+        row) -- the SHORTER stream is CYCLED (repeated, wrapping around) so
+        every batch of the LONGER stream still gets a partner every step.
+        Some of the shorter stream's rows are therefore reused multiple
+        times per epoch while others aren't -- a real, deliberately
+        accepted sampling non-uniformity, simpler than separately tuning
+        each stream's `batch_size` to make counts match exactly.
+
+        Metrics are still tracked and returned completely SEPARATELY per
+        source (main/pair/t0/crossing/resting) -- pairing only changes what
+        the ACTUAL backpropped gradient contains, not what gets measured or
+        reported. `mean_backprop_loss` specifically stays MAIN-component-
+        only (excludes the paired horizon loss) so it remains comparable to
+        `val_backprop_loss`, which has no horizon-pairing equivalent.
 
         Shared by both the main loop and decoder-only pretraining (pass in
         whichever `optimizer` that phase uses) -- their per-epoch training
@@ -1758,13 +2334,28 @@ def train(
         train_crossing_losses: list[float] = []
         train_crossing_pos_dist: list[float] = []
         train_crossing_dt_mae: list[float] = []
+        train_crossing_pos_loss: list[float] = []
+        train_crossing_dt_loss: list[float] = []
         train_resting_losses: list[float] = []
         train_resting_pos_dist: list[float] = []
         train_position_losses: list[float] = []
         train_position_pos_dist: list[float] = []
         train_event_losses: list[float] = []
+        # WEIGHTED per-step contributions of resting/position/event to
+        # backprop_loss (unlike train_resting_losses/train_position_losses/
+        # train_event_losses above, which stay raw/unweighted for
+        # cross-run comparability) -- main's own contribution is just
+        # train_losses itself (weight 1, no separate scale), and
+        # crossing's is train_crossing_losses (already weighted -- see
+        # _crossing_head_loss). Purely for the backprop_loss-contribution-
+        # by-head diagnostic below; not backpropagated themselves.
+        train_resting_contrib: list[float] = []
+        train_position_contrib: list[float] = []
+        train_event_contrib: list[float] = []
         train_event_oob_acc: list[float] = []
         train_event_goal_acc: list[float] = []
+        train_event_oob_counts: list[tuple[int, int, int, int]] = []
+        train_event_goal_counts: list[tuple[int, int, int, int]] = []
         train_backprop_losses: list[float] = []
         train_grad_norms: list[float] = []
         train_sq_err = {g: np.zeros(n_h) for g in _GROUPS}
@@ -1775,129 +2366,138 @@ def train(
         t0_sq_err = {g: np.zeros(n_h) for g in _GROUPS}
         t0_n_count = {g: np.zeros(n_h, dtype=np.int64) for g in _GROUPS}
 
-        # Build every source's minibatch-sized row-index chunks up front
-        # (main: shuffled chunks of `train_idx` itself; pair/t0: reuse
-        # `_interleaved_horizon_batches`' own per-item shuffling), tag each
-        # with which source/item it came from, then shuffle the COMBINED
-        # list's order across all sources together.
-        combined: list[tuple[str, int, np.ndarray]] = []
+        # Build each source's minibatch-sized row-index chunks up front
+        # (main: shuffled chunks of `train_idx` itself; horizon: reuses
+        # `_interleaved_horizon_batches`' own per-item shuffling), then pair
+        # them 1:1 -- cycling whichever stream is shorter so every batch of
+        # the longer stream gets a partner every step (see this function's
+        # own docstring for the rationale and the accepted reuse tradeoff).
+        # Drops the trailing under-batch_size remainder chunk (if any) --
+        # see _interleaved_horizon_batches' docstring for the rationale
+        # (noisier gradient step, negligible/re-shuffled-each-epoch data
+        # loss) -- except when train_idx itself is smaller than
+        # batch_size, where the one partial chunk is kept rather than
+        # training on zero main rows every epoch.
+        main_batches: list[np.ndarray] = []
         main_order = rng.permutation(len(train_idx))
         for start in range(0, len(main_order), batch_size):
             chunk = main_order[start:start + batch_size]
-            if len(chunk) > 0:
-                combined.append(("main", 0, chunk))
-        if horizon_pass_enabled:
-            for h_idx, row_idx in _interleaved_horizon_batches(autoencode_train_data, batch_size, rng):
-                combined.append(("horizon", h_idx, row_idx))
-        shuffle_order = rng.permutation(len(combined))
-        combined = [combined[i] for i in shuffle_order]
+            if len(chunk) == batch_size or not main_batches:
+                main_batches.append(chunk)
 
-        for kind, item_idx, row_idx in combined:
-            if kind == "main":
-                batch_idx = train_idx[row_idx]
-                x = torch.from_numpy(ds.inputs[batch_idx].astype(np.float32, copy=False)).to(device)
-                y = torch.from_numpy(ds.targets[batch_idx].astype(np.float32, copy=False)).to(device)
-                latent, heads = model(x)
-                loss, breakdown = compute_loss(heads, y, pos_weight, bce_weight, spin_weight)
-                # `backprop_loss` (not `loss`) is what actually gets stepped --
-                # folds in the crossing-head term for a single combined
-                # backward pass (cheaper than a separate step, and the
-                # encoder/latent are shared anyway), but `train_losses` below
-                # keeps reporting the main per-horizon `loss` ALONE, same
-                # convention as pair/t0 (always separate metrics, never
-                # merged into train_loss/val_loss) -- otherwise train_loss
-                # would include the crossing term while val_loss doesn't
-                # (val_loss is computed independently below, deliberately
-                # NOT reusing this combined backprop value), making the two
-                # look wildly different for a reason that has nothing to do
-                # with over/underfitting.
-                backprop_loss = loss
-                if has_crossing_data:
-                    crossing_loss, crossing_pos_dist_mean, crossing_dt_mae_mean = _crossing_head_loss(
-                        model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
-                    )
-                    backprop_loss = backprop_loss + crossing_weight * crossing_loss
-                    train_crossing_losses.append(float(crossing_loss.item()))
-                    train_crossing_pos_dist.append(crossing_pos_dist_mean)
-                    train_crossing_dt_mae.append(crossing_dt_mae_mean)
-                # resting_head reuses the SAME `latent` computed above for
-                # the main heads/crossing_head -- it's the same input row,
-                # so no extra encoder call needed (see resting_head's
-                # docstring).
-                resting_loss, resting_pos_dist_mean = _resting_head_loss(
-                    model, latent, resting_pos, resting_mask, batch_idx, device,
+        horizon_batches: list[tuple[int, np.ndarray]] = []
+        if horizon_pass_enabled:
+            horizon_batches = list(_interleaved_horizon_batches(autoencode_train_data, batch_size, rng))
+
+        if main_batches and horizon_batches:
+            n_pairs = max(len(main_batches), len(horizon_batches))
+            main_seq = [main_batches[i % len(main_batches)] for i in range(n_pairs)]
+            horizon_seq = [horizon_batches[i % len(horizon_batches)] for i in range(n_pairs)]
+            pair_order = rng.permutation(n_pairs)
+            pairs: list[tuple[np.ndarray, tuple[int, np.ndarray] | None]] = [
+                (main_seq[i], horizon_seq[i]) for i in pair_order
+            ]
+        else:
+            # Horizon pass disabled entirely this run -- main trains alone,
+            # one gradient step per main batch, same as always.
+            pairs = [(m, None) for m in main_batches]
+
+        progress = ProgressReporter(total=len(pairs), prefix=f"  {epoch_label} " if epoch_label else "  ", live=True)
+        for _step_i, (main_row_idx, horizon_item) in enumerate(pairs):
+            optimizer.zero_grad()
+
+            # ---- main component (always present) ----
+            batch_idx = train_idx[main_row_idx]
+            x = torch.from_numpy(ds.inputs[batch_idx].astype(np.float32, copy=False)).to(device)
+            y = torch.from_numpy(ds.targets[batch_idx].astype(np.float32, copy=False)).to(device)
+            latent, heads = model(x)
+            loss, breakdown = compute_loss(heads, y, pos_weight, bce_weight, spin_weight)
+            # `backprop_loss` folds in every t=0-only auxiliary head
+            # (crossing/resting/position/event), same as before pairing
+            # existed -- kept as the MAIN component's own value alone (NOT
+            # summed with the horizon component below) purely for what gets
+            # LOGGED as `mean_backprop_loss`, so it stays comparable to
+            # `val_backprop_loss` (no horizon-pairing equivalent exists on
+            # the eval side). The tensor actually backpropped (`step_loss`
+            # below) DOES include the horizon component -- only this logged
+            # scalar stays main-only. `train_losses` keeps reporting the
+            # main per-horizon `loss` ALONE, same convention as pair/t0
+            # (always separate metrics, never merged into train_loss/
+            # val_loss) -- otherwise train_loss would include the crossing
+            # term while val_loss doesn't, making the two look wildly
+            # different for a reason that has nothing to do with
+            # over/underfitting.
+            backprop_loss = loss
+            if has_crossing_data:
+                crossing_loss, crossing_pos_dist_mean, crossing_dt_mae_mean, crossing_pos_loss_val, crossing_dt_loss_val = _crossing_head_loss(
+                    model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
+                    pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight,
                 )
-                backprop_loss = backprop_loss + resting_weight * resting_loss
-                train_resting_losses.append(float(resting_loss.item()))
-                train_resting_pos_dist.append(resting_pos_dist_mean)
-                # position_head reuses the SAME `latent`/`x` as everything
-                # else above -- no dataset lookup, no extra encoder call.
-                position_loss, position_pos_dist_mean = _position_head_loss(model, latent, x)
-                backprop_loss = backprop_loss + position_weight * position_loss
-                train_position_losses.append(float(position_loss.item()))
-                train_position_pos_dist.append(position_pos_dist_mean)
-                # event_head is t=0 ONLY -- no horizon-branch counterpart,
-                # see event_head's docstring.
-                event_loss, event_oob_acc, event_goal_acc = _event_head_loss(
-                    model, latent, ever_oob, ever_goal, batch_idx, device,
-                )
-                backprop_loss = backprop_loss + event_weight * event_loss
-                train_event_losses.append(float(event_loss.item()))
-                train_event_oob_acc.append(event_oob_acc)
-                train_event_goal_acc.append(event_goal_acc)
-                optimizer.zero_grad()
-                backprop_loss.backward()
-                # Total gradient norm across every trainable param, BEFORE
-                # optimizer.step() consumes it -- a direct read of how large
-                # this step's raw update direction is, independent of `lr`.
-                # `clip_grad_norm_` with max_norm=inf computes (and returns)
-                # the norm without ever actually clipping/rescaling
-                # anything -- the standard portable way to just measure it.
-                # Diagnostic only: distinguishes "the step size is too big
-                # for the local curvature" (large, noisy grad norms -- try
-                # a smaller lr/eta_min_frac) from "genuinely converged,
-                # just slow" (small, stable grad norms -- more epochs is
-                # the only lever left).
-                grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float("inf")).item())
-                train_grad_norms.append(grad_norm)
-                optimizer.step()
-                train_losses.append(float(loss.item()))
-                train_backprop_losses.append(float(backprop_loss.item()))
-                train_breakdowns.append(breakdown)
-                with torch.no_grad():
-                    counts = compute_confusion_counts(heads, y)
-                    sq_err_counts = compute_group_sq_err(heads, y)
-                train_oob_counts += np.array(counts["oob"])
-                train_goal_counts += np.array(counts["goal"])
-                for g in _GROUPS:
-                    for h, (sq_err, n) in enumerate(sq_err_counts[g]):
-                        train_sq_err[g][h] += sq_err
-                        train_n[g][h] += n
-            else:  # "horizon" -- ONE encoder pass for this recorded
-                # horizon's shared pseudo-input, feeding whichever of
-                # {t0 reconstruction, every pair skip (masked), crossing
-                # (masked/horizon-adjusted), resting (masked/horizon-
-                # adjusted)} are enabled, all summed into ONE gradient step
-                # -- see _build_horizon_bundle's docstring for how the
-                # pair/crossing/resting targets were derived, and why pair's
-                # old row-filter had to become a mask so every task here can
-                # share the exact same row set.
-                h_idx = item_idx
+                backprop_loss = backprop_loss + crossing_loss
+                train_crossing_losses.append(float(crossing_loss.item()))
+                train_crossing_pos_dist.append(crossing_pos_dist_mean)
+                train_crossing_dt_mae.append(crossing_dt_mae_mean)
+                train_crossing_pos_loss.append(crossing_pos_loss_val)
+                train_crossing_dt_loss.append(crossing_dt_loss_val)
+            # resting_head reuses the SAME `latent` computed above for
+            # the main heads/crossing_head -- it's the same input row,
+            # so no extra encoder call needed (see resting_head's
+            # docstring).
+            resting_loss, resting_pos_dist_mean = _resting_head_loss(
+                model, latent, resting_pos, resting_mask, batch_idx, device,
+            )
+            backprop_loss = backprop_loss + resting_weight * resting_loss
+            train_resting_losses.append(float(resting_loss.item()))
+            train_resting_pos_dist.append(resting_pos_dist_mean)
+            train_resting_contrib.append(resting_weight * float(resting_loss.item()))
+            # position_head reuses the SAME `latent`/`x` as everything
+            # else above -- no dataset lookup, no extra encoder call.
+            position_loss, position_pos_dist_mean = _position_head_loss(model, latent, x)
+            backprop_loss = backprop_loss + position_weight * position_loss
+            train_position_losses.append(float(position_loss.item()))
+            train_position_pos_dist.append(position_pos_dist_mean)
+            train_position_contrib.append(position_weight * float(position_loss.item()))
+            # event_head is t=0 ONLY -- no horizon-branch counterpart,
+            # see event_head's docstring.
+            event_loss, event_oob_acc, event_goal_acc, event_oob_counts, event_goal_counts = _event_head_loss(
+                model, latent, ever_oob, ever_goal, batch_idx, device,
+            )
+            backprop_loss = backprop_loss + event_weight * event_loss
+            train_event_losses.append(float(event_loss.item()))
+            train_event_contrib.append(event_weight * float(event_loss.item()))
+            train_event_oob_acc.append(event_oob_acc)
+            train_event_goal_acc.append(event_goal_acc)
+            train_event_oob_counts.append(event_oob_counts)
+            train_event_goal_counts.append(event_goal_counts)
+            step_loss = backprop_loss
+
+            # ---- horizon component -- ONE encoder pass for this recorded
+            # horizon's shared pseudo-input, feeding whichever of
+            # {t0 reconstruction, every pair skip (masked), crossing
+            # (masked/horizon-adjusted), resting (masked/horizon-
+            # adjusted)} are enabled, all summed into `horizon_loss` -- see
+            # _build_horizon_bundle's docstring for how the pair/crossing/
+            # resting targets were derived, and why pair's old row-filter
+            # had to become a mask so every task here can share the exact
+            # same row set. Present whenever the horizon pass is enabled at
+            # all this run -- cycling above guarantees every pair gets one.
+            if horizon_item is not None:
+                h_idx, row_idx = horizon_item
                 ae_inputs, ae_targets = autoencode_train_data[h_idx]
-                x = torch.from_numpy(ae_inputs[row_idx].astype(np.float32, copy=False)).to(device)
-                latent = model.encoder(x)
-                combined_loss = x.new_zeros(())
+                x_h = torch.from_numpy(ae_inputs[row_idx].astype(np.float32, copy=False)).to(device)
+                latent_h = model.encoder(x_h)
+                horizon_loss = x_h.new_zeros(())
 
                 if autoencode_during_main_loop_enabled:
-                    y = torch.from_numpy(ae_targets[row_idx].astype(np.float32, copy=False)).to(device)
+                    y_h = torch.from_numpy(ae_targets[row_idx].astype(np.float32, copy=False)).to(device)
                     pw_row = pos_weight[h_idx]
-                    pred = model.decoder.forward_at(latent, 0.0)
-                    t0_loss, breakdown = _single_target_loss_with_breakdown(pred, y, pw_row, bce_weight, spin_weight)
-                    combined_loss = combined_loss + t0_loss
+                    pred = model.decoder.forward_at(latent_h, 0.0)
+                    t0_loss, t0_breakdown = _single_target_loss_with_breakdown(pred, y_h, pw_row, bce_weight, spin_weight)
+                    horizon_loss = horizon_loss + t0_loss
                     t0_losses.append(float(t0_loss.item()))
-                    t0_breakdowns_by_h[h_idx].append(breakdown)
+                    t0_breakdowns_by_h[h_idx].append(t0_breakdown)
                     with torch.no_grad():
-                        sq_err_counts = compute_group_sq_err([pred], y)
+                        sq_err_counts = compute_group_sq_err([pred], y_h)
                     for g in _GROUPS:
                         se, cnt = sq_err_counts[g][0]
                         t0_sq_err[g][h_idx] += se
@@ -1907,43 +2507,78 @@ def train(
                 if pair_targets_h:
                     mask_f = torch.from_numpy(horizon_bundle_train["pair_mask"][h_idx][row_idx]).to(device).float()
                     denom = mask_f.sum().clamp_min(1.0)
-                    pair_loss = x.new_zeros(())
+                    pair_loss = x_h.new_zeros(())
                     for skip, p_targets in pair_targets_h:
                         y_pair = torch.from_numpy(p_targets[row_idx]).to(device)
                         delta = cfg["horizons_s"][h_idx + skip] - cfg["horizons_s"][h_idx]
-                        pred_pair = model.decoder.forward_at(latent, delta)
+                        pred_pair = model.decoder.forward_at(latent_h, delta)
                         pw_row = pos_weight[h_idx + skip]
                         per_ex_loss = _single_target_per_episode_loss(pred_pair, y_pair, pw_row, bce_weight, spin_weight)
                         pair_loss = pair_loss + (per_ex_loss * mask_f).sum() / denom
-                    combined_loss = combined_loss + pair_loss
+                    horizon_loss = horizon_loss + pair_loss
                     train_pair_losses.append(float(pair_loss.item()))
 
                 if has_crossing_data:
-                    crossing_loss_h, pos_dist_mean_h, dt_mae_mean_h = _crossing_head_loss(
-                        model, latent, crossing_pos_train, horizon_bundle_train["crossing_dt"][h_idx],
+                    crossing_loss_h, pos_dist_mean_h, dt_mae_mean_h, pos_loss_val_h, dt_loss_val_h = _crossing_head_loss(
+                        model, latent_h, crossing_pos_train, horizon_bundle_train["crossing_dt"][h_idx],
                         horizon_bundle_train["crossing_valid"][h_idx], row_idx, device,
+                        pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight, trust_negatives=False,
                     )
-                    combined_loss = combined_loss + crossing_weight * crossing_loss_h
+                    horizon_loss = horizon_loss + crossing_loss_h
                     train_crossing_losses.append(float(crossing_loss_h.item()))
                     train_crossing_pos_dist.append(pos_dist_mean_h)
                     train_crossing_dt_mae.append(dt_mae_mean_h)
+                    train_crossing_pos_loss.append(pos_loss_val_h)
+                    train_crossing_dt_loss.append(dt_loss_val_h)
 
                 resting_loss_h, resting_pos_dist_mean_h = _resting_head_loss(
-                    model, latent, horizon_bundle_train["resting_pos"][h_idx], horizon_bundle_train["resting_mask"][h_idx],
+                    model, latent_h, horizon_bundle_train["resting_pos"][h_idx], horizon_bundle_train["resting_mask"][h_idx],
                     row_idx, device,
                 )
-                combined_loss = combined_loss + resting_weight * resting_loss_h
+                horizon_loss = horizon_loss + resting_weight * resting_loss_h
                 train_resting_losses.append(float(resting_loss_h.item()))
                 train_resting_pos_dist.append(resting_pos_dist_mean_h)
 
-                position_loss_h, position_pos_dist_mean_h = _position_head_loss(model, latent, x)
-                combined_loss = combined_loss + position_weight * position_loss_h
+                position_loss_h, position_pos_dist_mean_h = _position_head_loss(model, latent_h, x_h)
+                horizon_loss = horizon_loss + position_weight * position_loss_h
                 train_position_losses.append(float(position_loss_h.item()))
                 train_position_pos_dist.append(position_pos_dist_mean_h)
 
-                optimizer.zero_grad()
-                combined_loss.backward()
-                optimizer.step()
+                step_loss = step_loss + horizon_loss
+
+            step_loss.backward()
+            # Total gradient norm across every trainable param, BEFORE
+            # optimizer.step() consumes it -- a direct read of how large
+            # this step's raw update direction is, independent of `lr`.
+            # `clip_grad_norm_` with max_norm=inf computes (and returns)
+            # the norm without ever actually clipping/rescaling anything --
+            # the standard portable way to just measure it. Now computed
+            # once per PAIRED step (covers both components' combined
+            # gradient together, not main's alone as before pairing).
+            # Diagnostic only: distinguishes "the step size is too big
+            # for the local curvature" (large, noisy grad norms -- try
+            # a smaller lr/eta_min_frac) from "genuinely converged,
+            # just slow" (small, stable grad norms -- more epochs is
+            # the only lever left).
+            grad_norm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=float("inf")).item())
+            train_grad_norms.append(grad_norm)
+            optimizer.step()
+
+            train_losses.append(float(loss.item()))
+            train_backprop_losses.append(float(backprop_loss.item()))
+            train_breakdowns.append(breakdown)
+            with torch.no_grad():
+                counts = compute_confusion_counts(heads, y)
+                sq_err_counts = compute_group_sq_err(heads, y)
+            train_oob_counts += np.array(counts["oob"])
+            train_goal_counts += np.array(counts["goal"])
+            for g in _GROUPS:
+                for h, (sq_err, n) in enumerate(sq_err_counts[g]):
+                    train_sq_err[g][h] += sq_err
+                    train_n[g][h] += n
+
+            running_loss = float(np.mean(train_backprop_losses))
+            progress.update(_step_i + 1, postfix=f"loss={running_loss:.5f}")
 
         return {
             "mean_loss": float(np.mean(train_losses)) if train_losses else float("nan"),
@@ -1959,6 +2594,8 @@ def train(
             "mean_crossing_loss": float(np.mean(train_crossing_losses)) if train_crossing_losses else float("nan"),
             "crossing_pos_dist": float(np.mean(train_crossing_pos_dist)) if train_crossing_pos_dist else float("nan"),
             "crossing_dt_mae": float(np.mean(train_crossing_dt_mae)) if train_crossing_dt_mae else float("nan"),
+            "crossing_pos_loss": float(np.mean(train_crossing_pos_loss)) if train_crossing_pos_loss else float("nan"),
+            "crossing_dt_loss": float(np.mean(train_crossing_dt_loss)) if train_crossing_dt_loss else float("nan"),
             "mean_resting_loss": float(np.mean(train_resting_losses)) if train_resting_losses else float("nan"),
             "resting_pos_dist": float(np.mean(train_resting_pos_dist)) if train_resting_pos_dist else float("nan"),
             "mean_position_loss": float(np.mean(train_position_losses)) if train_position_losses else float("nan"),
@@ -1966,6 +2603,19 @@ def train(
             "mean_event_loss": float(np.mean(train_event_losses)) if train_event_losses else float("nan"),
             "event_oob_acc": float(np.mean(train_event_oob_acc)) if train_event_oob_acc else float("nan"),
             "event_goal_acc": float(np.mean(train_event_goal_acc)) if train_event_goal_acc else float("nan"),
+            "event_oob_recall": _recall_from_counts(_sum_counts(train_event_oob_counts)),
+            "event_goal_recall": _recall_from_counts(_sum_counts(train_event_goal_counts)),
+            # WEIGHTED mean contribution of each head to backprop_loss (main
+            # is train_losses/mean_loss itself, weight 1 -- see the
+            # accumulator declarations above) -- for the per-epoch
+            # contribution-by-head diagnostic below.
+            "backprop_contrib": {
+                "main": float(np.mean(train_losses)) if train_losses else float("nan"),
+                "crossing": float(np.mean(train_crossing_losses)) if train_crossing_losses else float("nan"),
+                "resting": float(np.mean(train_resting_contrib)) if train_resting_contrib else float("nan"),
+                "position": float(np.mean(train_position_contrib)) if train_position_contrib else float("nan"),
+                "event": float(np.mean(train_event_contrib)) if train_event_contrib else float("nan"),
+            },
             "mean_backprop_loss": float(np.mean(train_backprop_losses)) if train_backprop_losses else float("nan"),
             "grad_norm_stats": _summary_stats(train_grad_norms),
             # Batch-to-batch CHANGE in the main task's own per-batch loss,
@@ -2075,7 +2725,9 @@ def train(
         if not freeze_latent:
             decoder_only_params += list(model.encoder.out.parameters())
         decoder_only_optimizer = _build_phase_optimizer(
-            decoder_only_params, decoder_only_lr, cfg, "decoder_only_optimizer_type", "decoder_only_sgd_momentum", "Decoder-only-pretrain",
+            decoder_only_params, decoder_only_lr, cfg, "decoder_only_optimizer_type", "decoder_only_sgd_momentum",
+            "Decoder-only-pretrain",
+            beta1_key="decoder_only_adam_beta1", beta2_key="decoder_only_adam_beta2",
         )
         log.info(
             f"Decoder-only pretraining: {decoder_only_pretrain_epochs} epoch(s), "
@@ -2117,7 +2769,9 @@ def train(
         best_state_do: dict | None = None
         for do_epoch in range(decoder_only_pretrain_epochs):
             model.train()
-            epoch_result_do = _run_interleaved_train_epoch(decoder_only_optimizer)
+            epoch_result_do = _run_interleaved_train_epoch(
+                decoder_only_optimizer, epoch_label=f"decoder-only epoch {do_epoch + 1}/{decoder_only_pretrain_epochs}",
+            )
             mean_train_loss_do = epoch_result_do["mean_loss"]
             mean_train_pair_loss_do = epoch_result_do["mean_pair_loss"]
             mean_train_t0_loss_do = epoch_result_do["mean_t0_loss"]
@@ -2133,6 +2787,8 @@ def train(
             mean_train_event_loss_do = epoch_result_do["mean_event_loss"]
             train_event_oob_acc_do = epoch_result_do["event_oob_acc"]
             train_event_goal_acc_do = epoch_result_do["event_goal_acc"]
+            train_event_oob_recall_do = epoch_result_do["event_oob_recall"]
+            train_event_goal_recall_do = epoch_result_do["event_goal_recall"]
             mean_train_backprop_loss_do = epoch_result_do["mean_backprop_loss"]
 
             train_means_do = _mean_breakdown(epoch_result_do["breakdowns"])
@@ -2154,6 +2810,8 @@ def train(
             mean_val_event_loss_do = float("nan")
             val_event_oob_acc_do = float("nan")
             val_event_goal_acc_do = float("nan")
+            val_event_oob_recall_do = float("nan")
+            val_event_goal_recall_do = float("nan")
             mean_val_backprop_loss_do = float("nan")
             val_means_do = _mean_breakdown([])
             val_cls_do = _classification_from_counts(np.zeros((n_h, 4), dtype=np.int64), np.zeros((n_h, 4), dtype=np.int64))
@@ -2171,6 +2829,8 @@ def train(
                 val_crossing_losses_do: list[float] = []
                 val_crossing_pos_dists_do: list[float] = []
                 val_crossing_dt_maes_do: list[float] = []
+                val_crossing_pos_losses_do: list[float] = []
+                val_crossing_dt_losses_do: list[float] = []
                 val_resting_losses_do: list[float] = []
                 val_resting_pos_dists_do: list[float] = []
                 val_position_losses_do: list[float] = []
@@ -2178,6 +2838,8 @@ def train(
                 val_event_losses_do: list[float] = []
                 val_event_oob_accs_do: list[float] = []
                 val_event_goal_accs_do: list[float] = []
+                val_event_oob_counts_do: list[tuple[int, int, int, int]] = []
+                val_event_goal_counts_do: list[tuple[int, int, int, int]] = []
                 _val_pos_do = 0
                 with torch.no_grad():
                     for x, y in ds.iterate_minibatches(batch_size, val_idx, shuffle=False, device=device):
@@ -2195,12 +2857,15 @@ def train(
                                 val_n_do[g][h] += n
                         batch_idx = val_idx[_val_pos_do:_val_pos_do + x.shape[0]]
                         if has_crossing_data:
-                            crossing_loss, pos_dist_mean, dt_mae_mean = _crossing_head_loss(
-                            model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
-                        )
+                            crossing_loss, pos_dist_mean, dt_mae_mean, pos_loss_val, dt_loss_val = _crossing_head_loss(
+                                model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
+                                pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight,
+                            )
                             val_crossing_losses_do.append(float(crossing_loss.item()))
                             val_crossing_pos_dists_do.append(pos_dist_mean)
                             val_crossing_dt_maes_do.append(dt_mae_mean)
+                            val_crossing_pos_losses_do.append(pos_loss_val)
+                            val_crossing_dt_losses_do.append(dt_loss_val)
                         resting_loss, resting_pos_dist_mean = _resting_head_loss(
                             model, latent, resting_pos, resting_mask, batch_idx, device,
                         )
@@ -2209,12 +2874,14 @@ def train(
                         position_loss, position_pos_dist_mean = _position_head_loss(model, latent, x)
                         val_position_losses_do.append(float(position_loss.item()))
                         val_position_pos_dists_do.append(position_pos_dist_mean)
-                        event_loss, event_oob_acc, event_goal_acc = _event_head_loss(
+                        event_loss, event_oob_acc, event_goal_acc, event_oob_counts, event_goal_counts = _event_head_loss(
                             model, latent, ever_oob, ever_goal, batch_idx, device,
                         )
                         val_event_losses_do.append(float(event_loss.item()))
                         val_event_oob_accs_do.append(event_oob_acc)
                         val_event_goal_accs_do.append(event_goal_acc)
+                        val_event_oob_counts_do.append(event_oob_counts)
+                        val_event_goal_counts_do.append(event_goal_counts)
                         _val_pos_do += x.shape[0]
 
                 # Horizon-generalized pair/t0/crossing/resting -- one shared
@@ -2232,6 +2899,8 @@ def train(
                     val_crossing_losses_do.extend(horizon_result_do["crossing_losses"])
                     val_crossing_pos_dists_do.extend(horizon_result_do["crossing_pos_dists"])
                     val_crossing_dt_maes_do.extend(horizon_result_do["crossing_dt_maes"])
+                    val_crossing_pos_losses_do.extend(horizon_result_do["crossing_pos_losses"])
+                    val_crossing_dt_losses_do.extend(horizon_result_do["crossing_dt_losses"])
                     val_resting_losses_do.extend(horizon_result_do["resting_losses"])
                     val_resting_pos_dists_do.extend(horizon_result_do["resting_pos_dists"])
                     val_position_losses_do.extend(horizon_result_do["position_losses"])
@@ -2248,12 +2917,14 @@ def train(
                 mean_val_event_loss_do = float(np.mean(val_event_losses_do)) if val_event_losses_do else float("nan")
                 val_event_oob_acc_do = float(np.mean(val_event_oob_accs_do)) if val_event_oob_accs_do else float("nan")
                 val_event_goal_acc_do = float(np.mean(val_event_goal_accs_do)) if val_event_goal_accs_do else float("nan")
+                val_event_oob_recall_do = _recall_from_counts(_sum_counts(val_event_oob_counts_do))
+                val_event_goal_recall_do = _recall_from_counts(_sum_counts(val_event_goal_counts_do))
                 mean_val_backprop_loss_do = (
                     mean_val_loss_do + resting_weight * mean_val_resting_loss_do + position_weight * mean_val_position_loss_do
                     + event_weight * mean_val_event_loss_do
                 )
                 if has_crossing_data:
-                    mean_val_backprop_loss_do += crossing_weight * mean_val_crossing_loss_do
+                    mean_val_backprop_loss_do += mean_val_crossing_loss_do
                 raw_drop_do = best_val_loss_do - mean_val_loss_do
                 improved_do = raw_drop_do > decoder_only_early_stop_min_delta
                 # "best" only moves on a genuine (>=min_delta) improvement --
@@ -2328,14 +2999,16 @@ def train(
             crossing_line_do += (
                 f"  train_resting_loss={mean_train_resting_loss_do:.4f} (pos_dist={train_resting_pos_dist_do:.4f})"
                 f"  train_position_loss={mean_train_position_loss_do:.4f} (pos_dist={train_position_pos_dist_do:.4f})"
-                f"  train_event_loss={mean_train_event_loss_do:.4f} (oob_acc={train_event_oob_acc_do:.4f}, goal_acc={train_event_goal_acc_do:.4f})"
+                f"  train_event_loss={mean_train_event_loss_do:.4f} (oob_acc={train_event_oob_acc_do:.4f}, oob_recall={train_event_oob_recall_do:.4f}, "
+                f"goal_acc={train_event_goal_acc_do:.4f}, goal_recall={train_event_goal_recall_do:.4f})"
                 f"  train_backprop_loss={mean_train_backprop_loss_do:.4f}"
             )
             if len(val_idx) > 0:
                 crossing_line_do += (
                     f"  val_resting_loss={mean_val_resting_loss_do:.4f} (pos_dist={val_resting_pos_dist_do:.4f})"
                     f"  val_position_loss={mean_val_position_loss_do:.4f} (pos_dist={val_position_pos_dist_do:.4f})"
-                    f"  val_event_loss={mean_val_event_loss_do:.4f} (oob_acc={val_event_oob_acc_do:.4f}, goal_acc={val_event_goal_acc_do:.4f})"
+                    f"  val_event_loss={mean_val_event_loss_do:.4f} (oob_acc={val_event_oob_acc_do:.4f}, oob_recall={val_event_oob_recall_do:.4f}, "
+                    f"goal_acc={val_event_goal_acc_do:.4f}, goal_recall={val_event_goal_recall_do:.4f})"
                     f"  val_backprop_loss={mean_val_backprop_loss_do:.4f}"
                 )
             log.info(
@@ -2344,8 +3017,6 @@ def train(
             )
             for c in _LOG_COMPONENTS:
                 _log_component("train", c, train_means_do[c])
-            for c in _LOG_R2_KEYS:
-                log.info(f"    train {c:9s} by horizon: {np.array2string(train_r2_do[c], precision=4)}, mean: {_safe_nanmean(train_r2_do[c]):.4f}")
             for c in _LOG_PCTD_KEYS:
                 log.info(f"    train {c:16s} by horizon: {np.array2string(train_pct_disp_do[c], precision=4)}, mean: {_safe_nanmean(train_pct_disp_do[c]):.4f}")
             for c in _LOG_PCTB_KEYS:
@@ -2357,8 +3028,6 @@ def train(
                     _log_component("val  ", c, val_means_do[c])
                 for c in _LOG_CLS_KEYS:
                     log.info(f"    val   {c:14s} by horizon: {np.array2string(val_cls_do[c], precision=4)}, mean: {_safe_nanmean(val_cls_do[c]):.4f}")
-                for c in _LOG_R2_KEYS:
-                    log.info(f"    val   {c:9s} by horizon: {np.array2string(val_r2_do[c], precision=4)}, mean: {_safe_nanmean(val_r2_do[c]):.4f}")
                 for c in _LOG_PCTD_KEYS:
                     log.info(f"    val   {c:16s} by horizon: {np.array2string(val_pct_disp_do[c], precision=4)}, mean: {_safe_nanmean(val_pct_disp_do[c]):.4f}")
                 for c in _LOG_PCTB_KEYS:
@@ -2387,10 +3056,243 @@ def train(
 
         _save_phase_checkpoint("after_decoder_pretrain")
 
+    def _run_val_pass() -> dict:
+        """Runs ONE full forward-only pass over ``val_idx``, computing every
+        val_* metric a normal epoch's val portion reports. Shared by the
+        main per-epoch val block below AND the epoch-0 (before any training)
+        baseline logged just before the loop starts, so the two can't drift
+        apart in what they measure or how they compute it -- callers own
+        early-stopping/checkpoint-saving/epoch-over-epoch-delta bookkeeping
+        (those depend on mutable state -- best_val_loss, patience_ctr,
+        prev_val_loss -- that has no meaning for a pass that isn't a real
+        training epoch)."""
+        model.eval()
+        val_losses: list[float] = []
+        val_breakdowns: list[LossBreakdown] = []
+        val_oob_counts = np.zeros((n_h, 4), dtype=np.int64)
+        val_goal_counts = np.zeros((n_h, 4), dtype=np.int64)
+        val_sq_err = {g: np.zeros(n_h) for g in _GROUPS}
+        val_n = {g: np.zeros(n_h, dtype=np.int64) for g in _GROUPS}
+        val_crossing_losses: list[float] = []
+        val_crossing_pos_dists: list[float] = []
+        val_crossing_dt_maes: list[float] = []
+        val_crossing_pos_losses: list[float] = []
+        val_crossing_dt_losses: list[float] = []
+        val_resting_losses: list[float] = []
+        val_resting_pos_dists: list[float] = []
+        val_position_losses: list[float] = []
+        val_position_pos_dists: list[float] = []
+        val_event_losses: list[float] = []
+        val_event_oob_accs: list[float] = []
+        val_event_goal_accs: list[float] = []
+        val_event_oob_counts: list[tuple[int, int, int, int]] = []
+        val_event_goal_counts: list[tuple[int, int, int, int]] = []
+        _val_pos = 0
+        with torch.no_grad():
+            for x, y in ds.iterate_minibatches(batch_size, val_idx, shuffle=False, device=device):
+                latent, heads = model(x)
+                loss, breakdown = compute_loss(heads, y, pos_weight, bce_weight, spin_weight)
+                val_losses.append(float(loss.item()))
+                val_breakdowns.append(breakdown)
+                counts = compute_confusion_counts(heads, y)
+                val_oob_counts += np.array(counts["oob"])
+                val_goal_counts += np.array(counts["goal"])
+                sq_err_counts = compute_group_sq_err(heads, y)
+                for g in _GROUPS:
+                    for h, (sq_err, n) in enumerate(sq_err_counts[g]):
+                        val_sq_err[g][h] += sq_err
+                        val_n[g][h] += n
+                # `shuffle=False` above guarantees `iterate_minibatches`
+                # yields batches in the SAME order as `val_idx` itself, so a
+                # running offset into `val_idx` recovers each batch's
+                # original row indices without `iterate_minibatches`
+                # needing to expose them itself.
+                batch_idx = val_idx[_val_pos:_val_pos + x.shape[0]]
+                if has_crossing_data:
+                    crossing_loss, pos_dist_mean, dt_mae_mean, pos_loss_val, dt_loss_val = _crossing_head_loss(
+                        model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
+                        pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight,
+                    )
+                    val_crossing_losses.append(float(crossing_loss.item()))
+                    val_crossing_pos_dists.append(pos_dist_mean)
+                    val_crossing_dt_maes.append(dt_mae_mean)
+                    val_crossing_pos_losses.append(pos_loss_val)
+                    val_crossing_dt_losses.append(dt_loss_val)
+                resting_loss, resting_pos_dist_mean = _resting_head_loss(
+                    model, latent, resting_pos, resting_mask, batch_idx, device,
+                )
+                val_resting_losses.append(float(resting_loss.item()))
+                val_resting_pos_dists.append(resting_pos_dist_mean)
+                position_loss, position_pos_dist_mean = _position_head_loss(model, latent, x)
+                val_position_losses.append(float(position_loss.item()))
+                val_position_pos_dists.append(position_pos_dist_mean)
+                event_loss, event_oob_acc, event_goal_acc, event_oob_counts, event_goal_counts = _event_head_loss(
+                    model, latent, ever_oob, ever_goal, batch_idx, device,
+                )
+                val_event_losses.append(float(event_loss.item()))
+                val_event_oob_accs.append(event_oob_acc)
+                val_event_goal_accs.append(event_goal_acc)
+                val_event_oob_counts.append(event_oob_counts)
+                val_event_goal_counts.append(event_goal_counts)
+                _val_pos += x.shape[0]
+
+        # Horizon-generalized pair/t0/crossing/resting -- one shared eval
+        # pass (see _eval_horizon_pass's docstring); its crossing/resting
+        # raw lists are BLENDED into the same val_crossing_losses/
+        # val_resting_losses accumulators the t=0 usage above just
+        # populated (matching the training side's single shared accumulator
+        # convention), NOT reported as separate metrics.
+        horizon_result = (
+            _eval_horizon_pass(autoencode_val_data, horizon_bundle_val, crossing_pos_val)
+            if horizon_pass_enabled else None
+        )
+        if horizon_result is not None:
+            val_crossing_losses.extend(horizon_result["crossing_losses"])
+            val_crossing_pos_dists.extend(horizon_result["crossing_pos_dists"])
+            val_crossing_dt_maes.extend(horizon_result["crossing_dt_maes"])
+            val_crossing_pos_losses.extend(horizon_result["crossing_pos_losses"])
+            val_crossing_dt_losses.extend(horizon_result["crossing_dt_losses"])
+            val_resting_losses.extend(horizon_result["resting_losses"])
+            val_resting_pos_dists.extend(horizon_result["resting_pos_dists"])
+            val_position_losses.extend(horizon_result["position_losses"])
+            val_position_pos_dists.extend(horizon_result["position_pos_dists"])
+
+        val_loss = float(np.mean(val_losses))
+        mean_val_crossing_loss = float(np.mean(val_crossing_losses)) if val_crossing_losses else float("nan")
+        val_crossing_pos_dist = float(np.mean(val_crossing_pos_dists)) if val_crossing_pos_dists else float("nan")
+        val_crossing_dt_mae = float(np.mean(val_crossing_dt_maes)) if val_crossing_dt_maes else float("nan")
+        val_crossing_pos_loss = float(np.mean(val_crossing_pos_losses)) if val_crossing_pos_losses else float("nan")
+        val_crossing_dt_loss = float(np.mean(val_crossing_dt_losses)) if val_crossing_dt_losses else float("nan")
+        mean_val_resting_loss = float(np.mean(val_resting_losses)) if val_resting_losses else float("nan")
+        val_resting_pos_dist = float(np.mean(val_resting_pos_dists)) if val_resting_pos_dists else float("nan")
+        mean_val_position_loss = float(np.mean(val_position_losses)) if val_position_losses else float("nan")
+        val_position_pos_dist = float(np.mean(val_position_pos_dists)) if val_position_pos_dists else float("nan")
+        mean_val_event_loss = float(np.mean(val_event_losses)) if val_event_losses else float("nan")
+        val_event_oob_acc = float(np.mean(val_event_oob_accs)) if val_event_oob_accs else float("nan")
+        val_event_goal_acc = float(np.mean(val_event_goal_accs)) if val_event_goal_accs else float("nan")
+        val_event_oob_recall = _recall_from_counts(_sum_counts(val_event_oob_counts))
+        val_event_goal_recall = _recall_from_counts(_sum_counts(val_event_goal_counts))
+        # Same combined-objective value as `mean_backprop_loss` (train
+        # side), computed post-hoc rather than accumulated per-batch (val
+        # has no backward pass to piggyback the crossing/resting/position/
+        # event terms onto) -- valid because every term is already a
+        # batch-size-weighted mean over the SAME val batches, so summing the
+        # means equals the mean of the sums.
+        mean_val_backprop_loss = (
+            val_loss + resting_weight * mean_val_resting_loss + position_weight * mean_val_position_loss
+            + event_weight * mean_val_event_loss
+        )
+        if has_crossing_data:
+            mean_val_backprop_loss += mean_val_crossing_loss
+        # Same terms as mean_val_backprop_loss above, kept as a dict too --
+        # only used for the per-head epoch-over-epoch delta breakdown below
+        # (see val_backprop_loss_delta), not for mean_val_backprop_loss
+        # itself (that stays the original nan-propagating sum, unchanged).
+        val_backprop_contrib = {
+            "main": val_loss, "resting": resting_weight * mean_val_resting_loss,
+            "position": position_weight * mean_val_position_loss, "event": event_weight * mean_val_event_loss,
+        }
+        if has_crossing_data:
+            val_backprop_contrib["crossing"] = mean_val_crossing_loss
+
+        val_t0_means = {c: np.full(n_h, np.nan) for c in _COMPONENTS}
+        val_t0_r2: dict[str, np.ndarray] = {}
+        val_t0_cls: dict[str, np.ndarray] = {}
+        mean_val_pair_loss = float("nan")
+        mean_val_t0_loss = float("nan")
+        if horizon_result is not None:
+            mean_val_pair_loss = horizon_result["mean_pair_loss"]
+            if autoencode_during_main_loop_enabled:
+                mean_val_t0_loss = horizon_result["mean_t0_loss"]
+                val_t0_means = horizon_result["t0_means"]
+                val_t0_r2 = horizon_result["t0_r2"]
+                val_t0_cls = horizon_result["t0_cls"]
+
+        return {
+            "val_loss": val_loss,
+            "mean_val_pair_loss": mean_val_pair_loss,
+            "mean_val_t0_loss": mean_val_t0_loss,
+            "val_t0_means": val_t0_means,
+            "val_t0_r2": val_t0_r2,
+            "val_t0_cls": val_t0_cls,
+            "mean_val_crossing_loss": mean_val_crossing_loss,
+            "val_crossing_pos_dist": val_crossing_pos_dist,
+            "val_crossing_dt_mae": val_crossing_dt_mae,
+            "val_crossing_pos_loss": val_crossing_pos_loss,
+            "val_crossing_dt_loss": val_crossing_dt_loss,
+            "mean_val_resting_loss": mean_val_resting_loss,
+            "val_resting_pos_dist": val_resting_pos_dist,
+            "mean_val_position_loss": mean_val_position_loss,
+            "val_position_pos_dist": val_position_pos_dist,
+            "mean_val_event_loss": mean_val_event_loss,
+            "val_event_oob_acc": val_event_oob_acc,
+            "val_event_goal_acc": val_event_goal_acc,
+            "val_event_oob_recall": val_event_oob_recall,
+            "val_event_goal_recall": val_event_goal_recall,
+            "mean_val_backprop_loss": mean_val_backprop_loss,
+            "val_backprop_contrib": val_backprop_contrib,
+            "val_means": _mean_breakdown(val_breakdowns),
+            "val_cls": _classification_from_counts(val_oob_counts, val_goal_counts),
+            "val_r2": _r2_from_group_sums(val_sq_err, val_n),
+            "val_pct_disp": _pct_disp_from_group_sums(val_sq_err, val_n),
+            "val_pct_ballistic": _pct_ballistic_from_group_sums(val_sq_err, val_n),
+        }
+
+    def _log_val_baseline() -> None:
+        """Logs an "epoch 0 (before training)" val-only baseline -- same
+        metrics/format as a normal epoch's val portion (see the main loop
+        below), just before any gradient step has run, so the very first
+        real epoch's numbers have something to compare against instead of
+        being the first data point on the chart. Mirrors `_log_autoencode_
+        epoch`'s identical "epoch 0" baseline for the autoencode-pretrain
+        phase."""
+        if len(val_idx) == 0:
+            return
+        v = _run_val_pass()
+        crossing_line = ""
+        if has_crossing_data:
+            crossing_line = (
+                f"  val_crossing_loss={v['mean_val_crossing_loss']:.4f}"
+                f" (pos_dist={v['val_crossing_pos_dist']:.4f}, dt_mae={v['val_crossing_dt_mae']:.4f})"
+            )
+        crossing_line += (
+            f"  val_resting_loss={v['mean_val_resting_loss']:.4f} (pos_dist={v['val_resting_pos_dist']:.4f})"
+            f"  val_position_loss={v['mean_val_position_loss']:.4f} (pos_dist={v['val_position_pos_dist']:.4f})"
+            f"  val_event_loss={v['mean_val_event_loss']:.4f} (oob_acc={v['val_event_oob_acc']:.4f}, "
+            f"oob_recall={v['val_event_oob_recall']:.4f}, goal_acc={v['val_event_goal_acc']:.4f}, "
+            f"goal_recall={v['val_event_goal_recall']:.4f})"
+            f"  val_backprop_loss={v['mean_val_backprop_loss']:.4f}"
+        )
+        pair_line = f"  val_pair_loss={v['mean_val_pair_loss']:.4f}" if adjacent_pair_training_enabled and n_horizons > 1 else ""
+        t0_line = f"  val_t0_loss={v['mean_val_t0_loss']:.4f}" if autoencode_during_main_loop_enabled else ""
+        log.info(f"epoch 0/{epochs} (before training): val_loss={v['val_loss']:.4f}{pair_line}{t0_line}{crossing_line}")
+        for c in _LOG_COMPONENTS:
+            _log_component("val  ", c, v["val_means"][c])
+        for c in _LOG_CLS_KEYS:
+            log.info(f"    val   {c:14s} by horizon: {np.array2string(v['val_cls'][c], precision=4)}, mean: {_safe_nanmean(v['val_cls'][c]):.4f}")
+        for c in _LOG_PCTD_KEYS:
+            log.info(f"    val   {c:16s} by horizon: {np.array2string(v['val_pct_disp'][c], precision=4)}, mean: {_safe_nanmean(v['val_pct_disp'][c]):.4f}")
+        if autoencode_during_main_loop_enabled:
+            _log_t0_diagnostics("val  ", v["val_t0_means"], v["val_t0_r2"], v["val_t0_cls"])
+        for c in _LOG_PCTB_KEYS:
+            log.info(f"    val   {c:20s} by horizon: {np.array2string(v['val_pct_ballistic'][c], precision=4)}, mean: {_safe_nanmean(v['val_pct_ballistic'][c]):.4f}")
+
+    _log_val_baseline()
+
     for epoch in range(epochs):
         model.train()
-        epoch_result = _run_interleaved_train_epoch(optimizer)
+        epoch_result = _run_interleaved_train_epoch(optimizer, epoch_label=f"epoch {epoch + 1}/{epochs}")
         mean_train_loss = epoch_result["mean_loss"]
+        # Always overwritten every epoch, regardless of whether this epoch
+        # actually improved -- unlike `midtrain_latest` (val-gated, only
+        # updates on a new best), this is meant as "what does the model
+        # look like right now," for e.g. killing/resuming a run without
+        # losing anything more than the current epoch's progress. Was
+        # previously best-train-loss-gated (same convention as
+        # midtrain_latest); changed since a genuinely "latest" checkpoint
+        # is more useful once training plateaus/gets noisy and best-train-
+        # loss stops updating for many epochs at a stretch.
+        _save_phase_checkpoint("midtrain_latest_train")
         mean_train_pair_loss = epoch_result["mean_pair_loss"]
         mean_train_t0_loss = epoch_result["mean_t0_loss"]
         train_t0_means = epoch_result["t0_means"]
@@ -2398,6 +3300,8 @@ def train(
         mean_train_crossing_loss = epoch_result["mean_crossing_loss"]
         train_crossing_pos_dist = epoch_result["crossing_pos_dist"]
         train_crossing_dt_mae = epoch_result["crossing_dt_mae"]
+        train_crossing_pos_loss = epoch_result["crossing_pos_loss"]
+        train_crossing_dt_loss = epoch_result["crossing_dt_loss"]
         mean_train_resting_loss = epoch_result["mean_resting_loss"]
         train_resting_pos_dist = epoch_result["resting_pos_dist"]
         mean_train_position_loss = epoch_result["mean_position_loss"]
@@ -2405,7 +3309,10 @@ def train(
         mean_train_event_loss = epoch_result["mean_event_loss"]
         train_event_oob_acc = epoch_result["event_oob_acc"]
         train_event_goal_acc = epoch_result["event_goal_acc"]
+        train_event_oob_recall = epoch_result["event_oob_recall"]
+        train_event_goal_recall = epoch_result["event_goal_recall"]
         mean_train_backprop_loss = epoch_result["mean_backprop_loss"]
+        train_backprop_contrib = epoch_result["backprop_contrib"]
         grad_norm_stats = epoch_result["grad_norm_stats"]
         loss_delta_stats = epoch_result["loss_delta_stats"]
 
@@ -2422,6 +3329,8 @@ def train(
         mean_val_crossing_loss = float("nan")
         val_crossing_pos_dist = float("nan")
         val_crossing_dt_mae = float("nan")
+        val_crossing_pos_loss = float("nan")
+        val_crossing_dt_loss = float("nan")
         mean_val_resting_loss = float("nan")
         val_resting_pos_dist = float("nan")
         mean_val_position_loss = float("nan")
@@ -2429,136 +3338,46 @@ def train(
         mean_val_event_loss = float("nan")
         val_event_oob_acc = float("nan")
         val_event_goal_acc = float("nan")
+        val_event_oob_recall = float("nan")
+        val_event_goal_recall = float("nan")
         mean_val_backprop_loss = float("nan")
+        val_backprop_contrib: dict[str, float] = {}
         val_loss_delta = float("nan")
+        val_backprop_loss_delta = float("nan")
         val_means = _mean_breakdown([])
         val_cls = _classification_from_counts(np.zeros((n_h, 4), dtype=np.int64), np.zeros((n_h, 4), dtype=np.int64))
         val_r2 = _r2_from_group_sums({g: np.zeros(n_h) for g in _GROUPS}, {g: np.zeros(n_h, dtype=np.int64) for g in _GROUPS})
         val_pct_disp = _pct_disp_from_group_sums({g: np.zeros(n_h) for g in _GROUPS}, {g: np.zeros(n_h, dtype=np.int64) for g in _GROUPS})
         val_pct_ballistic = _pct_ballistic_from_group_sums({g: np.zeros(n_h) for g in _GROUPS}, {g: np.zeros(n_h, dtype=np.int64) for g in _GROUPS})
         if len(val_idx) > 0:
-            model.eval()
-            val_losses: list[float] = []
-            val_breakdowns: list[LossBreakdown] = []
-            val_oob_counts = np.zeros((n_h, 4), dtype=np.int64)
-            val_goal_counts = np.zeros((n_h, 4), dtype=np.int64)
-            val_sq_err = {g: np.zeros(n_h) for g in _GROUPS}
-            val_n = {g: np.zeros(n_h, dtype=np.int64) for g in _GROUPS}
-            val_crossing_losses: list[float] = []
-            val_crossing_pos_dists: list[float] = []
-            val_crossing_dt_maes: list[float] = []
-            val_resting_losses: list[float] = []
-            val_resting_pos_dists: list[float] = []
-            val_position_losses: list[float] = []
-            val_position_pos_dists: list[float] = []
-            val_event_losses: list[float] = []
-            val_event_oob_accs: list[float] = []
-            val_event_goal_accs: list[float] = []
-            _val_pos = 0
-            with torch.no_grad():
-                for x, y in ds.iterate_minibatches(batch_size, val_idx, shuffle=False, device=device):
-                    latent, heads = model(x)
-                    loss, breakdown = compute_loss(heads, y, pos_weight, bce_weight, spin_weight)
-                    val_losses.append(float(loss.item()))
-                    val_breakdowns.append(breakdown)
-                    counts = compute_confusion_counts(heads, y)
-                    val_oob_counts += np.array(counts["oob"])
-                    val_goal_counts += np.array(counts["goal"])
-                    sq_err_counts = compute_group_sq_err(heads, y)
-                    for g in _GROUPS:
-                        for h, (sq_err, n) in enumerate(sq_err_counts[g]):
-                            val_sq_err[g][h] += sq_err
-                            val_n[g][h] += n
-                    # `shuffle=False` above guarantees `iterate_minibatches`
-                    # yields batches in the SAME order as `val_idx` itself,
-                    # so a running offset into `val_idx` recovers each
-                    # batch's original row indices without `iterate_
-                    # minibatches` needing to expose them itself.
-                    batch_idx = val_idx[_val_pos:_val_pos + x.shape[0]]
-                    if has_crossing_data:
-                        crossing_loss, pos_dist_mean, dt_mae_mean = _crossing_head_loss(
-                            model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
-                        )
-                        val_crossing_losses.append(float(crossing_loss.item()))
-                        val_crossing_pos_dists.append(pos_dist_mean)
-                        val_crossing_dt_maes.append(dt_mae_mean)
-                    resting_loss, resting_pos_dist_mean = _resting_head_loss(
-                        model, latent, resting_pos, resting_mask, batch_idx, device,
-                    )
-                    val_resting_losses.append(float(resting_loss.item()))
-                    val_resting_pos_dists.append(resting_pos_dist_mean)
-                    position_loss, position_pos_dist_mean = _position_head_loss(model, latent, x)
-                    val_position_losses.append(float(position_loss.item()))
-                    val_position_pos_dists.append(position_pos_dist_mean)
-                    event_loss, event_oob_acc, event_goal_acc = _event_head_loss(
-                        model, latent, ever_oob, ever_goal, batch_idx, device,
-                    )
-                    val_event_losses.append(float(event_loss.item()))
-                    val_event_oob_accs.append(event_oob_acc)
-                    val_event_goal_accs.append(event_goal_acc)
-                    _val_pos += x.shape[0]
-
-            # Horizon-generalized pair/t0/crossing/resting -- one shared
-            # eval pass (see _eval_horizon_pass's docstring); its
-            # crossing/resting raw lists are BLENDED into the same
-            # val_crossing_losses/val_resting_losses accumulators the t=0
-            # usage above just populated (matching the training side's
-            # single shared accumulator convention), NOT reported as
-            # separate metrics.
-            horizon_result = (
-                _eval_horizon_pass(autoencode_val_data, horizon_bundle_val, crossing_pos_val)
-                if horizon_pass_enabled else None
-            )
-            if horizon_result is not None:
-                val_crossing_losses.extend(horizon_result["crossing_losses"])
-                val_crossing_pos_dists.extend(horizon_result["crossing_pos_dists"])
-                val_crossing_dt_maes.extend(horizon_result["crossing_dt_maes"])
-                val_resting_losses.extend(horizon_result["resting_losses"])
-                val_resting_pos_dists.extend(horizon_result["resting_pos_dists"])
-                val_position_losses.extend(horizon_result["position_losses"])
-                val_position_pos_dists.extend(horizon_result["position_pos_dists"])
-
-            val_loss = float(np.mean(val_losses))
-            mean_val_crossing_loss = float(np.mean(val_crossing_losses)) if val_crossing_losses else float("nan")
-            val_crossing_pos_dist = float(np.mean(val_crossing_pos_dists)) if val_crossing_pos_dists else float("nan")
-            val_crossing_dt_mae = float(np.mean(val_crossing_dt_maes)) if val_crossing_dt_maes else float("nan")
-            mean_val_resting_loss = float(np.mean(val_resting_losses)) if val_resting_losses else float("nan")
-            val_resting_pos_dist = float(np.mean(val_resting_pos_dists)) if val_resting_pos_dists else float("nan")
-            mean_val_position_loss = float(np.mean(val_position_losses)) if val_position_losses else float("nan")
-            val_position_pos_dist = float(np.mean(val_position_pos_dists)) if val_position_pos_dists else float("nan")
-            mean_val_event_loss = float(np.mean(val_event_losses)) if val_event_losses else float("nan")
-            val_event_oob_acc = float(np.mean(val_event_oob_accs)) if val_event_oob_accs else float("nan")
-            val_event_goal_acc = float(np.mean(val_event_goal_accs)) if val_event_goal_accs else float("nan")
-            # Same combined-objective value as `mean_backprop_loss` above,
-            # computed post-hoc rather than accumulated per-batch (val has
-            # no backward pass to piggyback the crossing/resting/position/
-            # event terms onto) -- valid because every term is already a
-            # batch-size-weighted mean over the SAME val batches, so summing
-            # the means equals the mean of the sums.
-            mean_val_backprop_loss = (
-                val_loss + resting_weight * mean_val_resting_loss + position_weight * mean_val_position_loss
-                + event_weight * mean_val_event_loss
-            )
-            if has_crossing_data:
-                mean_val_backprop_loss += crossing_weight * mean_val_crossing_loss
-
-            val_t0_means = {c: np.full(n_h, np.nan) for c in _COMPONENTS}
-            val_t0_r2: dict[str, np.ndarray] = {}
-            val_t0_cls: dict[str, np.ndarray] = {}
-            mean_val_pair_loss = float("nan")
-            if horizon_result is not None:
-                mean_val_pair_loss = horizon_result["mean_pair_loss"]
-                if autoencode_during_main_loop_enabled:
-                    mean_val_t0_loss = horizon_result["mean_t0_loss"]
-                    val_t0_means = horizon_result["t0_means"]
-                    val_t0_r2 = horizon_result["t0_r2"]
-                    val_t0_cls = horizon_result["t0_cls"]
-
-            val_means = _mean_breakdown(val_breakdowns)
-            val_cls = _classification_from_counts(val_oob_counts, val_goal_counts)
-            val_r2 = _r2_from_group_sums(val_sq_err, val_n)
-            val_pct_disp = _pct_disp_from_group_sums(val_sq_err, val_n)
-            val_pct_ballistic = _pct_ballistic_from_group_sums(val_sq_err, val_n)
+            v = _run_val_pass()
+            val_loss = v["val_loss"]
+            mean_val_pair_loss = v["mean_val_pair_loss"]
+            mean_val_t0_loss = v["mean_val_t0_loss"]
+            val_t0_means = v["val_t0_means"]
+            val_t0_r2 = v["val_t0_r2"]
+            val_t0_cls = v["val_t0_cls"]
+            mean_val_crossing_loss = v["mean_val_crossing_loss"]
+            val_crossing_pos_dist = v["val_crossing_pos_dist"]
+            val_crossing_dt_mae = v["val_crossing_dt_mae"]
+            val_crossing_pos_loss = v["val_crossing_pos_loss"]
+            val_crossing_dt_loss = v["val_crossing_dt_loss"]
+            mean_val_resting_loss = v["mean_val_resting_loss"]
+            val_resting_pos_dist = v["val_resting_pos_dist"]
+            mean_val_position_loss = v["mean_val_position_loss"]
+            val_position_pos_dist = v["val_position_pos_dist"]
+            mean_val_event_loss = v["mean_val_event_loss"]
+            val_event_oob_acc = v["val_event_oob_acc"]
+            val_event_goal_acc = v["val_event_goal_acc"]
+            val_event_oob_recall = v["val_event_oob_recall"]
+            val_event_goal_recall = v["val_event_goal_recall"]
+            mean_val_backprop_loss = v["mean_val_backprop_loss"]
+            val_backprop_contrib = v["val_backprop_contrib"]
+            val_means = v["val_means"]
+            val_cls = v["val_cls"]
+            val_r2 = v["val_r2"]
+            val_pct_disp = v["val_pct_disp"]
+            val_pct_ballistic = v["val_pct_ballistic"]
             # raw_drop is the plain best_val_loss - val_loss difference, before
             # the min_delta bar is applied -- logged alongside the pass/fail
             # verdict so "why didn't patience reset" is answerable from this
@@ -2592,6 +3411,33 @@ def train(
             # value yet).
             val_loss_delta = val_loss - prev_val_loss if not np.isnan(prev_val_loss) else float("nan")
             prev_val_loss = val_loss
+            # Same idea as val_loss_delta above, but tracking the combined
+            # objective (val_loss + crossing/resting/position/event, see
+            # mean_val_backprop_loss above) instead of the bare per-horizon
+            # val_loss -- val_loss alone can look flat/improving while one
+            # of the auxiliary terms is actually degrading (or vice versa),
+            # which this surfaces directly rather than requiring a manual
+            # diff across epochs' log lines.
+            val_backprop_loss_delta = (
+                mean_val_backprop_loss - prev_val_backprop_loss if not np.isnan(prev_val_backprop_loss) else float("nan")
+            )
+            prev_val_backprop_loss = mean_val_backprop_loss
+            # Per-head breakdown of THAT delta -- which head's own val
+            # contribution actually moved epoch-over-epoch, not just the
+            # summed total (a flat/improving total can hide one head
+            # regressing while another improves by a similar amount). See
+            # train_player_dynamics.py's identical diagnostic. Reuses
+            # _format_backprop_contrib's existing signed-value/near-zero-
+            # total handling -- nan on the first epoch (no prior per-head
+            # snapshot yet), and for any individual head that's nan in
+            # either epoch.
+            val_backprop_contrib_delta: dict[str, float] = {}
+            if prev_val_backprop_contrib is not None:
+                for name, val in val_backprop_contrib.items():
+                    prev_val = prev_val_backprop_contrib.get(name, float("nan"))
+                    if not math.isnan(val) and not math.isnan(prev_val):
+                        val_backprop_contrib_delta[name] = val - prev_val
+            prev_val_backprop_contrib = dict(val_backprop_contrib)
 
         current_lr = optimizer.param_groups[0]["lr"]
         pair_line = ""
@@ -2618,14 +3464,16 @@ def train(
         crossing_line += (
             f"  train_resting_loss={mean_train_resting_loss:.4f} (pos_dist={train_resting_pos_dist:.4f})"
             f"  train_position_loss={mean_train_position_loss:.4f} (pos_dist={train_position_pos_dist:.4f})"
-            f"  train_event_loss={mean_train_event_loss:.4f} (oob_acc={train_event_oob_acc:.4f}, goal_acc={train_event_goal_acc:.4f})"
+            f"  train_event_loss={mean_train_event_loss:.4f} (oob_acc={train_event_oob_acc:.4f}, oob_recall={train_event_oob_recall:.4f}, "
+            f"goal_acc={train_event_goal_acc:.4f}, goal_recall={train_event_goal_recall:.4f})"
             f"  train_backprop_loss={mean_train_backprop_loss:.4f}"
         )
         if len(val_idx) > 0:
             crossing_line += (
                 f"  val_resting_loss={mean_val_resting_loss:.4f} (pos_dist={val_resting_pos_dist:.4f})"
                 f"  val_position_loss={mean_val_position_loss:.4f} (pos_dist={val_position_pos_dist:.4f})"
-                f"  val_event_loss={mean_val_event_loss:.4f} (oob_acc={val_event_oob_acc:.4f}, goal_acc={val_event_goal_acc:.4f})"
+                f"  val_event_loss={mean_val_event_loss:.4f} (oob_acc={val_event_oob_acc:.4f}, oob_recall={val_event_oob_recall:.4f}, "
+                f"goal_acc={val_event_goal_acc:.4f}, goal_recall={val_event_goal_recall:.4f})"
                 f"  val_backprop_loss={mean_val_backprop_loss:.4f}"
             )
         log.info(
@@ -2650,15 +3498,31 @@ def train(
             f"    train_loss_delta (batch-to-batch): mean={loss_delta_stats['mean']:.6f} std={loss_delta_stats['std']:.6f} "
             f"min={loss_delta_stats['min']:.6f} max={loss_delta_stats['max']:.6f}"
         )
+        log.info(f"    backprop_loss contribution by head: {_format_backprop_contrib(train_backprop_contrib, mean_train_backprop_loss)}")
+        if has_crossing_data:
+            # Split of crossing_head's own loss between its two WEIGHTED
+            # sub-terms (pos/dt sum to mean_train_crossing_loss/mean_val_
+            # crossing_loss above) -- reuses _format_backprop_contrib's
+            # same name=value(pct%) formatting as the line above, one level
+            # down: which HALF of crossing_head's own loss is pos vs dt,
+            # not which head contributes to the total.
+            train_pos_dt = {"pos": train_crossing_pos_loss, "dt": train_crossing_dt_loss}
+            val_pos_dt = {"pos": val_crossing_pos_loss, "dt": val_crossing_dt_loss}
+            log.info(
+                f"    crossing_head pos/dt split: train {_format_backprop_contrib(train_pos_dt, mean_train_crossing_loss)}"
+                + (f" | val {_format_backprop_contrib(val_pos_dt, mean_val_crossing_loss)}" if len(val_idx) > 0 else "")
+            )
         if len(val_idx) > 0:
             log.info(f"    val_loss_delta (epoch-over-epoch): {val_loss_delta:.6f}")
+            log.info(
+                f"    val_backprop_loss_delta (epoch-over-epoch): {val_backprop_loss_delta:.6f}  "
+                f"({_format_backprop_contrib(val_backprop_contrib_delta, val_backprop_loss_delta)})"
+            )
         for c in _LOG_COMPONENTS:
             _log_component("train", c, train_means[c])
         # oob/goal accuracy/precision/recall are NOT logged for train (still
         # computed and saved to history/report) -- val alone is enough
         # signal per epoch and this was a lot of log-line noise.
-        for c in _LOG_R2_KEYS:
-            log.info(f"    train {c:9s} by horizon: {np.array2string(train_r2[c], precision=4)}, mean: {_safe_nanmean(train_r2[c]):.4f}")
         for c in _LOG_PCTD_KEYS:
             log.info(f"    train {c:16s} by horizon: {np.array2string(train_pct_disp[c], precision=4)}, mean: {_safe_nanmean(train_pct_disp[c]):.4f}")
         for c in _LOG_PCTB_KEYS:
@@ -2670,8 +3534,6 @@ def train(
                 _log_component("val  ", c, val_means[c])
             for c in _LOG_CLS_KEYS:
                 log.info(f"    val   {c:14s} by horizon: {np.array2string(val_cls[c], precision=4)}, mean: {_safe_nanmean(val_cls[c]):.4f}")
-            for c in _LOG_R2_KEYS:
-                log.info(f"    val   {c:9s} by horizon: {np.array2string(val_r2[c], precision=4)}, mean: {_safe_nanmean(val_r2[c]):.4f}")
             for c in _LOG_PCTD_KEYS:
                 log.info(f"    val   {c:16s} by horizon: {np.array2string(val_pct_disp[c], precision=4)}, mean: {_safe_nanmean(val_pct_disp[c]):.4f}")
             if autoencode_during_main_loop_enabled:
@@ -2694,6 +3556,10 @@ def train(
             "val_crossing_pos_dist": val_crossing_pos_dist,
             "train_crossing_dt_mae": train_crossing_dt_mae,
             "val_crossing_dt_mae": val_crossing_dt_mae,
+            "train_crossing_pos_loss": train_crossing_pos_loss,
+            "val_crossing_pos_loss": val_crossing_pos_loss,
+            "train_crossing_dt_loss": train_crossing_dt_loss,
+            "val_crossing_dt_loss": val_crossing_dt_loss,
             "train_resting_loss": mean_train_resting_loss,
             "val_resting_loss": mean_val_resting_loss,
             "train_resting_pos_dist": train_resting_pos_dist,
@@ -2719,6 +3585,7 @@ def train(
             "train_loss_delta_min": loss_delta_stats["min"],
             "train_loss_delta_max": loss_delta_stats["max"],
             "val_loss_delta": val_loss_delta,
+            "val_backprop_loss_delta": val_backprop_loss_delta,
             **{f"train_{c}": train_means[c] for c in _COMPONENTS},
             **{f"val_{c}": val_means[c] for c in _COMPONENTS},
             **{f"train_{c}": train_cls[c] for c in _CLS_KEYS},
@@ -2985,6 +3852,44 @@ def main() -> None:
              "after_autoencode with autoencode_pretrain_epochs=0 to skip "
              "straight to decoder-only pretrain / the main loop).",
     )
+    parser.add_argument(
+        "--reset-decoder-weights", action="store_true", default=False,
+        help="After loading --init-checkpoint (if given), reinitialize every "
+             "decoder-SIDE module (the shared per-horizon decoder + "
+             "crossing_head/resting_head/position_head/event_head) to a "
+             "fresh random init, leaving the encoder as-loaded. Also drops "
+             "those parameters' Adam moment state so they're treated as "
+             "genuinely fresh rather than carrying over stale exp_avg/"
+             "exp_avg_sq from whatever decoder weights they had before.",
+    )
+    parser.add_argument(
+        "--reset-optimizer-state", action="store_true", default=False,
+        help="After loading --init-checkpoint (if given), do NOT restore Adam's per-parameter moment state "
+             "(exp_avg/exp_avg_sq/step) -- the optimizer starts fresh while model weights still resume "
+             "normally. Use this whenever you've changed a loss weight (crossing_pos/dt_loss_weight etc.) "
+             "since the checkpoint was saved: the restored exp_avg_sq (v) is an EMA of squared gradients "
+             "with a ~1/(1-beta2) step memory (hundreds to 1000+ steps), so it stays calibrated to the OLD "
+             "loss scale for a long time after a resume, artificially throttling Adam's effective step size "
+             "far below what the current gradient would actually support.",
+    )
+    parser.add_argument(
+        "--max-episodes", type=int, default=None,
+        help="Randomly subsample the loaded dataset down to at most this many "
+             "episodes before splitting train/val (seeded off --seed). Useful "
+             "for testing whether the network can fit a small subset "
+             "near-perfectly (e.g. --max-episodes 5000) as a sanity check on "
+             "capacity/optimization, separate from the full dataset's "
+             "generalization question. Omit for the full dataset (default).",
+    )
+    parser.add_argument(
+        "--linear-decoder", action="store_true", default=None,
+        help="Override physics_pretrain.ball.linear_decoder_enabled to true for this run: swaps the shared "
+             "horizon-conditioned decoder for one independent Linear(latent_dim, 6) head per registered horizon "
+             "(pos+vel only, no spin/oob/goal, no continuous-time interpolation -- see "
+             "BallDynamicsLinearDecoder's docstring). Adjacent-pair combos whose delta doesn't land on a "
+             "registered horizon are dropped (logged as kept/dropped). Omit to use whatever the config says "
+             "(there is no CLI way to force it back off if the config has it on).",
+    )
     args = parser.parse_args()
 
     train(
@@ -2999,6 +3904,10 @@ def main() -> None:
         device=args.device,
         open_browser=args.open_report,
         init_checkpoint=args.init_checkpoint,
+        reset_decoder_weights=args.reset_decoder_weights,
+        reset_optimizer_state=args.reset_optimizer_state,
+        max_episodes=args.max_episodes,
+        linear_decoder=args.linear_decoder,
     )
 
 

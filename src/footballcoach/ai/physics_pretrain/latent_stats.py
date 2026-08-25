@@ -178,6 +178,19 @@ def compute_latent_stats(
     }
 
 
+def _format_dead_dims(dead_dims: np.ndarray, max_shown: int = 30) -> str:
+    """Dead-dim index list, truncated past ``max_shown`` entries (a wide
+    hidden layer -- see inspect_ball_pretrain.py's/inspect_player_pretrain.
+    py's per-stage capacity probe -- can have hundreds to thousands of
+    dead units, and printing the full list just buries the summary
+    scalars that actually matter)."""
+    idx = dead_dims.tolist()
+    if len(idx) <= max_shown:
+        return str(idx)
+    shown = idx[:max_shown]
+    return f"{shown} (+{len(idx) - max_shown} more)"
+
+
 def format_latent_stats(stats: dict, top_k_dims: int = 5, top_k_pairs: int = 5) -> str:
     """Renders ``compute_latent_stats``'s dict as a multi-line human-
     readable summary suitable for a single ``log.info(...)`` call --
@@ -191,7 +204,7 @@ def format_latent_stats(stats: dict, top_k_dims: int = 5, top_k_pairs: int = 5) 
         f"    per-dim std: mean={d['mean_per_dim_std']:.4f}  pooled={d['global_std_pooled']:.4f}"
         f"  |  latent norm: mean={d['mean_latent_norm']:.4f} std={d['std_latent_norm']:.4f}",
         f"    dead dims (std < threshold): {d['n_dead_dims']}/{d['latent_dim']}"
-        + (f"  {d['dead_dims'].tolist()}" if d["n_dead_dims"] else ""),
+        + (f"  {_format_dead_dims(d['dead_dims'])}" if d["n_dead_dims"] else ""),
         f"    off-diagonal |corr|: mean={d['mean_abs_offdiag_corr']:.4f}"
         f"  max={d['max_abs_offdiag_corr']:.4f} (dims {d['max_abs_offdiag_corr_pair']})"
         f"  redundant pairs (|corr|>threshold): {d['n_redundant_pairs']}",

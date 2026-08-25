@@ -11,13 +11,15 @@ FINAL artifact saved at ``--output`` only has ``encoder_state_dict`` (the
 decoder is discarded, see ``player_dynamics_net.py``'s module docstring)
 and can't be used here.
 
-Unlike ``inspect_ball_pretrain.py``, there is no crossing/resting panel --
-``PlayerDynamicsAutoencoder`` has no ``crossing_head``/``resting_head``
-equivalent (players don't get "frozen" at an out-of-bounds/goal event, see
-``player_episode_gen.py``'s module docstring). Instead this shows a
-per-point heading indicator (a short tick mark, gt vs pred) on the
-trajectory panel, and a dedicated stamina-over-horizon panel, since both
-are genuinely new information the ball inspector never had to display.
+Unlike ``inspect_ball_pretrain.py``, there is no resting panel --
+``PlayerDynamicsAutoencoder`` has no ``resting_head`` equivalent (players
+don't come to a physics-driven "rest" the way a ball does). It DOES have a
+``crossing_head`` (out-of-bounds/goal crossing point + delta_t off the
+latent, same idea as ball's), shown in its own panel just like the ball
+inspector's. This also shows a per-point heading indicator (a short tick
+mark, gt vs pred) on the trajectory panel, and a dedicated stamina-over-
+horizon panel, since both are genuinely new information the ball inspector
+never had to display.
 
 Usage::
 
@@ -50,6 +52,7 @@ from footballcoach.ai.physics_pretrain.player_dataset import PlayerDynamicsDatas
 from footballcoach.ai.physics_pretrain.player_dynamics_net import PlayerDynamicsAutoencoder
 from footballcoach.ai.physics_pretrain.player_episode_gen import N_TARGET_FIELDS_PER_HORIZON, PlayerEpisodeGenParams
 from footballcoach.ai.physics_pretrain.train_player_dynamics import _kinematics_denorm_scales, _pitch_dims_m
+from footballcoach.ai.physics_pretrain.latent_stats import compute_latent_stats, format_latent_stats
 
 _C_PITCH = "#227832"
 _C_LINE = "white"
@@ -169,6 +172,11 @@ class Inspector:
         self.ds = ds
         self.model = model
         self.horizons_s = list(cfg["horizons_s"])
+        # crossing_head's dt output trains against dt/dt_norm_s (see
+        # train_player_dynamics._crossing_head_loss's docstring) -- convert
+        # back to real seconds here the same way, matching crossing_dt_
+        # norm_s's definition in train().
+        self.dt_norm_s = float(max(self.horizons_s))
         self.gen_params = gen_params
         self.rng = np.random.default_rng(seed)  # only ever touched by the prefetch thread -- single producer, no lock needed
 
@@ -176,8 +184,8 @@ class Inspector:
         self._prefetch_thread = threading.Thread(target=self._prefetch_loop, daemon=True)
         self._prefetch_thread.start()
 
-        self.fig, (self.ax_traj, self.ax_stamina) = plt.subplots(
-            1, 2, figsize=(15, 8.5), facecolor=_C_BG, gridspec_kw={"width_ratios": [2, 1]},
+        self.fig, (self.ax_traj, self.ax_cross, self.ax_stamina) = plt.subplots(
+            1, 3, figsize=(18, 8.5), facecolor=_C_BG, gridspec_kw={"width_ratios": [2, 2, 1]},
         )
         self.fig.subplots_adjust(bottom=0.34, top=0.68, wspace=0.2)
         self.ax_table = self.fig.add_axes((0.04, 0.06, 0.92, 0.22))
@@ -215,9 +223,10 @@ class Inspector:
             x = torch.from_numpy(input_row[None].astype(np.float32))
             latent = self.model.encoder(x)
             decoder_outs = [o[0].numpy() for o in self.model.decoder(latent)]
+            crossing_pred = self.model.crossing_head(latent)[0].numpy()
         return {
             "idx": idx, "input_row": input_row, "div_x": div_x, "div_y": div_y, "div_vel": div_vel,
-            "decoder_outs": decoder_outs,
+            "decoder_outs": decoder_outs, "crossing_pred": crossing_pred,
         }
 
     def next_row(self) -> None:
@@ -227,7 +236,7 @@ class Inspector:
         idx = data["idx"]
         ds, gen_params = self.ds, self.gen_params
         input_row, div_x, div_y, div_vel = data["input_row"], data["div_x"], data["div_y"], data["div_vel"]
-        decoder_outs = data["decoder_outs"]
+        decoder_outs, crossing_pred = data["decoder_outs"], data["crossing_pred"]
         has_possession = bool(input_row[11] > 0.5)
 
         # ---- Trajectory (+ heading ticks) ----
@@ -278,6 +287,38 @@ class Inspector:
         ax.plot(*start_xy, "o", color="white", ms=4.5, alpha=0.3, zorder=6, mec="white", mew=0.4)
         for h, (gx, gy) in enumerate(gt_pts[1:]):
             ax.text(gx + 0.8, gy + 0.8, f"t={self.horizons_s[h]:g}s", color="#cccccc", fontsize=6, zorder=7)
+        ax.legend(loc="upper left", fontsize=8, facecolor=_C_BG, edgecolor="none", labelcolor="white", framealpha=0.75)
+
+        # ---- Crossing point ----
+        ax = self.ax_cross
+        ax.clear()
+        _draw_pitch(ax, gen_params)
+        _draw_episode_boundary(ax, input_row, gen_params)
+        _style_dark_ax(ax, "Crossing point: gt vs pred")
+        ax.plot(*start_xy, "o", color="white", ms=4.5, alpha=0.3, zorder=6, mec="white", mew=0.4)
+
+        # crossing_pred layout: (pos_x, pos_y, crosses_logit, dt_normalized)
+        # -- see PlayerDynamicsAutoencoder's crossing_head docstring.
+        pred_crosses_prob = float(1.0 / (1.0 + np.exp(-crossing_pred[2])))
+        pred_dt = float(crossing_pred[3]) * self.dt_norm_s
+        if pred_crosses_prob >= 0.5:
+            pred_cross_xy = (crossing_pred[0] * div_x, crossing_pred[1] * div_y)
+            ax.plot(*pred_cross_xy, "^", color=_C_PRED, ms=10, alpha=0.75, zorder=6, mec="white", mew=0.5, label="predicted")
+            ax.text(pred_cross_xy[0] + 0.8, pred_cross_xy[1] + 0.8, f"pred dt={pred_dt:.2f}s (p={pred_crosses_prob:.2f})",
+                    color=_C_PRED, fontsize=8, zorder=7)
+        else:
+            ax.text(0, gen_params.base_pitch_width_m / 2 + 3.0, f"predicted: never crosses (p={pred_crosses_prob:.2f}, dt={pred_dt:.2f}s)",
+                    color=_C_PRED, fontsize=8, ha="center")
+
+        if ds.crossing_mask is not None and ds.crossing_mask[idx]:
+            gt_cross_xy = (ds.crossing_pos[idx, 0] * div_x, ds.crossing_pos[idx, 1] * div_y)
+            gt_dt = float(ds.crossing_dt[idx])
+            ax.plot(*gt_cross_xy, "^", color=_C_GT, ms=10, alpha=0.75, zorder=6, mec="white", mew=0.5, label="ground truth")
+            ax.text(gt_cross_xy[0] + 0.8, gt_cross_xy[1] - 1.6, f"gt dt={gt_dt:.2f}s",
+                    color=_C_GT, fontsize=8, zorder=7)
+        else:
+            ax.text(0, -gen_params.base_pitch_width_m / 2 - 4.5, "ground truth: never crosses in this window",
+                    color=_C_GT, fontsize=8, ha="center")
         ax.legend(loc="upper left", fontsize=8, facecolor=_C_BG, edgecolor="none", labelcolor="white", framealpha=0.75)
 
         # ---- Stamina over horizon ----
@@ -365,6 +406,15 @@ def main() -> None:
     ap.add_argument("--checkpoint", required=True, type=Path, help="Full-model checkpoint (has model_state_dict), not the encoder-only final artifact.")
     ap.add_argument("--dataset", required=True, type=Path, help="Directory of .npz shards (e.g. physics_pretrain_data/player/).")
     ap.add_argument("--seed", type=int, default=None, help="Seed for the random row sequence (omit for a fresh sequence each run).")
+    ap.add_argument(
+        "--linear-decoder", action="store_true", default=None,
+        help="Force-build PlayerDynamicsLinearDecoder regardless of the checkpoint's own "
+             "config_snapshot['linear_decoder_enabled']. Needed for a checkpoint saved by a training process that "
+             "was already running before linear-decoder support existed here -- its config_snapshot is stale "
+             "(still says false) even though the actual saved decoder.* weights are the linear-decoder shape, "
+             "since that process never picked up the code change. Omit to trust config_snapshot as usual "
+             "(correct for any checkpoint saved after a restart).",
+    )
     args = ap.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
@@ -375,6 +425,16 @@ def main() -> None:
             "'.midtrain_latest.pt' or '.after_training.pt'."
         )
     cfg = ckpt["config_snapshot"]
+    linear_decoder = cfg.get("linear_decoder_enabled", False) if args.linear_decoder is None else args.linear_decoder
+    # encoder_leaky_relu_negative_slope isn't part of the saved weights
+    # (LeakyReLU has no learnable params), so unlike hidden_dim/latent_dim/
+    # etc. above (which MUST come from this checkpoint's own config_snapshot
+    # to match its actual saved shapes), this always reflects the CURRENT
+    # live config, even for a checkpoint saved before this setting existed
+    # or trained under a different slope (plain ReLU included) -- see its
+    # config comment in ai_config.json.
+    from footballcoach.ai.config import load_ai_config
+    leaky_relu_negative_slope = load_ai_config()["physics_pretrain"]["player"].get("encoder_leaky_relu_negative_slope", 0.0)
 
     model = PlayerDynamicsAutoencoder(
         hidden_dim=cfg["hidden_dim"],
@@ -386,12 +446,18 @@ def main() -> None:
         identity_shortcut_noise_std=cfg.get("identity_shortcut_noise_std", 0.0),
         encoder_concat_all_input_fields=cfg.get("encoder_concat_all_input_fields", False),
         decoder_identity_shortcut=cfg.get("decoder_identity_shortcut_enabled"),
+        linear_decoder=linear_decoder,
+        leaky_relu_negative_slope=leaky_relu_negative_slope,
     )
     # strict=False: tolerates a checkpoint saved before a param existed at
     # all -- see train_player_dynamics.py's own --init-checkpoint resume
-    # path for the identical pattern (no crossing-head-style migration
-    # shim needed here, player has no such head).
-    missing, unexpected = model.load_state_dict(ckpt["model_state_dict"], strict=False)
+    # path for the identical pattern. _migrate_crossing_head_state_dict
+    # handles crossing_head's 3->4 output shape change (pos_x, pos_y,
+    # delta_t -> pos_x, pos_y, crosses_logit, delta_t).
+    from footballcoach.ai.physics_pretrain.train_player_dynamics import _migrate_crossing_head_state_dict
+    missing, unexpected = model.load_state_dict(
+        _migrate_crossing_head_state_dict(ckpt["model_state_dict"], model), strict=False,
+    )
     if missing:
         print(f"Note: checkpoint missing {len(missing)} param(s), left at fresh init: {missing}")
     if unexpected:
@@ -408,6 +474,21 @@ def main() -> None:
         # against actually used), matching inspect_ball_pretrain.py's
         # identical override.
         gen_params = dataclasses.replace(gen_params, normalize_kinematics_by_base_pitch=normalize_by_base)
+
+    # Post-TRAINING capacity snapshot of every stage of the encoder (both
+    # hidden layers, the bottleneck, and the final latent) -- see
+    # inspect_ball_pretrain.py's identical addition for the full rationale.
+    trunk_children = list(model.encoder.trunk.children())
+    stages = [
+        ("hidden layer 1 (post-ReLU)", torch.nn.Sequential(*trunk_children[0:2])),
+        ("hidden layer 2 (post-ReLU)", torch.nn.Sequential(*trunk_children[0:4])),
+        ("bottleneck (post-ReLU)", torch.nn.Sequential(*trunk_children[0:6])),
+        ("final latent", model.encoder),
+    ]
+    for label, stage_module in stages:
+        print(f"--- {label} ---")
+        print(format_latent_stats(compute_latent_stats(stage_module, ds.inputs, device="cpu")))
+        print()
 
     inspector = Inspector(ds, model, cfg, gen_params, args.seed)
     inspector.show()

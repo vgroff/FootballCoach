@@ -66,12 +66,14 @@ class ProgressReporter:
         self._last_milestone = -1
         self._done = False
 
-    def update(self, current: int) -> None:
+    def update(self, current: int, postfix: str = "") -> None:
         """Report progress at ``current`` (out of ``total``). Throttled
         internally -- safe to call every loop iteration. Always renders once
         ``current >= total`` (final call), even if throttled, so the
         terminal is left in a clean state (trailing newline for the live
-        bar; a final 100% line for milestone mode)."""
+        bar; a final 100% line for milestone mode). ``postfix``, when given,
+        is appended verbatim (e.g. a running ``loss=0.0123`` readout) -- the
+        caller owns its formatting."""
         if self._done:
             return
         now = time.monotonic()
@@ -80,18 +82,18 @@ class ProgressReporter:
             if not finished and (now - self._last_update_s) < self.min_interval_s:
                 return
             self._last_update_s = now
-            self._render_live(current, now)
+            self._render_live(current, now, postfix)
         else:
             pct = int(current * 100 / self.total)
             milestone = (pct // self.milestone_pct) * self.milestone_pct
             if not finished and milestone <= self._last_milestone:
                 return
             self._last_milestone = milestone
-            self._render_milestone(current, now)
+            self._render_milestone(current, now, postfix)
         if finished:
             self._done = True
 
-    def _render_live(self, current: int, now: float) -> None:
+    def _render_live(self, current: int, now: float, postfix: str = "") -> None:
         elapsed = max(now - self._start, 1e-9)
         rate = current / elapsed
         frac = min(current / self.total, 1.0)
@@ -100,18 +102,20 @@ class ProgressReporter:
         eta_s = (self.total - current) / rate if rate > 0 else float("inf")
         eta_str = f"{eta_s:5.0f}s" if eta_s < 3600 else "  >1h"
         end = "\n" if current >= self.total else ""
+        suffix = f"  {postfix}" if postfix else ""
         print(
             f"\r{self.prefix}[{bar}] {current}/{self.total} ({frac * 100:5.1f}%)  "
-            f"{rate:6.1f} steps/s  eta {eta_str}",
+            f"{rate:6.1f} steps/s  eta {eta_str}{suffix}",
             end=end, file=self.stream, flush=True,
         )
 
-    def _render_milestone(self, current: int, now: float) -> None:
+    def _render_milestone(self, current: int, now: float, postfix: str = "") -> None:
         elapsed = max(now - self._start, 1e-9)
         rate = current / elapsed
         frac = min(current / self.total, 1.0)
+        suffix = f"  {postfix}" if postfix else ""
         print(
-            f"{self.prefix}{current}/{self.total} ({frac * 100:5.1f}%)  {rate:6.1f} steps/s",
+            f"{self.prefix}{current}/{self.total} ({frac * 100:5.1f}%)  {rate:6.1f} steps/s{suffix}",
             file=self.stream, flush=True,
         )
 

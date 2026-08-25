@@ -196,6 +196,22 @@ class BallDynamicsDataset:
     def __len__(self) -> int:
         return len(self.inputs)
 
+    def subset(self, indices: np.ndarray) -> "BallDynamicsDataset":
+        """Returns a NEW ``BallDynamicsDataset`` containing only rows at
+        ``indices`` (into ``self.inputs``/``self.targets``/etc.) -- e.g. for
+        ``--max-episodes`` in ``train_ball_dynamics.py``'s ``train()``, to
+        test whether the network can fit a small subset near-perfectly.
+        Goes back through the constructor (rather than hand-slicing every
+        attribute here) so ``crossing_pos``/``crossing_mask``/``crossing_dt``
+        get re-derived from the subsetted ``crossings``/``crossing_times``
+        the same way they always are -- one source of truth for that
+        derivation instead of two copies that could drift apart."""
+        return BallDynamicsDataset(
+            self.inputs[indices], self.targets[indices],
+            self.crossings[indices] if self.crossings is not None else None,
+            self.crossing_times[indices] if self.crossing_times is not None else None,
+        )
+
     @classmethod
     def from_directory(cls, directory: str | Path, pattern: str = "*.npz") -> "BallDynamicsDataset":
         paths = sorted(Path(directory).glob(pattern))

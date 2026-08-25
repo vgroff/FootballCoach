@@ -50,19 +50,20 @@ STAMINA_FIELD_INDEX = 6
 
 
 class PlayerDynamicsEncoder(nn.Module):
-    """``input(N_INPUT_FIELDS) -> Linear(hidden) -> ReLU -> Linear(hidden) -> ReLU ->
-    Linear(bottleneck) -> ReLU -> [concat raw input[0:7] if identity_shortcut] -> Linear(latent_dim)``.
+    """``input(N_INPUT_FIELDS) -> Linear(hidden) -> LeakyReLU -> Linear(hidden) -> LeakyReLU ->
+    Linear(bottleneck) -> LeakyReLU -> [concat raw input[0:7] if identity_shortcut] -> Linear(latent_dim)``.
 
     Structurally identical to ``BallDynamicsEncoder`` (see its docstring for
-    the full rationale behind the bottleneck layer and the identity-shortcut
-    concat) -- only the field counts differ (``N_IDENTITY_SHORTCUT_FIELDS``
-    here is 7, not 9; no spin/height axis).
+    the full rationale behind the bottleneck layer, the identity-shortcut
+    concat, and ``leaky_relu_negative_slope``) -- only the field counts
+    differ (``N_IDENTITY_SHORTCUT_FIELDS`` here is 7, not 9; no spin/height
+    axis).
     """
 
     def __init__(
         self, input_dim: int = N_INPUT_FIELDS, hidden_dim: int = 64, latent_dim: int = 16, bottleneck_dim: int = 32,
         identity_shortcut: bool = False, identity_shortcut_noise_std: float = 0.0,
-        concat_all_input_fields: bool = False,
+        concat_all_input_fields: bool = False, leaky_relu_negative_slope: float = 0.0,
     ):
         super().__init__()
         self.input_dim = input_dim
@@ -70,9 +71,9 @@ class PlayerDynamicsEncoder(nn.Module):
         self.identity_shortcut = identity_shortcut
         self.concat_all_input_fields = concat_all_input_fields
         self.trunk = nn.Sequential(
-            nn.Linear(input_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, hidden_dim), nn.ReLU(),
-            nn.Linear(hidden_dim, bottleneck_dim), nn.ReLU(),
+            nn.Linear(input_dim, hidden_dim), nn.LeakyReLU(negative_slope=leaky_relu_negative_slope),
+            nn.Linear(hidden_dim, hidden_dim), nn.LeakyReLU(negative_slope=leaky_relu_negative_slope),
+            nn.Linear(hidden_dim, bottleneck_dim), nn.LeakyReLU(negative_slope=leaky_relu_negative_slope),
         )
         if identity_shortcut:
             concat_dim = input_dim if concat_all_input_fields else N_IDENTITY_SHORTCUT_FIELDS
@@ -157,6 +158,83 @@ class PlayerDynamicsDecoder(nn.Module):
         feat = latent.new_tensor([t_norm, t_norm ** 2, math.log1p(horizon_s)])
         return self.net(torch.cat([latent, feat.expand(batch, 3)], dim=-1))
 
+    def has_horizon(self, horizon_s: float) -> bool:
+        """Always True -- see BallDynamicsDecoder.has_horizon's identical
+        rationale (interface parity with PlayerDynamicsLinearDecoder, which
+        is NOT always True)."""
+        return True
+
+
+# pos_x, pos_y, vel_x, vel_y -- see PlayerDynamicsLinearDecoder.
+N_LINEAR_DECODER_TARGET_FIELDS = 4
+
+# See BallDynamicsLinearDecoder's identical constant/rationale.
+_LINEAR_DECODER_HORIZON_ATOL = 1e-6
+
+
+class PlayerDynamicsLinearDecoder(nn.Module):
+    """Player analogue of ``BallDynamicsLinearDecoder`` -- see its docstring
+    for the full rationale (an affine decoder can't represent ``position ~=
+    velocity * t``, since that needs an episode-specific latent-derived
+    quantity multiplied by a horizon-derived time feature; independent
+    per-horizon linear heads sidestep this by not taking a time INPUT at
+    all). ``n_horizons + 1`` (the configured ``horizons_s``, plus ``0.0``)
+    independent ``Linear(latent_dim, 4)`` heads.
+
+    Predicts position + velocity ONLY (``pos_x, pos_y, vel_x, vel_y``) --
+    no heading, no stamina, no out_of_bounds/goal_scored logits.
+    ``forward``/``forward_at`` still return the full ``N_TARGET_FIELDS_PER_
+    HORIZON``-wide shape ``PlayerDynamicsDecoder`` does (zero-padding the
+    missing heading/stamina/logit columns), so every downstream loss/
+    breakdown/logging function works unchanged -- those constant-zero
+    columns carry no gradient. Unlike the ball version, heading_mse/
+    stamina_mse have no existing 0.0-disables weight of their own (they were
+    always unconditionally summed into ``compute_loss``'s ``total``) --
+    ``train_player_dynamics.py`` now threads ``heading_weight``/
+    ``stamina_weight`` (default 1.0, unweighted, matching prior behaviour)
+    through every loss function specifically so ``linear_decoder_enabled``
+    can zero them out too, same convention as ``bce_weight``, instead of
+    baking a meaningless constant offset into every reported train/val
+    loss.
+
+    ``0.0`` is always included as a registered horizon in addition to
+    ``horizons_s``, for the t=0 autoencoding sanity check
+    (``forward_at(latent, 0.0)``) -- not included in ``forward()``'s
+    returned list.
+    """
+
+    def __init__(self, latent_dim: int, horizons_s: list[float] | None = None):
+        super().__init__()
+        horizons_s = horizons_s if horizons_s is not None else [0.2, 1.0, 3.0, 5.0, 10.0]
+        self.n_horizons = len(horizons_s)
+        self.latent_dim = latent_dim
+        self._horizons = (0.0,) + tuple(horizons_s)
+        self.net = nn.Linear(latent_dim, len(self._horizons) * N_LINEAR_DECODER_TARGET_FIELDS)
+
+    def _heads_out(self, latent: torch.Tensor) -> torch.Tensor:
+        batch = latent.shape[0]
+        return self.net(latent).view(batch, len(self._horizons), N_LINEAR_DECODER_TARGET_FIELDS)
+
+    def _pad(self, out4: torch.Tensor) -> torch.Tensor:
+        pad = out4.new_zeros(out4.shape[0], N_TARGET_FIELDS_PER_HORIZON - N_LINEAR_DECODER_TARGET_FIELDS)
+        return torch.cat([out4, pad], dim=-1)
+
+    def forward(self, latent: torch.Tensor) -> list[torch.Tensor]:
+        all_out = self._heads_out(latent)
+        return [self._pad(all_out[:, i, :]) for i in range(1, len(self._horizons))]
+
+    def has_horizon(self, horizon_s: float) -> bool:
+        return any(abs(horizon_s - h) <= _LINEAR_DECODER_HORIZON_ATOL for h in self._horizons)
+
+    def forward_at(self, latent: torch.Tensor, horizon_s: float) -> torch.Tensor:
+        for i, h in enumerate(self._horizons):
+            if abs(horizon_s - h) <= _LINEAR_DECODER_HORIZON_ATOL:
+                return self._pad(self._heads_out(latent)[:, i, :])
+        raise ValueError(
+            f"PlayerDynamicsLinearDecoder has no head registered for horizon_s={horizon_s} "
+            f"(registered: {self._horizons}) -- callers must check has_horizon() first."
+        )
+
 
 class PlayerDynamicsAutoencoder(nn.Module):
     """Thin training-only wrapper composing encoder + the shared decoder +
@@ -172,15 +250,28 @@ class PlayerDynamicsAutoencoder(nn.Module):
     ``crossing_head``/``resting_head``). Being linear-off-the-latent is the
     point: whatever they predict, the latent is forced to encode LINEARLY.
 
-    ``crossing_head``: ``Linear(latent_dim, 3)`` -> ``(pos_x, pos_y,
-    delta_t)`` of the first out_of_bounds/goal_scored crossing (normalized
-    position; ``delta_t`` in seconds with a ``-1`` "no crossing" sentinel) --
-    the direct player analogue of the ball's identically-shaped head. See
-    ``PlayerDynamicsDataset``'s ``crossing_pos``/``crossing_dt``/
-    ``crossing_mask`` and ``physics_pretrain.player.crossing_pos_loss_weight``/
-    ``crossing_dt_loss_weight`` (split, unlike the ball's single combined
-    weight, since position and delta_t sit on very different natural
-    scales -- delta_t is raw unnormalized seconds).
+    ``crossing_head``: ``Linear(latent_dim, 4)`` -> ``(pos_x, pos_y,
+    crosses_logit, delta_t)`` of the first out_of_bounds/goal_scored
+    crossing. ``crosses_logit`` is a BCE-with-logits classifier -- "does
+    this row have a real crossing/already-crossed instance to report at
+    all" (true whenever ``crossing_dt`` isn't the -1 'genuinely never'
+    sentinel) -- and ``delta_t`` is a plain regression trained ONLY on rows
+    where that classifier's target is true (no -1 sentinel mixed into the
+    regression itself). Split out from a single combined delta_t regression
+    (see ``train_player_dynamics._crossing_head_loss``'s docstring) because
+    the old single-regression version forced MSE to blend two qualitatively
+    different signals -- "will it cross at all" and "when, given it
+    crosses" -- into one number, and for any input the network was even
+    slightly unsure about, the MSE-optimal prediction was a weighted
+    average of "-1" and "some real time", landing confidently on neither
+    and inflating error on both. Splitting removes that blend entirely: the
+    classifier only ever has to answer yes/no, and the regression only ever
+    sees real, same-scale values (0 for an already-crossed row, a real
+    positive delta_t for a genuine future crossing) with no -1 gap to
+    average against. See ``PlayerDynamicsDataset``'s ``crossing_pos``/
+    ``crossing_dt``/``crossing_mask`` and ``physics_pretrain.player.
+    crossing_pos_loss_weight``/``crossing_crosses_loss_weight``/
+    ``crossing_dt_loss_weight``.
 
     ``goal_dist_delta_head``: ``Linear(latent_dim, 2)`` -> the CHANGE in
     distance-to-the-closest-point-of-each-goal-mouth between t=0 and t=3.0s,
@@ -215,21 +306,31 @@ class PlayerDynamicsAutoencoder(nn.Module):
         identity_shortcut_noise_std: float = 0.0,
         encoder_concat_all_input_fields: bool = False,
         decoder_identity_shortcut: bool | None = None,
+        linear_decoder: bool = False,
+        leaky_relu_negative_slope: float = 0.0,
     ):
         super().__init__()
         self.encoder = PlayerDynamicsEncoder(
             input_dim=input_dim, hidden_dim=hidden_dim, latent_dim=latent_dim, bottleneck_dim=encoder_bottleneck_dim,
             identity_shortcut=identity_shortcut, identity_shortcut_noise_std=identity_shortcut_noise_std,
             concat_all_input_fields=encoder_concat_all_input_fields,
+            leaky_relu_negative_slope=leaky_relu_negative_slope,
         )
-        decoder_identity_shortcut = identity_shortcut if decoder_identity_shortcut is None else decoder_identity_shortcut
-        self.decoder = PlayerDynamicsDecoder(
-            latent_dim=latent_dim, horizons_s=horizons_s, hidden_dim=decoder_hidden_dim,
-            identity_shortcut=decoder_identity_shortcut, identity_shortcut_noise_std=identity_shortcut_noise_std,
-        )
+        self.linear_decoder = linear_decoder
+        if linear_decoder:
+            # decoder_hidden_dim/decoder_identity_shortcut/
+            # identity_shortcut_noise_std don't apply -- see
+            # PlayerDynamicsLinearDecoder's own docstring.
+            self.decoder = PlayerDynamicsLinearDecoder(latent_dim=latent_dim, horizons_s=horizons_s)
+        else:
+            decoder_identity_shortcut = identity_shortcut if decoder_identity_shortcut is None else decoder_identity_shortcut
+            self.decoder = PlayerDynamicsDecoder(
+                latent_dim=latent_dim, horizons_s=horizons_s, hidden_dim=decoder_hidden_dim,
+                identity_shortcut=decoder_identity_shortcut, identity_shortcut_noise_std=identity_shortcut_noise_std,
+            )
         # Auxiliary linear heads off the raw latent -- see the class
         # docstring. Always present; trained iff their config weight != 0.
-        self.crossing_head = nn.Linear(latent_dim, 3)
+        self.crossing_head = nn.Linear(latent_dim, 4)
         self.goal_dist_delta_head = nn.Linear(latent_dim, 2)
         self.short_horizon_head_0_2s = nn.Linear(latent_dim, 4)
         self.short_horizon_head_1_0s = nn.Linear(latent_dim, 4)
@@ -252,4 +353,6 @@ class PlayerDynamicsAutoencoder(nn.Module):
             identity_shortcut_noise_std=cfg.get("identity_shortcut_noise_std", 0.0),
             encoder_concat_all_input_fields=cfg.get("encoder_concat_all_input_fields", False),
             decoder_identity_shortcut=cfg.get("decoder_identity_shortcut_enabled"),
+            linear_decoder=cfg.get("linear_decoder_enabled", False),
+            leaky_relu_negative_slope=cfg.get("encoder_leaky_relu_negative_slope", 0.0),
         )

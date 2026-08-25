@@ -50,6 +50,7 @@ from footballcoach.ai.physics_pretrain.ball_episode_gen import (
     BALL_SPIN_NORM_DIVISOR_RAD_S, BallEpisodeGenParams, N_TARGET_FIELDS_PER_HORIZON,
 )
 from footballcoach.ai.physics_pretrain.train_ball_dynamics import _migrate_crossing_head_state_dict, compute_per_episode_loss
+from footballcoach.ai.physics_pretrain.latent_stats import compute_latent_stats, format_latent_stats
 
 _C_PITCH = "#227832"
 _C_LINE = "white"
@@ -197,8 +198,14 @@ def _correlate_errors_with_inputs(
     deliberately NOT the already-computed ``engineered features`` (input
     fields 14:19), which are themselves in normalized units and less
     directly interpretable in a printed correlation table. Also includes
-    ``dist_to_x/y_boundary`` (how close to the pitch edge the episode
-    starts) and ``already_oob_or_goal_at_start`` (0/1, via
+    ``speed`` (overall 3D velocity magnitude) alongside the signed
+    ``vel_x/y/z`` components, ``vertical_speed`` (``|vel_z|`` specifically
+    -- distinct from ``speed``, which conflates horizontal and vertical
+    motion, and from signed ``vel_z``, whose correlation can wash out
+    toward zero even when vertical speed matters if fast-rising and
+    fast-falling episodes drive similarly elevated error), ``dist_to_x/y_
+    boundary`` (how close to the pitch edge the episode starts), and
+    ``already_oob_or_goal_at_start`` (0/1, via
     ``compute_already_out_of_bounds_at_start_mask`` -- Pearson correlation
     against a 0/1 indicator is the point-biserial correlation, a standard
     and valid special case) since both are plausible error drivers not
@@ -281,15 +288,38 @@ def _correlate_errors_with_inputs(
     vel_y = inputs[:, 4] * vel_div
     vel_z = inputs[:, 5] * vel_div
     speed = np.sqrt(vel_x ** 2 + vel_y ** 2 + vel_z ** 2)
+    # |vel_z| specifically, distinct from the overall 3D `speed` above
+    # (which conflates horizontal and vertical motion) and from the raw
+    # SIGNED vel_z (whose correlation with error can wash out toward zero
+    # even when vertical speed genuinely matters, if fast-rising and
+    # fast-falling episodes both drive similarly elevated error -- a
+    # signed linear correlation can't see a same-magnitude-either-sign
+    # effect). Isolates vertical speed at whatever moment t=0 is, relevant
+    # since ground-bounce dynamics depend specifically on vertical speed
+    # at contact, not the horizontal components speed/vel_x/vel_y already
+    # capture.
+    vertical_speed = np.abs(vel_z)
     spin_x = inputs[:, 6] * BALL_SPIN_NORM_DIVISOR_RAD_S
     spin_y = inputs[:, 7] * BALL_SPIN_NORM_DIVISOR_RAD_S
     spin_z = inputs[:, 8] * BALL_SPIN_NORM_DIVISOR_RAD_S
     spin_mag = np.sqrt(spin_x ** 2 + spin_y ** 2 + spin_z ** 2)
-    already_oob_or_goal = ds.compute_already_out_of_bounds_at_start_mask(gen_params, indices=idx).astype(np.float64)
+    # Computed once, reused below both as its own feature AND to replicate
+    # train_ball_dynamics.py's train()'s exact crossing_mask/crossing_dt
+    # override for these rows (see the crossing_head block below) -- without
+    # that override this analysis silently compares crossing_head against
+    # ground truth for rows the model was NEVER trained to match on this
+    # head (already-oob-at-start episodes are excluded from crossing_head's
+    # position loss, and their crossing_dt target is trained toward the -1
+    # sentinel, not the raw near-immediate crossing time) -- a mismatch
+    # that shows up here as an inflated, misleading correlation with this
+    # exact flag rather than reflecting anything about model quality.
+    already_oob_bool = ds.compute_already_out_of_bounds_at_start_mask(gen_params, indices=idx)
+    already_oob_or_goal = already_oob_bool.astype(np.float64)
 
     features = {
         "pos_x (m)": pos_x, "pos_y (m)": pos_y, "height/pos_z (m)": pos_z,
         "vel_x (m/s)": vel_x, "vel_y (m/s)": vel_y, "vel_z (m/s)": vel_z, "speed (m/s)": speed,
+        "vertical_speed |vel_z| (m/s)": vertical_speed,
         "spin_x (rad/s)": spin_x, "spin_y (rad/s)": spin_y, "spin_z (rad/s)": spin_z, "spin_mag (rad/s)": spin_mag,
         "restitution": inputs[:, 9].astype(np.float64),
         "pitch_length (m)": inputs[:, 10] * gen_params.base_pitch_length_m,
@@ -316,23 +346,25 @@ def _correlate_errors_with_inputs(
             return
         rows = []
         for name, vals in feats.items():
-            var = float(np.var(vals))
-            if var < 1e-24 or np.std(err) < 1e-12:
+            feat_std, err_std = np.std(vals), np.std(err)
+            if feat_std < 1e-12 or err_std < 1e-12:
                 continue  # a constant feature/error this sample has no defined correlation
             r = float(np.corrcoef(vals, err)[0, 1])
-            # OLS slope of err ~ vals (Delta-error per unit Delta-feature) --
-            # NOT the same thing as r (see this function's docstring): r is
-            # unitless strength/direction, slope = cov(vals,err)/var(vals)
-            # = r * std(err)/std(vals) is the actual "how many
-            # [error units] per [feature unit]" a reader would want.
-            slope = float(np.cov(vals, err, ddof=1)[0, 1] / var)
+            # Effect size (regression slope), in the error metric's own
+            # units per unit of the feature -- r alone is unitless
+            # association STRENGTH, not magnitude (see this function's
+            # docstring note): slope = r * std(err) / std(feature) is the
+            # actual "how much extra error per unit of this feature" a
+            # simple linear fit would report, for the SAME feature/error
+            # pair r was computed from.
+            slope = r * err_std / feat_std
             rows.append((name, r, slope))
         rows.sort(key=lambda t: -abs(t[1]))
         if top_k is not None:
             rows = rows[:top_k]
         for name, r, slope in rows:
             bar = "#" * int(round(abs(r) * 40))
-            print(f"    {name:24s} r={r:+.3f}  slope={slope:+.4g}/unit  {bar}")
+            print(f"    {name:24s} r={r:+.3f}  slope={slope:+.4g}  {bar}")
 
     print(f"\n========== error / input correlation analysis ({sample_size:,} random episodes) ==========")
     _print_ranked("mean position error (m, averaged over horizons)", pos_err_m)
@@ -340,9 +372,15 @@ def _correlate_errors_with_inputs(
 
     print("\n---------- auxiliary heads (own separate parameters, top 5 correlates each) ----------")
     if ds.crossing_pos is not None:
-        c_mask = ds.crossing_mask[idx]
+        # Same already-oob-at-start override train() applies in place
+        # before training (see this function's docstring / the comment
+        # above already_oob_bool) -- mask OUT those rows from the position
+        # term, and override their crossing_dt target to the -1 sentinel,
+        # so this analysis measures the model against the SAME targets it
+        # was actually trained against, not the raw pre-override dataset.
+        c_mask = ds.crossing_mask[idx] & ~already_oob_bool
         c_pos = ds.crossing_pos[idx]
-        c_dt = ds.crossing_dt[idx]
+        c_dt = np.where(already_oob_bool, -1.0, ds.crossing_dt[idx])
         crossing_pos_err_m = np.hypot(
             (crossing_pred[:, 0] - c_pos[:, 0]) * half_length, (crossing_pred[:, 1] - c_pos[:, 1]) * half_width,
         )
@@ -631,6 +669,15 @@ def main() -> None:
         "--error-samples", type=int, default=20_000,
         help="How many random episodes to sample for the on-close error/input correlation analysis (default 20,000).",
     )
+    ap.add_argument(
+        "--linear-decoder", action="store_true", default=None,
+        help="Force-build BallDynamicsLinearDecoder regardless of the checkpoint's own "
+             "config_snapshot['linear_decoder_enabled']. Needed for a checkpoint saved by a training process that "
+             "was already running before linear-decoder support existed/was fixed here -- its config_snapshot is "
+             "stale (still says false) even though the actual saved decoder.* weights are the linear-decoder "
+             "shape, since that process never picked up the code change. Omit to trust config_snapshot as usual "
+             "(correct for any checkpoint saved after a restart).",
+    )
     args = ap.parse_args()
 
     ckpt = torch.load(args.checkpoint, map_location="cpu")
@@ -641,6 +688,16 @@ def main() -> None:
             "'.midtrain_latest.pt' or '.after_training.pt'."
         )
     cfg = ckpt["config_snapshot"]
+    linear_decoder = cfg.get("linear_decoder_enabled", False) if args.linear_decoder is None else args.linear_decoder
+    # encoder_leaky_relu_negative_slope isn't part of the saved weights
+    # (LeakyReLU has no learnable params), so unlike hidden_dim/latent_dim/
+    # etc. above (which MUST come from this checkpoint's own config_snapshot
+    # to match its actual saved shapes), this always reflects the CURRENT
+    # live config, even for a checkpoint saved before this setting existed
+    # or trained under a different slope (plain ReLU included) -- see its
+    # config comment in ai_config.json.
+    from footballcoach.ai.config import load_ai_config
+    leaky_relu_negative_slope = load_ai_config()["physics_pretrain"]["ball"].get("encoder_leaky_relu_negative_slope", 0.0)
 
     model = BallDynamicsAutoencoder(
         hidden_dim=cfg["hidden_dim"],
@@ -652,6 +709,8 @@ def main() -> None:
         identity_shortcut_noise_std=cfg.get("identity_shortcut_noise_std", 0.0),
         encoder_concat_all_input_fields=cfg.get("encoder_concat_all_input_fields", False),
         decoder_identity_shortcut=cfg.get("decoder_identity_shortcut_enabled"),
+        linear_decoder=linear_decoder,
+        leaky_relu_negative_slope=leaky_relu_negative_slope,
     )
     missing, unexpected = model.load_state_dict(
         _migrate_crossing_head_state_dict(ckpt["model_state_dict"], model), strict=False,
@@ -665,6 +724,37 @@ def main() -> None:
     ds = BallDynamicsDataset.from_directory(args.dataset)
     gen_params = BallEpisodeGenParams.from_config()
     normalize_by_base = bool(cfg.get("normalize_kinematics_by_base_pitch", gen_params.normalize_kinematics_by_base_pitch))
+
+    # Post-TRAINING capacity snapshot of EVERY stage of the encoder, not
+    # just its final latent output -- train_ball_dynamics.py only ever logs
+    # the final-latent version of this, once, at epoch 0 (before any
+    # gradient step), which can't tell you how much of latent_dim the
+    # FINAL, converged encoder actually uses, and says nothing at all about
+    # hidden_dim/encoder_bottleneck_dim (internal activations that are
+    # never otherwise inspected). compute_latent_stats works on any
+    # nn.Module, so it's pointed here at increasingly-deep PREFIXES of
+    # model.encoder.trunk (a plain nn.Sequential -- see BallDynamicsEncoder
+    # -- [0:2]=Linear+ReLU #1, out width hidden_dim; [0:4]=...+Linear+ReLU
+    # #2, still hidden_dim; [0:6]=full trunk, out width encoder_bottleneck_
+    # dim) as well as the full encoder (out width latent_dim). A low
+    # effective_rank_participation_ratio/n_components_for_95pct_variance
+    # relative to that STAGE's own width -- or a nonzero n_dead_dims (ReLU
+    # units that are exactly 0 for every row, a hard floor on wasted
+    # capacity, only meaningful for the two hidden-layer stages since the
+    # bottleneck/latent stages end in Linear, not ReLU) -- at any stage is
+    # a concrete, checkpoint-specific signal that stage's own width could
+    # shrink without losing accuracy, not just latent_dim.
+    trunk_children = list(model.encoder.trunk.children())
+    stages = [
+        ("hidden layer 1 (post-ReLU)", torch.nn.Sequential(*trunk_children[0:2])),
+        ("hidden layer 2 (post-ReLU)", torch.nn.Sequential(*trunk_children[0:4])),
+        ("bottleneck (post-ReLU)", torch.nn.Sequential(*trunk_children[0:6])),
+        ("final latent", model.encoder),
+    ]
+    for label, stage_module in stages:
+        print(f"--- {label} ---")
+        print(format_latent_stats(compute_latent_stats(stage_module, ds.inputs, device="cpu")))
+        print()
 
     inspector = Inspector(
         ds, model, cfg, gen_params, normalize_by_base, args.seed, alpha=args.alpha, error_samples=args.error_samples,
