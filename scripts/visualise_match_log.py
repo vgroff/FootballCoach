@@ -55,9 +55,11 @@ _EV: dict[str, tuple[str, str, float]] = {
     "possession_change": ("D",  "#88ff44", 7),
     "goal":              ("*",  "#ffe000", 15),
     "ball_out":          ("s",  "#cc88ff", 8),
+    "box_possession":    ("s",  "#44ddff", 8),
     "consistency":       (".",  "#888888", 5),
     "episode_end":       ("P",  "white",   10),
 }
+_C_BALL_END = "#ff2fb0"   # distinct from every other marker colour -- final ball position
 
 
 # ---------------------------------------------------------------------------
@@ -197,6 +199,12 @@ def visualise_single(
             player_tracks.setdefault(pid, []).append(
                 (float(ev["time_s"]), float(px), float(py))
             )
+        if ev["event"] == "episode_end" and "player_positions" in ev:
+            for pid2, info in ev["player_positions"].items():
+                px, py, _ = info["pos"]
+                player_tracks.setdefault(pid2, []).append(
+                    (float(ev["time_s"]), float(px), float(py))
+                )
 
     # ---- Reward data ----
     rew_t: list[float] = []
@@ -206,6 +214,29 @@ def visualise_single(
         if rc:
             rew_t.append(float(ev["time_s"]))
             rew_cumul.append(rc)
+
+    # ---- Predicted vs. actual value (debug_value_network.py's per-row
+    # predicted_value/actual_return, see _episode_rows_to_match_log) ----
+    # Lives either at the event's own top level (consistency/kick/
+    # tackle_attempt/possession_change) or nested under player_positions.
+    # self (start/episode_end, which key player data by id instead).
+    def _pred_actual(ev: dict) -> tuple[Optional[float], Optional[float]]:
+        if "predicted_value" in ev:
+            return ev["predicted_value"], ev.get("actual_return")
+        self_info = ev.get("player_positions", {}).get("self")
+        if self_info and "predicted_value" in self_info:
+            return self_info["predicted_value"], self_info.get("actual_return")
+        return None, None
+
+    pred_t: list[float] = []
+    pred_vals: list[float] = []
+    actual_vals: list[float] = []
+    for ev in events:
+        p, a = _pred_actual(ev)
+        if p is not None:
+            pred_t.append(float(ev["time_s"]))
+            pred_vals.append(p)
+            actual_vals.append(a if a is not None else float("nan"))
 
     duration = float(events[-1]["time_s"])
     outcome  = next(
@@ -334,6 +365,32 @@ def visualise_single(
         ev_rows.append(f"[{n:>2}] {ev['time_s']:5.1f}s  {etype:<20}  {pid_str}")
         n += 1
 
+    # Final ball position -- called out separately from the small numbered
+    # episode_end marker above (easy to miss buried among the other event
+    # markers/numbers, especially when the ball drifted well away from
+    # every player -- see the "timeout" episodes where the ball rolls
+    # unattended for several seconds after the last kick).
+    end_ev = next((e for e in events if e["event"] == "episode_end"), None)
+    if end_ev is not None:
+        ebx, eby = float(end_ev["ball_pos"][0]), float(end_ev["ball_pos"][1])
+        ax_pitch.plot(ebx, eby, "o", color=_C_BALL_END, ms=16, zorder=11,
+                      mec="white", mew=1.2, alpha=0.95)
+        ax_pitch.annotate(
+            "ball ends here", xy=(ebx, eby), xytext=(ebx + 2.2, eby - 2.2),
+            color=_C_BALL_END, fontsize=8, fontweight="bold", zorder=12,
+            arrowprops=dict(arrowstyle="-", color=_C_BALL_END, lw=1.0),
+        )
+        for pid3, info in end_ev.get("player_positions", {}).items():
+            ppx, ppy, _ = info["pos"]
+            pcol = _C_LEFT if info.get("team") == "left" else _C_RIGHT
+            ax_pitch.plot(ppx, ppy, "P", color=pcol, ms=13, zorder=11,
+                          mec="white", mew=1.0)
+            ax_pitch.annotate(
+                f"{pid3} ends here", xy=(ppx, ppy), xytext=(ppx + 2.2, ppy + 2.2),
+                color=pcol, fontsize=7.5, fontweight="bold", zorder=12,
+                arrowprops=dict(arrowstyle="-", color=pcol, lw=0.9),
+            )
+
     # ==================================================================
     # LEGEND (marker types + event log)
     # ==================================================================
@@ -403,12 +460,34 @@ def visualise_single(
                          ms=ms * 0.65, zorder=5, mec="white", mew=0.3)
 
     # ==================================================================
-    # CUMULATIVE REWARD
+    # PREDICTED VS. ACTUAL RETURN OVER TIME
     # ==================================================================
+    # Primary content for this panel: debug_value_network.py's per-row
+    # predicted_value/actual_return (see _episode_rows_to_match_log), one
+    # point per event that carries the trainee's own position -- lets you
+    # see whether the value net's prediction tracks the unfolding
+    # trajectory or sits oblivious to it. Falls back to the older
+    # reward-component accumulation view (rew_t/rew_cumul) for logs that
+    # don't have prediction data at all (e.g. real MatchLogger replays from
+    # scripts/replay_episode.py, or older worst-episode exports) -- the
+    # bare "reward_cumulative" from a synthetic reconstruction is usually
+    # just a single point at episode_end, not a real accumulation curve.
     ax_reward.set_xlabel("time (s)", color="white", fontsize=7)
-    ax_reward.set_ylabel("cumulative reward", color="white", fontsize=7)
-    ax_reward.set_title("Reward accumulation over episode", color="white", fontsize=7, pad=2)
-    if rew_t and rew_cumul:
+    if pred_t:
+        ax_reward.set_ylabel("value", color="white", fontsize=7)
+        ax_reward.set_title("Predicted vs. actual return over episode", color="white", fontsize=7, pad=2)
+        ax_reward.plot(pred_t, pred_vals, lw=1.6, marker="o", ms=3,
+                       color="#f5a623", label="predicted", zorder=5)
+        ax_reward.plot(pred_t, actual_vals, lw=1.6, marker="o", ms=3,
+                       color="#44ddff", label="actual", zorder=4)
+        ax_reward.axhline(0, color="#555555", lw=0.8)
+        ax_reward.legend(
+            loc="upper left", fontsize=6.5, facecolor=_C_BG,
+            edgecolor="none", labelcolor="white", framealpha=0.7,
+        )
+    elif rew_t and rew_cumul:
+        ax_reward.set_ylabel("cumulative reward", color="white", fontsize=7)
+        ax_reward.set_title("Reward accumulation over episode", color="white", fontsize=7, pad=2)
         all_keys = sorted({k for rc in rew_cumul for k in rc})
         cmap = plt.cm.tab20
         for i, key in enumerate(all_keys):

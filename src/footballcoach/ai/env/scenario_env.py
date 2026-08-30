@@ -197,12 +197,24 @@ class ScenarioEnv:
     # Gym-like API
     # -----------------------------------------------------------------------
 
-    def reset(self) -> ObservationBatch:
-        """Start a new trial and return the initial observation."""
+    def reset(self, *, seed: int | None = None) -> ObservationBatch:
+        """Start a new trial and return the initial observation.
+
+        ``seed``, when given, is forwarded as the scenario builder's own
+        ``seed`` kwarg (e.g. ``build_1v1_scenario(seed=...)``) -- makes the
+        WHOLE trial (positions, attributes, ball state, and every subsequent
+        physics RNG draw the returned Match's own ``rng`` makes) exactly
+        reproducible, for builders that accept it. Has no effect on builders
+        that don't accept a ``seed`` kwarg at all (e.g. phase 2's), same as
+        ``sim_dt_s`` below. ``None`` (default) -- the scenario builder draws
+        its own unseeded (OS-entropy) rng, matching prior behaviour exactly.
+        """
         from footballcoach.rules_ai import NeuralPlayerAI
         # Inject sim_dt_s so build functions can pass it to Match.
         # This has no effect on builds that don't accept it (e.g. phase 2).
         build_kwargs = {**self.scenario_kwargs, "sim_dt_s": self._dt_s}
+        if seed is not None:
+            build_kwargs["seed"] = seed
         # terminal_outcomes: phase 1 only allows "miss"/"goal" to terminate
         # the loop; everything else (dispossessed, saved, box_possession,
         # timeout) is suppressed so the episode runs until the env's own
@@ -247,6 +259,7 @@ class ScenarioEnv:
         self._trainee_cumulative_state: dict[str, float] = {}
         self.last_trainee_transition = None
         self.last_secondary_results = []
+        self.last_terminal_match = None
         self.last_reward_components: dict[str, float] = {}
 
         # Assign NeuralPlayerAI to trainee (and secondary players) when a
@@ -746,6 +759,27 @@ class ScenarioEnv:
                 outcome_label=info.trial_outcome if done else None,
                 trainee_out_component=_trainee_out_component,
             )
+        # The Match exactly as it stood on the TRUE final tick of the trial
+        # that just ended. Two different done-paths need two different
+        # sources here:
+        # - trial_ended_this_step=True: ScenarioLoop._trial_outcome() itself
+        #   detected the end (miss/goal/box_possession/loop-level timeout)
+        #   and already rebuilt self._loop.match for the NEXT trial before
+        #   step() returns -- last_completed_trial_match is the only place
+        #   that final state survives (see its own docstring).
+        # - trial_ended_this_step=False but done=True anyway (this env's OWN
+        #   independent box_terminal/opponent_box_terminal/timeout checks,
+        #   computed above from THIS tick's match state, separately from
+        #   ScenarioLoop's own outcome detection): nothing rebuilt anything
+        #   this step, so self._loop.match is still exactly the terminal
+        #   state itself -- last_completed_trial_match would be stale (the
+        #   PREVIOUS trial's end, or None on this env's very first episode).
+        if not done:
+            self.last_terminal_match = None
+        elif trial_ended_this_step:
+            self.last_terminal_match = self._loop.last_completed_trial_match
+        else:
+            self.last_terminal_match = self._loop.match
         return self._get_obs(), reward, done, info
 
     # -----------------------------------------------------------------------
@@ -785,20 +819,26 @@ class ScenarioEnv:
                     self.match_log_dir / f"episode_{self._episode_index:06d}_{name}.json"
                 )
 
-    def _get_obs(self, player_id: str | None = None) -> ObservationBatch:
+    def _get_obs(self, player_id: str | None = None, match: "Match | None" = None) -> ObservationBatch:
         """Encode the observation for *player_id* (default: the trainee).
 
         Passing an explicit ``player_id`` lets callers (e.g.
         record_demonstrations.py) encode observations for other players
         (the opponent) without disturbing any of the trainee-specific
         internal call sites, which all call this with no arguments.
+
+        Passing an explicit ``match`` (default: ``self._loop.match``, the
+        live match) lets a caller encode against a DIFFERENT match object --
+        specifically ``self.last_terminal_match`` (see its own docstring),
+        the true final tick of a just-ended trial, which ``self._loop.match``
+        itself can no longer represent by the time ``step()`` has returned.
         """
         time_remaining = max(
             0.0,
             self.max_episode_s - self._episode_ticks * self._dt_s
         )
         return encode_observation(
-            match=self._loop.match,
+            match=match if match is not None else self._loop.match,
             player_id=player_id if player_id is not None else self.trainee_player_id,
             time_remaining_s=time_remaining,
             attack_defence_smoothed=self._ema.smoothed,

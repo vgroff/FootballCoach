@@ -140,7 +140,7 @@ Not affected: `retr`, `appr_sq` retreat side, `poss`, `hdg`, `out`, `ill`, `box`
 
 | File | Why it matters |
 |------|----------------|
-| `src/footballcoach/ai/obs/schema.py` | Feature vector dataclasses; defines `PLAYER_FEATURE_DIM=32`, `BALL_FEATURE_DIM=11`, `GLOBAL_FEATURE_DIM=31` (11 match-context fields + 20 `task_id_N` one-hot fields, see "Task-id" note in `ai/knowledge.md`) |
+| `src/footballcoach/ai/obs/schema.py` | Feature vector dataclasses; defines `PLAYER_FEATURE_DIM=39`, `BALL_FEATURE_DIM=12`, `GLOBAL_FEATURE_DIM=31` (11 match-context fields + 20 `task_id_N` one-hot fields, see "Task-id" note in `ai/knowledge.md`) |
 | `src/footballcoach/ai/obs/encoder.py` | `encode_observation(match, player_id, time_remaining_s, ...)` → `ObservationBatch` |
 | `src/footballcoach/ai/models/decision_network.py` | `DecisionNetwork.from_config()` |
 | `src/footballcoach/ai/models/execution_network.py` | `ExecutionNetwork.from_config()` |
@@ -277,18 +277,26 @@ block to show which heads changed most since the rollout was collected.
 ### 3.4 Observation encoding
 
 `encode_observation(match, player_id, time_remaining_s, ...)`:
-- Builds `PlayerFeatures` (28 floats) for self (rel_dx=0, is_self=1) and up to 21 others.
+- Builds `PlayerFeatures` (39 floats) for self (rel_dx=0, is_self=1) and up to 21 others.
 - **Randomly shuffles** real players into random slots each call (permutation
   invariance — do not "fix" this).
 - Pads unused slots to zero; `exists=0.0` distinguishes empty from real.
-- Normalises positions by pitch half-dims, velocities by per-player top speed,
-  time by `log1p(t) / log1p(7200)`.
+- Normalises positions AND velocities by a FIXED reference pitch
+  half-diagonal (105m×68m standard, NOT the live match's own pitch
+  dimensions, NOT per-player top speed — see `ai/knowledge.md`'s position
+  normalization note), time by `log1p(t) / log1p(7200)`.
 - Returns `ObservationBatch` with `.to_torch_dict()` → `{self_feat, other_feat,
   ball_feat, global_feat, exists_mask}`.
 
 **`PlayerFeatures` layout (27 floats)** — last two fields are new absolute position:
-- `pos_x = player.position.x / 52.5` — world-frame x, ≈[-1,1] on standard pitch
-- `pos_y = player.position.y / 34.0` — world-frame y, ≈[-1,1] on standard pitch
+- `pos_x = player.position.x / half_diag` — world-frame x, ≈[-1,1] on standard pitch
+- `pos_y = player.position.y / half_diag` — world-frame y, ≈[-1,1] on standard pitch
+- Both use the pitch half-diagonal (`sqrt(52.5²+34.0²)`), the SAME divisor as ball
+  position and all velocity fields — NOT separate per-axis 52.5/34.0 divisors. This
+  used to be documented wrong in schema.py's own docstrings too (now fixed); trusting
+  the wrong per-axis claim in a standalone diagnostic script once cost a real
+  debugging session (positions looked well within bounds when actually near the
+  boundary) — see `ai/knowledge.md`.
 - `pos_x` is negated for `Team.RIGHT` observers by the permanent canonical-AI-frame
   wrapper (`ai/obs/canonical.py`), NOT `obs/augment.py`'s random augmenter.
   `pos_y` is still negated by `obs/augment.py`'s random `flip_y` augmentation.
@@ -301,6 +309,29 @@ pitch and a fraction on smaller training pitches. Fields renamed from `*_m` to `
 **⚠ Schema break**: `PLAYER_FEATURE_DIM` changed from 26 → 28. All existing
 `.pt` checkpoints and `.npz` demonstration files are **incompatible** and must
 be regenerated before training.
+
+**⚠ Schema break (later)**: `PLAYER_FEATURE_DIM` changed 32 → 39. Added, for
+every player slot (self and others), appended after `pos_y` so
+`ai/physics_pretrain/live_encoder_features.py`'s hardcoded `PF_*` field
+offsets stay valid: `heading_sin`/`heading_cos` (populated unconditionally,
+including at standstill/immobile — a static facing direction is real signal,
+unlike velocity — see `ai/knowledge.md`), and `desired_dir_x`/`desired_dir_y`
++ a `desired_speed_standstill`/`_jog`/`_sprint` one-hot (the previous
+decision's movement intent, still in effect until the next decision tick;
+sourced from `player.desired_direction`/`player.last_desired_speed_mode` —
+**not** `player.desired_speed_mode`, which `match._apply_movement()`
+unconditionally clears to `None` every tick after consuming it). Again,
+existing `.pt`/`.npz` files are incompatible and must be regenerated.
+
+**⚠ Schema break (later still)**: `BALL_FEATURE_DIM` changed 11 → 12. Added
+`last_touch_team_direction` (appended after `is_loose`, the previous last
+field, so nothing shifts): `+1.0`/`-1.0` for whichever team most recently
+*gained* possession (`Ball.last_touched_by_player_id`, persists through
+loose-ball periods), `0.0` until the first possession gain of the episode.
+Lets the network see who's responsible for an eventual out-of-bounds/goal
+outcome directly, rather than only via reward-shaping after the fact — see
+`ai/knowledge.md`'s "Frozen physics-dynamics encoders" section's neighbours
+for the full rationale. Again, existing `.pt`/`.npz` files are incompatible.
 
 ### 3.5 Model saving
 
@@ -703,21 +734,22 @@ combined loss.
   both prediction and label before computing the loss), `sprint` (BCE from logit),
   `kick_this_tick`/`tackle_attempt` (BCE from logit), and `kick_direction`
   (cosine loss, gated on `kick_this_tick==1`), `kick_power` (MSE), `kick_spin`
-  (MSE, normalized by `ball_spin_norm_max_rad_s`) — all captured automatically
+  (MSE, normalized by `ball_spin_nn_norm_rad_s`) — all captured automatically
   at the `Player.kick_direct()` chokepoint via `last_kick_direction`/
   `last_kick_power_fraction`/`last_kick_spin`, so this works for any AI that
   kicks, not just Phase1RulesAI. See `agent_plans/bc_kick_supervision_plan.md`.
 
 ### `kick_armed`: pre-kick aiming, not just the physical kick tick
 
-Rules AI can *arm* a push-kick — `rules_ai.py::_arm_box_kick()` sets
-`Player.kick_armed`/`kick_armed_aim_point`/`kick_armed_power_fraction`/
-`kick_armed_spin` one or more ticks before the physical kick actually fires
-(once the player is close enough to reach the ball within one decision
-interval). `phase1_labels()` treats `kick_this_tick` as `1.0` on **both**
-the physically-executed kick tick (`player.kicked_this_tick`) and any armed
-approach tick (`player.kick_armed`) — and on armed-only ticks, derives
-`kick_direction`/`kick_power` from `kick_armed_aim_point`/
+Rules AI can *arm* a push-kick — `orders.py::_try_push_kick()` (shared by
+`MoveOrder` and `GetPossessionOrder`) sets `Player.kick_armed`/
+`kick_armed_direction`/`kick_armed_power_fraction`/`kick_armed_spin` one or
+more ticks before the physical kick actually fires (once the player is
+close enough to reach the ball within one decision interval). `phase1_labels()`
+treats `kick_this_tick` as `1.0` on **both** the physically-executed kick
+tick (`player.kicked_this_tick`) and any armed approach tick
+(`player.kick_armed`) — and on armed-only ticks, derives
+`kick_direction`/`kick_power` from `kick_armed_direction`/
 `kick_armed_power_fraction` rather than leaving them unsupervised. This is
 deliberate and already correct: players need to be aiming/powering right
 during the run-up, not just at the moment of contact.

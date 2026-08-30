@@ -216,8 +216,7 @@ def build_penalty_scenario(rng_reduction: float = 0.3) -> Match:
     kicker = Player.create("kicker", Team.LEFT, attrs, position=penalty_spot)
 
     ball = Ball.at_rest(penalty_spot)
-    ball.possessed_by = kicker.player_id
-
+    ball.set_initial_possession(kicker.player_id)
     match = Match(pitch=pitch, players=[kicker], ball=ball, rng_reduction=rng_reduction, rng=random.Random())
 
     corner_offset_y = pitch.goal_width_m / 2.0 - 0.475
@@ -264,8 +263,7 @@ def build_tackle_scenario(
         0.0,
     )
     ball = Ball.at_rest(attacker_pos)
-    ball.possessed_by = attacker.player_id
-
+    ball.set_initial_possession(attacker.player_id)
     ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[defender, attacker], ball=ball,
@@ -437,8 +435,7 @@ def build_close_range_save_scenario(
     shooter.heading_rad = math.atan2(aim_dir.y, aim_dir.x)
 
     ball = Ball.at_rest(shooter_pos)
-    ball.possessed_by = shooter.player_id
-
+    ball.set_initial_possession(shooter.player_id)
     ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[gk, shooter], ball=ball,
@@ -526,8 +523,7 @@ def build_pass_scenario(
     passer.heading_rad = math.atan2(pass_dir.y, pass_dir.x)
 
     ball = Ball.at_rest(passer_pos)
-    ball.possessed_by = passer.player_id
-
+    ball.set_initial_possession(passer.player_id)
     ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[passer, receiver], ball=ball,
@@ -652,8 +648,7 @@ def build_2v2_scenario(
                        position=pitch.right_goal_centre, is_goalkeeper=True)
 
     ball = Ball.at_rest(attacker_a.position)
-    ball.possessed_by = attacker_a.player_id
-
+    ball.set_initial_possession(attacker_a.player_id)
     ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[attacker_a, attacker_b, defender, gk],
@@ -753,8 +748,7 @@ def build_1v2_scenario(
     gk = Player.create("keeper", Team.RIGHT, PlayerAttributes.average(gk_skill), position=gk_start, is_goalkeeper=True)
 
     ball = Ball.at_rest(attacker_start)
-    ball.possessed_by = attacker.player_id
-
+    ball.set_initial_possession(attacker.player_id)
     move_frac = rng.uniform(move_fraction_min, move_fraction_max)
     move_target_raw = attacker_start + (goal_centre - attacker_start) * move_frac
     move_target = Vector3(
@@ -858,8 +852,7 @@ def build_repulsion_obstacle_scenario(
         position=start,
     )
     ball = Ball.at_rest(start)
-    ball.possessed_by = attacker.player_id
-
+    ball.set_initial_possession(attacker.player_id)
     ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[attacker, obstacle], ball=ball,
@@ -1502,8 +1495,7 @@ def build_mark_standoff_scenario(
     )
 
     ball = Ball.at_rest(carrier_pos)
-    ball.possessed_by = carrier.player_id
-
+    ball.set_initial_possession(carrier.player_id)
     ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[carrier, target, marker], ball=ball,
@@ -1548,8 +1540,7 @@ def build_penalty_corner_accuracy_scenario(
     kicker.heading_rad = 0.0  # facing +x toward right goal
 
     ball = Ball.at_rest(penalty_spot)
-    ball.possessed_by = kicker.player_id
-
+    ball.set_initial_possession(kicker.player_id)
     ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
         pitch=pitch, players=[kicker], ball=ball,
@@ -1613,8 +1604,7 @@ def build_gk_far_post_scenario(
     shooter.heading_rad = math.pi  # facing -x toward left goal
 
     ball = Ball.at_rest(shooter.position)
-    ball.possessed_by = shooter.player_id
-
+    ball.set_initial_possession(shooter.player_id)
     aim_point = pitch.left_goal_centre + Vector3(0, half_goal_w - 0.3, 1.8)
 
     ui_cfg = load_gameplay_config().get("ui", {})
@@ -1877,20 +1867,19 @@ class ScenarioLoop:
     _initial_carrier_id: str | None = field(default=None, init=False, repr=False)
     _initial_scoreboard: tuple[int, int] = field(default=(0, 0), init=False, repr=False)
     _ball_released: bool = field(default=False, init=False, repr=False)
-    _last_ball_toucher_id: str | None = field(default=None, init=False, repr=False)
-    # Snapshot of _last_ball_toucher_id from the trial that just ENDED,
-    # taken by _start_trial() immediately before it resets the live field
-    # above for the new trial. _last_ball_toucher_id itself is wiped by
-    # _start_trial() before step() returns True for the completed trial, so
-    # a caller (ScenarioEnv) that only looks at step()'s return value would
-    # otherwise always see None -- this is the single source of truth for
-    # "who last touched the ball in the trial that just ended". See
-    # last_completed_trial_toucher_id property below; ScenarioEnv used to
-    # maintain its OWN separate (and separately-buggy: checked pre-tick
-    # instead of post-tick) copy of this exact tracking logic specifically
-    # to work around that reset-before-return timing -- this field replaces
-    # that duplicate entirely.
-    _last_completed_trial_toucher_id: str | None = field(default=None, init=False, repr=False)
+    # The Match object exactly as it stood on the trial's FINAL tick --
+    # captured (a cheap reference save, not a copy) immediately before
+    # _start_trial() reassigns self._match to a brand-new Match for the next
+    # trial -- step() returns True only after the rebuild has already
+    # happened, so self._match itself is unusable for reading the trial
+    # that just ended; this is the one place that state survives.
+    # last_completed_trial_toucher_id (property, below) derives from this
+    # rather than keeping its own separate snapshot, for the same reason.
+    # See last_completed_trial_match property below; record_demonstrations.py
+    # uses this to record the TRUE final observation (the real recorded
+    # physics tick the episode actually ended on), instead of the episode's
+    # last recorded row always being the tick BEFORE termination.
+    _last_completed_trial_match: Match | None = field(default=None, init=False, repr=False)
     outcomes: dict[str, int] = field(
         default_factory=dict,
         init=False, repr=False,
@@ -1918,38 +1907,43 @@ class ScenarioLoop:
             self._match.scoreboard.right_goals,
         )
         self._ball_released = False
-        # Stash the just-ended trial's toucher BEFORE resetting the live
-        # field for the new trial -- see _last_completed_trial_toucher_id's
-        # field comment. On the very first call (from __post_init__, no
-        # trial has completed yet) this just stashes None, which is correct.
-        self._last_completed_trial_toucher_id = self._last_ball_toucher_id
-        self._last_ball_toucher_id = None
         self._pending_outcome = None
         self._linger_remaining_s = 0.0
 
     def _apply_remap(self, outcome: str) -> str:
         if self.definition.outcome_remap is not None:
-            return self.definition.outcome_remap(self._match, outcome, self._last_ball_toucher_id)
+            return self.definition.outcome_remap(
+                self._match, outcome, self._match.ball.last_touched_by_player_id,
+            )
         return outcome
-
-    def _track_ball_toucher(self) -> None:
-        ball = self._match.ball
-        if ball.possessed_by is not None:
-            self._last_ball_toucher_id = ball.possessed_by
-        for _p in self._match.players:
-            if getattr(_p, "kicked_this_tick", False):
-                self._last_ball_toucher_id = _p.player_id
 
     @property
     def last_completed_trial_toucher_id(self) -> str | None:
-        """Who last touched the ball in the trial that just ended (correctly
-        ordered: updated after every match.step(), including the final tick
-        -- see _track_ball_toucher()). Valid to read any time after step()
-        returns True for that trial, up until the NEXT trial itself ends
-        (each _start_trial() call re-stashes it). The single source of
-        truth for this -- see ScenarioEnv, which used to duplicate this
-        tracking logic with its own (buggy) copy."""
-        return self._last_completed_trial_toucher_id
+        """Who last touched the ball in the trial that just ended -- derived
+        from last_completed_trial_match's own ball (Ball.
+        last_touched_by_player_id, the single authoritative write-path for
+        this fact -- see that field's own docstring; Match._set_possession()
+        keeps it current every tick of live play, so nothing here needs its
+        own separate tracking/snapshot logic beyond reusing
+        last_completed_trial_match, which already has to exist for other
+        reasons). Valid to read any time after step() returns True for that
+        trial, up until the NEXT trial itself ends -- same lifetime as
+        last_completed_trial_match itself. None before any trial has
+        completed."""
+        return (
+            self._last_completed_trial_match.ball.last_touched_by_player_id
+            if self._last_completed_trial_match is not None else None
+        )
+
+    @property
+    def last_completed_trial_match(self) -> Match | None:
+        """The Match exactly as it stood on the trial's TRUE final tick --
+        valid to read any time after step() returns True for that trial, up
+        until the NEXT trial itself ends. See _last_completed_trial_match's
+        own field comment for why this is the only way to observe that
+        state at all (self.match/self._match is already the NEXT trial's
+        fresh state by the time step() returns True)."""
+        return self._last_completed_trial_match
 
     @property
     def match(self) -> Match:
@@ -1975,11 +1969,11 @@ class ScenarioLoop:
                 self.definition.on_tick(self._match, self._trial_tick)
             self._match.step()
             self._trial_tick += 1
-            self._track_ball_toucher()
             self._linger_remaining_s -= self._match.dt_s
             if self._linger_remaining_s <= 0.0:
                 self.outcomes[self._pending_outcome] = self.outcomes.get(self._pending_outcome, 0) + 1
                 self._trial_count += 1
+                self._last_completed_trial_match = self._match
                 if not self.complete:
                     self._start_trial()
                 return True
@@ -1989,7 +1983,6 @@ class ScenarioLoop:
             self.definition.on_tick(self._match, self._trial_tick)
         self._match.step()
         self._trial_tick += 1
-        self._track_ball_toucher()
         # Call on_tick again after the step so that controllers can reissue
         # orders in the same tick they were cleared by match.step(). Without
         # this, a MoveOrder completing inside match.step() leaves
@@ -2016,6 +2009,7 @@ class ScenarioLoop:
                 return False
             self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
             self._trial_count += 1
+            self._last_completed_trial_match = self._match
             if not self.complete:
                 self._start_trial()
             return True

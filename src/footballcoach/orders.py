@@ -182,7 +182,7 @@ def _compute_movement_intent(
     if use_repulsion and target_direction.length_xy() > 1e-9:
         adj_dir, speed_mult = compute_repulsion(
             player, target_direction, match.players,
-            match.ball.possessed_by, match.repulsion_params,
+            match.ball.possessed_by, match.repulsion_params, match.pitch,
         )
         if speed_mode is SpeedMode.SPRINT and speed_mult < 0.75:
             speed_mode = SpeedMode.JOG
@@ -284,6 +284,163 @@ def _push_kick_params() -> dict:
     return require_section(load_orders_config(), "push_kick", "orders.json")
 
 
+def _push_kick_power_fraction(player: "Player", match: "Match", speed_factor: float) -> float:
+    """Shared push-kick power calc, used both for an immediate kick (ball
+    already in hand) and an ARMED kick (computed ahead of time for whenever
+    contact happens) -- must stay identical between the two so an armed kick
+    behaves exactly like a normal push-kick would have.
+
+    Reference speed is the average of the player's CURRENT speed
+    (player.speed_mps) and their theoretical max sprint speed (already
+    stamina-adjusted). Using max speed alone overstates how fast the player
+    will actually be moving by the time they reach the ball, especially
+    early in an approach.
+    """
+    from footballcoach.engine.kicking import max_kick_speed_mps
+    from footballcoach.engine.movement import effective_top_speed
+
+    max_sprint_speed = effective_top_speed(
+        match.movement_params, player.attributes.top_speed, player.stamina,
+        has_ball=False,
+    )
+    reference_speed = (player.speed_mps + max_sprint_speed) / 2.0
+    max_kick = max_kick_speed_mps(match.kicking_params, player.attributes.kick_power)
+    return min(1.0, reference_speed * speed_factor / max(max_kick, 0.1))
+
+
+def _push_kick_is_clear(
+    player: "Player",
+    match: "Match",
+    landing_point: "Vector3",
+    dist_m: float,
+    clearance_margin: float,
+) -> bool:
+    """Return True if no opponent would beat the carrier to landing_point.
+
+    landing_point/dist_m are an ESTIMATE, not an exact prediction -- push-
+    kicks are flat, direction-only kicks (see _try_push_kick), so there's no
+    config-specified travel distance to check against any more. The order's
+    real target_position (what the caller passes in) is the most reasonable
+    proxy for "how far this kick might carry the ball" available without
+    modelling ground-friction deceleration explicitly.
+    """
+    from footballcoach.engine.movement import (
+        effective_acceleration, effective_top_speed, sprint_eta,
+    )
+    from footballcoach.entities.player import PlayerState
+
+    self_v_top = max(
+        effective_top_speed(
+            match.movement_params, player.attributes.top_speed,
+            player.stamina, has_ball=False,
+        ),
+        0.1,
+    )
+    self_accel = effective_acceleration(
+        match.movement_params, player.attributes.acceleration, player.stamina,
+    )
+    self_eta = sprint_eta(dist_m, player.speed_mps, self_v_top, self_accel)
+
+    for other in match.players:
+        if other.player_id == player.player_id:
+            continue
+        if other.team == player.team:
+            continue  # only opponents can steal the ball
+        if other.state == PlayerState.INACTIVE_TACKLED:
+            continue
+        dist_other = (landing_point - other.position).length_xy()
+        if dist_other > dist_m + 10.0:  # rough radius pre-filter
+            continue
+        their_v_top = max(
+            effective_top_speed(
+                match.movement_params, other.attributes.top_speed,
+                other.stamina, has_ball=False,
+            ),
+            0.1,
+        )
+        their_accel = effective_acceleration(
+            match.movement_params, other.attributes.acceleration, other.stamina,
+        )
+        # Opponents start from standstill (v0=0) — conservative: assumes they
+        # react instantly and run the optimal line toward the landing spot.
+        their_eta = sprint_eta(dist_other, 0.0, their_v_top, their_accel)
+        if their_eta < self_eta * clearance_margin:
+            return False  # opponent beats us there — don't kick
+    return True
+
+
+def _try_push_kick(
+    player: "Player",
+    match: "Match",
+    target_position: "Vector3",
+    push_kick_min_dist_m: float | None,
+) -> tuple["Vector3", float] | None:
+    """Check whether a push-kick toward target_position should fire right
+    now -- shared by MoveOrder (ball already in hand, or chasing our own
+    just-kicked loose ball) and GetPossessionOrder (chasing a loose ball
+    we've never had, arming a first-touch redirect). Returns (direction_3d,
+    power_fraction) if every gate passes (far enough from target_position,
+    heading roughly toward it, no opponent would get there first), else
+    None.
+
+    power_fraction is returned ALREADY run-compensated (see
+    compensate_power_for_run_mult) using the player's CURRENT velocity --
+    callers must fire it via kick_with_direction(..., compensate_for_run=
+    False) (the default), NOT re-compensate a second time. This is
+    deliberate: for the has-ball/immediate-fire caller, arm time and fire
+    time are the same instant, so this is exact. For the armed-for-later
+    caller (GetPossessionOrder, or MoveOrder chasing its own just-kicked
+    ball), fire happens whenever the ball is actually reachable -- usually
+    the very same tick or the next one, so using arm-time velocity as the
+    compensation estimate is a good approximation, not a stale one.
+    Compensating fresh at fire time INSTEAD of at arm time (an earlier
+    version of this did that) makes the recorded "armed intent" and the
+    eventual "actual kick" carry two DIFFERENT power values for the exact
+    same touch -- a real discontinuity for BC/replay consumers (bc.py's
+    phase1_labels() reads kick_armed_power_fraction on approach ticks and
+    last_kick_power_fraction on the fire tick; those must already agree,
+    not just converge once the kick fires). Baking compensation in here,
+    once, at the point the decision is made, removes that cliff entirely.
+
+    Flat kick only -- no ballistic aim point / travel-distance parameter
+    (see orders.json's push_kick section, and Player.kick_with_direction):
+    direction alone plus speed_factor fully determines the kick; how far it
+    actually rolls is real ground physics, not a config number. The
+    min_dist_m gate is what stops repeated push-kicks from overshooting
+    target_position as the player closes in -- there's no separate cap on
+    the kick's own travel distance.
+    """
+    from footballcoach.engine.movement import angle_diff, effective_top_speed
+    from footballcoach.engine.kicking import running_power_multiplier, compensate_power_for_run_mult
+
+    direction = target_position - player.position
+    dist = direction.length_xy()
+    if dist < 1e-6:
+        return None
+    pk = _push_kick_params()
+    pk_min = push_kick_min_dist_m if push_kick_min_dist_m is not None else pk["min_dist_m"]
+    if dist < pk_min:
+        return None
+    push_dir = direction.xy().normalized()
+    kick_heading = push_dir.angle_xy()
+    max_heading_err = math.radians(pk["max_heading_error_deg"])
+    if abs(angle_diff(player.heading_rad, kick_heading)) > max_heading_err:
+        return None
+    if not _push_kick_is_clear(player, match, target_position, dist, pk["clearance_margin"]):
+        return None
+    direction_3d = Vector3(push_dir.x, push_dir.y, 0.0)
+    power_fraction = _push_kick_power_fraction(player, match, pk["speed_factor"])
+    top_speed = effective_top_speed(
+        match.movement_params, player.attributes.top_speed, player.stamina,
+        has_ball=True, ball_control_attr=player.attributes.ball_control,
+    )
+    run_mult = running_power_multiplier(
+        match.kicking_params.running_power_coefficient, player.velocity, direction_3d, top_speed,
+    )
+    adjusted_power = compensate_power_for_run_mult(power_fraction, run_mult)
+    return direction_3d, adjusted_power
+
+
 @dataclass
 class MoveOrder:
     target_position: Vector3
@@ -306,14 +463,16 @@ class MoveOrder:
     _overshoot_timer_s: float | None = None
     status: OrderStatus = OrderStatus.PENDING
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
-    # Push-kick: if True and the player has the ball, kick it ahead and sprint
+    # Push-kick: if True and the player has the ball, kick it flat (no
+    # ballistic loft -- see _try_push_kick) toward target_position and sprint
     # to it rather than dribbling. Only activates when the remaining distance
-    # to target is >= push_kick_min_dist_m (don't kick near the destination).
-    # A clearance check prevents kicking if any opponent would reach the
-    # ball before the carrier (within the clearance_margin ETA window).
-    # Defaults loaded from orders.json["push_kick"] at first use.
+    # to target is >= push_kick_min_dist_m (don't kick near the destination --
+    # this is also what stops repeated touches overshooting target_position,
+    # since there's no separate travel-distance cap on the kick itself).
+    # A clearance check prevents kicking if any opponent would reach
+    # target_position before the carrier (within the clearance_margin ETA
+    # window). Defaults loaded from orders.json["push_kick"] at first use.
     push_kick_enabled: bool = False
-    push_kick_dist_m: float | None = None       # None → from config
     push_kick_min_dist_m: float | None = None   # None → from config
 
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
@@ -326,36 +485,65 @@ class MoveOrder:
         dist = direction.length_xy()
 
         # Push-kick: when the player has the ball and is far enough from the
-        # destination, kick ahead and sprint free rather than dribbling.
+        # destination, kick ahead (flat, no ballistic loft -- see
+        # _try_push_kick / Player.kick_with_direction) and sprint free
+        # rather than dribbling.
         if has_ball and self.push_kick_enabled and direction.length_xy() > 1e-6:
-            import math as _math
-            from footballcoach.engine.movement import angle_diff as _angle_diff
-            pk = _push_kick_params()
-            pk_dist = self.push_kick_dist_m if self.push_kick_dist_m is not None else pk["dist_m"]
-            pk_min = self.push_kick_min_dist_m if self.push_kick_min_dist_m is not None else pk["min_dist_m"]
-            if dist >= pk_min:
-                push_dir = direction.xy().normalized()
-                kick_heading = push_dir.angle_xy()
-                max_heading_err = _math.radians(pk["max_heading_error_deg"])
-                heading_ok = abs(_angle_diff(player.heading_rad, kick_heading)) <= max_heading_err
-                if heading_ok:
-                    dist_jitter = match.rng.uniform(0.85, 1.15)
-                    speed_jitter = match.rng.uniform(0.85, 1.15)
-                    kick_dist = min(pk_dist * dist_jitter, dist - self.arrival_tolerance_m)
-                    push_target = player.position + Vector3(
-                        push_dir.x * kick_dist, push_dir.y * kick_dist, 0.0
-                    )
-                    if self._push_kick_is_clear(player, match, push_target, kick_dist, pk["clearance_margin"]):
-                        self._do_push_kick(player, match, push_target, pk["speed_factor"] * speed_jitter)
-                        # Immediately set movement intent: sprint free (no ball this tick).
-                        adj_dir, speed_mode = _compute_movement_intent(
-                            player, direction, match,
-                            sprint=True, arrival_dist=dist, arrival_speed=None,
-                            use_repulsion=True, use_brake_to_turn=True,
-                        )
-                        player.desired_direction = adj_dir
-                        player.desired_speed_mode = speed_mode
-                        return False
+            result = _try_push_kick(player, match, self.target_position, self.push_kick_min_dist_m)
+            if result is not None:
+                direction_3d, power_fraction = result
+                # Deterministic -- no rng draw here (used to jitter
+                # dist/speed by up to +/-15% via match.rng.uniform, an
+                # order-layer draw the NN-replay shadow never reproduces; a
+                # real source of replay divergence whenever it landed on the
+                # same tick as another rng-consuming physics event like a
+                # tackle roll -- see test_rules_ai_nn_replay_equivalence.py's
+                # rng_state_before_kick_noise docstring for the general
+                # problem class).
+                # power_fraction is already run-compensated by _try_push_kick
+                # -- compensate_for_run=False (the default) here, or this
+                # would compensate a second time.
+                player.kick_with_direction(match, direction_3d, power_fraction, Vector3.zero())
+                match._log_debug(
+                    f"{player.player_id} push-kick dir=({direction_3d.x:.2f},{direction_3d.y:.2f})"
+                    f" power={power_fraction:.2f}"
+                )
+                # Immediately set movement intent: sprint free (no ball this tick).
+                adj_dir, speed_mode = _compute_movement_intent(
+                    player, direction, match,
+                    sprint=True, arrival_dist=dist, arrival_speed=None,
+                    use_repulsion=True, use_brake_to_turn=True,
+                )
+                player.desired_direction = adj_dir
+                player.desired_speed_mode = speed_mode
+                return False
+
+        # Arm the NEXT touch while chasing our own just-kicked (now loose)
+        # ball, so re-catching it redirects immediately via
+        # Match._update_loose_ball_pickup's kick_armed branch -- true
+        # one-touch, no CONTROLLING_BALL delay, no control_speed_multiplier
+        # slowdown. Without this, arming was rules-AI-only (rules_ai.py's
+        # since-removed _arm_box_kick) and a bare MoveOrder(push_kick_enabled
+        # =True) -- no AI wrapper at all -- fell through to the slow
+        # control-then-kick pickup on every touch after the first, silently
+        # losing most of push-kick's speed advantage (confirmed:
+        # test_push_kick_faster_over_40m regressed to SLOWER than plain
+        # dribbling once the first touch stopped being artificially fast).
+        # Shares _try_push_kick's gating with the has_ball branch above so an
+        # armed touch produces exactly the kick a normal push-kick would
+        # have taken here.
+        if not has_ball and self.push_kick_enabled and direction.length_xy() > 1e-6:
+            result = _try_push_kick(player, match, self.target_position, self.push_kick_min_dist_m)
+            if result is not None:
+                direction_3d, power_fraction = result
+                player.kick_armed = True
+                player.kick_armed_direction = direction_3d
+                # Already run-compensated by _try_push_kick (using arm-time
+                # velocity) -- fired later via kick_with_direction's default
+                # compensate_for_run=False, so this value is used as-is, not
+                # compensated a second time.
+                player.kick_armed_power_fraction = power_fraction
+                player.kick_armed_spin = Vector3.zero()
 
         if dist <= self.arrival_tolerance_m:
             self.reached_target = True
@@ -411,87 +599,6 @@ class MoveOrder:
             player.desired_direction = adj_dir
             player.desired_speed_mode = speed_mode
         return False
-
-    def _push_kick_is_clear(
-        self,
-        player: "Player",
-        match: "Match",
-        push_target: "Vector3",
-        kick_dist_m: float,
-        clearance_margin: float,
-    ) -> bool:
-        """Return True if no opponent would beat the carrier to push_target."""
-        from footballcoach.engine.movement import (
-            effective_acceleration, effective_top_speed, sprint_eta,
-        )
-        from footballcoach.entities.player import PlayerState
-
-        self_v_top = max(
-            effective_top_speed(
-                match.movement_params, player.attributes.top_speed,
-                player.stamina, has_ball=False,
-            ),
-            0.1,
-        )
-        self_accel = effective_acceleration(
-            match.movement_params, player.attributes.acceleration, player.stamina,
-        )
-        self_eta = sprint_eta(kick_dist_m, player.speed_mps, self_v_top, self_accel)
-
-        for other in match.players:
-            if other.player_id == player.player_id:
-                continue
-            if other.team == player.team:
-                continue  # only opponents can steal the ball
-            if other.state == PlayerState.INACTIVE_TACKLED:
-                continue
-            dist_other = (push_target - other.position).length_xy()
-            if dist_other > kick_dist_m + 10.0:  # rough radius pre-filter
-                continue
-            their_v_top = max(
-                effective_top_speed(
-                    match.movement_params, other.attributes.top_speed,
-                    other.stamina, has_ball=False,
-                ),
-                0.1,
-            )
-            their_accel = effective_acceleration(
-                match.movement_params, other.attributes.acceleration, other.stamina,
-            )
-            # Opponents start from standstill (v0=0) — conservative: assumes they
-            # react instantly and run the optimal line toward the landing spot.
-            their_eta = sprint_eta(dist_other, 0.0, their_v_top, their_accel)
-            if their_eta < self_eta * clearance_margin:
-                return False  # opponent beats us there — don't kick
-        return True
-
-    def _do_push_kick(
-        self, player: "Player", match: "Match", push_target: "Vector3", speed_factor: float
-    ) -> None:
-        """Kick the ball toward push_target at speed_factor × the player's free-sprint speed.
-
-        Kicking faster than the player's own sprint speed ensures the ball
-        stays ahead of the runner (a slower kick is overtaken immediately,
-        which defeats the purpose of the push-kick).
-        `compensate_for_run=True` is used so the ball leaves at the intended
-        speed regardless of the kicker's current running direction.
-        """
-        from footballcoach.engine.kicking import max_kick_speed_mps
-        from footballcoach.engine.movement import effective_top_speed
-
-        sprint_speed = effective_top_speed(
-            match.movement_params, player.attributes.top_speed, player.stamina,
-            has_ball=False,
-        )
-        max_kick = max_kick_speed_mps(match.kicking_params, player.attributes.kick_power)
-        power_fraction = min(1.0, sprint_speed * speed_factor / max(max_kick, 0.1))
-
-        # kick_direct handles release-grace internally.
-        player.kick_direct(match, push_target, power_fraction, Vector3.zero(), compensate_for_run=True)
-        match._log_debug(
-            f"{player.player_id} push-kick to ({push_target.x:.1f},{push_target.y:.1f})"
-            f" power={power_fraction:.2f} speed_factor={speed_factor:.2f}"
-        )
 
 
 @dataclass
@@ -747,8 +854,21 @@ class GetPossessionOrder:
       attempts one tackle on contact (exactly like ChaseTackleOrder),
       then completes regardless of the tackle outcome.
     - Completes immediately if this player already possesses the ball.
+
+    Optional push-kick: if push_kick_enabled and target_position are both
+    set, and the ball is currently loose (never carried), a first-touch
+    redirect kick toward target_position is armed once close enough --
+    shares _try_push_kick's gating with MoveOrder, so the caller supplies
+    the SAME target it would use for a MoveOrder box-run and gets identical
+    kick behaviour whether the ball is already in hand or not. Skips
+    CONTROLLING_BALL entirely on pickup (see Match._update_loose_ball_pickup's
+    kick_armed branch) -- a true one-touch, no control-time delay, no
+    control_speed_multiplier slowdown.
     """
     sprint: bool = True  # True = sprint to ball, False = jog
+    target_position: Vector3 | None = None
+    push_kick_enabled: bool = False
+    push_kick_min_dist_m: float | None = None   # None → from config
     status: OrderStatus = OrderStatus.PENDING
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
     _possession_gained: bool = field(default=False, init=False, repr=False, compare=False)
@@ -763,7 +883,33 @@ class GetPossessionOrder:
             _order = self  # capture for closure
 
             def _on_possession(p: "Player") -> None:
-                _order._possession_gained = True
+                # An armed-kick pickup fires this callback from INSIDE
+                # Match._update_loose_ball_pickup's kick_armed branch, which
+                # calls _set_possession() (triggering this) and THEN
+                # immediately releases the ball again via kick_with_direction
+                # -- p.kick_armed is still True at this exact point (it's
+                # only reset at the TOP of the FOLLOWING tick's
+                # _process_orders, not right after use), so it reliably
+                # distinguishes "this is a fleeting touch about to be
+                # redirected" from "the player actually stopped to hold the
+                # ball". Only the latter should complete this order.
+                #
+                # Without this check: this order self-completes the tick
+                # after ANY momentary possession, including an armed
+                # redirect. Phase1RulesAI.act() only reissues a fresh
+                # GetPossessionOrder once it observes current_order is None
+                # -- one tick AFTER this order already completed -- so on
+                # that gap tick nothing re-arms the kick even though the
+                # ball's still loose (often still right at the player's
+                # feet if push_kick's speed_factor keeps it close). If the
+                # ball happens to still be in pickup range that gap tick,
+                # it falls through to a normal (slow, CONTROLLING_BALL)
+                # pickup instead -- defeating the entire point of arming a
+                # kick. Confirmed via direct trace: at speed_factor close to
+                # 1.0 (ball barely outruns the player) this fires on
+                # essentially every repossession attempt.
+                if not p.kick_armed:
+                    _order._possession_gained = True
 
             player.on_possession_gained = _on_possession
             self._callback_registered = True
@@ -777,6 +923,23 @@ class GetPossessionOrder:
             player.desired_direction = adj_dir
             player.desired_speed_mode = speed_mode
             return True
+
+        # Arm a first-touch redirect toward target_position -- only while the
+        # ball is loose (never carried by anyone). Chasing a carrier to
+        # tackle them is a different behaviour entirely (see
+        # _run_get_possession_behaviour below) and shouldn't arm a kick.
+        if self.push_kick_enabled and self.target_position is not None and match.ball.possessed_by is None:
+            result = _try_push_kick(player, match, self.target_position, self.push_kick_min_dist_m)
+            if result is not None:
+                direction_3d, power_fraction = result
+                player.kick_armed = True
+                player.kick_armed_direction = direction_3d
+                # Already run-compensated by _try_push_kick (using arm-time
+                # velocity) -- fired later via kick_with_direction's default
+                # compensate_for_run=False, so this value is used as-is, not
+                # compensated a second time.
+                player.kick_armed_power_fraction = power_fraction
+                player.kick_armed_spin = Vector3.zero()
 
         done = match._run_get_possession_behaviour(player, dt)
         if done:

@@ -245,3 +245,161 @@ def test_as_tensors_obs_stacked_correctly():
     assert stacked.shape == (2, 2)
     assert stacked[0, 0].item() == pytest.approx(1.0)
     assert stacked[1, 0].item() == pytest.approx(3.0)
+
+
+# ---------------------------------------------------------------------------
+# Multi-track segmentation (trainee + secondary/opponent rows interleaved)
+#
+# Real PPO rollout collection (ppo_trainer.py's train()/rollout_worker.py's
+# _collect()) appends one trainee row per tick immediately followed by that
+# tick's secondary-player row(s) (only non-empty when the secondary player
+# is neural-controlled, i.e. self-play) -- e.g.
+# [trainee_t0, opponent_t0, trainee_t1, opponent_t1, ...]. A naive flat
+# backward GAE scan over that layout reads the WRONG track's value/reward as
+# "next step" for roughly half the rows (whichever track's row does not sit
+# immediately before the next row of the SAME track). ``track_ids`` +
+# ``_track_index_groups()`` fix this by segmenting the backward recursion
+# per track before scattering results back into the flat output arrays.
+# ---------------------------------------------------------------------------
+
+def _add_track(buf, rewards, values, dones, track_id):
+    import numpy as np
+    dummy_obs = {"x": np.zeros(1, dtype="float32")}
+    dummy_act = {"a": np.zeros(1, dtype="float32")}
+    for r, v, d in zip(rewards, values, dones):
+        buf.add(obs=dummy_obs, action=dummy_act, log_prob=0.0, value=v, reward=r,
+                 done=d, track_id=track_id)
+
+
+class TestGAEMultiTrack:
+    # Same fixture as TestGAEEpisodeBoundary (expected adv = [5.0, 3.0, 1.0]).
+    TRAINEE_R, TRAINEE_V, TRAINEE_D = [1.0, 5.0, 2.0], [1.0, 2.0, 1.0], [0.0, 1.0, 0.0]
+    # Same fixture as TestGAEMonteCarlo-style (V=0 everywhere -> pure MC).
+    OPP_R, OPP_V, OPP_D = [10.0, 20.0, 30.0], [0.0, 0.0, 0.0], [0.0, 0.0, 1.0]
+
+    def _interleaved_buffer(self):
+        buf = RolloutBuffer()
+        for i in range(3):
+            _add_track(buf, [self.TRAINEE_R[i]], [self.TRAINEE_V[i]], [self.TRAINEE_D[i]], "trainee")
+            _add_track(buf, [self.OPP_R[i]], [self.OPP_V[i]], [self.OPP_D[i]], "opponent")
+        return buf
+
+    def test_interleaved_matches_isolated_per_track(self):
+        """The whole point of segmentation: interleaving two tracks in one
+        buffer must give byte-identical results to running GAE on each
+        track alone -- this is exactly what a flat backward scan over the
+        interleaved rows would get wrong."""
+        trainee_only = _make_buffer(self.TRAINEE_R, self.TRAINEE_V, self.TRAINEE_D)
+        expected_trainee_adv, expected_trainee_ret = trainee_only.compute_gae(1.0, 1.0, 0.0)
+        opp_only = _make_buffer(self.OPP_R, self.OPP_V, self.OPP_D)
+        expected_opp_adv, expected_opp_ret = opp_only.compute_gae(1.0, 1.0, 0.0)
+
+        buf = self._interleaved_buffer()
+        adv, ret = buf.compute_gae(1.0, 1.0, {"trainee": 0.0, "opponent": 0.0})
+
+        trainee_idx, opp_idx = [0, 2, 4], [1, 3, 5]
+        for local_i, flat_i in enumerate(trainee_idx):
+            assert adv[flat_i] == pytest.approx(expected_trainee_adv[local_i], abs=1e-6)
+            assert ret[flat_i] == pytest.approx(expected_trainee_ret[local_i], abs=1e-6)
+        for local_i, flat_i in enumerate(opp_idx):
+            assert adv[flat_i] == pytest.approx(expected_opp_adv[local_i], abs=1e-6)
+            assert ret[flat_i] == pytest.approx(expected_opp_ret[local_i], abs=1e-6)
+
+    def test_cross_track_leakage_would_change_result(self):
+        """Sanity check that the fixture actually exercises the bug this
+        segmentation fixes -- i.e. this suite isn't accidentally vacuous.
+        Manually replicate the OLD flat (unsegmented) scan and confirm it
+        disagrees with the correctly-segmented result at the row where
+        contamination would occur (trainee's step 0, whose flat "next" row
+        is the opponent's step 0, not trainee's own step 1)."""
+        buf = self._interleaved_buffer()
+        adv, _ = buf.compute_gae(1.0, 1.0, {"trainee": 0.0, "opponent": 0.0})
+
+        # Old algorithm: single running last_gae, all_values = flat values + [last_value].
+        rewards = buf.rewards
+        values = buf.values
+        dones = buf.dones
+        n = len(rewards)
+        flat_adv = [0.0] * n
+        last_gae = 0.0
+        all_values = values + [0.0]
+        for t in reversed(range(n)):
+            next_value = all_values[t + 1]
+            nnt = 1.0 - dones[t]
+            delta = rewards[t] + 1.0 * next_value * nnt - values[t]
+            last_gae = delta + 1.0 * 1.0 * nnt * last_gae
+            flat_adv[t] = last_gae
+
+        assert flat_adv[0] != pytest.approx(adv[0], abs=1e-6), (
+            "fixture no longer exercises cross-track leakage -- flat and "
+            "segmented results agree, so this test can no longer catch a "
+            "regression back to an unsegmented scan"
+        )
+
+    def test_missing_track_in_last_value_dict_defaults_to_zero(self):
+        buf = RolloutBuffer()
+        _add_track(buf, [1.0], [0.5], [0.0], "opponent")
+        adv_missing, _ = buf.compute_gae(0.9, 1.0, {})
+        adv_explicit, _ = buf.compute_gae(0.9, 1.0, {"opponent": 0.0})
+        assert adv_missing[0] == pytest.approx(adv_explicit[0], abs=1e-6)
+
+    def test_scalar_last_value_applies_to_every_track(self):
+        """Backward compat: a bare float last_value (every existing
+        single-track call site/test) still applies uniformly to ALL tracks
+        present in the buffer."""
+        buf = RolloutBuffer()
+        _add_track(buf, [1.0], [0.5], [0.0], "trainee")
+        _add_track(buf, [2.0], [0.3], [0.0], "opponent")
+        adv_scalar, ret_scalar = buf.compute_gae(0.9, 1.0, 5.0)
+        adv_dict, ret_dict = buf.compute_gae(0.9, 1.0, {"trainee": 5.0, "opponent": 5.0})
+        assert adv_scalar == pytest.approx(adv_dict, abs=1e-6)
+        assert ret_scalar == pytest.approx(ret_dict, abs=1e-6)
+
+    def test_track_ids_default_to_trainee(self):
+        buf = RolloutBuffer()
+        dummy = {"x": __import__("numpy").zeros(1, dtype="float32")}
+        buf.add(obs=dummy, action=dummy, log_prob=0.0, value=0.0, reward=0.0, done=0.0)
+        buf.add(obs=dummy, action=dummy, log_prob=0.0, value=0.0, reward=0.0, done=0.0, track_id="opponent")
+        assert buf.track_ids == ["trainee", "opponent"]
+
+    def test_truncate_to_last_episode_end_drops_track_ids_too(self):
+        buf = self._interleaved_buffer()
+        # Append one more trailing (incomplete) tick to both tracks.
+        _add_track(buf, [1.0], [0.0], [0.0], "trainee")
+        _add_track(buf, [1.0], [0.0], [0.0], "opponent")
+        n_dropped = buf.truncate_to_last_episode_end()
+        assert n_dropped == 2
+        assert len(buf.track_ids) == len(buf.rewards)
+        assert buf.track_ids == ["trainee", "opponent"] * 3
+
+
+class TestMCReturnsMultiTrack:
+    """compute_mc_returns() is currently only ever fed trainee-only buffers
+    (value pretraining doesn't record secondary transitions), but is
+    segmented the same way as compute_gae() defensively -- these tests
+    guard that segmentation directly rather than relying on it never being
+    exercised."""
+
+    def test_interleaved_matches_isolated_per_track(self):
+        trainee_r, trainee_d = [1.0, 5.0, 2.0], [0.0, 1.0, 0.0]
+        opp_r, opp_d = [10.0, 20.0, 30.0], [0.0, 0.0, 1.0]
+
+        trainee_only = RolloutBuffer()
+        _add_track(trainee_only, trainee_r, [0.0] * 3, trainee_d, "trainee")
+        expected_trainee = trainee_only.compute_mc_returns(0.9)
+
+        opp_only = RolloutBuffer()
+        _add_track(opp_only, opp_r, [0.0] * 3, opp_d, "opponent")
+        expected_opp = opp_only.compute_mc_returns(0.9)
+
+        buf = RolloutBuffer()
+        for i in range(3):
+            _add_track(buf, [trainee_r[i]], [0.0], [trainee_d[i]], "trainee")
+            _add_track(buf, [opp_r[i]], [0.0], [opp_d[i]], "opponent")
+        returns = buf.compute_mc_returns(0.9)
+
+        trainee_idx, opp_idx = [0, 2, 4], [1, 3, 5]
+        for local_i, flat_i in enumerate(trainee_idx):
+            assert returns[flat_i] == pytest.approx(expected_trainee[local_i], abs=1e-6)
+        for local_i, flat_i in enumerate(opp_idx):
+            assert returns[flat_i] == pytest.approx(expected_opp[local_i], abs=1e-6)

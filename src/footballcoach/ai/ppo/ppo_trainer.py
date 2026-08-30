@@ -100,9 +100,18 @@ def _load_state_dict_tolerant(module: torch.nn.Module, ckpt_sd: dict, label: str
 
 
 def _detach_decision_heads(d_heads: DecisionHeadsRaw) -> DecisionHeadsRaw:
-    """Return a copy of d_heads with every field detached (see separate_value_net)."""
+    """Return a copy of d_heads with every field detached (see separate_value_net).
+
+    ball_physics_full/self_physics_full/other_physics_full (see
+    "Frozen physics-dynamics encoders" in ai/knowledge.md) are None when
+    that feature is disabled (the default) -- skip detach() for those,
+    same None-passthrough every other consumer of DecisionHeadsRaw already
+    has to handle."""
     return dataclasses.replace(
-        d_heads, **{name: getattr(d_heads, name).detach() for name in _DECISION_HEADS_FIELD_NAMES}
+        d_heads, **{
+            name: (v.detach() if (v := getattr(d_heads, name)) is not None else None)
+            for name in _DECISION_HEADS_FIELD_NAMES
+        }
     )
 
 
@@ -600,9 +609,22 @@ class PPOTrainer:
                     kick_dir_param_ids.add(id(p))
             direction_param_ids = move_dir_param_ids | kick_dir_param_ids
             self.direction_param_ids = direction_param_ids
+            # Frozen physics-dynamics encoders (ai/knowledge.md "Frozen
+            # physics-dynamics encoders") -- owned only by decision_net, kept
+            # requires_grad=False by their loaders. Excluded from the
+            # optimizer entirely (not even a zero-LR param group), same
+            # treatment decision_net.value_head gets under the "single value
+            # head convention" -- no-op when the feature is disabled (the
+            # submodules don't exist, so named_parameters() yields nothing
+            # with these prefixes).
+            physics_encoder_param_ids = {
+                id(p) for name, p in decision_net.named_parameters()
+                if name.startswith("ball_physics_encoder.") or name.startswith("player_physics_encoder.")
+            }
             policy_params = [
                 p for p in list(decision_net.parameters()) + list(execution_net.parameters())
                 if id(p) not in value_param_ids and id(p) not in direction_param_ids
+                and id(p) not in physics_encoder_param_ids
             ]
             # When separate_value_net is enabled, execution_net's own
             # value_head/value_ai_type_channel are dead weight (never used --
@@ -968,6 +990,7 @@ class PPOTrainer:
                     done=sec["done"],
                     bc_label=None,
                     weight=self._secondary_weight,
+                    track_id=sec["player_id"],
                 )
                 secondary_episode_reward_accum += sec["reward"]
                 if sec["done"]:
@@ -1007,13 +1030,10 @@ class PPOTrainer:
                 rollout_time = time.perf_counter() - rollout_start
                 steps_per_sec = self.rollout_steps / max(rollout_time, 1e-6)
 
-                # Bootstrap value for last state
-                with torch.no_grad():
-                    last_obs_dict = {k: v.unsqueeze(0).to(self.device)
-                                     for k, v in next_obs.to_torch_dict().items()}
-                    last_value = self._get_value(last_obs_dict)
+                # Bootstrap value for last state (per track — see docstring)
+                last_values = self._bootstrap_last_values(env, next_obs, buffer)
 
-                advantages, returns = buffer.compute_gae(self.gamma, self.lam, last_value)
+                advantages, returns = buffer.compute_gae(self.gamma, self.lam, last_values)
                 batch = buffer.as_tensors(advantages, returns)
 
                 # Per-component step-level stats (pre-augmentation batch).
@@ -3570,6 +3590,35 @@ class PPOTrainer:
         e_heads = self._value_heads(sf, of, em, bf, gf, d_heads, sat, oat)
         return float(e_heads.value.mean())  # single critic (execution_net, or self.value_net)
 
+    def _bootstrap_last_values(self, env, next_obs, buffer: "RolloutBuffer") -> dict[str, float]:
+        """Per-track bootstrap values for ``RolloutBuffer.compute_gae()``.
+
+        The trainee's own next-state value comes from ``next_obs`` (already
+        available at the caller's rollout-window boundary — the return value
+        of the most recent ``env.step()``). For every OTHER track actually
+        present in the buffer (i.e. a secondary player whose transitions
+        were recorded this rollout — only possible when that player is
+        neural-controlled), re-encode that player's own current observation
+        via ``env._get_obs(player_id=...)`` and run it through the same
+        critic. Without this, ``compute_gae`` would silently fall back to
+        0.0 for that track's final-step bootstrap — see ``compute_gae``'s
+        docstring for why that's only an approximation, not a crash.
+        """
+        with torch.no_grad():
+            last_obs_dict = {
+                k: v.unsqueeze(0).to(self.device) for k, v in next_obs.to_torch_dict().items()
+            }
+            last_values = {"trainee": self._get_value(last_obs_dict)}
+            for track in set(buffer.track_ids):
+                if track == "trainee" or track in last_values:
+                    continue
+                sec_obs = env._get_obs(player_id=track)
+                sec_obs_dict = {
+                    k: v.unsqueeze(0).to(self.device) for k, v in sec_obs.to_torch_dict().items()
+                }
+                last_values[track] = self._get_value(sec_obs_dict)
+        return last_values
+
     def _compute_log_prob(self, d_heads, e_heads, samples: dict, exists_mask) -> torch.Tensor:
         """Compute combined log_prob across all action heads."""
         lp = torch.zeros(1, device=self.device)
@@ -4996,7 +5045,13 @@ class PPOTrainer:
 
     def load_checkpoint(self, path: Path) -> int:
         ckpt = torch.load(path, map_location=self.device, weights_only=False)
-        self.decision_net.load_state_dict(ckpt["decision_net"])
+        # Tolerant load (not strict): decision_net.state_dict() deliberately
+        # excludes ball_physics_encoder/player_physics_encoder keys (see
+        # DecisionNetwork.state_dict()), so a checkpoint saved with this
+        # feature enabled never has them either -- strict loading would
+        # otherwise raise "missing keys" for a submodule that's already
+        # correctly populated from its own physics_pretrain checkpoint path.
+        _load_state_dict_tolerant(self.decision_net, ckpt["decision_net"], "decision_net")
         _load_state_dict_tolerant(self.execution_net, ckpt["execution_net"], "execution_net")
         if self.value_net is not None:
             if "value_net" in ckpt:

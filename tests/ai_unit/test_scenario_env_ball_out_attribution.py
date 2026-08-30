@@ -42,22 +42,24 @@ def _send_ball_out(match, toucher_id: str) -> None:
     The ball must be LOOSE (not `possessed_by`) here -- a possessed ball is
     snapped back onto its carrier every tick by `_sync_possessed_ball()`,
     which would silently undo a manually-set out-of-bounds position.
-    `kicked_this_tick` is the same flag ScenarioLoop._track_ball_toucher()
-    reads to attribute the touch, mirroring what `Player.kick_direct()` sets
-    in real play.
 
-    match.step() is monkeypatched to a no-op: the real one resets EVERY
-    player's kicked_this_tick=False at the top of _process_orders() (see
-    Player.kicked_this_tick's per-tick reset in match.py), which would wipe
-    this synthetic flag before ScenarioLoop._track_ball_toucher() -- now
-    correctly called AFTER match.step(), not before, see the toucher-
-    tracking dedup fix -- ever observes it. detect_trial_outcome() only
-    reads match.ball.position (never requires match.step() to have run),
-    so the no-op is safe for outcome detection too.
+    `Ball.last_touched_by_player_id` is the single authoritative source for
+    "who touched this ball last" (set directly here since this is a
+    synthetic setup, not a real kick going through `Match._set_possession()`
+    -- see that field's own docstring for the two real write-paths). Also
+    sets `kicked_this_tick` to match what a real `Player.kick_direct()`
+    would leave behind, in case anything else inspects it.
+
+    match.step() is monkeypatched to a no-op so nothing resets these
+    synthetic flags before `detect_trial_outcome()` reads them.
+    `detect_trial_outcome()` only reads `match.ball.position` (never
+    requires `match.step()` to have run), so the no-op is safe for outcome
+    detection too.
     """
     match.ball.possessed_by = None
     match.ball.position = Vector3(match.pitch.half_length + 5.0, 0.0, 0.0)
     match.ball.velocity = Vector3(5.0, 0.0, 0.0)
+    match.ball.last_touched_by_player_id = toucher_id
     match.player_by_id(toucher_id).kicked_this_tick = True
     match.step = lambda: None
 
@@ -98,16 +100,19 @@ class TestBallOutAttribution:
         trainee = match.player_by_id("trainee")
 
         # Trainee possesses the ball for a step, safely away from any line.
-        match.ball.possessed_by = "trainee"
+        # set_initial_possession() (not a raw possessed_by assignment) so
+        # Ball.last_touched_by_player_id is set the same way a real
+        # possession gain would set it via Match._set_possession().
+        match.ball.set_initial_possession("trainee")
         match.ball.position = Vector3(trainee.position.x, trainee.position.y, 0.0)
         match.ball.velocity = Vector3(0.0, 0.0, 0.0)
         env.step()
-        # Mid-episode (trial not over yet): the LIVE tracker lives on
-        # ScenarioLoop now (single source of truth, see the toucher-tracking
-        # dedup fix) -- env._loop.last_completed_trial_toucher_id only
-        # updates when a trial actually ENDS, so it isn't the right thing to
-        # check here.
-        assert env._loop._last_ball_toucher_id == "trainee"
+        # Mid-episode (trial not over yet): read live off the current
+        # match's ball directly -- Ball.last_touched_by_player_id is the
+        # single source of truth (see the toucher-tracking dedup fix);
+        # env._loop.last_completed_trial_toucher_id only updates once a
+        # trial actually ENDS, so it isn't the right thing to check here.
+        assert env._loop._match.ball.last_touched_by_player_id == "trainee"
 
         # Now the opponent takes it and kicks it out.
         _send_ball_out(match, "opponent")

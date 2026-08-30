@@ -312,28 +312,25 @@ def solve_launch_pitch_rad(
     return math.atan(flatter_t)
 
 
-def _launch_ball(
+def _release_kick(
     ball: Ball,
     kicker_position: Vector3,
-    aim_point: Vector3,
+    yaw: float,
+    pitch: float,
     speed: float,
     sigma: float,
     spin: Vector3,
     rng: random.Random,
-    gravity_mps2: float,
 ) -> None:
-    """Shared aim-then-launch logic used by both `kick_ball` and
-    `pass_ball`: solves the ballistic angle to `aim_point` at the given
-    `speed`, perturbs yaw/pitch by independent Gaussian noise of std-dev
-    `sigma`, and releases the ball from possession with the resulting
-    velocity."""
+    """Shared release tail for EVERY kick/pass, given a already-known
+    pre-noise `yaw`/`pitch` (in radians): perturbs both by independent
+    Gaussian noise of std-dev `sigma`, and releases the ball from
+    possession with the resulting velocity. This is the one place actual
+    ball-release physics happens -- both `_launch_ball` (solves yaw/pitch
+    from an aim point first) and `kick_ball_from_direction` (already has
+    yaw/pitch directly from a given 3D direction, no solve needed) end here,
+    so a kick launched either way stays bit-identical past this point."""
     launch_position = kicker_position.with_z(ball.position.z)
-    delta = aim_point - launch_position
-    horizontal_distance = delta.xy().length()
-    yaw = delta.xy().angle_xy() if horizontal_distance > 1e-9 else 0.0
-
-    pitch = solve_launch_pitch_rad(horizontal_distance, delta.z, speed, gravity_mps2)
-
     final_yaw = yaw + rng.gauss(0.0, sigma)
     final_pitch = pitch + rng.gauss(0.0, sigma)
 
@@ -350,6 +347,29 @@ def _launch_ball(
     ball.position = launch_position
     ball.velocity = velocity
     ball.spin = spin
+
+
+def _launch_ball(
+    ball: Ball,
+    kicker_position: Vector3,
+    aim_point: Vector3,
+    speed: float,
+    sigma: float,
+    spin: Vector3,
+    rng: random.Random,
+    gravity_mps2: float,
+) -> None:
+    """Shared aim-then-launch logic used by both `kick_ball` and
+    `pass_ball`: solves the ballistic angle to `aim_point` at the given
+    `speed` (the part `kick_ball_from_direction` does NOT need -- it
+    already has a direction, not a point to solve for), then hands off to
+    `_release_kick` for the actual (noise + release) physics."""
+    launch_position = kicker_position.with_z(ball.position.z)
+    delta = aim_point - launch_position
+    horizontal_distance = delta.xy().length()
+    yaw = delta.xy().angle_xy() if horizontal_distance > 1e-9 else 0.0
+    pitch = solve_launch_pitch_rad(horizontal_distance, delta.z, speed, gravity_mps2)
+    _release_kick(ball, kicker_position, yaw, pitch, speed, sigma, spin, rng)
 
 
 def _log_kick_debug(
@@ -535,7 +555,12 @@ def kick_ball_from_direction(
 ) -> None:
     """Apply a kick from a 3D unit direction vector directly — no ballistic solve.
 
-    Used by the neural network. Rules-based AI uses kick_ball() instead.
+    Used by the neural network (Player.kick_with_direction) and by
+    rules-AI push-kicks (orders.py's _try_push_kick, which deliberately
+    avoids the ballistic aim-point solve -- push-kicks are flat, ground-level
+    kicks by design, see orders.json's push_kick section). Rules-AI kicks
+    that DO aim at an explicit point (shots, passes, KickOrder) still use
+    kick_ball() instead.
     """
     params = params or KickingParams.from_config()
     r = rng or random
@@ -553,20 +578,7 @@ def kick_ball_from_direction(
     yaw = direction_unit3.xy().angle_xy() if horiz_len > 1e-9 else 0.0
     pitch = math.atan2(direction_unit3.z, max(horiz_len, 1e-9))
 
-    final_yaw = r.gauss(yaw, sigma)
-    final_pitch = r.gauss(pitch, sigma)
-
-    horizontal_speed = speed * math.cos(final_pitch)
-    vertical_speed = speed * math.sin(final_pitch)
-
-    ball.possessed_by = None
-    ball.position = kicker_position.with_z(ball.position.z)
-    ball.velocity = Vector3(
-        math.cos(final_yaw) * horizontal_speed,
-        math.sin(final_yaw) * horizontal_speed,
-        vertical_speed,
-    )
-    ball.spin = spin
+    _release_kick(ball, kicker_position, yaw, pitch, speed, sigma, spin, r)
 
 
 # ShootOrder blocker detection: perpendicular-distance threshold from the shot

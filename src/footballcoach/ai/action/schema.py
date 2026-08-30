@@ -57,6 +57,18 @@ class DecisionHeadsRaw:
 
     value: "torch.Tensor"                  # (batch, 1) - critic value estimate (shared trunk)
 
+    # --- Frozen physics-encoder passthrough (NOT real heads) ---
+    # Computed once by DecisionNetwork.forward() (the only place that owns/
+    # loads the frozen ball_physics_encoder/player_physics_encoder) and
+    # ferried to ExecutionNetwork.forward() via this dataclass, exactly like
+    # latent_vector above -- ExecutionNetwork reads these instead of calling
+    # either frozen encoder itself, so it never runs twice per observation.
+    # None when physics-encoder integration is disabled (default config).
+    # See ai/knowledge.md's "Frozen physics-dynamics encoders" section.
+    ball_physics_full: "torch.Tensor | None" = None    # (batch, ball_physics_encoder.output_dim)
+    self_physics_full: "torch.Tensor | None" = None    # (batch, player_physics_encoder.output_dim)
+    other_physics_full: "torch.Tensor | None" = None   # (batch, MAX_OTHER_PLAYERS, player_physics_encoder.output_dim)
+
 
 @dataclass
 class DecisionAction:

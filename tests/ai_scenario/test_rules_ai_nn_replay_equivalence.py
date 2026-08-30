@@ -113,19 +113,28 @@ def _install_movement_capture_hook(match, player_id: str) -> dict:
 
 
 def _install_kick_angle_capture_hook() -> dict:
-    """Monkeypatch `kicking._launch_ball` (module-level, shared by `kick_ball`
-    and `pass_ball`) to record the PRE-noise `yaw`/`pitch` it computes right
-    before perturbing them -- see module docstring "Kick capture: pre-noise
-    angle, not post-noise direction". Mirrors `_launch_ball`'s own yaw/pitch
-    lines exactly (reusing its public `solve_launch_pitch_rad` helper for the
-    pitch solve, not re-deriving it) so this can't drift from the real
-    formula. MUST be uninstalled via the returned restore function -- it's a
-    global module patch.
+    """Monkeypatch both real kick-physics entry points to record the
+    PRE-noise `yaw`/`pitch` each computes right before perturbing them --
+    see module docstring "Kick capture: pre-noise angle, not post-noise
+    direction". Mirrors each function's own yaw/pitch lines exactly (reusing
+    `solve_launch_pitch_rad` for the ballistic pitch solve, not re-deriving
+    it) so this can't drift from the real formula. MUST be uninstalled via
+    the returned restore function -- both are global module patches.
+
+    Two entry points, because push-kicks (both rules-AI, via orders.py's
+    _try_push_kick, and the NN) are flat direction-only kicks -- no
+    ballistic aim-point solve at all -- and go through
+    `kick_ball_from_direction`, NOT `kick_ball`/`_launch_ball`. Only
+    KickOrder/ShootOrder/PassOrder-style explicit-aim-point kicks go through
+    `_launch_ball`. Phase1RulesAI's box-run push-kicks are exactly the kicks
+    this test exercises, so both paths must be captured or `kick_angle`
+    silently stays empty on every push-kick tick.
     """
     captured: dict = {}
-    original = kicking_mod._launch_ball
+    original_launch = kicking_mod._launch_ball
+    original_from_direction = kicking_mod.kick_ball_from_direction
 
-    def _patched(ball, kicker_position, aim_point, speed, sigma, spin, rng, gravity_mps2):
+    def _patched_launch(ball, kicker_position, aim_point, speed, sigma, spin, rng, gravity_mps2):
         launch_position = kicker_position.with_z(ball.position.z)
         delta = aim_point - launch_position
         horizontal_distance = delta.xy().length()
@@ -142,12 +151,25 @@ def _install_kick_angle_capture_hook() -> dict:
         # captures the exact starting point so the shadow can be resynced
         # surgically right before its own two draws.
         captured["rng_state_before_noise"] = rng.getstate()
-        return original(ball, kicker_position, aim_point, speed, sigma, spin, rng, gravity_mps2)
+        return original_launch(ball, kicker_position, aim_point, speed, sigma, spin, rng, gravity_mps2)
 
-    kicking_mod._launch_ball = _patched
+    def _patched_from_direction(ball, kicker_position, direction_unit3, *args, **kwargs):
+        import math as _math
+        import random as _random
+        horiz_len = direction_unit3.xy().length()
+        captured["yaw"] = direction_unit3.xy().angle_xy() if horiz_len > 1e-9 else 0.0
+        captured["pitch"] = _math.atan2(direction_unit3.z, max(horiz_len, 1e-9))
+        # rng is the 6th positional arg (index 5 of *args) or the "rng" kwarg.
+        rng = kwargs.get("rng", args[5] if len(args) > 5 else None) or _random
+        captured["rng_state_before_noise"] = rng.getstate()
+        return original_from_direction(ball, kicker_position, direction_unit3, *args, **kwargs)
+
+    kicking_mod._launch_ball = _patched_launch
+    kicking_mod.kick_ball_from_direction = _patched_from_direction
 
     def _restore():
-        kicking_mod._launch_ball = original
+        kicking_mod._launch_ball = original_launch
+        kicking_mod.kick_ball_from_direction = original_from_direction
 
     captured["_restore"] = _restore
     return captured

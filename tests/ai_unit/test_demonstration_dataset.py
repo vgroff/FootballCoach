@@ -27,6 +27,7 @@ def _write_npz(
     valid_mask: np.ndarray | None = None,
     rewards: np.ndarray | None = None,
     dones: np.ndarray | None = None,
+    is_decision_step: np.ndarray | None = None,
 ) -> None:
     """Write a small hand-built demonstration .npz file with n steps."""
     obs_self_feat = np.random.randn(n, PLAYER_FEATURE_DIM).astype(np.float32)
@@ -52,6 +53,8 @@ def _write_npz(
         kwargs["rewards"] = rewards
     if dones is not None:
         kwargs["dones"] = dones
+    if is_decision_step is not None:
+        kwargs["is_decision_step"] = is_decision_step
     np.savez(path, **kwargs)
 
 
@@ -166,6 +169,70 @@ class TestComputeReturns:
         # Episode 2: G_3=2, G_2=1+0.9*2=2.8
         expected = np.array([28.0, 20.0, 2.8, 2.0], dtype=np.float32)
         np.testing.assert_allclose(returns, expected, atol=1e-4)
+
+
+class TestIsDecisionStepDiscount:
+    """is_decision_step=0.0 rows (kick/tackle-callback or terminal rows, see
+    record_demonstrations.py) must not consume their own gamma-discount step
+    in compute_returns() -- only genuine timed-sample rows (is_decision_step
+    =1.0) should."""
+
+    def test_non_decision_row_does_not_consume_a_discount_step(self, tmp_path):
+        """3-step episode, gamma=0.5. Row 1 (index 1) is flagged as a
+        non-decision (e.g. kick-callback) row with reward=0.0, inserted
+        between two real decision rows.
+
+        rewards =           [1, 0, 4]
+        is_decision_step =  [1, 0, 1]
+        done at last step only.
+
+        G_2 = 4
+        G_1 = 0 + 1.0*4 = 4     (row 1 is NOT a decision step -> multiplier 1.0, not gamma)
+        G_0 = 1 + 0.5*4 = 3     (row 0 IS a decision step -> multiplier gamma)
+        """
+        n = 3
+        rewards = np.array([1.0, 0.0, 4.0], dtype=np.float32)
+        dones = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        is_decision_step = np.array([1.0, 0.0, 1.0], dtype=np.float32)
+        _write_npz(
+            tmp_path / "demo1.npz", n=n, rewards=rewards, dones=dones,
+            is_decision_step=is_decision_step,
+        )
+        ds = DemonstrationDataset.from_directory(tmp_path)
+
+        returns = ds.compute_returns(gamma=0.5)
+        expected = np.array([3.0, 4.0, 4.0], dtype=np.float32)
+        np.testing.assert_allclose(returns, expected, atol=1e-5)
+
+    def test_matches_plain_compute_returns_when_every_row_is_a_decision_step(self, tmp_path):
+        """Sanity check: with is_decision_step all-1.0 (the default), results
+        must be identical to the pre-existing, un-flagged behaviour."""
+        n = 3
+        rewards = np.array([1.0, 2.0, 4.0], dtype=np.float32)
+        dones = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        is_decision_step = np.ones(n, dtype=np.float32)
+        _write_npz(
+            tmp_path / "demo1.npz", n=n, rewards=rewards, dones=dones,
+            is_decision_step=is_decision_step,
+        )
+        ds = DemonstrationDataset.from_directory(tmp_path)
+
+        returns = ds.compute_returns(gamma=0.5)
+        expected = np.array([3.0, 4.0, 4.0], dtype=np.float32)
+        np.testing.assert_allclose(returns, expected, atol=1e-5)
+
+    def test_missing_field_defaults_to_all_decision_steps(self, tmp_path):
+        """Older files (no is_decision_step field at all) must behave exactly
+        as before -- every row treated as its own decision step."""
+        n = 3
+        rewards = np.array([1.0, 2.0, 4.0], dtype=np.float32)
+        dones = np.array([0.0, 0.0, 1.0], dtype=np.float32)
+        _write_npz(tmp_path / "demo1.npz", n=n, rewards=rewards, dones=dones)
+        ds = DemonstrationDataset.from_directory(tmp_path)
+
+        returns = ds.compute_returns(gamma=0.5)
+        expected = np.array([3.0, 4.0, 4.0], dtype=np.float32)
+        np.testing.assert_allclose(returns, expected, atol=1e-5)
 
 
 class TestHasRewards:

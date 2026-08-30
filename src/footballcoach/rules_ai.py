@@ -40,30 +40,23 @@ from footballcoach.orders import (
 
 
 class Phase1RulesAI(PlayerAI):
-    """Chase ball; when possessed, sprint toward a random point inside the
-    opponent's box (in the half of the box nearest to the player's current
-    y-position).  Team-aware via player.team."""
+    """Chase ball; when possessed, sprint toward the closest point on/in the
+    opponent box (deterministic -- the true nearest point on the box
+    rectangle to wherever we are, not a random point and not always the
+    near edge).  Team-aware via player.team."""
 
     def act(self, player: Player, match: Match, trial_tick: int) -> None:
         if match.ball.possessed_by == player.player_id:
-            # Have the ball — run toward a random point inside the opponent box.
+            # Have the ball — run toward the closest point on the box
+            # rectangle (deterministic: no rng draw here -- see
+            # rng_state_before_kick_noise's docstring in
+            # test_rules_ai_nn_replay_equivalence.py for why an order-layer
+            # rng draw here was a real source of real/shadow replay
+            # divergence whenever it landed on the same tick as another
+            # rng-consuming physics event, e.g. a tackle roll).
             if not isinstance(player.current_order, MoveOrder):
-                pitch = match.pitch
-                half_box_w = pitch.box_width_m / 2.0
-                # x: random within the full box depth (inner edge → goal line)
-                if player.team == Team.LEFT:
-                    box_inner_x = pitch.half_length - pitch.box_length_m
-                    target_x = match.rng.uniform(box_inner_x, pitch.half_length)
-                else:
-                    box_inner_x = -(pitch.half_length - pitch.box_length_m)
-                    target_x = match.rng.uniform(-pitch.half_length, box_inner_x)
-                # y: random in the nearest half of the box to the player
-                if player.position.y >= 0.0:
-                    target_y = match.rng.uniform(0.0, half_box_w)
-                else:
-                    target_y = match.rng.uniform(-half_box_w, 0.0)
                 player.current_order = MoveOrder(
-                    target_position=Vector3(target_x, target_y, 0.0),
+                    target_position=_nearest_box_point(player, match),
                     sprint=True,
                     push_kick_enabled=True,
                 )
@@ -72,13 +65,44 @@ class Phase1RulesAI(PlayerAI):
             # Don't have the ball — chase it.  Recalculate sprint every tick
             # so the decision tracks changing distances; only re-issue the
             # order when the flag actually flips to avoid resetting its state.
-            should_sprint = _should_sprint_to_ball(player, match)
+            #
+            # Against an immobile opponent (can never move or contest the
+            # ball), _should_sprint_to_ball's opponent-relative race check
+            # is structurally always "no threat, jog is fine" -- but that's
+            # wrong here: it also throttles the chase back to a ball THIS
+            # player just push-kicked away, which is exactly when speed
+            # matters most. Confirmed empirically: one kick, then ~16.6s of
+            # JOG-paced chasing back to the player's own kicked ball before
+            # recatching it, in a real traced episode. Skip the race check
+            # entirely and always sprint when the opponent can't threaten.
+            opponent_is_immobile = any(
+                opp.player_id != player.player_id and opp.team != player.team and opp.ai is None
+                for opp in match.players
+            )
+            should_sprint = opponent_is_immobile or _should_sprint_to_ball(player, match)
+            # Push-kick target: same nearest-point-on-box logic as the
+            # has-ball branch above, and the SAME field GetPossessionOrder
+            # now shares with MoveOrder (orders.py's _try_push_kick) --
+            # previously this lived as a separate, ad hoc reimplementation
+            # (rules_ai.py's since-removed _arm_box_kick) that aimed at a
+            # hardcoded box-CENTER point instead of the real target, and had
+            # no cap tying its kick distance to that target at all. One
+            # target, computed once per order (not every tick, matching the
+            # has-ball branch's own "locked in at possession/order-creation
+            # time" behaviour) -- not two divergent implementations.
             if not isinstance(player.current_order, GetPossessionOrder):
-                player.current_order = GetPossessionOrder(sprint=should_sprint)
+                player.current_order = GetPossessionOrder(
+                    sprint=should_sprint,
+                    target_position=_nearest_box_point(player, match),
+                    push_kick_enabled=True,
+                )
                 match._log_info(f"[AI] {player.player_id}: GetPossession")
             elif player.current_order.sprint != should_sprint:
-                player.current_order = GetPossessionOrder(sprint=should_sprint)
-            _arm_box_kick(player, match)
+                player.current_order = GetPossessionOrder(
+                    sprint=should_sprint,
+                    target_position=_nearest_box_point(player, match),
+                    push_kick_enabled=True,
+                )
 
 
 class StopWhenIdleAI(PlayerAI):
@@ -104,49 +128,41 @@ class StopWhenIdleAI(PlayerAI):
             player.current_order = StopOrder()
 
 
-_DECISION_INTERVAL_S = 0.5  # 15 ticks at 30 Hz — one neural decision window
+_BOX_AIM_SHRINK_FRAC = 0.05  # aim at a box 5% smaller than the real one, not
+# right on its true edges -- a corner target (esp. the end-line edge, which
+# IS the pitch boundary) is delicate: small overshoot/timing variance can
+# carry the ball past the real line. Shrinking the box uniformly around its
+# own center pulls every edge a bit inward, trading a negligible amount of
+# box depth/width for a real margin of error. Simple deliberately -- not a
+# per-axis "nudge 1m in whichever direction" special case.
 
 
-def _arm_box_kick(player: Player, match: Match) -> None:
-    """Arm a push-kick only when close enough to pick up the ball within one
-    decision interval AND the push-kick heading/distance checks would pass.
-    """
-    import math as _math
-    from footballcoach.engine.kicking import max_kick_speed_mps
-    from footballcoach.engine.movement import effective_top_speed, angle_diff
-    from footballcoach.orders import _push_kick_params
-
-    sprint_speed = effective_top_speed(
-        match.movement_params, player.attributes.top_speed, player.stamina, has_ball=False,
-    )
-    dist_to_ball = (match.ball.position - player.position).length_xy()
-    if dist_to_ball > sprint_speed * _DECISION_INTERVAL_S:
-        return
-
-    pk = _push_kick_params()
+def _nearest_box_point(player: Player, match: Match) -> Vector3:
+    """Nearest point on/in a box 5% smaller than the real opponent box
+    (see _BOX_AIM_SHRINK_FRAC) to the player's current position --
+    independently clamp x and y to that shrunk box's own range. Clamping x
+    to ONLY the near edge is wrong whenever the player already happens to
+    be within the box's x-range (e.g. gained possession already deep
+    upfield) -- that would send them back out to the shallow edge first, a
+    visibly backwards detour instead of the true shortest path in.
+    Team-aware via player.team. Used as the shared target for both the
+    has-ball box-run MoveOrder and the pre-possession GetPossessionOrder
+    push-kick (see Phase1RulesAI.act())."""
     pitch = match.pitch
+    half_box_w = (pitch.box_width_m / 2.0) * (1.0 - _BOX_AIM_SHRINK_FRAC)
     if player.team == Team.LEFT:
-        aim_x = pitch.half_length - pitch.box_length_m / 2.0
+        box_x_min = pitch.half_length - pitch.box_length_m
+        box_x_max = pitch.half_length
     else:
-        aim_x = -(pitch.half_length - pitch.box_length_m / 2.0)
-    aim_point = Vector3(aim_x, 0.0, 0.0)
-    push_dir = aim_point - player.position
-    if push_dir.length_xy() < 1e-6:
-        return
-    if (aim_point - player.position).length_xy() < pk["min_dist_m"]:
-        return
-    if abs(angle_diff(player.heading_rad, push_dir.xy().angle_xy())) > _math.radians(pk["max_heading_error_deg"]):
-        return
-
-    kick_dist = pk["dist_m"]
-    push_unit = push_dir.xy().normalized()
-    armed_aim = player.position + Vector3(push_unit.x * kick_dist, push_unit.y * kick_dist, 0.0)
-    max_kick = max_kick_speed_mps(match.kicking_params, player.attributes.kick_power)
-    power = min(1.0, sprint_speed * pk["speed_factor"] / max(max_kick, 0.1))
-    player.kick_armed = True
-    player.kick_armed_aim_point = armed_aim
-    player.kick_armed_power_fraction = power
-    player.kick_armed_spin = Vector3.zero()
+        box_x_min = -pitch.half_length
+        box_x_max = -(pitch.half_length - pitch.box_length_m)
+    box_center_x = (box_x_min + box_x_max) / 2.0
+    half_box_length = (box_x_max - box_x_min) / 2.0 * (1.0 - _BOX_AIM_SHRINK_FRAC)
+    box_x_min = box_center_x - half_box_length
+    box_x_max = box_center_x + half_box_length
+    target_x = max(box_x_min, min(box_x_max, player.position.x))
+    target_y = max(-half_box_w, min(half_box_w, player.position.y))
+    return Vector3(target_x, target_y, 0.0)
 
 
 def _should_sprint_to_ball(player: Player, match: Match) -> bool:

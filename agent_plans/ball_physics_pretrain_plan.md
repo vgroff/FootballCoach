@@ -13,10 +13,25 @@
 **Standalone pipeline implemented and in active use** (episode generation,
 dataset, network, training script, auto-generated HTML report — §4-7, §9,
 §10). **§8 (wiring the frozen encoder into `DecisionNetwork`/
-`ExecutionNetwork`) is explicitly ON HOLD** pending the user validating the
-standalone pipeline (training data quality, loss curves, classification
-metrics) — do not start §8 without an explicit go-ahead; it's a real
-architecture change that invalidates existing checkpoints (see §8.4).
+`ExecutionNetwork`) is IMPLEMENTED** — both the ball encoder (this section)
+and the player encoder (§11's sketch, extended) are wired in, opt-in via
+`network.ball_physics_encoder_checkpoint`/`network.player_physics_encoder_checkpoint`
+(both `null`/off by default, so existing training is unaffected until
+explicitly enabled). One refinement over the design below: the frozen
+encoder is computed **once inside `DecisionNetwork.forward()` only** and
+ferried to `ExecutionNetwork` via new `DecisionHeadsRaw` passthrough fields
+(`ball_physics_full`/`self_physics_full`/`other_physics_full`, same
+convention as the existing `latent_vector` field) — `ExecutionNetwork`
+never calls either frozen encoder itself, so each one runs at most once per
+observation instead of once per network. See `src/footballcoach/ai/models/
+physics_encoders.py`, `decision_network.py`, `execution_network.py`,
+`tests/ai_unit/test_physics_encoder_wiring.py`, and `ai/knowledge.md`'s
+"Frozen physics-dynamics encoders" section for the as-built details.
+**Known gap**: each encoder still runs once per observation rather than
+once per (entity, team-frame) — only coincidentally bounded to "twice per
+tick" because Phase 1 is 1v1. See
+`agent_plans/physics_encoder_cross_observation_caching_plan.md` for the
+planned true N-player fix.
 
 See §12 for a full account of what was actually built, including a set of
 quality-of-life additions beyond the original design here (random seeds,
@@ -24,9 +39,6 @@ append-mode dataset generation, a live progress bar, fine-grained per-head
 loss/classification-metric reporting, and an auto-opening HTML training
 report) — §11's player-dynamics follow-up should get the same treatment,
 not just the network/pipeline itself (flagged again at the top of §11).
-
-Ball-only for this pass — the analogous player-dynamics network is a
-deliberately deferred follow-up (see §11) once this one is validated.
 
 ---
 
@@ -577,11 +589,22 @@ tests/ai_unit/test_ball_physics_pretrain.py       # §10
 > **Implemented — see `agent_plans/player_physics_pretrain_plan.md`.** The
 > standalone player-dynamics pretraining pipeline (episode generator,
 > dataset, network, training script, HTML report) described there was built
-> as a parallel pipeline to this one, per the sketch below. Live-network
-> integration (this plan's §8, and the analogous section for the player net)
-> remains unimplemented/out of scope for that pass too. The sketch below is
-> kept as the original design record — the "as-built" doc explains where
-> the final implementation deviated and why.
+> as a parallel pipeline to this one, per the sketch below.
+>
+> **Live-network integration is now ALSO implemented** (see §0's updated
+> status) — with the refinement described there: rather than widening
+> `EntityEncoder.__init__`/`per_entity_mlp` as this sketch originally
+> proposed, `self_feat_aug`/`other_feat_aug` are built inside
+> `DecisionNetwork.forward()` (mirroring the ball's own §8.2 pattern) and
+> `EntityEncoder` itself was left untouched. The two open questions this
+> sketch flagged below (desired_direction/speed_mode missing for
+> other-player slots; no natural mask for a player's latent) were both
+> resolved before implementation: `PlayerFeatures` gained
+> `heading_sin/cos`/`desired_dir_x/y`/a speed-mode one-hot for every player
+> slot in a prior session (see `ai/knowledge.md`), and no masking beyond the
+> existing `exists_mask` convention turned out to be needed (a player's
+> dynamics latent is always meaningful, unlike the ball's `is_loose` gate).
+> The sketch below is kept as the original design record.
 
 Sketch only, for whoever picks this up next, once the ball version is
 validated end-to-end (trained, wired in, and shows some measurable effect —
@@ -688,9 +711,10 @@ value-loss calibration near box/boundary states — before investing further).
 Written up after actually building and iterating on §4-7/§9/§10 (the
 episode generator, dataset, network, and training script), so future work
 (especially §11's player-dynamics follow-up) starts from what's real rather
-than the original design sketch above. **§8 (live-network integration)
-remains untouched/on hold** — everything below is scoped to the standalone
-pretraining pipeline only.
+than the original design sketch above. §8 (live-network integration) was
+still on hold at the time this section was written; see §0 for its
+now-implemented status — everything below is scoped to the standalone
+pretraining pipeline only and is unaffected by that later change.
 
 ### 12.1 File layout (matches §9, confirmed as-built)
 

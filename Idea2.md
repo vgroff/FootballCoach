@@ -28,7 +28,6 @@ Notes to self:
 - GK needs fixing - he saves no shots in the close rnage scenario
 - When running these messy/random scenarios, we might need to decide (maye using a value network) whcih runs are actually good (advantage-wise and in absolute)
 
-Since the previous request explicitly said "scenarios end with: win / loss / ballout / timeout — THAT'S IT, nothing else". Is that what it said though? Or are you intentionally paraphrasing? did it specifically have "ballout (split by intentional and not intentional)" per chance? OH look, it did. Maybe you should've clarified if you were unsure
 
 
 
@@ -36,9 +35,13 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. Please do not skip any of them. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
+    - !! Check all tests pass
+    - !! Friction coefficient needs increasing 2-4x - need to retrain the physics model (ball only)
+        - doesnt seem that awful tbh, kick factor speed is like 1.3 and it looks fine. wouldnt increase it too much
+        - IS air drag stronger than frctions? Is that weird? Do some real physics on this
     - !! Broken current order stuff AI has found bugs!!
     - !! real neural net: don't normalise by pitch half diag, just normalise by base pitch half diag
-    - !! real neural net: ball spin should be normalised by a fix value rather than this random ass max_rad thing
+        - players/ball may need pitch size now
     - !! physics network
         - test quality of embedding with a small capacity (e.g. 10 neurons), newly initialised decoder + shortut switched off - how quickly can it learn? especially during demo pre-train
             - do tiny batch size for new ones, huge batch for old ones than need fine tune
@@ -46,12 +49,9 @@ Current notes:
         - consider - a tiny decoder trained to output the positions/velocities at some time horizons - then tacked on to the output in the proper network
             - maybe also have it predict time and crossing point for going out
         - Cooked idea but could be fun for later - take the ball encoder and player encoder, run trials where both move and train a decoder (tiny hidden layer, like 8 or smth) on top of both encoders to predict player-ball distance at some future time t (e.g. 0.2 and 1s and 4s), and then you can change the move order in the player encoder, and "see" player-ball distance in the future. Could then be a learnable parameter for the (self-player) policy network to see what different move orders would do, and act on that basis/affect the attention etc...
-    - !! generate a ton of demo data uisng vvgood immobile
-        - !!!!! Does it have a random seed each time???
-        - for value net pretraining + BC when we change a neural net
-        - TIMESTEPS ARNE'T UNIFORM!! - how does MC deal with this?
-
+    - TIMESTEPS ARNE'T UNIFORM!! - how does MC deal with this?
         - on debug value net - check the match logs that do poorly on invalid
+    - My hack goalkeeper should have much lower deceleration, so that when he commits to a "dive" he can't pull out easily. Maybe also faster turn speed, however that works
     - !!!!!!! Add heading to the neural network. Also increase capacity, and do BC training I guess
         - !!! heading add by just making velocity + speed a unit vector + magnitude?
     - !! Implement and try out the physics encoder thingy, just for the ball

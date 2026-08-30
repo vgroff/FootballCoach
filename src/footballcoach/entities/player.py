@@ -99,10 +99,34 @@ class Player:
     kicked_this_tick: bool = field(default=False, repr=False, compare=False)
     # Set by GetPossessionOrder / neural AI; engine fires on_tackle on next contact.
     tackle_armed: bool = field(default=False, repr=False, compare=False)
-    # Set by rules AI / neural AI during approach; engine fires kick_direct on first-touch.
-    # Analogous to tackle_armed. Reset each tick in _process_orders.
+    # Set by rules AI (orders.py's _try_push_kick, via MoveOrder /
+    # GetPossessionOrder) or neural AI (apply_nn_action.py) during approach;
+    # engine fires the kick on first-touch (_update_loose_ball_pickup),
+    # skipping CONTROLLING_BALL entirely -- a true one-touch, no
+    # control-time delay, no control_speed_multiplier slowdown. Analogous to
+    # tackle_armed. Reset each tick in _process_orders.
+    #
+    # kick_armed_direction: a 3D unit direction -> fired via
+    # Player.kick_with_direction(), the same no-ballistic-solve
+    # direct-direction kick used for every other kick (rules AI and neural
+    # AI alike), so an armed-then-triggered kick behaves identically to one
+    # taken with the ball already in hand.
+    # kick_armed_power_fraction is the FINAL value fired later via
+    # kick_with_direction's default compensate_for_run=False -- for
+    # push-kicks (orders.py's _try_push_kick) it's already run-compensated
+    # using arm-time velocity as the estimate, computed once at the point
+    # the arm decision is made, not re-compensated fresh at fire time. That
+    # matters for BC/replay consumers: bc.py's phase1_labels() reads this
+    # same field on approach ("armed but not yet fired") ticks, so it must
+    # already equal what actually gets fired -- compensating at fire time
+    # instead would make the recorded "intent" and the "actual kick" carry
+    # two different power values for the same touch, a real discontinuity
+    # a learner would have to paper over. Arm and fire are typically the
+    # same or an adjacent tick, so using arm-time velocity as the estimate
+    # costs essentially no accuracy for the win of never diverging from the
+    # label at all.
     kick_armed: bool = field(default=False, repr=False, compare=False)
-    kick_armed_aim_point: "Vector3 | None" = field(default=None, repr=False, compare=False)
+    kick_armed_direction: "Vector3 | None" = field(default=None, repr=False, compare=False)
     kick_armed_power_fraction: float = field(default=0.85, repr=False, compare=False)
     kick_armed_spin: "Vector3 | None" = field(default=None, repr=False, compare=False)
     # Set by _update_loose_ball_pickup when CONTROLLING_BALL begins; read by kick_direct/
@@ -133,6 +157,16 @@ class Player:
     # engine applies them via step_player_towards.  desired_speed_mode=None means no movement.
     desired_direction: Vector3 = field(default_factory=Vector3.zero, repr=False, compare=False)
     desired_speed_mode: object | None = field(default=None, repr=False, compare=False)  # SpeedMode at runtime
+
+    # Mirrors desired_speed_mode but is NEVER reset to None by
+    # match._apply_movement() -- it always holds whichever SpeedMode was most
+    # recently actually consumed, surviving across the ticks where
+    # desired_speed_mode reads back None. Exists solely so ai/obs/encoder.py
+    # can read "what speed mode is this player's last decision currently
+    # asking for" as an observation input (desired_speed_mode itself is
+    # unusable for that -- see match._apply_movement()). Never read by any
+    # engine/order logic, only by the AI observation layer.
+    last_desired_speed_mode: object | None = field(default=None, repr=False, compare=False)  # SpeedMode at runtime
 
     radius_m: float = 0.3
     height_m: float = 1.8
@@ -178,6 +212,38 @@ class Player:
         """Issue a KickOrder. Used by the rules-based AI and human input only."""
         from footballcoach.orders import KickOrder
         self.current_order = KickOrder(aim_point=aim_point, power_fraction=power_fraction, spin=spin)
+
+    def _finish_kick(
+        self, match: "Match", is_first_touch: bool, log_label: str,
+        log_power_fraction: float, adjusted_power: float, spin: "Vector3",
+    ) -> None:
+        """Shared bookkeeping tail for both direct-physics kick methods
+        (kick_direct, kick_with_direction), called AFTER the ball has
+        actually been launched (kick_ball/kick_ball_from_direction already
+        ran and set match.ball.velocity). The two callers differ only in
+        HOW they aim (ballistic solve to a point vs. a raw direction,
+        with/without run compensation) -- everything downstream of "the
+        ball is now in flight" is identical: clear first-touch control
+        state, record last_kick_* for BC/replay consumers, set
+        kicked_this_tick, and fire on_kick.
+
+        log_power_fraction is the ORIGINAL (pre-compensation) power_fraction
+        the caller passed in, for the debug log line; last_kick_power_fraction
+        stores adjusted_power (what was actually passed to the physics
+        function), matching each method's prior individual behaviour.
+        """
+        if is_first_touch:
+            self.state = PlayerState.ACTIVE
+            self.state_timer_s = 0.0
+        match._log_debug(f"{self.player_id} kicked ({log_label})  power={log_power_fraction:.2f}")
+        self.kicked_this_tick = True
+        _vel = match.ball.velocity
+        _vel_len = _vel.length()
+        self.last_kick_direction = (_vel * (1.0 / _vel_len)) if _vel_len > 1e-6 else None
+        self.last_kick_power_fraction = float(adjusted_power)
+        self.last_kick_spin = spin
+        if self.on_kick is not None:
+            self.on_kick(self)
 
     def kick_direct(self, match: "Match", aim_point: Vector3, power_fraction: float, spin: Vector3, compensate_for_run: bool = True) -> None:
         """Execute kick physics immediately WITHOUT issuing a KickOrder.
@@ -229,22 +295,39 @@ class Player:
             kicker_velocity=self.velocity,
             kicker_top_speed_mps=top_speed,
         )
-        if is_first_touch:
-            self.state = PlayerState.ACTIVE
-            self.state_timer_s = 0.0
-        match._log_debug(f"{self.player_id} kicked (direct)  power={power_fraction:.2f}")
-        self.kicked_this_tick = True
-        _vel = match.ball.velocity
-        _vel_len = _vel.length()
-        self.last_kick_direction = (_vel * (1.0 / _vel_len)) if _vel_len > 1e-6 else None
-        self.last_kick_power_fraction = float(adjusted_power)  # what was actually passed to kick_ball
-        self.last_kick_spin = spin
-        if self.on_kick is not None:
-            self.on_kick(self)
+        self._finish_kick(match, is_first_touch, "direct", power_fraction, adjusted_power, spin)
 
-    def kick_with_direction(self, match: "Match", direction_3d: "Vector3", power_fraction: float, spin: "Vector3") -> None:
-        """Execute a kick with an explicit 3D unit direction vector (no ballistic solve). Neural network only."""
-        from footballcoach.engine.kicking import kick_ball_from_direction, firsttime_difficulty_multiplier
+    def kick_with_direction(
+        self, match: "Match", direction_3d: "Vector3", power_fraction: float, spin: "Vector3",
+        compensate_for_run: bool = False,
+    ) -> None:
+        """Execute a kick with an explicit 3D unit direction vector (no ballistic solve).
+
+        Used by the neural network (default compensate_for_run=False --
+        raw power, unchanged) and by rules-AI push-kicks (orders.py's
+        _try_push_kick, compensate_for_run=True).
+
+        compensate_for_run=False (default): power_fraction is used raw, so
+        sprinting in line with the kick direction adds the full running
+        boost to ball speed (kick_ball_from_direction's own run_mult,
+        uncancelled) -- same semantics kick_direct's compensate_for_run=False
+        has.
+        compensate_for_run=True: pre-divides power_fraction by run_mult (same
+        formula/inputs kick_ball_from_direction will independently recompute
+        internally) so the ball leaves at the intended speed regardless of
+        running direction -- mirrors kick_direct's own compensation exactly.
+        Without this, a push-kick fired while sprinting dead-in-line with its
+        own target (guaranteed by _try_push_kick's heading gate) launches at
+        up to (1 + running_power_coefficient) x the speed speed_factor alone
+        implies -- confirmed empirically: with running_power_coefficient=0.6,
+        a push-kick's actual launch speed was ~1.5x its intended
+        (reference_speed * speed_factor) value, making speed_factor changes
+        alone barely move the observed kick distance.
+        """
+        from footballcoach.engine.kicking import (
+            kick_ball_from_direction, firsttime_difficulty_multiplier,
+            running_power_multiplier, compensate_power_for_run_mult,
+        )
         from footballcoach.engine.movement import effective_top_speed
         if match.ball.possessed_by != self.player_id:
             return
@@ -257,11 +340,19 @@ class Player:
             match.movement_params, self.attributes.top_speed, self.stamina,
             has_ball=True, ball_control_attr=self.attributes.ball_control,
         )
+        if compensate_for_run:
+            run_mult = running_power_multiplier(
+                match.kicking_params.running_power_coefficient, self.velocity,
+                direction_3d, top_speed,
+            )
+            adjusted_power = compensate_power_for_run_mult(power_fraction, run_mult)
+        else:
+            adjusted_power = power_fraction
         kick_ball_from_direction(
             match.ball,
             self.position,
             direction_3d,
-            power_fraction,
+            adjusted_power,
             self.attributes.kick_precision,
             self.attributes.kick_power,
             spin,
@@ -272,18 +363,7 @@ class Player:
             kicker_velocity=self.velocity,
             kicker_top_speed_mps=top_speed,
         )
-        if is_first_touch:
-            self.state = PlayerState.ACTIVE
-            self.state_timer_s = 0.0
-        match._log_debug(f"{self.player_id} kicked (direct 3D)  power={power_fraction:.2f}")
-        self.kicked_this_tick = True
-        _vel = match.ball.velocity
-        _vel_len = _vel.length()
-        self.last_kick_direction = (_vel * (1.0 / _vel_len)) if _vel_len > 1e-6 else None
-        self.last_kick_power_fraction = float(power_fraction)
-        self.last_kick_spin = spin
-        if self.on_kick is not None:
-            self.on_kick(self)
+        self._finish_kick(match, is_first_touch, "direct 3D", power_fraction, adjusted_power, spin)
 
     def pass_ball(
         self,

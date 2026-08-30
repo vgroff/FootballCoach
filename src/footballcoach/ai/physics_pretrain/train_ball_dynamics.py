@@ -185,31 +185,63 @@ def compute_per_episode_loss(
 def _crossing_head_loss(
     model: BallDynamicsAutoencoder, latent: torch.Tensor, pos_all: np.ndarray, dt_all: np.ndarray,
     mask_all: np.ndarray, row_idx: np.ndarray, device: torch.device,
-    pos_loss_weight: float = 1.0, dt_loss_weight: float = 1.0, trust_negatives: bool = True,
-) -> tuple[torch.Tensor, float, float, float, float]:
-    """``model.crossing_head``'s loss for one batch: position MSE (summed
-    over x/y ONLY -- height is deliberately excluded, MASKED to rows where
-    ``mask_all`` is True -- an episode with no crossing AHEAD of whichever
-    pseudo-start these targets were built relative to has no meaningful
-    crossing position to regress toward) plus delta_t MSE (UNMASKED, against
-    ``dt_all``'s -1 sentinel for those same rows -- see ``BallDynamicsDataset``'s
-    docstring for why delta_t is trained on the sentinel directly rather
-    than also being masked).
+    pos_loss_weight: float = 1.0, crosses_loss_weight: float = 1.0, dt_loss_weight: float = 1.0,
+    dt_norm_s: float = 1.0, trust_negatives: bool = True,
+) -> tuple[torch.Tensor, float, float, float, float, float, float, float]:
+    """``model.crossing_head``'s loss for one batch -- THREE separate terms
+    (near-verbatim port of ``train_player_dynamics._crossing_head_loss``'s
+    identical split, see its docstring for the original rationale and the
+    empirical evidence that motivated it):
 
-    ``pos_loss_weight``/``dt_loss_weight`` (both default 1.0, i.e. plain
-    sum, the original behaviour) scale the two terms BEFORE they're combined
-    into the returned ``loss`` -- split out because the two terms sit on
-    very different natural scales: position error is in normalized (roughly
-    O(1)) units like everything else in this pipeline, but delta_t is RAW,
-    UNNORMALIZED seconds (spanning ``[-1, max(horizons_s)]``), so its
-    squared error can dominate the combined loss purely from unit choice,
-    not actual difficulty -- see ``physics_pretrain.ball.crossing_dt_loss_
-    weight``'s config comment. Callers apply these as ``crossing_pos_loss_
-    weight``/``crossing_dt_loss_weight`` from config; there's no longer a
-    separate OUTER weight multiplying the whole head's loss (the weighting
-    happens in here, once). Direct port of ``train_player_dynamics.
-    _crossing_head_loss``'s identical split -- see its docstring for the
-    original rationale.
+    1. Position MSE (x/y ONLY -- height is deliberately excluded, MASKED to
+       rows where ``mask_all`` is True -- an episode with no crossing AHEAD
+       of whichever pseudo-start these targets were built relative to has no
+       meaningful crossing position to regress toward).
+    2. ``crosses_logit`` BCE-with-logits: "does this row have a real
+       crossing/already-crossed instance at all" -- target is ``dt_all !=
+       -1.0`` (true for BOTH a genuine future crossing AND an already-
+       crossed/already-out-of-bounds row, false only for the genuinely-
+       never-happens case). UNMASKED -- every row has a well-defined yes/no
+       answer to this, unlike position.
+    3. ``dt`` regression, MASKED to the SAME ``dt_all != -1.0`` rows the
+       classifier target uses (NOT ``mask_all`` -- deliberately wider,
+       includes already-crossed rows too) -- trained on the real value only
+       (0 for already-crossed, a real positive delta_t for a genuine future
+       crossing), with the -1 sentinel excluded from the regression entirely
+       rather than mixed in (replaces the OLD single unmasked delta_t
+       regression against the -1 sentinel directly).
+
+    This 3-way split (rather than one combined delta_t regression against
+    the -1 sentinel) exists because the single-regression version forced
+    MSE to blend two qualitatively different signals -- "will it cross at
+    all" and "when, given it crosses" -- into one number, landing
+    confidently on neither for any row the network was unsure about.
+    Concretely: a real-match-data evaluation of a checkpoint using the
+    pre-split head (``diagnose_crossing_head.py``, treating
+    ``predicted delta_t > 0`` as an implicit "will cross soon" classifier)
+    came back at only ~60% boolean accuracy on `invalid`-outcome episodes
+    (untouched free-flight physics, i.e. exactly the case this head should
+    be good at) -- which is what prompted this split.
+
+    ``dt_norm_s`` (default 1.0 -- no-op) divides ``dt_all`` by this before
+    the network's raw ``dt`` output is compared to it (on the now-masked,
+    sentinel-free regression), so the MODEL trains against a roughly-O(1)
+    target instead of raw seconds -- same convention as every OTHER
+    regression target in this pipeline. Callers pass ``max(horizons_s)``
+    (see ``train()``'s ``crossing_dt_norm_s``) -- see ``train_player_
+    dynamics._crossing_head_loss``'s identical ``dt_norm_s`` docstring for
+    why this (not ``dt_loss_weight``) is the real fix for the raw-unit
+    scale mismatch under Adam. ``dt_mae_mean`` (see Returns below) is
+    converted back to real seconds for logging regardless of this
+    normalization.
+
+    ``pos_loss_weight``/``crosses_loss_weight``/``dt_loss_weight`` (all
+    default 1.0, i.e. plain sum) scale the three terms BEFORE they're
+    combined into the returned ``loss``. Callers apply these as
+    ``crossing_pos_loss_weight``/``crossing_crosses_loss_weight``/
+    ``crossing_dt_loss_weight`` from config; there's no separate OUTER
+    weight multiplying the whole head's loss (the weighting happens in here,
+    once).
 
     ``pos_all``/``dt_all``/``mask_all`` are plain arrays (not tied to a
     specific dataset attribute) so this same function serves BOTH the main
@@ -222,85 +254,121 @@ def _crossing_head_loss(
     indexing convention; this function doesn't care which one it is.
 
     ``trust_negatives`` (default True -- unchanged behaviour): whether a
-    NEGATIVE ``dt_all`` entry (the ``-1.0`` "never crosses" sentinel) is
-    trustworthy enough to train ``dt_loss`` against. ``ball_episode_gen.
-    generate_episode`` only simulates each episode for ``max(horizons_s)``
-    seconds -- if no out-of-bounds/goal event happens in that fixed window,
-    ``crossing_time_s`` (and therefore ``dt_all``) gets the ``-1.0``/inf
-    "never" sentinel regardless of whether a real event would have
-    happened just PAST the window. That's a RIGHT-CENSORED observation,
-    not a verified "never": at t=0 it's a complete, uncensored fact (the
-    full ``max(horizons_s)``-second window was observed), but at a
+    NEGATIVE ``crosses_target`` (i.e. ``dt_all == -1.0``, "never crosses") is
+    trustworthy enough to train ``crosses_logit`` against. ``ball_episode_
+    gen.generate_episode`` only simulates each episode for
+    ``max(horizons_s)`` seconds -- if no out-of-bounds/goal event happens in
+    that fixed window, ``crossing_time_s`` (and therefore ``dt_all``) gets
+    the ``-1.0``/inf "never" sentinel regardless of whether a real event
+    would have happened just PAST the window. That's a RIGHT-CENSORED
+    observation, not a verified "never": at t=0 it's a complete, uncensored
+    fact (the full ``max(horizons_s)``-second window was observed), but at a
     horizon-pass pseudo-start ``h`` the REMAINING observed window is only
-    ``max(horizons_s) - horizons_s[h]`` seconds -- shorter, and shrinking
-    as ``h`` grows -- while ``crossing_head`` has no input telling it which
+    ``max(horizons_s) - horizons_s[h]`` seconds -- shorter, and shrinking as
+    ``h`` grows -- while ``crossing_head`` has no input telling it which
     pseudo-start it's being asked from (it only sees the latent, i.e.
     current position/velocity/etc.). A ball whose true exit happens just
-    after the recording ends gets trained toward ``-1.0`` at EVERY
-    pseudo-start, contradicting a possibly-correct physical extrapolation
-    purely because the recording stopped first. POSITIVE rows (``dt_all !=
-    -1.0`` -- a genuine future crossing or an already-out/scored row) stay
-    hard, unconditionally verified facts at any horizon and are never
-    affected by this. Set False (only ever passed by horizon-pass call
-    sites; t=0 stays at the default True) to exclude negative rows from
-    ``dt_loss`` entirely rather than training against a possibly-wrong
-    censored target -- positive rows there are untouched. Does not affect
-    ``pos_loss``, which is already masked to positive-only rows (``mask_
-    all``) regardless of this flag, so it was never exposed to this
-    censoring issue.
+    after the recording ends gets labelled "never" at EVERY pseudo-start,
+    contradicting a possibly-correct physical extrapolation purely because
+    the recording stopped first. POSITIVE labels stay hard, unconditionally
+    verified facts at any horizon and are never affected by this. Set False
+    (only ever passed by horizon-pass call sites; t=0 stays at the default
+    True) to exclude negative rows from the ``crosses_logit`` BCE entirely
+    rather than training against a possibly-wrong censored label -- positive
+    rows there are untouched. Does not affect ``pos_loss``/``dt_loss``: both
+    are already masked to positive-only rows regardless of this flag, so
+    they were never exposed to this censoring issue.
 
-    Returns ``(loss, pos_dist_mean, dt_mae_mean)`` -- the last two are
-    plain floats (not backpropagated) for per-epoch reporting: mean
-    Euclidean crossing-position error (x/y only) over the rows that actually
+    Returns ``(loss, pos_dist_mean, dt_mae_mean, pos_loss_val,
+    crosses_loss_val, dt_loss_val, crosses_acc, crosses_recall)`` --
+    ``pos_dist_mean``/``dt_mae_mean``/``crosses_acc``/``crosses_recall`` are
+    plain floats (not backpropagated) for per-epoch reporting, UNWEIGHTED:
+    mean Euclidean crossing-position error over the rows that actually
     crossed (0.0 if none did, matching the masked loss's own 0-numerator/
-    1-denominator convention), and mean absolute delta_t error over ALL rows
-    (sentinel included, since that's what the loss itself trains against).
-    ``loss`` itself is the WEIGHTED sum (unlike ``pos_dist_mean``/``dt_mae_
-    mean``, which stay raw/unweighted so they're directly comparable across
-    different weight settings) -- so the logged ``train_crossing_loss=``/
-    ``val_crossing_loss=`` fields now reflect ``pos_loss_weight``/``dt_loss_
-    weight`` too, same as ``train_player_dynamics.py``'s identical field.
-    ``pos_loss_val``/``dt_loss_val`` are the two WEIGHTED sub-terms that sum
-    to ``loss`` (as plain floats), letting callers report how much of
-    ``crossing_head``'s own loss comes from each half -- see
-    ``_log_aux_diagnostics``'s per-head pos/dt breakdown line.
+    1-denominator convention), mean absolute delta_t error over the
+    ``dt_all != -1.0`` rows (matching what the regression itself now trains
+    against, converted back to real seconds), classification accuracy of
+    ``crosses_logit`` against its target (masked to match whatever
+    ``crosses_loss`` actually trained on -- see ``trust_negatives`` above),
+    and RECALL on the positive class only (``crosses_target == 1``: TP /
+    (TP + FN), i.e. of the rows that really do cross, what fraction the
+    classifier actually catches -- always computed the same way regardless
+    of ``trust_negatives``, since positive rows are never right-censored).
+    ``crosses_acc`` alone can look fine on a heavily negative-skewed
+    population even while recall on the rows that matter is poor -- a real
+    checkpoint showed exactly this (39% "accuracy" against an all-positive
+    slice of real match data, which was really just a low recall number).
+    ``pos_loss_val``/``crosses_loss_val``/``dt_loss_val`` are the three
+    WEIGHTED sub-terms that sum to ``loss``, letting callers report how much
+    of ``crossing_head``'s own loss comes from each part -- see
+    ``_log_aux_diagnostics``'s per-head split line.
     """
     crossing_pred = model.crossing_head(latent)
     c_pos = torch.from_numpy(pos_all[row_idx]).to(device)
-    c_dt = torch.from_numpy(dt_all[row_idx]).to(device)
+    c_dt_raw = torch.from_numpy(dt_all[row_idx]).to(device)
     c_mask = torch.from_numpy(mask_all[row_idx]).to(device)
     mask_f = c_mask.float()
     denom = mask_f.sum().clamp_min(1.0)
     pos_err = crossing_pred[:, 0:2] - c_pos
     pos_loss = (pos_err.pow(2).sum(dim=-1) * mask_f).sum() / denom
+
+    crosses_target = (c_dt_raw != -1.0).float()
+    crosses_logit = crossing_pred[:, 2]
     if trust_negatives:
-        dt_loss = F.mse_loss(crossing_pred[:, 2], c_dt)
+        crosses_loss = F.binary_cross_entropy_with_logits(crosses_logit, crosses_target)
     else:
-        # See this function's own trust_negatives docstring -- a -1.0
-        # ("never crosses") target here is right-censored, not verified,
-        # so it's excluded from dt_loss entirely rather than trained
-        # against. Positive rows (c_dt != -1.0) are untouched.
-        dt_target_mask = (c_dt != -1.0).float()
-        dt_target_denom = dt_target_mask.sum().clamp_min(1.0)
-        dt_loss = ((crossing_pred[:, 2] - c_dt).pow(2) * dt_target_mask).sum() / dt_target_denom
+        # See this function's own trust_negatives docstring -- a negative
+        # label here is right-censored, not verified, so it's excluded
+        # from the BCE entirely rather than trained against. Positive
+        # rows (crosses_target == 1) are untouched.
+        crosses_denom = crosses_target.sum().clamp_min(1.0)
+        crosses_loss = (
+            F.binary_cross_entropy_with_logits(crosses_logit, crosses_target, reduction="none") * crosses_target
+        ).sum() / crosses_denom
+
+    dt_mask_f = crosses_target
+    dt_denom = dt_mask_f.sum().clamp_min(1.0)
+    dt_pred = crossing_pred[:, 3]
+    c_dt_norm = c_dt_raw / dt_norm_s
+    dt_loss = ((dt_pred - c_dt_norm).pow(2) * dt_mask_f).sum() / dt_denom
+
     weighted_pos_loss = pos_loss_weight * pos_loss
+    weighted_crosses_loss = crosses_loss_weight * crosses_loss
     weighted_dt_loss = dt_loss_weight * dt_loss
-    loss = weighted_pos_loss + weighted_dt_loss
+    loss = weighted_pos_loss + weighted_crosses_loss + weighted_dt_loss
     with torch.no_grad():
         pos_dist_mean = float((torch.linalg.norm(pos_err, dim=-1) * mask_f).sum().item() / float(denom.item()))
-        # Masked to match whatever dt_loss actually trained on above --
+        # Converted back to real seconds (undoing dt_norm_s), masked to the
+        # same dt_all != -1.0 rows the regression itself trains against.
+        dt_mae_mean = float(((dt_pred - c_dt_norm).abs() * dt_mask_f).sum().item() / float(dt_denom.item())) * dt_norm_s
+        # Masked to match whatever crosses_loss actually trained on above --
         # unmasked (all rows) when trust_negatives=True, positive-rows-only
-        # when False, so a caller watching this metric sees error over the
-        # SAME population the gradient came from rather than a figure
-        # diluted by rows deliberately excluded from training (see
-        # trust_negatives's own docstring for why those are excluded).
-        if trust_negatives:
-            dt_mae_mean = float((crossing_pred[:, 2] - c_dt).abs().mean().item())
-        else:
-            dt_mae_mean = float(((crossing_pred[:, 2] - c_dt).abs() * dt_target_mask).sum().item() / float(dt_target_denom.item()))
+        # when False, so a caller watching this metric sees accuracy over
+        # the SAME population the gradient came from rather than a figure
+        # diluted by rows that were deliberately excluded from training
+        # (see trust_negatives's own docstring for why those are excluded).
+        crosses_acc_mask = crosses_target if not trust_negatives else torch.ones_like(crosses_target)
+        crosses_acc_denom = crosses_acc_mask.sum().clamp_min(1.0)
+        crosses_correct = ((crosses_logit > 0) == (crosses_target > 0.5)).float()
+        crosses_acc = float((crosses_correct * crosses_acc_mask).sum().item() / float(crosses_acc_denom.item()))
+        # Recall on the POSITIVE class only (crosses_target == 1: a genuine
+        # future crossing or an already-crossed row) -- TP / (TP + FN),
+        # i.e. of the rows that really do cross, what fraction does the
+        # classifier actually catch. Distinct from crosses_acc: accuracy can
+        # look fine on a heavily negative-skewed population (most rows,
+        # across all episode types, never approach a crossing) even while
+        # recall on the rows that matter is poor -- exactly what a real
+        # checkpoint showed (diagnose_crossing_head.py against `invalid`
+        # episodes, i.e. rows that are ALL genuine positives: 39% "accuracy"
+        # there was really just recall, and a low one). Positive rows are
+        # never right-censored (see trust_negatives's docstring), so this is
+        # always computed the same way regardless of trust_negatives.
+        crosses_recall_denom = crosses_target.sum().clamp_min(1.0)
+        crosses_recall = float((crosses_correct * crosses_target).sum().item() / float(crosses_recall_denom.item()))
         pos_loss_val = float(weighted_pos_loss.item())
+        crosses_loss_val = float(weighted_crosses_loss.item())
         dt_loss_val = float(weighted_dt_loss.item())
-    return loss, pos_dist_mean, dt_mae_mean, pos_loss_val, dt_loss_val
+    return loss, pos_dist_mean, dt_mae_mean, pos_loss_val, crosses_loss_val, dt_loss_val, crosses_acc, crosses_recall
 
 
 def _resting_head_loss(
@@ -553,31 +621,58 @@ def _build_horizon_bundle(
 
 
 def _migrate_crossing_head_state_dict(state_dict: dict, model: BallDynamicsAutoencoder) -> dict:
-    """Backward-compat shim for checkpoints saved when ``crossing_head`` had
-    4 outputs (``pos_x, pos_y, height, delta_t``) -- before height was
-    dropped (see ``BallDynamicsAutoencoder``'s docstring, current layout
-    ``pos_x, pos_y, delta_t``). Drops the old height row (index 2) from
-    ``crossing_head.weight``/``.bias`` -- everything else (encoder, decoder)
-    is untouched -- so an old checkpoint can still be resumed via
-    ``--init-checkpoint`` instead of erroring on a plain shape mismatch.
-    Returns a NEW dict (doesn't mutate ``state_dict``); a no-op if shapes
-    already match (nothing to migrate) or ``crossing_head.weight`` isn't
-    present at all (checkpoint predates the head entirely -- an ordinary
-    ``load_state_dict`` error surfaces normally in that case, same as any
-    other genuinely-incompatible checkpoint).
+    """Backward-compat shim for TWO earlier ``crossing_head`` shapes, applied
+    in sequence (a checkpoint could in principle need both, though in
+    practice any real checkpoint only ever needs one):
+
+    1. 4 outputs (``pos_x, pos_y, height, delta_t``) -- before height was
+       dropped -- to 3 (``pos_x, pos_y, delta_t``). Drops the old height row
+       (index 2).
+    2. 3 outputs (``pos_x, pos_y, delta_t``) -- before ``delta_t`` was split
+       into a separate ``crosses_logit`` classifier + masked ``delta_t``
+       regression (see ``_crossing_head_loss``'s docstring for why -- direct
+       port of ``train_player_dynamics``'s identical split, which hit the
+       same single-regression-blending problem first) -- to 4 (``pos_x,
+       pos_y, crosses_logit, delta_t``), the CURRENT layout. Preserves the
+       still-valid ``pos_x``/``pos_y`` rows; the two NEW rows
+       (``crosses_logit``/``delta_t``) are left at the CURRENT model's own
+       fresh init -- there's no sensible way to migrate the OLD single
+       ``delta_t`` value into either new output alone, since it used to
+       blend both signals into one number.
+
+    Everything else (encoder, decoder) is untouched in both cases -- so an
+    old checkpoint can still be resumed via ``--init-checkpoint`` instead of
+    erroring on a plain shape mismatch. Returns a NEW dict (doesn't mutate
+    ``state_dict``); a no-op if shapes already match (nothing to migrate) or
+    ``crossing_head.weight`` isn't present at all (checkpoint predates the
+    head entirely -- an ordinary ``load_state_dict`` error surfaces normally
+    in that case, same as any other genuinely-incompatible checkpoint).
     """
     key_w, key_b = "crossing_head.weight", "crossing_head.bias"
     if key_w not in state_dict:
         return state_dict
-    old_out, new_out = state_dict[key_w].shape[0], model.crossing_head.weight.shape[0]
-    if old_out == 4 and new_out == 3:
-        state_dict = dict(state_dict)
+    state_dict = dict(state_dict)
+    old_out = state_dict[key_w].shape[0]
+    if old_out == 4 and model.crossing_head.weight.shape[0] in (3, 4):
         keep_rows = [0, 1, 3]  # pos_x, pos_y, delta_t -- drops row 2 (height)
         state_dict[key_w] = state_dict[key_w][keep_rows]
         state_dict[key_b] = state_dict[key_b][keep_rows]
+        old_out = 3
         log.info(
             "Migrated checkpoint's crossing_head from 4 outputs (pos_x, pos_y, height, delta_t) "
             "to 3 (pos_x, pos_y, delta_t) -- dropped the height row."
+        )
+    new_out = model.crossing_head.weight.shape[0]
+    if old_out == 3 and new_out == 4:
+        fresh_w = model.crossing_head.weight.detach().clone()
+        fresh_b = model.crossing_head.bias.detach().clone()
+        fresh_w[0:2] = state_dict[key_w][0:2]
+        fresh_b[0:2] = state_dict[key_b][0:2]
+        state_dict[key_w] = fresh_w
+        state_dict[key_b] = fresh_b
+        log.info(
+            "Migrated checkpoint's crossing_head from 3 outputs (pos_x, pos_y, delta_t) to 4 (pos_x, pos_y, "
+            "crosses_logit, delta_t) -- kept pos_x/pos_y, reset crosses_logit/delta_t to fresh init."
         )
     return state_dict
 
@@ -1302,22 +1397,29 @@ def train(
     # comparable to other runs.
     spin_weight = float(cfg.get("spin_loss_weight", 1.0))
 
-    # Weight on model.crossing_head's own loss (crossing position, masked to
-    # episodes that actually went oob/scored within the simulated window,
-    # plus unmasked delta_t against the ds.crossing_dt -1-sentinel target --
-    # see BallDynamicsDataset's docstring). Split into separate position/
-    # delta_t weights (rather than one combined weight applied to both) --
-    # see _crossing_head_loss's docstring for why: delta_t is raw,
-    # unnormalized seconds, a very different natural scale from position's
-    # roughly-O(1) normalized units, so one shared weight can't tune them
-    # independently. Direct port of train_player_dynamics.py's identical
-    # split. 0.0 on BOTH fully disables the head's gradient, same convention
-    # as bce_weight/spin_weight above. `has_crossing_data` guards every
-    # crossing-head call site below: a dataset built without crossings/
-    # crossing_times (e.g. a hand-built one in a test) simply skips the head
-    # entirely rather than crashing on a None array.
+    # Weight on model.crossing_head's own loss -- THREE terms as of the
+    # classifier/regression split (direct port of train_player_dynamics.py's
+    # identical split, see _crossing_head_loss's docstring for the full
+    # rationale): crossing position (masked to episodes that actually went
+    # oob/scored within the simulated window), crosses_logit (BCE-with-
+    # logits "does this row have a real crossing at all", target
+    # crossing_dt != -1), and delta_t (masked regression over the SAME
+    # crossing_dt != -1 rows, no -1 sentinel mixed in -- unlike the OLD
+    # single-regression version this replaces). `has_crossing_data` guards
+    # every crossing-head call site below: a dataset built without
+    # crossings/crossing_times (e.g. a hand-built one in a test) simply
+    # skips the head entirely rather than crashing on a None array.
     crossing_pos_weight = float(cfg.get("crossing_pos_loss_weight", 1.0))
+    crossing_crosses_weight = float(cfg.get("crossing_crosses_loss_weight", 1.0))
     crossing_dt_weight = float(cfg.get("crossing_dt_loss_weight", 1.0))
+    # Divides crossing_dt (raw seconds) by this before it reaches the dt
+    # regression, so crossing_head's dt output trains against a roughly-O(1)
+    # target instead of raw seconds spanning [-1, max(horizons_s)] -- same
+    # reasoning/mechanism as train_player_dynamics.py's identical
+    # crossing_dt_norm_s (see _crossing_head_loss's dt_norm_s docstring for
+    # why this, not crossing_dt_loss_weight, is the actual fix for the
+    # raw-unit scale mismatch under Adam).
+    crossing_dt_norm_s = float(max(cfg["horizons_s"]))
     has_crossing_data = ds.crossing_pos is not None
     if has_crossing_data:
         # Episodes that started ALREADY out of bounds/in a goal mouth (see
@@ -1611,6 +1713,34 @@ def train(
                             # ever changes).
                             if "initial_lr" not in keep:
                                 group.pop("initial_lr", None)
+                        # optimizer.load_state_dict() maps saved per-parameter
+                        # moment state (exp_avg/exp_avg_sq) POSITIONALLY, with
+                        # NO shape check -- it happily restores a stale-shaped
+                        # tensor and only crashes much LATER, inside Adam's
+                        # internal foreach op on the first optimizer.step()
+                        # that touches it (a RuntimeError far from this
+                        # try/except, which only wraps load_state_dict()
+                        # itself). This happens for real whenever a model-side
+                        # migration changes a parameter's shape (e.g.
+                        # crossing_head widened 3->4 outputs when delta_t was
+                        # split into a classifier + masked regression -- see
+                        # _migrate_crossing_head_state_dict) but the
+                        # CHECKPOINT's optimizer state still reflects the old
+                        # shape. Reset (not skip-the-whole-restore) so every
+                        # OTHER parameter unaffected by the resize still
+                        # resumes its real momentum normally.
+                        _n_shape_reset = 0
+                        for _p, _state in list(optimizer.state.items()):
+                            if "exp_avg" in _state and _state["exp_avg"].shape != _p.shape:
+                                optimizer.state[_p] = {}
+                                _n_shape_reset += 1
+                        if _n_shape_reset:
+                            log.info(
+                                f"Reset Adam moment state for {_n_shape_reset} parameter(s) whose "
+                                "checkpoint-saved shape no longer matches this run's model (e.g. "
+                                "crossing_head widened) -- those start fresh; every other parameter "
+                                "resumed normally."
+                            )
                         log.info(
                             "Resumed Adam moment state (exp_avg/exp_avg_sq/step) from checkpoint -- "
                             "lr/betas/weight_decay kept at this run's configured values"
@@ -2159,8 +2289,10 @@ def train(
         Returns a dict: ``mean_t0_loss``, ``t0_means``, ``t0_r2``, ``t0_cls``
         (t0's own diagnostics, unrelated to anything else); ``mean_pair_loss``
         (masked mean pair loss); and RAW per-batch lists --
-        ``crossing_losses``/``crossing_pos_dists``/``crossing_dt_maes``,
-        ``resting_losses``/``resting_pos_dists`` -- deliberately NOT
+        ``crossing_losses``/``crossing_pos_dists``/``crossing_dt_maes``/
+        ``crossing_crosses_accs``/``crossing_crosses_recalls``,
+        ``resting_losses``/``resting_pos_dists``
+        -- deliberately NOT
         pre-averaged here, since callers blend these into the SAME
         accumulator as the main task's own t=0 crossing/resting usage
         (matching the training side's convention of one combined
@@ -2177,7 +2309,10 @@ def train(
         crossing_losses: list[float] = []
         crossing_pos_dists: list[float] = []
         crossing_dt_maes: list[float] = []
+        crossing_crosses_accs: list[float] = []
+        crossing_crosses_recalls: list[float] = []
         crossing_pos_losses: list[float] = []
+        crossing_crosses_losses: list[float] = []
         crossing_dt_losses: list[float] = []
         resting_losses: list[float] = []
         resting_pos_dists: list[float] = []
@@ -2223,15 +2358,19 @@ def train(
                         pair_losses.append(float(pair_loss.item()))
 
                     if has_crossing_data:
-                        crossing_loss_h, pos_dist_mean_h, dt_mae_mean_h, pos_loss_h, dt_loss_h = _crossing_head_loss(
+                        crossing_loss_h, pos_dist_mean_h, dt_mae_mean_h, pos_loss_h, crosses_loss_h, dt_loss_h, crosses_acc_h, crosses_recall_h = _crossing_head_loss(
                             model, latent, crossing_pos_here, horizon_bundle["crossing_dt"][h_idx],
                             horizon_bundle["crossing_valid"][h_idx], row_idx, device,
-                            pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight, trust_negatives=False,
+                            pos_loss_weight=crossing_pos_weight, crosses_loss_weight=crossing_crosses_weight,
+                            dt_loss_weight=crossing_dt_weight, dt_norm_s=crossing_dt_norm_s, trust_negatives=False,
                         )
                         crossing_losses.append(float(crossing_loss_h.item()))
                         crossing_pos_dists.append(pos_dist_mean_h)
                         crossing_dt_maes.append(dt_mae_mean_h)
+                        crossing_crosses_accs.append(crosses_acc_h)
+                        crossing_crosses_recalls.append(crosses_recall_h)
                         crossing_pos_losses.append(pos_loss_h)
+                        crossing_crosses_losses.append(crosses_loss_h)
                         crossing_dt_losses.append(dt_loss_h)
 
                     resting_loss_h, resting_pos_dist_mean_h = _resting_head_loss(
@@ -2254,7 +2393,10 @@ def train(
             "crossing_losses": crossing_losses,
             "crossing_pos_dists": crossing_pos_dists,
             "crossing_dt_maes": crossing_dt_maes,
+            "crossing_crosses_accs": crossing_crosses_accs,
+            "crossing_crosses_recalls": crossing_crosses_recalls,
             "crossing_pos_losses": crossing_pos_losses,
+            "crossing_crosses_losses": crossing_crosses_losses,
             "crossing_dt_losses": crossing_dt_losses,
             "resting_losses": resting_losses,
             "resting_pos_dists": resting_pos_dists,
@@ -2334,7 +2476,10 @@ def train(
         train_crossing_losses: list[float] = []
         train_crossing_pos_dist: list[float] = []
         train_crossing_dt_mae: list[float] = []
+        train_crossing_crosses_acc: list[float] = []
+        train_crossing_crosses_recall: list[float] = []
         train_crossing_pos_loss: list[float] = []
+        train_crossing_crosses_loss: list[float] = []
         train_crossing_dt_loss: list[float] = []
         train_resting_losses: list[float] = []
         train_resting_pos_dist: list[float] = []
@@ -2429,15 +2574,19 @@ def train(
             # over/underfitting.
             backprop_loss = loss
             if has_crossing_data:
-                crossing_loss, crossing_pos_dist_mean, crossing_dt_mae_mean, crossing_pos_loss_val, crossing_dt_loss_val = _crossing_head_loss(
+                crossing_loss, crossing_pos_dist_mean, crossing_dt_mae_mean, crossing_pos_loss_val, crossing_crosses_loss_val, crossing_dt_loss_val, crossing_crosses_acc_mean, crossing_crosses_recall_mean = _crossing_head_loss(
                     model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
-                    pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight,
+                    pos_loss_weight=crossing_pos_weight, crosses_loss_weight=crossing_crosses_weight,
+                    dt_loss_weight=crossing_dt_weight, dt_norm_s=crossing_dt_norm_s,
                 )
                 backprop_loss = backprop_loss + crossing_loss
                 train_crossing_losses.append(float(crossing_loss.item()))
                 train_crossing_pos_dist.append(crossing_pos_dist_mean)
                 train_crossing_dt_mae.append(crossing_dt_mae_mean)
+                train_crossing_crosses_acc.append(crossing_crosses_acc_mean)
+                train_crossing_crosses_recall.append(crossing_crosses_recall_mean)
                 train_crossing_pos_loss.append(crossing_pos_loss_val)
+                train_crossing_crosses_loss.append(crossing_crosses_loss_val)
                 train_crossing_dt_loss.append(crossing_dt_loss_val)
             # resting_head reuses the SAME `latent` computed above for
             # the main heads/crossing_head -- it's the same input row,
@@ -2519,16 +2668,20 @@ def train(
                     train_pair_losses.append(float(pair_loss.item()))
 
                 if has_crossing_data:
-                    crossing_loss_h, pos_dist_mean_h, dt_mae_mean_h, pos_loss_val_h, dt_loss_val_h = _crossing_head_loss(
+                    crossing_loss_h, pos_dist_mean_h, dt_mae_mean_h, pos_loss_val_h, crosses_loss_val_h, dt_loss_val_h, crosses_acc_h, crosses_recall_h = _crossing_head_loss(
                         model, latent_h, crossing_pos_train, horizon_bundle_train["crossing_dt"][h_idx],
                         horizon_bundle_train["crossing_valid"][h_idx], row_idx, device,
-                        pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight, trust_negatives=False,
+                        pos_loss_weight=crossing_pos_weight, crosses_loss_weight=crossing_crosses_weight,
+                        dt_loss_weight=crossing_dt_weight, dt_norm_s=crossing_dt_norm_s, trust_negatives=False,
                     )
                     horizon_loss = horizon_loss + crossing_loss_h
                     train_crossing_losses.append(float(crossing_loss_h.item()))
                     train_crossing_pos_dist.append(pos_dist_mean_h)
                     train_crossing_dt_mae.append(dt_mae_mean_h)
+                    train_crossing_crosses_acc.append(crosses_acc_h)
+                    train_crossing_crosses_recall.append(crosses_recall_h)
                     train_crossing_pos_loss.append(pos_loss_val_h)
+                    train_crossing_crosses_loss.append(crosses_loss_val_h)
                     train_crossing_dt_loss.append(dt_loss_val_h)
 
                 resting_loss_h, resting_pos_dist_mean_h = _resting_head_loss(
@@ -2594,7 +2747,10 @@ def train(
             "mean_crossing_loss": float(np.mean(train_crossing_losses)) if train_crossing_losses else float("nan"),
             "crossing_pos_dist": float(np.mean(train_crossing_pos_dist)) if train_crossing_pos_dist else float("nan"),
             "crossing_dt_mae": float(np.mean(train_crossing_dt_mae)) if train_crossing_dt_mae else float("nan"),
+            "crossing_crosses_acc": float(np.mean(train_crossing_crosses_acc)) if train_crossing_crosses_acc else float("nan"),
+            "crossing_crosses_recall": float(np.mean(train_crossing_crosses_recall)) if train_crossing_crosses_recall else float("nan"),
             "crossing_pos_loss": float(np.mean(train_crossing_pos_loss)) if train_crossing_pos_loss else float("nan"),
+            "crossing_crosses_loss": float(np.mean(train_crossing_crosses_loss)) if train_crossing_crosses_loss else float("nan"),
             "crossing_dt_loss": float(np.mean(train_crossing_dt_loss)) if train_crossing_dt_loss else float("nan"),
             "mean_resting_loss": float(np.mean(train_resting_losses)) if train_resting_losses else float("nan"),
             "resting_pos_dist": float(np.mean(train_resting_pos_dist)) if train_resting_pos_dist else float("nan"),
@@ -2780,6 +2936,8 @@ def train(
             mean_train_crossing_loss_do = epoch_result_do["mean_crossing_loss"]
             train_crossing_pos_dist_do = epoch_result_do["crossing_pos_dist"]
             train_crossing_dt_mae_do = epoch_result_do["crossing_dt_mae"]
+            train_crossing_crosses_acc_do = epoch_result_do["crossing_crosses_acc"]
+            train_crossing_crosses_recall_do = epoch_result_do["crossing_crosses_recall"]
             mean_train_resting_loss_do = epoch_result_do["mean_resting_loss"]
             train_resting_pos_dist_do = epoch_result_do["resting_pos_dist"]
             mean_train_position_loss_do = epoch_result_do["mean_position_loss"]
@@ -2803,6 +2961,8 @@ def train(
             mean_val_crossing_loss_do = float("nan")
             val_crossing_pos_dist_do = float("nan")
             val_crossing_dt_mae_do = float("nan")
+            val_crossing_crosses_acc_do = float("nan")
+            val_crossing_crosses_recall_do = float("nan")
             mean_val_resting_loss_do = float("nan")
             val_resting_pos_dist_do = float("nan")
             mean_val_position_loss_do = float("nan")
@@ -2829,7 +2989,10 @@ def train(
                 val_crossing_losses_do: list[float] = []
                 val_crossing_pos_dists_do: list[float] = []
                 val_crossing_dt_maes_do: list[float] = []
+                val_crossing_crosses_accs_do: list[float] = []
+                val_crossing_crosses_recalls_do: list[float] = []
                 val_crossing_pos_losses_do: list[float] = []
+                val_crossing_crosses_losses_do: list[float] = []
                 val_crossing_dt_losses_do: list[float] = []
                 val_resting_losses_do: list[float] = []
                 val_resting_pos_dists_do: list[float] = []
@@ -2857,14 +3020,18 @@ def train(
                                 val_n_do[g][h] += n
                         batch_idx = val_idx[_val_pos_do:_val_pos_do + x.shape[0]]
                         if has_crossing_data:
-                            crossing_loss, pos_dist_mean, dt_mae_mean, pos_loss_val, dt_loss_val = _crossing_head_loss(
+                            crossing_loss, pos_dist_mean, dt_mae_mean, pos_loss_val, crosses_loss_val, dt_loss_val, crosses_acc_mean, crosses_recall_mean = _crossing_head_loss(
                                 model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
-                                pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight,
+                                pos_loss_weight=crossing_pos_weight, crosses_loss_weight=crossing_crosses_weight,
+                                dt_loss_weight=crossing_dt_weight, dt_norm_s=crossing_dt_norm_s,
                             )
                             val_crossing_losses_do.append(float(crossing_loss.item()))
                             val_crossing_pos_dists_do.append(pos_dist_mean)
                             val_crossing_dt_maes_do.append(dt_mae_mean)
+                            val_crossing_crosses_accs_do.append(crosses_acc_mean)
+                            val_crossing_crosses_recalls_do.append(crosses_recall_mean)
                             val_crossing_pos_losses_do.append(pos_loss_val)
+                            val_crossing_crosses_losses_do.append(crosses_loss_val)
                             val_crossing_dt_losses_do.append(dt_loss_val)
                         resting_loss, resting_pos_dist_mean = _resting_head_loss(
                             model, latent, resting_pos, resting_mask, batch_idx, device,
@@ -2899,7 +3066,10 @@ def train(
                     val_crossing_losses_do.extend(horizon_result_do["crossing_losses"])
                     val_crossing_pos_dists_do.extend(horizon_result_do["crossing_pos_dists"])
                     val_crossing_dt_maes_do.extend(horizon_result_do["crossing_dt_maes"])
+                    val_crossing_crosses_accs_do.extend(horizon_result_do["crossing_crosses_accs"])
+                    val_crossing_crosses_recalls_do.extend(horizon_result_do["crossing_crosses_recalls"])
                     val_crossing_pos_losses_do.extend(horizon_result_do["crossing_pos_losses"])
+                    val_crossing_crosses_losses_do.extend(horizon_result_do["crossing_crosses_losses"])
                     val_crossing_dt_losses_do.extend(horizon_result_do["crossing_dt_losses"])
                     val_resting_losses_do.extend(horizon_result_do["resting_losses"])
                     val_resting_pos_dists_do.extend(horizon_result_do["resting_pos_dists"])
@@ -2910,6 +3080,8 @@ def train(
                 mean_val_crossing_loss_do = float(np.mean(val_crossing_losses_do)) if val_crossing_losses_do else float("nan")
                 val_crossing_pos_dist_do = float(np.mean(val_crossing_pos_dists_do)) if val_crossing_pos_dists_do else float("nan")
                 val_crossing_dt_mae_do = float(np.mean(val_crossing_dt_maes_do)) if val_crossing_dt_maes_do else float("nan")
+                val_crossing_crosses_acc_do = float(np.mean(val_crossing_crosses_accs_do)) if val_crossing_crosses_accs_do else float("nan")
+                val_crossing_crosses_recall_do = float(np.mean(val_crossing_crosses_recalls_do)) if val_crossing_crosses_recalls_do else float("nan")
                 mean_val_resting_loss_do = float(np.mean(val_resting_losses_do)) if val_resting_losses_do else float("nan")
                 val_resting_pos_dist_do = float(np.mean(val_resting_pos_dists_do)) if val_resting_pos_dists_do else float("nan")
                 mean_val_position_loss_do = float(np.mean(val_position_losses_do)) if val_position_losses_do else float("nan")
@@ -2989,12 +3161,14 @@ def train(
             if has_crossing_data:
                 crossing_line_do = (
                     f"  train_crossing_loss={mean_train_crossing_loss_do:.4f}"
-                    f" (pos_dist={train_crossing_pos_dist_do:.4f}, dt_mae={train_crossing_dt_mae_do:.4f})"
+                    f" (pos_dist={train_crossing_pos_dist_do:.4f}, dt_mae={train_crossing_dt_mae_do:.4f}, "
+                    f"crosses_acc={train_crossing_crosses_acc_do:.4f}, crosses_recall={train_crossing_crosses_recall_do:.4f})"
                 )
                 if len(val_idx) > 0:
                     crossing_line_do += (
                         f"  val_crossing_loss={mean_val_crossing_loss_do:.4f}"
-                        f" (pos_dist={val_crossing_pos_dist_do:.4f}, dt_mae={val_crossing_dt_mae_do:.4f})"
+                        f" (pos_dist={val_crossing_pos_dist_do:.4f}, dt_mae={val_crossing_dt_mae_do:.4f}, "
+                        f"crosses_acc={val_crossing_crosses_acc_do:.4f}, crosses_recall={val_crossing_crosses_recall_do:.4f})"
                     )
             crossing_line_do += (
                 f"  train_resting_loss={mean_train_resting_loss_do:.4f} (pos_dist={train_resting_pos_dist_do:.4f})"
@@ -3076,7 +3250,10 @@ def train(
         val_crossing_losses: list[float] = []
         val_crossing_pos_dists: list[float] = []
         val_crossing_dt_maes: list[float] = []
+        val_crossing_crosses_accs: list[float] = []
+        val_crossing_crosses_recalls: list[float] = []
         val_crossing_pos_losses: list[float] = []
+        val_crossing_crosses_losses: list[float] = []
         val_crossing_dt_losses: list[float] = []
         val_resting_losses: list[float] = []
         val_resting_pos_dists: list[float] = []
@@ -3109,14 +3286,18 @@ def train(
                 # needing to expose them itself.
                 batch_idx = val_idx[_val_pos:_val_pos + x.shape[0]]
                 if has_crossing_data:
-                    crossing_loss, pos_dist_mean, dt_mae_mean, pos_loss_val, dt_loss_val = _crossing_head_loss(
+                    crossing_loss, pos_dist_mean, dt_mae_mean, pos_loss_val, crosses_loss_val, dt_loss_val, crosses_acc_mean, crosses_recall_mean = _crossing_head_loss(
                         model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
-                        pos_loss_weight=crossing_pos_weight, dt_loss_weight=crossing_dt_weight,
+                        pos_loss_weight=crossing_pos_weight, crosses_loss_weight=crossing_crosses_weight,
+                        dt_loss_weight=crossing_dt_weight, dt_norm_s=crossing_dt_norm_s,
                     )
                     val_crossing_losses.append(float(crossing_loss.item()))
                     val_crossing_pos_dists.append(pos_dist_mean)
                     val_crossing_dt_maes.append(dt_mae_mean)
+                    val_crossing_crosses_accs.append(crosses_acc_mean)
+                    val_crossing_crosses_recalls.append(crosses_recall_mean)
                     val_crossing_pos_losses.append(pos_loss_val)
+                    val_crossing_crosses_losses.append(crosses_loss_val)
                     val_crossing_dt_losses.append(dt_loss_val)
                 resting_loss, resting_pos_dist_mean = _resting_head_loss(
                     model, latent, resting_pos, resting_mask, batch_idx, device,
@@ -3150,7 +3331,10 @@ def train(
             val_crossing_losses.extend(horizon_result["crossing_losses"])
             val_crossing_pos_dists.extend(horizon_result["crossing_pos_dists"])
             val_crossing_dt_maes.extend(horizon_result["crossing_dt_maes"])
+            val_crossing_crosses_accs.extend(horizon_result["crossing_crosses_accs"])
+            val_crossing_crosses_recalls.extend(horizon_result["crossing_crosses_recalls"])
             val_crossing_pos_losses.extend(horizon_result["crossing_pos_losses"])
+            val_crossing_crosses_losses.extend(horizon_result["crossing_crosses_losses"])
             val_crossing_dt_losses.extend(horizon_result["crossing_dt_losses"])
             val_resting_losses.extend(horizon_result["resting_losses"])
             val_resting_pos_dists.extend(horizon_result["resting_pos_dists"])
@@ -3161,6 +3345,8 @@ def train(
         mean_val_crossing_loss = float(np.mean(val_crossing_losses)) if val_crossing_losses else float("nan")
         val_crossing_pos_dist = float(np.mean(val_crossing_pos_dists)) if val_crossing_pos_dists else float("nan")
         val_crossing_dt_mae = float(np.mean(val_crossing_dt_maes)) if val_crossing_dt_maes else float("nan")
+        val_crossing_crosses_acc = float(np.mean(val_crossing_crosses_accs)) if val_crossing_crosses_accs else float("nan")
+        val_crossing_crosses_recall = float(np.mean(val_crossing_crosses_recalls)) if val_crossing_crosses_recalls else float("nan")
         val_crossing_pos_loss = float(np.mean(val_crossing_pos_losses)) if val_crossing_pos_losses else float("nan")
         val_crossing_dt_loss = float(np.mean(val_crossing_dt_losses)) if val_crossing_dt_losses else float("nan")
         mean_val_resting_loss = float(np.mean(val_resting_losses)) if val_resting_losses else float("nan")
@@ -3218,7 +3404,10 @@ def train(
             "mean_val_crossing_loss": mean_val_crossing_loss,
             "val_crossing_pos_dist": val_crossing_pos_dist,
             "val_crossing_dt_mae": val_crossing_dt_mae,
+            "val_crossing_crosses_acc": val_crossing_crosses_acc,
+            "val_crossing_crosses_recall": val_crossing_crosses_recall,
             "val_crossing_pos_loss": val_crossing_pos_loss,
+            "val_crossing_crosses_loss": float(np.mean(val_crossing_crosses_losses)) if val_crossing_crosses_losses else float("nan"),
             "val_crossing_dt_loss": val_crossing_dt_loss,
             "mean_val_resting_loss": mean_val_resting_loss,
             "val_resting_pos_dist": val_resting_pos_dist,
@@ -3253,7 +3442,8 @@ def train(
         if has_crossing_data:
             crossing_line = (
                 f"  val_crossing_loss={v['mean_val_crossing_loss']:.4f}"
-                f" (pos_dist={v['val_crossing_pos_dist']:.4f}, dt_mae={v['val_crossing_dt_mae']:.4f})"
+                f" (pos_dist={v['val_crossing_pos_dist']:.4f}, dt_mae={v['val_crossing_dt_mae']:.4f}, "
+                f"crosses_acc={v['val_crossing_crosses_acc']:.4f}, crosses_recall={v['val_crossing_crosses_recall']:.4f})"
             )
         crossing_line += (
             f"  val_resting_loss={v['mean_val_resting_loss']:.4f} (pos_dist={v['val_resting_pos_dist']:.4f})"
@@ -3300,7 +3490,10 @@ def train(
         mean_train_crossing_loss = epoch_result["mean_crossing_loss"]
         train_crossing_pos_dist = epoch_result["crossing_pos_dist"]
         train_crossing_dt_mae = epoch_result["crossing_dt_mae"]
+        train_crossing_crosses_acc = epoch_result["crossing_crosses_acc"]
+        train_crossing_crosses_recall = epoch_result["crossing_crosses_recall"]
         train_crossing_pos_loss = epoch_result["crossing_pos_loss"]
+        train_crossing_crosses_loss = epoch_result["crossing_crosses_loss"]
         train_crossing_dt_loss = epoch_result["crossing_dt_loss"]
         mean_train_resting_loss = epoch_result["mean_resting_loss"]
         train_resting_pos_dist = epoch_result["resting_pos_dist"]
@@ -3329,7 +3522,10 @@ def train(
         mean_val_crossing_loss = float("nan")
         val_crossing_pos_dist = float("nan")
         val_crossing_dt_mae = float("nan")
+        val_crossing_crosses_acc = float("nan")
+        val_crossing_crosses_recall = float("nan")
         val_crossing_pos_loss = float("nan")
+        val_crossing_crosses_loss = float("nan")
         val_crossing_dt_loss = float("nan")
         mean_val_resting_loss = float("nan")
         val_resting_pos_dist = float("nan")
@@ -3360,7 +3556,10 @@ def train(
             mean_val_crossing_loss = v["mean_val_crossing_loss"]
             val_crossing_pos_dist = v["val_crossing_pos_dist"]
             val_crossing_dt_mae = v["val_crossing_dt_mae"]
+            val_crossing_crosses_acc = v["val_crossing_crosses_acc"]
+            val_crossing_crosses_recall = v["val_crossing_crosses_recall"]
             val_crossing_pos_loss = v["val_crossing_pos_loss"]
+            val_crossing_crosses_loss = v["val_crossing_crosses_loss"]
             val_crossing_dt_loss = v["val_crossing_dt_loss"]
             mean_val_resting_loss = v["mean_val_resting_loss"]
             val_resting_pos_dist = v["val_resting_pos_dist"]
@@ -3454,12 +3653,14 @@ def train(
         if has_crossing_data:
             crossing_line = (
                 f"  train_crossing_loss={mean_train_crossing_loss:.4f}"
-                f" (pos_dist={train_crossing_pos_dist:.4f}, dt_mae={train_crossing_dt_mae:.4f})"
+                f" (pos_dist={train_crossing_pos_dist:.4f}, dt_mae={train_crossing_dt_mae:.4f}, "
+                f"crosses_acc={train_crossing_crosses_acc:.4f}, crosses_recall={train_crossing_crosses_recall:.4f})"
             )
             if len(val_idx) > 0:
                 crossing_line += (
                     f"  val_crossing_loss={mean_val_crossing_loss:.4f}"
-                    f" (pos_dist={val_crossing_pos_dist:.4f}, dt_mae={val_crossing_dt_mae:.4f})"
+                    f" (pos_dist={val_crossing_pos_dist:.4f}, dt_mae={val_crossing_dt_mae:.4f}, "
+                    f"crosses_acc={val_crossing_crosses_acc:.4f}, crosses_recall={val_crossing_crosses_recall:.4f})"
                 )
         crossing_line += (
             f"  train_resting_loss={mean_train_resting_loss:.4f} (pos_dist={train_resting_pos_dist:.4f})"
@@ -3556,8 +3757,14 @@ def train(
             "val_crossing_pos_dist": val_crossing_pos_dist,
             "train_crossing_dt_mae": train_crossing_dt_mae,
             "val_crossing_dt_mae": val_crossing_dt_mae,
+            "train_crossing_crosses_acc": train_crossing_crosses_acc,
+            "val_crossing_crosses_acc": val_crossing_crosses_acc,
+            "train_crossing_crosses_recall": train_crossing_crosses_recall,
+            "val_crossing_crosses_recall": val_crossing_crosses_recall,
             "train_crossing_pos_loss": train_crossing_pos_loss,
             "val_crossing_pos_loss": val_crossing_pos_loss,
+            "train_crossing_crosses_loss": train_crossing_crosses_loss,
+            "val_crossing_crosses_loss": val_crossing_crosses_loss,
             "train_crossing_dt_loss": train_crossing_dt_loss,
             "val_crossing_dt_loss": val_crossing_dt_loss,
             "train_resting_loss": mean_train_resting_loss,

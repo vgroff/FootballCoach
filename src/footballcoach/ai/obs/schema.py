@@ -27,10 +27,23 @@ class PlayerFeatures:
     is 0 (including ``exists=0``, which distinguishes a padded slot from
     a real player standing at the same position as the observer).
 
-    Velocity normalization: pitch half-diagonal (``sqrt((L/2)²+(W/2)²)``)
-    so values represent absolute speed in pitch-scale units per second,
-    matching ball velocity normalization.  Position normalization: relative
-    offset divided by pitch half-dimensions so values stay ≈[-1, 1].
+    Velocity normalization: FIXED reference pitch half-diagonal
+    (``sqrt(52.5²+34.0²)``, standard 105m×68m pitch -- see
+    ``ai/obs/encoder.py``'s ``_REF_HALF_DIAG_M``), NOT the live match's own
+    pitch dimensions, so values represent absolute speed in a fixed
+    pitch-scale unit per second regardless of episode pitch size, matching
+    ball velocity normalization and the ``ai/physics_pretrain`` package's
+    ``normalize_kinematics_by_base_pitch`` convention.  Position
+    normalization (``rel_dx``/``rel_dy``/``pos_x``/``pos_y`` alike): also
+    divided by the same fixed half-diagonal, NOT by the per-axis
+    half-dimensions (52.5/34.0) and NOT by the live match's pitch (pitch-scale
+    curriculum is not wired up today, but a live-pitch divisor would have
+    silently made the same physical distance encode differently across
+    episodes for no reason the network can see, once it is). The live
+    pitch's actual size is still available to the network via
+    ``GlobalFeatures.pitch_length_norm``/``pitch_width_norm``. Values stay
+    ≈[-1, 1] on a standard pitch either way, so this only matters for anyone
+    hand-computing a real metre distance back out of a raw feature value.
     """
     # --- Position (relative to observing player) ---
     rel_dx: float = 0.0          # (other.x - self.x) / (half_diag)
@@ -49,8 +62,14 @@ class PlayerFeatures:
     velocity_x: float = 0.0      # world-frame vx / pitch_half_diagonal
     velocity_y: float = 0.0      # world-frame vy / pitch_half_diagonal
     speed_mps: float = 0.0       # |v_xy| / pitch_half_diagonal, redundant
-    # heading dropped: velocity = (cos(heading)*speed, sin(heading)*speed) so
-    # heading is fully recoverable from velocity when speed > 0, irrelevant when speed = 0.
+    # heading_sin/heading_cos live at the end of this dataclass (see below) --
+    # NOT dropped. velocity = (cos(heading)*speed, sin(heading)*speed) only
+    # while speed > 0 (engine/movement.py constructs velocity FROM heading
+    # every tick, so they're identical by construction whenever moving), but
+    # at speed == 0 velocity collapses to (0,0,0) while heading_rad keeps its
+    # last real value -- exactly the case a prior version of this comment
+    # dismissed as "irrelevant." A standstill player's facing direction is
+    # real signal, not noise.
 
     # --- Stamina ---
     stamina: float = 1.0         # current stamina fraction [0, 1]
@@ -80,13 +99,48 @@ class PlayerFeatures:
     # --- Immobility flag ---
     is_immobile: float = 0.0     # 1.0 if this player has no AI and will not move
 
-    # --- Absolute position (scaled by standard pitch half-dims) ---
+    # --- Absolute position (scaled by pitch half-diagonal) ---
     # Uses same axis convention as the engine: origin at pitch centre,
-    # x in [-52.5, 52.5], y in [-34, 34].  Divided by standard half-dims
-    # so values are ≈[-1, 1] on a standard pitch and scale gracefully on
-    # smaller pitches.  Negated under flip_x / flip_y in augment.py.
-    pos_x: float = 0.0           # player.position.x / 52.5
-    pos_y: float = 0.0           # player.position.y / 34.0
+    # x in [-52.5, 52.5], y in [-34, 34].  Divided by the pitch
+    # half-diagonal (sqrt(52.5^2 + 34^2), NOT separate per-axis 52.5/34.0
+    # divisors -- see ai/obs/encoder.py's actual pos_x=.../half_diag and
+    # this class's own docstring) so values are ≈[-1, 1] on a standard
+    # pitch and scale gracefully on smaller pitches.  Negated under
+    # flip_x / flip_y in augment.py.
+    pos_x: float = 0.0           # player.position.x / half_diag
+    pos_y: float = 0.0           # player.position.y / half_diag
+
+    # --- Heading (facing direction) ---
+    # Populated unconditionally from player.heading_rad, including at
+    # standstill and for immobile players -- unlike velocity, a static facing
+    # direction is real signal (see the velocity_x/velocity_y comment above).
+    # Mirror rule (established by ai/ppo/bc.py's own heading_sin/heading_cos
+    # BC label fields and physics_value_net.py's canonicalize_bc_labels()
+    # hand-patch, now made systematic in obs/augment.py/obs/canonical.py):
+    # flip_y negates heading_sin only; the canonical x-mirror negates
+    # heading_cos only.
+    heading_sin: float = 0.0     # sin(player.heading_rad)
+    heading_cos: float = 1.0     # cos(player.heading_rad)
+
+    # --- Previous-decision movement intent ---
+    # The direction/speed-mode set by the player's LAST decision, still in
+    # effect until the next decision tick overwrites it -- a cheap
+    # acceleration/intent signal (ai/physics_pretrain already relies on the
+    # equivalent quantity via BC labels; this exposes it as a live input
+    # too). desired_dir_x/y come from player.desired_direction (world-frame
+    # unit vector, safe to read directly -- never auto-cleared). The one-hot
+    # comes from player.last_desired_speed_mode, NOT player.desired_speed_mode
+    # (which match._apply_movement() unconditionally clears to None every
+    # tick after consuming it -- see that field's own docstring on Player).
+    # Zeroed (dir=0, one-hot=STANDSTILL) for immobile players and for a
+    # player with no decision yet (last_desired_speed_mode is None) --
+    # "no movement intent" is real signal here, same rationale as the
+    # is_immobile velocity-zeroing above.
+    desired_dir_x: float = 0.0
+    desired_dir_y: float = 0.0
+    desired_speed_standstill: float = 1.0
+    desired_speed_jog: float = 0.0
+    desired_speed_sprint: float = 0.0
 
     def to_array(self) -> np.ndarray:
         # vars(self).values() preserves field-declaration order (Python 3.7+ dict
@@ -99,27 +153,45 @@ class PlayerFeatures:
 
 @dataclass
 class BallFeatures:
-    """Ball feature vector (11 floats).
+    """Ball feature vector (12 floats).
 
-    Absolute pitch position normalized by standard half-dimensions (52.5m ×
-    34.0m), so values are ≈[-1, 1].  Height uses a fixed divisor
+    Absolute pitch position normalized by the FIXED reference pitch
+    half-diagonal (``sqrt(52.5^2 + 34.0^2)``, standard 105m×68m pitch --
+    the SAME divisor ``PlayerFeatures.pos_x``/``pos_y`` use, and NOT the
+    live match's own pitch dimensions -- see ``ai/obs/encoder.py``'s
+    ``_REF_HALF_DIAG_M`` and ``PlayerFeatures``'s own docstring), so values
+    are ≈[-1, 1].  Height uses a fixed divisor
     (``height_norm_m`` from ai_config.json, default 3.0m).  Ball-to-player
     relative position is encoded per-player in ``PlayerFeatures.ball_rel_*``.
     """
-    pos_x: float = 0.0           # ball.position.x / 52.5
-    pos_y: float = 0.0           # ball.position.y / 34.0
+    pos_x: float = 0.0           # ball.position.x / half_diag
+    pos_y: float = 0.0           # ball.position.y / half_diag
     height_m: float = 0.0        # ball.position.z / height_norm_m
 
     velocity_x: float = 0.0      # world-frame, normalized by pitch_half_diagonal / s (rough physical scale)
     velocity_y: float = 0.0
     velocity_z: float = 0.0
 
-    spin_x: float = 0.0          # normalized by ball_spin_norm_max_rad_s
+    spin_x: float = 0.0          # normalized by ball_spin_nn_norm_rad_s
     spin_y: float = 0.0
     spin_z: float = 0.0
 
     is_possessed: float = 0.0    # 1 if ball.possessed_by is not None
     is_loose: float = 1.0        # 1 - is_possessed (redundant but explicit)
+
+    # Which team most recently GAINED possession (persists through loose-ball
+    # periods -- see entities/ball.py's Ball.last_touched_by_player_id, whose
+    # single write-path is Match._set_possession()). +1.0 if that player's
+    # team attacks +x (Team.LEFT), -1.0 if Team.RIGHT, 0.0 if nobody has
+    # touched the ball yet this episode. Matters for attributing an
+    # out-of-bounds/goal outcome to a team (mirrors the engine's own existing
+    # `own_team_touched_last` pattern in match.py's
+    # _run_get_possession_behaviour -- this exposes that same fact to the
+    # network instead of only using it inside reward shaping / rules logic).
+    # Same sign convention as PlayerFeatures.attacking_direction; negated
+    # under the canonical x-mirror in obs/augment.py's BALL_FLIP_X_IDX (NOT
+    # flip_y -- a team-direction sign, not a y-coordinate).
+    last_touch_team_direction: float = 0.0
 
     def to_array(self) -> np.ndarray:
         # See PlayerFeatures.to_array() -- same astuple() -> vars().values() swap.

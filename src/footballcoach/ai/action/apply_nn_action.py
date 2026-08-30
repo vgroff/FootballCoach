@@ -81,24 +81,36 @@ def apply_action_to_player(
     )
 
     # --- Kick: immediate physics via 3D direction, no ballistic solve ---
-    # Fires only when the player actually has the ball; if not (e.g. cached gating
-    # while chasing), the call is a silent no-op — kick_with_direction checks
-    # possessed_by internally. First-touch difficulty is applied automatically
-    # by kick_with_direction when the player is in CONTROLLING_BALL state.
+    # Fires only when the player actually has the ball. When it doesn't
+    # (e.g. still chasing a loose ball), the intent is ARMED instead of
+    # dropped: Player.kick_armed_direction/kick_armed_power_fraction are set
+    # here, and _update_loose_ball_pickup fires the same kick_with_direction
+    # call the instant the ball becomes reachable, skipping CONTROLLING_BALL
+    # entirely -- a true one-touch (no control-time delay, no
+    # control_speed_multiplier slowdown), matching what orders.py's
+    # _try_push_kick already does for the rules AI. Previously this branch
+    # only fired the ball-in-hand case and silently dropped the chase-phase
+    # intent, so a neural player could never one-touch a ball it was still
+    # running onto -- it had to fully pick up (and get slowed by control)
+    # first, unlike the rules AI. First-touch difficulty is applied
+    # automatically by kick_with_direction when the player is in
+    # CONTROLLING_BALL state (kick fired with the ball already in hand).
     if gating.kick_this_tick:
         kick_dir = gating.kick_direction
         if kick_dir is not None and np.linalg.norm(kick_dir) > 1e-6:
             direction_3d = Vector3(float(kick_dir[0]), float(kick_dir[1]), float(kick_dir[2]) if len(kick_dir) > 2 else 0.0)
         else:
             direction_3d = Vector3(1.0, 0.0, 0.0)  # safe fallback, should not occur
-        player.kick_with_direction(
-            match,
-            direction_3d,
-            float(gating.kick_power_fraction) if gating.kick_power_fraction > 0 else 0.85,
-            # Spin is disabled for the neural network for now -- see
-            # agent_plans/spin_implementation_plan.md for the plan to re-enable it.
-            Vector3.zero(),
-        )
+        power_fraction = float(gating.kick_power_fraction) if gating.kick_power_fraction > 0 else 0.85
+        # Spin is disabled for the neural network for now -- see
+        # agent_plans/spin_implementation_plan.md for the plan to re-enable it.
+        if match.ball.possessed_by == player.player_id:
+            player.kick_with_direction(match, direction_3d, power_fraction, Vector3.zero())
+        else:
+            player.kick_armed = True
+            player.kick_armed_direction = direction_3d
+            player.kick_armed_power_fraction = power_fraction
+            player.kick_armed_spin = Vector3.zero()
 
     # --- Tackle: arm intent; _check_armed_tackles resolves on contact ---
     # Target slot is not used — the engine finds the ball carrier directly.

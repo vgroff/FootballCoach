@@ -4,7 +4,7 @@
   "_comment_target_fps": "Render frame rate cap. Physics ticks are governed separately by gameplay.json ui.physics_tick_hz.",
   "camera": {
     "_comment": "pixels_per_metre: zoom level. 9=1025x692 window, 12=1340x896, 14=1570x1032. margin_px: empty border around pitch.",
-    "pixels_per_metre": 13.0,
+    "pixels_per_metre": 12.0,
     "margin_px": 50
   },
   "player": {

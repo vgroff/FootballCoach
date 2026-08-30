@@ -28,6 +28,7 @@ import torch.nn as nn
 
 from footballcoach.ai.action.schema import DecisionHeadsRaw
 from footballcoach.ai.models.entity_encoder import EntityEncoder
+from footballcoach.ai.models.physics_encoders import BallPhysicsFeatureBlock, PlayerPhysicsFeatureBlock
 from footballcoach.ai.models.value_side_channel import ValueAiTypeSideChannel
 from footballcoach.ai.obs.schema import (
     AI_TYPE_ONE_HOT_DIM,
@@ -69,21 +70,40 @@ class DecisionNetwork(nn.Module):
         value_extra_hidden: int = 16,
         value_hidden_dim: int = 0,
         inter_player_num_heads: int = 0,
+        ball_physics_encoder_checkpoint: Optional[str] = None,
+        player_physics_encoder_checkpoint: Optional[str] = None,
     ):
         super().__init__()
+        # --- Optional frozen physics-dynamics encoders (opt-in, null by
+        # default -- see ai/knowledge.md "Frozen physics-dynamics encoders").
+        # Owned EXCLUSIVELY here: ExecutionNetwork never builds its own copy,
+        # it reads the already-computed output off the DecisionHeadsRaw this
+        # network returns (see forward() below and execution_network.py),
+        # so each frozen encoder runs at most once per observation. ---
+        self.ball_physics_encoder = (
+            BallPhysicsFeatureBlock(ball_physics_encoder_checkpoint)
+            if ball_physics_encoder_checkpoint else None
+        )
+        self.player_physics_encoder = (
+            PlayerPhysicsFeatureBlock(player_physics_encoder_checkpoint)
+            if player_physics_encoder_checkpoint else None
+        )
+        ball_dim_eff = ball_dim + (self.ball_physics_encoder.output_dim if self.ball_physics_encoder else 0)
+        self_dim_eff = self_dim + (self.player_physics_encoder.output_dim if self.player_physics_encoder else 0)
+
         self.entity_encoder = EntityEncoder(
-            entity_feature_dim=self_dim,
+            entity_feature_dim=self_dim_eff,
             embed_dim=entity_embed_dim,
             num_heads=num_attention_heads,
-            ball_feat_dim=ball_dim,
+            ball_feat_dim=ball_dim_eff,
             global_feat_dim=global_dim,
             inter_player_num_heads=inter_player_num_heads,
         )
         self.self_mlp = nn.Sequential(
-            nn.Linear(self_dim, self_mlp_hidden), nn.ReLU()
+            nn.Linear(self_dim_eff, self_mlp_hidden), nn.ReLU()
         )
         self.ball_mlp = nn.Sequential(
-            nn.Linear(ball_dim, ball_mlp_hidden), nn.ReLU()
+            nn.Linear(ball_dim_eff, ball_mlp_hidden), nn.ReLU()
         )
         self.global_mlp = nn.Sequential(
             nn.Linear(global_dim, global_mlp_hidden), nn.ReLU()
@@ -163,6 +183,21 @@ class DecisionNetwork(nn.Module):
         else:
             self.value_head = nn.Linear(value_in_dim, 1)
 
+    def state_dict(self, *args, **kwargs):
+        """Excludes ball_physics_encoder/player_physics_encoder params (see
+        __init__) -- they're an external, versioned artifact loaded fresh
+        from their own physics_pretrain checkpoint path every time this
+        network is constructed, never part of the main PPO checkpoint's
+        training state. CanonicalNetworkWrapper.state_dict() delegates
+        straight here, so this applies to every save call site in
+        ppo_trainer.py automatically, with no per-call-site changes needed.
+        See load_checkpoint()'s matching tolerant load."""
+        sd = super().state_dict(*args, **kwargs)
+        for k in list(sd.keys()):
+            if k.startswith("ball_physics_encoder.") or k.startswith("player_physics_encoder."):
+                del sd[k]
+        return sd
+
     def forward(
         self,
         self_feat: torch.Tensor,    # (batch, self_dim)
@@ -173,15 +208,35 @@ class DecisionNetwork(nn.Module):
         self_ai_type: Optional[torch.Tensor] = None,   # (batch, AI_TYPE_ONE_HOT_DIM)
         other_ai_type: Optional[torch.Tensor] = None,  # (batch, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM)
     ) -> DecisionHeadsRaw:
+        # --- Frozen physics-encoder features (see __init__), computed at
+        # most once per observation -- ExecutionNetwork reuses these via the
+        # DecisionHeadsRaw fields set below instead of recomputing. ---
+        ball_physics_full = None
+        self_physics_full = None
+        other_physics_full = None
+        ball_feat_aug = ball_feat
+        self_feat_aug = self_feat
+        other_feat_aug = other_feat
+        if self.ball_physics_encoder is not None:
+            ball_physics_full = self.ball_physics_encoder(ball_feat, global_feat)
+            is_loose = ball_feat[..., -1:]  # BallFeatures.is_loose is always the last field
+            ball_physics_full = ball_physics_full * is_loose
+            ball_feat_aug = torch.cat([ball_feat, ball_physics_full], dim=-1)
+        if self.player_physics_encoder is not None:
+            self_physics_full = self.player_physics_encoder(self_feat, global_feat)
+            other_physics_full = self.player_physics_encoder(other_feat, global_feat)
+            self_feat_aug = torch.cat([self_feat, self_physics_full], dim=-1)
+            other_feat_aug = torch.cat([other_feat, other_physics_full], dim=-1)
+
         entity_ctx, self_embed_raw, other_embed_raw = self.entity_encoder(
-            self_feat, other_feat, exists_mask, return_embeds=True,
-            ball_feat=ball_feat, global_feat=global_feat,
+            self_feat_aug, other_feat_aug, exists_mask, return_embeds=True,
+            ball_feat=ball_feat_aug, global_feat=global_feat,
             # No extra_query_bias for decision network — ball+global already cover it.
         )
         h = torch.cat([
             entity_ctx,
-            self.self_mlp(self_feat),
-            self.ball_mlp(ball_feat),
+            self.self_mlp(self_feat_aug),
+            self.ball_mlp(ball_feat_aug),
             self.global_mlp(global_feat),
         ], dim=-1)
         h = self.trunk(h)
@@ -220,6 +275,9 @@ class DecisionNetwork(nn.Module):
             attack_defence_raw=self.attack_defence_raw(h),
             latent_vector=self.latent_vector(h),
             value=self.value_head(value_input),
+            ball_physics_full=ball_physics_full,
+            self_physics_full=self_physics_full,
+            other_physics_full=other_physics_full,
         )
 
     @classmethod
@@ -238,6 +296,8 @@ class DecisionNetwork(nn.Module):
             value_extra_hidden=cfg.get("value_extra_hidden", 16),
             value_hidden_dim=cfg.get("value_hidden_dim", 0),
             inter_player_num_heads=cfg.get("inter_player_attn_heads", 0),
+            ball_physics_encoder_checkpoint=cfg.get("ball_physics_encoder_checkpoint"),
+            player_physics_encoder_checkpoint=cfg.get("player_physics_encoder_checkpoint"),
         )
 
 

@@ -82,6 +82,16 @@ def test_trainee_reward_survives_mid_step_callback_row_insertion(monkeypatch):
                 # mid-call, exactly like the real on_kick/on_tackle wiring.
                 opp.on_kick(opp)
             reward = _DISTINCTIVE_REWARD
+            # This test forces an episode end on an artificial tick rather
+            # than letting real ScenarioLoop outcome detection decide it, so
+            # env.last_terminal_match (normally set by ScenarioEnv.step()
+            # itself -- see its own docstring) was never populated for this
+            # synthetic ending. self._loop.match is still the real, un-
+            # rebuilt current state at this exact tick (nothing in the real
+            # engine decided to end/rebuild anything), so it's the correct
+            # stand-in -- matches ScenarioEnv.step()'s own fallback for its
+            # non-ScenarioLoop-detected done paths (box_terminal/timeout).
+            self.last_terminal_match = self._loop.match
             # End the episode on this exact tick. _reward_by_pid also
             # accrues into _pending_reward["trainee"] every tick (by
             # design -- see test_pending_reward_does_not_leak_across_
@@ -121,28 +131,28 @@ def test_trainee_reward_survives_mid_step_callback_row_insertion(monkeypatch):
     )
 
 
-_LEAK_PER_TICK_REWARD = 100.0
-_LEAK_THRESHOLD = 50.0  # anything at/above this can only be explained by a cross-episode leak
+_DISTINCTIVE_REWARD_2 = 777.0
 
 
-def test_pending_reward_does_not_leak_across_episodes(monkeypatch):
-    """Regression test: ``_pending_reward`` (accrued per-tick, drained only
-    when an on_kick/on_tackle callback fires for that player) must be reset
-    at every ``env.reset()`` -- it represents "reward accrued since this
-    player's last recorded sample", which can never legitimately span an
-    episode boundary. Left uncleared, a player whose callback rarely fires
-    (e.g. a neural-driven trainee that almost never kicks) silently
-    accumulates reward across many episodes, then dumps the entire backlog
-    onto a single row the next time a callback happens to fire -- confirmed
-    in real recorded data: one row carried reward=1474.952, corrupting that
-    episode's MC returns into the hundreds/thousands.
+def test_kick_callback_row_does_not_duplicate_prior_reward(monkeypatch):
+    """Regression test for the double-counting bug: a kick/tackle callback's
+    own row must always carry reward=0.0, never a copy of a reward that was
+    already attributed to an EARLIER timed-sample row.
 
-    Episode 1 here accrues a large, distinctive reward every tick with NO
-    callback ever firing (so it would all sit in ``_pending_reward`` if
-    uncleared). Episode 2 fires an on_kick callback on its very first tick,
-    before any of its own reward could have accrued -- if episode 1's
-    backlog leaked through, that callback's row would carry ~100 * n_ticks;
-    if reset correctly, it carries ~0.
+    The removed ``_pending_reward`` mechanism accrued every timed sample's
+    reward into a per-player dict, meant to be "claimed" by whichever
+    kick/tackle callback fired next -- but the same reward had ALREADY been
+    written onto its own timed-sample row immediately, unconditionally, so
+    that claim was always a duplicate, not a deferred attribution. Confirmed
+    in real recorded data: row N carried get_possession=+1.0 with a real
+    component breakdown; row N+6, the kick-callback row where the trainee
+    kicked the ball away, carried ANOTHER +1.0 with an empty breakdown.
+
+    This reproduces that exact temporal pattern: a distinctive reward fires
+    on tick 1 (a genuine timed sample), then an on_kick callback fires on
+    tick 2, a SEPARATE later env.step() call. Fixed behaviour: the
+    distinctive reward appears exactly once (on tick 1's row); the
+    callback's own row carries reward=0.0.
     """
     phase = CurriculumPhase(
         name="p1", phase_id=1, scenario_key="phase1_1v1", env_kwargs={"max_episode_s": 10.0}
@@ -152,56 +162,105 @@ def test_pending_reward_does_not_leak_across_episodes(monkeypatch):
     env.always_compute_secondary_reward = True
 
     orig_step = scenario_env_mod.ScenarioEnv.step
-    orig_reset = scenario_env_mod.ScenarioEnv.reset
-    state = {"episode": -1, "ticks_this_episode": 0}
-
-    def _patched_reset(self):
-        state["episode"] += 1
-        state["ticks_this_episode"] = 0
-        return orig_reset(self)
+    state = {"ticks": 0}
 
     def _patched_step(self):
         obs, reward, done, info = orig_step(self)
-        state["ticks_this_episode"] += 1
-        if state["episode"] == 0:
-            # Episode 1: large distinctive per-tick reward, no callback ever
-            # fires, force a clean end after a few ticks.
-            reward = _LEAK_PER_TICK_REWARD
-            if state["ticks_this_episode"] >= 4:
-                done = True
-        elif state["episode"] == 1:
-            # Episode 2, first tick: fire the trainee's own on_kick callback
-            # immediately, before any of THIS episode's reward has accrued.
-            if state["ticks_this_episode"] == 1:
-                match = self._loop.match
-                trainee = match.player_by_id(env.trainee_player_id)
-                if trainee.on_kick is not None:
-                    trainee.on_kick(trainee)
+        state["ticks"] += 1
+        if state["ticks"] == 1:
+            reward = _DISTINCTIVE_REWARD_2
+        elif state["ticks"] == 2:
+            match = self._loop.match
+            trainee = match.player_by_id(env.trainee_player_id)
+            if trainee.on_kick is not None:
+                trainee.on_kick(trainee)
             reward = 0.0
             done = True
+            self.last_terminal_match = self._loop.match  # see other test's comment
         return obs, reward, done, info
 
     monkeypatch.setattr(scenario_env_mod.ScenarioEnv, "step", _patched_step)
-    monkeypatch.setattr(scenario_env_mod.ScenarioEnv, "reset", _patched_reset)
 
     result = record_episodes(
-        env, label_fn, n_episodes=2, scenario_key="phase1_1v1", phase_id=1,
+        env, label_fn, n_episodes=1, scenario_key="phase1_1v1", phase_id=1,
         sample_interval_s=0.5,
         opponent_rules_prob=0.0, opponent_immobile_prob=1.0,
     )
 
     rewards = result["rewards"]
+    assert state["ticks"] >= 2, "test setup didn't reach the callback tick"
+
+    hit_rows = np.nonzero(rewards == _DISTINCTIVE_REWARD_2)[0]
+    assert len(hit_rows) == 1, (
+        f"expected the distinctive reward to appear on exactly one row, found {len(hit_rows)} "
+        f"(>1 means the kick callback's row duplicated a reward already attributed to an "
+        f"earlier timed-sample row -- the exact double-counting bug this test guards)"
+    )
+
+    # Every row from the callback tick onward must carry reward=0.0 -- none
+    # of them should have "claimed" tick 1's reward for themselves.
+    assert np.all(rewards[hit_rows[0] + 1:] == 0.0), (
+        f"rows after the distinctive reward's row carry nonzero reward "
+        f"{rewards[hit_rows[0] + 1:].tolist()} -- expected all zero (callback/terminal rows "
+        f"never carry their own reward, see record_episodes()'s _record_now docstring)"
+    )
+
+
+def test_is_decision_step_flags_real_timed_samples_only(monkeypatch):
+    """``is_decision_step`` must be 1.0 for genuine timed-sample rows and 0.0
+    for kick/tackle-callback rows and the trailing true-terminal row --
+    DemonstrationDataset.compute_returns() relies on this to only apply its
+    per-row MC discount on rows that represent a real elapsed
+    sample_interval_s, not once per row regardless of real time (see its own
+    docstring)."""
+    phase = CurriculumPhase(
+        name="p1", phase_id=1, scenario_key="phase1_1v1", env_kwargs={"max_episode_s": 10.0}
+    )
+    env = build_env(phase)
+    label_fn = bc_label_fn_for_phase(1)
+    env.always_compute_secondary_reward = True
+
+    orig_step = scenario_env_mod.ScenarioEnv.step
+    state = {"ticks": 0}
+
+    def _patched_step(self):
+        obs, reward, done, info = orig_step(self)
+        state["ticks"] += 1
+        if state["ticks"] == 2:
+            match = self._loop.match
+            trainee = match.player_by_id(env.trainee_player_id)
+            if trainee.on_kick is not None:
+                trainee.on_kick(trainee)
+        if state["ticks"] >= 4:
+            done = True
+            self.last_terminal_match = self._loop.match  # see other test's comment
+        return obs, reward, done, info
+
+    monkeypatch.setattr(scenario_env_mod.ScenarioEnv, "step", _patched_step)
+
+    result = record_episodes(
+        env, label_fn, n_episodes=1, scenario_key="phase1_1v1", phase_id=1,
+        sample_interval_s=0.5,
+        opponent_rules_prob=0.0, opponent_immobile_prob=1.0,
+    )
+
+    is_decision_step = result["is_decision_step"]
+    is_trainee = result["is_trainee"]
     dones = result["dones"]
 
-    assert state["episode"] >= 1, "test setup didn't reach episode 2"
-
-    # Episode 2 = every row after the first done==1 pair.
-    first_done_pair_end = np.nonzero(dones > 0.5)[0][1]
-    ep2_rewards = rewards[first_done_pair_end + 1:]
-    assert len(ep2_rewards) > 0, "episode 2 recorded no rows"
-    bad = ep2_rewards[np.abs(ep2_rewards) >= _LEAK_THRESHOLD]
-    assert len(bad) == 0, (
-        f"episode 2 contains reward value(s) {bad.tolist()} that can only be explained by "
-        f"episode 1's un-drained _pending_reward backlog leaking across env.reset() -- "
-        f"_pending_reward must be cleared at the start of every episode."
+    assert state["ticks"] >= 4, "test setup didn't reach the forced episode end"
+    assert is_decision_step.sum() > 0, "no rows flagged as real decision steps at all"
+    assert is_decision_step.sum() < len(is_decision_step), (
+        "every row flagged as a real decision step -- the on_kick callback row "
+        "(and/or the trailing terminal row) should be flagged 0.0"
+    )
+    # The trailing terminal row (the true final row for each player, one
+    # real physics tick after the last timed sample -- see
+    # ScenarioLoop.last_completed_trial_match) must be flagged 0.0.
+    trainee_rows = np.nonzero(is_trainee > 0.5)[0]
+    last_trainee_row = trainee_rows[-1]
+    assert dones[last_trainee_row] > 0.5, "last trainee row should carry the real dones=1 boundary"
+    assert is_decision_step[last_trainee_row] < 0.5, (
+        "the trailing terminal row must be flagged is_decision_step=0.0 -- it's one real "
+        "physics tick after the last timed sample, not a new decision interval of its own"
     )

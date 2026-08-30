@@ -41,6 +41,7 @@ for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
 import argparse
 import logging
 import math
+import random
 import time
 from pathlib import Path
 
@@ -212,6 +213,33 @@ def _iterate_over(ds, idx, returns, batch_size, shuffle):
 
 
 
+def _compute_outcome_norm_weights(train_outcomes: np.ndarray, max_weight: float) -> dict:
+    """Inverse-frequency weight per outcome value present in
+    ``train_outcomes``, normalized to mean 1.0 (so the overall loss scale --
+    and therefore --lr -- is unaffected, only the relative per-row weighting
+    changes) and capped at ``max_weight`` (uncapped weights blow up when an
+    outcome has only a handful of rows, e.g. 5 'loss' rows in 146k -- a
+    single such row would then dominate a minibatch's gradient outright,
+    which looks like training collapse, not a computation bug). See
+    --outcome-reweight/--outcome-reweight-max."""
+    outcomes_unique, outcome_counts = np.unique(train_outcomes, return_counts=True)
+    inv_freq = {o: len(train_outcomes) / c for o, c in zip(outcomes_unique, outcome_counts)}
+    mean_inv_freq = float(np.mean([inv_freq[o] for o in train_outcomes]))
+    return {o: min(w / mean_inv_freq, max_weight) for o, w in inv_freq.items()}
+
+
+def _build_outcome_weight_array(outcome_by_row: np.ndarray, norm_weight: dict) -> np.ndarray:
+    """Per-row weight array from a fixed outcome->weight mapping (see
+    _compute_outcome_norm_weights()) -- any outcome value not present in
+    norm_weight (e.g. an "incomplete" trailing-episode row, or an outcome
+    that simply didn't occur in whatever sample norm_weight was computed
+    from) defaults to a neutral 1.0."""
+    weights = np.ones(len(outcome_by_row), dtype=np.float32)
+    for o, w in norm_weight.items():
+        weights[outcome_by_row == o] = w
+    return weights
+
+
 def _log_component_correlation(ds, val_idx: np.ndarray, gamma: float) -> None:
     """Correlate each reward component's per-episode MC-return contribution
     against the value network's episode-level residual (return - predicted)
@@ -238,10 +266,16 @@ def _episode_residual_correlation(
 ) -> None:
     """Per reward component, correlate its per-episode MC-return total
     against the value network's per-episode mean residual (return -
-    predicted), across all complete val episodes. Low |correlation| for a
-    component that has non-trivial variance means the network isn't
-    picking up on that component's contribution at all -- a candidate
-    "hardest to predict" signal."""
+    predicted), across all complete val episodes. HIGH |correlation| for a
+    component that has non-trivial variance means that component's swings
+    show up in the net's ERROR, i.e. the net hasn't learned to account for
+    it -- a candidate "hardest to predict" signal. LOW |correlation| means
+    the opposite: whatever this component contributes is already reflected
+    in the net's prediction, leaving no residual trace, even though the
+    component itself has real variance (well-tracked). Verified with a
+    synthetic check (a component the predictor fully captures correlates
+    ~0 with the residual; one it fully ignores correlates ~1) -- don't
+    trust the direction from intuition alone, it's easy to get backwards."""
     if not ds.has_reward_components:
         return
     from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS
@@ -261,16 +295,110 @@ def _episode_residual_correlation(
             continue
         corr = float(np.corrcoef(ep_comp, ep_residual)[0, 1])
         rows.append((k, corr, ep_comp.std()))
-    rows.sort(key=lambda r: abs(r[1]))
+    rows.sort(key=lambda r: -abs(r[1]))
     for k, corr, std in rows:
         log.info(f"  {lbl_map.get(k, k):<16}  {corr:>+7.3f}  {std:>9.4f}")
     if rows:
-        log.info("  (components near the top -- low |corr| despite real variance -- "
-                  "are the ones the value net's errors track least; read alongside "
+        log.info("  (sorted worst-tracked first: HIGH |corr| = this component's variance "
+                  "shows up in the net's error (poorly captured); LOW |corr| despite real "
+                  "variance = already well-accounted-for in the prediction. Read alongside "
                   "the per-component MC-return magnitude above.)")
 
 
-def _episode_rows_to_match_log(ds, start: int, end: int) -> list[dict]:
+def _log_feature_error_correlation(
+    ds, val_idx: np.ndarray, returns_val_all: np.ndarray, residual_by_row: np.ndarray,
+) -> None:
+    """Correlate per-ROW interpretable observation features (not reward
+    components) against the value network's per-row squared error, across
+    every val row -- answers "what kind of situation is hardest to predict
+    the return for", complementing _episode_residual_correlation()'s
+    per-episode reward-component view (which only sees the 7 named reward
+    components, not raw observable state like possession/distance/stamina).
+
+    Uses Pearson correlation, which is well-defined for the 0/1 flags here
+    too (equivalent to point-biserial correlation), so one table covers
+    continuous and binary features alike without separate binning logic.
+    ``corr_sqerr`` is the primary signal -- high |corr| means error
+    concentrates where that feature is high (positive) or low (negative).
+    ``corr_signed`` shows which DIRECTION the net is biased in when that
+    feature is high (residual = actual - predicted, so positive = the net
+    UNDERESTIMATES the return there) -- two features can have the same
+    |corr_sqerr| for very different reasons (systematic bias vs. pure
+    noise), which corr_signed disambiguates.
+
+    Field indices below are PlayerFeatures/BallFeatures field-declaration
+    order (see obs/schema.py -- field position IS the array index, same
+    convention already used by _episode_rows_to_match_log()'s _VEL_X etc.)."""
+    residual = residual_by_row[val_idx]
+    sq_err = residual ** 2
+    self_feat = ds._self_feat[val_idx]
+    ball_feat = ds._ball_feat[val_idx]
+    global_feat = ds._global_feat[val_idx]
+
+    # PlayerFeatures attribute block (schema.py field order, indices 13-20):
+    # top_speed, acceleration, kick_power, kick_precision, dribbling,
+    # ball_control, tackling, stamina_attr -- these are FIXED per-player
+    # (drawn once at spawn), not per-row state like possession/distance
+    # above, so a correlation here answers "does the net do worse for
+    # certain player BUILDS" rather than "certain situations". Included
+    # because push-kick behaviour (orders.py's _try_push_kick) is directly
+    # driven by the top_speed/kick_power ratio (reference_speed from
+    # top_speed, max_kick_speed from kick_power) -- a fast, weak-kicking
+    # player saturates power_fraction against its 1.0 clamp differently
+    # than a slow, hard-kicking one, so it's a real candidate explanation
+    # for player-dependent weirdness (e.g. the many-tiny-kicks degenerate
+    # mode seen in one real worst-episode trace) that per-row situational
+    # features can't see at all.
+    top_speed = self_feat[:, 13]
+    kick_power = self_feat[:, 15]
+    features = {
+        "|return| (target)":     np.abs(returns_val_all[val_idx]),
+        "time_remaining_norm":   global_feat[:, 1],
+        "self_has_possession":   self_feat[:, 23],
+        "self_is_controlling":   self_feat[:, 25],
+        "self_ball_distance":    self_feat[:, 5],
+        "self_ball_closing_spd": self_feat[:, 8],
+        "self_speed":            self_feat[:, 11],
+        "self_stamina":          self_feat[:, 12],
+        "ball_is_loose":         ball_feat[:, 10],
+        "ball_height":           ball_feat[:, 2],
+        "ball_speed":            np.linalg.norm(ball_feat[:, 3:6], axis=1),
+        "is_trainee_row":        ds._is_trainee[val_idx],
+        "attr_top_speed":        top_speed,
+        "attr_acceleration":     self_feat[:, 14],
+        "attr_kick_power":       kick_power,
+        "attr_kick_precision":   self_feat[:, 16],
+        "attr_dribbling":        self_feat[:, 17],
+        "attr_ball_control":     self_feat[:, 18],
+        "attr_tackling":         self_feat[:, 19],
+        "attr_stamina_attr":     self_feat[:, 20],
+        "attr_top_speed_minus_kick_power": top_speed - kick_power,
+    }
+    log.info("--- Per-row feature vs. value-error correlation (val rows) ---")
+    log.info(f"  {'feature':<24}  {'corr_sqerr':>10}  {'corr_signed':>11}")
+    rows = []
+    for name, vals in features.items():
+        if vals.std() < 1e-8:
+            continue
+        corr_sq = float(np.corrcoef(vals, sq_err)[0, 1])
+        corr_signed = float(np.corrcoef(vals, residual)[0, 1])
+        rows.append((name, corr_sq, corr_signed))
+    rows.sort(key=lambda r: -abs(r[1]))
+    for name, corr_sq, corr_signed in rows:
+        log.info(f"  {name:<24}  {corr_sq:>+10.3f}  {corr_signed:>+11.3f}")
+    if rows:
+        log.info("  (corr_sqerr: high |corr| = error concentrates where this feature is "
+                  "high/low. corr_signed: positive = net UNDERESTIMATES the return when "
+                  "this feature is high (residual=actual-predicted grows with it), "
+                  "negative = net OVERESTIMATES there.)")
+
+
+def _episode_rows_to_match_log(
+    ds, start: int, end: int, *,
+    returns_by_row: np.ndarray | None = None,
+    residual_by_row: np.ndarray | None = None,
+    has_prediction: np.ndarray | None = None,
+) -> list[dict]:
     """Convert dataset rows [start, end] (one complete episode, both players
     interleaved as consecutive rows per timed sample -- see
     record_demonstrations.py's _record_now(player_id=None)) into an event
@@ -295,6 +423,37 @@ def _episode_rows_to_match_log(ds, start: int, end: int) -> list[dict]:
     in the dataset) -- it's just the row's position within the episode, so
     the timeline/x-axis is evenly spaced by decision tick rather than by
     real seconds.
+
+    Every event carrying a "player_pos" also carries a matching "player_vel"
+    (3-tuple, same m/s convention as "ball_vel") -- current speed at that
+    exact sample, not derivable from position deltas alone since samples
+    aren't evenly spaced in real time (kick/tackle callback rows). The
+    "start" event's player_positions additionally carries "attributes" (the
+    8 PlayerAttributes fields, all [0,1]) per player -- fixed for the whole
+    episode (drawn once at spawn), so captured once there rather than
+    repeated on every subsequent event. The "episode_end" event also carries
+    "seed" (the int this episode's scenario was built with, or None for
+    datasets predating meta_episode_seeds -- see DemonstrationDataset.
+    episode_seed()) so a worst-episode export can be rebuilt exactly later
+    via scripts/replay_episode.py, not just read as a static log.
+
+    When ``returns_by_row``/``residual_by_row``/``has_prediction`` are given
+    (all full-``ds``-length arrays, e.g. straight from _run_val_diagnostics'
+    own residual_by_row/returns_val plus a `has_prediction[val_idx] = True`
+    mask), every event carrying "self"'s own position also gets
+    "predicted_value" and "actual_return" (predicted = actual - residual,
+    per debug_value_network.py's own residual convention: return -
+    predicted) for THAT row -- not just once at episode end. Previously the
+    net's prediction was only ever visible as a single number
+    (worst_residual) on the episode_end event, computed from the episode's
+    FIRST row -- there was no way to see whether the prediction tracked the
+    unfolding trajectory (e.g. dropping as the ball visibly heads toward
+    the boundary) or sat oblivious to it. `has_prediction` guards against
+    stamping a misleading 0.0 on a row `valid_indices()`/val_idx excluded
+    (e.g. a non-decision-step callback row) -- residual_by_row/returns_by_row
+    are only meaningful where has_prediction is True. Omitted (None, the
+    default) on all three: no predicted_value/actual_return fields at all,
+    exactly the prior behaviour.
     """
     from footballcoach.ai.ppo.bc import (
         _I_AI_TYPE, _I_KICK_THIS_TICK, _I_OPPONENT_AI_TYPE, _I_TACKLE_ATTEMPT,
@@ -304,20 +463,47 @@ def _episode_rows_to_match_log(ds, start: int, end: int) -> list[dict]:
     _AI_TYPE_NAME = {AI_TYPE_RULES: "rules", AI_TYPE_IMMOBILE: "immobile", AI_TYPE_NEURAL: "neural"}
     # PlayerFeatures column indices (see schema.py field order).
     _VEL_X, _VEL_Y, _HAS_POSS, _POS_X, _POS_Y = 9, 10, 23, 30, 31
+    _ATTACKING_DIR = 27
+    # Attribute block (schema.py fields 13-20, all [0,1] from PlayerAttributes)
+    # -- FIXED per player for the whole episode (drawn once at spawn), unlike
+    # every other field this function reads, so it's only captured once, on
+    # the "start" event, rather than repeated on every position sample.
+    _ATTR_TOP_SPEED, _ATTR_ACCEL, _ATTR_KICK_POWER, _ATTR_KICK_PRECISION = 13, 14, 15, 16
+    _ATTR_DRIBBLING, _ATTR_BALL_CONTROL, _ATTR_TACKLING, _ATTR_STAMINA_ATTR = 17, 18, 19, 20
     # BallFeatures column indices (height_m is already in real metres, not
     # normalized -- see schema.py's BallFeatures.height_m).
     _BALL_POS_X, _BALL_POS_Y, _BALL_POS_Z, _BALL_VEL_X, _BALL_VEL_Y = 0, 1, 2, 3, 4
     # Pitch half-diagonal -- ai/obs/encoder.py normalizes BOTH position
     # AND velocity x/y by this SAME constant for players and the ball alike
     # (encoder.py: "pos_x=ball.position.x / half_diag", "pos_y=... /
-    # half_diag" -- NOT separate 52.5/34.0 per-axis divisors, despite what
-    # schema.py's docstring implies ("normalized by standard half-dimensions
-    # (52.5m x 34.0m)"). Using 52.5/34.0 here under-scales y by ~1.84x and x
-    # by ~1.19x, silently producing positions that look well within bounds
-    # when the real position is actually near/at the boundary -- this is
-    # exactly what made early debugging of ball-out episodes so confusing.
+    # half_diag" -- NOT separate 52.5/34.0 per-axis divisors; schema.py's
+    # docstrings used to (wrongly) imply per-axis normalization and have
+    # since been corrected to match this). Using 52.5/34.0 under-scales y
+    # by ~1.84x and x by ~1.19x, silently producing positions that look
+    # well within bounds when the real position is actually near/at the
+    # boundary -- this is exactly what made early debugging of ball-out
+    # episodes so confusing, and the same bug resurfaced in a standalone
+    # diagnostic script (diagnose_crossing_head.py) that didn't reuse this
+    # function -- see ai/knowledge.md.
     import math
     _HALF_DIAG = math.hypot(52.5, 34.0)
+
+    # Real elapsed seconds per TIMED sample (see record_demonstrations.py's
+    # `sample_interval_s` / ai_config.json's bc.demo_sample_interval_s).
+    # Previously this reconstruction used raw `row - start` as "time_s",
+    # which is NOT real time -- kick/tackle callbacks insert extra rows
+    # between timed samples, and even ignoring those, one row-index step
+    # is NOT one second. On one real ball_out episode this made an 18-row
+    # episode display as "18.0s" when the true duration (verified against
+    # the player's own recorded speed_mps and this same divisor) was closer
+    # to 4.5s -- a ~4x error that made a clean, fast sprint-and-intercept
+    # look like a slow multi-second jog. Approximated as
+    # (index within trainee_rows) * sample_interval_s -- exact when no
+    # kick/tackle mid-interval callback has inserted an extra trainee row
+    # (the common case), a slight underestimate otherwise (those extra rows
+    # don't represent a new timed sample, but do advance the index by 1).
+    from footballcoach.ai.config import load_ai_config
+    _sample_interval_s = float(load_ai_config()["bc"]["demo_sample_interval_s"])
 
     def _pos3(feat, pos_x_i, pos_y_i) -> tuple[float, float, float]:
         return (
@@ -339,6 +525,29 @@ def _episode_rows_to_match_log(ds, start: int, end: int) -> list[dict]:
             round(float(feat[vel_y_i]) * _HALF_DIAG, 2),
             0.0,
         )
+
+    def _attrs(feat) -> dict[str, float]:
+        """PlayerAttributes snapshot (all [0,1]) -- fixed for the whole
+        episode, so callers only need this once per player, not per row."""
+        return {
+            "top_speed": round(float(feat[_ATTR_TOP_SPEED]), 3),
+            "acceleration": round(float(feat[_ATTR_ACCEL]), 3),
+            "kick_power": round(float(feat[_ATTR_KICK_POWER]), 3),
+            "kick_precision": round(float(feat[_ATTR_KICK_PRECISION]), 3),
+            "dribbling": round(float(feat[_ATTR_DRIBBLING]), 3),
+            "ball_control": round(float(feat[_ATTR_BALL_CONTROL]), 3),
+            "tackling": round(float(feat[_ATTR_TACKLING]), 3),
+            "stamina_attr": round(float(feat[_ATTR_STAMINA_ATTR]), 3),
+        }
+
+    def _pred_fields(row: int) -> dict[str, float]:
+        """predicted_value/actual_return for `row`, or {} if prediction data
+        wasn't passed in or this row has none (see docstring above)."""
+        if has_prediction is None or not has_prediction[row]:
+            return {}
+        actual = round(float(returns_by_row[row]), 4)
+        predicted = round(actual - float(residual_by_row[row]), 4)
+        return {"predicted_value": predicted, "actual_return": actual}
 
     def _reward_breakdown(start_row: int, end_row: int) -> dict[str, float]:
         """Sum reward components over [start_row, end_row] (the WHOLE
@@ -362,36 +571,151 @@ def _episode_rows_to_match_log(ds, start: int, end: int) -> list[dict]:
             if abs(comp_sum[i]) > 1e-9
         }
 
-    self_ai_type = _AI_TYPE_NAME.get(float(ds._labels[start][_I_AI_TYPE]), "unknown")
-    opp_ai_type = _AI_TYPE_NAME.get(float(ds._labels[start][_I_OPPONENT_AI_TYPE]), "unknown")
-
     def _opp_feat(row: int):
         _exists_row = ds._exists_mask[row]
         _opp_slot = int(_exists_row.argmax()) if _exists_row.any() else 0
         return ds._other_feat[row, _opp_slot]
 
-    start_self_feat = ds._self_feat[start]
-    start_ball_feat = ds._ball_feat[start]
-    start_opp_feat = _opp_feat(start)
+    # BUG FIX (verified against raw ds._is_trainee/_self_feat/_other_feat
+    # data before applying): trainee and opponent rows are INTERLEAVED
+    # within an episode's row range (see compute_returns()'s docstring --
+    # every timed sample appends the trainee's own row AND the opponent's
+    # own row, back to back, order not guaranteed). Each row's self_feat/
+    # bc_label is THAT ROW's OWNER's own perspective -- on an
+    # opponent-owned row (is_trainee=0), ds._self_feat[row] is the
+    # OPPONENT's own state (e.g. an immobile opponent correctly pinned at
+    # its spawn point) and ds._other_feat[row] is really the TRAINEE as
+    # seen by the opponent, NOT "self"/"opponent" from the trainee's point
+    # of view this reconstruction is trying to tell a story from. Using
+    # every row blindly and always labelling self_feat "self" therefore
+    # SWAPS the two players' identities every other row -- verified
+    # directly against raw rows: it produced a nonsensical "immobile
+    # opponent teleports to wherever the ball is and gains possession every
+    # tick" narrative for an episode whose raw data is actually completely
+    # clean (opponent provably pinned at one spot the whole time, trainee's
+    # possession stable, position progressing smoothly). Restricting to
+    # only the trainee's OWN rows fixes this -- each such row already has a
+    # fully correct self=trainee/other=opponent view, so the opponent's own
+    # interleaved rows aren't needed at all (also true for `start`/`end`
+    # themselves -- neither is guaranteed to land on a trainee row).
+    trainee_rows = [r for r in range(start, end + 1) if ds._is_trainee[r] > 0.5]
+    if not trainee_rows:
+        raise ValueError(
+            f"_episode_rows_to_match_log: no trainee-owned row in [{start}, {end}] -- "
+            f"every episode must have at least one (its own is_trainee marking is broken, "
+            f"or start/end don't actually bound one complete episode)."
+        )
+    ep_start, ep_end = trainee_rows[0], trainee_rows[-1]
+    # Real elapsed time only advances on genuine decision-step rows
+    # (is_decision_step==1, 0.5s apart) -- kick/tackle-callback rows and the
+    # trailing terminal row are_decision_step==0 (one real physics tick
+    # later, not a new 0.5s sample) and must NOT advance the clock.
+    # Previously this used a flat enumerate() index over ALL trainee rows
+    # regardless of is_decision_step, so every callback/terminal row
+    # inflated the count by a false extra 0.5s -- confirmed against real
+    # data: a timeout episode with 40 true decision-steps (20.0s, matching
+    # ds.classify_outcome's own 40 rows independently) displayed as 21.5s
+    # (43 * 0.5s) purely because 4 of its 44 trainee rows were non-decision
+    # callback/terminal rows that still each advanced the old flat index.
+    _row_to_i: dict[int, int] = {}
+    _i = -1
+    for r in trainee_rows:
+        if ds._is_decision_step[r] > 0.5:
+            _i += 1
+        _row_to_i[r] = max(_i, 0)
+
+    def _t(row: int) -> float:
+        """Real elapsed seconds for `row` -- see _sample_interval_s's own
+        comment. `row` may not itself be trainee-owned (e.g. `end`); falls
+        back to the nearest trainee row's index rather than raising."""
+        if row in _row_to_i:
+            return round(_row_to_i[row] * _sample_interval_s, 3)
+        nearest = min(trainee_rows, key=lambda r: abs(r - row))
+        return round(_row_to_i[nearest] * _sample_interval_s, 3)
+
+    self_ai_type = _AI_TYPE_NAME.get(float(ds._labels[ep_start][_I_AI_TYPE]), "unknown")
+    opp_ai_type = _AI_TYPE_NAME.get(float(ds._labels[ep_start][_I_OPPONENT_AI_TYPE]), "unknown")
+
+    start_self_feat = ds._self_feat[ep_start]
+    start_ball_feat = ds._ball_feat[ep_start]
+    start_opp_feat = _opp_feat(ep_start)
+    # "team": "left"/"right" is a DISPLAY label only (picks marker colour in
+    # scripts/visualise_match_log.py) -- must be derived from the real
+    # PlayerFeatures.attacking_direction field (+1.0 attacks +x, -1.0 attacks
+    # -x), NOT hardcoded. Previously this was hardcoded "left"/"right"
+    # regardless of which way the player actually attacks, which silently
+    # mislabelled every player whose real attacking_direction is -1.0 --
+    # made a legitimate box_possession-scoring run (ball correctly deep in
+    # the TRUE opponent box on the -x side) look like it ended nowhere near
+    # either box when checked against the wrong (+x) side.
+    self_attacks_pos_x = float(start_self_feat[_ATTACKING_DIR]) > 0.0
+    self_team = "left" if self_attacks_pos_x else "right"
+    opp_team = "right" if self_attacks_pos_x else "left"
     events: list[dict] = [{
         "time_s": 0.0, "event": "start",
         "ball_pos": _ball_pos3(start_ball_feat),
         "ball_vel": _vel3(start_ball_feat, _BALL_VEL_X, _BALL_VEL_Y),
         "player_positions": {
-            "self": {"pos": _pos3(start_self_feat, _POS_X, _POS_Y), "team": "left",
-                     "ai_type": self_ai_type},
-            "opponent": {"pos": _pos3(start_opp_feat, _POS_X, _POS_Y), "team": "right",
-                         "ai_type": opp_ai_type},
+            "self": {"pos": _pos3(start_self_feat, _POS_X, _POS_Y),
+                     "vel": _vel3(start_self_feat, _VEL_X, _VEL_Y),
+                     "team": self_team, "ai_type": self_ai_type,
+                     "attributes": _attrs(start_self_feat),
+                     **_pred_fields(ep_start)},
+            "opponent": {"pos": _pos3(start_opp_feat, _POS_X, _POS_Y),
+                         "vel": _vel3(start_opp_feat, _VEL_X, _VEL_Y),
+                         "team": opp_team, "ai_type": opp_ai_type,
+                         "attributes": _attrs(start_opp_feat)},
         },
     }]
 
+    # Periodic position snapshots so the visualiser's player-track lines
+    # don't sit frozen between sparse events (possession_change/kick/
+    # tackle_attempt) -- previously "consistency" only ever appeared once,
+    # right before episode_end (see below), so a long quiet stretch of
+    # dribbling/running with no kicks (e.g. the timeout episode's last 9s)
+    # rendered as a dead straight line with no sense of how the players
+    # actually moved through it. Reuses the same "consistency" event type
+    # (small muted marker, not a "real" match event) at a fixed real-time
+    # cadence instead of just at the end.
+    _CONSISTENCY_INTERVAL_S = 2.0
+    _last_snapshot_t = float("-inf")
+
+    # kick_this_tick (label index 12) is 1.0 for BOTH a real, physics-
+    # executed kick AND a mere "armed" approach tick with no ball contact
+    # yet (see ai/ppo/bc.py: `kick_this_tick = 1.0 if (player.kicked_this_tick
+    # or player.kick_armed) else 0.0`) -- the two are not separately stored,
+    # so a naive `label[_I_KICK_THIS_TICK] > 0.5` filter shows an "armed but
+    # never touched the ball" tick as if it were a real kick.
+    #
+    # A previous version of this filter used "self has possession again on
+    # the next recorded row" as the real-kick test. That test is now WRONG:
+    # since the engine's one-touch armed-kick fix (Match.
+    # _update_loose_ball_pickup's kick_armed branch), a real kick taken
+    # while merely armed (the common case for a chasing player) grants and
+    # releases possession within the SAME physics tick, by design (no
+    # CONTROLLING_BALL, no lingering possession) -- so has_poss never shows
+    # True on ANY sampled row for that kick, even though it genuinely
+    # struck the ball (confirmed against raw recorded data: repeated real
+    # velocity bumps on a chase with has_poss=False throughout). The
+    # possession-based test silently hid every one-touch redirect.
+    #
+    # The reliable signal instead: is_decision_step==0 marks a row inserted
+    # by the engine's own on_kick/on_tackle callback (see record_
+    # demonstrations.py), and on_kick only ever fires from a REAL executed
+    # kick (Player.kick_direct/kick_with_direction), never from merely
+    # being armed -- so `kick_this_tick AND is_decision_step==0` on the
+    # SAME row is a genuine physics-level kick, independent of whether
+    # possession lingers afterward.
+    _is_decision_step_by_i = [ds._is_decision_step[r] > 0.5 for r in trainee_rows]
+
     last_possessor: str | None = None
-    for row in range(start, end + 1):
-        t = float(row - start)
+    for _i, row in enumerate(trainee_rows):
+        t = _t(row)
         self_feat = ds._self_feat[row]
         ball_feat = ds._ball_feat[row]
         ball_pos = _ball_pos3(ball_feat)
         pos = _pos3(self_feat, _POS_X, _POS_Y)
+        vel = _vel3(self_feat, _VEL_X, _VEL_Y)
         # The (single, in phase 1) opponent occupies a RANDOMIZED slot in
         # other_feat each row (see ai/obs/encoder.py's rng.sample slot
         # shuffle) -- find it via exists_mask rather than assuming slot 0.
@@ -399,6 +723,19 @@ def _episode_rows_to_match_log(ds, start: int, end: int) -> list[dict]:
         # which self_feat's has_possession alone can't distinguish from a
         # loose ball.
         other_feat = _opp_feat(row)
+        other_pos = _pos3(other_feat, _POS_X, _POS_Y)
+        other_vel = _vel3(other_feat, _VEL_X, _VEL_Y)
+        if row != ep_end and t - _last_snapshot_t >= _CONSISTENCY_INTERVAL_S:
+            events.append({
+                "time_s": t, "event": "consistency", "player_id": "self",
+                "player_pos": pos, "player_vel": vel, "ball_pos": ball_pos,
+                **_pred_fields(row),
+            })
+            events.append({
+                "time_s": t, "event": "consistency", "player_id": "opponent",
+                "player_pos": other_pos, "player_vel": other_vel, "ball_pos": ball_pos,
+            })
+            _last_snapshot_t = t
         self_has_poss = self_feat[_HAS_POSS] > 0.5
         opp_has_poss = other_feat[_HAS_POSS] > 0.5
         possessor = "self" if self_has_poss else "opponent" if opp_has_poss else None
@@ -408,26 +745,41 @@ def _episode_rows_to_match_log(ds, start: int, end: int) -> list[dict]:
                 "possessor_id": possessor, "ball_pos": ball_pos,
                 "player_id": possessor,
                 "player_pos": pos if possessor == "self" else
-                    _pos3(other_feat, _POS_X, _POS_Y) if possessor == "opponent" else None,
+                    other_pos if possessor == "opponent" else None,
+                "player_vel": vel if possessor == "self" else
+                    other_vel if possessor == "opponent" else None,
+                **(_pred_fields(row) if possessor == "self" else {}),
             })
             last_possessor = possessor
         label = ds._labels[row]
-        if label[_I_KICK_THIS_TICK] > 0.5:
+        if label[_I_KICK_THIS_TICK] > 0.5 and not _is_decision_step_by_i[_i]:
             events.append({
                 "time_s": t, "event": "kick", "player_id": "self",
-                "player_pos": pos, "ball_pos": ball_pos,
+                "player_pos": pos, "player_vel": vel, "ball_pos": ball_pos,
+                **_pred_fields(row),
             })
         if label[_I_TACKLE_ATTEMPT] > 0.5:
             events.append({
                 "time_s": t, "event": "tackle_attempt", "player_id": "self",
-                "player_pos": pos, "ball_pos": ball_pos,
+                "player_pos": pos, "player_vel": vel, "ball_pos": ball_pos,
+                **_pred_fields(row),
             })
 
+    # ball_feat is shared/global (not player-relative), so reading it at the
+    # raw episode `end` row is fine regardless of which player owns that
+    # row -- only self_feat/other_feat (player-relative) need ep_end.
     end_ball_feat = ds._ball_feat[end]
-    end_self_feat = ds._self_feat[end]
-    end_opp_feat = _opp_feat(end)
+    end_self_feat = ds._self_feat[ep_end]
+    end_opp_feat = _opp_feat(ep_end)
     end_breakdown = _reward_breakdown(start, end)
-    end_t = float(end - start)
+    end_t = _t(end)
+    end_outcome = ds.classify_outcome(end) if ds.has_episode_outcomes else None
+    # The seed this episode's scenario was built with -- see Ball.
+    # episode_seed()'s own docstring. None for datasets recorded before
+    # meta_episode_seeds existed (re-record to enable replay). Lets any
+    # worst-episode export be rebuilt exactly via scripts/replay_episode.py
+    # --seed <this value>, instead of only ever inspecting this static log.
+    end_seed = ds.episode_seed(end) if ds.has_episode_seeds else None
     # Neither real MatchLogger events ("consistency"/"episode_end") nor this
     # reconstruction's own possession_change/kick/tackle_attempt events
     # necessarily carry a position for BOTH players on the episode's last
@@ -442,25 +794,56 @@ def _episode_rows_to_match_log(ds, start: int, end: int) -> list[dict]:
     events.append({
         "time_s": end_t, "event": "consistency", "player_id": "self",
         "player_pos": _pos3(end_self_feat, _POS_X, _POS_Y),
+        "player_vel": _vel3(end_self_feat, _VEL_X, _VEL_Y),
         "ball_pos": _ball_pos3(end_ball_feat),
+        **_pred_fields(ep_end),
     })
     events.append({
         "time_s": end_t, "event": "consistency", "player_id": "opponent",
         "player_pos": _pos3(end_opp_feat, _POS_X, _POS_Y),
+        "player_vel": _vel3(end_opp_feat, _VEL_X, _VEL_Y),
         "ball_pos": _ball_pos3(end_ball_feat),
     })
+    # NOTE: `end_ball_feat`/`end_t` are simply whatever the LAST recorded row
+    # of the episode is -- this function never extrapolates or replays
+    # physics to guess at a state that wasn't recorded. Data recorded
+    # BEFORE the record_demonstrations.py fix (see ScenarioLoop.
+    # last_completed_trial_match / ScenarioEnv.last_terminal_match /
+    # _record_terminal_now in record_demonstrations.py) has its last row
+    # one physics tick BEFORE the true terminal state (env.step() rebuilds
+    # the next trial's match before returning, so the tick that actually
+    # triggered the outcome was never captured) -- re-record to get the
+    # real final tick; this reconstruction only ever shows what's actually
+    # in the file.
+
     events.append({
         "time_s": end_t, "event": "episode_end",
         "ball_pos": _ball_pos3(end_ball_feat),
         "reward_total": round(float(ds._rewards[start:end + 1].sum()), 4),
         "reward_components": end_breakdown,
         "reward_cumulative": end_breakdown,
-        "outcome": ds.classify_outcome(end) if ds.has_episode_outcomes else None,
+        "outcome": end_outcome,
+        "seed": end_seed,
+        # Both players' TRUE final recorded positions, same shape as the
+        # "start" event's player_positions -- lets the visualiser draw a
+        # dedicated end-of-episode marker for each player (not just the
+        # ball) and close out each player's trajectory at its real
+        # endpoint rather than only via the muted "consistency" dot.
+        "player_positions": {
+            "self": {"pos": _pos3(end_self_feat, _POS_X, _POS_Y),
+                     "vel": _vel3(end_self_feat, _VEL_X, _VEL_Y), "team": self_team,
+                     **_pred_fields(ep_end)},
+            "opponent": {"pos": _pos3(end_opp_feat, _POS_X, _POS_Y),
+                         "vel": _vel3(end_opp_feat, _VEL_X, _VEL_Y), "team": opp_team},
+        },
     })
     return events
 
 
-def _save_worst_episode_match_log(ds, val_idx: np.ndarray, residual_by_row: np.ndarray, out_path: str) -> None:
+def _save_worst_episode_match_log(
+    ds, val_idx: np.ndarray, residual_by_row: np.ndarray, out_path: str,
+    returns_by_row: np.ndarray | None = None,
+) -> None:
     """For EACH outcome present among complete val episodes, find the one
     episode with the largest |residual| (return - predicted value, evaluated
     at the episode's first row) and save a synthetic match log (see
@@ -473,8 +856,41 @@ def _save_worst_episode_match_log(ds, val_idx: np.ndarray, residual_by_row: np.n
     only top-level field not already in the last event (episode_end) --
     everything else (AI matchup, final positions/velocities, reward
     breakdown) lives there, not duplicated at the top, to keep each file
-    skimmable."""
+    skimmable.
+
+    `returns_by_row` (the same actual-return array `residual_by_row` was
+    computed against, e.g. `returns_val`) is optional -- when given, every
+    self-position event in the saved log also carries predicted_value/
+    actual_return for that row (see _episode_rows_to_match_log), not just
+    a single residual number on episode_end. `has_prediction` is derived
+    from `val_idx` here (rows outside it never had a real forward pass this
+    diagnostics run) rather than trusting residual_by_row's own default-0.0
+    fill, which is indistinguishable from a genuine zero residual.
+
+    ALSO saves one more file, independent of the per-outcome selection
+    above: the single complete val episode with the most REAL kicks (see
+    _count_real_kicks below), as "<stem>_most_kicks<suffix>" -- a cheap,
+    separate diagnostic lens (a chaotic thrash of kicks looks nothing like
+    a clean episode even when the outcome/residual alone wouldn't flag it
+    as unusual)."""
     import json
+    from footballcoach.ai.ppo.bc import _I_KICK_THIS_TICK
+
+    def _count_real_kicks(start: int, end: int) -> int:
+        """Real, physics-executed kicks only -- kick_this_tick AND NOT
+        is_decision_step (see _episode_rows_to_match_log's own docstring:
+        kick_this_tick alone also fires for a merely-armed approach with no
+        ball contact yet), restricted to trainee-owned rows to match
+        exactly which rows become "kick" events in the saved log."""
+        is_trainee_slice = ds._is_trainee[start:end + 1]
+        labels_slice = ds._labels[start:end + 1]
+        is_decision_step_slice = ds._is_decision_step[start:end + 1]
+        real_kick = (
+            (is_trainee_slice > 0.5)
+            & (labels_slice[:, _I_KICK_THIS_TICK] > 0.5)
+            & (is_decision_step_slice <= 0.5)
+        )
+        return int(real_kick.sum())
 
     ranges = ds.episode_row_ranges(val_idx)
     if not ranges:
@@ -486,12 +902,40 @@ def _save_worst_episode_match_log(ds, val_idx: np.ndarray, residual_by_row: np.n
         outcome = ds.classify_outcome(end) if ds.has_episode_outcomes else "unknown"
         by_outcome.setdefault(outcome, []).append((start, end))
 
+    # episode_row_ranges(val_idx) deliberately returns val_idx's OWN
+    # first/last row per episode, which -- per its own docstring -- can be
+    # a proper SUBSET of the full-dataset episode whenever val_idx is
+    # filtered (val_idx here excludes some rows; see valid_indices()).
+    # Using that truncated end directly as _episode_rows_to_match_log's
+    # `end` would omit the episode's real terminal row entirely -- confirmed
+    # against real data: a timeout episode's true dones=1 boundary was 3
+    # rows past what episode_row_ranges(val_idx) reported, silently cutting
+    # off the actual final state. Resolve to the TRUE full-dataset boundary
+    # before reconstructing, so the saved match log always ends on the
+    # episode's real last row.
+    full_ranges = ds._full_dataset_episode_row_ranges()
+    full_ends = np.array([e for _s, e in full_ranges], dtype=np.int64)
+
+    def _resolve_full_range(any_row: int) -> tuple[int, int]:
+        idx = int(np.searchsorted(full_ends, any_row, side="left"))
+        return full_ranges[idx]
+
+    has_prediction = None
+    if returns_by_row is not None:
+        has_prediction = np.zeros(len(ds), dtype=bool)
+        has_prediction[val_idx] = True
+
     out_path = Path(out_path)
     for outcome in sorted(by_outcome):
         outcome_ranges = by_outcome[outcome]
         worst_start, worst_end = max(outcome_ranges, key=lambda r: abs(residual_by_row[r[0]]))
         worst_residual = float(residual_by_row[worst_start])
-        events = _episode_rows_to_match_log(ds, worst_start, worst_end)
+        true_start, true_end = _resolve_full_range(worst_start)
+        events = _episode_rows_to_match_log(
+            ds, true_start, true_end,
+            returns_by_row=returns_by_row, residual_by_row=residual_by_row,
+            has_prediction=has_prediction,
+        )
         # Metadata folded into the episode_end event as extra keys (ignored
         # by scripts/visualise_match_log.py, which only reads specific known
         # fields) rather than wrapped in a top-level dict -- the file itself
@@ -499,20 +943,39 @@ def _save_worst_episode_match_log(ds, val_idx: np.ndarray, residual_by_row: np.n
         # so this is directly viewable with:
         #   uv run python scripts/visualise_match_log.py <this file>
         events[-1]["residual"] = worst_residual
-        events[-1]["row_range"] = [int(worst_start), int(worst_end)]
+        events[-1]["row_range"] = [int(true_start), int(true_end)]
         events[-1]["n_episodes_this_outcome"] = len(outcome_ranges)
         outcome_path = out_path.with_name(f"{out_path.stem}_{outcome}{out_path.suffix}")
         with open(outcome_path, "w") as f:
             json.dump(events, f, indent=2)
         log.info(f"--- Worst val episode for outcome={outcome} ({len(outcome_ranges)} "
-                  f"episode(s)): rows [{worst_start}, {worst_end}], "
+                  f"episode(s)): rows [{true_start}, {true_end}], "
                   f"residual={worst_residual:+.3f} -- saved match log to {outcome_path} ---")
 
+    most_kicks_start, most_kicks_end = max(ranges, key=lambda r: _count_real_kicks(r[0], r[1]))
+    kick_count = _count_real_kicks(most_kicks_start, most_kicks_end)
+    true_start, true_end = _resolve_full_range(most_kicks_start)
+    events = _episode_rows_to_match_log(
+        ds, true_start, true_end,
+        returns_by_row=returns_by_row, residual_by_row=residual_by_row,
+        has_prediction=has_prediction,
+    )
+    events[-1]["kick_count"] = kick_count
+    events[-1]["row_range"] = [int(true_start), int(true_end)]
+    most_kicks_path = out_path.with_name(f"{out_path.stem}_most_kicks{out_path.suffix}")
+    with open(most_kicks_path, "w") as f:
+        json.dump(events, f, indent=2)
+    log.info(f"--- Val episode with the most kicks ({kick_count}, outcome="
+              f"{events[-1].get('outcome')}): rows [{true_start}, {true_end}] -- "
+              f"saved match log to {most_kicks_path} ---")
 
-def _iterate_over_with_indices(ds, idx, returns, batch_size):
+
+def _iterate_over_with_indices(ds, idx, returns, batch_size, device: torch.device | None = None):
     """Like _iterate_over(shuffle=False) but also yields the row-index chunk,
     so callers can scatter per-row outputs (e.g. residuals) back into a
-    dataset-sized array."""
+    dataset-sized array. ``device`` (default: CPU, matching _to_tensor's own
+    default) -- pass the training device so batches land there directly
+    instead of needing a separate transfer per step."""
     from footballcoach.ai.bc.dataset import _build_ai_type_arrays, _to_tensor
 
     for start in range(0, len(idx), batch_size):
@@ -523,19 +986,24 @@ def _iterate_over_with_indices(ds, idx, returns, batch_size):
             ds._labels[chunk], ds._exists_mask[chunk]
         )
         obs_dict = {
-            "self_feat":   _to_tensor(ds._self_feat[chunk], None),
-            "other_feat":  _to_tensor(ds._other_feat[chunk], None),
-            "exists_mask": _to_tensor(ds._exists_mask[chunk], None),
-            "ball_feat":   _to_tensor(ds._ball_feat[chunk], None),
-            "global_feat": _to_tensor(ds._global_feat[chunk], None),
-            "self_ai_type":  _to_tensor(self_ai_type, None),
-            "other_ai_type": _to_tensor(other_ai_type, None),
+            "self_feat":   _to_tensor(ds._self_feat[chunk], device),
+            "other_feat":  _to_tensor(ds._other_feat[chunk], device),
+            "exists_mask": _to_tensor(ds._exists_mask[chunk], device),
+            "ball_feat":   _to_tensor(ds._ball_feat[chunk], device),
+            "global_feat": _to_tensor(ds._global_feat[chunk], device),
+            "self_ai_type":  _to_tensor(self_ai_type, device),
+            "other_ai_type": _to_tensor(other_ai_type, device),
+            "labels": _to_tensor(ds._labels[chunk], device),
+            "row_idx": torch.as_tensor(chunk, dtype=torch.long, device=device),
         }
-        ret_batch = _to_tensor(returns[chunk], None)
+        ret_batch = _to_tensor(returns[chunk], device)
         yield obs_dict, ret_batch, chunk
 
 
-def _iterate_synthetic_batches(obs_list: list, returns_arr: np.ndarray, batch_size: int, shuffle: bool = False):
+def _iterate_synthetic_batches(
+    obs_list: list, returns_arr: np.ndarray, batch_size: int, shuffle: bool = False,
+    device: torch.device | None = None,
+):
     """Like _iterate_over_with_indices but sourced from the synthetic
     obs_list/returns_arr (see _generate_synthetic_ball_out_set) instead of
     the dataset arrays -- lets those rows be folded into real training
@@ -560,15 +1028,15 @@ def _iterate_synthetic_batches(obs_list: list, returns_arr: np.ndarray, batch_si
         if len(chunk) == 0:
             continue
         obs_dict = {
-            "self_feat":     _to_tensor(self_feat[chunk], None),
-            "other_feat":    _to_tensor(other_feat[chunk], None),
-            "exists_mask":   _to_tensor(exists_mask[chunk], None),
-            "ball_feat":     _to_tensor(ball_feat[chunk], None),
-            "global_feat":   _to_tensor(global_feat[chunk], None),
-            "self_ai_type":  _to_tensor(self_ai_type[chunk], None),
-            "other_ai_type": _to_tensor(other_ai_type[chunk], None),
+            "self_feat":     _to_tensor(self_feat[chunk], device),
+            "other_feat":    _to_tensor(other_feat[chunk], device),
+            "exists_mask":   _to_tensor(exists_mask[chunk], device),
+            "ball_feat":     _to_tensor(ball_feat[chunk], device),
+            "global_feat":   _to_tensor(global_feat[chunk], device),
+            "self_ai_type":  _to_tensor(self_ai_type[chunk], device),
+            "other_ai_type": _to_tensor(other_ai_type[chunk], device),
         }
-        ret_batch = _to_tensor(returns_arr[chunk], None)
+        ret_batch = _to_tensor(returns_arr[chunk], device)
         yield obs_dict, ret_batch, chunk
 
 
@@ -985,11 +1453,13 @@ def _generate_synthetic_ball_out_set(
 
 def _score_synthetic_ball_out_with_net(
     decision_net, value_net, obs_list: list, returns_arr: np.ndarray,
-    outcomes: np.ndarray | None = None,
+    outcomes: np.ndarray | None = None, device: torch.device | None = None,
 ) -> None:
     """Score the TRAINED value_net against the fixed synthetic set's real
     discounted returns (see _generate_synthetic_ball_out_set), broken down
     per outcome (ball_out vs. win) when *outcomes* is given."""
+    from footballcoach.ai.physics_pretrain.physics_value_net import PhysicsEncoderValueNet
+
     if not obs_list:
         return
     self_feat = np.stack([o.self_feat for o in obs_list])
@@ -1002,18 +1472,27 @@ def _score_synthetic_ball_out_with_net(
 
     value_net.eval()
     with torch.no_grad():
-        d_heads = decision_net(
-            torch.from_numpy(self_feat), torch.from_numpy(other_feat),
-            torch.from_numpy(exists_mask), torch.from_numpy(ball_feat),
-            torch.from_numpy(global_feat),
-        )
+        self_feat_t = torch.from_numpy(self_feat).to(device)
+        other_feat_t = torch.from_numpy(other_feat).to(device)
+        exists_mask_t = torch.from_numpy(exists_mask).to(device)
+        ball_feat_t = torch.from_numpy(ball_feat).to(device)
+        global_feat_t = torch.from_numpy(global_feat).to(device)
+        self_ai_type_t = torch.from_numpy(self_ai_type).to(device)
+        other_ai_type_t = torch.from_numpy(other_ai_type).to(device)
+        d_heads = decision_net(self_feat_t, other_feat_t, exists_mask_t, ball_feat_t, global_feat_t)
+        # PhysicsEncoderValueNet is never reachable here in practice -- guarded
+        # upfront in main() (--physics-encoder-value-net is incompatible with
+        # --synthetic-ball-out-episodes/--synthetic-timeout-episodes, the only
+        # callers of this function) -- isinstance check kept as defensive
+        # insurance only; synthetic ObservationBatch rows have no BC-label
+        # source, so this would raise inside forward() if ever hit.
+        extra_kwargs = {"labels": None} if isinstance(value_net, PhysicsEncoderValueNet) else {}
         e_heads = value_net(
-            torch.from_numpy(self_feat), torch.from_numpy(other_feat),
-            torch.from_numpy(exists_mask), torch.from_numpy(ball_feat),
-            torch.from_numpy(global_feat), d_heads,
-            torch.from_numpy(self_ai_type), torch.from_numpy(other_ai_type),
+            self_feat_t, other_feat_t, exists_mask_t, ball_feat_t, global_feat_t, d_heads,
+            self_ai_type_t, other_ai_type_t,
+            **extra_kwargs,
         )
-        pred = e_heads.value.squeeze(-1).numpy()
+        pred = e_heads.value.squeeze(-1).cpu().numpy()
 
     ret_std = max(float(returns_arr.std()), 1e-6)
     for label, mask in [
@@ -1168,6 +1647,142 @@ def _reset_dir_log_std(net) -> None:
     fresh = ExecutionNetwork.from_config()
     net.move_dir_log_std.data.copy_(fresh.move_dir_log_std.data)
     net.kick_dir_log_std.data.copy_(fresh.kick_dir_log_std.data)
+
+
+def _save_value_net_checkpoint(
+    path: str, kind: str, state_dict: dict, optimizer, epoch: int, best_val_norm: float, extra_meta: dict,
+) -> None:
+    """Save THIS script's own value_net training progress -- see
+    --value-checkpoint-dir/--init-value-checkpoint. ``kind`` tags which
+    branch produced this checkpoint ("physics_encoder_value_net" or
+    "fresh_execution_net") so a later --init-value-checkpoint can refuse to
+    load one into the wrong branch with a clear error instead of a silent
+    shape mismatch. ``extra_meta`` carries the branch-specific construction
+    args needed to rebuild an identically-shaped network before loading
+    ``state_dict`` back in (e.g. the physics branch's checkpoint paths/
+    mlp_hidden, or the fresh branch's trunk_hidden/value_hidden_dim/
+    entity_embed_dim)."""
+    from pathlib import Path
+
+    ckpt = {
+        "kind": kind,
+        "state_dict": state_dict,
+        "optimizer_state_dict": optimizer.state_dict(),
+        "epoch": epoch,
+        "best_val_norm": best_val_norm,
+        **extra_meta,
+    }
+    out_path = Path(path)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(ckpt, out_path)
+
+
+def _move_optimizer_state_to_device(optimizer, device: torch.device) -> None:
+    """optimizer.load_state_dict() restores Adam's exp_avg/exp_avg_sq as
+    whatever device they were SAVED on (always CPU here, see torch.save's
+    map_location="cpu" in _load_value_net_checkpoint) -- these don't follow
+    the model's own .to(device) call, so a resumed run on GPU would
+    otherwise hit a device-mismatch error (or silently use stale CPU state)
+    the moment optimizer.step() first runs. Call once right after
+    load_state_dict()."""
+    for state in optimizer.state.values():
+        for k, v in state.items():
+            if torch.is_tensor(v):
+                state[k] = v.to(device)
+
+
+def _load_value_net_checkpoint(path: str, expected_kind: str) -> dict:
+    """Load a checkpoint written by _save_value_net_checkpoint(), raising a
+    clear SystemExit if it was saved by a different branch (kind mismatch)
+    rather than letting load_state_dict() fail with an opaque shape error."""
+    ckpt = torch.load(path, map_location="cpu", weights_only=False)
+    if ckpt.get("kind") != expected_kind:
+        raise SystemExit(
+            f"--init-value-checkpoint {path} was saved as kind={ckpt.get('kind')!r}, expected "
+            f"{expected_kind!r} -- checkpoints from --physics-encoder-value-net and the fresh-"
+            f"ExecutionNetwork path are not interchangeable."
+        )
+    return ckpt
+
+
+def _peek_file_stats(path) -> tuple[int, int]:
+    """Cheap per-file (n_episodes, n_rows), WITHOUT decompressing the big
+    observation arrays -- mirrors DemonstrationDataset.from_files()'s own
+    "Pass 1" (see its docstring): np.load() on a .npz is lazy per-array, so
+    reading just meta_episode_outcomes'/bc_labels' shapes never touches
+    obs_other_feat/obs_self_feat/etc. Used by _EpochFilePool to size a
+    --max-episodes-per-epoch working set (n_episodes) and by
+    PhysicsEncoderValueNet.compute_features_for_files_cached() to know each
+    file's row range within a from_files()-built dataset (n_rows), without
+    paying the full decompression cost for the whole directory up front --
+    the entire point of this feature."""
+    with np.load(path) as data:
+        n_rows = int(data["bc_labels"].shape[0])
+        n_episodes = int(data["meta_episode_outcomes"].shape[0]) if "meta_episode_outcomes" in data.files else n_rows
+        return n_episodes, n_rows
+
+
+class _EpochFilePool:
+    """Manages a --max-episodes-per-epoch training file pool: holds a
+    "working set" of files sized to reach roughly max_episodes episodes,
+    replacing a resample_frac fraction of it with a fresh random draw from
+    the rest of the pool every epoch (see resample()). A real class (not
+    module functions) since it owns real cross-epoch state (which files are
+    currently active, each file's episode/row counts) that would otherwise
+    need threading through main()'s closures by hand.
+
+    Kept deliberately simple: file SELECTION isn't reproduced across a
+    --init-value-checkpoint resume (only model/optimizer state is) -- a
+    resumed run just starts with a fresh random initial sample. Good enough
+    since training data composition doesn't need bit-exact reproducibility
+    the way model weights do.
+    """
+
+    def __init__(self, files: list, max_episodes: int, resample_frac: float, rng: random.Random):
+        # Parallelized across a thread pool -- same rationale as
+        # DemonstrationDataset.from_files()'s own thread pool (see its
+        # _MAX_LOAD_WORKERS): each np.load()+shape-peek is real zlib
+        # decompression + zip-directory parsing, and this runs over the
+        # ENTIRE training file pool (thousands of files) once at startup.
+        import concurrent.futures
+        _n_workers = min(8, _os.cpu_count() or 4)
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_n_workers) as ex:
+            stats = dict(zip(files, ex.map(_peek_file_stats, files)))
+        self._episode_counts = {f: n_ep for f, (n_ep, _n_rows) in stats.items()}
+        self.row_counts = {f: n_rows for f, (_n_ep, n_rows) in stats.items()}
+        self._pool = list(files)
+        self._rng = rng
+        self._max_episodes = max_episodes
+        self._resample_frac = resample_frac
+        self._working_set: list = []
+        self._fill_to_target()
+
+    def _fill_to_target(self) -> None:
+        candidates = [f for f in self._pool if f not in self._working_set]
+        self._rng.shuffle(candidates)
+        total = sum(self._episode_counts[f] for f in self._working_set)
+        for f in candidates:
+            if total >= self._max_episodes:
+                break
+            self._working_set.append(f)
+            total += self._episode_counts[f]
+
+    def resample(self) -> None:
+        """Call at the start of every epoch AFTER the first (the initial
+        working set from __init__ is used for that one)."""
+        n_drop = round(self._resample_frac * len(self._working_set))
+        if n_drop > 0:
+            drop = set(self._rng.sample(self._working_set, n_drop))
+            self._working_set = [f for f in self._working_set if f not in drop]
+        self._fill_to_target()
+
+    @property
+    def files(self) -> list:
+        return list(self._working_set)
+
+    @property
+    def n_episodes(self) -> int:
+        return sum(self._episode_counts[f] for f in self._working_set)
 
 
 def _rollout_label_fn(env):
@@ -1695,6 +2310,92 @@ def main() -> None:
                              "note). Must be divisible by the network's attention head counts "
                              "(network.num_attention_heads / inter_player_attn_heads in "
                              "ai_config.json) or construction will raise.")
+    parser.add_argument("--physics-encoder-value-net", action="store_true", default=False,
+                        help="Replace the normal ExecutionNetwork-based value_net with a tiny "
+                             "MLP over two FROZEN, independently-pretrained physics encoders' "
+                             "latents (ball, masked to zero whenever the ball isn't loose; "
+                             "trainee's own player state, unmasked) plus time-remaining/elapsed, "
+                             "an is-possessed flag, and the opponent's relative position (2 raw "
+                             "scalars, not entity attention) -- no decision-network context. "
+                             "Diagnostic: isolates whether "
+                             "physics-only pretraining already carries reward-to-go signal. "
+                             "Requires --physics-ball-checkpoint/--physics-player-checkpoint. "
+                             "Requires BC labels for heading/desired-direction/speed-mode "
+                             "reconstruction (available from --data demo recordings and from "
+                             "--checkpoint rollout collection alike); incompatible with "
+                             "--synthetic-ball-out-episodes/--synthetic-timeout-episodes (no "
+                             "BC-label source for those rows) and with --reset-value-weights/"
+                             "--reset-separate-value-net/--trunk-hidden/--value-hidden-dim/"
+                             "--entity-embed-dim (none apply to this net's architecture -- use "
+                             "--physics-value-mlp-hidden instead).")
+    parser.add_argument("--physics-ball-checkpoint", type=str, default=None,
+                        help="Frozen BallDynamicsEncoder checkpoint path, e.g. "
+                             "checkpoints/physics_pretrain/ball_encoder_63.midtrain_latest_train.pt. "
+                             "Required with --physics-encoder-value-net.")
+    parser.add_argument("--physics-player-checkpoint", type=str, default=None,
+                        help="Frozen PlayerDynamicsEncoder checkpoint path, e.g. "
+                             "checkpoints/physics_pretrain/player_encoder_45.midtrain_latest_train.pt. "
+                             "Required with --physics-encoder-value-net.")
+    parser.add_argument("--physics-value-mlp-hidden", type=int, default=64,
+                        help="Hidden width of the small trainable MLP head on top of the two "
+                             "frozen latents + time/possession context. Only meaningful with "
+                             "--physics-encoder-value-net.")
+    parser.add_argument("--value-checkpoint-dir", type=str, default=None,
+                        help="If given, saves THIS script's own value_net training progress here "
+                             "every epoch: <dir>/latest.pt (overwritten every epoch) and "
+                             "<dir>/best_val.pt (whenever val normalized MSE improves). Works for "
+                             "both --physics-encoder-value-net and the default fresh-"
+                             "ExecutionNetwork path (not the --checkpoint branch, which loads an "
+                             "already-trained PPO checkpoint -- a different, pre-existing concept "
+                             "with its own resume semantics). Default: not saved.")
+    parser.add_argument("--init-value-checkpoint", type=str, default=None,
+                        help="Resume this script's own value_net + optimizer state + epoch/best-"
+                             "val bookkeeping from a checkpoint previously written by "
+                             "--value-checkpoint-dir (e.g. .../latest.pt or .../best_val.pt). Must "
+                             "match the current branch (--physics-encoder-value-net vs the fresh "
+                             "path) and, for the physics branch, the same --physics-ball-checkpoint/"
+                             "--physics-player-checkpoint/--physics-value-mlp-hidden -- raises a "
+                             "clear error rather than a silent shape mismatch otherwise. "
+                             "Independent of --checkpoint.")
+    parser.add_argument("--max-episodes-per-epoch", type=int, default=None,
+                        help="If given, don't load the whole --data directory into RAM up front. "
+                             "Instead hold a bounded-size TRAINING working set of files (sized to "
+                             "reach roughly this many episodes), and every --epochs-per-reload "
+                             "epochs replace a --epoch-resample-frac fraction of it with a fresh "
+                             "random draw from the rest of the directory -- caps memory to roughly "
+                             "one reload's worth of raw data instead of the entire dataset, at the "
+                             "cost of re-reading the swapped-in fraction from disk each reload "
+                             "(only the newly-added files are actually re-read from disk -- files "
+                             "that survive a resample are spliced in from memory, no re-decompress). "
+                             "The VALIDATION set is a SEPARATE, fixed set of files "
+                             "held out once at the start and never resampled (comparing 'best val' "
+                             "against a moving target would defeat early stopping/checkpointing). "
+                             "With --physics-encoder-value-net, each file's frozen-encoder features "
+                             "are cached per-file (not per-epoch) the first time that file is drawn, "
+                             "so files that survive a resample never get re-encoded. Requires --data "
+                             "(incompatible with --checkpoint). --outcome-reweight's per-outcome "
+                             "weights are computed ONCE from the initial train working set (assumed "
+                             "representative of the full pool) and reused unchanged across every "
+                             "later resample. Skips the one-time pre-training dataset-"
+                             "distribution/linear-regression/reward-breakdown diagnostics (those "
+                             "would only describe the initial sample, not the full pool) -- default "
+                             "None = today's behaviour, load the whole directory once, unchanged.")
+    parser.add_argument("--epoch-resample-frac", type=float, default=0.5,
+                        help="Fraction of the training working set replaced every reload (only "
+                             "meaningful with --max-episodes-per-epoch). 0.5 (default) = swap half "
+                             "the files each reload. 1.0 = fully fresh random sample each reload. "
+                             "0.0 = load once and never resample (degenerates to today's static "
+                             "behaviour, just restricted to a --max-episodes-per-epoch-sized subset "
+                             "instead of the whole directory).")
+    parser.add_argument("--epochs-per-reload", type=int, default=1,
+                        help="How many epochs to train on the current resampled working set before "
+                             "swapping in the next --epoch-resample-frac fraction (only meaningful "
+                             "with --max-episodes-per-epoch). 1 (default) = resample every epoch, "
+                             "unchanged from before this flag existed. Raise this if the reload cost "
+                             "(logged as 'epoch N data reload:') is a meaningful fraction of your "
+                             "actual training time per epoch -- e.g. 5 means the working set only "
+                             "gets swapped every 5th epoch, cutting reload overhead 5x at the cost of "
+                             "the model seeing a less-frequently-refreshed data sample.")
     args = parser.parse_args()
 
     if args.checkpoint and args.data:
@@ -1725,15 +2426,54 @@ def main() -> None:
             raise SystemExit("--reset-value-weights/--reset-separate-value-net/"
                               "--reset-dir-log-std only apply with --checkpoint.")
 
+    if args.physics_encoder_value_net:
+        if not args.physics_ball_checkpoint or not args.physics_player_checkpoint:
+            raise SystemExit("--physics-encoder-value-net requires both "
+                              "--physics-ball-checkpoint and --physics-player-checkpoint.")
+        if args.synthetic_ball_out_episodes or args.synthetic_timeout_episodes:
+            raise SystemExit("--physics-encoder-value-net is incompatible with "
+                              "--synthetic-ball-out-episodes/--synthetic-timeout-episodes "
+                              "(no BC-label source for those rows).")
+        if args.reset_value_weights or args.reset_separate_value_net or args.trunk_hidden or \
+           args.value_hidden_dim or args.entity_embed_dim:
+            raise SystemExit("--reset-value-weights/--reset-separate-value-net/"
+                              "--trunk-hidden/--value-hidden-dim/--entity-embed-dim don't apply "
+                              "to --physics-encoder-value-net's architecture -- use "
+                              "--physics-value-mlp-hidden instead.")
+
+    if args.max_episodes_per_epoch is not None:
+        if args.checkpoint:
+            raise SystemExit("--max-episodes-per-epoch requires --data (loading the whole "
+                              "directory in one shot is inherent to the --checkpoint branch's "
+                              "rollout-collection/warm-start paths) -- incompatible with "
+                              "--checkpoint.")
+        if not (0.0 <= args.epoch_resample_frac <= 1.0):
+            raise SystemExit(f"--epoch-resample-frac must be in [0.0, 1.0], got "
+                              f"{args.epoch_resample_frac!r}.")
+        if args.max_episodes_per_epoch <= 0:
+            raise SystemExit(f"--max-episodes-per-epoch must be positive, got "
+                              f"{args.max_episodes_per_epoch!r}.")
+        if args.epochs_per_reload <= 0:
+            raise SystemExit(f"--epochs-per-reload must be positive, got "
+                              f"{args.epochs_per_reload!r}.")
+    elif args.epochs_per_reload != 1:
+        raise SystemExit("--epochs-per-reload only applies with --max-episodes-per-epoch.")
+
     from footballcoach.ai.config import load_ai_config
 
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
     torch.set_num_threads(int(load_ai_config().get("ppo", {}).get("main_process_torch_threads", 4)))
 
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    log.info(f"Using device: {device}" + (f" ({torch.cuda.get_device_name(0)})" if device.type == "cuda" else ""))
+
+    _resampling_enabled = args.max_episodes_per_epoch is not None
+
     from footballcoach.ai.bc.dataset import DemonstrationDataset
     from footballcoach.ai.models.decision_network import DecisionNetwork
     from footballcoach.ai.models.execution_network import ExecutionNetwork
+    from footballcoach.ai.physics_pretrain.physics_value_net import PhysicsEncoderValueNet
 
     ckpt_trainer = None
     if args.checkpoint:
@@ -1745,7 +2485,7 @@ def main() -> None:
         log.info(f"Checkpoint {args.checkpoint}: separate_value_net="
                  f"{_ckpt_separate_value_net} (auto-detected)")
         ckpt_trainer = PPOTrainer.from_config(
-            device=torch.device("cpu"), inference_only=True,
+            device=device, inference_only=True,
             separate_value_net=_ckpt_separate_value_net,
         )
         ckpt_trainer.load_checkpoint(Path(args.checkpoint))
@@ -1782,140 +2522,325 @@ def main() -> None:
                 reset_dir_log_std=args.reset_dir_log_std,
                 progress_milestone_pct=args.progress_milestone_pct,
             )
+    elif _resampling_enabled:
+        ds = None  # not used in this mode -- see the dedicated setup block below
     else:
         ds = DemonstrationDataset.from_directory(args.data)
-    log.info(f"Loaded {len(ds):,} rows total")
-    log.info(f"has_rewards={ds.has_rewards}")
 
-    valid_idx = ds.valid_indices()
-    log.info(f"valid_indices(): {len(valid_idx):,} rows "
-              f"({100.0 * len(valid_idx) / len(ds):.1f}% of total)")
+    if _resampling_enabled:
+        _setup_start = time.monotonic()
+        all_files = sorted(Path(args.data).glob("*.npz"))
+        if not all_files:
+            raise SystemExit(f"--max-episodes-per-epoch: no .npz files found in {args.data}")
+        _file_rng = random.Random(args.seed)
+        _file_rng.shuffle(all_files)
+        n_val_files = max(1, round(len(all_files) * args.val_frac))
+        val_files, train_files_pool = all_files[:n_val_files], all_files[n_val_files:]
+        if not train_files_pool:
+            raise SystemExit("--max-episodes-per-epoch: --val-frac leaves no files for the "
+                              "training pool -- lower --val-frac or add more recorded files.")
+        log.info(f"--max-episodes-per-epoch: {len(all_files):,} files total -- "
+                 f"{len(val_files)} reserved for a FIXED val set, {len(train_files_pool)} in "
+                 f"the resampled training pool")
 
-    # classify_outcome()/row_outcomes() report the ground-truth episode
-    # outcome (win/loss/ball_out/invalid/timeout) FROM THE TRAINEE'S
-    # PERSPECTIVE ONLY -- e.g. "win" means the trainee reached the box, not
-    # whichever player a given row's self_feat happens to describe.
-    # valid_idx (used for value-net TRAINING, intentionally) includes BOTH
-    # the trainee's own rows AND a non-immobile secondary player's own rows
-    # in the same episode -- for the secondary player, a "win" episode was
-    # actually THEIR loss. Any diagnostic that groups by outcome must
-    # therefore restrict to the trainee's own rows (is_trainee==1) or it
-    # silently mixes the trainee's winning returns with the losing
-    # opponent's returns under the same "win" bucket, producing nonsense
-    # like a negative min inside the "win" outcome. Training itself is
-    # unaffected -- it still uses valid_idx (both perspectives), which is
-    # correct there since self_feat is genuinely self-relative.
-    trainee_valid_idx = valid_idx[ds._is_trainee[valid_idx] > 0.5]
+        ds_val = DemonstrationDataset.from_files(val_files)
+        valid_only = not args.include_immobile_self
+        val_idx = ds_val.valid_indices() if valid_only else np.arange(len(ds_val))
+        if len(val_idx) == 0:
+            raise SystemExit("No val rows -- dataset needs >= 2 complete episodes. "
+                              "Record more episodes; lowering --val-frac won't help; check `dones`.")
+        returns_val = ds_val.compute_returns(gamma=args.gamma)
+        outcome_by_row_val = (
+            ds_val.outcome_by_row() if ds_val.has_episode_outcomes
+            else np.full(len(ds_val), "n/a", dtype=object)
+        )
+        log.info(f"  fixed val set: {len(ds_val):,} rows across {ds_val.n_episodes()} episodes "
+                 f"({len(val_idx):,} valid_idx rows)")
 
-    returns = ds.compute_returns(gamma=args.gamma)
-    log.info(f"Returns over ALL rows: mean={returns.mean():.3f} std={returns.std():.3f} "
-              f"min={returns.min():.3f} max={returns.max():.3f}")
-    returns_valid = returns[valid_idx]
-    log.info(f"Returns over valid_indices(): mean={returns_valid.mean():.3f} "
-              f"std={returns_valid.std():.3f}")
+        file_pool = _EpochFilePool(
+            train_files_pool, args.max_episodes_per_epoch, args.epoch_resample_frac, _file_rng,
+        )
+        file_feature_cache: dict = {}  # persists across epochs -- see PhysicsEncoderValueNet.compute_features_for_files_cached
+        # train_file_slices' KEY ORDER is ds_train's actual row order (insertion
+        # order == the order files were successfully loaded in) -- every
+        # consumer of "what order is ds_train in" (the resample reload below,
+        # compute_features_for_files_cached) must use list(train_file_slices)
+        # for that, NOT file_pool.files (which is just the target working set,
+        # not necessarily in ds_train's row order once resampling reorders
+        # kept-vs-newly-loaded files -- see the resample block below).
+        ds_train, train_file_slices = DemonstrationDataset.from_files_with_offsets(file_pool.files)
+        train_idx = ds_train.valid_indices() if valid_only else np.arange(len(ds_train))
+        returns_train = ds_train.compute_returns(gamma=args.gamma)
+        outcome_by_row_train = (
+            ds_train.outcome_by_row() if ds_train.has_episode_outcomes
+            else np.full(len(ds_train), "n/a", dtype=object)
+        )
+        _reload_cadence = ("every epoch" if args.epochs_per_reload == 1
+                           else f"every {args.epochs_per_reload} epochs")
+        log.info(f"  initial train working set: {len(file_pool.files)} files, "
+                 f"{file_pool.n_episodes} episodes, {len(ds_train):,} rows "
+                 f"({len(train_idx):,} valid_idx rows)  [target {args.max_episodes_per_epoch} "
+                 f"episodes, {args.epoch_resample_frac:.0%} resampled {_reload_cadence}]")
+        log.info(f"  --max-episodes-per-epoch setup: {time.monotonic() - _setup_start:.1f}s")
 
-    _log_dataset_distribution(ds, valid_idx, returns, trainee_valid_idx=trainee_valid_idx)
-    _log_reward_component_breakdown(ds, trainee_valid_idx)
-    if ds.has_reward_components:
-        for _outc in ("win", "loss", "ball_out", "invalid", "timeout"):
-            _log_reward_component_breakdown(ds, trainee_valid_idx, outcome_filter=_outc)
-    _log_returns_by_outcome(ds, trainee_valid_idx, returns, label="trainee's own valid rows")
-    _log_episode_total_reward_by_outcome(ds, trainee_valid_idx, label="trainee's own valid rows")
-
-    valid_only = not args.include_immobile_self
-    train_idx, val_idx = ds.split_train_val_indices(val_frac=args.val_frac, valid_only=valid_only)
-    n_train_eps = ds.n_episodes(train_idx) if len(train_idx) else 0
-    n_val_eps = ds.n_episodes(val_idx) if len(val_idx) else 0
-    log.info(f"Train/val split (valid_only={valid_only}): "
-              f"{len(train_idx):,} train rows across {n_train_eps} episodes  |  "
-              f"{len(val_idx):,} val rows across {n_val_eps} episodes")
-    if len(val_idx) == 0:
-        raise SystemExit("No val rows -- dataset needs >= 2 complete episodes. "
-                          "Record more episodes; lowering --val-frac won't help; "
-                          "check `dones`.")
-
-    # Per-row outcome lookup (see DemonstrationDataset.outcome_by_row()),
-    # cached over the FULL dataset (not train_idx/val_idx, which may be
-    # shuffled/non-contiguous) so any later row chunk can be indexed
-    # directly into it regardless of iteration order. Requires ground-truth
-    # episode outcomes (re-record demonstrations if this dataset predates
-    # meta_episode_outcomes) -- falls back to an all-"n/a" lookup rather
-    # than raising, so the rest of this script's diagnostics still run.
-    if ds.has_episode_outcomes:
-        outcome_by_row = ds.outcome_by_row()
+        # Per-outcome weight MAPPING is computed ONCE here, from the initial
+        # train working set (assumed representative of the full pool, per
+        # the user's call) -- only the per-row weight ARRAY gets rebuilt on
+        # every later resample (see the reload block below), reusing this
+        # same fixed mapping rather than recomputing inverse frequencies
+        # against each epoch's smaller, noisier sample.
+        outcome_reweight_norm_weight: dict | None = None
+        outcome_weight_by_row: np.ndarray | None = None
+        if args.outcome_reweight:
+            outcome_reweight_norm_weight = _compute_outcome_norm_weights(
+                outcome_by_row_train[train_idx], args.outcome_reweight_max,
+            )
+            outcome_weight_by_row = _build_outcome_weight_array(
+                outcome_by_row_train, outcome_reweight_norm_weight,
+            )
+            log.info(f"--- Outcome reweighting enabled (from initial train working set, "
+                     f"capped at {args.outcome_reweight_max}x, reused unchanged across "
+                     f"resamples): {outcome_reweight_norm_weight} ---")
+        synthetic_obs_list: list = []
+        synthetic_returns = np.array([], dtype=np.float64)
+        synthetic_outcomes = np.array([], dtype=object)
+        if args.synthetic_ball_out_episodes > 0 or args.synthetic_timeout_episodes > 0:
+            raise SystemExit("--max-episodes-per-epoch + --synthetic-ball-out-episodes/"
+                              "--synthetic-timeout-episodes isn't supported yet.")
+        log.info("--max-episodes-per-epoch: running the one-time dataset-distribution/reward-"
+                 "breakdown/MC-return diagnostics against the INITIAL TRAIN WORKING SET only "
+                 "(a resampled sample, not the full pool) -- treat as indicative, not exact.")
+        trainee_train_idx = train_idx[ds_train._is_trainee[train_idx] > 0.5]
+        _log_dataset_distribution(ds_train, train_idx, returns_train, trainee_valid_idx=trainee_train_idx)
+        _log_reward_component_breakdown(ds_train, trainee_train_idx)
+        if ds_train.has_reward_components:
+            for _outc in ("win", "loss", "ball_out", "invalid", "timeout"):
+                _log_reward_component_breakdown(ds_train, trainee_train_idx, outcome_filter=_outc)
+        _log_returns_by_outcome(ds_train, trainee_train_idx, returns_train, label="initial train sample")
+        _log_episode_total_reward_by_outcome(ds_train, trainee_train_idx, label="initial train sample")
     else:
-        log.warning("Dataset has no ground-truth episode outcomes -- "
-                    "per-outcome value-loss breakdown will be skipped "
-                    "(re-record with the updated record_demonstrations.py).")
-        outcome_by_row = np.full(len(ds), "n/a", dtype=object)
+        log.info(f"Loaded {len(ds):,} rows total")
+        log.info(f"has_rewards={ds.has_rewards}")
 
-    # Inverse-frequency weight per outcome, computed over train_idx only so
-    # val's loss (and its early-stop signal) stays unweighted/comparable.
-    # Normalized to mean 1.0 over train rows so the overall loss scale (and
-    # therefore --lr) is unaffected -- only the relative per-row weighting
-    # changes, not the total gradient magnitude for a "flat" outcome mix.
-    # Shared by both the linear-regression baseline below and the value net.
-    outcome_weight_by_row: np.ndarray | None = None
-    if args.outcome_reweight:
-        train_outcomes_full = outcome_by_row[train_idx]
-        outcomes_unique, outcome_counts = np.unique(train_outcomes_full, return_counts=True)
-        inv_freq = {o: len(train_outcomes_full) / c for o, c in zip(outcomes_unique, outcome_counts)}
-        mean_inv_freq = float(np.mean([inv_freq[o] for o in train_outcomes_full]))
-        norm_weight = {o: min(w / mean_inv_freq, args.outcome_reweight_max) for o, w in inv_freq.items()}
-        outcome_weight_by_row = np.ones(len(ds), dtype=np.float32)
-        for o, w in norm_weight.items():
-            outcome_weight_by_row[outcome_by_row == o] = w
-        log.info(f"--- Outcome reweighting enabled (train rows only, capped at "
-                 f"{args.outcome_reweight_max}x): {norm_weight} ---")
+        valid_idx = ds.valid_indices()
+        log.info(f"valid_indices(): {len(valid_idx):,} rows "
+                  f"({100.0 * len(valid_idx) / len(ds):.1f}% of total)")
 
-    synthetic_obs_list: list = []
-    synthetic_returns = np.array([], dtype=np.float64)
-    synthetic_outcomes = np.array([], dtype=object)
-    if args.synthetic_ball_out_episodes > 0 or args.synthetic_timeout_episodes > 0:
-        # Each generator builds and drives its own ScenarioEnv instance and
-        # is otherwise pure Python/NumPy (holds the GIL almost the whole
-        # time) -- a thread pool would just take turns, not actually run
-        # both concurrently. Use separate processes for real parallelism;
-        # both generators are already side-effect-free functions returning
-        # plain (list, ndarray, ndarray) results, so they pickle cleanly.
-        import concurrent.futures
+        # classify_outcome()/row_outcomes() report the ground-truth episode
+        # outcome (win/loss/ball_out/invalid/timeout) FROM THE TRAINEE'S
+        # PERSPECTIVE ONLY -- e.g. "win" means the trainee reached the box, not
+        # whichever player a given row's self_feat happens to describe.
+        # valid_idx (used for value-net TRAINING, intentionally) includes BOTH
+        # the trainee's own rows AND a non-immobile secondary player's own rows
+        # in the same episode -- for the secondary player, a "win" episode was
+        # actually THEIR loss. Any diagnostic that groups by outcome must
+        # therefore restrict to the trainee's own rows (is_trainee==1) or it
+        # silently mixes the trainee's winning returns with the losing
+        # opponent's returns under the same "win" bucket, producing nonsense
+        # like a negative min inside the "win" outcome. Training itself is
+        # unaffected -- it still uses valid_idx (both perspectives), which is
+        # correct there since self_feat is genuinely self-relative.
+        trainee_valid_idx = valid_idx[ds._is_trainee[valid_idx] > 0.5]
 
-        with concurrent.futures.ProcessPoolExecutor(max_workers=5) as pool:
-            ball_out_future = (
-                pool.submit(
-                    _generate_synthetic_ball_out_set,
-                    args.synthetic_ball_out_episodes, args.synthetic_ball_out_t_max_s, args.seed,
+        returns = ds.compute_returns(gamma=args.gamma)
+        log.info(f"Returns over ALL rows: mean={returns.mean():.3f} std={returns.std():.3f} "
+                  f"min={returns.min():.3f} max={returns.max():.3f}")
+        returns_valid = returns[valid_idx]
+        log.info(f"Returns over valid_indices(): mean={returns_valid.mean():.3f} "
+                  f"std={returns_valid.std():.3f}")
+
+        _log_dataset_distribution(ds, valid_idx, returns, trainee_valid_idx=trainee_valid_idx)
+        _log_reward_component_breakdown(ds, trainee_valid_idx)
+        if ds.has_reward_components:
+            for _outc in ("win", "loss", "ball_out", "invalid", "timeout"):
+                _log_reward_component_breakdown(ds, trainee_valid_idx, outcome_filter=_outc)
+        _log_returns_by_outcome(ds, trainee_valid_idx, returns, label="trainee's own valid rows")
+        _log_episode_total_reward_by_outcome(ds, trainee_valid_idx, label="trainee's own valid rows")
+
+        valid_only = not args.include_immobile_self
+        train_idx, val_idx = ds.split_train_val_indices(val_frac=args.val_frac, valid_only=valid_only)
+        n_train_eps = ds.n_episodes(train_idx) if len(train_idx) else 0
+        n_val_eps = ds.n_episodes(val_idx) if len(val_idx) else 0
+        log.info(f"Train/val split (valid_only={valid_only}): "
+                  f"{len(train_idx):,} train rows across {n_train_eps} episodes  |  "
+                  f"{len(val_idx):,} val rows across {n_val_eps} episodes")
+        if len(val_idx) == 0:
+            raise SystemExit("No val rows -- dataset needs >= 2 complete episodes. "
+                              "Record more episodes; lowering --val-frac won't help; "
+                              "check `dones`.")
+
+        # Per-row outcome lookup (see DemonstrationDataset.outcome_by_row()),
+        # cached over the FULL dataset (not train_idx/val_idx, which may be
+        # shuffled/non-contiguous) so any later row chunk can be indexed
+        # directly into it regardless of iteration order. Requires ground-truth
+        # episode outcomes (re-record demonstrations if this dataset predates
+        # meta_episode_outcomes) -- falls back to an all-"n/a" lookup rather
+        # than raising, so the rest of this script's diagnostics still run.
+        if ds.has_episode_outcomes:
+            outcome_by_row = ds.outcome_by_row()
+        else:
+            log.warning("Dataset has no ground-truth episode outcomes -- "
+                        "per-outcome value-loss breakdown will be skipped "
+                        "(re-record with the updated record_demonstrations.py).")
+            outcome_by_row = np.full(len(ds), "n/a", dtype=object)
+
+        # Inverse-frequency weight per outcome, computed over train_idx only so
+        # val's loss (and its early-stop signal) stays unweighted/comparable.
+        # Normalized to mean 1.0 over train rows so the overall loss scale (and
+        # therefore --lr) is unaffected -- only the relative per-row weighting
+        # changes, not the total gradient magnitude for a "flat" outcome mix.
+        # Shared by both the linear-regression baseline below and the value net.
+        outcome_weight_by_row: np.ndarray | None = None
+        if args.outcome_reweight:
+            norm_weight = _compute_outcome_norm_weights(outcome_by_row[train_idx], args.outcome_reweight_max)
+            outcome_weight_by_row = _build_outcome_weight_array(outcome_by_row, norm_weight)
+            log.info(f"--- Outcome reweighting enabled (train rows only, capped at "
+                     f"{args.outcome_reweight_max}x): {norm_weight} ---")
+
+        synthetic_obs_list: list = []
+        synthetic_returns = np.array([], dtype=np.float64)
+        synthetic_outcomes = np.array([], dtype=object)
+        if args.synthetic_ball_out_episodes > 0 or args.synthetic_timeout_episodes > 0:
+            # Each generator builds and drives its own ScenarioEnv instance and
+            # is otherwise pure Python/NumPy (holds the GIL almost the whole
+            # time) -- a thread pool would just take turns, not actually run
+            # both concurrently. Use separate processes for real parallelism;
+            # both generators are already side-effect-free functions returning
+            # plain (list, ndarray, ndarray) results, so they pickle cleanly.
+            import concurrent.futures
+
+            with concurrent.futures.ProcessPoolExecutor(max_workers=5) as pool:
+                ball_out_future = (
+                    pool.submit(
+                        _generate_synthetic_ball_out_set,
+                        args.synthetic_ball_out_episodes, args.synthetic_ball_out_t_max_s, args.seed,
+                    )
+                    if args.synthetic_ball_out_episodes > 0 else None
                 )
-                if args.synthetic_ball_out_episodes > 0 else None
-            )
-            timeout_future = (
-                pool.submit(
-                    _generate_synthetic_timeout_set,
-                    args.synthetic_timeout_episodes, args.synthetic_timeout_s_min,
-                    args.synthetic_timeout_s_max, args.seed,
+                timeout_future = (
+                    pool.submit(
+                        _generate_synthetic_timeout_set,
+                        args.synthetic_timeout_episodes, args.synthetic_timeout_s_min,
+                        args.synthetic_timeout_s_max, args.seed,
+                    )
+                    if args.synthetic_timeout_episodes > 0 else None
                 )
-                if args.synthetic_timeout_episodes > 0 else None
+                if ball_out_future is not None:
+                    synthetic_obs_list, synthetic_returns, synthetic_outcomes = ball_out_future.result()
+                if timeout_future is not None:
+                    to_obs_list, to_returns, to_outcomes_raw = timeout_future.result()
+                    if to_obs_list:
+                        # Tagged "timeout_<outcome>" (rather than reusing bare outcome
+                        # names) so this set's breakdown stays distinguishable from the
+                        # ball-out set's above even after both are concatenated.
+                        to_outcomes = np.array([f"timeout_{o}" for o in to_outcomes_raw], dtype=object)
+                        synthetic_obs_list = synthetic_obs_list + to_obs_list
+                        synthetic_returns = np.concatenate([synthetic_returns, to_returns])
+                        synthetic_outcomes = np.concatenate([synthetic_outcomes, to_outcomes])
+
+        _run_linear_regression(
+            ds, train_idx, val_idx, returns, outcome_weight_by_row,
+            synthetic_obs_list=synthetic_obs_list, synthetic_returns=synthetic_returns,
+            synthetic_outcomes=synthetic_outcomes,
+        )
+
+        # Non-resampling mode: train and val share the same underlying
+        # dataset/returns/outcome lookup (just different row slices) --
+        # aliasing them onto the ds_train/ds_val names lets _run_epoch()
+        # use ONE selection rule (is_val_data) uniformly in both modes,
+        # rather than needing its own separate branch for this case.
+        ds_train = ds_val = ds
+        returns_train = returns_val = returns
+        outcome_by_row_train = outcome_by_row_val = outcome_by_row
+
+    # Overridden below (in the physics-encoder / fresh-ExecutionNetwork
+    # branches only -- see --init-value-checkpoint) if resuming this
+    # script's own prior training progress.
+    start_epoch = 1
+    resumed_best_val_norm: float | None = None
+
+    if args.physics_encoder_value_net:
+        # decision_net is still built (existing call-site contract) but its
+        # output is unused by PhysicsEncoderValueNet.forward() -- reuse the
+        # checkpoint's own decision_net if one was loaded (--checkpoint given
+        # alongside this flag), otherwise a fresh throwaway one, same
+        # "frozen, context only" role as the other two branches below.
+        decision_net = ckpt_trainer.decision_net if ckpt_trainer is not None else DecisionNetwork.from_config()
+        decision_net = decision_net.to(device)
+        decision_net.eval()
+        for p in decision_net.parameters():
+            p.requires_grad_(False)
+
+        _obs_cfg = load_ai_config().get("observation", {})
+        _curr_cfg = load_ai_config().get("curriculum", {})
+        value_net = PhysicsEncoderValueNet.from_checkpoints(
+            args.physics_ball_checkpoint, args.physics_player_checkpoint,
+            mlp_hidden=args.physics_value_mlp_hidden,
+            live_ball_spin_nn_norm_rad_s=float(_obs_cfg.get("ball_spin_nn_norm_rad_s", 55.0)),
+            live_height_norm_m=float(_obs_cfg.get("height_norm_m", 3.0)),
+            time_norm_max_s=float(_obs_cfg.get("time_remaining_norm_max_s", 7200.0)),
+            max_episode_s=float(_curr_cfg.get("phase1_max_episode_s", 60.0)),
+        )
+        # MUST move to device before constructing the optimizer -- .to()
+        # replaces each Parameter's underlying tensor; an optimizer built
+        # from the pre-move parameters would keep training stale CPU copies
+        # never touched by any forward/backward pass on GPU.
+        value_net = value_net.to(device)
+        optimizer = torch.optim.Adam(
+            value_net.mlp.parameters(), lr=args.lr, eps=1e-5, weight_decay=args.weight_decay
+        )
+        n_params = sum(p.numel() for p in value_net.mlp.parameters())
+        log.info(f"value_net: physics-encoder diagnostic net (ball+player frozen encoders + "
+                 f"{args.physics_value_mlp_hidden}-wide MLP head), trainable_params={n_params:,}")
+        # Encoders/aux heads/canonicalization are all frozen -- nothing about
+        # their output depends on self.mlp's (the only trainable part)
+        # weights, so precompute+cache once over every row that'll ever be
+        # looked up instead of recomputing the same frozen pipeline every
+        # single epoch. --max-episodes-per-epoch needs TWO separate caches
+        # (the static val set's, and the per-epoch-resampled train set's --
+        # see _run_epoch's is_val_data-keyed swap of value_net._feature_cache
+        # right before each call) since ds_train's row layout changes every
+        # epoch while ds_val's never does; outside that mode ds_train IS
+        # ds_val (aliased above), so one combined cache covers both, exactly
+        # like before this feature existed.
+        _precompute_start = time.monotonic()
+        if _resampling_enabled:
+            val_feature_cache = value_net.precompute_and_cache_features(ds_val, val_idx)
+            train_feature_cache = value_net.compute_features_for_files_cached(
+                ds_train, list(train_file_slices), file_pool.row_counts, file_feature_cache,
             )
-            if ball_out_future is not None:
-                synthetic_obs_list, synthetic_returns, synthetic_outcomes = ball_out_future.result()
-            if timeout_future is not None:
-                to_obs_list, to_returns, to_outcomes_raw = timeout_future.result()
-                if to_obs_list:
-                    # Tagged "timeout_<outcome>" (rather than reusing bare outcome
-                    # names) so this set's breakdown stays distinguishable from the
-                    # ball-out set's above even after both are concatenated.
-                    to_outcomes = np.array([f"timeout_{o}" for o in to_outcomes_raw], dtype=object)
-                    synthetic_obs_list = synthetic_obs_list + to_obs_list
-                    synthetic_returns = np.concatenate([synthetic_returns, to_returns])
-                    synthetic_outcomes = np.concatenate([synthetic_outcomes, to_outcomes])
-
-    _run_linear_regression(
-        ds, train_idx, val_idx, returns, outcome_weight_by_row,
-        synthetic_obs_list=synthetic_obs_list, synthetic_returns=synthetic_returns,
-        synthetic_outcomes=synthetic_outcomes,
-    )
-
-    if args.checkpoint:
+            log.info(f"  precomputed+cached physics-encoder features for val ({len(val_idx):,} "
+                     f"rows) + initial train working set ({len(ds_train):,} rows) in "
+                     f"{time.monotonic() - _precompute_start:.1f}s")
+        else:
+            train_feature_cache = val_feature_cache = value_net.precompute_and_cache_features(
+                ds_train, np.concatenate([train_idx, val_idx]),
+            )
+            log.info(f"  precomputed+cached physics-encoder features for "
+                     f"{len(train_idx) + len(val_idx):,} rows in "
+                     f"{time.monotonic() - _precompute_start:.1f}s")
+        if args.init_value_checkpoint:
+            _vckpt = _load_value_net_checkpoint(args.init_value_checkpoint, "physics_encoder_value_net")
+            if (_vckpt.get("physics_ball_checkpoint") != args.physics_ball_checkpoint or
+                    _vckpt.get("physics_player_checkpoint") != args.physics_player_checkpoint or
+                    _vckpt.get("physics_value_mlp_hidden") != args.physics_value_mlp_hidden):
+                raise SystemExit(
+                    f"--init-value-checkpoint {args.init_value_checkpoint} was trained with "
+                    f"physics_ball_checkpoint={_vckpt.get('physics_ball_checkpoint')!r}, "
+                    f"physics_player_checkpoint={_vckpt.get('physics_player_checkpoint')!r}, "
+                    f"physics_value_mlp_hidden={_vckpt.get('physics_value_mlp_hidden')!r} -- "
+                    f"doesn't match the current run's --physics-ball-checkpoint/"
+                    f"--physics-player-checkpoint/--physics-value-mlp-hidden. Resuming into a "
+                    f"differently-shaped/differently-sourced net would silently corrupt training."
+                )
+            value_net.mlp.load_state_dict(_vckpt["state_dict"])
+            optimizer.load_state_dict(_vckpt["optimizer_state_dict"])
+            _move_optimizer_state_to_device(optimizer, device)
+            start_epoch = int(_vckpt["epoch"]) + 1
+            resumed_best_val_norm = float(_vckpt["best_val_norm"])
+            log.info(f"  resumed from {args.init_value_checkpoint}: epoch={_vckpt['epoch']} "
+                     f"best_val_norm={resumed_best_val_norm:.4f} -- continuing at epoch {start_epoch}")
+    elif args.checkpoint:
         # Loaded checkpoint's decision_net -- frozen either way (this script
         # never trains it), same role as the fresh-random one below: produce
         # decision_heads context for the execution/value network's forward
@@ -1949,6 +2874,7 @@ def main() -> None:
                 value_hidden_dim_override=args.value_hidden_dim,
                 entity_embed_dim_override=args.entity_embed_dim,
             )
+            value_net = value_net.to(device)  # before optimizer construction, see physics-branch comment
             optimizer = torch.optim.Adam(
                 value_net.parameters(), lr=args.lr, eps=1e-5, weight_decay=args.weight_decay
             )
@@ -1982,7 +2908,7 @@ def main() -> None:
         # for the execution network's forward pass -- mirrors how the value net
         # is always fed decision_heads in the real training loop, but here it is
         # NOT trained, isolating "can a value net fit returns from obs alone".
-        decision_net = DecisionNetwork.from_config()
+        decision_net = DecisionNetwork.from_config().to(device)
         decision_net.eval()
         for p in decision_net.parameters():
             p.requires_grad_(False)
@@ -1992,6 +2918,9 @@ def main() -> None:
             value_hidden_dim_override=args.value_hidden_dim,
             entity_embed_dim_override=args.entity_embed_dim,
         )
+        # MUST move to device before constructing the optimizer -- see the
+        # physics-encoder branch's identical comment.
+        value_net = value_net.to(device)
         n_params = sum(p.numel() for p in value_net.parameters())
         log.info(
             f"value_net capacity: trunk_hidden={value_net.trunk[0].out_features}  "
@@ -2002,8 +2931,28 @@ def main() -> None:
         optimizer = torch.optim.Adam(
             value_net.parameters(), lr=args.lr, eps=1e-5, weight_decay=args.weight_decay
         )
+        if args.init_value_checkpoint:
+            _vckpt = _load_value_net_checkpoint(args.init_value_checkpoint, "fresh_execution_net")
+            if (_vckpt.get("trunk_hidden") != args.trunk_hidden or
+                    _vckpt.get("value_hidden_dim") != args.value_hidden_dim or
+                    _vckpt.get("entity_embed_dim") != args.entity_embed_dim):
+                raise SystemExit(
+                    f"--init-value-checkpoint {args.init_value_checkpoint} was trained with "
+                    f"trunk_hidden={_vckpt.get('trunk_hidden')!r}, "
+                    f"value_hidden_dim={_vckpt.get('value_hidden_dim')!r}, "
+                    f"entity_embed_dim={_vckpt.get('entity_embed_dim')!r} -- doesn't match the "
+                    f"current run's --trunk-hidden/--value-hidden-dim/--entity-embed-dim. Resuming "
+                    f"into a differently-shaped net would silently corrupt training."
+                )
+            value_net.load_state_dict(_vckpt["state_dict"])
+            optimizer.load_state_dict(_vckpt["optimizer_state_dict"])
+            _move_optimizer_state_to_device(optimizer, device)
+            start_epoch = int(_vckpt["epoch"]) + 1
+            resumed_best_val_norm = float(_vckpt["best_val_norm"])
+            log.info(f"  resumed from {args.init_value_checkpoint}: epoch={_vckpt['epoch']} "
+                     f"best_val_norm={resumed_best_val_norm:.4f} -- continuing at epoch {start_epoch}")
 
-    ret_std_train = float(np.std(returns[train_idx])) if len(train_idx) else 1.0
+    ret_std_train = float(np.std(returns_train[train_idx])) if len(train_idx) else 1.0
     ret_var_train = max(ret_std_train ** 2, 1e-6)
 
     from footballcoach.ai.ppo.bc import (
@@ -2011,50 +2960,93 @@ def main() -> None:
     )
     _OPP_TYPE_NAME = {AI_TYPE_RULES: "rules", AI_TYPE_IMMOBILE: "immobile", AI_TYPE_NEURAL: "neural"}
 
-    def _run_epoch(idx: np.ndarray, train: bool) -> tuple[float, float, dict[str, tuple[float, int]], dict[str, tuple[float, int]]]:
-        """Return (raw_mse, normalized_mse, per_opponent_type, per_outcome)
-        averaged over all rows in idx. Both breakdown dicts map name ->
+    def _run_epoch(
+        idx: np.ndarray, train: bool, is_val_data: bool = False,
+    ) -> tuple[float, float, dict[str, tuple[float, int]], dict[str, tuple[float, int]], dict[str, float] | None]:
+        """Return (raw_mse, normalized_mse, per_opponent_type, per_outcome,
+        grad_norm_stats) averaged over all rows in idx. grad_norm_stats is
+        {"mean": ..., "max": ...} (the pre-clip gradient L2 norm from every
+        optimizer.step() this epoch) when train=True, else None (no backward
+        pass ran). Both breakdown dicts map name ->
         (raw_mse, n_rows). When train=True and synthetic rows were generated
         (--synthetic-ball-out-episodes), those rows are mixed into the SAME
         training batches (not a separate pass) -- they're tagged with a
         "synthetic_" prefix on their real (ball_out/win) outcome in the
         per-outcome breakdown so their contribution stays visible without a
-        second training loop."""
+        second training loop.
+
+        ``is_val_data`` selects WHICH dataset ``idx`` indexes into
+        (ds_val/returns_val/outcome_by_row_val vs. ds_train/returns_train/
+        outcome_by_row_train) -- deliberately separate from ``train`` (which
+        only controls whether gradients/optimizer.step() happen): the
+        epoch-0 baseline call below evaluates train_idx with train=False
+        (pure forward pass, no gradient) but it's still TRAIN data. Outside
+        --max-episodes-per-epoch, ds_train IS ds_val (same object, aliased)
+        so this selection is a no-op either way. For --physics-encoder-value-net,
+        also swaps value_net's active feature cache to match (train_feature_cache
+        is rebuilt fresh every epoch by the caller; val_feature_cache is
+        static) -- see PhysicsEncoderValueNet.compute_features_for_files_cached()."""
+        from footballcoach.ai.progress import ProgressReporter
+
+        ds_cur = ds_val if is_val_data else ds_train
+        returns_cur = returns_val if is_val_data else returns_train
+        outcome_by_row_cur = outcome_by_row_val if is_val_data else outcome_by_row_train
+        if isinstance(value_net, PhysicsEncoderValueNet):
+            value_net._feature_cache = val_feature_cache if is_val_data else train_feature_cache
+
         total_sq_err = 0.0
         n_rows = 0
         opp_sq_err: dict[str, float] = {}
         opp_n_rows: dict[str, int] = {}
         outc_sq_err: dict[str, float] = {}
         outc_n_rows: dict[str, int] = {}
+        # Pre-clip gradient L2 norm (clip_grad_norm_ always returns this,
+        # whether or not it actually clips) -- tracked per optimizer.step()
+        # to help diagnose "loss isn't moving": a norm collapsing toward 0
+        # means vanishing gradients (nothing left to learn from), a norm
+        # pinned near/above the clip threshold (1.0, see below) every step
+        # means clipping is constantly kicking in and likely bottlenecking
+        # progress, neither of which is visible from the loss curve alone.
+        grad_norm_sum = 0.0
+        grad_norm_max = 0.0
+        n_grad_steps = 0
         value_net.train(train)
         epoch_idx = idx.copy()
         if train:
             np.random.shuffle(epoch_idx)
 
         def _step(obs_dict, ret_batch, opp_type_col, outcome_col, row_weights):
-            nonlocal total_sq_err, n_rows
+            nonlocal total_sq_err, n_rows, grad_norm_sum, grad_norm_max, n_grad_steps
             with torch.set_grad_enabled(train):
                 with torch.no_grad():
                     d_heads = decision_net(
                         obs_dict["self_feat"], obs_dict["other_feat"], obs_dict["exists_mask"],
                         obs_dict["ball_feat"], obs_dict["global_feat"],
                     )
+                extra_kwargs = (
+                    {"labels": obs_dict.get("labels"), "row_idx": obs_dict.get("row_idx")}
+                    if isinstance(value_net, PhysicsEncoderValueNet) else {}
+                )
                 e_heads = value_net(
                     obs_dict["self_feat"], obs_dict["other_feat"], obs_dict["exists_mask"],
                     obs_dict["ball_feat"], obs_dict["global_feat"], d_heads,
                     obs_dict.get("self_ai_type"), obs_dict.get("other_ai_type"),
+                    **extra_kwargs,
                 )
                 pred = e_heads.value.squeeze(-1)
                 per_row_sq = (pred - ret_batch) ** 2
                 if train and row_weights is not None:
-                    loss = (torch.from_numpy(row_weights) * per_row_sq).mean()
+                    loss = (torch.from_numpy(row_weights).to(device) * per_row_sq).mean()
                 else:
                     loss = per_row_sq.mean()
                 if train:
                     optimizer.zero_grad()
                     loss.backward()
-                    torch.nn.utils.clip_grad_norm_(value_net.parameters(), 1.0)
+                    total_norm = float(torch.nn.utils.clip_grad_norm_(value_net.parameters(), 1.0))
                     optimizer.step()
+                    grad_norm_sum += total_norm
+                    grad_norm_max = max(grad_norm_max, total_norm)
+                    n_grad_steps += 1
             # Reported/logged MSE is always the UNWEIGHTED mean squared error
             # (per_row_sq), even when the backward pass above used a weighted
             # loss -- keeps every logged number comparable across runs regardless
@@ -2062,32 +3054,43 @@ def main() -> None:
             per_row_sq_err = per_row_sq.detach()
             total_sq_err += float(per_row_sq_err.sum())
             n_rows += len(ret_batch)
+            # .cpu() before numpy-boolean-mask indexing below -- opp_type_col/
+            # outcome_col are plain numpy arrays, and indexing/",numpy()"-ing a
+            # CUDA tensor with/into one raises; harmless no-op on CPU.
+            per_row_sq_err_np = per_row_sq_err.cpu().numpy()
             if opp_type_col is not None:
                 for code, name in _OPP_TYPE_NAME.items():
                     row_mask = opp_type_col == code
                     if not row_mask.any():
                         continue
-                    opp_sq_err[name] = opp_sq_err.get(name, 0.0) + float(per_row_sq_err[row_mask].sum())
+                    opp_sq_err[name] = opp_sq_err.get(name, 0.0) + float(per_row_sq_err_np[row_mask].sum())
                     opp_n_rows[name] = opp_n_rows.get(name, 0) + int(row_mask.sum())
             for outcome in np.unique(outcome_col):
                 row_mask_np = outcome_col == outcome
                 outc_sq_err[outcome] = outc_sq_err.get(outcome, 0.0) + float(
-                    per_row_sq_err.numpy()[row_mask_np].sum()
+                    per_row_sq_err_np[row_mask_np].sum()
                 )
                 outc_n_rows[outcome] = outc_n_rows.get(outcome, 0) + int(row_mask_np.sum())
 
-        for obs_dict, ret_batch, chunk in _iterate_over_with_indices(ds, epoch_idx, returns, args.batch_size):
+        progress = ProgressReporter(len(epoch_idx), prefix="  val:   " if is_val_data else "  train: ")
+        for obs_dict, ret_batch, chunk in _iterate_over_with_indices(
+            ds_cur, epoch_idx, returns_cur, args.batch_size, device=device,
+        ):
             row_weights = (
                 outcome_weight_by_row[chunk] if train and outcome_weight_by_row is not None else None
             )
-            _step(obs_dict, ret_batch, ds._labels[chunk, _I_OPPONENT_AI_TYPE], outcome_by_row[chunk], row_weights)
+            _step(
+                obs_dict, ret_batch, ds_cur._labels[chunk, _I_OPPONENT_AI_TYPE],
+                outcome_by_row_cur[chunk], row_weights,
+            )
+            progress.update(n_rows, postfix=f"loss={total_sq_err / max(n_rows, 1):.4f}")
 
         if train and synthetic_obs_list:
             synthetic_outcome_col_full = np.array(
                 [f"synthetic_{o}" for o in synthetic_outcomes], dtype=object
             )
             for obs_dict, ret_batch, chunk in _iterate_synthetic_batches(
-                synthetic_obs_list, synthetic_returns, args.batch_size, shuffle=True,
+                synthetic_obs_list, synthetic_returns, args.batch_size, shuffle=True, device=device,
             ):
                 _step(obs_dict, ret_batch, None, synthetic_outcome_col_full[chunk], None)
 
@@ -2100,7 +3103,11 @@ def main() -> None:
             name: (outc_sq_err[name] / max(outc_n_rows[name], 1), outc_n_rows[name])
             for name in outc_sq_err
         }
-        return raw_mse, raw_mse / ret_var_train, per_opponent_type, per_outcome
+        grad_norm_stats = (
+            {"mean": grad_norm_sum / n_grad_steps, "max": grad_norm_max}
+            if n_grad_steps > 0 else None
+        )
+        return raw_mse, raw_mse / ret_var_train, per_opponent_type, per_outcome, grad_norm_stats
 
     log.info(f"Fitting fresh separate value network: {args.epochs} epochs, "
              f"lr={args.lr}, weight_decay={args.weight_decay}, batch_size={args.batch_size}, "
@@ -2111,13 +3118,21 @@ def main() -> None:
     # like 40).
     def _log_epoch_result(
         epoch_label: str,
-        train_raw, train_norm, train_by_opp, train_by_outc,
-        val_raw, val_norm, val_by_opp, val_by_outc,
+        train_raw, train_norm, train_by_opp, train_by_outc, train_grad_norm,
+        val_raw, val_norm, val_by_opp, val_by_outc, val_grad_norm,
     ) -> None:
+        # train_grad_norm is None on the epoch-0 baseline call (train=False,
+        # no backward pass ever ran) -- val_grad_norm is always None (no
+        # gradients on val) and isn't printed.
+        grad_norm_str = (
+            f"  grad_norm={train_grad_norm['mean']:.4f} (max={train_grad_norm['max']:.4f})"
+            if train_grad_norm is not None else ""
+        )
         log.info(
             f"{epoch_label}  "
             f"train_rmse={math.sqrt(train_raw):.4f} (norm={math.sqrt(train_norm):.4f})  "
             f"val_rmse={math.sqrt(val_raw):.4f} (norm={math.sqrt(val_norm):.4f})"
+            f"{grad_norm_str}"
         )
         for name in sorted(set(train_by_opp) | set(val_by_opp)):
             train_mse, train_n = train_by_opp.get(name, (float("nan"), 0))
@@ -2141,28 +3156,191 @@ def main() -> None:
     # below, just never called with train=True first.
     _log_epoch_result(
         f"epoch   0/{args.epochs} (baseline, no training yet)",
-        *_run_epoch(train_idx, train=False), *_run_epoch(val_idx, train=False),
+        *_run_epoch(train_idx, train=False, is_val_data=False),
+        *_run_epoch(val_idx, train=False, is_val_data=True),
     )
 
-    best_val_norm = float("inf")
+    def _save_value_net_now(epoch: int, current_best_val_norm: float, filename: str) -> None:
+        if not args.value_checkpoint_dir:
+            return
+        if isinstance(value_net, PhysicsEncoderValueNet):
+            _save_value_net_checkpoint(
+                f"{args.value_checkpoint_dir}/{filename}", "physics_encoder_value_net",
+                value_net.mlp.state_dict(), optimizer, epoch, current_best_val_norm,
+                extra_meta={
+                    "physics_ball_checkpoint": args.physics_ball_checkpoint,
+                    "physics_player_checkpoint": args.physics_player_checkpoint,
+                    "physics_value_mlp_hidden": args.physics_value_mlp_hidden,
+                },
+            )
+        elif not args.checkpoint:
+            _save_value_net_checkpoint(
+                f"{args.value_checkpoint_dir}/{filename}", "fresh_execution_net",
+                value_net.state_dict(), optimizer, epoch, current_best_val_norm,
+                extra_meta={
+                    "trunk_hidden": args.trunk_hidden,
+                    "value_hidden_dim": args.value_hidden_dim,
+                    "entity_embed_dim": args.entity_embed_dim,
+                },
+            )
+        else:
+            log.warning("--value-checkpoint-dir has no effect with --checkpoint (the PPO-"
+                        "checkpoint-warm-start branch) -- only --physics-encoder-value-net and "
+                        "the fresh-ExecutionNetwork path support saving this script's own "
+                        "training progress.")
+
+    def _run_val_diagnostics(epoch_label: str) -> None:
+        """Recompute per-row val residuals (a full forward pass over
+        val_idx, separate from _run_epoch's own val pass since that only
+        keeps the running loss, not per-row predictions) and run the
+        component-correlation/feature-correlation/worst-episode diagnostics
+        against them. Called periodically during training (see the epoch
+        loop, same cadence as --epochs-per-reload) and once more after the
+        loop ends, so a long run gets visibility into how these correlations
+        evolve instead of only a single snapshot at the very end."""
+        residual_by_row = np.zeros(len(ds_val), dtype=np.float32)
+        value_net.eval()
+        if isinstance(value_net, PhysicsEncoderValueNet):
+            # Defensive, not load-bearing given _run_epoch's own call order
+            # (it always ends on an is_val_data=True call, which already
+            # leaves this set correctly) -- but don't rely on that.
+            value_net._feature_cache = val_feature_cache
+        with torch.no_grad():
+            for obs_dict, ret_batch, chunk in _iterate_over_with_indices(
+                ds_val, val_idx, returns_val, args.batch_size, device=device,
+            ):
+                d_heads = decision_net(
+                    obs_dict["self_feat"], obs_dict["other_feat"], obs_dict["exists_mask"],
+                    obs_dict["ball_feat"], obs_dict["global_feat"],
+                )
+                extra_kwargs = (
+                    {"labels": obs_dict.get("labels"), "row_idx": obs_dict.get("row_idx")}
+                    if isinstance(value_net, PhysicsEncoderValueNet) else {}
+                )
+                e_heads = value_net(
+                    obs_dict["self_feat"], obs_dict["other_feat"], obs_dict["exists_mask"],
+                    obs_dict["ball_feat"], obs_dict["global_feat"], d_heads,
+                    obs_dict.get("self_ai_type"), obs_dict.get("other_ai_type"),
+                    **extra_kwargs,
+                )
+                pred = e_heads.value.squeeze(-1).cpu().numpy()
+                residual_by_row[chunk] = ret_batch.cpu().numpy() - pred
+
+        log.info(f"=== Val diagnostics @ {epoch_label} ===")
+        _log_component_correlation(ds_val, val_idx, args.gamma)
+        _episode_residual_correlation(ds_val, val_idx, args.gamma, residual_by_row)
+        _log_feature_error_correlation(ds_val, val_idx, returns_val, residual_by_row)
+        _save_worst_episode_match_log(
+            ds_val, val_idx, residual_by_row, args.worst_episode_log_path,
+            returns_by_row=returns_val,
+        )
+
+    best_val_norm = resumed_best_val_norm if resumed_best_val_norm is not None else float("inf")
     _patience_ctr = 0
-    for epoch in range(1, args.epochs + 1):
-        train_raw, train_norm, train_by_opp, train_by_outc = _run_epoch(train_idx, train=True)
-        val_raw, val_norm, val_by_opp, val_by_outc = _run_epoch(val_idx, train=False)
+    for epoch in range(start_epoch, args.epochs + 1):
+        if _resampling_enabled and epoch > start_epoch and (epoch - start_epoch) % args.epochs_per_reload == 0:
+            # Skip on the very first epoch of a run (whether fresh or
+            # resumed) -- file_pool's own __init__ already gave us that
+            # epoch's initial working set; resampling from epoch 2 onward
+            # avoids throwing away half of what was just loaded before
+            # training on it even once. --epochs-per-reload > 1 further
+            # skips this on every epoch except every Nth one (counted from
+            # start_epoch, so a --init-value-checkpoint resume mid-cycle
+            # doesn't matter -- it just restarts the N-epoch counter from
+            # wherever it resumed, same as a fresh run would from epoch 0).
+            # Incremental reload: only files NEW to the working set this epoch
+            # get re-read from disk (DemonstrationDataset.from_files_with_offsets()
+            # -- the expensive, zlib-decompressing step). Files that survive
+            # the resample get their rows sliced straight out of the CURRENT
+            # ds_train (still alive at this point -- see concat_slices()) and
+            # spliced into the new one via concat_slices(), no disk I/O at
+            # all. Previously this called from_files() on the ENTIRE working
+            # set every epoch regardless of how much of it actually changed
+            # -- with a typical --epoch-resample-frac (e.g. 0.3), that meant
+            # re-decompressing ~70% of the pool from scratch every single
+            # epoch for no reason.
+            _reload_start = time.monotonic()
+            file_pool.resample()
+            kept_files = [f for f in file_pool.files if f in train_file_slices]
+            new_files = [f for f in file_pool.files if f not in train_file_slices]
+            pieces = [(ds_train, train_file_slices[f]) for f in kept_files]
+            piece_files = list(kept_files)
+            if new_files:
+                ds_new, new_file_slices = DemonstrationDataset.from_files_with_offsets(new_files)
+                for f in new_files:
+                    if f in new_file_slices:  # defensive: skip any unreadable-file race, see from_files()
+                        pieces.append((ds_new, new_file_slices[f]))
+                        piece_files.append(f)
+            n_new_files = len(piece_files) - len(kept_files)
+            ds_train = DemonstrationDataset.concat_slices(pieces)
+            # Rebuild the offset map for the NEW ds_train -- its row order is
+            # piece_files' order (kept files first, then newly-loaded ones),
+            # which is generally NOT file_pool.files' order, so any later
+            # consumer of "what order is ds_train in" must use
+            # list(train_file_slices), not file_pool.files.
+            train_file_slices = {}
+            _off = 0
+            for f, (_src, sl) in zip(piece_files, pieces):
+                n_rows = sl.stop - sl.start
+                train_file_slices[f] = slice(_off, _off + n_rows)
+                _off += n_rows
+            train_idx = ds_train.valid_indices() if valid_only else np.arange(len(ds_train))
+            returns_train = ds_train.compute_returns(gamma=args.gamma)
+            outcome_by_row_train = (
+                ds_train.outcome_by_row() if ds_train.has_episode_outcomes
+                else np.full(len(ds_train), "n/a", dtype=object)
+            )
+            if outcome_reweight_norm_weight is not None:
+                # Reuse the FIXED mapping computed once from the initial
+                # working set (see setup above) -- only the per-row array
+                # needs rebuilding, since ds_train's row layout just changed.
+                outcome_weight_by_row = _build_outcome_weight_array(
+                    outcome_by_row_train, outcome_reweight_norm_weight,
+                )
+            if isinstance(value_net, PhysicsEncoderValueNet):
+                train_feature_cache = value_net.compute_features_for_files_cached(
+                    ds_train, piece_files, file_pool.row_counts, file_feature_cache,
+                )
+            log.info(
+                f"  epoch {epoch} data reload: {time.monotonic() - _reload_start:.1f}s "
+                f"({n_new_files} new file(s) loaded from disk, {len(kept_files)} kept in "
+                f"memory from last epoch (no re-read/re-decompress, encoder features "
+                f"reused), {len(ds_train):,} rows, {file_pool.n_episodes} episodes)"
+            )
+
+        train_raw, train_norm, train_by_opp, train_by_outc, train_grad_norm = _run_epoch(
+            train_idx, train=True, is_val_data=False,
+        )
+        val_raw, val_norm, val_by_opp, val_by_outc, val_grad_norm = _run_epoch(
+            val_idx, train=False, is_val_data=True,
+        )
         _log_epoch_result(
             f"epoch {epoch:3d}/{args.epochs}",
-            train_raw, train_norm, train_by_opp, train_by_outc,
-            val_raw, val_norm, val_by_opp, val_by_outc,
+            train_raw, train_norm, train_by_opp, train_by_outc, train_grad_norm,
+            val_raw, val_norm, val_by_opp, val_by_outc, val_grad_norm,
         )
-        if val_norm < best_val_norm:
+        # Same cadence as the data reload above (both keyed off
+        # --epochs-per-reload, default 1 = every epoch outside
+        # --max-episodes-per-epoch) -- these diagnostics involve their own
+        # full forward pass over val_idx (to get per-row predictions, not
+        # just the running loss _run_epoch already computed), so tying them
+        # to the reload cadence keeps a long run's overhead bounded instead
+        # of paying for correlation/worst-episode analysis every epoch.
+        if (epoch - start_epoch) % args.epochs_per_reload == 0:
+            _run_val_diagnostics(f"epoch {epoch}/{args.epochs}")
+        is_best = val_norm < best_val_norm
+        if is_best:
             best_val_norm = val_norm
             _patience_ctr = 0
         else:
             _patience_ctr += 1
-            if args.patience > 0 and _patience_ctr >= args.patience:
-                log.info(f"Early stopping at epoch {epoch}/{args.epochs} "
-                         f"(val normalized MSE did not improve for {args.patience} epochs).")
-                break
+        _save_value_net_now(epoch, best_val_norm, "latest.pt")
+        if is_best:
+            _save_value_net_now(epoch, best_val_norm, "best_val.pt")
+        if not is_best and args.patience > 0 and _patience_ctr >= args.patience:
+            log.info(f"Early stopping at epoch {epoch}/{args.epochs} "
+                     f"(val normalized MSE did not improve for {args.patience} epochs).")
+            break
 
     log.info(f"Best val normalized MSE achieved: {best_val_norm:.4f} "
              f"(RMSE={math.sqrt(best_val_norm):.4f}; "
@@ -2177,30 +3355,16 @@ def main() -> None:
             "observable in obs_self_feat/obs_ball_feat/obs_global_feat."
         )
 
-    # --- Per-row residuals on val set for the two post-training diagnostics ---
-    residual_by_row = np.zeros(len(ds), dtype=np.float32)
-    value_net.eval()
-    with torch.no_grad():
-        for obs_dict, ret_batch, chunk in _iterate_over_with_indices(ds, val_idx, returns, args.batch_size):
-            d_heads = decision_net(
-                obs_dict["self_feat"], obs_dict["other_feat"], obs_dict["exists_mask"],
-                obs_dict["ball_feat"], obs_dict["global_feat"],
-            )
-            e_heads = value_net(
-                obs_dict["self_feat"], obs_dict["other_feat"], obs_dict["exists_mask"],
-                obs_dict["ball_feat"], obs_dict["global_feat"], d_heads,
-                obs_dict.get("self_ai_type"), obs_dict.get("other_ai_type"),
-            )
-            pred = e_heads.value.squeeze(-1).numpy()
-            residual_by_row[chunk] = ret_batch.numpy() - pred
-
-    _log_component_correlation(ds, val_idx, args.gamma)
-    _episode_residual_correlation(ds, val_idx, args.gamma, residual_by_row)
-    _save_worst_episode_match_log(ds, val_idx, residual_by_row, args.worst_episode_log_path)
+    # Final diagnostics snapshot for the truly-last epoch reached (natural
+    # completion or early stopping) -- may repeat the last periodic call
+    # from inside the loop if the run happened to stop on a reload-cadence
+    # epoch, which is harmless.
+    _run_val_diagnostics("final")
 
     if synthetic_obs_list:
         _score_synthetic_ball_out_with_net(
             decision_net, value_net, synthetic_obs_list, synthetic_returns, synthetic_outcomes,
+            device=device,
         )
 
 

@@ -35,15 +35,15 @@ N_TARGET_FIELDS_PER_HORIZON = 11
 
 # Fixed divisor for encoding/decoding spin (``_kinematics_divisors``'s
 # ``div_spin``) -- DELIBERATELY hardcoded, NOT sourced from
-# ``ball_spin_norm_max_rad_s`` (a `BallEpisodeGenParams` field, see below)
+# ``ball_spin_nn_norm_rad_s`` (a `BallEpisodeGenParams` field, see below)
 # even though the two used to be the same number. Reasoning: `params.
-# ball_spin_norm_max_rad_s` is also `ai/obs/encoder.py`'s live-match spin
+# ball_spin_nn_norm_rad_s` is also `ai/obs/encoder.py`'s live-match spin
 # normalization scale (same `ai_config.json["observation"]` key, shared
 # between systems) AND `_sample_spin`'s sampling-range upper bound -- both
 # of which are legitimate to want to change independently of "what number
 # do already-generated dataset shards divide spin by". If this dataset's
 # own normalization divisor tracked that config value, bumping
-# `ball_spin_norm_max_rad_s` to widen the sampling range (or to retune the
+# `ball_spin_nn_norm_rad_s` to widen the sampling range (or to retune the
 # live encoder) would silently re-scale every NEWLY generated shard's spin
 # encoding relative to already-generated ones still on disk -- and
 # `ball_dataset.generate_dataset` APPENDS to an existing output directory
@@ -71,6 +71,32 @@ class BallEpisodeGenParams:
     ball_speed_max_mps: float
     out_of_bounds_start_frac: float
     spin_active_frac: float
+    # Fraction of NOT-``start_special`` episodes that start resting exactly
+    # on the ground (z=radius, vel_z=0.0, purely horizontal velocity) instead
+    # of the general in-play draw (z in [radius, 3.0], full random-3D-sphere
+    # velocity -- see `_sample_velocity`/`_sample_position_in_play`).
+    # Motivated by a real-match diagnostic (`diagnose_crossing_head.py`)
+    # finding `crossing_head` confidently wrong on real "invalid"-outcome
+    # (untouched ball rolls out) episodes despite 99.5% recall on this
+    # dataset's own validation split: genuinely grounded rows (|vel_z|<0.001
+    # AND height_z<0.005) were only ~0.1% of this dataset before this field
+    # existed (354 of 348,000 val rows), because `_sample_velocity` always
+    # draws a full 3D direction and `_sample_position_in_play` always starts
+    # z in [radius, 3.0] -- there was no code path that ever produced a
+    # sustained grounded-roll trajectory, even though that's the dominant
+    # regime in real open play (most of the pitch time is rolling
+    # passes/dribbles, not lobs/bounces) and specifically the regime real
+    # "invalid" episodes are drawn from almost exclusively. The tiny sliver
+    # of near-grounded rows that DID exist were mostly non-crossing (11.9%
+    # positive vs this dataset's 48.9% overall), so the classifier had
+    # learned "grounded correlates with won't-cross-soon" as a spurious
+    # artifact of near-total absence, not a real physical relationship --
+    # even fast, obviously-boundary-bound rolling balls got confidently
+    # classified as "won't cross." Default 0.0 (opt-in via config, backward
+    # compatible with existing dataset shards/checkpoints trained before
+    # this field existed) -- see ai_config.json's own comment for the
+    # recommended nonzero value.
+    grounded_start_frac: float
     sim_dt_s: float
     base_pitch_length_m: float
     base_pitch_width_m: float
@@ -82,7 +108,7 @@ class BallEpisodeGenParams:
     # this dataset's own spin normalization divisor -- see
     # `BALL_SPIN_NORM_DIVISOR_RAD_S` above for why those were deliberately
     # split apart.
-    ball_spin_norm_max_rad_s: float
+    ball_spin_nn_norm_rad_s: float
     height_norm_m: float
     normalize_kinematics_by_base_pitch: bool
     goal_net_collisions_enabled: bool
@@ -105,13 +131,14 @@ class BallEpisodeGenParams:
             ball_speed_max_mps=float(pp_cfg["ball_speed_max_mps"]),
             out_of_bounds_start_frac=float(pp_cfg["out_of_bounds_start_frac"]),
             spin_active_frac=float(pp_cfg.get("spin_active_frac", 0.35)),
+            grounded_start_frac=float(pp_cfg.get("grounded_start_frac", 0.0)),
             sim_dt_s=float(obs_cfg["sim_dt_s"]),
             base_pitch_length_m=float(pitch_cfg["length_m"]),
             base_pitch_width_m=float(pitch_cfg["width_m"]),
             base_goal_width_m=float(pitch_cfg["goal_width_m"]),
             base_goal_height_m=float(pitch_cfg["goal_height_m"]),
             base_restitution=float(ball_physics_cfg["bounce_restitution_vertical"]),
-            ball_spin_norm_max_rad_s=float(obs_cfg["ball_spin_norm_max_rad_s"]),
+            ball_spin_nn_norm_rad_s=float(obs_cfg["ball_spin_nn_norm_rad_s"]),
             height_norm_m=float(obs_cfg.get("height_norm_m", 3.0)),
             normalize_kinematics_by_base_pitch=bool(pp_cfg.get("normalize_kinematics_by_base_pitch", False)),
             goal_net_collisions_enabled=bool(pp_cfg.get("goal_net_collisions_enabled", True)),
@@ -201,6 +228,28 @@ def _sample_velocity(rng: random.Random, speed_max_mps: float) -> Vector3:
     return Vector3(float(v[0]), float(v[1]), float(v[2]))
 
 
+def _sample_position_grounded(rng: random.Random, pitch: Pitch, radius: float) -> Vector3:
+    """Same x/y sampling as ``_sample_position_in_play``, but ``z`` is fixed
+    EXACTLY at the ball's own radius (resting on the ground) instead of
+    drawn from ``[radius, 3.0]`` -- paired with ``_sample_velocity_
+    grounded``'s ``vel_z=0`` for a genuine "ball rolling on the pitch" start,
+    see ``BallEpisodeGenParams.grounded_start_frac``'s docstring for why
+    this exact combination didn't otherwise exist in this generator."""
+    margin = 1.0
+    x = rng.uniform(-pitch.half_length + margin, pitch.half_length - margin)
+    y = rng.uniform(-pitch.half_width + margin, pitch.half_width - margin)
+    return Vector3(x, y, radius)
+
+
+def _sample_velocity_grounded(rng: random.Random, speed_max_mps: float) -> Vector3:
+    """Uniform random direction in the HORIZONTAL (x/y) plane only, magnitude
+    uniform in ``[0, speed_max_mps]``, ``vel_z`` exactly ``0.0`` -- see
+    ``BallEpisodeGenParams.grounded_start_frac``'s docstring."""
+    angle = rng.uniform(0.0, 2.0 * math.pi)
+    speed = rng.uniform(0.0, speed_max_mps)
+    return Vector3(speed * math.cos(angle), speed * math.sin(angle), 0.0)
+
+
 def _sample_spin(rng: random.Random, spin_max_rad_s: float, active_frac: float) -> Vector3:
     """Zero spin most of the time (real play is usually low/no-spin);
     ``active_frac`` of episodes get a random-axis, random-magnitude spin
@@ -251,7 +300,7 @@ def _kinematics_divisors(pitch: Pitch, params: BallEpisodeGenParams) -> tuple[fl
     its config comment in ai_config.json). ``div_spin`` is always the fixed
     ``BALL_SPIN_NORM_DIVISOR_RAD_S`` module constant -- spin was never
     per-episode-scaled to begin with, and this divisor is deliberately NOT
-    ``params.ball_spin_norm_max_rad_s`` (see that constant's docstring for
+    ``params.ball_spin_nn_norm_rad_s`` (see that constant's docstring for
     why). ``div_vel`` is always ``half_diag``, one shared
     divisor across x/y/z (unaffected by this flag either way -- only WHICH
     pitch's half_diag it is changes).
@@ -403,14 +452,25 @@ def generate_episode(
     phys_params = replace(BallPhysicsParams.from_config(), bounce_restitution_vertical=restitution)
 
     start_special = rng.random() < params.out_of_bounds_start_frac
-    position = (
-        _sample_position_already_special(rng, pitch, params.ball_radius_m) if start_special
-        else _sample_position_in_play(rng, pitch, params.ball_radius_m)
-    )
+    # Grounded-roll draw only applies to the "ordinary in-play" branch --
+    # start_special already places the ball via its own dedicated (also
+    # airborne-capable) sampling, and combining the two would double-count
+    # the frac against the wrong denominator. See BallEpisodeGenParams.
+    # grounded_start_frac's docstring for why this branch exists at all.
+    start_grounded = (not start_special) and (rng.random() < params.grounded_start_frac)
+    if start_special:
+        position = _sample_position_already_special(rng, pitch, params.ball_radius_m)
+        velocity = _sample_velocity(rng, params.ball_speed_max_mps)
+    elif start_grounded:
+        position = _sample_position_grounded(rng, pitch, params.ball_radius_m)
+        velocity = _sample_velocity_grounded(rng, params.ball_speed_max_mps)
+    else:
+        position = _sample_position_in_play(rng, pitch, params.ball_radius_m)
+        velocity = _sample_velocity(rng, params.ball_speed_max_mps)
     ball = Ball(
         position=position,
-        velocity=_sample_velocity(rng, params.ball_speed_max_mps),
-        spin=_sample_spin(rng, params.ball_spin_norm_max_rad_s, params.spin_active_frac),
+        velocity=velocity,
+        spin=_sample_spin(rng, params.ball_spin_nn_norm_rad_s, params.spin_active_frac),
     )
 
     input_row = _encode_input(ball, pitch, restitution, params)

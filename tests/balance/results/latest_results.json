@@ -64,18 +64,18 @@
   "turning_reversal_scenario_accel_0.5": {
     "reference_speed_mps": 8.14,
     "time_to_start_reversing_s": 1.033,
-    "separation_after_10s_m": 143.32
+    "separation_after_10s_m": 142.78
   },
   "turning_reversal_accel_comparison": {
     "low_accel_attr_0.1": {
       "reference_speed_mps": 8.14,
       "time_to_start_reversing_s": 1.367,
-      "separation_after_10s_m": 137.49
+      "separation_after_10s_m": 137.32
     },
     "high_accel_attr_0.9": {
       "reference_speed_mps": 8.14,
       "time_to_start_reversing_s": 0.867,
-      "separation_after_10s_m": 146.45
+      "separation_after_10s_m": 146.32
     }
   },
   "shoot_order_penalty_precision_0.8_corner_aim": {
@@ -93,18 +93,18 @@
     "result": "overlap_occurred"
   },
   "repulsion_on_collision_avoidance": {
-    "min_separation_m": 1.1349,
+    "min_separation_m": 1.2014,
     "sum_radii_m": 0.6,
-    "clearance_m": 0.5349,
+    "clearance_m": 0.6014,
     "p0_arrived_within_2s": false,
     "p1_arrived_within_2s": false,
     "direct_travel_ticks": 25
   },
   "repulsion_ball_carrier_avoidance": {
-    "min_sep_with_ball_m": 1.7673,
-    "min_sep_without_ball_m": 1.6652,
-    "mean_close_approach_speed_with_ball_mps": 8.487,
-    "mean_close_approach_speed_without_ball_mps": 8.834,
+    "min_sep_with_ball_m": 2.4916,
+    "min_sep_without_ball_m": 1.7504,
+    "mean_close_approach_speed_with_ball_mps": 7.993,
+    "mean_close_approach_speed_without_ball_mps": 8.788,
     "carrier_is_slower": true
   },
   "dribble_penalty_near_zero_margin": {
@@ -268,8 +268,8 @@
   },
   "repulsion_three_neighbours": {
     "initial_x": 0.0,
-    "final_x": 1.252,
-    "displacement_m": 1.252,
+    "final_x": 2.307,
+    "displacement_m": 2.307,
     "made_forward_progress": true
   },
   "repulsion_oscillation_check": {

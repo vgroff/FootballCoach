@@ -273,15 +273,29 @@ class ExecutionNetwork(nn.Module):
         other_ai_type: Optional[torch.Tensor] = None,  # (batch, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM)
     ) -> ExecutionHeadsRaw:
         dec_flat = flatten_decision_heads(decision_heads)
+
+        # --- Reuse DecisionNetwork's already-computed physics features
+        # (see decision_network.py's forward()) -- never call either frozen
+        # physics encoder here, that would run it a second time per
+        # observation. None when the feature is disabled (default). ---
+        ball_feat_aug = ball_feat
+        self_feat_aug = self_feat
+        other_feat_aug = other_feat
+        if decision_heads.ball_physics_full is not None:
+            ball_feat_aug = torch.cat([ball_feat, decision_heads.ball_physics_full], dim=-1)
+        if decision_heads.self_physics_full is not None:
+            self_feat_aug = torch.cat([self_feat, decision_heads.self_physics_full], dim=-1)
+            other_feat_aug = torch.cat([other_feat, decision_heads.other_physics_full], dim=-1)
+
         entity_ctx, self_embed_raw, other_embed_raw = self.entity_encoder(
-            self_feat, other_feat, exists_mask, return_embeds=True,
-            ball_feat=ball_feat, global_feat=global_feat,
+            self_feat_aug, other_feat_aug, exists_mask, return_embeds=True,
+            ball_feat=ball_feat_aug, global_feat=global_feat,
             extra_query_bias=self.decision_query_proj(dec_flat),
         )
         h = torch.cat([
             entity_ctx,
-            self.self_mlp(self_feat),
-            self.ball_mlp(ball_feat),
+            self.self_mlp(self_feat_aug),
+            self.ball_mlp(ball_feat_aug),
             self.global_mlp(global_feat),
             self.decision_mlp(dec_flat),
         ], dim=-1)
@@ -359,7 +373,23 @@ class ExecutionNetwork(nn.Module):
             entity_embed_dim_override if entity_embed_dim_override is not None
             else cfg["entity_embed_dim"]
         )
+        # --- Sizing-only mirror of DecisionNetwork's physics-encoder widening
+        # (ai/knowledge.md "Frozen physics-dynamics encoders"): this network
+        # never loads either frozen encoder itself (see forward(), which reads
+        # decision_heads.*_physics_full instead), but self_mlp/ball_mlp (when
+        # not shared) and entity_encoder (when not shared) still need the same
+        # widened input dims DecisionNetwork built, so peek each configured
+        # checkpoint's output_dim without constructing a full feature block. ---
+        from footballcoach.ai.physics_pretrain.live_encoder_features import (
+            peek_ball_physics_output_dim, peek_player_physics_output_dim,
+        )
+        ball_ckpt = cfg.get("ball_physics_encoder_checkpoint")
+        player_ckpt = cfg.get("player_physics_encoder_checkpoint")
+        self_dim = PLAYER_FEATURE_DIM + (peek_player_physics_output_dim(player_ckpt) if player_ckpt else 0)
+        ball_dim = BALL_FEATURE_DIM + (peek_ball_physics_output_dim(ball_ckpt) if ball_ckpt else 0)
         return cls(
+            self_dim=self_dim,
+            ball_dim=ball_dim,
             latent_dim=cfg["latent_dim"],
             entity_embed_dim=entity_embed,
             num_attention_heads=cfg["num_attention_heads"],

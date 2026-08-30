@@ -169,6 +169,7 @@ def _worker_main(
                     done=sec["done"],
                     bc_label=None,
                     weight=trainer._secondary_weight,
+                    track_id=sec["player_id"],
                 )
                 secondary_episode_reward_accum += sec["reward"]
                 if sec["done"]:
@@ -208,15 +209,15 @@ def _worker_main(
                 progress_reporter.update(collected)
         progress_reporter.finish(collected, n_episodes=len(episode_outcome_labels))
 
-        # Bootstrap value for the state AFTER the last stored step, same as
-        # the single-process path — required for correct per-worker GAE.
-        with torch.no_grad():
-            last_obs_dict = {k: v.unsqueeze(0) for k, v in obs.to_torch_dict().items()}
-            last_value = trainer._get_value(last_obs_dict)
+        # Bootstrap value for the state AFTER the last stored step, per track
+        # (trainee + any active secondary player) — same as the single-process
+        # path, required for correct per-worker GAE. See
+        # PPOTrainer._bootstrap_last_values()'s docstring.
+        last_values = trainer._bootstrap_last_values(env, obs, buffer)
 
         return {
             "buffer": buffer,
-            "last_value": last_value,
+            "last_value": last_values,
             "stats": {
                 "episode_rewards": episode_rewards,
                 "episode_outcome_labels": episode_outcome_labels,

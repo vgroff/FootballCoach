@@ -28,7 +28,10 @@
     "min_orthogonal_adjust_mps": 2.0,
     "max_deflection_deg": 80.0,
     "behind_tolerance_m": 1.2,
-    "velocity_lookahead_s": 0.4
+    "velocity_lookahead_s": 0.4,
+    "_comment_boundary": "Boundary repulsion (ball carriers only): steers a carry path away from the pitch edge before it's crossed, using the SAME blend/speed-penalty machinery as player repulsion above (added into net_rep, so max_deflection_deg/ball_carrier_speed_penalty_max still cap it). Closes a real gap: engine/match.py's boundary_braking_params only ever applies while chasing a LOOSE ball -- once a player actually has the ball, movement runs through this function instead, which previously had zero boundary awareness (confirmed: a real traced episode picked up the ball 2m from the corner and sprinted dead straight through the touchline a second later). boundary_radius_m: distance from the pitch edge at which this starts (0.0 disables it entirely -- pre-existing tests/callers that don't pass a `pitch` get skipped regardless). boundary_strength_base: peak weight at the line itself (d=0), same units/scale as strength_base above -- picked to land in the same ballpark as the EFFECTIVE player-carrier repulsion strength (strength_base * ball_carrier_repulsion_mult = 1.5 at contact), not yet empirically tuned against real carry-near-boundary episodes the way the player-repulsion values above have been -- treat as a starting point.",
+    "boundary_radius_m": 4.0,
+    "boundary_strength_base": 1.2
   },
 
   "shot_selection": {
@@ -40,20 +43,26 @@
   "marking": {
     "_comment": "MarkOrder AI behaviour: marker stands between a target opposition player and the ball, and switches to GetPossession-style chase/tackle when the target has the ball or the ball comes within mark_intercept_radius_m. mark_standoff_m: distance from the target (toward the ball) the marker tries to hold.",
     "mark_intercept_radius_m": 4.0,
-    "mark_standoff_m": 1.5  
+    "mark_standoff_m": 1.5
+  },
+
+  "boundary_braking": {
+    "_comment": "Match._run_get_possession_behaviour's loose-ball chase (shared by GetPossessionOrder and MarkOrder's intercept fallback): when closing on a ball near the pitch boundary, caps arrival speed via v^2=2*a*d kinematics so the player can stop before carrying it out themselves, UNLESS the player's own team touched the ball last (Ball.last_touched_by_player_id) -- in that case braking is skipped entirely (sprint blindly), since the reward model's untouched-exit floor ('invalid', 0 reward) is already gone for us either way once our own team has touched it, so caution there can only cost a recovery, never avoid a worse outcome. See own_team_touched_last in that method for the full reasoning.",
+    "brake_buffer_m": 0.6,
+    "_comment_brake_buffer": "Extra fixed buffer beyond pickup_radius_m subtracted from the raw distance-to-boundary before computing the safe arrival speed. Corrects for discretisation slack (speed mode is only re-evaluated once per tick, so a player can travel a bit further than the ideal continuous-braking stopping distance before the slower mode actually takes effect) -- not a physically-derived quantity, tuned empirically (see test_ball_out_overrun.py).",
+    "abandon_margin_m": -1.0,
+    "_comment_abandon_margin": "Only applies when the player's own team did NOT touch the ball last (see _comment above -- that case always goes for it regardless of risk). If the RAW (pre-clamp) boundary margin at the projected intercept point is <= this value, the chase is abandoned entirely (player holds position) instead of continuing to close in at the computed near-zero safe speed -- letting the ball roll out untouched scores 'invalid' (0 reward) instead of a penalised 'ball_out' (-4). CAUTION when tuning this up toward 0.0: raw_margin is already negative (pickup_radius_m + brake_buffer_m subtracted off) in perfectly recoverable cases -- test_ball_out_overrun.py's validated 0.5m-inside-the-line pickup sits at raw_margin=-0.65 and DOES recover cleanly (no overrun, real possession gained) despite that, which is why the default here is -1.0, not 0.0 (0.0 was tried first and broke that exact test -- it abandoned a recoverable chase). A real FAILING episode traced this session (0.54m overrun despite the safe-speed cap already being 0) had raw_margin=-0.91, uncomfortably close to that same recoverable case's -0.65 -- raw distance-to-boundary alone doesn't cleanly separate recoverable from doomed chases; the ball's own sustained drift speed toward the boundary looked like the more likely real discriminator (the failing case drifted ~0.7m/s over 3s, the recoverable test case crawls at 0.05m/s) but that signal isn't wired in here yet. Treat this default as conservative-by-necessity, not fully tuned -- raise it carefully, re-running test_ball_out_overrun.py plus real worst-episode traces after each change, not on a single data point."
   },
 
   "push_kick": {
-    "_comment": "MoveOrder push-kick: when push_kick_enabled=True the ball carrier kicks the ball ahead rather than dribbling, then sprints to it. Only fires when the remaining distance exceeds min_dist_m (so the player doesn't kick near the destination). The ball is kicked at speed_factor x the player's free-sprint speed. Opponents whose ETA to the landing spot is less than the carrier's ETA x clearance_margin are considered a threat — the kick is skipped if any such opponent exists.",
-    "dist_m": 11.0,
-    "_comment_dist": "How far ahead (m) to kick the ball.",
-    "min_dist_m": 29.0,
+    "_comment": "MoveOrder / GetPossessionOrder push-kick: when push_kick_enabled=True the ball carrier kicks the ball flat (no ballistic loft -- straight toward the order's target_position, via Player.kick_with_direction) rather than dribbling, then sprints to it. Only fires when the remaining distance to target_position exceeds min_dist_m (so the player doesn't kick near the destination -- this is also what stops repeated touches overshooting target_position, since there's no separate travel-distance cap on the kick itself; how far it actually rolls is real ground physics driven by speed_factor, not a config distance). Opponents whose ETA to target_position is less than the carrier's ETA x clearance_margin are considered a threat — the kick is skipped if any such opponent exists.",
+    "min_dist_m": 20.0,
     "_comment_min_dist": "Don't push-kick when this close to the destination.",
-    "speed_factor": 1.1,
+    "speed_factor": 1.28,
     "_comment_speed_factor": "Ball is kicked at speed_factor x carrier's free-sprint speed, ensuring it stays ahead of the running player.",
-    "clearance_margin": 1.65,
+    "clearance_margin": 1.4,
     "_comment_clearance": "ETA safety margin: if any opponent's ETA to landing spot < carrier's ETA x clearance_margin, skip the kick. 0.95 = 5% margin.",
-    "max_heading_error_deg": 30.0,
+    "max_heading_error_deg": 15.0,
     "_comment_heading": "Don't push-kick if the player's current heading differs from the kick direction by more than this many degrees. Prevents kicking sideways or backwards."
   }
 }

@@ -109,6 +109,8 @@ PLAYER_FLIP_X_IDX: list[int] = [
     _field_index(PlayerFeatures, "velocity_x"),
     _field_index(PlayerFeatures, "attacking_direction"),  # +x → -x
     _field_index(PlayerFeatures, "pos_x"),             # absolute x negated under flip_x
+    _field_index(PlayerFeatures, "heading_cos"),       # heading angle θ under flip_x: cos negated, sin unchanged
+    _field_index(PlayerFeatures, "desired_dir_x"),     # plain vector x-component, same rule as velocity_x
 ]
 # ball_closing_speed is flip-invariant: both rel-velocity and direction components
 # negate under a flip, so their dot product (= closing speed) is unchanged.
@@ -120,6 +122,8 @@ PLAYER_FLIP_Y_IDX: list[int] = [
     _field_index(PlayerFeatures, "ball_vel_rel_y"),
     _field_index(PlayerFeatures, "velocity_y"),
     _field_index(PlayerFeatures, "pos_y"),             # absolute y negated under flip_y
+    _field_index(PlayerFeatures, "heading_sin"),       # heading angle θ under flip_y: sin negated, cos unchanged
+    _field_index(PlayerFeatures, "desired_dir_y"),     # plain vector y-component, same rule as velocity_y
 ]
 
 #: BallFeatures indices negated by flip_x (includes pseudovector spin)
@@ -128,6 +132,7 @@ BALL_FLIP_X_IDX: list[int] = [
     _field_index(BallFeatures, "velocity_x"),
     _field_index(BallFeatures, "spin_y"),  # pseudovector flip_x: -ω_y
     _field_index(BallFeatures, "spin_z"),  # pseudovector flip_x: -ω_z
+    _field_index(BallFeatures, "last_touch_team_direction"),  # team-direction sign, same rule as attacking_direction
 ]
 
 #: BallFeatures indices negated by flip_y (includes pseudovector spin)

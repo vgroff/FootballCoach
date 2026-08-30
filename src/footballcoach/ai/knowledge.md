@@ -94,12 +94,14 @@ ai/
     record_demonstrations.py  # CLI: record rules-based episodes as .npz BC datasets
 ```
 
-## BC label vector (BC_LABEL_DIM = 24)
+## BC label vector (BC_LABEL_DIM = 27)
 
-`bc.py` stores 17 floats per step (see the module docstring in `bc.py` for
+`bc.py` stores 27 floats per step (see the module docstring in `bc.py` for
 the authoritative up-to-date layout table — do not let this count drift out
-of sync, it has already changed twice: 15→16 (added `exec_move`), 16→17
-(added `ai_type`)):
+of sync, it has already changed several times: 15→16 (added `exec_move`),
+16→17 (added `ai_type`), 17→25 (added `opponent_ai_type` + kick
+direction/power/spin), 25→27 (added `heading_sin`/`heading_cos`, read
+directly off `player.heading_rad` at record time — see `phase1_labels()`)):
 
 | idx | field | source |
 |-----|-------|--------|
@@ -507,17 +509,18 @@ The engine fires these in `match.py`/`player.py` at the exact tick the action
 executes — not when the order is set.  Useful for: BC recording, UI effects,
 logging, statistics.  Both default to `None` (no-op).
 
-`on_kick` fires from **any** code path that calls `Player.kick_direct()` —
-`KickOrder`/`ShootOrder`/`PassOrder.execute()` all delegate to it, and so does
-`MoveOrder`'s push-kick behaviour (`_do_push_kick()` in `orders.py`) and the
-neural network's direct-drive kick action. Alongside the optional callback,
-`kick_direct()` also unconditionally sets `player.kicked_this_tick = True`
-(reset to `False` for every player at the top of
-`Match._process_orders()`) — this flag exists specifically so code that runs
-*after* order processing (e.g. `bc.py`'s `phase1_labels()`) can check "did
-this player kick this tick" without needing `on_kick` wired up and without
-inspecting order types (which missed the `MoveOrder` push-kick case — see
-the BC label table above).
+`on_kick` fires from **any** code path that calls `Player.kick_direct()` or
+`Player.kick_with_direction()` — `KickOrder`/`ShootOrder`/`PassOrder.execute()`
+delegate to the former, and push-kicks (`MoveOrder`/`GetPossessionOrder` via
+`_try_push_kick()` in `orders.py` -- a flat, direction-only kick, no
+ballistic solve) and the neural network's direct-drive kick action delegate
+to the latter. Alongside the optional callback, both unconditionally set
+`player.kicked_this_tick = True` (reset to `False` for every player at the
+top of `Match._process_orders()`) — this flag exists specifically so code
+that runs *after* order processing (e.g. `bc.py`'s `phase1_labels()`) can
+check "did this player kick this tick" without needing `on_kick` wired up
+and without inspecting order types (which missed the `MoveOrder` push-kick
+case — see the BC label table above).
 
 ### Demonstration recording (`record_demonstrations.py`)
 
@@ -608,16 +611,64 @@ track and one opponent track:
   — `env.always_compute_secondary_reward` — already generalizes to N
   secondary players for free; only the recording/dataset side is 2-player-
   specific).
-- `reward_components` stays one ENV-LEVEL (all players combined) value
-  duplicated onto every player's row — already a known limitation for 2
-  players (see `compute_component_returns()`'s docstring); with N players
-  this convention would need rethinking too, not just extending.
+- `reward_components` is genuinely per-player (same fix as `rewards` above,
+  each secondary player's own breakdown comes from its own
+  `last_secondary_results[i]["reward_components"]`), but the 2-track
+  assumption in `compute_component_returns()`'s per-track scan is the same
+  as `compute_returns()`'s — extending to N players needs the same
+  dict-of-accumulators change, just applied to both functions together.
 Until Phase 1 (1v1) is the only scenario with demo recording, this is fine —
 but the FIRST 2v2+ (or N-secondary-player) demo-recording scenario must
 revisit `is_trainee` (→ a real per-row player-id/role field), the two-
 accumulator scan in `compute_returns()`/`compute_component_returns()` (→ a
 dict of accumulators keyed by that field), and `_record_now()`'s hardcoded
 `ids` list, together — not just one of them.
+
+**Per-track GAE segmentation (`RolloutBuffer`, PPO side)**: the same
+row-interleaving bug that `compute_returns()` above was fixed for on the BC
+dataset side also existed, unfixed, on the PPO rollout-buffer side —
+`RolloutBuffer.compute_gae()` used to do one flat backward scan over
+`rewards`/`values`/`dones`, with `next_value = all_values[t+1]`. Since
+`ppo_trainer.py`'s `train()`/`rollout_worker.py`'s `_collect()` push one
+trainee row then immediately that tick's secondary-opponent row(s)
+(`env.last_secondary_results`), a trainee step's "next" value in the flat
+scan was actually the SAME-TICK secondary player's value, not the
+trainee's own next-tick value — and vice versa. This was invisible for a
+long time because `phase1_opponent_neural_ratio` has always been 0 (see
+the "opponent audit" in `agent_plans/`), so `last_secondary_results` was
+always empty and the buffer only ever held a single track in practice — it
+would have activated the instant a neural secondary opponent (self-play)
+was enabled.
+
+Fixed via a per-row `track_id` field on `RolloutBuffer` (`"trainee"` or the
+secondary player's id, e.g. `"opponent"` — defaults to `"trainee"` so every
+existing single-track call site/test is unaffected). `compute_gae()` and
+`compute_mc_returns()` both segment rows by `track_id` via
+`_track_index_groups()`, run the backward recursion independently per
+track (in that track's own chronological order — rows for a track are
+always appended in order even though interleaved with other tracks in the
+flat lists), then scatter results back into the flat, original-index
+output arrays. `compute_gae()`'s `last_value` bootstrap argument now
+accepts either a bare float (applied to every track — the common
+single-track case) or a `{track_id: value}` dict; `PPOTrainer.
+_bootstrap_last_values()` builds that dict once per rollout window (the
+trainee's own next-obs value, already available from `env.step()`'s
+return, plus — for every OTHER track actually present in the buffer — a
+fresh `env._get_obs(player_id=track)` re-encode run through the same
+critic). Both the single-process (`train()`) and worker (`rollout_worker.
+py`'s `_collect()`) rollout-collection loops call this same trainer method,
+so the fix is identical in both places. See `tests/ai_unit/test_gae.py`'s
+`TestGAEMultiTrack`/`TestMCReturnsMultiTrack` (buffer-level, including a
+regression check that the fixture actually would disagree with a flat
+scan) and `tests/ai_scenario/test_secondary_opponent_gae.py` (full
+`ScenarioEnv`+`PPOTrainer` pipeline with a real neural secondary opponent,
+including one call through the actual `PPOTrainer.train()` entry point).
+
+`compute_mc_returns()` (value-pretraining only) was given the identical
+segmentation defensively even though it's never actually fed a multi-track
+buffer today (value-pretrain rollout collection never records secondary
+transitions) — kept consistent so it doesn't become the same landmine if
+that changes later.
 
 ## Critical design rules
 
@@ -813,6 +864,92 @@ does this via `inv_perm = argsort(perm)`. Forgetting this causes
 now-masked slot), which blows up `approx_kl` to `inf`. This was a bug that
 was fixed — do not revert this remapping.
 
+### Frozen physics-dynamics encoders (`models/physics_encoders.py`)
+
+The standalone-pretrained `ai/physics_pretrain/` encoders (`BallDynamicsEncoder`/
+`PlayerDynamicsEncoder`, latent + auxiliary-head outputs concatenated —
+matching `physics_value_net.py`'s `PhysicsEncoderValueNet.compute_features()`
+diagnostic pattern) are wired into the main `DecisionNetwork`/
+`ExecutionNetwork` as an **opt-in** feature — see
+`agent_plans/ball_physics_pretrain_plan.md` §8 for the full design rationale
+and rejected alternatives (§8.1: why the latent isn't just appended as new
+`BallFeatures`/`PlayerFeatures` fields — checkpoint/dataset invalidation, and
+an opaque latent has no defined sign under canonical-frame mirroring).
+
+**Config**: `network.ball_physics_encoder_checkpoint`/
+`network.player_physics_encoder_checkpoint` (`ai_config.json`, both `null`
+by default = feature off, byte-identical behaviour to before this feature
+existed). Set a path to a `physics_pretrain` checkpoint (e.g.
+`checkpoints/physics_pretrain/ball_encoder_68.midtrain_latest.pt`) to enable.
+
+**Computed once, inside `DecisionNetwork.forward()` ONLY** — never inside
+`ExecutionNetwork`. `DecisionNetwork` is the sole owner/loader of
+`BallPhysicsFeatureBlock`/`PlayerPhysicsFeatureBlock`
+(`models/physics_encoders.py`); its `forward()` concatenates each frozen
+block's output onto `ball_feat`/`self_feat`/`other_feat` before they reach
+`ball_mlp`/`self_mlp`/`entity_encoder`, and stashes the raw (un-concatenated)
+per-entity output on three new `DecisionHeadsRaw` passthrough fields
+(`ball_physics_full`/`self_physics_full`/`other_physics_full`) — same "not a
+real head, just data ferried to execution net" status as the existing
+`latent_vector` field. `ExecutionNetwork.forward()` reads these straight off
+the `decision_heads` argument it already receives at every call site in the
+codebase (no plumbing changes needed there) and builds its own augmented
+tensors via a cheap concat — it **never calls either frozen encoder**. This
+means each encoder runs at most once per observation (not once per network),
+and at most twice per decision tick in the current 1v1 curriculum (once per
+team/canonical-frame — see "Canonical AI frame" above), not once per
+player-observation-slot. See `tests/ai_unit/test_physics_encoder_wiring.py`
+for the regression coverage (shape correctness, frozen-gradient guarantee,
+`is_loose` masking, the compute-once-per-observation call-count property, and
+the canonical-mirror-consistency proof).
+
+**Masking**: the ball's combined block is multiplied by `BallFeatures.is_loose`
+(zero when the ball is possessed — matches `physics_value_net.py`'s own
+`ball_full * is_loose`). The player block is **never masked** — unlike the
+ball, a player's dynamics latent is always meaningful regardless of
+possession state; padded other-player slots get whatever the encoder
+produces on all-zero input, which `exists_mask` already zeroes out
+downstream like every other per-slot feature.
+
+**Frozen, no-grad, excluded from the optimizer and from the main PPO
+checkpoint**: `requires_grad_(False)` inside `load_frozen_ball_encoder`/
+`load_frozen_player_encoder` (`ai/physics_pretrain/live_encoder_features.py`);
+`ppo_trainer.py`'s `policy_params` construction explicitly filters out any
+parameter whose name starts with `ball_physics_encoder.`/
+`player_physics_encoder.`. `DecisionNetwork.state_dict()` is overridden to
+drop those same keys before returning (delegated through automatically by
+`CanonicalNetworkWrapper.state_dict()`, so every save call site in
+`ppo_trainer.py` is covered with no per-call-site changes) — the frozen
+encoder is an external, separately-versioned artifact referenced by
+checkpoint path, never embedded training state. Correspondingly,
+`PPOTrainer.load_checkpoint()` loads `decision_net` via the existing
+`_load_state_dict_tolerant()` helper (same one `execution_net`/`value_net`
+already used) rather than strict `load_state_dict()`, so the always-missing
+physics-encoder keys don't raise — the live submodule already has correct
+weights from its own checkpoint load, and tolerant loading simply leaves
+them untouched.
+
+**Sizing wrinkle**: `ExecutionNetwork` (including `separate_value_net`'s
+standalone `value_net`, also an `ExecutionNetwork`) needs the same widened
+`self_dim`/`ball_dim` as `DecisionNetwork` for its own `self_mlp`/`ball_mlp`
+(when not shared via `network.share_entity_encoder`)/`entity_encoder`, even
+though it never loads the encoder itself — `ExecutionNetwork.from_config()`
+calls `peek_ball_physics_output_dim()`/`peek_player_physics_output_dim()`
+(`live_encoder_features.py`) to read just the checkpoint's `latent_dim` for
+sizing, without constructing a full feature block.
+
+**Known scaling gap (not yet addressed)**: each frozen encoder is computed
+once per *observation* (shared between that observation's decision+execution
+calls), which only coincidentally bounds to "twice per tick" in the current
+1v1 curriculum (at most 2 observations/tick). It does **not** yet achieve
+true cross-observation caching — with N>2 simultaneously-deciding players,
+the same physical entity's physics block gets redundantly recomputed once
+per observation it appears in, rather than once per (entity, team-frame).
+See `agent_plans/physics_encoder_cross_observation_caching_plan.md` for the
+planned fix (a per-tick cache keyed by (entity_id, team), populated directly
+from raw `Player`/`Ball` state since the physics-encoder inputs are entity-
+intrinsic, never observer-relative).
+
 ### time_remaining_s is caller-managed
 
 The engine only tracks `match.time_s` (elapsed time).  The env wrapper
@@ -821,6 +958,94 @@ remainder to `encode_observation()`.  Time is log1p-normalized so the
 "urgent endgame" scenarios (1–20s remaining, 10% of curriculum) are
 distinguishable from "2 minutes remaining" after normalization - see design
 doc section 7.5 for why plain linear /7200 fails here.
+
+### Position normalization: pitch half-diagonal everywhere, NOT per-axis 52.5/34.0
+
+`PlayerFeatures.pos_x/pos_y`, `BallFeatures.pos_x/pos_y`, and every `rel_dx`/
+`rel_dy`/`ball_rel_dx`/`ball_rel_dy` field are all normalized by the pitch
+**half-diagonal** (`sqrt(52.5²+34.0²) ≈ 62.66`) — the exact same divisor
+velocity fields use — via `ai/obs/encoder.py`'s actual `pos_x=.../half_diag`.
+There is NO separate per-axis `x/52.5`, `y/34.0` divisor anywhere in the real
+encoding, even though `schema.py`'s docstrings claimed exactly that for a long
+time (fixed now). Values still land ≈[-1, 1] on a standard pitch either way,
+so this silently doesn't matter for training — it only bites when a
+standalone script hand-reconstructs a real metre position from a raw feature
+value for debugging/diagnostics. Using 52.5/34.0 there under-scales y by
+~1.84x and x by ~1.19x, making positions look well within bounds when the
+real position is actually at/past the boundary. This has caused real
+confusion twice: once in `debug_value_network.py`'s match-log reconstruction
+(fixed, see `_episode_rows_to_match_log`'s own comment), and again
+independently in a standalone `diagnose_crossing_head.py` script that didn't
+reuse that fixed helper (also fixed). If you're hand-computing a real-world
+distance/position from a raw `PlayerFeatures`/`BallFeatures` value anywhere
+new, use the half-diagonal, not 52.5/34.0.
+
+### Heading and previous-decision movement intent (PlayerFeatures)
+
+`PlayerFeatures` gained 7 fields (appended after `pos_y` specifically so
+`ai/physics_pretrain/live_encoder_features.py`'s hardcoded `PF_*` offsets
+stay valid — see that section of `ai_trainer_knowledge.md` for the full
+dimension-bump note), encoded for **every player slot, self and others
+alike** (matches how every other field is already symmetric):
+
+- `heading_sin`/`heading_cos` — `sin`/`cos(player.heading_rad)`, populated
+  **unconditionally**, including at standstill and for immobile players. This
+  fixes a real gap: `engine/movement.py` constructs `player.velocity` FROM
+  `heading_rad` every tick (`velocity = Vector3.from_angle_xy(new_heading,
+  new_speed)`), so heading is only recoverable from velocity while `speed >
+  0` — at `speed == 0`, velocity collapses to `(0,0,0)` but `heading_rad`
+  keeps its last real value, which the schema previously (wrongly) dismissed
+  as "irrelevant." A standstill player's facing direction is real signal,
+  unlike velocity (which genuinely is noise for a never-moving player, hence
+  still zeroed for `is_immobile`).
+- `desired_dir_x`/`desired_dir_y` + a `desired_speed_standstill`/`_jog`/
+  `_sprint` one-hot — the previous decision's movement intent, still in
+  effect until the next decision tick overwrites it (a cheap
+  acceleration/intent signal `ai/physics_pretrain` already relies on via BC
+  labels — see `ai_trainer_knowledge.md` §6 — now also exposed as a live
+  observation input). Direction is sourced from `player.desired_direction`
+  (safe to read directly — never auto-cleared). The speed mode is sourced
+  from **`player.last_desired_speed_mode`, NOT `player.desired_speed_mode`**:
+  `engine/match.py::_apply_movement()` unconditionally resets
+  `desired_speed_mode = None` for every player every tick right after
+  consuming it, so by the time the next decision's `encode_observation()`
+  runs it always reads back `None` — `last_desired_speed_mode` is a sibling
+  `Player` field that mirrors it but is deliberately never cleared (set
+  alongside the reset in `_apply_movement()`, see its own docstring on
+  `Player`). Immobile players and a player with no decision yet both default
+  to zero-direction/`STANDSTILL` — "no movement intent" is real signal here,
+  same rationale as heading's `is_immobile` exception is the opposite of.
+
+Mirror/flip rule (established first for `ai/ppo/bc.py`'s own
+`heading_sin`/`heading_cos` BC label fields and `physics_value_net.py`'s
+hand-patched `canonicalize_bc_labels()` call, now made systematic in
+`obs/augment.py`'s `PLAYER_FLIP_X_IDX`/`PLAYER_FLIP_Y_IDX` — which
+`obs/canonical.py`'s permanent x-mirror also reuses, see "Canonical AI frame"
+above): **flip_y negates `heading_sin`/`desired_dir_y` only; the x-mirror
+negates `heading_cos`/`desired_dir_x` only.** `desired_dir_x`/`desired_dir_y`
+otherwise follow the exact same vector convention as `velocity_x`/
+`velocity_y`.
+
+### Last-touch team (`BallFeatures.last_touch_team_direction`)
+
+`+1.0`/`-1.0` for whichever team most recently **gained** possession
+(`ball.last_touched_by_player_id`, `entities/ball.py` — set only on a
+genuine possession gain by `Match._set_possession()`, `engine/match.py:264-267`,
+so it persists through loose-ball periods rather than resetting the instant
+the ball becomes loose again), `0.0` until the first possession gain of the
+episode. Same sign convention as `PlayerFeatures.attacking_direction` (`+1.0`
+= that team attacks +x, i.e. `Team.LEFT`); negated under the canonical
+x-mirror via `obs/augment.py`'s `BALL_FLIP_X_IDX` (a team-direction sign, not
+a coordinate, so it's **not** in `BALL_FLIP_Y_IDX`).
+
+Exists so the network can see directly who's responsible for an eventual
+out-of-bounds/goal outcome, rather than only learning it indirectly through
+reward-shaping after the fact — `match.py`'s own
+`_run_get_possession_behaviour()` already derives this exact "did my own
+team touch it last" fact internally (comparing
+`player_by_id(last_toucher_id).team == player.team`) for boundary-braking
+logic; this field exposes the same underlying fact to the observation
+instead of leaving it as a rules-only/reward-only computation.
 
 ### Restitution coefficient in observations
 

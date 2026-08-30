@@ -27,10 +27,14 @@ of the engine.
 
 `Player.kick_direct()` and `Player.kick_with_direction()` bypass the Orders
 system entirely and execute kick physics immediately — no `KickOrder` is
-created either way. Only `kick_with_direction()` is called by the neural
-network (via `ai/action/apply_nn_action.py::apply_action_to_player()`);
-`kick_direct()` is used by `KickOrder.execute()`/rules AI and by
-`MoveOrder`'s push-kick behaviour (`orders.py::_do_push_kick()`):
+created either way. `kick_direct()` is used by `KickOrder.execute()` and
+other order types that aim at an explicit point; `kick_with_direction()` is
+used by the neural network (via `ai/action/apply_nn_action.py::
+apply_action_to_player()`) AND by push-kicks (`MoveOrder`/
+`GetPossessionOrder` via `orders.py::_try_push_kick()`) — push-kicks are
+flat, direction-only kicks with no ballistic loft by design (see
+`orders.json`'s `push_kick` section), so they share the NN's no-solve kick
+path rather than `kick_direct()`'s ballistic one:
 
 - `player.kick_direct(match, aim_point, power_fraction, spin)` — aims at an
   explicit target point; the ball's launch direction is solved from that aim
@@ -38,7 +42,6 @@ network (via `ai/action/apply_nn_action.py::apply_action_to_player()`);
   fires if `ball.possessed_by == player.player_id`.
 - `player.kick_with_direction(match, direction_3d, power_fraction, spin)` —
   takes an explicit 3D unit direction directly, no aim-point ballistic solve.
-  Neural network only.
 
 Both are otherwise equivalent chokepoints: each independently sets
 `player.kicked_this_tick = True`, `last_kick_direction`/`last_kick_power_fraction`/

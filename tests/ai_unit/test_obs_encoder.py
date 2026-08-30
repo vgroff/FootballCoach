@@ -377,20 +377,43 @@ class TestBallFeatures:
         obs = encode_observation(duel_match, "p1", time_remaining_s=60.0,
                                  rng=random.Random(0))
         # ball.possessed_by = "p1" in duel_match
-        assert obs.ball_feat[-2] == pytest.approx(1.0, abs=1e-6)  # is_possessed
-        assert obs.ball_feat[-1] == pytest.approx(0.0, abs=1e-6)  # is_loose
+        # is_possessed/is_loose are at fixed indices 9/10 (last_touch_team_direction
+        # was appended after them, not inserted earlier -- see obs/schema.py).
+        assert obs.ball_feat[9] == pytest.approx(1.0, abs=1e-6)  # is_possessed
+        assert obs.ball_feat[10] == pytest.approx(0.0, abs=1e-6)  # is_loose
 
     def test_ball_loose_flag(self, solo_match):
         obs = encode_observation(solo_match, "p1", time_remaining_s=60.0,
                                  rng=random.Random(0))
         # solo_match ball is loose (not possessed)
-        assert obs.ball_feat[-2] == pytest.approx(0.0, abs=1e-6)  # is_possessed
-        assert obs.ball_feat[-1] == pytest.approx(1.0, abs=1e-6)  # is_loose
+        assert obs.ball_feat[9] == pytest.approx(0.0, abs=1e-6)  # is_possessed
+        assert obs.ball_feat[10] == pytest.approx(1.0, abs=1e-6)  # is_loose
 
     def test_is_possessed_plus_is_loose_equals_one(self, duel_match):
         obs = encode_observation(duel_match, "p1", time_remaining_s=60.0,
                                  rng=random.Random(0))
-        assert (obs.ball_feat[-2] + obs.ball_feat[-1]) == pytest.approx(1.0, abs=1e-6)
+        assert (obs.ball_feat[9] + obs.ball_feat[10]) == pytest.approx(1.0, abs=1e-6)
+
+    def test_last_touch_team_direction_none_when_never_touched(self, duel_match):
+        # duel_match's fixture sets ball.possessed_by directly (bypassing
+        # Match._set_possession()), so last_touched_by_player_id is still
+        # None -- the field must read as 0.0, not derive from possessed_by.
+        assert duel_match.ball.last_touched_by_player_id is None
+        obs = encode_observation(duel_match, "p1", time_remaining_s=60.0,
+                                 rng=random.Random(0))
+        assert obs.ball_feat[-1] == pytest.approx(0.0, abs=1e-6)
+
+    def test_last_touch_team_direction_left(self, duel_match):
+        duel_match.ball.last_touched_by_player_id = "p1"  # p1 is Team.LEFT
+        obs = encode_observation(duel_match, "p1", time_remaining_s=60.0,
+                                 rng=random.Random(0))
+        assert obs.ball_feat[-1] == pytest.approx(1.0, abs=1e-6)
+
+    def test_last_touch_team_direction_right(self, duel_match):
+        duel_match.ball.last_touched_by_player_id = "p2"  # p2 is Team.RIGHT
+        obs = encode_observation(duel_match, "p1", time_remaining_s=60.0,
+                                 rng=random.Random(0))
+        assert obs.ball_feat[-1] == pytest.approx(-1.0, abs=1e-6)
 
 
 # ---------------------------------------------------------------------------

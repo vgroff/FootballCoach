@@ -120,6 +120,21 @@ class RolloutBuffer:
     # empty string for mid-episode steps.
     step_outcomes: list[str] = field(default_factory=list)
 
+    # Which chronological sequence this row belongs to: "trainee" for the
+    # trainee's own transitions, or the secondary player's id (e.g.
+    # "opponent") for transitions drained from ``env.last_secondary_results``.
+    # Rows for a given track are always appended in real temporal order
+    # (env.step() calls are ordered; the trainee row for a tick is added
+    # before that tick's secondary row(s), and both accumulate strictly in
+    # tick order across the rollout) -- but rows from DIFFERENT tracks are
+    # interleaved in the flat lists above (trainee_t0, secondary_t0,
+    # trainee_t1, secondary_t1, ...). ``compute_gae``/``compute_mc_returns``
+    # use this field to segment the backward recursion per track, so a
+    # trainee step's bootstrap never reads the secondary player's value (or
+    # reward, or done flag) for the same tick, and vice versa. See
+    # ai/knowledge.md "Per-track GAE segmentation" for the bug this fixes.
+    track_ids: list[str] = field(default_factory=list)
+
     def add(
         self,
         obs: dict[str, np.ndarray],
@@ -133,6 +148,7 @@ class RolloutBuffer:
         weight: float = 1.0,
         reward_comps: Optional[dict] = None,
         step_outcome: str = "",
+        track_id: str = "trainee",
     ) -> None:
         from footballcoach.ai.ppo.bc import BC_LABEL_DIM
         self.obs.append(obs)
@@ -152,6 +168,19 @@ class RolloutBuffer:
         self.weights.append(weight)
         self.reward_comps.append(reward_comps if reward_comps is not None else {})
         self.step_outcomes.append(step_outcome)
+        self.track_ids.append(track_id)
+
+    def _track_index_groups(self) -> dict[str, list[int]]:
+        """Row indices grouped by ``track_ids``, each preserving original order.
+
+        Since rows are only ever appended (never reordered), the indices for
+        a given track already come out in that track's own chronological
+        order -- no sort needed.
+        """
+        groups: dict[str, list[int]] = {}
+        for i, t in enumerate(self.track_ids):
+            groups.setdefault(t, []).append(i)
+        return groups
 
     def __len__(self) -> int:
         return len(self.rewards)
@@ -160,7 +189,7 @@ class RolloutBuffer:
         self,
         gamma: float,
         lam: float,
-        last_value: float,
+        last_value: float | dict[str, float],
     ) -> tuple[list[float], list[float]]:
         """Compute GAE(lambda) advantages and value targets (returns).
 
@@ -170,7 +199,16 @@ class RolloutBuffer:
             last_value: Critic's value estimate for the state AFTER the last
                 stored step (the bootstrap value for the final step; should
                 be 0.0 if the episode ended exactly at the last stored step,
-                otherwise the next-state value estimate).
+                otherwise the next-state value estimate). Either a single
+                float applied to every track (the common single-track case:
+                immobile/rules-AI opponent, no secondary rows), or a
+                ``{track_id: value}`` dict for a buffer containing more than
+                one track (e.g. a neural secondary opponent, track_id
+                "opponent"). A track present in the buffer but missing from
+                the dict falls back to 0.0 -- harmless whenever that track's
+                own last row has done=1 (next_non_terminal zeroes it out
+                anyway), and only an approximation otherwise, so callers
+                should supply every active track's own next-state value.
 
         Returns:
             (advantages, returns) - both lists of floats, same length as
@@ -180,23 +218,38 @@ class RolloutBuffer:
         at step t uses the value at t+1 (after transitioning), not t.
         ``next_non_terminal`` is 0 when dones[t]=1 so no bootstrapping
         happens across episode boundaries.  See design doc section 9.3.
+
+        **Per-track segmentation**: a buffer can interleave more than one
+        chronological sequence (trainee rows and secondary-opponent rows,
+        see ``track_ids``). Naively scanning the flat arrays backward would
+        read the WRONG track's value/reward/done as "next step" whenever
+        two different tracks' rows sit adjacent in the flat lists -- exactly
+        the bug this method used to have. Each track is segmented out via
+        ``_track_index_groups()`` and given its own independent backward
+        GAE pass (in that track's own chronological order) before scattering
+        results back into the flat, original-index-order output lists.
         """
         n = len(self.rewards)
+        last_values = (
+            last_value if isinstance(last_value, dict)
+            else {t: last_value for t in set(self.track_ids)}
+        )
         advantages = [0.0] * n
-        last_gae = 0.0
-        # Extend values list with last_value for the n+1 bootstrap
-        all_values = self.values + [last_value]
-
-        for t in reversed(range(n)):
-            next_value = all_values[t + 1]
-            next_non_terminal = 1.0 - self.dones[t]
-            delta = (
-                self.rewards[t]
-                + gamma * next_value * next_non_terminal
-                - self.values[t]
-            )
-            last_gae = delta + gamma * lam * next_non_terminal * last_gae
-            advantages[t] = last_gae
+        for track, indices in self._track_index_groups().items():
+            track_last_value = last_values.get(track, 0.0)
+            last_gae = 0.0
+            prev_value = track_last_value
+            for idx in reversed(indices):
+                next_value = prev_value
+                next_non_terminal = 1.0 - self.dones[idx]
+                delta = (
+                    self.rewards[idx]
+                    + gamma * next_value * next_non_terminal
+                    - self.values[idx]
+                )
+                last_gae = delta + gamma * lam * next_non_terminal * last_gae
+                advantages[idx] = last_gae
+                prev_value = self.values[idx]
 
         returns = [adv + val for adv, val in zip(advantages, self.values)]
         return advantages, returns
@@ -214,15 +267,21 @@ class RolloutBuffer:
         complete episodes (see ``last_complete_episode_end``); an unterminated
         trailing episode would otherwise get an incorrectly zero-bootstrapped
         tail return.
+
+        Segmented per track (see ``compute_gae``'s docstring) for the same
+        reason -- not currently exercised with multi-track buffers (value
+        pretraining only ever records trainee rows today), but kept
+        consistent so this doesn't become a landmine if that changes.
         """
         n = len(self.rewards)
         returns = [0.0] * n
-        g = 0.0
-        for t in reversed(range(n)):
-            if self.dones[t] > 0.5:
-                g = 0.0
-            g = self.rewards[t] + gamma * g
-            returns[t] = g
+        for _track, indices in self._track_index_groups().items():
+            g = 0.0
+            for idx in reversed(indices):
+                if self.dones[idx] > 0.5:
+                    g = 0.0
+                g = self.rewards[idx] + gamma * g
+                returns[idx] = g
         return returns
 
     def last_complete_episode_end(self) -> int:
@@ -259,6 +318,7 @@ class RolloutBuffer:
         self.weights = self.weights[:keep]
         self.reward_comps = self.reward_comps[:keep]
         self.step_outcomes = self.step_outcomes[:keep]
+        self.track_ids = self.track_ids[:keep]
         return n_dropped
 
     def as_tensors(
@@ -324,3 +384,4 @@ class RolloutBuffer:
         self.weights.clear()
         self.reward_comps.clear()
         self.step_outcomes.clear()
+        self.track_ids.clear()

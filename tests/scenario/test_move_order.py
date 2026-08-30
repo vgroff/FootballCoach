@@ -353,6 +353,51 @@ def test_push_kick_faster_over_40m():
     )
 
 
+def test_push_kick_box_to_box_realistic_kick_count():
+    """A player push-kicking the full length of the pitch, box to box
+    (~88.5m on the standard pitch), should take a REALISTIC number of
+    touches to get there -- not one or two kicks that each boot the ball
+    half the pitch, and not dozens of tiny taps either. A single push-kick
+    covering 40+m in one touch is not a "push-kick while running", it's a
+    clearance -- the mechanic this models is a player nudging the ball
+    ahead of themselves a sensible distance and sprinting onto it
+    repeatedly, matching how push_kick_enabled dribbling is used everywhere
+    else (Phase1RulesAI's box-run). Tune push_kick's speed_factor/
+    min_dist_m in orders.json against this test, not the other way around.
+    """
+    pitch = Pitch.standard()
+    start = Vector3(-(pitch.half_length - pitch.box_length_m / 2), 0.0, 0.0)
+    target = Vector3(pitch.half_length - pitch.box_length_m / 2, 0.0, 0.0)
+
+    player = make_player("p1", Team.LEFT, attr_value=0.6, position=start)
+    player.heading_rad = 0.0
+    ball = Ball.at_rest(start)
+    ball.possessed_by = player.player_id
+    match = Match(pitch=pitch, players=[player], ball=ball, rng_reduction=1.0, rng=random.Random(0))
+    player.current_order = MoveOrder(target_position=target, sprint=True, push_kick_enabled=True)
+
+    kicks = 0
+    max_ticks = 30 * 60  # 60s -- ample even for a slow, many-touch run
+    for tick in range(max_ticks):
+        match.step()
+        if player.kicked_this_tick:
+            kicks += 1
+        if player.current_order is None:
+            break
+    else:
+        raise AssertionError(f"box-to-box push-kick run never completed within {max_ticks} ticks")
+
+    assert player.position.distance_to(target) <= 0.5, (
+        f"player did not actually arrive at the far box (pos={player.position}, target={target})"
+    )
+    assert 4 <= kicks <= 15, (
+        f"box-to-box push-kick run took {kicks} touches over "
+        f"{(target - start).length():.1f}m -- expected something in the 4-15 range "
+        f"for a realistic 'nudge and sprint onto it' cadence, not a couple of "
+        f"full-pitch boots or a flurry of tiny taps"
+    )
+
+
 def test_push_kick_not_triggered_near_destination():
     """When the remaining distance is below push_kick_min_dist_m the player
     should NOT kick (ball stays possessed, no release-grace period starts)."""

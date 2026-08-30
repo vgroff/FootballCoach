@@ -25,8 +25,8 @@ from footballcoach.ai.obs.schema import (
 # Dimension constants
 # ---------------------------------------------------------------------------
 
-def test_player_feature_dim_is_32():
-    """PLAYER_FEATURE_DIM must stay 32 (change this test IFF you change the schema).
+def test_player_feature_dim_is_39():
+    """PLAYER_FEATURE_DIM must stay 39 (change this test IFF you change the schema).
 
     Fields: rel_dx, rel_dy, distance_m, ball_rel_dx, ball_rel_dy,
     ball_distance_m, ball_vel_rel_x, ball_vel_rel_y, ball_closing_speed,
@@ -34,13 +34,14 @@ def test_player_feature_dim_is_32():
     top_speed, acceleration, kick_power, kick_precision, dribbling,
     ball_control, tackling, stamina_attr, is_own_team, is_self, has_possession,
     is_inactive_tackled, is_controlling_ball, is_goalkeeper, attacking_direction,
-    exists, is_immobile, pos_x, pos_y.
+    exists, is_immobile, pos_x, pos_y, heading_sin, heading_cos, desired_dir_x,
+    desired_dir_y, desired_speed_standstill, desired_speed_jog, desired_speed_sprint.
     """
-    assert PLAYER_FEATURE_DIM == 32
+    assert PLAYER_FEATURE_DIM == 39
 
 
-def test_ball_feature_dim_is_11():
-    assert BALL_FEATURE_DIM == 11
+def test_ball_feature_dim_is_12():
+    assert BALL_FEATURE_DIM == 12
 
 
 def test_global_feature_dim_is_31():
@@ -131,23 +132,55 @@ def test_player_features_first_three_are_position():
     assert arr[2] == pytest.approx(3.0)
 
 
-def test_player_features_pos_are_last_two():
-    """pos_x and pos_y are the last two fields (indices 25, 26)."""
+def test_player_features_pos_at_fixed_indices():
+    """pos_x/pos_y stay at indices 30/31 -- ai/physics_pretrain/live_encoder_features.py
+    hardcodes these as PF_POS_X/PF_POS_Y, so newer fields must be appended AFTER
+    pos_y, never inserted earlier, to avoid silently breaking those offsets."""
     import dataclasses
     names = [f.name for f in dataclasses.fields(PlayerFeatures)]
-    assert names[-2] == "pos_x"
-    assert names[-1] == "pos_y"
+    assert names[30] == "pos_x"
+    assert names[31] == "pos_y"
     feat = PlayerFeatures(pos_x=0.5, pos_y=-0.3)
     arr = feat.to_array()
-    assert arr[-2] == pytest.approx(0.5)
-    assert arr[-1] == pytest.approx(-0.3)
+    assert arr[30] == pytest.approx(0.5)
+    assert arr[31] == pytest.approx(-0.3)
 
 
-def test_ball_features_is_possessed_second_to_last():
+def test_player_features_heading_and_intent_are_last_seven():
+    """heading_sin/cos + desired_dir_x/y + speed-mode one-hot are appended
+    after pos_y, in this exact order (see the field-ordering constraint in
+    ai/knowledge.md's 'Heading and previous-decision movement intent' note)."""
+    import dataclasses
+    names = [f.name for f in dataclasses.fields(PlayerFeatures)]
+    assert names[-7:] == [
+        "heading_sin", "heading_cos",
+        "desired_dir_x", "desired_dir_y",
+        "desired_speed_standstill", "desired_speed_jog", "desired_speed_sprint",
+    ]
+    feat = PlayerFeatures(
+        heading_sin=0.1, heading_cos=0.2, desired_dir_x=0.3, desired_dir_y=0.4,
+        desired_speed_standstill=0.5, desired_speed_jog=0.6, desired_speed_sprint=0.7,
+    )
+    arr = feat.to_array()
+    assert arr[-7:] == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+
+
+def test_ball_features_is_possessed_at_fixed_indices():
+    """is_possessed/is_loose stay at indices 9/10 -- last_touch_team_direction
+    was appended AFTER them (index 11), not inserted earlier."""
     feat = BallFeatures(is_possessed=1.0, is_loose=0.0)
     arr = feat.to_array()
-    assert arr[-2] == pytest.approx(1.0)
-    assert arr[-1] == pytest.approx(0.0)
+    assert arr[9] == pytest.approx(1.0)
+    assert arr[10] == pytest.approx(0.0)
+
+
+def test_ball_features_last_touch_team_direction_is_last():
+    import dataclasses
+    names = [f.name for f in dataclasses.fields(BallFeatures)]
+    assert names[-1] == "last_touch_team_direction"
+    feat = BallFeatures(last_touch_team_direction=-1.0)
+    arr = feat.to_array()
+    assert arr[-1] == pytest.approx(-1.0)
 
 
 def test_global_features_attack_defence_before_task_id_block():

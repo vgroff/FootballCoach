@@ -17,6 +17,7 @@ import math
 from dataclasses import dataclass
 
 from footballcoach.config import load_orders_config, require_section
+from footballcoach.entities.pitch import Pitch
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
 
@@ -36,6 +37,8 @@ class RepulsionParams:
     max_deflection_deg: float = 90.0
     behind_tolerance_m: float = 1.2
     velocity_lookahead_s: float = 0.4
+    boundary_radius_m: float = 0.0
+    boundary_strength_base: float = 0.0
 
     @staticmethod
     def from_config() -> "RepulsionParams":
@@ -51,6 +54,8 @@ class RepulsionParams:
             max_deflection_deg=d.get("max_deflection_deg", 90.0),
             behind_tolerance_m=d.get("behind_tolerance_m", 1.2),
             velocity_lookahead_s=d.get("velocity_lookahead_s", 0.4),
+            boundary_radius_m=d.get("boundary_radius_m", 0.0),
+            boundary_strength_base=d.get("boundary_strength_base", 0.0),
         )
 
 
@@ -60,6 +65,7 @@ def compute_repulsion(
     other_players: list[Player],
     ball_carrier_id: str | None,
     params: RepulsionParams,
+    pitch: Pitch | None = None,
 ) -> tuple[Vector3, float]:
     """Compute a repulsion-adjusted movement direction and speed multiplier.
 
@@ -80,6 +86,9 @@ def compute_repulsion(
         their path — only the carrier gets extra push-force toward others).
     params:
         Repulsion config loaded from ``physics.json["repulsion"]``.
+    pitch:
+        Needed only to compute the boundary-repulsion term below (``None``
+        skips it entirely, e.g. existing callers/tests that don't pass one).
 
     Returns
     -------
@@ -90,8 +99,9 @@ def compute_repulsion(
     speed_multiplier:
         A value in ``[0, 1]``.  ``1.0`` means no speed change; lower
         values indicate the player should slow down (relevant when the
-        player is a ball carrier near an obstacle).  Non-carrier players
-        always receive ``1.0``.
+        player is a ball carrier near an obstacle, OR near the pitch
+        boundary while carrying — see below).  Non-carrier players always
+        receive ``1.0``.
     """
     has_ball = (ball_carrier_id is not None and ball_carrier_id == player.player_id)
 
@@ -153,6 +163,37 @@ def compute_repulsion(
     if has_ball:
         net_rep_x *= params.ball_carrier_repulsion_mult
         net_rep_y *= params.ball_carrier_repulsion_mult
+
+    # ── Boundary repulsion (ball carriers only) ────────────────────────────
+    # Steers the CARRY path away from the pitch boundary before it's
+    # crossed, the same way a nearby player steers it -- added directly
+    # into net_rep so it rides the existing blend/orthogonal-nudge/
+    # max_deflection_deg machinery below and the ball-carrier speed penalty
+    # right after this block, rather than a bespoke mechanism.
+    #
+    # Real gap this closes: Match._run_get_possession_behaviour's boundary
+    # braking (engine/match.py's boundary_braking_params) only ever runs
+    # while CHASING a loose ball -- the instant a player actually has the
+    # ball, movement goes through MoveOrder/this function instead, which
+    # had zero boundary awareness at all. Confirmed via a real traced
+    # episode: a player picked up the ball 2m from the corner and sprinted
+    # straight through the touchline one second later, dead straight line,
+    # despite plenty of room to have curved inward. Deliberately steering-
+    # only (bend the direction + slow down), not a redirect kick -- run
+    # differently, don't take an action to fix it.
+    #
+    # `params.boundary_radius_m <= 0.0` (the config default) disables this
+    # outright, matching every pre-existing test/caller that never
+    # anticipated boundary geometry mattering to repulsion.
+    if has_ball and pitch is not None and params.boundary_radius_m > 0.0:
+        margin_x = pitch.half_length - abs(player.position.x)
+        margin_y = pitch.half_width - abs(player.position.y)
+        if margin_x < params.boundary_radius_m:
+            strength = params.boundary_strength_base * (1.0 - margin_x / params.boundary_radius_m)
+            net_rep_x += (-1.0 if player.position.x > 0.0 else 1.0) * strength
+        if margin_y < params.boundary_radius_m:
+            strength = params.boundary_strength_base * (1.0 - margin_y / params.boundary_radius_m)
+            net_rep_y += (-1.0 if player.position.y > 0.0 else 1.0) * strength
 
     # ── Speed multiplier (ball carrier only) ─────────────────────────────
     speed_multiplier = 1.0

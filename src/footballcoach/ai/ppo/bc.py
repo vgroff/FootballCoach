@@ -21,7 +21,7 @@ Design rule: BC labels do NOT go through the PPO importance ratio / clipping.
 They are a separate, additive loss term. This means they can use actions taken
 by the rules-based AI (which has no π_old) without corrupting PPO's math.
 
-Flat tensor layout for stored BC labels (17 floats per step):
+Flat tensor layout for stored BC labels (27 floats per step):
   [0]  shoot
   [1]  pass_
   [2]  move
@@ -62,6 +62,13 @@ Flat tensor layout for stored BC labels (17 floats per step):
                           from Player.last_kick_spin.)
   [22] kick_spin_y
   [23] kick_spin_z
+  [24] kick_dir_z         (3D unit vector's z component -- see [18]/[19])
+  [25] heading_sin        (sin(player.heading_rad) -- CURRENT state, read
+                          directly, not derived from any Order/execute()
+                          simulation. Always populated whenever `player` was
+                          resolved, regardless of which order branch below
+                          fires.)
+  [26] heading_cos
 """
 from __future__ import annotations
 
@@ -74,9 +81,27 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from footballcoach.ai.config import load_ai_config
+
 log = logging.getLogger("footballcoach.ai.bc")
 
-BC_LABEL_DIM = 25  # elements in the flat label vector (see module docstring)
+BC_LABEL_DIM = 27  # elements in the flat label vector (see module docstring)
+
+# Single source of truth: ai/obs/encoder.py normalizes live BallFeatures
+# spin_x/y/z by this same config value. Read once at import time (NOT
+# hardcoded here) so this can never silently drift out of sync with the live
+# encoder the way it previously did -- ai_config.json's own
+# ball_spin_nn_norm_rad_s comment warns this exact drift will happen if the
+# config value changes without a matching hand-edit here. Deliberately NOT
+# the same as physics_pretrain's BALL_SPIN_NORM_DIVISOR_RAD_S (=30.0,
+# ball_episode_gen.py) -- that constant is intentionally decoupled from this
+# config value for its own reasons (dataset-shard normalization stability);
+# this module operates on live BC data in the live encoder's normalization
+# space, not physics_pretrain's. Not a physical spin bound: kick_spin is an
+# unsquashed/unbounded regression head (plain Normal, no SquashedNormalHead --
+# see ppo_trainer.py's _kick_spin_dist), so this only calibrates the BC MSE
+# loss scale, it does not clip or limit what the network can represent.
+_SPIN_NN_NORM_RAD_S: float = float(load_ai_config()["observation"]["ball_spin_nn_norm_rad_s"])
 
 # Indices into the flat label vector
 _I_SHOOT          = 0
@@ -104,6 +129,8 @@ _I_KICK_SPIN_X    = 21
 _I_KICK_SPIN_Y    = 22
 _I_KICK_SPIN_Z    = 23
 _I_KICK_DIR_Z     = 24  # kick_direction z component (3D unit vector with indices 18, 19, 24)
+_I_HEADING_SIN    = 25
+_I_HEADING_COS    = 26
 
 # ai_type integer codes (see module docstring layout table)
 AI_TYPE_RULES    = 0.0
@@ -144,6 +171,8 @@ class BCLabel:
     kick_direction: Optional[np.ndarray] = None      # shape (3,) 3D unit vector of actual launch direction
     kick_power_fraction: Optional[float] = None       # [0, 1], None if not kicking
     kick_spin: Optional[np.ndarray] = None            # shape (3,), None if not kicking
+    heading_sin: float = 0.0  # sin(player.heading_rad) -- current state, not order-simulated
+    heading_cos: float = 0.0
 
     def to_array(self) -> np.ndarray:
         """Pack into a flat float32 array of length BC_LABEL_DIM."""
@@ -178,6 +207,8 @@ class BCLabel:
             arr[_I_KICK_SPIN_X] = float(self.kick_spin[0])
             arr[_I_KICK_SPIN_Y] = float(self.kick_spin[1])
             arr[_I_KICK_SPIN_Z] = float(self.kick_spin[2])
+        arr[_I_HEADING_SIN] = self.heading_sin
+        arr[_I_HEADING_COS] = self.heading_cos
         return arr
 
     @staticmethod
@@ -231,6 +262,14 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     except (KeyError, AttributeError):
         return BCLabel.invalid()
 
+    # heading_sin/cos: CURRENT player state, read directly -- same category as
+    # player.stamina/player.position elsewhere in this function, not an
+    # execution-simulation artifact like move_direction below (see the
+    # snapshot/execute()/restore block's own docstring note), so no
+    # snapshot/restore dance is needed here.
+    heading_sin = math.sin(player.heading_rad)
+    heading_cos = math.cos(player.heading_rad)
+
     # ai_type reflects which AI actually controls *player* right now (rules
     # vs neural vs immobile) — NOT which AI the label was derived from (this
     # function always queries Phase1RulesAI internally regardless of the
@@ -276,12 +315,10 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
                 [player.last_kick_spin.x, player.last_kick_spin.y, player.last_kick_spin.z],
                 dtype=np.float32,
             )
-    elif player.kick_armed and player.kick_armed_aim_point is not None:
-        # Approach tick: arm intent with estimated direction/power toward the pre-computed target.
-        _d = player.kick_armed_aim_point - player.position
-        _d_len = (_d.x**2 + _d.y**2 + _d.z**2) ** 0.5
-        if _d_len > 1e-6:
-            kick_direction = np.array([_d.x / _d_len, _d.y / _d_len, _d.z / _d_len], dtype=np.float32)
+    elif player.kick_armed and player.kick_armed_direction is not None:
+        # Approach tick: arm intent with the pre-computed direction/power.
+        _d = player.kick_armed_direction
+        kick_direction = np.array([_d.x, _d.y, _d.z], dtype=np.float32)
         kick_power_fraction = player.kick_armed_power_fraction
         kick_spin = np.zeros(3, dtype=np.float32)
     # tackle_attempt: ChaseTackleOrder always, OR GetPossessionOrder when tackle_armed
@@ -392,6 +429,8 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
             kick_direction=kick_direction,
             kick_power_fraction=kick_power_fraction,
             kick_spin=kick_spin,
+            heading_sin=heading_sin,
+            heading_cos=heading_cos,
         )
     elif isinstance(order, GetPossessionOrder):
         ball = match.ball
@@ -409,6 +448,8 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
             kick_direction=kick_direction,
             kick_power_fraction=kick_power_fraction,
             kick_spin=kick_spin,
+            heading_sin=heading_sin,
+            heading_cos=heading_cos,
         )
     else:
         return BCLabel.invalid()
@@ -901,9 +942,8 @@ def bc_loss_from_tensor(
             kick_power_loss_per = torch.where(kicked_mask, power_mse, torch.zeros_like(power_mse))
             loss += exec_weight * kick_power_loss_per
 
-            spin_norm_max = 30.0  # matches ai_config.json obs['ball_spin_norm_max_rad_s']
-            target_spin = labels[:, _I_KICK_SPIN_X:_I_KICK_SPIN_Z + 1] / spin_norm_max
-            pred_spin = exec_heads.kick_spin / spin_norm_max
+            target_spin = labels[:, _I_KICK_SPIN_X:_I_KICK_SPIN_Z + 1] / _SPIN_NN_NORM_RAD_S
+            pred_spin = exec_heads.kick_spin / _SPIN_NN_NORM_RAD_S
             spin_mse = ((pred_spin - target_spin) ** 2).sum(dim=-1)
             kick_spin_loss_per = torch.where(kicked_mask, spin_mse, torch.zeros_like(spin_mse))
             loss += exec_weight * kick_spin_loss_per

@@ -13,3 +13,5 @@ wheels/
 
 # Virtual environments
 .venv
+
+ConsoleHost_history.txt

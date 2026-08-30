@@ -17,7 +17,7 @@ Usage::
 
 Output .npz files contain:
     obs_self_feat, obs_other_feat, obs_exists_mask, obs_ball_feat,
-    obs_global_feat, bc_labels, meta_phase, meta_scenario
+    obs_global_feat, bc_labels, meta_phase, meta_scenario, meta_episode_seeds
 
 Each file is self-contained and can be loaded individually or combined with
 DemonstrationDataset.from_directory().
@@ -27,6 +27,7 @@ from __future__ import annotations
 import argparse
 import logging
 import os
+import random
 import time
 from pathlib import Path
 
@@ -233,6 +234,20 @@ def record_episodes(
     # segment its backward MC scan per player-track instead of mixing the two
     # players' reward streams together. See "is_trainee" note in dataset.py.
     is_trainee_flags = []
+    # 1.0 if this row's own reward corresponds to a genuine NEW decision
+    # interval (a real sample_interval_s-spaced timed sample), 0.0 for a
+    # kick/tackle-callback row or the trailing true-terminal row (see
+    # _record_terminal_now) -- both fire at some SUB-interval moment inside
+    # (or, for the terminal row, one physics tick after) an ALREADY-counted
+    # decision interval, not a new one of their own.
+    # DemonstrationDataset.compute_returns() uses this so its per-row MC
+    # discount (`gamma ** 1` per row) only actually applies once per REAL
+    # elapsed sample_interval_s, not once per row regardless of real time --
+    # otherwise an episode with a flurry of kicks (many callback rows in a
+    # couple of real seconds) gets over-discounted relative to an
+    # equal-duration episode with fewer touches, purely as an artifact of
+    # how many rows happened to get inserted, not real elapsed time.
+    is_decision_step_flags = []
     # Per-step reward-component breakdown, one fixed-width row per sample --
     # column order = REWARD_COMP_LABELS (short-key order), so this stays in
     # sync with ppo_trainer.py's diagnostics/reward.py's component keys
@@ -256,6 +271,21 @@ def record_episodes(
     # per-player reward component at all, so there is nothing to infer from).
     outcome_counts: dict[str, int] = {}
     episode_outcomes: list[str] = []
+    # Per-episode seed passed to build_1v1_scenario(seed=...) (see below,
+    # drawn fresh each episode from this worker's already-seeded --seed
+    # stream) -- persisted verbatim (meta_episode_seeds below) so any
+    # recorded episode can be rebuilt EXACTLY later (positions, attributes,
+    # ball state, opponent-type roll, and every subsequent tackle-roll/kick-
+    # noise draw, since build_1v1_scenario's returned Match keeps using this
+    # same seeded rng for all of its own physics too -- see that function's
+    # own docstring) via scripts/replay_episode.py, instead of only ever
+    # being able to inspect a static post-hoc log. Previously no seed was
+    # ever captured -- the --seed CLI flag only seeded the global numpy/
+    # random modules, which build_1v1_scenario's own rng=random.Random()
+    # (freshly OS-entropy-seeded, never connected to that global state) never
+    # used, so recorded episodes were never actually reproducible despite
+    # --seed's docstring implying otherwise.
+    episode_seeds: list[int] = []
 
     # Reward component breakdown accumulator (mirrors train.py's diagnostic
     # "_comp_acc" pattern), reset after each periodic log line so the
@@ -316,15 +346,6 @@ def record_episodes(
     if total_episodes is None:
         total_episodes = n_episodes
 
-    # Per-player reward accrued since the last time it was consumed by a
-    # sample (timed sample or kick/tackle callback), keyed by player id.
-    # Cleared per-player every time it's read so reward is never
-    # double-counted across rows and never silently dropped when a kick/
-    # tackle callback fires between timed samples (see the main loop below,
-    # which accrues into this dict after each env.step()). Kept per-player
-    # (not one shared scalar) because the trainee and the opponent get
-    # GENUINELY DIFFERENT rewards -- see _record_now()'s docstring.
-    _pending_reward: dict[str, float] = {}
 
     def _record_now(reward: float | None = None, done: bool = False, player_id: str | None = None) -> list[str]:
         """Append one (obs, label) sample per player. Returns the list of
@@ -336,26 +357,32 @@ def record_episodes(
         on_tackle callback samples, which fire per-player) records only that
         player.
 
-        reward=None (the default, used by kick/tackle callbacks) consumes and
-        clears whatever reward has accrued for THAT SPECIFIC player since
-        their last sample, via ``_pending_reward[pid]`` — never another
-        player's value. Timed samples explicitly pass reward=0.0 (a
+        reward=None (the default, used by kick/tackle callbacks): these rows
+        carry reward=0.0 always. The real reward for whatever env.step()
+        call is in progress gets attributed EXACTLY ONCE, to that step's own
+        timed-sample row (see the main loop below) — a kick/tackle callback
+        firing synchronously inside that same env.step() call exists purely
+        to record a genuine BC-label row at the exact tick the action
+        happened (kick_this_tick=1 etc.), not to carry its own reward.
+        Earlier this also drained a per-player pending-reward accrual here,
+        which double-counted: the reward had already been written to its
+        timed-sample row before any callback could fire, so the accrual was
+        never actually needed to avoid losing anything — it only added a
+        second, unlabelled copy of the same value on whatever row happened
+        to consume it next. Timed samples explicitly pass reward=0.0 (a
         placeholder) and get each player's real, INDIVIDUALLY-COMPUTED
         reward backfilled after env.step() — the trainee's own reward
         (env.step()'s return) is NOT the same value as the opponent's own
         reward (env.last_secondary_results, computed via the same
         _compute_phase1_reward_for_player() call PPO training itself uses
         for a neural secondary player — see env.always_compute_secondary_
-        reward). Previously both rows were given the trainee's reward
-        value, silently double-counting it in every downstream MC-return/
-        episode-total computation and mislabeling the opponent's row with
-        someone else's reward.
+        reward).
         """
         ids = [env.trainee_player_id, "opponent"] if player_id is None else [player_id]
         nonlocal steps_total, steps_valid
         nonlocal _kick_count_since_log, _tackle_count_since_log, _kick_count_total, _tackle_count_total
         for pid in ids:
-            pid_reward = _pending_reward.pop(pid, 0.0) if reward is None else reward
+            pid_reward = 0.0 if reward is None else reward
             obs = env._get_obs(player_id=pid)
             label = label_fn(env, player_id=pid)
             label_arr = label.to_array()
@@ -368,6 +395,11 @@ def record_episodes(
             rewards.append(np.float32(pid_reward))
             dones.append(np.float32(done))
             is_trainee_flags.append(np.float32(1.0 if pid == env.trainee_player_id else 0.0))
+            # player_id is None only for the timed-sample call (line ~557) --
+            # a genuine new decision interval; kick/tackle callbacks always
+            # pass an explicit player_id (see is_decision_step_flags' own
+            # comment above).
+            is_decision_step_flags.append(np.float32(1.0 if player_id is None else 0.0))
             reward_components.append(np.zeros(len(_comp_key_order), dtype=np.float32))
             steps_total += 1
             if label.valid:
@@ -379,6 +411,51 @@ def record_episodes(
                     _tackle_count_since_log += 1
                     _tackle_count_total += 1
         return ids
+
+    def _record_terminal_now() -> list[int]:
+        """Append the TRUE final row for both players, one real physics tick
+        later than any `_record_now()` call could ever capture -- see
+        ScenarioLoop.last_completed_trial_match's docstring for exactly why
+        that tick was previously unrecordable (env.step() only returns
+        AFTER the next trial's match has already been built, so the episode
+        that just ended can no longer be read from env._loop.match/
+        env._get_obs() by that point). Every row here is real, recorded
+        engine state -- NOT extrapolated or replayed.
+
+        Returns the row indices just appended (always exactly 2: trainee,
+        opponent) so the caller can mark them (not the previous timed
+        sample's rows) as the episode's real dones=1 boundary.
+
+        reward=0.0 / an invalid BCLabel: this tick corresponds to no new
+        decision (the episode is already over) and no new reward (the
+        terminal reward was already correctly attributed to the last timed
+        sample by env.step()'s own return, exactly as before) -- this row
+        exists ONLY to carry the true final observation, e.g. for match-log
+        reconstruction. `label.valid=False` means BC training already skips
+        it via the same steps_valid/label.valid convention every other
+        padding row uses.
+        """
+        from footballcoach.ai.ppo.bc import BCLabel
+
+        nonlocal steps_total
+        row_indices = []
+        for pid in (env.trainee_player_id, "opponent"):
+            obs = env._get_obs(player_id=pid, match=env.last_terminal_match)
+            label_arr = BCLabel(valid=False).to_array()
+            self_feats.append(obs.self_feat.copy())
+            other_feats.append(obs.other_feat.copy())
+            exists_masks.append(obs.exists_mask.copy())
+            ball_feats.append(obs.ball_feat.copy())
+            global_feats.append(obs.global_feat.copy())
+            bc_labels.append(label_arr)
+            rewards.append(np.float32(0.0))
+            dones.append(np.float32(0.0))  # caller overwrites -- see docstring
+            is_trainee_flags.append(np.float32(1.0 if pid == env.trainee_player_id else 0.0))
+            is_decision_step_flags.append(np.float32(0.0))  # see its own comment above
+            reward_components.append(np.zeros(len(_comp_key_order), dtype=np.float32))
+            row_indices.append(len(rewards) - 1)
+            steps_total += 1
+        return row_indices
 
     # Sample tackle_armed/kick_armed (transient per-tick flags on Player,
     # reset every tick by Match._process_orders) once per physics tick via
@@ -437,28 +514,21 @@ def record_episodes(
         return _cb
 
     for ep in range(n_episodes):
-        env.reset()
+        # Drawn from this worker's own --seed-derived numpy stream (already
+        # seeded once at worker start -- see _run_recording_job), so the
+        # WHOLE run is reproducible given the same --seed + worker index +
+        # episode order, and each individual episode is ALSO independently
+        # reproducible on its own via just this one int (see
+        # episode_seeds/meta_episode_seeds above). int() so it round-trips
+        # cleanly through np.int64 -> plain Python int -> build_1v1_
+        # scenario's own `seed: int | None` param.
+        episode_seed = int(np.random.randint(0, 2**31 - 1))
+        env.reset(seed=episode_seed)
         for role in _ROLES:
             for k in _ep_counts[role]:
                 _ep_counts[role][k] = 0
         for k in _ep_poss_reward:
             _ep_poss_reward[k] = 0.0
-        # _pending_reward represents "reward accrued since this player's last
-        # recorded sample" -- must never survive env.reset(). Left uncleared,
-        # a player whose on_kick/on_tackle callback rarely fires (e.g. a
-        # neural-driven trainee with ~0% kick rate) would silently accumulate
-        # reward across MANY episodes without ever being drained, then dump
-        # the entire cross-episode backlog onto a single row the next time a
-        # callback happened to fire -- confirmed in real recorded data: one
-        # row carried reward=1474.952, and DemonstrationDataset.compute_
-        # returns()'s backward MC scan then propagated that single corrupted
-        # value across the whole episode (and, via prev_had_done resets,
-        # was at least contained to one episode -- but still produced
-        # "episode total reward" values in the hundreds/thousands from an
-        # episode whose real per-component rewards were all normal, single-
-        # digit values).
-        _pending_reward.clear()
-
         # Drive trainee with rules-based AI (or a neural checkpoint, when
         # driver_trainer is given -- env.reset() just above already assigned
         # NeuralPlayerAI to it via env.sample_action_fn, so don't override
@@ -482,12 +552,28 @@ def record_episodes(
         # on_kick/on_tackle are wired unconditionally for code simplicity — the
         # immobile branch never kicks/tackles, so the callbacks are harmless but
         # inert in that case.
+        #
+        # NOTE this is a SEPARATE roll from (and unconditionally OVERRIDES)
+        # whatever build_1v1_scenario itself already decided internally using
+        # its own seeded rng -- a real pre-existing quirk (this one folds the
+        # "would-be-neural" probability mass into "rules" instead, matching
+        # "no neural opponent during demo recording" above; build_1v1_
+        # scenario's own internal roll instead leaves that region as ai=None,
+        # relying on ScenarioEnv to assign a NeuralPlayerAI, which doesn't
+        # happen during plain recording), deliberately preserved as-is rather
+        # than unified, to avoid silently changing the recorded opponent-type
+        # distribution. Sourced from a LOCAL rng seeded by THIS episode's own
+        # seed (not the global numpy stream) so it's captured by episode_seed
+        # like everything else -- scripts/replay_episode.py MUST reproduce
+        # this exact second roll (same seed, same formula) after building the
+        # scenario, not just call build_1v1_scenario(seed=...) alone, or a
+        # replayed episode's opponent type can differ from the recorded one.
         try:
             match = env._loop.match
             opp = match.player_by_id("opponent")
             # opponent_immobile_prob (if given) lets immobile-prob be set
             # independently of rules_prob instead of implicitly = 1 - rules_prob.
-            _roll = np.random.random()
+            _roll = random.Random(episode_seed).random()
             if _roll < opponent_rules_prob:
                 opp.ai = Phase1RulesAI()
                 match._opponent_use_rules_ai = True
@@ -560,12 +646,33 @@ def record_episodes(
                 reward_components[_row_idx] = np.array(
                     [_pid_comps.get(k, 0.0) for k in _comp_key_order], dtype=np.float32,
                 )
-                if done:
-                    dones[_row_idx] = np.float32(1.0)
-            # Accrue each player's own reward for THEIR next kick/tackle
-            # callback (if any) that fires before the next timed sample.
-            for _pid, _r in _reward_by_pid.items():
-                _pending_reward[_pid] = _pending_reward.get(_pid, 0.0) + _r
+                # dones=1 is NOT set here even when done=True -- it belongs
+                # on the TRUE final row recorded below (_record_terminal_now,
+                # via env.last_terminal_match), one real physics tick later
+                # than this row. Reward/components stay here (correctly
+                # attributed to the tick that earned them); dones alone
+                # moves to mark the real episode boundary in the right place.
+            # NOTE: previously also accrued each player's reward into
+            # _pending_reward here, for a LATER kick/tackle callback's own
+            # _record_now(player_id=pid, reward=None) call to pop() as ITS
+            # OWN reward. That was a genuine double-count, not a deferred
+            # attribution: the reward computed by THIS env.step() call was
+            # ALREADY written onto this timed sample's own row two lines
+            # above, unconditionally, every single call -- there was never a
+            # scenario where it still needed a second home. Confirmed in
+            # real recorded data: row N carried get_possession=+1.0 with a
+            # real component breakdown (the genuine timed-sample event), and
+            # row N+6 -- the kick-callback row six rows later, where the
+            # trainee kicked the ball away -- carried ANOTHER +1.0 with an
+            # EMPTY component breakdown (reward_components is only ever
+            # backfilled for timed-sample rows, never callback rows) -- an
+            # orphaned duplicate of the same value, silently inflating every
+            # downstream MC return computed across that stretch. Removed
+            # entirely; _pending_reward/_record_now's reward=None path now
+            # always resolves to 0.0 (see _record_now's own docstring),
+            # matching how kick/tackle-callback rows already carry
+            # meaningful BC labels but zero reward of their own -- exactly
+            # like the terminal row _record_terminal_now adds.
             # Accumulate reward component breakdown for periodic logging (see
             # train.py's "_comp_acc" diagnostic for the analogous pattern).
             # This periodic run-wide SUMMARY is deliberately env-level (all
@@ -581,6 +688,23 @@ def record_episodes(
             _ep_poss_reward["poss"] += sum(c.get("poss", 0.0) for c in _comp_by_pid.values())
             _ep_poss_reward["lpos"] += sum(c.get("lpos", 0.0) for c in _comp_by_pid.values())
 
+        # `while not done` has just exited, so done=True and env.last_terminal_match
+        # holds the trial's real final tick (see ScenarioLoop.last_completed_trial_match).
+        # Record it as the episode's true last row -- see _record_terminal_now's
+        # own docstring for why this exists and why it's real, not reconstructed.
+        if env.last_terminal_match is not None:
+            for _row_idx in _record_terminal_now():
+                dones[_row_idx] = np.float32(1.0)
+        else:
+            # Should not happen (done=True always sets last_terminal_match --
+            # see ScenarioEnv.step()) but fail loudly rather than silently
+            # recording an episode with no dones=1 row at all, which would
+            # corrupt every downstream episode-boundary computation.
+            raise AssertionError(
+                "episode ended (done=True) but env.last_terminal_match is None -- "
+                "ScenarioEnv.step()/ScenarioLoop.last_completed_trial_match is broken."
+            )
+
         _comp_acc_episodes += 1
         episode_poss_reward.append(dict(_ep_poss_reward))
         _poss_reward_since_log.append(dict(_ep_poss_reward))
@@ -592,6 +716,7 @@ def record_episodes(
         outcome = getattr(last_info, "trial_outcome", None) or "unknown"
         outcome_counts[outcome] = outcome_counts.get(outcome, 0) + 1
         episode_outcomes.append(outcome)
+        episode_seeds.append(episode_seed)
 
         global_ep = episode_offset + ep + 1
         if global_ep % 10 == 0 or global_ep == total_episodes:
@@ -648,6 +773,7 @@ def record_episodes(
         "bc_labels":       np.stack(bc_labels).astype(np.float32),
         "rewards":         np.array(rewards, dtype=np.float32),
         "is_trainee":      np.array(is_trainee_flags, dtype=np.float32),
+        "is_decision_step": np.array(is_decision_step_flags, dtype=np.float32),
         "dones":           np.array(dones, dtype=np.float32),
         "reward_components": np.stack(reward_components).astype(np.float32),
         "meta_reward_component_keys": np.array(_comp_key_order),
@@ -672,6 +798,9 @@ def record_episodes(
         # comment above) -- one entry per complete episode, same order as
         # `dones`' done=1 rows.
         "meta_episode_outcomes": np.array(episode_outcomes, dtype="U32"),
+        # Per-episode seed (see episode_seeds comment above) -- same order/
+        # length as meta_episode_outcomes, one int per complete episode.
+        "meta_episode_seeds": np.array(episode_seeds, dtype=np.int64),
     }
 
 
@@ -809,7 +938,12 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=None,
                         help="RNG seed. Default: None -- draws a fresh random seed each run "
                              "(logged so the run can be reproduced later). Pass an explicit "
-                             "value for reproducible/comparable recordings across runs.")
+                             "value for reproducible/comparable recordings across runs. You "
+                             "don't need to remember this to replay one specific episode later "
+                             "though -- every recorded episode's own build_1v1_scenario seed is "
+                             "saved individually (meta_episode_seeds), so "
+                             "scripts/replay_episode.py only needs THAT one int, not this "
+                             "whole-run --seed.")
     _cfg = __import__("footballcoach.ai.config", fromlist=["load_ai_config"]).load_ai_config()
     _default_interval = float(_cfg.get("bc", {}).get("demo_sample_interval_s", 0.2))
     parser.add_argument("--sample-interval", type=float, default=_default_interval,

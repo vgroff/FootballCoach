@@ -373,24 +373,27 @@ class BallDynamicsAutoencoder(nn.Module):
     Not itself a saved artifact -- only ``encoder.state_dict()`` becomes the
     real, permanent output (§6.3, §7).
 
-    ``crossing_head``: a single ``Linear(latent_dim, 3)``, no hidden layer,
+    ``crossing_head``: a single ``Linear(latent_dim, 4)``, no hidden layer,
     reading directly off the latent (same input the decoder's per-horizon
     heads see, but not routed through the decoder itself) -- predicts the
     ball's out-of-bounds/goal-scored crossing position (``pos_x, pos_y``
-    ONLY, not height -- same normalized units as target fields 0:2) and
-    ``delta_t`` (seconds until that crossing, ``-1`` sentinel for "never
-    happens within the simulated window" -- see ``BallDynamicsDataset.
-    crossing_dt``), as one global per-episode prediction rather than one per
-    horizon. Always present (cheap: 3*(latent_dim+1) params) so a
-    checkpoint's shape doesn't depend on whether this head was ever trained;
-    trained/not is entirely controlled by ``physics_pretrain.ball.
-    crossing_pos_loss_weight``/``crossing_dt_loss_weight`` (split, since
-    position and delta_t sit on very different natural scales -- see
-    ``train_ball_dynamics._crossing_head_loss``'s docstring; both 0.0 = no
-    gradient reaches it, same convention as ``bce_loss_weight``/
-    ``spin_loss_weight``) -- not a constructor flag, so there's nothing to
-    keep in sync between "does the head exist" and "does it get
-    supervision".
+    ONLY, not height -- same normalized units as target fields 0:2),
+    ``crosses_logit`` (BCE-with-logits classifier: "does this row have a
+    real crossing/already-crossed instance to report at all", true whenever
+    ``crossing_dt`` isn't the ``-1`` "genuinely never" sentinel), and
+    ``delta_t`` (seconds until that crossing, regressed ONLY on rows where
+    ``crosses_logit``'s target is true -- no ``-1`` sentinel mixed into the
+    regression itself, matching ``PlayerDynamicsAutoencoder.crossing_head``'s
+    identical split -- see ``train_ball_dynamics._crossing_head_loss``'s
+    docstring for why the combined single-regression version was replaced).
+    Always present (cheap: 4*(latent_dim+1) params) so a checkpoint's shape
+    doesn't depend on whether this head was ever trained; trained/not is
+    entirely controlled by ``physics_pretrain.ball.crossing_pos_loss_
+    weight``/``crossing_crosses_loss_weight``/``crossing_dt_loss_weight``
+    (all 0.0 = no gradient reaches that term, same convention as
+    ``bce_loss_weight``/``spin_loss_weight``) -- not a constructor flag, so
+    there's nothing to keep in sync between "does the head exist" and "does
+    it get supervision".
 
     ``resting_head``: same shape/idea as ``crossing_head`` (``Linear(latent_
     dim, 2)``, no hidden layer, off the latent) but predicts where the ball
@@ -477,7 +480,7 @@ class BallDynamicsAutoencoder(nn.Module):
                 latent_dim=latent_dim, horizons_s=horizons_s, hidden_dim=decoder_hidden_dim,
                 identity_shortcut=decoder_identity_shortcut, identity_shortcut_noise_std=identity_shortcut_noise_std,
             )
-        self.crossing_head = nn.Linear(latent_dim, 3)
+        self.crossing_head = nn.Linear(latent_dim, 4)
         self.resting_head = nn.Linear(latent_dim, 2)
         self.position_head = nn.Linear(latent_dim, 2)
         self.event_head = nn.Linear(latent_dim, 2)

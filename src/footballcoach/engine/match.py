@@ -79,6 +79,26 @@ class MarkingParams:
         )
 
 
+@dataclass(frozen=True)
+class BoundaryBrakingParams:
+    """Config for ``Match._run_get_possession_behaviour``'s loose-ball
+    boundary-safety braking (and its own-team-touched-last abandonment) —
+    loaded from ``orders.json["boundary_braking"]``. See that section's own
+    ``_comment``/``_comment_brake_buffer``/``_comment_abandon_margin`` for
+    the full reasoning; kept here as one config-backed dataclass rather than
+    local magic-number constants so both are independently tunable."""
+    brake_buffer_m: float = 0.6
+    abandon_margin_m: float = -1.0
+
+    @staticmethod
+    def from_config() -> "BoundaryBrakingParams":
+        d = require_section(load_orders_config(), "boundary_braking", "orders.json")
+        return BoundaryBrakingParams(
+            brake_buffer_m=d.get("brake_buffer_m", 0.6),
+            abandon_margin_m=d.get("abandon_margin_m", -1.0),
+        )
+
+
 @dataclass
 class Match:
     pitch: Pitch
@@ -102,6 +122,7 @@ class Match:
     collision_params: CollisionParams = field(default_factory=CollisionParams.from_config)
     marking_params: MarkingParams = field(default_factory=MarkingParams.from_config)
     ball_pickup_params: BallPickupParams = field(default_factory=BallPickupParams.from_config)
+    boundary_braking_params: BoundaryBrakingParams = field(default_factory=BoundaryBrakingParams.from_config)
 
     paused: bool = False
     time_s: float = 0.0
@@ -237,6 +258,8 @@ class Match:
         this, a player with nonzero velocity would freeze in place for any no-intent tick, which
         step_player_towards's own physics never does (it always advances position from velocity).
         ``desired_speed_mode`` is cleared to ``None`` after application so each tick is independent.
+        ``player.last_desired_speed_mode`` is set to whatever was just consumed and is NOT cleared --
+        see its docstring on ``Player`` (used by ai/obs/encoder.py to read "current movement intent").
         """
         for player in self.players:
             if player.desired_speed_mode is None:
@@ -249,6 +272,7 @@ class Match:
             speed_mode = player.desired_speed_mode
             step_player_towards(player, player.desired_direction, speed_mode, dt, self.movement_params, has_ball)
             player.stamina = _drain_if_sprinting(self.movement_params, player, speed_mode is SpeedMode.SPRINT, dt)
+            player.last_desired_speed_mode = speed_mode  # NOT cleared -- see Player.last_desired_speed_mode
             player.desired_speed_mode = None  # consumed; reset for next tick
 
     def _set_possession(self, player_id: str | None) -> None:
@@ -261,6 +285,7 @@ class Match:
         old = self.ball.possessed_by
         self.ball.possessed_by = player_id
         if player_id is not None and player_id != old:
+            self.ball.last_touched_by_player_id = player_id
             p = self.player_by_id(player_id)
             if p.on_possession_gained is not None:
                 p.on_possession_gained(p)
@@ -293,7 +318,7 @@ class Match:
             player.kicked_this_tick = False
             player.tackle_armed = False
             player.kick_armed = False
-            player.kick_armed_aim_point = None
+            player.kick_armed_direction = None
             player.last_kick_direction = None
             player.last_kick_power_fraction = None
             player.last_kick_spin = None
@@ -404,10 +429,135 @@ class Match:
                     dist_to_intercept = (intercept - player.position).length_xy()
                     intercept = intercept + ball_vel_xy * (dist_to_intercept * overshoot_frac / ball_speed_xy)
             direction = intercept - player.position
+
+            # Boundary-aware braking: don't sprint blindly onto a ball
+            # sitting near the touchline/goal line -- a player who arrives
+            # too fast to decelerate before the boundary just carries a
+            # newly-possessed ball out with them the instant they pick it
+            # up (confirmed real bug -- see test_ball_out_overrun.py).
+            #
+            # Compute the fastest speed the player could be moving at the
+            # intercept point and still be able to brake to a stop before
+            # crossing the NEAREST boundary (same v^2=2*a*d kinematics
+            # already used by braking_speed_mode for a normal arrival
+            # stop), then feed it in as arrival_speed via the same
+            # arrival-distance/braking machinery every other order uses.
+            # When the ball is nowhere near a boundary this naturally
+            # computes a safe speed at or above sprint speed, so
+            # braking_speed_mode's own "no braking needed" branch leaves
+            # ordinary mid-pitch chases at full sprint, unchanged.
+            #
+            # This doesn't guarantee a stop exactly at the line (discrete
+            # 30Hz ticks + the tiny pickup radius mean some residual
+            # overrun is still possible) -- it's a real reduction, not a
+            # hard guarantee, per the tradeoff of reusing the existing
+            # braking curve rather than a bespoke boundary solver. When
+            # there's essentially NO room left to decelerate into at all
+            # (raw_margin <= boundary_braking_params.abandon_margin_m,
+            # below), the chase is abandoned outright rather than crawling
+            # in at whatever near-zero speed the formula computes -- see
+            # that branch's own comment.
+            #
+            # Both this buffer and the abandon threshold are configurable
+            # via orders.json["boundary_braking"] (self.boundary_braking_
+            # params) rather than hardcoded, so they can be tuned without a
+            # code change.
+            #
+            # Skipped entirely when the player's OWN TEAM touched this ball
+            # last (Ball.last_touched_by_player_id): the reward model only
+            # scores a clean "ball_out" penalty once SOMEONE has touched the
+            # ball (an untouched exit is "invalid", 0 reward, not -4 -- see
+            # ai/env/reward.py's ball_went_out_after_touch / ai/env/
+            # outcome.py's "miss" vs "invalid" split). Once our own team has
+            # already touched it, that untouched-exit floor is gone for us
+            # either way, so cautious braking can only ever cost a shot at
+            # recovering it (stop-and-redirect) -- there's no longer a
+            # worse outcome it's protecting against. Braking still applies
+            # normally on the FIRST chase of a possession sequence (nobody
+            # has touched it yet) and whenever the OPPONENT touched it last
+            # (their team's fault, not ours, if it rolls out) -- both cases
+            # where a careless carry-out would make things worse than a
+            # clean miss.
+            own_team_touched_last = False
+            _last_toucher_id = self.ball.last_touched_by_player_id
+            if _last_toucher_id is not None:
+                own_team_touched_last = self.player_by_id(_last_toucher_id).team == player.team
+
+            if own_team_touched_last:
+                # No braking at all -- arrival_dist=None is what disables
+                # the braking curve entirely in _compute_movement_intent
+                # (arrival_speed=None alone would NOT do this -- it only
+                # resolves the arrival TARGET to jog speed, still braking
+                # to get there; see that function's own docstring). This is
+                # the exact pre-boundary-fix behaviour, deliberately
+                # reinstated for this specific case.
+                arrival_dist_for_call = None
+                arrival_speed_for_call = None
+            else:
+                from footballcoach.engine.movement import effective_acceleration
+                bp = self.boundary_braking_params
+                # Unclamped: how much room is left to decelerate into,
+                # which can go negative (there's NO room at all, not just
+                # "zero room") -- used below to decide whether to abandon
+                # the chase entirely, not just cap its speed. The clamped
+                # (>= 0) version is what actually feeds the kinematic
+                # v^2=2*a*d safe-speed formula, matching braking_speed_
+                # mode's own arrival_speed convention (never negative).
+                #
+                # Deliberately measured against the ball's CURRENT position,
+                # not `intercept` (the predicted future meeting point). This
+                # was a real, confirmed bug: `intercept` extrapolates the
+                # ball forward by however long it'd take THIS player to
+                # close the gap, so a player far from a ball that's merely
+                # heading toward a boundary got an already-near-boundary
+                # predicted margin from tick one -- abandoning (see below)
+                # immediately and permanently, long before it was a live
+                # decision, even from the opposite side of the pitch.
+                # Confirmed via two real traced episodes: player frozen at
+                # velocity zero for the entire episode while a loose ball
+                # 15-25m away drifted untouched out of bounds. Using the
+                # ball's actual position instead means this only goes
+                # sharply negative once the ball is genuinely near the
+                # line, and it re-evaluates fresh every tick as both the
+                # player and the ball actually move.
+                raw_margin = min(
+                    self.pitch.half_length - abs(self.ball.position.x),
+                    self.pitch.half_width - abs(self.ball.position.y),
+                ) - self.pickup_radius_m - bp.brake_buffer_m
+
+                if raw_margin <= bp.abandon_margin_m:
+                    # No meaningful room to decelerate into, and it isn't
+                    # our team's ball to lose -- crawling toward it at the
+                    # near-zero safe speed the formula below would compute
+                    # still reliably ends up carrying it out anyway
+                    # (confirmed: a real traced episode overran by 0.54m
+                    # despite max_safe_speed already computing to 0 there).
+                    # Holding position instead lets the ball roll out
+                    # untouched -- "invalid" (0 reward) instead of a
+                    # penalised "ball_out" (-4) -- for zero further downside,
+                    # since we were never going to make a safe recovery here
+                    # either way. Tackle_armed was already set above (still
+                    # relevant if this is actually a carrier chase reusing
+                    # this branch via a race-condition edge case); nothing
+                    # else needs undoing.
+                    player.desired_direction = Vector3.zero()
+                    player.desired_speed_mode = SpeedMode.STANDSTILL
+                    return False
+
+                boundary_margin = max(0.0, raw_margin)
+                a_max = effective_acceleration(
+                    self.movement_params, player.attributes.acceleration,
+                    player.stamina, player.is_goalkeeper,
+                )
+                a_eff = a_max * self.movement_params.standstill_decel_multiplier
+                max_safe_speed = (2.0 * a_eff * boundary_margin) ** 0.5
+                arrival_dist_for_call = direction.length_xy()
+                arrival_speed_for_call = max_safe_speed
+
             from footballcoach.orders import _compute_movement_intent
             adj_dir, sm = _compute_movement_intent(
                 player, direction, self,
-                sprint=sprint, arrival_dist=None,
+                sprint=sprint, arrival_dist=arrival_dist_for_call, arrival_speed=arrival_speed_for_call,
                 use_repulsion=False, use_brake_to_turn=True,
             )
             player.desired_direction = adj_dir
@@ -458,6 +608,26 @@ class Match:
             candidates,
             key=lambda p: (p.position.xy().distance_to(self.ball.position.xy()), p.player_id),
         )
+
+        # Armed kick (see orders.py's _try_push_kick / apply_nn_action.py /
+        # Player.kick_armed): the player already committed to redirecting
+        # this ball the instant it's reachable, so skip CONTROLLING_BALL
+        # possession entirely -- no control-time delay, no
+        # control_speed_multiplier slowdown. This is the actual one-touch
+        # path; without it, "arming" a kick had no effect on physics at all
+        # (every pickup went through the normal control-then-kick sequence
+        # below regardless of kick_armed). Flat, direction-only kick (no
+        # ballistic solve) -- see Player.kick_armed_direction's docstring.
+        if player.kick_armed and player.kick_armed_direction is not None:
+            self._set_possession(player.player_id)
+            # kick_armed_power_fraction is already the final value (run-
+            # compensated at arm time for push-kicks -- see its docstring)
+            # -- compensate_for_run defaults False here, i.e. used as-is.
+            player.kick_with_direction(
+                self, player.kick_armed_direction, player.kick_armed_power_fraction,
+                player.kick_armed_spin or Vector3.zero(),
+            )
+            return
 
         relative_speed = (self.ball.velocity - player.velocity).length()
         player.firsttime_difficulty = compute_difficulty(

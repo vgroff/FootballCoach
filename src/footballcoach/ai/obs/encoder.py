@@ -6,12 +6,18 @@ engine's entities and the neural networks.
 
 Key design choices (from ai_design_doc.md section 7):
 - Positions encoded as (dx, dy) relative to the observing player, normalized
-  by pitch half-dimensions.
-- Velocities normalized by pitch half-diagonal (absolute pitch-scale units).
+  by a FIXED reference pitch half-diagonal (see ``_REF_HALF_DIAG_M`` below) --
+  NOT the live match's own pitch dimensions, so the same physical distance
+  always maps to the same feature value regardless of episode pitch size.
+- Velocities normalized by the same fixed pitch half-diagonal (absolute
+  pitch-scale units).
 - Other-player slots are shuffled randomly each call so the network learns
   permutation invariance (slot index carries no semantic meaning).
 - Unused slots are zero-filled with exists=0.0.
 - Time remaining: log1p-normalized (avoids squashing urgent endgame scenarios).
+- Heading (heading_sin/heading_cos) and previous-decision movement intent
+  (desired_dir_x/y + a STANDSTILL/JOG/SPRINT one-hot) are encoded for every
+  player slot (self and others) -- see PlayerFeatures' own docstring.
 
 ``time_remaining_s`` must be passed in by the caller (the env wrapper tracks
 the episode's remaining time; the engine only tracks elapsed ``time_s``).
@@ -46,9 +52,31 @@ from footballcoach.ai.obs.schema import (
     PlayerFeatures,
 )
 from footballcoach.engine.match import Match
+from footballcoach.engine.movement import SpeedMode
 from footballcoach.entities.player import Player, PlayerState, Team
 
 MAX_OTHER_PLAYERS: int = 21  # full 11v11 minus self
+
+# Reference/standard pitch dimensions used to normalize position and
+# velocity features. Deliberately FIXED (not read from match.pitch) so the
+# same physical distance/speed always maps to the same feature value
+# regardless of the episode's pitch size -- pitch-scale curriculum
+# (ai_config.json's curriculum.pitch_min_scale etc.) is not wired up yet,
+# but WOULD silently corrupt this normalization if it ever is, since a
+# live-pitch-derived divisor makes the same physical quantity encode
+# differently across episodes for no reason the network can see (the value
+# network in particular has no way to "explain away" that variance). Matches
+# physics.json's pitch defaults, GlobalFeatures.pitch_length_norm/
+# pitch_width_norm's own reference values just below, and
+# ai/physics_pretrain's `normalize_kinematics_by_base_pitch` convention (see
+# ai/physics_pretrain/live_encoder_features.py, which previously had to
+# reconcile this live/fixed mismatch explicitly -- see ai/knowledge.md).
+# The live pitch's actual size is still available to the network via
+# GlobalFeatures.pitch_length_norm/pitch_width_norm (pitch.length_m/105.0,
+# pitch.width_m/68.0) -- unaffected by this change.
+_REF_PITCH_LENGTH_M: float = 105.0
+_REF_PITCH_WIDTH_M: float = 68.0
+_REF_HALF_DIAG_M: float = math.hypot(_REF_PITCH_LENGTH_M / 2.0, _REF_PITCH_WIDTH_M / 2.0)
 
 
 def encode_observation(
@@ -86,15 +114,14 @@ def encode_observation(
 
     cfg = load_ai_config()
     obs_cfg = cfg["observation"]
-    spin_norm = float(obs_cfg["ball_spin_norm_max_rad_s"])
+    spin_norm = float(obs_cfg["ball_spin_nn_norm_rad_s"])
     time_norm_max = float(obs_cfg["time_remaining_norm_max_s"])
     height_norm_m = float(obs_cfg.get("height_norm_m", 3.0))
 
     self_player = _find_player(match, player_id)
-    pitch = match.pitch
-    half_len = pitch.length_m / 2.0
-    half_wid = pitch.width_m / 2.0
-    half_diag = math.hypot(half_len, half_wid)
+    half_len = _REF_PITCH_LENGTH_M / 2.0
+    half_wid = _REF_PITCH_WIDTH_M / 2.0
+    half_diag = _REF_HALF_DIAG_M
 
     # Build self features
     self_feat = _player_features(
@@ -253,6 +280,32 @@ def _player_features(
     # Team.LEFT attacks +x, Team.RIGHT attacks -x (per engine/offside.py convention)
     attacking_dir = +1.0 if player.team == Team.LEFT else -1.0
 
+    # Heading: populated unconditionally, including at standstill/immobile --
+    # a static facing direction is real signal, unlike velocity (which really
+    # is noise for a never-moving player). See PlayerFeatures docstring.
+    heading_sin = math.sin(player.heading_rad)
+    heading_cos = math.cos(player.heading_rad)
+
+    # Previous-decision movement intent: desired_direction is safe to read
+    # directly (never auto-cleared); last_desired_speed_mode is the one that
+    # survives match._apply_movement()'s per-tick reset of desired_speed_mode
+    # (see Player.last_desired_speed_mode's docstring). Immobile players and
+    # players with no decision yet both get the STANDSTILL/zero-direction
+    # default -- "no movement intent" is real signal here, same rationale as
+    # the is_immobile velocity-zeroing above.
+    if is_immobile:
+        desired_dir_x = 0.0
+        desired_dir_y = 0.0
+        speed_mode = SpeedMode.STANDSTILL
+    else:
+        d = player.desired_direction
+        desired_dir_x = d.x
+        desired_dir_y = d.y
+        speed_mode = player.last_desired_speed_mode or SpeedMode.STANDSTILL
+    desired_speed_standstill = 1.0 if speed_mode is SpeedMode.STANDSTILL else 0.0
+    desired_speed_jog = 1.0 if speed_mode is SpeedMode.JOG else 0.0
+    desired_speed_sprint = 1.0 if speed_mode is SpeedMode.SPRINT else 0.0
+
     feat = PlayerFeatures(
         rel_dx=dx / half_diag,
         rel_dy=dy / half_diag,
@@ -286,6 +339,13 @@ def _player_features(
         is_immobile=1.0 if is_immobile else 0.0,
         pos_x=player.position.x / half_diag,
         pos_y=player.position.y / half_diag,
+        heading_sin=heading_sin,
+        heading_cos=heading_cos,
+        desired_dir_x=desired_dir_x,
+        desired_dir_y=desired_dir_y,
+        desired_speed_standstill=desired_speed_standstill,
+        desired_speed_jog=desired_speed_jog,
+        desired_speed_sprint=desired_speed_sprint,
     )
     return feat.to_array()
 
@@ -296,10 +356,20 @@ def _ball_features(
     height_norm_m: float,
 ) -> np.ndarray:
     ball = match.ball
-    half_diag = math.hypot(match.pitch.length_m / 2.0, match.pitch.width_m / 2.0)
+    half_diag = _REF_HALF_DIAG_M
     vel_norm = max(half_diag, 1.0)
 
     is_possessed = 1.0 if ball.possessed_by is not None else 0.0
+
+    # Team.LEFT attacks +x, Team.RIGHT attacks -x -- same convention as
+    # PlayerFeatures.attacking_direction (engine/offside.py). 0.0 until the
+    # first possession gain of the episode (Ball.last_touched_by_player_id
+    # is None).
+    last_touch_team_direction = 0.0
+    if ball.last_touched_by_player_id is not None:
+        last_toucher = match.player_by_id(ball.last_touched_by_player_id)
+        last_touch_team_direction = +1.0 if last_toucher.team == Team.LEFT else -1.0
+
     feat = BallFeatures(
         pos_x=ball.position.x / half_diag,
         pos_y=ball.position.y / half_diag,
@@ -312,6 +382,7 @@ def _ball_features(
         spin_z=ball.spin.z / max(spin_norm, 1e-3),
         is_possessed=is_possessed,
         is_loose=1.0 - is_possessed,
+        last_touch_team_direction=last_touch_team_direction,
     )
     return feat.to_array()
 

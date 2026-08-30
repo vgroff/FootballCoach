@@ -30,6 +30,7 @@ Usage::
 """
 from __future__ import annotations
 
+import concurrent.futures
 import logging
 import os
 import zipfile
@@ -58,6 +59,16 @@ from footballcoach.ai.ppo.bc import (
 
 log = logging.getLogger("footballcoach.ai.bc.dataset")
 
+# Loading a .npz demonstration file is zlib-decompression-bound, not disk-I/O
+# -bound (see record_demonstrations.py's np.savez_compressed) -- and zlib's C
+# decompression releases the GIL, so a thread pool gives real wall-clock
+# speedup for from_files()'s per-file loop without the IPC/pickling cost a
+# process pool would add for shipping each file's decompressed arrays back.
+# Capped at 8: past that, per-file Python-level overhead (zip central-
+# directory parsing, .npy header parsing -- neither releases the GIL) starts
+# to dominate and more threads mostly just add contention.
+_MAX_LOAD_WORKERS = min(8, os.cpu_count() or 4)
+
 
 class DemonstrationDataset:
     """In-memory dataset loaded from one or more .npz demonstration files."""
@@ -75,7 +86,9 @@ class DemonstrationDataset:
         reward_components: np.ndarray | None = None,
         reward_component_keys: list[str] | None = None,
         episode_outcomes: np.ndarray | None = None,
+        episode_seeds: np.ndarray | None = None,
         is_trainee: np.ndarray | None = None,
+        is_decision_step: np.ndarray | None = None,
     ):
         n = len(obs_self_feat)
         assert all(len(x) == n for x in [
@@ -100,6 +113,20 @@ class DemonstrationDataset:
         # exactly the previous (imperfect but at least self-consistent)
         # flat-scan behavior, not a new failure mode.
         self._is_trainee = is_trainee if is_trainee is not None else np.ones(n, dtype=np.float32)
+        # 1.0 = this row's own reward corresponds to a genuine new decision
+        # interval (a real sample_interval_s-spaced timed sample), 0.0 = a
+        # kick/tackle-callback row or the trailing true-terminal row (see
+        # record_demonstrations.py's is_decision_step_flags). compute_returns()
+        # only applies its per-row MC discount on rows where this is True, so
+        # an episode with many kick/tackle-inserted rows in a short real span
+        # doesn't get over-discounted relative to one with fewer touches over
+        # the same real duration. Older files predating this field default to
+        # all-1.0 -- every row treated as its own decision step, exactly the
+        # previous (imperfect but self-consistent) behavior, not a new
+        # failure mode.
+        self._is_decision_step = (
+            is_decision_step if is_decision_step is not None else np.ones(n, dtype=np.float32)
+        )
         # reward_components/keys are optional -- older files predate per-
         # component persistence (see record_demonstrations.py). Falls back to
         # an empty (n, 0) array + empty key list rather than zeros-with-
@@ -121,6 +148,17 @@ class DemonstrationDataset:
         # components again -- see classify_outcome()'s docstring).
         self._episode_outcomes = (
             np.asarray(episode_outcomes, dtype=object) if episode_outcomes is not None else None
+        )
+        # Ground-truth per-EPISODE seed (the int passed to build_1v1_scenario
+        # (seed=...), verbatim -- see record_demonstrations.py's episode_seeds
+        # comment), one entry per complete episode, SAME order/length as
+        # _episode_outcomes -- required to rebuild a specific recorded
+        # episode exactly (scripts/replay_episode.py). None/missing for
+        # recordings predating meta_episode_seeds -- those episodes simply
+        # cannot be replayed, same "say so explicitly, never guess" rule as
+        # _episode_outcomes.
+        self._episode_seeds = (
+            np.asarray(episode_seeds, dtype=np.int64) if episode_seeds is not None else None
         )
         self._n = n
         self._trivial_mask_cache: np.ndarray | None = None
@@ -146,6 +184,14 @@ class DemonstrationDataset:
         False for recordings made before this field existed; re-record to
         enable outcome-split diagnostics."""
         return self._episode_outcomes is not None
+
+    @property
+    def has_episode_seeds(self) -> bool:
+        """True if this dataset has per-episode seeds (``meta_episode_seeds``,
+        see ``episode_seed()``) -- required to replay a specific recorded
+        episode via ``scripts/replay_episode.py``. False for recordings made
+        before this field existed; re-record to enable replay."""
+        return self._episode_seeds is not None
 
     # Number of consecutive done=1 rows that mark ONE real episode boundary
     # (see episode_row_ranges()'s docstring) -- record_demonstrations.py's
@@ -257,6 +303,59 @@ class DemonstrationDataset:
             self._episode_end_rows_cache = np.array([end for _start, end in ranges], dtype=np.int64)
         return self._episode_end_rows_cache
 
+    def _episode_idx_for_row(self, end_row: int, requester: str) -> int:
+        """Shared row -> episode-index resolution for classify_outcome()/
+        episode_seed() (anything indexed 1:1 against _episode_end_rows()).
+
+        *end_row* need not be an exact full-dataset episode-end row: callers
+        commonly pass the LAST row of an episode within a FILTERED row_pool
+        (e.g. after valid_indices() dropped some rows from that episode,
+        such as the immobile opponent's own rows) -- that filtered last row
+        is always <= the true full-dataset end row for the same episode and
+        > the previous episode's end row, so mapping to "the first full-
+        dataset episode-end row >= end_row" always resolves to the correct
+        episode regardless of filtering. NOT dones[:end_row+1].sum(), which
+        double-counts every episode when 2+ players share one timed sample
+        and both get done=1 on the same episode (the exact bug that caused
+        an IndexError past the end of _episode_outcomes before this
+        resolution existed). `requester` is just the calling method's name,
+        for the error message."""
+        end_rows = self._episode_end_rows()
+        pos = int(np.searchsorted(end_rows, end_row, side="left"))
+        if pos >= len(end_rows):
+            raise ValueError(
+                f"row {end_row} is past the last known episode boundary "
+                f"(last end row: {end_rows[-1] if len(end_rows) else 'n/a'}) -- "
+                f"{requester}() must be called with a row belonging to "
+                f"a complete episode."
+            )
+        return pos
+
+    def episode_seed(self, end_row: int) -> int | None:
+        """The seed passed to build_1v1_scenario(seed=...) when the episode
+        CONTAINING *end_row* was recorded (see meta_episode_seeds /
+        record_demonstrations.py's episode_seeds) -- rebuild that exact
+        episode later via scripts/replay_episode.py --seed <this value>.
+
+        Returns None if this dataset predates meta_episode_seeds (re-record
+        demonstrations to enable replay) -- unlike classify_outcome(), this
+        does not raise for a missing-seeds dataset, since "can't replay this"
+        is a much lower-stakes gap than "can't tell win from loss" and many
+        callers (e.g. debug_value_network.py's worst-episode export) want to
+        degrade gracefully (seed: null) rather than hard-fail entirely."""
+        if self._episode_seeds is None:
+            return None
+        ep_idx = self._episode_idx_for_row(end_row, "episode_seed")
+        if ep_idx >= len(self._episode_seeds):
+            raise ValueError(
+                f"episode {ep_idx} (row {end_row}) has no matching entry in "
+                f"meta_episode_seeds (length {len(self._episode_seeds)}) -- "
+                f"the dataset's dones/episode-boundary count disagrees with "
+                f"the number of episodes actually recorded; re-record with a "
+                f"consistent record_demonstrations.py version."
+            )
+        return int(self._episode_seeds[ep_idx])
+
     # Maps ScenarioEnv's ground-truth info.trial_outcome strings (see
     # ai/env/outcome.py's outcome vocabulary and ScenarioEnv.step()'s
     # "invalid" split) to the short labels used by debug_value_network.py /
@@ -309,23 +408,7 @@ class DemonstrationDataset:
                 "the current record_demonstrations.py to enable outcome "
                 "classification."
             )
-        # episode index = index of the first full-dataset episode-end row
-        # >= end_row (see docstring above for why this correctly handles a
-        # filtered row_pool's own last row, not just an exact full-dataset
-        # match) -- NOT dones[:end_row+1].sum(), which double-counts every
-        # episode when 2+ players share one timed sample and both get
-        # done=1 on the same episode (the exact bug that caused an
-        # IndexError past the end of self._episode_outcomes).
-        end_rows = self._episode_end_rows()
-        pos = int(np.searchsorted(end_rows, end_row, side="left"))
-        if pos >= len(end_rows):
-            raise ValueError(
-                f"row {end_row} is past the last known episode boundary "
-                f"(last end row: {end_rows[-1] if len(end_rows) else 'n/a'}) -- "
-                f"classify_outcome() must be called with a row belonging to "
-                f"a complete episode."
-            )
-        ep_idx = pos
+        ep_idx = self._episode_idx_for_row(end_row, "classify_outcome")
         if ep_idx >= len(self._episode_outcomes):
             raise ValueError(
                 f"episode {ep_idx} (row {end_row}) has no matching entry in "
@@ -416,12 +499,121 @@ class DemonstrationDataset:
                 [str(o) for o in data["meta_episode_outcomes"]]
                 if "meta_episode_outcomes" in data else None
             ),
+            episode_seeds=data["meta_episode_seeds"] if "meta_episode_seeds" in data else None,
             is_trainee=data["is_trainee"] if "is_trainee" in data else None,
+            is_decision_step=data["is_decision_step"] if "is_decision_step" in data else None,
         )
 
     @classmethod
     def from_files(cls, paths: list[str | Path]) -> "DemonstrationDataset":
-        """Load and concatenate multiple .npz files.
+        """Load and concatenate multiple .npz files. See ``_from_files_impl()``
+        for the two-pass loading design; this just discards the per-file row
+        offsets it also computes. Use ``from_files_with_offsets()`` if you
+        need those (e.g. to splice out a subset of rows later without
+        re-reading from disk)."""
+        ds, _file_row_ranges = cls._from_files_impl(paths)
+        return ds
+
+    @classmethod
+    def from_files_with_offsets(
+        cls, paths: list[str | Path],
+    ) -> tuple["DemonstrationDataset", dict]:
+        """Like ``from_files()``, but also returns a ``{path: slice}`` map of
+        each successfully-loaded file's row range within the result (files
+        skipped as unreadable, see ``_from_files_impl()``, are simply absent
+        from the map). Pairs with ``concat_slices()``: a caller that keeps a
+        dataset around across reloads (``debug_value_network.py``'s
+        ``--max-episodes-per-epoch`` resampling) can reuse already
+        -decompressed rows for files it wants to keep, and only pay disk +
+        decompression cost for genuinely new files."""
+        return cls._from_files_impl(paths)
+
+    @classmethod
+    def concat_slices(
+        cls, pieces: list[tuple["DemonstrationDataset", slice]],
+    ) -> "DemonstrationDataset":
+        """Build a new dataset by concatenating row ranges sliced out of
+        already-loaded datasets, entirely in memory (no disk I/O) -- the
+        counterpart to ``from_files_with_offsets()`` that lets a caller reuse
+        previously-decompressed rows instead of re-reading files from disk on
+        every reload (see ``debug_value_network.py``'s
+        ``--max-episodes-per-epoch`` resampling, which keeps ~most of its
+        training working set from one epoch to the next).
+
+        Each slice MUST align exactly with complete-episode boundaries in its
+        source dataset -- true for any per-file slice returned by
+        ``from_files_with_offsets()``, since ``record_demonstrations.py``
+        never splits an episode across two files (each file is its own
+        complete, self-contained batch of episodes). Slicing mid-episode
+        would silently corrupt the ``_dones``-based episode-boundary
+        detection of the result.
+
+        All pieces must share the same ``reward_component_keys`` (true for
+        any two datasets loaded by this codebase today) -- mismatched keys
+        raise ``ValueError`` rather than silently misaligning columns.
+        """
+        if not pieces:
+            raise ValueError("concat_slices() called with no pieces")
+
+        ref_keys = pieces[0][0]._reward_component_keys
+        for ds, _sl in pieces:
+            if ds._reward_component_keys != ref_keys:
+                raise ValueError(
+                    "concat_slices(): mismatched reward_component_keys across "
+                    f"pieces ({ds._reward_component_keys!r} vs {ref_keys!r})"
+                )
+
+        def _cat(attr: str) -> np.ndarray:
+            return np.concatenate([getattr(ds, attr)[sl] for ds, sl in pieces], axis=0)
+
+        episode_outcomes = None
+        if all(ds._episode_outcomes is not None for ds, _sl in pieces):
+            # _episode_outcomes is indexed by EPISODE, not row -- select just
+            # the entries whose episode END row falls inside this piece's
+            # slice (exact, since the slice always aligns to episode
+            # boundaries per the docstring above).
+            parts = []
+            for ds, sl in pieces:
+                end_rows = ds._episode_end_rows()
+                ep_mask = (end_rows >= sl.start) & (end_rows < sl.stop)
+                parts.append(ds._episode_outcomes[ep_mask])
+            episode_outcomes = np.concatenate(parts)
+
+        # episode_seeds: same episode-indexed (not row-indexed) mask-select
+        # as episode_outcomes immediately above, for the same reasons.
+        episode_seeds = None
+        if all(ds._episode_seeds is not None for ds, _sl in pieces):
+            parts = []
+            for ds, sl in pieces:
+                end_rows = ds._episode_end_rows()
+                ep_mask = (end_rows >= sl.start) & (end_rows < sl.stop)
+                parts.append(ds._episode_seeds[ep_mask])
+            episode_seeds = np.concatenate(parts)
+
+        return cls(
+            obs_self_feat=_cat("_self_feat"),
+            obs_other_feat=_cat("_other_feat"),
+            obs_exists_mask=_cat("_exists_mask"),
+            obs_ball_feat=_cat("_ball_feat"),
+            obs_global_feat=_cat("_global_feat"),
+            bc_labels=_cat("_labels"),
+            rewards=_cat("_rewards"),
+            dones=_cat("_dones"),
+            reward_components=_cat("_reward_components"),
+            reward_component_keys=ref_keys,
+            episode_outcomes=episode_outcomes,
+            episode_seeds=episode_seeds,
+            is_trainee=_cat("_is_trainee"),
+            is_decision_step=_cat("_is_decision_step"),
+        )
+
+    @classmethod
+    def _from_files_impl(
+        cls, paths: list[str | Path],
+    ) -> tuple["DemonstrationDataset", dict]:
+        """Load and concatenate multiple .npz files, returning both the
+        dataset and a ``{path: slice}`` map of each file's row range within
+        it (see ``from_files()``/``from_files_with_offsets()``).
 
         Two-pass, pre-allocated loading -- NOT "build a ``DemonstrationDataset``
         per file via ``from_file()``, keep the whole list of them alive, then
@@ -457,22 +649,21 @@ class DemonstrationDataset:
         # mid-np.savez_compressed() on this exact filename -- it writes
         # directly to the final name, no temp-file+rename, so a concurrent
         # reader can catch it half-written) are skipped with a warning
-        # rather than crashing the whole load -- see ai_trainer_knowledge.md. ---
-        good_paths: list[Path] = []
-        n_per_file: list[int] = []
-        all_have_outcomes = True
-        ref_shapes: dict[str, tuple] = {}
-        ref_dtypes: dict[str, np.dtype] = {}
-        reward_component_keys: list[str] | None = None
-
-        for p in paths:
+        # rather than crashing the whole load -- see ai_trainer_knowledge.md.
+        #
+        # Parallelized across a thread pool (_MAX_LOAD_WORKERS) -- reading
+        # just bc_labels per file is still real zlib decompression + zip
+        # central-directory parsing, and at thousands of files this loop
+        # alone was a meaningful chunk of load time. ThreadPoolExecutor.map()
+        # preserves input order in its output regardless of completion order,
+        # so good_paths/n_per_file end up in the same deterministic order as
+        # the sequential version did. ---
+        def _peek_pass1(p):
             try:
                 data = np.load(p)
                 bc_labels_i = data["bc_labels"]
             except (OSError, zipfile.BadZipFile, EOFError, ValueError) as e:
-                log.warning(f"Skipping unreadable .npz file {p}: {e!r} "
-                            f"(likely still being written by a concurrent recorder)")
-                continue
+                return (p, e, None, None, None)
             if bc_labels_i.shape[-1] != BC_LABEL_DIM:
                 raise ValueError(
                     f"{p}: bc_labels has width {bc_labels_i.shape[-1]}, expected "
@@ -483,21 +674,26 @@ class DemonstrationDataset:
                     f"uv run python -m footballcoach.ai.scripts.record_demonstrations "
                     f"--phase 1 --n-episodes <N> --output <dir>"
                 )
-            good_paths.append(p)
-            n_per_file.append(bc_labels_i.shape[0])
-            if "meta_episode_outcomes" not in data.files:
-                all_have_outcomes = False
-            if not ref_shapes:
-                for key in ("obs_self_feat", "obs_other_feat", "obs_exists_mask",
-                            "obs_ball_feat", "obs_global_feat", "bc_labels"):
-                    arr = bc_labels_i if key == "bc_labels" else data[key]
-                    ref_shapes[key] = arr.shape[1:]
-                    ref_dtypes[key] = arr.dtype
-                reward_component_keys = (
-                    [str(k) for k in data["meta_reward_component_keys"]]
-                    if "meta_reward_component_keys" in data.files
-                    else [k for k, _ in REWARD_COMP_LABELS]
-                )
+            has_outcomes = "meta_episode_outcomes" in data.files
+            has_seeds = "meta_episode_seeds" in data.files
+            return (p, None, int(bc_labels_i.shape[0]), has_outcomes, has_seeds)
+
+        good_paths: list[Path] = []
+        n_per_file: list[int] = []
+        all_have_outcomes = True
+        all_have_seeds = True
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_LOAD_WORKERS) as ex:
+            for p, err, n_rows, has_outcomes, has_seeds in ex.map(_peek_pass1, paths):
+                if err is not None:
+                    log.warning(f"Skipping unreadable .npz file {p}: {err!r} "
+                                f"(likely still being written by a concurrent recorder)")
+                    continue
+                good_paths.append(p)
+                n_per_file.append(n_rows)
+                if not has_outcomes:
+                    all_have_outcomes = False
+                if not has_seeds:
+                    all_have_seeds = False
 
         if not good_paths:
             raise FileNotFoundError(
@@ -505,6 +701,26 @@ class DemonstrationDataset:
                 "could be read (all skipped as unreadable/corrupt -- see warnings above)"
             )
         total_n = sum(n_per_file)
+
+        # ref_shapes/dtypes/reward_component_keys only need reading from ONE
+        # file (they're the same across the whole dataset) -- deliberately
+        # read sequentially, from just good_paths[0], rather than inside
+        # _peek_pass1 above, which would otherwise have EVERY worker thread
+        # redundantly decompress all 6 big arrays just to check "is this the
+        # first one" (that guard only works race-free in a single thread).
+        ref_shapes: dict[str, tuple] = {}
+        ref_dtypes: dict[str, np.dtype] = {}
+        _ref_data = np.load(good_paths[0])
+        for key in ("obs_self_feat", "obs_other_feat", "obs_exists_mask",
+                    "obs_ball_feat", "obs_global_feat", "bc_labels"):
+            arr = _ref_data[key]
+            ref_shapes[key] = arr.shape[1:]
+            ref_dtypes[key] = arr.dtype
+        reward_component_keys = (
+            [str(k) for k in _ref_data["meta_reward_component_keys"]]
+            if "meta_reward_component_keys" in _ref_data.files
+            else [k for k, _ in REWARD_COMP_LABELS]
+        )
 
         # --- Pre-allocate the final arrays ONCE -- this is the whole point:
         # never hold more than one file's worth of extra data alongside them. ---
@@ -526,6 +742,9 @@ class DemonstrationDataset:
         # (see its docstring); zero-defaulting here would silently relabel
         # every un-tagged row as "opponent".
         is_trainee = np.ones(total_n, dtype=np.float32)
+        # is_decision_step defaults to 1.0 for the same backward-compat
+        # reason as is_trainee above -- see __init__'s docstring.
+        is_decision_step = np.ones(total_n, dtype=np.float32)
         # episode_outcomes: only populated if EVERY file has it -- a mix of
         # old (no meta_episode_outcomes) and new files would produce an
         # outcome list misaligned with dones, worse than falling back to None
@@ -537,15 +756,31 @@ class DemonstrationDataset:
         # the end instead; it's small (episodes, not rows) so this doesn't
         # reintroduce the peak-memory problem this rewrite exists to fix.
         episode_outcomes_parts: list[np.ndarray] = [] if all_have_outcomes else None
+        # episode_seeds: same episode-indexed (not row-indexed) treatment as
+        # episode_outcomes_parts immediately above, for the same reasons.
+        episode_seeds_parts: list[np.ndarray] = [] if all_have_seeds else None
 
-        # --- Pass 2: re-open each file, copy its arrays straight into the
-        # pre-allocated slice, then let it be garbage-collected before the
-        # next iteration -- at most one file's decompressed data is alive
-        # at any point. ---
-        offset = 0
-        for p, n_i in zip(good_paths, n_per_file):
+        # --- Pass 2: re-open each file and copy its arrays straight into the
+        # pre-allocated slice. This is the expensive part (every big array,
+        # fully decompressed) and now runs across a thread pool: each worker
+        # decompresses its OWN file and writes directly into its own,
+        # disjoint slice of the shared pre-allocated arrays (safe without
+        # locking -- different threads never touch the same memory, and
+        # numpy's C-level copy releases the GIL for the bulk of the work).
+        # Peak extra memory is now up to _MAX_LOAD_WORKERS files' worth of
+        # decompressed data alive at once instead of one -- still bounded
+        # and tiny next to the final arrays, not the "25,000 files at once"
+        # blowup this two-pass design exists to avoid. ---
+        offsets: list[int] = []
+        _off = 0
+        for n_i in n_per_file:
+            offsets.append(_off)
+            _off += n_i
+
+        def _load_pass2(item):
+            p, off, n_i = item
             data = np.load(p)
-            sl = slice(offset, offset + n_i)
+            sl = slice(off, off + n_i)
             obs_self_feat[sl] = data["obs_self_feat"]
             obs_other_feat[sl] = data["obs_other_feat"]
             obs_exists_mask[sl] = data["obs_exists_mask"]
@@ -560,15 +795,29 @@ class DemonstrationDataset:
                 reward_components[sl] = data["reward_components"]
             if "is_trainee" in data.files:
                 is_trainee[sl] = data["is_trainee"]
-            if episode_outcomes_parts is not None:
-                episode_outcomes_parts.append(data["meta_episode_outcomes"])
-            offset += n_i
+            if "is_decision_step" in data.files:
+                is_decision_step[sl] = data["is_decision_step"]
+            outcomes = data["meta_episode_outcomes"] if episode_outcomes_parts is not None else None
+            seeds = data["meta_episode_seeds"] if episode_seeds_parts is not None else None
+            return p, sl, outcomes, seeds
+
+        file_row_ranges: dict = {}
+        with concurrent.futures.ThreadPoolExecutor(max_workers=_MAX_LOAD_WORKERS) as ex:
+            for p, sl, outcomes, seeds in ex.map(_load_pass2, zip(good_paths, offsets, n_per_file)):
+                file_row_ranges[p] = sl
+                if episode_outcomes_parts is not None:
+                    episode_outcomes_parts.append(outcomes)
+                if episode_seeds_parts is not None:
+                    episode_seeds_parts.append(seeds)
 
         episode_outcomes = (
             np.concatenate(episode_outcomes_parts) if episode_outcomes_parts is not None else None
         )
+        episode_seeds = (
+            np.concatenate(episode_seeds_parts) if episode_seeds_parts is not None else None
+        )
 
-        return cls(
+        ds = cls(
             obs_self_feat=obs_self_feat,
             obs_other_feat=obs_other_feat,
             obs_exists_mask=obs_exists_mask,
@@ -580,8 +829,11 @@ class DemonstrationDataset:
             reward_components=reward_components,
             reward_component_keys=reward_component_keys,
             episode_outcomes=episode_outcomes,
+            episode_seeds=episode_seeds,
             is_trainee=is_trainee,
+            is_decision_step=is_decision_step,
         )
+        return ds, file_row_ranges
 
     @classmethod
     def from_directory(
@@ -854,6 +1106,7 @@ class DemonstrationDataset:
         rewards = self._rewards
         dones   = self._dones
         is_trainee = self._is_trainee
+        is_decision_step = self._is_decision_step
         n = self._n
         returns = np.zeros(n, dtype=np.float32)
         running_trainee = 0.0
@@ -881,11 +1134,19 @@ class DemonstrationDataset:
             if is_done and not prev_had_done:
                 running_trainee = 0.0
                 running_opponent = 0.0
+            # The discount for entering row i (from whatever chronologically
+            # NEXT same-track row's running total already holds) only
+            # applies if row i itself is a real decision step -- a kick/
+            # tackle-callback or terminal row (is_decision_step[i]==0, always
+            # reward=0 after the double-counting fix) passes the running
+            # total through unchanged instead of consuming a discount step
+            # it didn't earn -- see is_decision_step's own field comment.
+            mult = gamma if is_decision_step[i] > 0.5 else 1.0
             if is_trainee[i] > 0.5:
-                running_trainee = rewards[i] + gamma * running_trainee
+                running_trainee = rewards[i] + mult * running_trainee
                 returns[i] = running_trainee
             else:
-                running_opponent = rewards[i] + gamma * running_opponent
+                running_opponent = rewards[i] + mult * running_opponent
                 returns[i] = running_opponent
             prev_had_done = is_done
         return returns
@@ -896,16 +1157,20 @@ class DemonstrationDataset:
         row-interleaving reason -- see its docstring) but computed
         independently for each reward component column.
 
-        NOTE: unlike ``rewards`` (which is now genuinely per-player, see
-        record_demonstrations.py's per-player reward fix), ``reward_components``
-        is still recorded as one ENV-LEVEL (trainee+opponent combined) value
-        duplicated onto both players' rows for a given timestep (a separate,
-        pre-existing convention -- see ``ai/knowledge.md``). This function's
-        per-track segmentation still removes the row-interleaving double-count
-        (each track now sums every OTHER row instead of every row), but the
-        summed component values themselves remain the combined env-level
-        figure, not a true per-player split -- so this will NOT sum exactly
-        to ``compute_returns()``'s total for a given player-track row.
+        NOTE: like ``rewards``, ``reward_components`` is genuinely per-player
+        (see record_demonstrations.py's ``_comp_by_pid`` -- each secondary
+        player's own breakdown comes from its own
+        ``env.last_secondary_results[i]["reward_components"]`` entry, not
+        the trainee's ``env.last_reward_components``). This was previously
+        one ENV-LEVEL (trainee+opponent combined) value duplicated onto both
+        players' rows -- e.g. a trainee "win" row would also carry the
+        losing opponent's own ``loss_terminal`` penalty -- but that was fixed
+        alongside the ``rewards`` per-player fix; see
+        ``scenario_env.py``'s ``last_secondary_results`` docstring. So this
+        function's per-track segmentation sums each player's own component
+        breakdown, and DOES sum to ``compute_returns()``'s total for a given
+        player-track row (modulo any component ``compute_returns()`` itself
+        excludes, e.g. reward contributions not broken into a component).
 
         Requires the dataset to have been recorded with per-component reward
         data (``has_reward_components``); returns an all-zero array per key
@@ -919,6 +1184,7 @@ class DemonstrationDataset:
         """
         dones = self._dones
         is_trainee = self._is_trainee
+        is_decision_step = self._is_decision_step
         n = self._n
         out: dict[str, np.ndarray] = {}
         for col, key in enumerate(self._reward_component_keys):
@@ -936,11 +1202,14 @@ class DemonstrationDataset:
                 if is_done and not prev_had_done:
                     running_trainee = 0.0
                     running_opponent = 0.0
+                # See compute_returns()'s matching comment for why this isn't
+                # just `gamma` unconditionally.
+                mult = gamma if is_decision_step[i] > 0.5 else 1.0
                 if is_trainee[i] > 0.5:
-                    running_trainee = comp_rewards[i] + gamma * running_trainee
+                    running_trainee = comp_rewards[i] + mult * running_trainee
                     comp_returns[i] = running_trainee
                 else:
-                    running_opponent = comp_rewards[i] + gamma * running_opponent
+                    running_opponent = comp_rewards[i] + mult * running_opponent
                     comp_returns[i] = running_opponent
                 prev_had_done = is_done
             out[key] = comp_returns
