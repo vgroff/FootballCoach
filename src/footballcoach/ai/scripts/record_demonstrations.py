@@ -153,7 +153,7 @@ def record_episodes(
     phase_id: int,
     episode_offset: int = 0,
     total_episodes: int | None = None,
-    sample_interval_s: float = 0.2,
+    sample_every_n_decisions: int = 1,
     opponent_rules_prob: float = 0.0,
     opponent_immobile_prob: float | None = None,
     verbose_stats: bool = False,
@@ -164,16 +164,46 @@ def record_episodes(
 
     Sampling strategy:
       - on_kick / on_tackle player callbacks fire at the exact engine tick the
-        action executes → always recorded regardless of sample interval.
-      - Time-based sampling at *sample_interval_s* cadence (default 0.2s),
-        independent of the neural-network decision interval (0.5s).
+        action executes → always recorded regardless of sample_every_n_decisions.
+      - env.step() always advances by exactly ONE real decision interval (the
+        env's own ``observation.decision_interval_s``, same cadence used by
+        real PPO training/gameplay -- recording no longer overrides this, see
+        below). A timed sample is recorded every *sample_every_n_decisions*
+        calls to env.step(), so every recorded timed sample lands exactly on
+        a genuine decision, never at an independently-configured cadence that
+        drifts from how the trained policy actually gets stepped.
       - env.step() handles all terminal conditions normally (box possession,
         timeout) so episodes end correctly.
 
     Args:
-        sample_interval_s: How often (in sim-seconds) to record a timed sample.
-            Kicks and tackles are always recorded via callbacks regardless.
-            Default is 0.2s.
+        sample_every_n_decisions: Record a timed sample every this many real
+            decision intervals (1 = record every single decision; 2 = every
+            other decision, etc.). Kicks and tackles are always recorded via
+            callbacks regardless, even on a decision interval that's
+            otherwise skipped. Previously this was a sim-seconds interval
+            (``sample_interval_s``) that overrode the env's own decision
+            cadence (``env._ticks_per_decision``) to match it -- meaning
+            recorded episodes ran the trainee/opponent AI at a DIFFERENT
+            decision rate than real training ever uses, a real behavioural
+            mismatch (Phase1RulesAI/NeuralPlayerAI re-evaluate their order
+            once per decision, so a different cadence means different
+            trajectories, not just different logging density). Recording
+            now always uses the env's real, configured decision cadence;
+            this parameter only controls how many of those genuine
+            decisions get a timed sample.
+        opponent_rules_prob / opponent_immobile_prob: Per-episode
+            probabilities for the opponent's driver. **KNOWN LIMITATION,
+            intentional for now**: these never actually add a neural
+            opponent, even though there's a third implied "remainder"
+            probability mass. The roll below (separate from, and
+            overriding, whatever ``build_1v1_scenario`` itself decided)
+            deliberately folds that remainder into "rules" instead of
+            leaving the opponent neural-controlled -- only the TRAINEE can
+            be neural during recording (via ``driver_trainer`` below). See
+            ``ai/knowledge.md``'s "Demonstration recording" section for the
+            full explanation and why it matters (BC data never covers what
+            the opponent's own state distribution looks like when IT is
+            neural).
         driver_trainer: Optional loaded ``PPOTrainer`` (e.g. via
             ``PPOTrainer.load_for_inference()``). When given, the TRAINEE is
             driven by this checkpoint (via ``NeuralPlayerAI``, auto-assigned
@@ -213,12 +243,8 @@ def record_episodes(
     from footballcoach.rules_ai import Phase1RulesAI
     from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS
 
-    # Override the env's ticks-per-decision to match sample_interval_s so that
-    # env.step() advances by sample_interval_s and we sample at that cadence.
-    # Kicks/tackle callbacks are unaffected (they fire inside each env.step()).
-    orig_ticks = env._ticks_per_decision
-    sample_ticks = max(1, round(sample_interval_s / env._dt_s))
-    env._ticks_per_decision = sample_ticks
+    if sample_every_n_decisions < 1:
+        raise ValueError(f"sample_every_n_decisions must be >= 1, got {sample_every_n_decisions}")
 
     self_feats = []
     other_feats = []
@@ -235,14 +261,14 @@ def record_episodes(
     # players' reward streams together. See "is_trainee" note in dataset.py.
     is_trainee_flags = []
     # 1.0 if this row's own reward corresponds to a genuine NEW decision
-    # interval (a real sample_interval_s-spaced timed sample), 0.0 for a
-    # kick/tackle-callback row or the trailing true-terminal row (see
-    # _record_terminal_now) -- both fire at some SUB-interval moment inside
-    # (or, for the terminal row, one physics tick after) an ALREADY-counted
-    # decision interval, not a new one of their own.
+    # interval (a real timed sample, recorded every sample_every_n_decisions
+    # decisions), 0.0 for a kick/tackle-callback row or the trailing
+    # true-terminal row (see _record_terminal_now) -- both fire at some
+    # SUB-interval moment inside (or, for the terminal row, one physics tick
+    # after) an ALREADY-counted decision interval, not a new one of their own.
     # DemonstrationDataset.compute_returns() uses this so its per-row MC
     # discount (`gamma ** 1` per row) only actually applies once per REAL
-    # elapsed sample_interval_s, not once per row regardless of real time --
+    # elapsed decision interval, not once per row regardless of real time --
     # otherwise an episode with a flurry of kicks (many callback rows in a
     # couple of real seconds) gets over-discounted relative to an
     # equal-duration episode with fewer touches, purely as an artifact of
@@ -313,7 +339,7 @@ def record_episodes(
     # tackle_armed/kick_armed are per-tick flags on Player, sampled once per
     # env.step() via definition.on_tick; on_tackle/on_tackle_result fire
     # exactly once per real tackle attempt/outcome regardless of
-    # sample_interval_s.
+    # sample_every_n_decisions.
     # auto_tackle_attempts/wins/losses are the collision-based fallback path
     # (_check_head_on_tackles, on_auto_tackle_result) -- separate from
     # tackle_attempts/wins/losses (the intentional/armed path, on_tackle/
@@ -595,28 +621,46 @@ def record_episodes(
 
         done = False
         last_info = None
+        # Counts real decision intervals (= env.step() calls) within THIS
+        # episode, so a timed sample is recorded on decision 0, then every
+        # sample_every_n_decisions'th one after that -- always starts each
+        # episode on the very first decision rather than carrying a
+        # cross-episode phase offset.
+        _decision_count = 0
         while not done:
-            # Timed sample at sample_interval_s cadence (reward=0 placeholder
-            # for mid-step samples; each player's OWN real reward is assigned
-            # to their row(s) below, or accrued for the NEXT sample(s)).
-            # player_id=None -> records BOTH trainee and opponent -> appends 2 rows.
-            n_before = len(rewards)
-            _recorded_ids = _record_now(reward=0.0, done=False)
-            # ABSOLUTE row indices, captured now (before env.step() can insert
-            # anything else) -- NOT a relative/negative-offset count. on_kick/
-            # on_tackle callbacks fire SYNCHRONOUSLY inside env.step() below
-            # and themselves call _record_now(player_id=pid), appending
-            # MORE rows to these same lists mid-call. A stale "how many did
-            # I append" count combined with negative indexing (rewards[-i])
-            # would then silently backfill the WRONG rows once any kick/
-            # tackle happens in the same decision interval as this timed
-            # sample -- confirmed in real recorded data: a trainee's genuine
-            # box-possession-terminal row ended up misattributed to the
-            # opponent's row (and vice versa for the loss penalty) this way.
-            # Absolute indices are immune to however many extra rows a
-            # callback inserts afterward.
-            _recorded_row_indices = list(range(n_before, n_before + len(_recorded_ids)))
-            # Advance sim by sample_interval_s; kick/tackle callbacks fire inside
+            _do_timed_sample = (_decision_count % sample_every_n_decisions == 0)
+            _decision_count += 1
+            # Timed sample on every sample_every_n_decisions'th real decision
+            # (reward=0 placeholder; each player's OWN real reward is
+            # assigned to their row(s) below). player_id=None -> records BOTH
+            # trainee and opponent -> appends 2 rows. Skipped entirely on a
+            # non-sampled decision -- _recorded_ids/_recorded_row_indices
+            # stay empty, so the reward/component backfill below (a zip over
+            # these two lists) naturally no-ops for this iteration.
+            if _do_timed_sample:
+                n_before = len(rewards)
+                _recorded_ids = _record_now(reward=0.0, done=False)
+                # ABSOLUTE row indices, captured now (before env.step() can insert
+                # anything else) -- NOT a relative/negative-offset count. on_kick/
+                # on_tackle callbacks fire SYNCHRONOUSLY inside env.step() below
+                # and themselves call _record_now(player_id=pid), appending
+                # MORE rows to these same lists mid-call. A stale "how many did
+                # I append" count combined with negative indexing (rewards[-i])
+                # would then silently backfill the WRONG rows once any kick/
+                # tackle happens in the same decision interval as this timed
+                # sample -- confirmed in real recorded data: a trainee's genuine
+                # box-possession-terminal row ended up misattributed to the
+                # opponent's row (and vice versa for the loss penalty) this way.
+                # Absolute indices are immune to however many extra rows a
+                # callback inserts afterward.
+                _recorded_row_indices = list(range(n_before, n_before + len(_recorded_ids)))
+            else:
+                _recorded_ids = []
+                _recorded_row_indices = []
+            # Advance exactly one real decision interval (the env's own,
+            # unmodified decision_interval_s -- see this function's
+            # docstring); kick/tackle callbacks fire inside regardless of
+            # _do_timed_sample.
             _obs, _reward, done, last_info = env.step()
             # Per-player reward for this step: the trainee's own (env.step()'s
             # return) plus the opponent's own (env.last_secondary_results,
@@ -762,7 +806,6 @@ def record_episodes(
             _poss_reward_since_log.clear()
 
     env.definition.on_tick = _orig_on_tick  # restore original
-    env._ticks_per_decision = orig_ticks  # restore original
 
     return {
         "obs_self_feat":   np.stack(self_feats).astype(np.float32),
@@ -878,7 +921,7 @@ def _run_recording_job(job: dict) -> dict:
             phase_id=job["phase_id"],
             episode_offset=episodes_done,
             total_episodes=n_eps,
-            sample_interval_s=job["sample_interval_s"],
+            sample_every_n_decisions=job["sample_every_n_decisions"],
             opponent_rules_prob=job["opponent_rules_prob"],
             opponent_immobile_prob=job["opponent_immobile_prob"],
             verbose_stats=job.get("verbose_stats", False),
@@ -945,10 +988,12 @@ def main() -> None:
                              "scripts/replay_episode.py only needs THAT one int, not this "
                              "whole-run --seed.")
     _cfg = __import__("footballcoach.ai.config", fromlist=["load_ai_config"]).load_ai_config()
-    _default_interval = float(_cfg.get("bc", {}).get("demo_sample_interval_s", 0.2))
-    parser.add_argument("--sample-interval", type=float, default=_default_interval,
-                        help=f"Sim-seconds between timed samples (default: {_default_interval}). "
-                             "Kicks and tackles are always recorded regardless.")
+    _default_sample_every_n = int(_cfg.get("bc", {}).get("demo_sample_every_n_decisions", 1))
+    parser.add_argument("--sample-every-n-decisions", type=int, default=_default_sample_every_n,
+                        help=f"Record a timed sample every this many real decision intervals "
+                             f"(default: {_default_sample_every_n}; 1 = every decision). Always "
+                             "lands exactly on a genuine decision -- kicks and tackles are always "
+                             "recorded via callbacks regardless.")
     _demo_curr = _cfg.get("curriculum", {})
     _demo_rules_r = float(_demo_curr.get("phase1_demo_opponent_rules_ratio", 1.0))
     _demo_immobile_r = float(_demo_curr.get("phase1_demo_opponent_immobile_ratio", 1.0))
@@ -1045,7 +1090,7 @@ def main() -> None:
         log.info(
             f"Recording {n_eps} episodes of phase {args.phase} ({scenario_key}) "
             f"→ {n_files} file(s) in {output_dir} "
-            f"[sample_interval={args.sample_interval}s, opponent_rules_prob={args.opponent_rules_prob:.0%}]"
+            f"[sample_every_n_decisions={args.sample_every_n_decisions}, opponent_rules_prob={args.opponent_rules_prob:.0%}]"
         )
         result = _run_recording_job({
             "phase_id": args.phase,
@@ -1055,7 +1100,7 @@ def main() -> None:
             "file_idx_start": _file_idx_offset,
             "verbose_stats": args.verbose_stats,
             "seed": args.seed,
-            "sample_interval_s": args.sample_interval,
+            "sample_every_n_decisions": args.sample_every_n_decisions,
             "opponent_rules_prob": args.opponent_rules_prob,
             "opponent_immobile_prob": args.opponent_immobile_prob,
             "driver_checkpoint": args.driver_checkpoint,
@@ -1089,7 +1134,7 @@ def main() -> None:
             "file_idx_start": file_idx_cursor,
             "verbose_stats": args.verbose_stats,
             "seed": args.seed + i,
-            "sample_interval_s": args.sample_interval,
+            "sample_every_n_decisions": args.sample_every_n_decisions,
             "opponent_rules_prob": args.opponent_rules_prob,
             "opponent_immobile_prob": args.opponent_immobile_prob,
             "driver_checkpoint": args.driver_checkpoint,
@@ -1102,7 +1147,7 @@ def main() -> None:
     log.info(
         f"Recording {n_eps} episodes of phase {args.phase} ({scenario_key}) "
         f"across {len(jobs)} process(es) → {n_files} file(s) in {output_dir} "
-        f"[sample_interval={args.sample_interval}s, opponent_rules_prob={args.opponent_rules_prob:.0%}]"
+        f"[sample_every_n_decisions={args.sample_every_n_decisions}, opponent_rules_prob={args.opponent_rules_prob:.0%}]"
     )
 
     ctx = mp.get_context("spawn")

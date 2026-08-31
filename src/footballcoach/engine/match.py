@@ -99,6 +99,35 @@ class BoundaryBrakingParams:
         )
 
 
+@dataclass(frozen=True)
+class InterceptionParams:
+    """Config for the deceleration-aware loose-ball intercept solve (see
+    ``engine.interception.intercept_target``'s own ``target_decel_mps2``
+    docstring for the full reasoning) — loaded from
+    ``orders.json["interception"]``.
+
+    ``assumed_ball_decel_mps2`` defaults to the ball's own REAL configured
+    ground-friction deceleration (``ball_physics.rolling_friction_coefficient
+    * world.gravity_mps2`` — 0.05 * 9.81 = 0.4905 m/s^2 by default), but is
+    kept as its own independently-tunable value here rather than reading
+    physics.json directly at call time: the intercept solve only needs a
+    reasonable ESTIMATE of how fast the ball is slowing down, not an exact
+    match to the live ground-physics constant (a kicked ball spends part of
+    its flight airborne, where drag behaves differently from rolling
+    friction) — separating the two lets this be retuned for the solve's own
+    behaviour without touching real ball physics, or vice versa.
+    ``0.0`` disables the deceleration-aware solve entirely, reproducing the
+    exact prior (constant-velocity-only) behaviour."""
+    assumed_ball_decel_mps2: float = 0.4905
+
+    @staticmethod
+    def from_config() -> "InterceptionParams":
+        d = require_section(load_orders_config(), "interception", "orders.json")
+        return InterceptionParams(
+            assumed_ball_decel_mps2=d.get("assumed_ball_decel_mps2", 0.4905),
+        )
+
+
 @dataclass
 class Match:
     pitch: Pitch
@@ -123,6 +152,7 @@ class Match:
     marking_params: MarkingParams = field(default_factory=MarkingParams.from_config)
     ball_pickup_params: BallPickupParams = field(default_factory=BallPickupParams.from_config)
     boundary_braking_params: BoundaryBrakingParams = field(default_factory=BoundaryBrakingParams.from_config)
+    interception_params: InterceptionParams = field(default_factory=InterceptionParams.from_config)
 
     paused: bool = False
     time_s: float = 0.0
@@ -416,7 +446,22 @@ class Match:
             return False
         else:
             # Ball is loose — run to intercept; pickup via _update_loose_ball_pickup.
-            intercept = self._intercept_target(player, self.ball.position, self.ball.velocity)
+            # Deceleration-aware: see engine.interception.intercept_target's
+            # own target_decel_mps2 docstring -- without this, the solve
+            # assumes the ball holds its CURRENT speed forever, which has a
+            # real, confirmed failure mode (not just a directional bias): a
+            # numerical singularity whenever the ball's speed crosses the
+            # chaser's own speed, producing a predicted intercept point
+            # hundreds of metres off the pitch for a real multi-tick window
+            # (confirmed on a real traced "invalid" episode -- the chaser
+            # aimed at that nonsense point instead of anywhere near the
+            # actual ball, and missed by 1.89m at the line as a direct
+            # result). Confirmed fix via the same traced episode: with this
+            # enabled, the chaser gets genuine possession instead.
+            intercept = self._intercept_target(
+                player, self.ball.position, self.ball.velocity,
+                self.interception_params.assumed_ball_decel_mps2,
+            )
             # Overshoot margin: aim past the intercept in the direction of ball travel so
             # the player arrives slightly before the ball and has time to set their feet.
             # Proportional to the player's current distance to intercept so the offset
@@ -429,6 +474,34 @@ class Match:
                     dist_to_intercept = (intercept - player.position).length_xy()
                     intercept = intercept + ball_vel_xy * (dist_to_intercept * overshoot_frac / ball_speed_xy)
             direction = intercept - player.position
+
+            # Degenerate-intercept fallback: intercept_target() solves
+            # assuming the ball holds its CURRENT velocity for the whole
+            # chase, so whenever the ball's recorded position already
+            # coincides with the player's own (confirmed real case: the
+            # tick right after THIS player kicks the ball, its velocity
+            # jumps immediately but its position only integrates forward on
+            # the NEXT physics tick -- so for that one tick the ball is
+            # still recorded exactly where the player is standing, despite
+            # already moving at real speed), the solve's "time to meet" is
+            # trivially 0 and it hands back the player's OWN position as
+            # the "intercept point" -- direction collapses to the zero
+            # vector. _compute_movement_intent/step_player_towards treats a
+            # zero direction as "no target, decelerate to a stop" (a
+            # perfectly reasonable behaviour when there's genuinely nowhere
+            # to go), which here actively BRAKES the player every single
+            # tick this happens, although the ball is plainly still moving
+            # away at real speed the whole time. Confirmed via direct
+            # instrumentation (traced push-kick repetition: this fired on
+            # literally every other tick, capping speed around 5.3 m/s
+            # against a 7+ m/s ceiling, for 87 kicks straight). Falling back
+            # to the ball's OWN direction of travel here -- not standing
+            # still -- is the correct read of "the target is right where I
+            # am AND already moving": follow it.
+            if direction.length_xy() < 1e-6:
+                ball_vel_xy = self.ball.velocity.xy()
+                if ball_vel_xy.length() > 1e-6:
+                    direction = ball_vel_xy
 
             # Boundary-aware braking: don't sprint blindly onto a ball
             # sitting near the touchline/goal line -- a player who arrives
@@ -454,9 +527,11 @@ class Match:
             # braking curve rather than a bespoke boundary solver. When
             # there's essentially NO room left to decelerate into at all
             # (raw_margin <= boundary_braking_params.abandon_margin_m,
-            # below), the chase is abandoned outright rather than crawling
-            # in at whatever near-zero speed the formula computes -- see
-            # that branch's own comment.
+            # below), the chase is abandoned -- braking to a stop if that
+            # can actually clear the pickup radius in time, or steering
+            # away from the ball instead if it can't -- rather than
+            # crawling in at whatever near-zero speed the formula computes
+            # -- see that branch's own comment.
             #
             # Both this buffer and the abandon threshold are configurable
             # via orders.json["boundary_braking"] (self.boundary_braking_
@@ -532,16 +607,78 @@ class Match:
                     # still reliably ends up carrying it out anyway
                     # (confirmed: a real traced episode overran by 0.54m
                     # despite max_safe_speed already computing to 0 there).
-                    # Holding position instead lets the ball roll out
-                    # untouched -- "invalid" (0 reward) instead of a
-                    # penalised "ball_out" (-4) -- for zero further downside,
-                    # since we were never going to make a safe recovery here
-                    # either way. Tackle_armed was already set above (still
+                    #
+                    # Braking to a dead stop (SpeedMode.STANDSTILL, which
+                    # already applies a boosted decel -- movement_params.
+                    # standstill_decel_multiplier, 1.5x by default) sounds
+                    # like it should avoid touching the ball, but by the
+                    # time raw_margin crosses this threshold the player is
+                    # typically already CLOSER to the ball than that boosted
+                    # brake's own stopping distance needs: confirmed on a
+                    # real traced episode (v0=5.98 m/s, boosted-brake
+                    # stopping distance 2.42m, actual gap to the ball only
+                    # 1.54m) where full braking still let momentum carry the
+                    # player into the ball's pickup radius. That's a real
+                    # bug on its own (possession.can_pick_up_ball has no
+                    # notion of ball-in-bounds, only proximity, so this
+                    # incidental touch flips a free "invalid" (0 reward)
+                    # into a penalised "ball_out", -4) -- but even setting
+                    # that aside, braking alone can't reliably prevent the
+                    # touch in the first place here, so predict whether it
+                    # actually can before committing to it.
+                    #
+                    # If braking (that same boosted decel) IS predicted to
+                    # stop the player short of the pickup radius, do that --
+                    # unchanged from before. If not, steer directly AWAY
+                    # from the ball's current position instead, at full
+                    # sprint with no arrival braking: this changes the
+                    # velocity VECTOR rather than trying to kill speed the
+                    # player physically can't shed in time, so distance-to-
+                    # ball stops closing without needing to stop moving
+                    # first. Confirmed on the same traced episode: closest
+                    # approach becomes 0.78m (pickup radius is 0.55m)
+                    # instead of an incidental touch, flipping that
+                    # episode's outcome from ball_out (-4) to invalid (0)
+                    # with zero effect on any other episode -- verified via
+                    # a 500-episode outcome_baseline.py run before and after
+                    # this change (identical counts for every OTHER outcome
+                    # bucket). Tackle_armed was already set above (still
                     # relevant if this is actually a carrier chase reusing
                     # this branch via a race-condition edge case); nothing
                     # else needs undoing.
-                    player.desired_direction = Vector3.zero()
-                    player.desired_speed_mode = SpeedMode.STANDSTILL
+                    dist_to_ball = player.position.xy().distance_to(self.ball.position.xy())
+                    current_speed = player.velocity.length_xy()
+                    a_max = effective_acceleration(
+                        self.movement_params, player.attributes.acceleration,
+                        player.stamina, player.is_goalkeeper,
+                    )
+                    a_eff_brake = a_max * self.movement_params.standstill_decel_multiplier
+                    stop_dist = (
+                        (current_speed ** 2) / (2.0 * a_eff_brake) if a_eff_brake > 0 else float("inf")
+                    )
+                    can_brake_in_time = stop_dist <= max(0.0, dist_to_ball - self.pickup_radius_m)
+
+                    if can_brake_in_time:
+                        player.desired_direction = Vector3.zero()
+                        player.desired_speed_mode = SpeedMode.STANDSTILL
+                        return False
+
+                    away_xy = player.position.xy() - self.ball.position.xy()
+                    if away_xy.length() < 1e-6:
+                        # Degenerate: standing exactly on the ball's (x,y) --
+                        # fall back to the reverse of current heading rather
+                        # than a zero direction (which would just re-trigger
+                        # the "no target: decelerate" path in
+                        # step_player_towards).
+                        away_xy = player.velocity.xy() * -1.0
+                    away_dir = Vector3(away_xy.x, away_xy.y, 0.0)
+                    from footballcoach.orders import _compute_movement_intent
+                    adj_dir, sm = _compute_movement_intent(
+                        player, away_dir, self, sprint=True, arrival_dist=None, arrival_speed=None,
+                        use_repulsion=False, use_brake_to_turn=True,
+                    )
+                    player.desired_direction = adj_dir
+                    player.desired_speed_mode = sm
                     return False
 
                 boundary_margin = max(0.0, raw_margin)
@@ -618,7 +755,43 @@ class Match:
         # (every pickup went through the normal control-then-kick sequence
         # below regardless of kick_armed). Flat, direction-only kick (no
         # ballistic solve) -- see Player.kick_armed_direction's docstring.
-        if player.kick_armed and player.kick_armed_direction is not None:
+        #
+        # ball_settled (real bug fix, confirmed via direct instrumentation):
+        # an armed redirect must NOT fire while the ball still has real
+        # vertical velocity (mid-bounce, e.g. from this SAME player's own
+        # prior kick landing with a touch of angle noise -- kicks are
+        # nominally flat but still draw the same pitch noise every other
+        # kick does, occasionally crossing the ground-contact engine's own
+        # real-bounce threshold). Confirmed by direct trace: a redirect
+        # consumed the instant the ball re-entered pickup range regardless
+        # of vz, so a bounce that brought the ball's speed down to near-
+        # match the chaser's own sprint speed got treated as pickable
+        # immediately (can_pick_up_ball's own closing-speed deadzone,
+        # unrelated to this fix and untouched), re-firing another armed
+        # kick before the player ever settled it -- a self-sustaining loop
+        # confirmed on one real seed to repeat 90 times in a row. Falling
+        # through to the NORMAL control-time grant below when unsettled
+        # fixes this at the actual point of failure: _sync_possessed_ball
+        # zeroes the ball's vz every tick it's genuinely held, so a forced
+        # real possession here reliably breaks the loop, whereas the armed
+        # path never touches vz at all. Confirmed via the same seed: real
+        # kicks dropped from 91 to 28 with this change alone (arming itself,
+        # and every other mechanic here, is unchanged).
+        #
+        # Threshold is config-backed (ball_pickup_params.armed_redirect_
+        # settle_vz_mps, physics.json), not "exactly zero" -- an initial
+        # 1e-6 cutoff turned out to be a second, connected bug of its own:
+        # a push-kick's own kick-angle noise routinely leaves it with some
+        # small vz (~0.5-0.6 m/s is typical), which almost never decays to
+        # 1e-6 before a fast-sprinting player recatches it -- so EVERY touch
+        # was falling through to the slow control-time grant regardless,
+        # defeating the entire point of arming (confirmed on a real traced
+        # episode: 40 short, speed-losing hops instead of ~7 long full-speed
+        # ones). Retuned empirically across 500 real episodes -- see
+        # physics.json's own _comment_armed_redirect_settle_vz for the full
+        # sweep (0.01/0.5/0.7/1.0/1.5) and why 1.0 was chosen.
+        ball_settled = abs(self.ball.velocity.z) < self.ball_pickup_params.armed_redirect_settle_vz_mps
+        if player.kick_armed and player.kick_armed_direction is not None and ball_settled:
             self._set_possession(player.player_id)
             # kick_armed_power_fraction is already the final value (run-
             # compensated at arm time for push-kicks -- see its docstring)
@@ -685,11 +858,19 @@ class Match:
         predicted = order.target_position + target.velocity.xy() * t_arrive
         return predicted.with_z(0.0)
 
-    def _intercept_target(self, player: Player, target_pos: Vector3, target_vel: Vector3) -> Vector3:
+    def _intercept_target(
+        self, player: Player, target_pos: Vector3, target_vel: Vector3,
+        target_decel_mps2: float = 0.0,
+    ) -> Vector3:
         """Returns the world position this player should sprint toward in order
         to intercept the target (ball or carrier) in the shortest possible time.
 
-        See `engine.interception.intercept_target` for the underlying math.
+        See `engine.interception.intercept_target` for the underlying math,
+        including `target_decel_mps2` -- callers chasing the loose BALL
+        should pass `self.interception_params.assumed_ball_decel_mps2` (see
+        `_run_get_possession_behaviour`'s own call); a chased carrier isn't
+        decelerating the same way, so the carrier-chase call site leaves
+        this at its 0.0 default.
         """
         v_p = effective_top_speed(
             self.movement_params,
@@ -698,7 +879,7 @@ class Match:
             has_ball=False,
             is_goalkeeper=player.is_goalkeeper,
         )
-        return intercept_target(player.position, v_p, target_pos, target_vel)
+        return intercept_target(player.position, v_p, target_pos, target_vel, target_decel_mps2)
 
     def _check_armed_tackles(self) -> None:
         """Resolve tackles for any player who armed tackle_armed this tick

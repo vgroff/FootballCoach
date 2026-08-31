@@ -418,6 +418,37 @@ function signature clean:
 - If the tackler wins against a `CONTROLLING_BALL` target, the tackler is
   given the ball (not just the target losing possession).
 
+**4. Aerial-ball tackle immunity — currently DEAD CODE, deferred on
+purpose**:
+- `physics.json["control_time"]["control_tackle_immune_height_m"]` (0.95,
+  waist height) and the checks that read it
+  (`Match._attempt_tackle_contact`, `Match._check_head_on_tackles`'s inline
+  check) are real, reachable code that's SUPPOSED to block a tackle
+  attempt against a `CONTROLLING_BALL` target whose ball is still above
+  that height (a first-touch on an aerial ball, not yet brought to the
+  ground). See `tests/scenario/test_control_behaviour.py`'s module
+  docstring for the original intent.
+- In practice this can only ever fire on the exact tick control starts.
+  `Match._sync_possessed_ball()` (tick-order step 3) unconditionally snaps
+  the ball to `radius_m` height for ANY carrier, every tick, regardless of
+  `CONTROLLING_BALL` state — and it runs BEFORE the tackle-resolution steps
+  (`_check_armed_tackles`/`_check_head_on_tackles`, missing from this file's
+  own tick-order list above — TODO). So by the first tick a tackle attempt
+  is actually resolved against an already-controlling target, the ball's
+  height has already been flattened, and the immune-height check always
+  reads a ground-level ball no matter how high the ball was when control
+  began.
+- Grounding the ball immediately on control is intentional for now (simpler
+  physics) — NOT something to silently "fix" by making
+  `_sync_possessed_ball` preserve height during `CONTROLLING_BALL`, without
+  a deliberate decision to actually support aerial control properly.
+  `tests/scenario/test_control_behaviour.py::_disabled_test_
+  controlling_aerial_ball_immune_to_regular_tackle` is disabled (renamed
+  with a leading underscore so pytest skips it) pending that decision — its
+  head-on-tackle sibling test currently still passes by coincidence (a
+  hand-set-up single `match.step()` that never exercises the multi-tick
+  glue-then-check ordering), not because the underlying issue is fixed.
+
 ### `ChaseTackleOrder` - the "Tackle" high-level action
 
 `ChaseTackleOrder` persists across ticks: the

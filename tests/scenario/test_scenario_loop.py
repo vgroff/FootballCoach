@@ -123,7 +123,11 @@ def test_linger_delays_trial_end():
     result = loop.step()
     assert result is False, "first step after OOB should be False (linger started)"
     assert loop.trial_count == 0, "outcome must not be recorded yet during linger"
-    assert loop._pending_outcome == "miss"
+    # remap_phase1_outcome() (via SCENARIOS[0]'s outcome_remap) splits the
+    # raw "miss" from detect_trial_outcome() into "invalid" when nobody
+    # touched the ball before it went out -- true here, since the ball was
+    # teleported out of bounds directly, never touched by either player.
+    assert loop._pending_outcome == "invalid"
 
     # All steps during the linger must return False.
     false_count = 0
@@ -136,8 +140,10 @@ def test_linger_delays_trial_end():
         raise AssertionError("linger never expired — loop.step() never returned True")
 
     assert loop.trial_count == 1, "outcome must be recorded once linger expires"
-    # This is an OOB (miss) event → linger is linger_s * 0.5 = 0.25 s ≈ 7 ticks.
-    # Allow ±2 ticks for floating-point rounding.
+    # This is an OOB event (raw-detected as "miss" by detect_trial_outcome(),
+    # before the phase1 remap above turns it into "invalid") → linger is
+    # linger_s * 0.5 = 0.25 s ≈ 7 ticks. Allow ±2 ticks for floating-point
+    # rounding.
     oob_linger_s = linger_s * 0.5
     expected_ticks = round(oob_linger_s / match.dt_s)
     assert false_count >= max(1, expected_ticks - 2), (

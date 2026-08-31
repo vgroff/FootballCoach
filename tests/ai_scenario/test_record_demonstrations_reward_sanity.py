@@ -53,7 +53,7 @@ def test_recorded_episode_rewards_stay_within_sane_bounds():
 
     result = record_episodes(
         env, label_fn, n_episodes=300, scenario_key="phase1_1v1", phase_id=1,
-        sample_interval_s=0.2,
+        sample_every_n_decisions=1,
         opponent_rules_prob=1.0, opponent_immobile_prob=0.0,
     )
 

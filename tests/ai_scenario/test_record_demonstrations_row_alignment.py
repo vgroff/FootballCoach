@@ -109,7 +109,7 @@ def test_trainee_reward_survives_mid_step_callback_row_insertion(monkeypatch):
 
     result = record_episodes(
         env, label_fn, n_episodes=1, scenario_key="phase1_1v1", phase_id=1,
-        sample_interval_s=0.5,
+        sample_every_n_decisions=1,
         opponent_rules_prob=0.0, opponent_immobile_prob=1.0,
     )
 
@@ -183,7 +183,7 @@ def test_kick_callback_row_does_not_duplicate_prior_reward(monkeypatch):
 
     result = record_episodes(
         env, label_fn, n_episodes=1, scenario_key="phase1_1v1", phase_id=1,
-        sample_interval_s=0.5,
+        sample_every_n_decisions=1,
         opponent_rules_prob=0.0, opponent_immobile_prob=1.0,
     )
 
@@ -210,8 +210,8 @@ def test_is_decision_step_flags_real_timed_samples_only(monkeypatch):
     """``is_decision_step`` must be 1.0 for genuine timed-sample rows and 0.0
     for kick/tackle-callback rows and the trailing true-terminal row --
     DemonstrationDataset.compute_returns() relies on this to only apply its
-    per-row MC discount on rows that represent a real elapsed
-    sample_interval_s, not once per row regardless of real time (see its own
+    per-row MC discount on rows that represent a real elapsed decision
+    interval, not once per row regardless of real time (see its own
     docstring)."""
     phase = CurriculumPhase(
         name="p1", phase_id=1, scenario_key="phase1_1v1", env_kwargs={"max_episode_s": 10.0}
@@ -240,7 +240,7 @@ def test_is_decision_step_flags_real_timed_samples_only(monkeypatch):
 
     result = record_episodes(
         env, label_fn, n_episodes=1, scenario_key="phase1_1v1", phase_id=1,
-        sample_interval_s=0.5,
+        sample_every_n_decisions=1,
         opponent_rules_prob=0.0, opponent_immobile_prob=1.0,
     )
 

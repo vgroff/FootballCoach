@@ -524,15 +524,36 @@ case — see the BC label table above).
 
 ### Demonstration recording (`record_demonstrations.py`)
 
+**!!!! KNOWN LIMITATION, INTENTIONAL FOR NOW: the secondary opponent is
+NEVER neural during demo recording !!!!** `record_episodes()`'s own
+opponent-type roll (lines ~571-588, a SEPARATE roll from -- and
+unconditionally overriding -- whatever `build_1v1_scenario` itself already
+decided) only ever assigns `Phase1RulesAI()` or leaves the opponent
+immobile; the `opponent_rules_prob`/`opponent_immobile_prob` args (and the
+`--opponent-rules-prob`/`--opponent-immobile-prob` CLI flags,
+`phase1_demo_opponent_*_ratio` in ai_config.json) sum to less than 1.0 on
+purpose -- the REMAINDER probability mass (what would be "neural") is
+deliberately folded into "rules" instead, not left as a real option. Only
+the TRAINEE can be neural-driven during recording (`--driver-checkpoint`,
+via `driver_trainer`). This means recorded BC datasets never contain a
+sample of "what does the opponent's own state distribution look like when
+IT is neural" -- relevant if a future neural-secondary-opponent PPO
+self-play run (see the "secondary opponent audit" work) ever wants matching
+BC-pretraining coverage for that opponent policy too. Also flagged (more
+tersely) in `ai_config.json`'s `_comment_phase1_opponent` and inline at the
+roll logic itself in `record_demonstrations.py`.
+
 Sampling strategy:
-- `env.step()` is called for each 0.5s decision interval — episodes terminate
-  correctly (box-possession terminal, timeout) because `ScenarioEnv.step()`
-  handles those checks.
+- `env.step()` is called once per real decision interval (the env's own
+  `observation.decision_interval_s`, same cadence real training uses — see
+  "Timed-sample cadence" below) — episodes terminate correctly
+  (box-possession terminal, timeout) because `ScenarioEnv.step()` handles
+  those checks.
 - Inside each `env.step()` call, the engine fires `player.on_kick` /
   `player.on_tackle` callbacks at the exact physics tick the action executes.
   These callbacks record an extra (obs, label) sample immediately.
-- Net result: one regular sample per 0.5s + one extra sample per kick/tackle
-  event. ~7k steps for 200 phase-1 episodes (~7s to record).
+- Net result: one regular sample per decision (or every Nth decision, see
+  `sample_every_n_decisions`) + one extra sample per kick/tackle event.
 - Reward wiring: kick/tackle callback samples used to hardcode `reward=0.0`,
   silently dropping real reward (e.g. `gain_possession_bonus`) that fired on
   exactly that tick. Fixed via a per-player `_pending_reward: dict[str, float]`
@@ -549,6 +570,33 @@ Sampling strategy:
   `env.step()` and reset after each log line) — mirrors `train.py`'s
   pre-training reward diagnostic (`_comp_acc` pattern) so demo-recording
   reward shaping can be sanity-checked the same way.
+
+**Timed-sample cadence is decision-count based, not time based**
+(`sample_every_n_decisions`, `bc.demo_sample_every_n_decisions` in
+ai_config.json): used to be a sim-seconds interval (`sample_interval_s`,
+default 0.2s in code / 0.5s in config -- two different stale defaults, never
+actually equal to each other or to `observation.decision_interval_s`
+=0.239s) that OVERRODE `env._ticks_per_decision` to force `env.step()` to
+advance by exactly that many seconds. That wasn't just a sampling-density
+choice — `Phase1RulesAI`/`NeuralPlayerAI` re-evaluate their order/action
+once per decision (once per `env.step()` call), so forcing a different
+decision cadence during recording than real training/gameplay ever uses
+means the recorded trajectories themselves were shaped by a different
+policy-update rate, not just logged at a different density. Fixed:
+recording no longer touches `_ticks_per_decision` at all — `env.step()`
+always advances by the env's own real `decision_interval_s`, identical to
+real training — and `sample_every_n_decisions` (default 1 = record every
+decision) just controls how many of those genuine `env.step()` calls get a
+timed sample (`_do_timed_sample = decision_count % sample_every_n_decisions
+== 0`, reset to 0 at the start of each episode). on_kick/on_tackle callback
+rows are unaffected either way (always recorded, per-player, regardless of
+whether that decision was sampled) — matches the existing "kicks and tackles
+always recorded regardless" behavior. `is_decision_step`/`is_trainee`/dones
+bookkeeping is unchanged; a skipped (non-sampled) decision simply appends
+zero timed-sample rows for that iteration (the reward/component backfill is
+a `zip()` over two empty lists, a natural no-op), so at `N>1` that
+decision's reward is not captured anywhere — an intentional tradeoff of
+thinning the recorded density, not a bug.
 
 **Neural driver/teacher** (`--driver-checkpoint`/`--teacher-checkpoint`): the
 trainee can be driven by a loaded checkpoint's own policy instead of

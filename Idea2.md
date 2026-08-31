@@ -39,6 +39,8 @@ Current notes:
     - !! Friction coefficient needs increasing 2-4x - need to retrain the physics model (ball only)
         - doesnt seem that awful tbh, kick factor speed is like 1.3 and it looks fine. wouldnt increase it too much
         - IS air drag stronger than frctions? Is that weird? Do some real physics on this
+        - horizontal bounce resitution is too low (0.8)
+        - does the dt affect the physics? surely not right?
     - !! Broken current order stuff AI has found bugs!!
     - !! real neural net: don't normalise by pitch half diag, just normalise by base pitch half diag
         - players/ball may need pitch size now
@@ -221,8 +223,6 @@ NB Immediate:
 
 NB:
 - currently stamina regen is faster than sprint depeltion, do we want that?
-- Pretty sure you can currently kick at full power with having full in the kick_power stat, which begs the question of what it's purpose is. I think you should only have full power at 1.0 kick power
-    - Ask the AI to explain the kick power calculations - maybe we need a non-linearity
 - implement goalie rebounds and "failed" saves of various kinds
     - also implement rebounds off players for failed ball controls and from succesful tackles
 - Show player attributes somewhere on select
@@ -234,7 +234,7 @@ NB:
 Past MVP - Late Stage Plans
 
 Mechanics
-- Think about introducing non-linearities in kick power, stamina etc... stuff that maybe less spearated in effect than theye are in rarity (gaussian), or the reverse (e.g. dribbling, maybe gets extra good at 80+)j - [Late thing] - Implement a foot choice when kicking, and foot preference and degree of ambitextricity etc... foot choice affects power/precisions depending on direction of kicking vs velocity heading, it affects spin in the same way 
+- Think about introducing non-linearities in kick power, stamina etc... stuff that maybe less spearated in effect than theye are in rarity (gaussian), or the reverse (e.g. dribbling, maybe gets extra good at 80+)j - [Late thing] - Implement a foot choice when kicking, and foot preference and degree of ambitextricity etc... foot choice affects power/precisions depending on direction of kicking vs velocity heading, it affects spin in the same way. Also, any of the check based ones like tackling or dribbling shuold have a min value like dribbling skill is actually 0.2 +0.8*dribbling skill, or something, I think it'll be a bit more stable if the ratio between the two can't be like infinity
 
 Player stuff:
 - Traits

@@ -34,6 +34,30 @@ from pathlib import Path
 log = logging.getLogger("footballcoach.replay_episode")
 
 
+def _real_sim_dt_s() -> float:
+    """The REAL physics tick size real phase-1 recording actually runs at
+    -- ai_config.json's observation.sim_dt_s (0.06s / ~16.67Hz by default,
+    NOT the interactive UI's fixed 30Hz -- see that key's own config
+    comment: "UI ignores this and always uses 30Hz"). This was a real,
+    confirmed bug in every function below: each one used to hardcode
+    dt_s=1/30 (the UI's rate), silently simulating a completely different
+    physics timestep than the one the seed was actually recorded at.
+
+    Confirmed via direct comparison: build_replay_match's constructed Match
+    and a genuine ScenarioEnv.reset(seed=...) start with byte-IDENTICAL
+    match.rng state and positions, but after even a single decision
+    interval of stepping (dt_s=1/30 vs the real 0.06), positions had
+    already diverged -- proving the RNG draws matched (same sequence, same
+    count) and the divergence was purely from the wrong timestep, not any
+    RNG/ordering difference. Over a multi-second episode this compounds
+    into a completely different trajectory (confirmed: a real recorded
+    episode with 87 real kicks replayed down to just 1-4 kicks under the
+    wrong dt_s)."""
+    from footballcoach.ai.config import load_ai_config
+
+    return float(load_ai_config().get("observation", {}).get("sim_dt_s", 1.0 / 30.0))
+
+
 def _phase1_opponent_probs() -> tuple[float, float]:
     """(opponent_rules_prob, opponent_immobile_prob), computed EXACTLY like
     ai/curriculum/envs.py's _build_phase1_env does -- the real recording
@@ -91,6 +115,7 @@ def build_replay_match(seed: int, *, rng_reduction: float = 0.3):
         rng_reduction, seed=seed, ball_max_speed_mps=10.0,
         opponent_rules_prob=opponent_rules_prob,
         opponent_immobile_prob=opponent_immobile_prob,
+        sim_dt_s=_real_sim_dt_s(),
     )
 
     trainee = match.player_by_id("trainee")
@@ -140,6 +165,7 @@ def run_headless(seed: int, output: str, *, rng_reduction: float = 0.3) -> None:
 
     import functools
     from footballcoach.ui.scenarios import build_1v1_scenario
+    dt_s = _real_sim_dt_s()
     defn = ScenarioDefinition(
         key="phase1_1v1_replay",
         label="Phase 1 replay",
@@ -148,18 +174,22 @@ def run_headless(seed: int, output: str, *, rng_reduction: float = 0.3) -> None:
             build_1v1_scenario, ball_max_speed_mps=10.0,
             opponent_rules_prob=opponent_rules_prob,
             opponent_immobile_prob=opponent_immobile_prob,
+            sim_dt_s=dt_s,
         ),
         on_tick=phase1_training_on_tick,
     )
     max_episode_s = float(load_ai_config().get("curriculum", {}).get("phase1_max_episode_s", 18.5))
-    dt_s = 1.0 / 30.0
     max_ticks = max(1, int(max_episode_s / dt_s))
 
     loop = ScenarioLoop(
         definition=defn, max_trials=1, rng_reduction=rng_reduction,
         kwargs={"seed": seed}, timeout_ticks=max_ticks,
     )
-    loop.match.dt_s = dt_s
+    # dt_s is already correctly set via sim_dt_s above (build_1v1_scenario
+    # applies it to the constructed Match) -- no need to override it again
+    # here; a prior version of this line hardcoded dt_s=1/30 AFTER
+    # construction, silently overwriting whatever the real config-derived
+    # value would otherwise have been.
     # Same AI assignment / overriding second roll as build_replay_match()
     # (duplicated inline rather than reusing that function directly, since
     # it builds its OWN Match rather than accepting an existing one --
@@ -228,6 +258,17 @@ def run_ui(seed: int, *, rng_reduction: float = 0.3) -> None:
             "ball_max_speed_mps": 10.0,
             "opponent_rules_prob": opponent_rules_prob,
             "opponent_immobile_prob": opponent_immobile_prob,
+            # Real recording runs at ai_config.json's observation.sim_dt_s
+            # (0.06s), NOT the UI's normal fixed 30Hz (see _real_sim_dt_s's
+            # own docstring for the confirmed bug this fixes) -- without
+            # this the replayed match plays out completely different
+            # physics than what was actually recorded, even at the exact
+            # same seed. Trade-off: the match now advances more simulated
+            # time per engine tick than a normal 30Hz UI scenario, so it
+            # will visibly run faster than real-time -- a real, accepted
+            # cost of correctly reproducing the recorded episode instead of
+            # a cosmetically smoother but WRONG one.
+            "sim_dt_s": _real_sim_dt_s(),
         },
     )
     # Trainee needs Phase1RulesAI explicitly (build_1v1_scenario doesn't

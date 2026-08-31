@@ -17,8 +17,10 @@ uv sync --group ai
 # --- Demonstrations (do this first; used for offline BC pre-training) ---
 
 # Record 200 phase-1 episodes of rules-based AI play (~7k steps, ~7s)
-# Sampling: env.step() every 0.5s + on_kick/on_tackle callbacks fire extra
-# samples at the exact tick kicks/tackles execute. Demos already in demonstrations/phase1/.
+# Sampling: every real decision interval (observation.decision_interval_s,
+# same cadence real training uses) by default (bc.demo_sample_every_n_decisions=1)
+# + on_kick/on_tackle callbacks fire extra samples at the exact tick kicks/tackles
+# execute. Demos already in demonstrations/phase1/.
 uv run python -m footballcoach.ai.scripts.record_demonstrations \
     --phase 1 --n-episodes 200 --episodes-per-file 8 \
     --output demonstrations/phase1/

@@ -114,8 +114,9 @@ class DemonstrationDataset:
         # flat-scan behavior, not a new failure mode.
         self._is_trainee = is_trainee if is_trainee is not None else np.ones(n, dtype=np.float32)
         # 1.0 = this row's own reward corresponds to a genuine new decision
-        # interval (a real sample_interval_s-spaced timed sample), 0.0 = a
-        # kick/tackle-callback row or the trailing true-terminal row (see
+        # interval (a real timed sample, recorded every sample_every_n_
+        # decisions decisions), 0.0 = a kick/tackle-callback row or the
+        # trailing true-terminal row (see
         # record_demonstrations.py's is_decision_step_flags). compute_returns()
         # only applies its per-row MC discount on rows where this is True, so
         # an episode with many kick/tackle-inserted rows in a short real span

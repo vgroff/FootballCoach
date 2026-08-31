@@ -127,6 +127,28 @@ def _load(path: Path) -> list[dict]:
         return json.load(f)
 
 
+def _archive_copy(log_path: Path) -> Path:
+    """Copy log_path into a sibling match_log_archive/ directory with a
+    timestamp suffix. Several source files this script visualises get
+    REWRITTEN IN PLACE at a fixed path by whatever produced them (e.g.
+    debug_value_network.py's worst-episode-per-outcome files, overwritten
+    on every diagnostics pass, often by a live training process running
+    concurrently) -- without this, looking at one, then running the
+    producer again, silently destroys the exact episode you just looked
+    at (lived this firsthand this session: had to manually copy files to
+    a scratch dir before each render to avoid losing them mid-analysis).
+    Returns the archive copy's path."""
+    import shutil
+    from datetime import datetime
+
+    archive_dir = log_path.parent / "match_log_archive"
+    archive_dir.mkdir(exist_ok=True)
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    archive_path = archive_dir / f"{log_path.stem}_{stamp}{log_path.suffix}"
+    shutil.copy2(log_path, archive_path)
+    return archive_path
+
+
 def _ball_colour(pid: Optional[str], team_map: dict[str, str]) -> str:
     team = team_map.get(pid) if pid else None
     if team == "left":
@@ -152,11 +174,16 @@ def visualise_single(
     output: Optional[Path],
     show: bool,
     event_filter: Optional[set[str]],
+    archive: bool = True,
 ) -> None:
     events = _load(log_path)
     if not events:
         print("Empty log.", file=sys.stderr)
         return
+
+    if archive:
+        archive_path = _archive_copy(log_path)
+        print(f"Archived a copy to {archive_path}")
 
     start_ev = next((e for e in events if e["event"] == "start"), None)
     team_map: dict[str, str] = {}
@@ -206,6 +233,36 @@ def visualise_single(
                     (float(ev["time_s"]), float(px), float(py))
                 )
 
+    # ---- Player-ball distance over time (every event carries ball_pos;
+    # reuse the same player_id/player_pos rows player_tracks is built from,
+    # keyed the same way, so this covers whatever player IDs the log
+    # actually uses -- "self"/"opponent" in debug_value_network.py's
+    # synthetic reconstructions, real player IDs in an actual MatchLogger
+    # dump -- with no hardcoded name). ----
+    player_ball_dist: dict[str, list[tuple[float, float]]] = {}
+
+    def _add_dist(pid: str, t: float, px: float, py: float, ev: dict) -> None:
+        bx, by, _ = ev["ball_pos"]
+        d = math.hypot(px - float(bx), py - float(by))
+        player_ball_dist.setdefault(pid, []).append((t, d))
+
+    if start_ev and "player_positions" in start_ev:
+        for pid, info in start_ev["player_positions"].items():
+            px, py, _ = info["pos"]
+            _add_dist(pid, float(start_ev["time_s"]), float(px), float(py), start_ev)
+    for ev in events:
+        pid = ev.get("player_id")
+        pp  = ev.get("player_pos")
+        if pid and pp:
+            px, py, _ = pp
+            _add_dist(pid, float(ev["time_s"]), float(px), float(py), ev)
+        if ev["event"] == "episode_end" and "player_positions" in ev:
+            for pid2, info in ev["player_positions"].items():
+                px, py, _ = info["pos"]
+                _add_dist(pid2, float(ev["time_s"]), float(px), float(py), ev)
+    for track in player_ball_dist.values():
+        track.sort(key=lambda t: t[0])
+
     # ---- Reward data ----
     rew_t: list[float] = []
     rew_cumul: list[dict[str, float]] = []
@@ -249,9 +306,9 @@ def visualise_single(
     fig = plt.figure(figsize=(17, 11), facecolor=_C_BG, layout="constrained")
     fig.get_layout_engine().set(hspace=0.02, wspace=0.02, h_pad=0.02, w_pad=0.04)
     gs = gridspec.GridSpec(
-        3, 2,
+        4, 2,
         figure=fig,
-        height_ratios=[7, 1, 2.5],
+        height_ratios=[7, 1, 1.4, 2.5],
         width_ratios=[3.5, 1],
     )
     gs_right = gridspec.GridSpecFromSubplotSpec(
@@ -261,9 +318,10 @@ def visualise_single(
     ax_legend   = fig.add_subplot(gs_right[0])
     ax_bar      = fig.add_subplot(gs_right[1])
     ax_timeline = fig.add_subplot(gs[1, :])
-    ax_reward   = fig.add_subplot(gs[2, :])
+    ax_dist     = fig.add_subplot(gs[2, :])
+    ax_reward   = fig.add_subplot(gs[3, :])
 
-    for ax in (ax_legend, ax_bar, ax_timeline, ax_reward):
+    for ax in (ax_legend, ax_bar, ax_timeline, ax_dist, ax_reward):
         _style_dark_ax(ax)
     ax_legend.axis("off")
     ax_bar.axis("off")
@@ -345,6 +403,12 @@ def visualise_single(
         ys = [t[2] for t in track]
         col = _C_LEFT if team_map.get(pid) == "left" else _C_RIGHT
         ax_pitch.plot(xs, ys, "--", color=col, lw=0.9, alpha=0.4, zorder=5)
+        # Sample dots along the track, same treatment as the ball's own
+        # trail dots below -- makes the actual per-event TIME sampling
+        # visible (dashed line alone hides how sparse/dense it is, and
+        # where the player was moving fast vs. barely at all).
+        ax_pitch.scatter(xs, ys, s=14, c=col, zorder=6, alpha=0.8,
+                         linewidths=0.4, edgecolors="white")
 
     # Numbered event markers
     ev_rows: list[str] = []
@@ -458,6 +522,43 @@ def visualise_single(
         mk, col, ms = _EV.get(etype, ("o", "white", 7))
         ax_timeline.plot(float(ev["time_s"]), 0, mk, color=col,
                          ms=ms * 0.65, zorder=5, mec="white", mew=0.3)
+
+    # ==================================================================
+    # PLAYER-BALL DISTANCE OVER TIME
+    # ==================================================================
+    ax_dist.set_xlim(0, max(duration, 1.0))
+    ax_dist.set_xlabel("time (s)", color="white", fontsize=7)
+    ax_dist.set_ylabel("dist to ball (m)", color="white", fontsize=7)
+    ax_dist.set_title("Player-ball distance over episode", color="white", fontsize=7, pad=2)
+    # Trainee only ("self", the debug_value_network.py convention) -- the
+    # opponent's own distance to the ball isn't the diagnostic signal these
+    # logs are read for. Falls back to plotting every player_id present
+    # when there's no "self" key at all (a real, non-synthetic MatchLogger
+    # dump won't use that name), so this panel still shows something on
+    # logs from outside debug_value_network.py's own reconstruction path.
+    dist_pids = ["self"] if "self" in player_ball_dist else list(player_ball_dist)
+    if player_ball_dist:
+        for pid in dist_pids:
+            track = player_ball_dist[pid]
+            ts = [t for t, _ in track]
+            ds = [d for _, d in track]
+            col = _C_LEFT if team_map.get(pid) == "left" else (
+                _C_RIGHT if team_map.get(pid) == "right" else "white"
+            )
+            ax_dist.plot(ts, ds, lw=1.3, marker=".", ms=3, color=col, label=pid, zorder=4)
+        # Pickup radius reference line (ball_pickup.pickup_radius_m,
+        # physics.json -- 0.55m by default): distance has to cross below
+        # this for a pickup to even become eligible, so it's the natural
+        # scale to read this panel against.
+        ax_dist.axhline(0.55, color="#888888", lw=0.8, ls="--", zorder=2)
+        ax_dist.text(
+            max(duration, 1.0), 0.55, " pickup radius", color="#aaaaaa",
+            fontsize=5.5, va="center", ha="left",
+        )
+        ax_dist.legend(
+            loc="upper right", fontsize=6.5, facecolor=_C_BG,
+            edgecolor="none", labelcolor="white", framealpha=0.7,
+        )
 
     # ==================================================================
     # PREDICTED VS. ACTUAL RETURN OVER TIME
@@ -622,6 +723,13 @@ def main() -> None:
         choices=list(_EV.keys()),
         help="Show only these event types on the pitch (timeline always shows all)",
     )
+    ap.add_argument(
+        "--no-archive", action="store_true",
+        help="Don't copy the log into a sibling match_log_archive/ dir before rendering "
+             "(archiving is on by default -- several producers of these files, e.g. "
+             "debug_value_network.py's worst-episode logs, overwrite the same path on "
+             "every run, often from a live concurrent process)",
+    )
     args = ap.parse_args()
 
     if args.dir:
@@ -630,6 +738,7 @@ def main() -> None:
         visualise_single(
             args.log, args.output, args.show,
             set(args.events) if args.events else None,
+            archive=not args.no_archive,
         )
     else:
         ap.print_help()
