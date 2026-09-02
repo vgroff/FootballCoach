@@ -236,22 +236,27 @@ def _ai_type_of(ai) -> float:
 
 
 def phase1_labels(env, player_id: str = None) -> BCLabel:
-    """Derive BC labels for Phase 1 by asking Phase1RulesAI what it would do.
+    """``env``-based convenience wrapper around ``phase1_labels_for_player()``
+    -- resolves ``player``/``match`` off ``env`` and delegates. Safe to call
+    at ANY point where ``env.match``'s CURRENT state is the state you want a
+    label for (e.g. record_demonstrations.py's recording loop, which always
+    calls this either BEFORE that decision interval's own env.step() or
+    synchronously from inside an on_kick/on_tackle callback -- both points
+    where "current state" and "the state the observation was captured from"
+    are the same instant).
 
-    Instantiates a temporary Phase1RulesAI, calls act() on the current match
-    state, and reads back the order it sets — so the labels are always exactly
-    in sync with the rules AI behaviour, with no duplicated logic here.
-
-    All quantities returned here (``move_direction``, ``move_region_center_m``,
-    ``kick_direction``, ``kick_spin``, ...) are in raw WORLD/ENGINE-FRAME
-    coordinates, matching the world-frame observations from ``obs/encoder.py``.
-    No canonical-AI-frame mirroring happens here — that transform is applied
-    later, as a thin wrapper around network forward calls (see
-    ``ai/obs/canonical.py``), not baked into recorded/generated labels.
+    Do NOT use this to label a transition captured earlier (e.g. via
+    NeuralPlayerAI's own last_transition/obs) -- ``env.match`` has moved on
+    by the time such a transition is available to a caller (env.step() has
+    already returned, meaning a full tick's worth of _apply_movement has
+    already run past the instant the observation was captured at -- see
+    phase1_labels_for_player()'s own docstring for why this matters and
+    NeuralPlayerAI's bc_label_fn mechanism, which computes the label
+    DURING act(), at the same instant as the observation, specifically to
+    avoid this). Raises no exception on a malformed env -- returns
+    BCLabel.invalid() instead, matching the previous behaviour of this
+    function before the phase1_labels_for_player() split.
     """
-    from footballcoach.rules_ai import Phase1RulesAI
-    from footballcoach.orders import MoveOrder, GetPossessionOrder, ChaseTackleOrder
-
     try:
         match = env.match
         if player_id is None:
@@ -261,6 +266,92 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         player = match.player_by_id(player_id)
     except (KeyError, AttributeError):
         return BCLabel.invalid()
+    return phase1_labels_for_player(player, match)
+
+
+def phase1_labels_for_player(player: "Player", match: "Match") -> BCLabel:
+    """Derive BC labels for Phase 1 by asking Phase1RulesAI what it would do,
+    from ``player``'s CURRENT state in ``match`` (whatever that state is at
+    the moment this is called -- see the CRITICAL timing note below).
+
+    Instantiates a temporary Phase1RulesAI, calls act() on the current match
+    state, and reads back the order it sets — so the labels are always exactly
+    in sync with the rules AI behaviour, with no duplicated logic here.
+
+    EVERY execution-level field (move_direction, sprint, exec_move,
+    kick_this_tick, kick_direction, kick_power_fraction, kick_spin,
+    tackle_attempt) comes from ONE counterfactual run of the decided order's
+    execute() -- fully snapshotted/reset/restored so it has ZERO effect on
+    the real match (see the block below) -- and is read back from whatever
+    actually landed on the player. No execution field is ever read from the
+    REAL, already-executed state of whichever AI is really driving *player*
+    right now. An earlier version of this function did exactly that for
+    kick_this_tick/kick_direction/kick_power_fraction/kick_spin/
+    tackle_attempt specifically (reasoning: Phase1RulesAI only expresses
+    kick/tackle intent through real physics execution, so there was no
+    "just ask it" shortcut the way there is for move_direction) -- but since
+    those fields are keyed off Player-level flags (kicked_this_tick,
+    kick_armed, tackle_armed) that are equally real regardless of WHICH ai
+    set them, that meant during on-policy PPO/DAgger training (the trainee's
+    own NeuralPlayerAI physically driving the player) these five fields
+    silently echoed the STUDENT's own kick/tackle behaviour back at it
+    instead of the rules AI's — providing no corrective signal at all for
+    "should I be kicking/tackling here". Fixed by running the SAME
+    counterfactual execute() move_direction/sprint/exec_move already use,
+    and reading these five fields off ITS result instead.
+
+    CRITICAL -- CALLER-SIDE TIMING (fixed 2026-09, second bug in the same
+    area): this function reads ``player``'s CURRENT position/velocity/
+    heading/ball-state, exactly as they stand at the moment THIS FUNCTION is
+    called. ``Match.step()`` runs ``_process_orders(dt)`` (where a REAL
+    decision -- and the observation NeuralPlayerAI encodes for it --
+    happens, using state as of the START of that tick) and ONLY AFTERWARD
+    runs ``_apply_movement(dt)`` (which actually advances position/
+    velocity/heading for that tick, via ``step_player_towards``). Calling
+    this function AFTER a full ``env.step()`` has already returned means it
+    sees POST-movement state -- one physics tick (1/30s) further along than
+    whatever observation the label is meant to accompany. This mismatch is
+    small for move_direction (a multi-metre-away target heading barely
+    changes over 33ms) but can be large for kick/tackle, whose gates
+    (``_try_push_kick``'s ``min_dist_m``/``max_heading_error_deg``,
+    run-compensated power) are sensitive to instantaneous position/heading/
+    velocity and can even flip a boolean fire/no-fire decision right at a
+    threshold. FIXED by moving the call site: ``NeuralPlayerAI.act()`` now
+    calls its own ``bc_label_fn`` (this function, via
+    ``bc_label_fn_for_phase_player()``) INTERNALLY, at the exact instant it
+    encodes the observation -- see that method's own ``bc_label_fn``
+    parameter. Any caller that instead calls this function later, after a
+    full ``env.step()`` has returned (the OLD, now-fixed pattern), is back
+    to the same bug.
+
+    CRITICAL -- SHARED RNG STREAM (fixed 2026-09, third bug in the same
+    area): if the counterfactual ``order.execute()`` below causes a real
+    push-kick to fire, ``Player.kick_direct()`` draws its yaw/pitch noise
+    from ``match.rng`` -- a SINGLE ``random.Random`` instance shared by the
+    ENTIRE simulation (every kick, tackle roll, etc. in this match). Without
+    protecting it, this exploratory call would silently consume real draws
+    from that shared stream, desyncing every subsequent genuine random
+    outcome in the match from what it would have been had this label never
+    been computed -- a real determinism leak, not just a label-accuracy
+    issue. Fixed the same way as every other field this function must leave
+    untouched: ``match.rng.getstate()``/``setstate()`` around the whole
+    counterfactual block (see below).
+
+    See ``tests/ai_unit/test_phase1_labels_timing.py`` for regression tests
+    covering both bugs (they fail loudly if either invariant is ever broken
+    again), and ``ai/knowledge.md``'s "Orders vs execution-network labels
+    boundary" for the full history of all three timing/leak bugs in this
+    area.
+
+    All quantities returned here (``move_direction``, ``move_region_center_m``,
+    ``kick_direction``, ``kick_spin``, ...) are in raw WORLD/ENGINE-FRAME
+    coordinates, matching the world-frame observations from ``obs/encoder.py``.
+    No canonical-AI-frame mirroring happens here — that transform is applied
+    later, as a thin wrapper around network forward calls (see
+    ``ai/obs/canonical.py``), not baked into recorded/generated labels.
+    """
+    from footballcoach.rules_ai import Phase1RulesAI
+    from footballcoach.orders import MoveOrder, GetPossessionOrder
 
     # heading_sin/cos: CURRENT player state, read directly -- same category as
     # player.stamina/player.position elsewhere in this function, not an
@@ -287,66 +378,47 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
             opponent_ai_type = _ai_type_of(_p.ai)
             break
 
-    # Execution heads reflect what the rules AI is physically doing RIGHT NOW —
-    # i.e. the current order it's executing, before any new decision is made.
-    from footballcoach.orders import MoveOrder as _MoveOrder, GetPossessionOrder as _GPOrder
     current_exec = player.current_order
-    # kick_this_tick: read Player.kicked_this_tick directly rather than
-    # inspecting order types. kick_direct() sets this flag unconditionally
-    # whenever it actually executes kick physics — including MoveOrder's
-    # push-kick path (rules_ai.py's box-run), which never creates a
-    # ShootOrder/KickOrder/PassOrder and was previously missed entirely,
-    # causing recorded demonstrations to have zero "kick" labels despite
-    # visible kicks in the UI. See Player.kicked_this_tick docstring.
-    kick_this_tick = 1.0 if (player.kicked_this_tick or player.kick_armed) else 0.0
-    kick_direction = None
-    kick_power_fraction = None
-    kick_spin = None
-    if player.kicked_this_tick:
-        # Actual kick this tick — use real post-physics values.
-        if player.last_kick_direction is not None:
-            kick_direction = np.array(
-                [player.last_kick_direction.x, player.last_kick_direction.y, player.last_kick_direction.z],
-                dtype=np.float32,
-            )
-        kick_power_fraction = player.last_kick_power_fraction
-        if player.last_kick_spin is not None:
-            kick_spin = np.array(
-                [player.last_kick_spin.x, player.last_kick_spin.y, player.last_kick_spin.z],
-                dtype=np.float32,
-            )
-    elif player.kick_armed and player.kick_armed_direction is not None:
-        # Approach tick: arm intent with the pre-computed direction/power.
-        _d = player.kick_armed_direction
-        kick_direction = np.array([_d.x, _d.y, _d.z], dtype=np.float32)
-        kick_power_fraction = player.kick_armed_power_fraction
-        kick_spin = np.zeros(3, dtype=np.float32)
-    # tackle_attempt: ChaseTackleOrder always, OR GetPossessionOrder when tackle_armed
-    # is True — set every tick during the approach by _run_get_possession_behaviour,
-    # so BC sees tackle intent across the full approach, not only at contact range.
-    _is_gp_tackling = isinstance(current_exec, _GPOrder) and player.tackle_armed
-    tackle_attempt = 1.0 if (isinstance(current_exec, ChaseTackleOrder) or _is_gp_tackling) else 0.0
 
     # Decision heads reflect what the rules AI DECIDES next.
     # Temporarily clear current_order so the AI always produces a fresh decision.
+    #
+    # decision_interval_ticks=1 (bypassing Phase1RulesAI's own config-driven
+    # default) is deliberate, not an oversight: this ephemeral instance is
+    # constructed fresh on every call, so it never accumulates decision-
+    # cadence state across ticks the way the REAL match's persistent
+    # Phase1RulesAI instance does -- and this function is already only
+    # invoked once per real decision (see ppo_trainer.py's training loop,
+    # which calls bc_label_fn only on ticks env.last_trainee_transition is
+    # non-None, i.e. exactly the ticks a real decision was just made). A
+    # throttled default here would silently disagree with the real match's
+    # own decision about WHEN to decide, breaking replay equivalence
+    # (confirmed: test_rules_ai_nn_replay_equivalence.py failed with the
+    # class default before this fix). Always decide immediately when asked.
     player.current_order = None
     try:
-        Phase1RulesAI().act(player, match, trial_tick=0)
+        Phase1RulesAI(decision_interval_ticks=1).act(player, match, trial_tick=0)
         order = player.current_order
     finally:
         player.current_order = current_exec  # always restore
 
-    # Execution-level fields (move_direction / sprint / exec_move) must NEVER
-    # be hand-derived from Order fields (bypasses braking/repulsion/turn-
-    # limiting/push-kick logic in _compute_movement_intent()). Instead, run
-    # the decided order's execute() once (fully snapshotted/restored so it
-    # has ZERO effect on the real match) and read back what actually landed
-    # on player.desired_direction/player.desired_speed_mode. See
-    # ai/knowledge.md "Orders vs execution-network labels boundary".
+    # Execution-level fields (move_direction / sprint / exec_move / kick_* /
+    # tackle_attempt) must NEVER be hand-derived from Order fields (bypasses
+    # braking/repulsion/turn-limiting/push-kick logic in
+    # _compute_movement_intent()/_try_push_kick()). Instead, run the decided
+    # order's execute() once (fully snapshotted/reset/restored so it has
+    # ZERO effect on the real match) and read back what actually landed on
+    # the player. See ai/knowledge.md "Orders vs execution-network labels
+    # boundary".
     move_direction = None
     sprint_label = 0.0
     exec_move_label = 0.0
     move_region_center = None
+    kick_this_tick = 0.0
+    kick_direction = None
+    kick_power_fraction = None
+    kick_spin = None
+    tackle_attempt = 0.0
 
     if isinstance(order, (MoveOrder, GetPossessionOrder)):
         # Snapshot everything execute() might mutate, so this exploratory
@@ -360,6 +432,11 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         _snap_last_kick_dir = player.last_kick_direction
         _snap_last_kick_power = player.last_kick_power_fraction
         _snap_last_kick_spin = player.last_kick_spin
+        _snap_kick_armed = player.kick_armed
+        _snap_kick_armed_dir = player.kick_armed_direction
+        _snap_kick_armed_power = player.kick_armed_power_fraction
+        _snap_kick_armed_spin = player.kick_armed_spin
+        _snap_tackle_armed = player.tackle_armed
         _snap_current_order = player.current_order
         _snap_on_possession_gained = player.on_possession_gained
         _snap_on_kick = player.on_kick
@@ -369,9 +446,37 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         _snap_ball_possessed_by = match.ball.possessed_by
         _snap_ball_velocity = match.ball.velocity
         _snap_ball_position = match.ball.position
+        # match.rng: Player.kick_direct() -> kicking._launch_ball()/
+        # kick_ball_from_direction() -> _release_kick() draws its yaw/pitch
+        # noise from match.rng (a SINGLE Random instance shared by the whole
+        # simulation -- see entities/player.py's kick_direct(), which passes
+        # match.rng straight through). If this exploratory execute() call
+        # causes a real push-kick to fire, it draws 2 real rng.gauss() calls
+        # from that SAME shared stream -- silently desyncing every
+        # subsequent REAL random draw in this match (kick noise, tackle
+        # rolls, anything else keyed off match.rng) from what it would have
+        # been had this label never been computed. getstate()/setstate()
+        # (not just noting "a kick happened") is the only way to undo this
+        # exactly -- there's no way to know in advance how many draws (0, 2,
+        # or more via retries) execute() will consume.
+        _snap_rng_state = match.rng.getstate()
         # order is a FRESH object from Phase1RulesAI().act() above (not
         # current_exec), so its own internal state starts clean.
         player.current_order = order
+        # Reset the same three per-tick flags Match._process_orders() itself
+        # resets before running a REAL order's execute() (see that method:
+        # "Reset before this tick's AI/order execution so kick_direct() ...
+        # can set it fresh"). This exploratory execute() call bypasses
+        # _process_orders entirely, so without this reset it would evaluate
+        # the hypothetical order on top of whatever kicked_this_tick/
+        # kick_armed/tackle_armed the REAL tick's REAL order already left
+        # behind -- contaminating "would the rules AI arm/fire right now"
+        # with leftover state from whichever AI is actually driving the
+        # player. Matching the real per-tick reset makes this genuinely
+        # stateless, independent of real history, exactly like decide().
+        player.kicked_this_tick = False
+        player.kick_armed = False
+        player.tackle_armed = False
         # Prevent on_kick/on_tackle/on_tackle_result from firing real callbacks
         # during this exploratory execute() (e.g. record_demonstrations.py wires
         # these to _record_now(), which would otherwise recursively re-enter here).
@@ -380,7 +485,7 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
         player.on_tackle_result = None
         player.on_auto_tackle_result = None
         try:
-            _dt = env._dt_s
+            _dt = match.dt_s
             order.execute(player, match, _dt)
             if player.desired_speed_mode is not None:
                 from footballcoach.engine.movement import SpeedMode
@@ -390,6 +495,47 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
                     move_direction = np.array([_n.x, _n.y], dtype=np.float32)
                 sprint_label = 1.0 if player.desired_speed_mode is SpeedMode.SPRINT else 0.0
                 exec_move_label = 0.0 if player.desired_speed_mode is SpeedMode.STANDSTILL else 1.0
+            # kick_this_tick / kick_direction / kick_power_fraction /
+            # kick_spin: same formula this function used to apply to the
+            # REAL executed state, now applied to the COUNTERFACTUAL
+            # post-execute() state -- a genuine "did the rules AI's own
+            # hypothetical order actually fire or arm a push-kick right
+            # now" answer, independent of whoever is really driving
+            # *player*. See Player.kicked_this_tick's docstring: kick_direct()
+            # sets it unconditionally whenever it actually executes kick
+            # physics, including MoveOrder's push-kick path (rules_ai.py's
+            # box-run), which never creates a separate Shoot/Kick/PassOrder.
+            if player.kicked_this_tick:
+                # Actual kick this tick — use real post-physics values.
+                kick_this_tick = 1.0
+                if player.last_kick_direction is not None:
+                    kick_direction = np.array(
+                        [player.last_kick_direction.x, player.last_kick_direction.y, player.last_kick_direction.z],
+                        dtype=np.float32,
+                    )
+                kick_power_fraction = player.last_kick_power_fraction
+                if player.last_kick_spin is not None:
+                    kick_spin = np.array(
+                        [player.last_kick_spin.x, player.last_kick_spin.y, player.last_kick_spin.z],
+                        dtype=np.float32,
+                    )
+            elif player.kick_armed and player.kick_armed_direction is not None:
+                # Approach tick: arm intent with the pre-computed direction/power.
+                kick_this_tick = 1.0
+                _d = player.kick_armed_direction
+                kick_direction = np.array([_d.x, _d.y, _d.z], dtype=np.float32)
+                kick_power_fraction = player.kick_armed_power_fraction
+                kick_spin = np.zeros(3, dtype=np.float32)
+            # tackle_attempt: `order` here is always MoveOrder/GetPossessionOrder
+            # (Phase1RulesAI.decide() never produces a ChaseTackleOrder
+            # directly -- that only ever arises from MarkOrder's own
+            # intercept/tackle fallback, which decide() never chooses), and
+            # only GetPossessionOrder's execute() (via
+            # Match._run_get_possession_behaviour) can arm a tackle. Reading
+            # tackle_armed post-execute() covers exactly that case with no
+            # extra branching needed.
+            if player.tackle_armed:
+                tackle_attempt = 1.0
         finally:
             # Restore EVERYTHING — this call must be perfectly invisible to
             # the real simulation.
@@ -402,6 +548,11 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
             player.last_kick_direction = _snap_last_kick_dir
             player.last_kick_power_fraction = _snap_last_kick_power
             player.last_kick_spin = _snap_last_kick_spin
+            player.kick_armed = _snap_kick_armed
+            player.kick_armed_direction = _snap_kick_armed_dir
+            player.kick_armed_power_fraction = _snap_kick_armed_power
+            player.kick_armed_spin = _snap_kick_armed_spin
+            player.tackle_armed = _snap_tackle_armed
             player.current_order = _snap_current_order
             player.on_possession_gained = _snap_on_possession_gained
             player.on_kick = _snap_on_kick
@@ -411,6 +562,7 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
             match.ball.possessed_by = _snap_ball_possessed_by
             match.ball.velocity = _snap_ball_velocity
             match.ball.position = _snap_ball_position
+            match.rng.setstate(_snap_rng_state)
 
     if isinstance(order, MoveOrder):
         move_region_center = np.array(
@@ -466,15 +618,13 @@ def phase1_labels_from_teacher(env, teacher_trainer, player_id: str = None) -> B
     comes directly from ONE forward call through
     ``teacher_trainer.decision_net``/``teacher_trainer.execution_net``, fully
     decoupled from whatever ``player.ai`` is physically doing to *player*
-    this tick. This sidesteps the real-state-vs-counterfactual gap
-    ``phase1_labels()``'s ``kick_this_tick``/``tackle_attempt`` fields have
-    (those read real player/order state because Phase1RulesAI only speaks in
-    Orders, not raw action probabilities, so it needs a snapshot/restore
-    sandbox to get a genuine counterfactual for move/sprint but not for
-    kick/tackle — see that function's docstring and
-    ai/knowledge.md "Orders vs execution-network labels boundary"). A neural
-    teacher has no such gap: every head is read straight off its own output
-    tensors, so kick/tackle labels are just as counterfactual as move/sprint.
+    this tick — the same "driver decides where to go, teacher decides what
+    the label is" separation ``phase1_labels()`` uses (its own snapshot/
+    reset/restore counterfactual around the decided order's ``execute()``,
+    covering kick/tackle too as of 2026-09; see that function's docstring
+    and ai/knowledge.md "Orders vs execution-network labels boundary"), just
+    sourced from a neural forward pass instead of a rules-AI order
+    simulation.
 
     Labels are SOFT (the teacher's own sigmoid probabilities / raw outputs,
     not hard 0/1) — ``bc_loss_from_tensor()``'s BCE/cosine/MSE terms accept
@@ -737,11 +887,59 @@ def compute_bc_loss_floor(
 # BC loss computation
 # ---------------------------------------------------------------------------
 
+def direction_magnitude_reg(exec_heads, coef: float) -> torch.Tensor:
+    """``coef * (||raw|| - 1)^2`` on the PRE-normalize output of both
+    move_direction and kick_direction, meaned over the batch and unweighted
+    by any BC label mask.
+
+    ``move_direction``/``kick_direction`` each work by outputting a raw
+    vector from a plain Linear layer, then L2-normalizing it to get the
+    Gaussian mean used for PPO sampling/log_prob. That normalize op's
+    Jacobian scales as ``~1/||raw||`` -- whenever the raw vector's own
+    magnitude collapses toward 0 (nothing in the ordinary training losses
+    constrains it to stay near 1: the cosine BC loss is scale-invariant in
+    ||raw||, and PPO's own log_prob is computed on the already-normalized
+    mean), that division amplifies whatever gradient is already flowing
+    through the mean by the same factor. Confirmed directly (2026-09-02
+    grad-norm investigation, see debug_grad_norms.py): across several real
+    spiky PPO minibatch steps, the gap between a hand-derived "expected"
+    weight-gradient norm and the actually-observed one tracked
+    ``1/||raw pre-normalize output||`` almost exactly (e.g. ||raw||=0.064
+    -> ~15x underestimate without this factor).
+
+    Deliberately a STANDALONE, unconditional function (previously this
+    lived inside ``bc_loss_from_tensor`` as an optional
+    ``direction_mag_reg_coef`` parameter, gated by each row's own BC label
+    mask AND scaled by whatever coefficient/schedule was weighting the BC
+    loss itself) -- the failure mode this guards against is a property of
+    the network's OWN output, not of any particular loss or label, so it
+    needs to apply in every training context that runs a real backward
+    pass through move_direction/kick_direction: PPO's own policy-gradient
+    update, Phase 1 BC pretrain, BC-repair, and the bc-only continuation
+    (see call sites in ppo_trainer.py -- search "direction_magnitude_reg").
+    Coupling it to the BC-aux-loss anneal meant it silently went to zero
+    exactly when PPO's own policy gradient (the thing actually driving
+    training once BC anneals off) most needed it.
+
+    ``coef <= 0.0`` (e.g. the default ``bc.direction_mag_reg_coef`` config
+    value) returns an inert zero tensor -- callers can always add this
+    unconditionally to their loss without an ``if coef > 0`` guard of their
+    own.
+    """
+    device = exec_heads.move_direction.device
+    if coef <= 0.0:
+        return torch.zeros((), device=device)
+    move_mag_sq = (exec_heads.move_direction_unnormalized.norm(dim=-1) - 1.0) ** 2
+    kick_mag_sq = (exec_heads.kick_direction_unnormalized.norm(dim=-1) - 1.0) ** 2
+    return coef * (move_mag_sq.mean() + kick_mag_sq.mean())
+
+
 def bc_loss_from_tensor(
     labels: torch.Tensor,
     decision_heads,
     exec_heads=None,
     direction_loss_weight: float = 3.0,
+    direction_loss_mode: str = "cosine",
     region_loss_weight: float = 1.0,
     pos_weight_kick: float = 1.0,
     pos_weight_tackle_attempt: float = 1.0,
@@ -764,10 +962,36 @@ def bc_loss_from_tensor(
             and the move_direction cosine loss). Used by Phase 0 of
             ``PPOTrainer.pretrain_combined()``, which only trains
             ``decision_net`` — see ai/knowledge.md "Phase 0" note.
-        direction_loss_weight: Multiplier on the move_direction cosine loss.
-            From ai_config.json['bc']['direction_loss_weight'] (default 3.0).
-            Upweights direction relative to ~11 Bernoulli BCE heads so it gets
-            proportional gradient pressure. Ignored when exec_heads is None.
+        direction_loss_weight: Multiplier on the move_direction loss (cosine
+            or mse, see direction_loss_mode). From ai_config.json['bc']
+            ['direction_loss_weight'] (default 3.0). Upweights direction
+            relative to ~11 Bernoulli BCE heads so it gets proportional
+            gradient pressure. Ignored when exec_heads is None.
+        direction_loss_mode: "cosine" (default) = current behaviour: fit
+            exec_heads.move_direction (already L2-normalized in
+            ExecutionNetwork.forward()) via 1 - cosine_similarity. This loss
+            is scale-invariant in the raw pre-normalize vector's magnitude,
+            so nothing constrains that magnitude to stay well-conditioned,
+            and the loss's own gradient w.r.t. the raw vector scales as
+            1/||raw|| -- confirmed live (debug_policy_net.py) to let ||raw||
+            drift unbounded over training while gradient norm shrinks in
+            lockstep. "mse" = fit exec_heads.move_direction_unnormalized
+            (the pre-normalize raw vector) directly via plain MSE against
+            the (genuinely unit-length) target -- no division-by-norm
+            anywhere in this loss's backward pass, so gradient magnitude is
+            just linear in the residual, same well-conditioned shape as any
+            ordinary regression. For two vectors that are both unit length,
+            ||a-b||^2 == 2(1-cos(a,b)) -- same fixed point as "cosine", just
+            better-conditioned gradients getting there. From
+            ai_config.json['bc']['direction_loss_mode']. See
+            direction_magnitude_reg() (below) for the raw-vector-magnitude
+            regularizer that used to live here as an optional param --
+            pulled out to a standalone, unconditionally-applied function so
+            it isn't coupled to whatever coefficient/schedule is scaling
+            THIS loss (e.g. PPO's BC-aux-loss anneal), since the failure
+            mode it guards against (||raw|| collapsing toward 0, amplifying
+            gradients through the L2-normalize op by ~1/||raw||) applies
+            regardless of which loss is currently training the network.
         region_loss_weight: Multiplier on the move_region_center MSE loss.
             From ai_config.json['bc']['region_loss_weight'] (default 1.0).
             Separate from direction_loss_weight: in Phase 1 the region target
@@ -902,18 +1126,24 @@ def bc_loss_from_tensor(
         )
         loss += exec_weight * exec_bce_loss
 
-        # --- Execution: move_direction cosine loss ---
+        # --- Execution: move_direction loss (cosine or mse, see
+        # direction_loss_mode's docstring above for the full rationale) ---
         # Upweighted by direction_loss_weight so the single continuous head gets
         # proportional gradient against ~11 Bernoulli heads.
-        # 1 - cosine_similarity → 0 when aligned, 2 when opposite.
         has_dir = (labels[:, _I_DIR_X].abs() + labels[:, _I_DIR_Y].abs()) > 1e-6
         if has_dir.any():
-            target_dir = labels[:, _I_DIR_X:_I_DIR_Y + 1]  # (N, 2)
-            pred_dir = exec_heads.move_direction             # (N, 2) raw (pre-normalize)
+            target_dir = labels[:, _I_DIR_X:_I_DIR_Y + 1]  # (N, 2), genuinely unit-length
             eps = 1e-6
-            pred_norm = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
-            cos_loss = 1.0 - (pred_norm * target_dir).sum(dim=-1)
-            dir_loss_per = direction_loss_weight * torch.where(has_dir, cos_loss, torch.zeros_like(cos_loss))
+            if direction_loss_mode == "mse":
+                pred_dir_raw = exec_heads.move_direction_unnormalized  # (N, 2) true raw, pre-normalize
+                mse = ((pred_dir_raw - target_dir) ** 2).sum(dim=-1)
+                dir_loss_per = direction_loss_weight * torch.where(has_dir, mse, torch.zeros_like(mse))
+            else:
+                # "cosine" (default). 1 - cosine_similarity -> 0 when aligned, 2 when opposite.
+                pred_dir = exec_heads.move_direction  # (N, 2) already L2-normalized in forward()
+                pred_norm = pred_dir / (pred_dir.norm(dim=-1, keepdim=True) + eps)
+                cos_loss = 1.0 - (pred_norm * target_dir).sum(dim=-1)
+                dir_loss_per = direction_loss_weight * torch.where(has_dir, cos_loss, torch.zeros_like(cos_loss))
             loss += exec_weight * dir_loss_per
 
         # --- Execution: kick_direction cosine loss (3D, only on kick ticks) ---
@@ -925,7 +1155,7 @@ def bc_loss_from_tensor(
             target_kdir = torch.stack(
                 [labels[:, _I_KICK_DIR_X], labels[:, _I_KICK_DIR_Y], labels[:, _I_KICK_DIR_Z]], dim=-1
             )  # (N, 3)
-            pred_kdir = exec_heads.kick_direction  # (N, 3) raw
+            pred_kdir = exec_heads.kick_direction  # (N, 3) already L2-normalized in forward()
             pred_kdir_norm = pred_kdir / (pred_kdir.norm(dim=-1, keepdim=True) + eps)
             kdir_cos_loss = 1.0 - (pred_kdir_norm * target_kdir).sum(dim=-1)
             kick_dir_loss_per = direction_loss_weight * torch.where(

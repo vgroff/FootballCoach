@@ -24,6 +24,17 @@ from footballcoach.rules_ai import (
     _should_sprint_to_ball,
 )
 
+# This suite tests DECISION LOGIC (does the AI issue the right order in
+# response to state X), not decision-cadence throttling (covered
+# separately, e.g. outcome_baseline.py's --decision-interval-ticks sweeps)
+# -- so every AI here is constructed with decision_interval_ticks=1
+# (decide on every act() call) to keep the two concerns independent. The
+# real rules-based AI classes default to a config-driven interval instead
+# (matching the trained policy's own decision cadence -- see rules_ai.py's
+# _RulesBasedAI/_default_decision_interval_ticks); tests that called
+# act()/decide() more than once per test would otherwise see later calls
+# silently no-op until that interval elapsed.
+
 from tests.conftest import make_player
 
 
@@ -67,20 +78,20 @@ def _make_simple_match(
 class TestPhase1RulesAI:
     def test_issues_get_possession_when_no_order_and_no_ball(self):
         match, p1, _ = _make_simple_match()
-        p1.ai = Phase1RulesAI()
+        p1.ai = Phase1RulesAI(decision_interval_ticks=1)
         assert p1.current_order is None
         p1.ai.act(p1, match, 0)
         assert isinstance(p1.current_order, GetPossessionOrder)
 
     def test_issues_move_order_when_has_ball_and_no_order(self):
         match, p1, _ = _make_simple_match(ball_possessed_by="p1")
-        p1.ai = Phase1RulesAI()
+        p1.ai = Phase1RulesAI(decision_interval_ticks=1)
         p1.ai.act(p1, match, 0)
         assert isinstance(p1.current_order, MoveOrder)
 
     def test_move_order_target_in_opponent_box_for_left_team(self):
         match, p1, _ = _make_simple_match(attacker_team=Team.LEFT, ball_possessed_by="p1")
-        p1.ai = Phase1RulesAI()
+        p1.ai = Phase1RulesAI(decision_interval_ticks=1)
         for _ in range(20):  # check across random seeds
             p1.current_order = None
             p1.ai.act(p1, match, 0)
@@ -92,7 +103,7 @@ class TestPhase1RulesAI:
 
     def test_move_order_target_in_opponent_box_for_right_team(self):
         match, _, p2 = _make_simple_match(ball_possessed_by="p2")
-        p2.ai = Phase1RulesAI()
+        p2.ai = Phase1RulesAI(decision_interval_ticks=1)
         for _ in range(20):
             p2.current_order = None
             p2.ai.act(p2, match, 0)
@@ -101,19 +112,35 @@ class TestPhase1RulesAI:
             box_inner_x = -(match.pitch.half_length - match.pitch.box_length_m)
             assert target.x <= box_inner_x + 1e-6, f"target.x={target.x} not in left box"
 
-    def test_does_not_replace_active_move_order_while_has_ball(self):
+    def test_recomputes_move_order_target_while_has_ball(self):
+        """decide() always recomputes a fresh target on every call (not just
+        when the order type changes) -- deliberately memoryless/idempotent
+        given current player/match state, rather than locking a target in
+        once and holding it for the order's whole lifetime. See rules_ai.py's
+        Phase1RulesAI.decide() docstring: a prior version only recomputed the
+        target when the order type changed, which made a genuinely
+        persistent Phase1RulesAI diverge measurably from bc.py's
+        phase1_labels() (a fresh Phase1RulesAI instance queried once per real
+        decision, with no memory of any previously-locked target) -- see
+        tests/ai_scenario/test_rules_ai_fresh_vs_persistent_equivalence.py.
+        A stale/arbitrary pre-existing MoveOrder must therefore be REPLACED
+        with a freshly-targeted one, not left untouched."""
         match, p1, _ = _make_simple_match(ball_possessed_by="p1")
-        p1.ai = Phase1RulesAI()
-        existing = MoveOrder(target_position=Vector3(40, 5, 0))
-        p1.current_order = existing
+        p1.ai = Phase1RulesAI(decision_interval_ticks=1)
+        stale = MoveOrder(target_position=Vector3(40, 5, 0))
+        p1.current_order = stale
         p1.ai.act(p1, match, 0)
-        assert p1.current_order is existing  # unchanged
+        assert isinstance(p1.current_order, MoveOrder)
+        assert p1.current_order is not stale
+        assert p1.current_order.target_position != stale.target_position, (
+            "target should be freshly recomputed via _nearest_box_point, not the stale pre-set one"
+        )
 
     def test_switches_to_get_possession_when_ball_lost_mid_move_order(self):
         """KEY BUG REGRESSION: player had ball, was running (MoveOrder), lost
         possession — AI must immediately switch to GetPossessionOrder."""
         match, p1, _ = _make_simple_match()
-        p1.ai = Phase1RulesAI()
+        p1.ai = Phase1RulesAI(decision_interval_ticks=1)
         # Simulate: had ball, AI issued MoveOrder, then lost possession
         p1.current_order = MoveOrder(target_position=Vector3(40, 5, 0))
         # Ball is now loose (p1 does NOT have it)
@@ -126,26 +153,32 @@ class TestPhase1RulesAI:
     def test_switches_to_get_possession_when_ball_lost_immediately(self):
         """Possession is given to opponent; p1 had a MoveOrder; AI should react."""
         match, p1, p2 = _make_simple_match(ball_possessed_by="p2")
-        p1.ai = Phase1RulesAI()
+        p1.ai = Phase1RulesAI(decision_interval_ticks=1)
         p1.current_order = MoveOrder(target_position=Vector3(40, 0, 0))
         p1.ai.act(p1, match, 0)
         assert isinstance(p1.current_order, GetPossessionOrder)
 
-    def test_get_possession_not_reissued_each_tick_once_active(self):
-        """Once GetPossessionOrder is active, AI should not replace it each tick."""
+    def test_get_possession_recomputed_each_tick_but_stays_equivalent(self):
+        """Once GetPossessionOrder is active, decide() still recomputes a
+        fresh order every call (see test_recomputes_move_order_target_while_
+        has_ball's docstring for why) -- so the OBJECT is not reused, but
+        since nothing in the match moved between these two act() calls, the
+        freshly-recomputed order is value-equal to the previous one (same
+        type, same target, same sprint flag)."""
         match, p1, _ = _make_simple_match()
-        p1.ai = Phase1RulesAI()
+        p1.ai = Phase1RulesAI(decision_interval_ticks=1)
         p1.ai.act(p1, match, 0)
-        existing_order = p1.current_order
-        assert isinstance(existing_order, GetPossessionOrder)
+        first_order = p1.current_order
+        assert isinstance(first_order, GetPossessionOrder)
         p1.ai.act(p1, match, 1)
-        # Should be the same object (not re-issued)
-        assert p1.current_order is existing_order
+        assert isinstance(p1.current_order, GetPossessionOrder)
+        assert p1.current_order.target_position == first_order.target_position
+        assert p1.current_order.sprint == first_order.sprint
 
     def test_issues_new_move_order_each_time_possession_gained_without_order(self):
         """After completing a MoveOrder (order cleared), gaining ball again → new MoveOrder."""
         match, p1, _ = _make_simple_match(ball_possessed_by="p1")
-        p1.ai = Phase1RulesAI()
+        p1.ai = Phase1RulesAI(decision_interval_ticks=1)
         p1.current_order = None  # order just completed
         p1.ai.act(p1, match, 0)
         assert isinstance(p1.current_order, MoveOrder)
@@ -153,7 +186,7 @@ class TestPhase1RulesAI:
     def test_full_possession_cycle_via_match_steps(self):
         """Integration: run match ticks and verify AI switches orders when possession changes."""
         match, p1, p2 = _make_simple_match()
-        p1.ai = Phase1RulesAI()
+        p1.ai = Phase1RulesAI(decision_interval_ticks=1)
 
         # Give p1 the ball — AI should issue MoveOrder on next act()
         match._set_possession("p1")
@@ -264,13 +297,13 @@ class TestStagedGoalkeeperAI:
     def test_issues_save_order_when_ball_aimed_at_goal(self):
         match, p1, _ = _make_simple_match(ball_position=Vector3(0, 0, 0))
         match.ball.velocity = Vector3(-20.0, 0, 0)  # aimed at p1's (LEFT) goal
-        p1.ai = StagedGoalkeeperAI()
+        p1.ai = StagedGoalkeeperAI(decision_interval_ticks=1)
         p1.ai.act(p1, match, 0)
         assert isinstance(p1.current_order, SaveOrder)
 
     def test_issues_move_order_to_goal_centre_when_no_order_and_ball_not_threatening(self):
         match, p1, _ = _make_simple_match()
-        p1.ai = StagedGoalkeeperAI()
+        p1.ai = StagedGoalkeeperAI(decision_interval_ticks=1)
         p1.ai.act(p1, match, 0)
         assert isinstance(p1.current_order, MoveOrder), (
             "AI should jog back to goal centre when the ball is loose but not aimed at goal"
@@ -278,14 +311,14 @@ class TestStagedGoalkeeperAI:
 
     def test_does_not_issue_save_order_when_has_ball(self):
         match, p1, _ = _make_simple_match(ball_possessed_by="p1")
-        p1.ai = StagedGoalkeeperAI()
+        p1.ai = StagedGoalkeeperAI(decision_interval_ticks=1)
         p1.current_order = None
         p1.ai.act(p1, match, 0)
         assert p1.current_order is None
 
     def test_does_not_replace_existing_order(self):
         match, p1, _ = _make_simple_match()
-        p1.ai = StagedGoalkeeperAI()
+        p1.ai = StagedGoalkeeperAI(decision_interval_ticks=1)
         existing = MoveOrder(target_position=Vector3(0, 0, 0))
         p1.current_order = existing
         p1.ai.act(p1, match, 0)
@@ -294,7 +327,7 @@ class TestStagedGoalkeeperAI:
     def test_reissues_save_order_after_order_cleared(self):
         match, p1, _ = _make_simple_match(ball_position=Vector3(0, 0, 0))
         match.ball.velocity = Vector3(-20.0, 0, 0)  # aimed at p1's (LEFT) goal
-        p1.ai = StagedGoalkeeperAI()
+        p1.ai = StagedGoalkeeperAI(decision_interval_ticks=1)
         p1.current_order = None
         p1.ai.act(p1, match, 0)
         assert isinstance(p1.current_order, SaveOrder)
@@ -313,19 +346,19 @@ class TestBallCarrierAttackerAI:
 
     def test_does_nothing_when_no_ball(self):
         match, p1, _ = _make_simple_match()
-        p1.ai = BallCarrierAttackerAI(self._aim())
+        p1.ai = BallCarrierAttackerAI(self._aim(), decision_interval_ticks=1)
         p1.ai.act(p1, match, 0)
         assert p1.current_order is None
 
     def test_issues_shoot_order_when_has_ball_and_no_order(self):
         match, p1, _ = _make_simple_match(ball_possessed_by="p1")
-        p1.ai = BallCarrierAttackerAI(self._aim())
+        p1.ai = BallCarrierAttackerAI(self._aim(), decision_interval_ticks=1)
         p1.ai.act(p1, match, 0)
         assert isinstance(p1.current_order, ShootOrder)
 
     def test_switches_to_shoot_when_move_order_stalls(self):
         match, p1, _ = _make_simple_match(ball_possessed_by="p1")
-        ai = BallCarrierAttackerAI(self._aim())
+        ai = BallCarrierAttackerAI(self._aim(), decision_interval_ticks=1)
         p1.ai = ai
         target = Vector3(40, 0, 0)
         p1.current_order = MoveOrder(target_position=target)
@@ -339,7 +372,7 @@ class TestBallCarrierAttackerAI:
 
     def test_does_not_switch_while_approaching(self):
         match, p1, _ = _make_simple_match(ball_possessed_by="p1")
-        ai = BallCarrierAttackerAI(self._aim())
+        ai = BallCarrierAttackerAI(self._aim(), decision_interval_ticks=1)
         p1.ai = ai
         target = Vector3(40, 0, 0)
         p1.current_order = MoveOrder(target_position=target)
@@ -351,7 +384,7 @@ class TestBallCarrierAttackerAI:
 
     def test_resets_stall_detection_on_possession_loss(self):
         match, p1, _ = _make_simple_match(ball_possessed_by="p1")
-        ai = BallCarrierAttackerAI(self._aim())
+        ai = BallCarrierAttackerAI(self._aim(), decision_interval_ticks=1)
         p1.ai = ai
         target = Vector3(40, 0, 0)
         p1.current_order = MoveOrder(target_position=target)
@@ -407,7 +440,7 @@ class TestSprintWaypointAI:
         match, p1, _ = _make_simple_match()
         waypoints = [Vector3(10, 0, 0), Vector3(20, 0, 0), Vector3(30, 0, 0)]
         p1.current_order = MoveOrder(target_position=waypoints[0])
-        ai = SprintWaypointAI(waypoints, start_idx=1)
+        ai = SprintWaypointAI(waypoints, start_idx=1, decision_interval_ticks=1)
         p1.ai = ai
         # Order still active — no new order
         ai.act(p1, match, 0)
@@ -417,7 +450,7 @@ class TestSprintWaypointAI:
         match, p1, _ = _make_simple_match()
         waypoints = [Vector3(10, 0, 0), Vector3(20, 0, 0), Vector3(30, 0, 0)]
         p1.current_order = None
-        ai = SprintWaypointAI(waypoints, start_idx=1)
+        ai = SprintWaypointAI(waypoints, start_idx=1, decision_interval_ticks=1)
         p1.ai = ai
         ai.act(p1, match, 0)
         assert isinstance(p1.current_order, MoveOrder)
@@ -427,7 +460,7 @@ class TestSprintWaypointAI:
         match, p1, _ = _make_simple_match()
         waypoints = [Vector3(i * 10, 0, 0) for i in range(4)]
         p1.current_order = MoveOrder(target_position=waypoints[0])
-        ai = SprintWaypointAI(waypoints, start_idx=1)
+        ai = SprintWaypointAI(waypoints, start_idx=1, decision_interval_ticks=1)
         for expected_idx in range(1, len(waypoints)):
             p1.current_order = None
             ai.act(p1, match, expected_idx)
@@ -437,6 +470,6 @@ class TestSprintWaypointAI:
         match, p1, _ = _make_simple_match()
         waypoints = [Vector3(10, 0, 0)]
         p1.current_order = None
-        ai = SprintWaypointAI(waypoints, start_idx=1)  # start_idx beyond list
+        ai = SprintWaypointAI(waypoints, start_idx=1, decision_interval_ticks=1)  # start_idx beyond list
         ai.act(p1, match, 0)
         assert p1.current_order is None  # no more waypoints

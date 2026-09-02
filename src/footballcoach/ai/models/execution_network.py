@@ -321,10 +321,12 @@ class ExecutionNetwork(nn.Module):
 
         return ExecutionHeadsRaw(
             move_direction=raw_move / (raw_move.norm(dim=-1, keepdim=True) + eps),
+            move_direction_unnormalized=raw_move,
             exec_move_logit=self.exec_move_logit(h),
             sprint_logit=self.sprint_logit(h),
             kick_logit=self.kick_logit(h),
             kick_direction=raw_kick / (raw_kick.norm(dim=-1, keepdim=True) + eps),
+            kick_direction_unnormalized=raw_kick,
             kick_power=self.kick_power(h),
             kick_spin=self.kick_spin(h),
             tackle_attempt_logit=self.tackle_attempt_logit(h),

@@ -489,7 +489,10 @@ def _episode_rows_to_match_log(
     _HALF_DIAG = math.hypot(52.5, 34.0)
 
     # Real elapsed seconds per TIMED sample (see record_demonstrations.py's
-    # `sample_interval_s` / ai_config.json's bc.demo_sample_interval_s).
+    # `sample_every_n_decisions` -- recording always runs at the env's real
+    # `observation.decision_interval_s` cadence, so one timed sample is
+    # exactly `sample_every_n_decisions * decision_interval_s` of sim time,
+    # not an independently-configured interval).
     # Previously this reconstruction used raw `row - start` as "time_s",
     # which is NOT real time -- kick/tackle callbacks insert extra rows
     # between timed samples, and even ignoring those, one row-index step
@@ -498,12 +501,16 @@ def _episode_rows_to_match_log(
     # the player's own recorded speed_mps and this same divisor) was closer
     # to 4.5s -- a ~4x error that made a clean, fast sprint-and-intercept
     # look like a slow multi-second jog. Approximated as
-    # (index within trainee_rows) * sample_interval_s -- exact when no
+    # (index within trainee_rows) * _sample_interval_s -- exact when no
     # kick/tackle mid-interval callback has inserted an extra trainee row
     # (the common case), a slight underestimate otherwise (those extra rows
     # don't represent a new timed sample, but do advance the index by 1).
     from footballcoach.ai.config import load_ai_config
-    _sample_interval_s = float(load_ai_config()["bc"]["demo_sample_interval_s"])
+    _ai_cfg = load_ai_config()
+    _sample_interval_s = (
+        float(_ai_cfg["bc"]["demo_sample_every_n_decisions"])
+        * float(_ai_cfg["observation"]["decision_interval_s"])
+    )
 
     def _pos3(feat, pos_x_i, pos_y_i) -> tuple[float, float, float]:
         return (
@@ -559,12 +566,31 @@ def _episode_rows_to_match_log(
         one un-recorded decision interval's physics substeps). Reading only
         end_row silently drops every non-terminal component, which looked
         exactly like "the trainee never got possession" even on episodes
-        where it clearly did (verified against live rollout data)."""
+        where it clearly did (verified against live rollout data).
+
+        REAL BUG FIXED: [start_row, end_row] contains BOTH players'
+        interleaved rows (see the trainee_rows/is_trainee discussion
+        elsewhere in this function), and each row carries that OWNER's own
+        INDEPENDENTLY computed reward/components -- record_demonstrations.py
+        backfills the trainee's own env.step() reward onto trainee rows and
+        each secondary player's own env.last_secondary_results reward onto
+        THEIR rows, deliberately NOT merged (see that file's own comment:
+        "Previously every row got the SAME env-level-combined dict... e.g. a
+        trainee 'win' row would also carry the losing opponent's own
+        loss_terminal penalty"). Summing over every row in the range
+        regardless of owner re-introduces exactly that bug one level up:
+        confirmed against a real "win" episode showing an "opponent_box:
+        -2.5" component that has nothing to do with the trainee at all --
+        it's the OPPONENT's own penalty for conceding box possession,
+        recorded on the opponent's own interleaved row. Masking to
+        is_trainee rows only reads just the trainee's own reward stream, as
+        intended."""
         if not ds.has_reward_components:
             return {}
         from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS
         lbl_map = dict(REWARD_COMP_LABELS)
-        comp_sum = ds._reward_components[start_row:end_row + 1].sum(axis=0)
+        trainee_mask = ds._is_trainee[start_row:end_row + 1] > 0.5
+        comp_sum = ds._reward_components[start_row:end_row + 1][trainee_mask].sum(axis=0)
         return {
             lbl_map.get(k, k): round(float(comp_sum[i]), 4)
             for i, k in enumerate(ds._reward_component_keys)
@@ -725,20 +751,36 @@ def _episode_rows_to_match_log(
         other_feat = _opp_feat(row)
         other_pos = _pos3(other_feat, _POS_X, _POS_Y)
         other_vel = _vel3(other_feat, _VEL_X, _VEL_Y)
+        # Computed BEFORE the consistency snapshot block below (not after,
+        # as this used to be ordered) so those snapshots can carry the
+        # correct, CURRENT possessor_id -- see MatchEvent's own schema
+        # (engine/match_logger.py): a real "consistency" event always
+        # carries possessor_id, and scripts/visualise_match_log.py's
+        # possession-trail colouring trusts it on EVERY "consistency" event,
+        # not just "possession_change" ones. Omitting it here (as this
+        # reconstruction used to) meant `ev.get("possessor_id")` silently
+        # returned None on every periodic snapshot, incorrectly resetting
+        # the trail to "loose ball" grey immediately after a real, correct
+        # possession_change -- a real, confirmed rendering bug: the data was
+        # right (one real change, possession held the whole rest of the
+        # episode) but the render made it look like the ball kept coming
+        # loose again after every ~2s snapshot.
+        self_has_poss = self_feat[_HAS_POSS] > 0.5
+        opp_has_poss = other_feat[_HAS_POSS] > 0.5
+        possessor = "self" if self_has_poss else "opponent" if opp_has_poss else None
         if row != ep_end and t - _last_snapshot_t >= _CONSISTENCY_INTERVAL_S:
             events.append({
                 "time_s": t, "event": "consistency", "player_id": "self",
                 "player_pos": pos, "player_vel": vel, "ball_pos": ball_pos,
+                "possessor_id": possessor,
                 **_pred_fields(row),
             })
             events.append({
                 "time_s": t, "event": "consistency", "player_id": "opponent",
                 "player_pos": other_pos, "player_vel": other_vel, "ball_pos": ball_pos,
+                "possessor_id": possessor,
             })
             _last_snapshot_t = t
-        self_has_poss = self_feat[_HAS_POSS] > 0.5
-        opp_has_poss = other_feat[_HAS_POSS] > 0.5
-        possessor = "self" if self_has_poss else "opponent" if opp_has_poss else None
         if possessor != last_possessor and (possessor is not None or last_possessor is not None):
             events.append({
                 "time_s": t, "event": "possession_change",
@@ -791,11 +833,20 @@ def _episode_rows_to_match_log(
     # type -- small muted marker, not a "real" event) right before
     # episode_end so the visualiser's generic player_id/player_pos track
     # picks up each player's final position.
+    # Explicit, not reused from the loop's last iteration -- see the
+    # possessor_id fix above; recomputed directly off end_self_feat/
+    # end_opp_feat rather than relying on `possessor` having leaked out of
+    # the loop with the right value.
+    end_possessor = (
+        "self" if end_self_feat[_HAS_POSS] > 0.5 else
+        "opponent" if end_opp_feat[_HAS_POSS] > 0.5 else None
+    )
     events.append({
         "time_s": end_t, "event": "consistency", "player_id": "self",
         "player_pos": _pos3(end_self_feat, _POS_X, _POS_Y),
         "player_vel": _vel3(end_self_feat, _VEL_X, _VEL_Y),
         "ball_pos": _ball_pos3(end_ball_feat),
+        "possessor_id": end_possessor,
         **_pred_fields(ep_end),
     })
     events.append({
@@ -803,6 +854,7 @@ def _episode_rows_to_match_log(
         "player_pos": _pos3(end_opp_feat, _POS_X, _POS_Y),
         "player_vel": _vel3(end_opp_feat, _VEL_X, _VEL_Y),
         "ball_pos": _ball_pos3(end_ball_feat),
+        "possessor_id": end_possessor,
     })
     # NOTE: `end_ball_feat`/`end_t` are simply whatever the LAST recorded row
     # of the episode is -- this function never extrapolates or replays
@@ -819,7 +871,12 @@ def _episode_rows_to_match_log(
     events.append({
         "time_s": end_t, "event": "episode_end",
         "ball_pos": _ball_pos3(end_ball_feat),
-        "reward_total": round(float(ds._rewards[start:end + 1].sum()), 4),
+        # Same is_trainee masking as _reward_breakdown -- [start, end] holds
+        # both players' interleaved rows, and unmasked summing double-counts
+        # the opponent's own separately-computed reward alongside the
+        # trainee's (see _reward_breakdown's docstring for the real
+        # confirmed case this fixes).
+        "reward_total": round(float(ds._rewards[start:end + 1][ds._is_trainee[start:end + 1] > 0.5].sum()), 4),
         "reward_components": end_breakdown,
         "reward_cumulative": end_breakdown,
         "outcome": end_outcome,
@@ -866,6 +923,17 @@ def _save_worst_episode_match_log(
     from `val_idx` here (rows outside it never had a real forward pass this
     diagnostics run) rather than trusting residual_by_row's own default-0.0
     fill, which is indistinguishable from a genuine zero residual.
+
+    ALSO saves, per outcome, the MEDIAN episode (the one whose |residual|
+    is closest to that outcome's median |residual| across all its episodes)
+    as "<stem>_<outcome>_median<suffix>" -- the worst-episode file above is,
+    by construction, always the extreme tail; without a median counterpart
+    there's no way to tell "every episode of this outcome looks about this
+    bad" from "one outlier, the rest are fine" just from the worst file
+    alone. Same reconstruction path as the worst file (_episode_rows_to_
+    match_log), so it's viewable the same way; episode_end additionally
+    carries `"selection": "median"` (vs `"worst"` on the worst file) so the
+    two are distinguishable without relying on the filename.
 
     ALSO saves one more file, independent of the per-outcome selection
     above: the single complete val episode with the most REAL kicks (see
@@ -945,12 +1013,41 @@ def _save_worst_episode_match_log(
         events[-1]["residual"] = worst_residual
         events[-1]["row_range"] = [int(true_start), int(true_end)]
         events[-1]["n_episodes_this_outcome"] = len(outcome_ranges)
+        events[-1]["selection"] = "worst"
         outcome_path = out_path.with_name(f"{out_path.stem}_{outcome}{out_path.suffix}")
         with open(outcome_path, "w") as f:
             json.dump(events, f, indent=2)
         log.info(f"--- Worst val episode for outcome={outcome} ({len(outcome_ranges)} "
                   f"episode(s)): rows [{true_start}, {true_end}], "
                   f"residual={worst_residual:+.3f} -- saved match log to {outcome_path} ---")
+
+        # Median: the episode whose |residual| is closest to this outcome's
+        # own median |residual| -- see this function's own docstring for why
+        # (the worst file alone can't distinguish "everyone's about this
+        # bad" from "one outlier").
+        abs_residuals = [abs(residual_by_row[r[0]]) for r in outcome_ranges]
+        median_target = float(np.median(abs_residuals))
+        median_start, median_end = min(
+            outcome_ranges, key=lambda r: abs(abs(residual_by_row[r[0]]) - median_target)
+        )
+        median_residual = float(residual_by_row[median_start])
+        true_start, true_end = _resolve_full_range(median_start)
+        events = _episode_rows_to_match_log(
+            ds, true_start, true_end,
+            returns_by_row=returns_by_row, residual_by_row=residual_by_row,
+            has_prediction=has_prediction,
+        )
+        events[-1]["residual"] = median_residual
+        events[-1]["row_range"] = [int(true_start), int(true_end)]
+        events[-1]["n_episodes_this_outcome"] = len(outcome_ranges)
+        events[-1]["selection"] = "median"
+        median_path = out_path.with_name(f"{out_path.stem}_{outcome}_median{out_path.suffix}")
+        with open(median_path, "w") as f:
+            json.dump(events, f, indent=2)
+        log.info(f"--- Median val episode for outcome={outcome} ({len(outcome_ranges)} "
+                  f"episode(s)): rows [{true_start}, {true_end}], "
+                  f"residual={median_residual:+.3f} (outcome median |residual|="
+                  f"{median_target:.3f}) -- saved match log to {median_path} ---")
 
     most_kicks_start, most_kicks_end = max(ranges, key=lambda r: _count_real_kicks(r[0], r[1]))
     kick_count = _count_real_kicks(most_kicks_start, most_kicks_end)

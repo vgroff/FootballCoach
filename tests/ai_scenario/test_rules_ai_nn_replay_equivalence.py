@@ -175,22 +175,37 @@ def _install_kick_angle_capture_hook() -> dict:
     return captured
 
 
-def _force_fresh_movement_decision(player, match):
+def _force_fresh_movement_decision(player, match, decision_ai, *, is_gap_tick: bool):
     """Mirror `bc.py::phase1_labels()`'s snapshot/force-decision/restore
     pattern for ticks where the live order machinery has no current order in
     effect (a transient gap between one order completing and the AI's next
     decision -- e.g. right after a push-kick releases the ball, before
     Phase1RulesAI decides the next GetPossessionOrder). `Match._apply_movement`
     now correctly coasts the player under their existing velocity during this
-    gap (see `match.py`'s inertial-coasting fix) -- but that's a LIVE-PLAY
-    physics detail the BC label generator never represents: `phase1_labels()`
-    always clears `current_order` and forces a fresh `Phase1RulesAI` decision,
-    so the network is never trained to imitate "coast, no opinion" -- only
-    genuine SPRINT/JOG/STANDSTILL decisions. Replaying the live match's literal
-    gap-tick state would test something the BC pipeline never asks the network
-    to reproduce. This computes the same "what would a fresh decision's
-    execute() do" fields `phase1_labels()` would, fully invisibly to the real
-    match (same snapshot/restore contract).
+    gap (see `match.py`'s inertial-coasting fix).
+
+    `decision_ai` must be a PERSISTENT `Phase1RulesAI` instance (constructed
+    once, outside the capture loop, with the SAME decision_interval_ticks as
+    the real trainee's own AI -- see this test's own call site) rather than
+    a fresh one per call: Phase1RulesAI's decision cadence is stateful
+    (`_ticks_since_decision`), and this function is called once per REAL
+    match tick -- EVERY tick, not just gap ticks, see the call site -- in
+    lockstep with the real trainee AI's own `.act()` calls, so a
+    `decision_ai` ticked the same way stays in the exact same decision-phase
+    as the real one for the whole episode.
+
+    `is_gap_tick` gates whether the decided order's `execute()` actually
+    runs: `decide()` itself is pure/deterministic (no rng draw -- see
+    rules_ai.py's own comments), but `execute()` can trigger a REAL push-
+    kick, which draws real kick-angle noise from `match.rng`. Only the
+    ACTUAL gap-tick call needs that result; calling `execute()` on every
+    decision tick regardless (an earlier, wrong version of this function)
+    drew EXTRA, spurious rng noise on every ordinary decision tick too --
+    confirmed via direct instrumentation to shift ball_vel by a measurable
+    amount and break the real/shadow equivalence this test checks, even
+    though decide()'s own phase-locked cadence was already correct by that
+    point. So: always tick decision_ai (keeps the counter phase-locked),
+    only ever execute()/consume rng when the result is actually needed.
     """
     from footballcoach.orders import GetPossessionOrder, MoveOrder
 
@@ -215,9 +230,9 @@ def _force_fresh_movement_decision(player, match):
     player.on_tackle = None
     exec_move, sprint, move_direction = False, False, None
     try:
-        Phase1RulesAI().act(player, match, trial_tick=0)
+        decision_ai.act(player, match, trial_tick=0)
         order = player.current_order
-        if isinstance(order, (MoveOrder, GetPossessionOrder)):
+        if is_gap_tick and isinstance(order, (MoveOrder, GetPossessionOrder)):
             order.execute(player, match, match.dt_s)
             if player.desired_speed_mode is not None:
                 exec_move = player.desired_speed_mode is not SpeedMode.STANDSTILL
@@ -244,21 +259,38 @@ def _force_fresh_movement_decision(player, match):
     return exec_move, sprint, move_direction
 
 
-def _capture_tick_record(player, match, movement_snapshot: dict, kick_angle: dict) -> dict:
+def _capture_tick_record(
+    player, match, movement_snapshot: dict, kick_angle: dict, decision_ai,
+) -> dict:
     """Read back the raw execution-level fields the order machinery produced
     on `player` THIS tick -- the same field set (and the same rule: never
     hand-derive from Order fields) `ai/knowledge.md`'s BC-label corollary
     mandates. Movement fields come from `movement_snapshot` (see
     `_install_movement_capture_hook`); kick/tackle fields are read directly
     off `player` since those are NOT reset until the next tick's
-    `_process_orders()`."""
+    `_process_orders()`. `decision_ai`: see _force_fresh_movement_decision's
+    own docstring -- must be the SAME persistent, phase-synchronized
+    instance across the whole capture loop."""
     speed_mode = movement_snapshot["speed_mode"]
+    # Tick decision_ai EVERY call, unconditionally -- not just on gap ticks
+    # -- so its internal decision-cadence counter advances once per real
+    # match tick, exactly like the real trainee AI's own .act() (called
+    # every tick by Match._process_orders regardless of gap/no-gap). Only
+    # gating this call on speed_mode is None would mean decision_ai simply
+    # never gets ticked on ordinary (non-gap) ticks at all, letting its
+    # phase drift arbitrarily far from the real one -- confirmed via direct
+    # instrumentation: with that (wrong, earlier) version, decision_ai's
+    # counter stayed frozen for ~10 real ticks in a row between gaps
+    # instead of advancing 1 per tick like the real one does.
+    forced_exec_move, forced_sprint, forced_move_direction = _force_fresh_movement_decision(
+        player, match, decision_ai, is_gap_tick=speed_mode is None,
+    )
     if speed_mode is None:
-        # Gap tick -- no order in effect. See _force_fresh_movement_decision:
-        # the live match now correctly coasts here, but that's not a state
-        # the BC-trained network ever learned to imitate, so replay a forced
-        # fresh decision instead of the live match's literal "no intent".
-        exec_move, sprint, move_direction = _force_fresh_movement_decision(player, match)
+        # Gap tick -- no order in effect. Use the synthetic decision just
+        # computed above (see _force_fresh_movement_decision's own
+        # docstring for why a phase-synchronized decision_ai makes this
+        # correctly match the real match's own coast-vs-decide cadence).
+        exec_move, sprint, move_direction = forced_exec_move, forced_sprint, forced_move_direction
     else:
         exec_move = speed_mode != SpeedMode.STANDSTILL
         sprint = speed_mode == SpeedMode.SPRINT
@@ -384,10 +416,18 @@ def _assert_snapshots_close(a: dict, b: dict, tick: int) -> None:
 @pytest.mark.parametrize("seed", [1, 2, 3])
 def test_rules_ai_replay_through_apply_nn_action_is_identical(seed: int):
     real_match = build_1v1_scenario(seed=seed, trainee_team=Team.LEFT)
-    real_match.player_by_id(TRAINEE_ID).ai = Phase1RulesAI()
+    real_trainee_ai = Phase1RulesAI()
+    real_match.player_by_id(TRAINEE_ID).ai = real_trainee_ai
     # Opponent is immobile by default (opponent_immobile_prob=1.0) -- ai=None.
     # Both matches use the real, untouched default kicking_params/physics
     # config -- see module docstring for why no config needs zeroing.
+
+    # Persistent, phase-synchronized shadow decision AI for gap ticks -- see
+    # _force_fresh_movement_decision's own docstring. Same decision_interval_
+    # ticks as the real trainee AI (read off it directly, not re-derived, so
+    # this can never drift out of sync with whatever the real default is),
+    # ticked exactly once per real match tick below, same as the real one.
+    shadow_decision_ai = Phase1RulesAI(decision_interval_ticks=real_trainee_ai.decision_interval_ticks)
 
     movement_snapshot = _install_movement_capture_hook(real_match, TRAINEE_ID)
     kick_angle = _install_kick_angle_capture_hook()
@@ -399,7 +439,10 @@ def test_rules_ai_replay_through_apply_nn_action_is_identical(seed: int):
         for _ in range(EPISODE_TICKS):
             real_match.step()
             records.append(
-                _capture_tick_record(real_match.player_by_id(TRAINEE_ID), real_match, movement_snapshot, kick_angle)
+                _capture_tick_record(
+                    real_match.player_by_id(TRAINEE_ID), real_match, movement_snapshot, kick_angle,
+                    shadow_decision_ai,
+                )
             )
             snapshots.append(_snapshot(real_match))
             rng_states.append(real_match.rng.getstate())

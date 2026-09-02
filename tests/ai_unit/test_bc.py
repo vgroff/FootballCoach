@@ -163,10 +163,12 @@ def _zeros_heads(n: int) -> tuple[DecisionHeadsRaw, ExecutionHeadsRaw]:
     )
     e_heads = ExecutionHeadsRaw(
         move_direction=z2.clone(),
+        move_direction_unnormalized=z2.clone(),
         exec_move_logit=z1.clone(),
         sprint_logit=z1.clone(),
         kick_logit=z1.clone(),
         kick_direction=z2.clone(),
+        kick_direction_unnormalized=z2.clone(),
         kick_power=z1.clone(),
         kick_spin=torch.zeros(n, 3),
         tackle_attempt_logit=z1.clone(),

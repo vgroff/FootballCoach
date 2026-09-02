@@ -63,7 +63,7 @@ def _worker_main(
 
     import torch
 
-    from footballcoach.ai.curriculum.envs import build_env, bc_label_fn_for_phase
+    from footballcoach.ai.curriculum.envs import build_env, bc_label_fn_for_phase_player
     from footballcoach.ai.curriculum.phases import PHASES_BY_ID
     from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
     from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
@@ -75,7 +75,11 @@ def _worker_main(
 
     phase = PHASES_BY_ID[phase_id]
     env = build_env(phase)
-    bc_label_fn = bc_label_fn_for_phase(phase_id)
+    # (player, match) -> BCLabel convention -- threaded into env.bc_label_fn
+    # below so NeuralPlayerAI.act() computes it internally, at the same
+    # instant as the observation. See PPOTrainer.train()'s own bc_label_fn
+    # docstring and NeuralPlayerAI.bc_label_fn's docstring for why.
+    bc_label_fn = bc_label_fn_for_phase_player(phase_id)
 
     # inference_only=True: no optimizer construction needed, this process
     # never runs a gradient step — the main process owns training. Must match
@@ -88,6 +92,7 @@ def _worker_main(
     if phase.frozen_heads:
         trainer.set_frozen_heads(phase.frozen_heads)
     env.sample_action_fn = trainer._sample_action
+    env.bc_label_fn = bc_label_fn
 
     obs = env.reset()
     buffer = RolloutBuffer()
@@ -141,9 +146,9 @@ def _worker_main(
 
             from footballcoach.ai.ppo.ppo_trainer import _action_to_numpy
 
-            bc_label_arr = None
-            if bc_label_fn is not None:
-                bc_label_arr = bc_label_fn(env).to_array()
+            # Computed INSIDE NeuralPlayerAI.act() (see env.bc_label_fn
+            # wiring above), at the same instant as tr["obs"].
+            bc_label_arr = tr.get("bc_label")
 
             buffer.add(
                 obs=tr["obs"],

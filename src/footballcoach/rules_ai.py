@@ -39,13 +39,98 @@ from footballcoach.orders import (
 )
 
 
-class Phase1RulesAI(PlayerAI):
+def _default_decision_interval_ticks() -> int:
+    """Ticks between decisions for rules-based AI, defaulting to MATCH the
+    real trained policy's own decision cadence -- ai_config.json's
+    observation.decision_interval_s / observation.sim_dt_s, computed exactly
+    the way ScenarioEnv itself derives _ticks_per_decision for NeuralPlayerAI
+    -- rather than a separately maintained number in some other config file
+    that could silently drift out of sync with it. (0.239s / 0.06s -> 4
+    ticks as of this writing.)"""
+    from footballcoach.ai.config import load_ai_config
+    cfg = load_ai_config()["observation"]
+    return max(1, round(float(cfg["decision_interval_s"]) / float(cfg["sim_dt_s"])))
+
+
+class _RulesBasedAI(PlayerAI):
+    """Shared base for every rules-based AI in this module.
+
+    Subclasses implement ``decide(player, match, trial_tick)`` (NOT
+    ``act()`` -- see PlayerAI's own docstring for why) and get decision-
+    cadence throttling for free, with no per-subclass boilerplate: ``act()``
+    itself lives once, here, inherited unchanged by everyone below.
+
+    ``decision_interval_ticks=None`` (the default for every rules-based AI
+    constructor in this file) resolves to ``_default_decision_interval_
+    ticks()`` -- the real trained policy's own cadence -- rather than
+    "every tick" the way a bare PlayerAI defaults; pass an explicit value
+    to override. This throttles WHICH order/target/sprint-flag the AI
+    holds, not the continuous steering underneath it -- Match._process_
+    orders calls order.execute() unconditionally every tick regardless of
+    this cadence, so movement itself never freezes (see PlayerAI's own
+    docstring for the full reasoning)."""
+
+    def __init__(self, decision_interval_ticks: int | None = None) -> None:
+        super().__init__(
+            decision_interval_ticks=(
+                decision_interval_ticks if decision_interval_ticks is not None
+                else _default_decision_interval_ticks()
+            )
+        )
+
+    def act(self, player: Player, match: Match, trial_tick: int) -> None:
+        if player.current_order is None:
+            # No order in effect at all -- never something to wait out the
+            # decision interval for. Throttling is only meant to gate
+            # "should I RECONSIDER my current order" (see this class's own
+            # docstring); "should I even HAVE an order" is not optional --
+            # a rules-based AI with current_order=None just sits there
+            # (Match._process_orders skips execute() entirely when order is
+            # None, leaving desired_speed_mode unset -- the player coasts
+            # on stale velocity, same as a human letting go of the
+            # controls). Confirmed a real bug via direct trace: an order
+            # that self-completes mid-interval (e.g. GetPossessionOrder
+            # reporting done the instant has_ball is confirmed, which can
+            # land on any tick, not just a decision tick) left the player
+            # coasting for up to decision_interval_ticks-1 ticks before the
+            # next SCHEDULED decision, even though "I have no order" is
+            # exactly the situation this AI exists to never leave
+            # unresolved. Force a decision now, and resync the cadence
+            # counter to it (not the original schedule) so the next
+            # ROUTINE reconsideration is a full interval from this forced
+            # one, not from wherever the old schedule happened to land.
+            self._ticks_since_decision = 0
+            self.decide(player, match, trial_tick)
+            return
+        super().act(player, match, trial_tick)
+
+
+class Phase1RulesAI(_RulesBasedAI):
     """Chase ball; when possessed, sprint toward the closest point on/in the
     opponent box (deterministic -- the true nearest point on the box
     rectangle to wherever we are, not a random point and not always the
     near edge).  Team-aware via player.team."""
 
-    def act(self, player: Player, match: Match, trial_tick: int) -> None:
+    def decide(self, player: Player, match: Match, trial_tick: int) -> None:
+        # Always recompute target_position fresh on every call -- decide()
+        # is deliberately memoryless/idempotent given the current player/
+        # match state, rather than locking a target in once and holding it
+        # for the order's whole lifetime. A prior version only recomputed
+        # the target when the order TYPE changed (or, for GetPossessionOrder,
+        # when `sprint` flipped) -- confirmed via
+        # tests/ai_scenario/test_rules_ai_fresh_vs_persistent_equivalence.py
+        # to make a genuinely continuous, persistent Phase1RulesAI diverge
+        # measurably (within a few seconds) from bc.py's phase1_labels(),
+        # which asks a BRAND NEW Phase1RulesAI instance what it would do
+        # once per real decision, with no memory of any previously-locked
+        # target -- exactly the mechanism DAgger's rollout labelling and
+        # PPO's on-policy BC-aux-loss both rely on. Always recomputing
+        # removes the discrepancy at the source (this shared decision
+        # function) instead of adding statefulness to every label-generation
+        # call site that queries it. Order objects are still only
+        # RECREATED (and the transition logged) when the order TYPE
+        # actually changes -- recomputing target_position on an unchanged
+        # order type is not itself a state transition worth logging.
         if match.ball.possessed_by == player.player_id:
             # Have the ball — run toward the closest point on the box
             # rectangle (deterministic: no rng draw here -- see
@@ -55,16 +140,15 @@ class Phase1RulesAI(PlayerAI):
             # divergence whenever it landed on the same tick as another
             # rng-consuming physics event, e.g. a tackle roll).
             if not isinstance(player.current_order, MoveOrder):
-                player.current_order = MoveOrder(
-                    target_position=_nearest_box_point(player, match),
-                    sprint=True,
-                    push_kick_enabled=True,
-                )
                 match._log_debug(f"[AI] {player.player_id}: MoveOrder (box run)")
+            player.current_order = MoveOrder(
+                target_position=_nearest_box_point(player, match),
+                sprint=True,
+                push_kick_enabled=True,
+            )
         else:
             # Don't have the ball — chase it.  Recalculate sprint every tick
-            # so the decision tracks changing distances; only re-issue the
-            # order when the flag actually flips to avoid resetting its state.
+            # so the decision tracks changing distances.
             #
             # Against an immobile opponent (can never move or contest the
             # ball), _should_sprint_to_ball's opponent-relative race check
@@ -82,27 +166,14 @@ class Phase1RulesAI(PlayerAI):
             should_sprint = opponent_is_immobile or _should_sprint_to_ball(player, match)
             # Push-kick target: same nearest-point-on-box logic as the
             # has-ball branch above, and the SAME field GetPossessionOrder
-            # now shares with MoveOrder (orders.py's _try_push_kick) --
-            # previously this lived as a separate, ad hoc reimplementation
-            # (rules_ai.py's since-removed _arm_box_kick) that aimed at a
-            # hardcoded box-CENTER point instead of the real target, and had
-            # no cap tying its kick distance to that target at all. One
-            # target, computed once per order (not every tick, matching the
-            # has-ball branch's own "locked in at possession/order-creation
-            # time" behaviour) -- not two divergent implementations.
+            # shares with MoveOrder (orders.py's _try_push_kick).
             if not isinstance(player.current_order, GetPossessionOrder):
-                player.current_order = GetPossessionOrder(
-                    sprint=should_sprint,
-                    target_position=_nearest_box_point(player, match),
-                    push_kick_enabled=True,
-                )
                 match._log_info(f"[AI] {player.player_id}: GetPossession")
-            elif player.current_order.sprint != should_sprint:
-                player.current_order = GetPossessionOrder(
-                    sprint=should_sprint,
-                    target_position=_nearest_box_point(player, match),
-                    push_kick_enabled=True,
-                )
+            player.current_order = GetPossessionOrder(
+                sprint=should_sprint,
+                target_position=_nearest_box_point(player, match),
+                push_kick_enabled=True,
+            )
 
 
 class StopWhenIdleAI(PlayerAI):
@@ -244,7 +315,7 @@ def _should_sprint_to_ball(player: Player, match: Match) -> bool:
 _GK_PARKED_TOLERANCE_M = 0.5  # matches MoveOrder's widened arrival tolerance for max_speed_on_arrival_mps=0.0
 
 
-class StagedGoalkeeperAI(PlayerAI):
+class StagedGoalkeeperAI(_RulesBasedAI):
     """GK AI: jogs to goal centre, then reacts to shots.
 
     Enters SaveOrder only when the ball's trajectory is aimed at the GK's goal
@@ -255,7 +326,8 @@ class StagedGoalkeeperAI(PlayerAI):
     step happened to leave it at.
     """
 
-    def __init__(self, jog_to_centre: bool = True) -> None:
+    def __init__(self, jog_to_centre: bool = True, decision_interval_ticks: int | None = None) -> None:
+        super().__init__(decision_interval_ticks=decision_interval_ticks)
         self._jog_to_centre = jog_to_centre  # kept for API compat; behaviour unchanged
 
     def _goal_centre(self, player: Player, match: Match) -> Vector3:
@@ -314,7 +386,7 @@ class StagedGoalkeeperAI(PlayerAI):
         if dist <= _GK_PARKED_TOLERANCE_M and player.speed_mps < 0.05:
             player.heading_rad = self._outfield_heading(player)
 
-    def act(self, player: Player, match: Match, trial_tick: int) -> None:
+    def decide(self, player: Player, match: Match, trial_tick: int) -> None:
         ball = match.ball
 
         # Ball is held by anyone → cease SaveOrder and jog back to goal centre.
@@ -352,7 +424,7 @@ class StagedGoalkeeperAI(PlayerAI):
                 )
 
 
-class BallCarrierAttackerAI(PlayerAI):
+class BallCarrierAttackerAI(_RulesBasedAI):
     """Ball carrier runs toward goal; if their MoveOrder progress stalls
     (distance to target starts increasing), the order completes, or the
     player is already at least as close to goal as the MoveOrder's own
@@ -365,7 +437,11 @@ class BallCarrierAttackerAI(PlayerAI):
     shooting via ``shot_selection.choose_shot_target()``.
     """
 
-    def __init__(self, aim_point: Vector3 | None = None, power_fraction: float = 0.9) -> None:
+    def __init__(
+        self, aim_point: Vector3 | None = None, power_fraction: float = 0.9,
+        decision_interval_ticks: int | None = None,
+    ) -> None:
+        super().__init__(decision_interval_ticks=decision_interval_ticks)
         self.aim_point = aim_point
         self.power_fraction = power_fraction
         self._prev_dist_to_target: float | None = None
@@ -386,7 +462,7 @@ class BallCarrierAttackerAI(PlayerAI):
         gk = next((p for p in match.players if p.team != player.team and p.is_goalkeeper), None)
         return choose_shot_target(player, self.power_fraction, gk, match.pitch, match.rng)
 
-    def act(self, player: Player, match: Match, trial_tick: int) -> None:
+    def decide(self, player: Player, match: Match, trial_tick: int) -> None:
         if match.ball.possessed_by != player.player_id:
             self._prev_dist_to_target = None
             return
@@ -541,7 +617,7 @@ class BallReceiverThenShootAI(PlayerAI):
         self._carrier_ai.act(player, match, trial_tick)
 
 
-class SprintWaypointAI(PlayerAI):
+class SprintWaypointAI(_RulesBasedAI):
     """Issue sequential MoveOrders along a pre-computed waypoint list.
     The first waypoint and ``start_idx`` should be set during scenario build::
 
@@ -549,7 +625,11 @@ class SprintWaypointAI(PlayerAI):
         player.ai = SprintWaypointAI(waypoints, start_idx=1)
     """
 
-    def __init__(self, waypoints: list[Vector3], start_idx: int = 1) -> None:
+    def __init__(
+        self, waypoints: list[Vector3], start_idx: int = 1,
+        decision_interval_ticks: int | None = None,
+    ) -> None:
+        super().__init__(decision_interval_ticks=decision_interval_ticks)
         self.waypoints = waypoints
         self._next_idx = start_idx
 
@@ -559,7 +639,7 @@ class SprintWaypointAI(PlayerAI):
         (current_order cleared by the engine on arrival)."""
         return self._next_idx >= len(self.waypoints) and player.current_order is None
 
-    def act(self, player: Player, match: Match, trial_tick: int) -> None:
+    def decide(self, player: Player, match: Match, trial_tick: int) -> None:
         if self._next_idx >= len(self.waypoints):
             return
         if player.current_order is None:
@@ -596,6 +676,7 @@ class NeuralPlayerAI(PlayerAI):
         max_episode_s: float = 120.0,
         ema_smoothed: float = 0.0,
         rng=None,
+        bc_label_fn=None,
     ) -> None:
         self.sample_action_fn = sample_action_fn
         self.decision_interval_ticks = decision_interval_ticks
@@ -606,6 +687,19 @@ class NeuralPlayerAI(PlayerAI):
         self._episode_ticks: int = 0
         self.last_transition = None
         self._last_gating = None  # cached gating result; re-applied every tick
+        # Optional Callable[[Player, Match], BCLabel] (e.g.
+        # footballcoach.ai.ppo.bc.phase1_labels_for_player), called from
+        # WITHIN act() -- see its call site below for why: it must run at
+        # the exact same instant the observation is encoded, before
+        # Match._apply_movement() advances the player for this tick, or the
+        # resulting label describes a state one physics tick later than the
+        # observation it's meant to accompany (see phase1_labels_for_player's
+        # own "CRITICAL -- CALLER-SIDE TIMING" docstring section for the
+        # full story -- this is exactly the fix for that bug). None
+        # (default) = no label computed, preserving prior behaviour for
+        # every caller that doesn't need one (pure PPO fine-tuning phases,
+        # eval, etc).
+        self.bc_label_fn = bc_label_fn
 
     def reset(self) -> None:
         self._ticks_since_decision = self.decision_interval_ticks
@@ -647,6 +741,26 @@ class NeuralPlayerAI(PlayerAI):
         )
         obs_dict = obs.to_torch_dict()
 
+        # Compute the BC label (if configured) RIGHT HERE, before anything
+        # else this tick touches the player -- this is the exact instant
+        # `obs` was encoded from, still inside Match._process_orders(),
+        # BEFORE Match._apply_movement() advances position/velocity/heading
+        # for this tick. See bc_label_fn's own docstring (__init__ above)
+        # and phase1_labels_for_player's "CRITICAL -- CALLER-SIDE TIMING"
+        # section for why this specific placement (not "any time before
+        # act() returns", and definitely not from a caller after a whole
+        # env.step() has already resolved) is the actual fix, not just a
+        # convenient one. sample_action_fn/apply_action_to_player below only
+        # ever set desired_direction/desired_speed_mode/kicked_this_tick/
+        # kick_armed/tackle_armed -- never position/velocity/heading -- and
+        # phase1_labels_for_player()'s own snapshot/reset/restore already
+        # protects against those specific flags regardless of call order, so
+        # computing the label before vs. after sample_action_fn runs is
+        # equivalent; before is simplest to reason about.
+        bc_label_arr = None
+        if self.bc_label_fn is not None:
+            bc_label_arr = self.bc_label_fn(player, match).to_array()
+
         result = self.sample_action_fn(obs_dict)
         (action, log_prob, value, decision_probs, exec_phys,
          dec_phys, target_slots, raw_exec, head_log_probs) = result
@@ -667,6 +781,7 @@ class NeuralPlayerAI(PlayerAI):
             "action": action,
             "log_prob": float(log_prob),
             "value": float(value),
+            "bc_label": bc_label_arr,
             "raw_exec": raw_exec,
             "head_log_probs": head_log_probs,
             "illegal_action": translation.illegal_action,

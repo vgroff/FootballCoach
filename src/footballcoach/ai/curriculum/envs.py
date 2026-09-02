@@ -24,10 +24,48 @@ def build_env(phase: CurriculumPhase):
 
 
 def bc_label_fn_for_phase(phase_id: int) -> Optional[Callable]:
-    """Return the rules-based BC label function for *phase_id*, or None."""
+    """Return the ``(env, player_id=None) -> BCLabel`` rules-based BC label
+    function for *phase_id*, or None.
+
+    For callers that already have an ``env`` and want a label for its
+    CURRENT state, synchronously, at the point they call this (e.g.
+    record_demonstrations.py's recording loop, always called either before
+    that decision interval's own env.step() or from inside an on_kick/
+    on_tackle callback -- both points where "current state" and "the state
+    the observation was captured from" are the same instant; also
+    BCPretrainer._pretrain_online(), which similarly labels BEFORE stepping
+    the env). See bc_label_fn_for_phase_player() for the OTHER calling
+    convention, needed by any caller that can't guarantee that -- notably
+    on-policy PPO/DAgger rollout collection, where the label must be
+    computed synchronously inside NeuralPlayerAI.act() instead (see that
+    function's own bc_label_fn parameter).
+    """
     if phase_id == 1:
         from footballcoach.ai.ppo.bc import phase1_labels
         return phase1_labels
+    return None
+
+
+def bc_label_fn_for_phase_player(phase_id: int) -> Optional[Callable]:
+    """Return the ``(player, match) -> BCLabel`` rules-based BC label
+    function for *phase_id*, or None.
+
+    This is the convention ``NeuralPlayerAI``/``ScenarioEnv.bc_label_fn``
+    need (see ``NeuralPlayerAI.bc_label_fn``'s own docstring): the label
+    must be computed SYNCHRONOUSLY inside ``NeuralPlayerAI.act()``, at the
+    exact same instant the observation is encoded -- before
+    ``Match._apply_movement()`` advances the player for that tick -- or it
+    describes a state one physics tick later than the observation it's
+    paired with (see ``phase1_labels_for_player()``'s "CRITICAL --
+    CALLER-SIDE TIMING" docstring section for the full story). Used by
+    on-policy PPO training (``PPOTrainer.train()``/``rollout_worker.py``)
+    and DAgger (``ai/ppo/dagger.py``) -- never call this AFTER an
+    ``env.step()`` has already returned and expect it to describe the
+    observation THAT step produced; it won't.
+    """
+    if phase_id == 1:
+        from footballcoach.ai.ppo.bc import phase1_labels_for_player
+        return phase1_labels_for_player
     return None
 
 

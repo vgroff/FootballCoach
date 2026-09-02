@@ -13,6 +13,11 @@ from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import MoveOrder, SaveOrder, ShootOrder
 from footballcoach.rules_ai import BallCarrierAttackerAI, StagedGoalkeeperAI
+
+# decision_interval_ticks=1 throughout this file: these tests check
+# DECISION LOGIC, not decision-cadence throttling (see test_rules_ai.py's
+# identical note) -- both classes now default to a config-driven interval
+# instead of "every act() call".
 from footballcoach.ui.scenarios import (
     build_1v2_scenario,
     build_2v2_scenario,
@@ -41,7 +46,7 @@ class TestBallCarrierAttackerAI:
         pitch = Pitch.standard()
         aim = pitch.right_goal_centre.with_z(1.0)
         match, player = self._make_match(Vector3(0.0, 0.0, 0.0), aim)
-        ai = BallCarrierAttackerAI(aim, power_fraction=0.9)
+        ai = BallCarrierAttackerAI(aim, power_fraction=0.9, decision_interval_ticks=1)
 
         assert player.current_order is None
         ai.act(player, match, 0)
@@ -58,7 +63,7 @@ class TestBallCarrierAttackerAI:
         target = Vector3(10.0, 0.0, 0.0)
         match, player = self._make_match(Vector3(0.0, 0.0, 0.0), aim)
         player.current_order = MoveOrder(target_position=target, sprint=True)
-        ai = BallCarrierAttackerAI(aim, power_fraction=0.9)
+        ai = BallCarrierAttackerAI(aim, power_fraction=0.9, decision_interval_ticks=1)
 
         # First tick: records dist, doesn't shoot
         ai.act(player, match, 0)
@@ -73,7 +78,7 @@ class TestBallCarrierAttackerAI:
         target = Vector3(10.0, 0.0, 0.0)
         match, player = self._make_match(Vector3(9.0, 0.0, 0.0), aim)
         player.current_order = MoveOrder(target_position=target, sprint=True)
-        ai = BallCarrierAttackerAI(aim, power_fraction=0.9)
+        ai = BallCarrierAttackerAI(aim, power_fraction=0.9, decision_interval_ticks=1)
 
         # First tick: dist = 1.0, recorded
         ai.act(player, match, 0)
@@ -92,7 +97,7 @@ class TestBallCarrierAttackerAI:
         aim = pitch.right_goal_centre.with_z(1.0)
         match, player = self._make_match(Vector3(0.0, 0.0, 0.0), aim)
         match.ball.possessed_by = None  # nobody has the ball
-        ai = BallCarrierAttackerAI(aim)
+        ai = BallCarrierAttackerAI(aim, decision_interval_ticks=1)
 
         ai.act(player, match, 0)
         assert player.current_order is None, "AI should not act when player lacks the ball"
@@ -105,7 +110,7 @@ class TestBallCarrierAttackerAI:
         target = Vector3(10.0, 0.0, 0.0)
         match, player = self._make_match(Vector3(9.0, 0.0, 0.0), aim)
         player.current_order = MoveOrder(target_position=target, sprint=True)
-        ai = BallCarrierAttackerAI(aim)
+        ai = BallCarrierAttackerAI(aim, decision_interval_ticks=1)
 
         ai.act(player, match, 0)  # prev_dist recorded
         match.ball.possessed_by = None  # ball lost
@@ -129,7 +134,7 @@ class TestStagedGoalkeeperAI:
                       rng_reduction=1.0, rng=random.Random(0))
         gk.current_order = MoveOrder(target_position=pitch.left_goal_centre, sprint=False,
                                      max_speed_on_arrival_mps=0.0)
-        ai = StagedGoalkeeperAI()
+        ai = StagedGoalkeeperAI(decision_interval_ticks=1)
 
         ai.act(gk, match, 0)
         assert isinstance(gk.current_order, MoveOrder), (
@@ -146,7 +151,7 @@ class TestStagedGoalkeeperAI:
         match = Match(pitch=pitch, players=[gk], ball=ball,
                       rng_reduction=1.0, rng=random.Random(0))
         gk.current_order = None  # MoveOrder already completed
-        ai = StagedGoalkeeperAI()
+        ai = StagedGoalkeeperAI(decision_interval_ticks=1)
 
         ai.act(gk, match, 0)
         assert isinstance(gk.current_order, SaveOrder), (
@@ -166,7 +171,7 @@ class TestStagedGoalkeeperAI:
         match = Match(pitch=pitch, players=[gk], ball=ball,
                       rng_reduction=1.0, rng=random.Random(0))
         gk.current_order = None  # MoveOrder already completed
-        ai = StagedGoalkeeperAI()
+        ai = StagedGoalkeeperAI(decision_interval_ticks=1)
 
         ai.act(gk, match, 0)
         assert isinstance(gk.current_order, MoveOrder), (
@@ -179,7 +184,7 @@ class TestStagedGoalkeeperAI:
         heading it last had -- covers both the 'ball loose, not threatening'
         and 'ball possessed by someone else' cases."""
         pitch = Pitch.standard()
-        ai = StagedGoalkeeperAI()
+        ai = StagedGoalkeeperAI(decision_interval_ticks=1)
 
         # Team.LEFT defends the left goal -> outfield heading is 0.0 (+x).
         gk = make_player("gk", Team.LEFT, position=pitch.left_goal_centre, is_goalkeeper=True)
@@ -216,7 +221,7 @@ class TestStagedGoalkeeperAI:
                       rng_reduction=1.0, rng=random.Random(0))
         existing_save = SaveOrder()
         gk.current_order = existing_save
-        ai = StagedGoalkeeperAI()
+        ai = StagedGoalkeeperAI(decision_interval_ticks=1)
 
         ai.act(gk, match, 0)
         assert gk.current_order is existing_save, (
@@ -232,7 +237,7 @@ class TestStagedGoalkeeperAI:
         match = Match(pitch=pitch, players=[gk], ball=ball,
                       rng_reduction=1.0, rng=random.Random(0))
         gk.current_order = None
-        ai = StagedGoalkeeperAI()
+        ai = StagedGoalkeeperAI(decision_interval_ticks=1)
 
         ai.act(gk, match, 0)
         assert gk.current_order is None, (

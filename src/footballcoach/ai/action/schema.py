@@ -125,10 +125,23 @@ class ExecutionHeadsRaw:
     See ai_design_doc.md section 8.6 for the full output surface.
     """
     move_direction: "torch.Tensor"         # (batch, 2) unit vector (L2-normalized in forward())
+    move_direction_unnormalized: "torch.Tensor"  # (batch, 2) the SAME head's raw pre-normalize
+                                            # output -- move_direction above is this divided by
+                                            # its own (near-)norm; kept separately so a loss can
+                                            # penalize the raw vector's magnitude directly (see
+                                            # debug_policy_net.py's --bc-dir-mag-reg-coef) without
+                                            # needing to re-run the Linear layer. Not consumed by
+                                            # DirectionHead/PPO exploration (that already re-derives
+                                            # its own normalized mean from `move_direction`
+                                            # defensively) -- this field exists purely so a loss
+                                            # term can see the un-normalized magnitude.
     exec_move_logit: "torch.Tensor"        # (batch, 1) Bernoulli: move vs standstill
     sprint_logit: "torch.Tensor"           # (batch, 1) Bernoulli: sprint vs jog (only when moving)
     kick_logit: "torch.Tensor"             # (batch, 1) Bernoulli: kick this tick?
     kick_direction: "torch.Tensor"         # (batch, 3) 3D unit vector (L2-normalized in forward())
+    kick_direction_unnormalized: "torch.Tensor"  # (batch, 3) same head's raw pre-normalize
+                                            # output -- see move_direction_unnormalized's comment,
+                                            # identical rationale (magnitude regularizer support).
     kick_power: "torch.Tensor"             # (batch, 1) raw; sigmoid -> 0-1 power_fraction
     kick_spin: "torch.Tensor"              # (batch, 3) raw spin vector
     tackle_attempt_logit: "torch.Tensor"   # (batch, 1) Bernoulli

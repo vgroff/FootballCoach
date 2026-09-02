@@ -974,7 +974,7 @@ def main() -> None:
     parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 3, 4])
     parser.add_argument("--n-episodes", type=int, default=200,
                         help="Total episodes to record (default: 200)")
-    parser.add_argument("--episodes-per-file", type=int, default=8,
+    parser.add_argument("--episodes-per-file", type=int, default=50,
                         help="Episodes per output .npz file (default: 8)")
     parser.add_argument("--output", type=str, required=True,
                         help="Output directory for .npz files")

@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 import random
+import shutil
 from pathlib import Path
 
 logging.basicConfig(
@@ -84,8 +85,10 @@ def main() -> None:
                         help="Path to a checkpoint .pt file to resume from")
     parser.add_argument("--checkpoint-dir", type=str, default=None,
                         help="Directory to save training checkpoints (default: auto-generated as checkpoints/phase{N}_run{next}/)")
-    parser.add_argument("--device", type=str, default="cpu",
-                        help="PyTorch device (default: cpu)")
+    parser.add_argument("--device", type=str, default=None,
+                        help="PyTorch device. Default: auto-detect -- 'cuda' if a GPU is "
+                             "available, else 'cpu'. Pass explicitly (e.g. --device cpu) to "
+                             "override the auto-detection.")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed")
     parser.add_argument("--bc-pretrain-steps", type=int, default=None,
@@ -129,6 +132,31 @@ def main() -> None:
                         help="Epochs over dataset for offline BC pre-training (default: bc.bc_pretrain_epochs in ai_config.json).")
     parser.add_argument("--bc-pretrain-batch-size", type=int, default=None,
                         help="Minibatch size for offline BC pre-training (default: bc.bc_pretrain_batch_size in ai_config.json).")
+    parser.add_argument("--dagger-iterations", type=int, default=None,
+                        help="Enable production DAgger after Phase 1 BC pretrain: alternate "
+                             "full-dataset BC training with closed-loop policy rollouts, "
+                             "aggregating visited states labelled by phase1_labels(). "
+                             "Overrides bc.dagger_iterations in ai_config.json. Default: 0 "
+                             "(disabled) unless set in config.")
+    parser.add_argument("--dagger-bc-epochs-per-iter", type=int, default=None,
+                        help="Full-dataset BC epochs per DAgger iteration (default: "
+                             "bc.dagger_bc_epochs_per_iter in ai_config.json).")
+    parser.add_argument("--dagger-buffer-max-size", type=int, default=None,
+                        help="Cap on the aggregated on-policy DAgger buffer, uniform-random "
+                             "eviction past this size (default: bc.dagger_buffer_max_size).")
+    parser.add_argument("--dagger-max-replay-steps", type=int, default=None,
+                        help="Safety cap on env ticks per DAgger closed-loop rollout "
+                             "(default: bc.dagger_max_replay_steps).")
+    parser.add_argument("--dagger-episodes-per-iteration", type=int, default=None,
+                        help="Number of independent random-episode rollouts collected per DAgger "
+                             "iteration, before the next BC-training step (default: "
+                             "bc.dagger_episodes_per_iteration, normally 1).")
+    parser.add_argument("--dagger-n-workers", type=int, default=None,
+                        help="Collect each DAgger iteration's rollouts across this many "
+                             "subprocesses in parallel (default: bc.dagger_n_workers, normally "
+                             "1 = sequential). Rollout collection (real env physics ticks) is "
+                             "the slowest part of each DAgger iteration, so this is usually "
+                             "where parallelism matters most.")
     parser.add_argument("--verbose", action="store_true",
                         help="Enable debug-level logs (per-minibatch details, per-head diagnostics).")
     parser.add_argument("--from-pretrained", type=str, default=None, metavar="PATH",
@@ -168,6 +196,15 @@ def main() -> None:
                              "--pretrain-from-checkpoint, --from-pretrained, --latest[-pretrain]). "
                              "Useful when a loaded policy's log_std has drifted/collapsed and is "
                              "causing move_dir KL to dominate early-stop.")
+    parser.add_argument("--reset-optimizer", action="store_true",
+                        help="Skip restoring Adam's optimizer state (per-param running "
+                             "m/v moment estimates + step count) when loading any checkpoint "
+                             "(--checkpoint, --pretrain-from-checkpoint, --from-pretrained, "
+                             "--latest[-pretrain]) -- network weights still load normally. "
+                             "Adam's state otherwise carries forward unchanged across a resume. "
+                             "Useful after changing hyperparameters (grad-norm clips, learning "
+                             "rates, entropy weights) enough that Adam's old running averages, "
+                             "tuned for the previous regime, would fight the new one.")
     args = parser.parse_args()
 
     if args.verbose:
@@ -181,7 +218,27 @@ def main() -> None:
     random.seed(args.seed)
     torch.set_num_threads(int(load_ai_config().get("ppo", {}).get("main_process_torch_threads", 4)))
 
-    device = torch.device(args.device)
+    _cuda_available = torch.cuda.is_available()
+    if args.device is not None:
+        device = torch.device(args.device)
+        log.info(f"Device: {device} (explicitly requested via --device)")
+        if device.type == "cpu" and _cuda_available:
+            _gpu_name = torch.cuda.get_device_name(0)
+            log.warning(
+                "\n"
+                + "!" * 78 + "\n"
+                + f"! GPU AVAILABLE BUT NOT USED ({_gpu_name}) -- running on CPU because\n"
+                + "! --device cpu was passed explicitly. Drop --device (or pass\n"
+                + "! --device cuda) to use it.\n"
+                + "!" * 78
+            )
+    else:
+        device = torch.device("cuda" if _cuda_available else "cpu")
+        log.info(
+            f"Device: {device} (auto-detected"
+            + (f" -- {torch.cuda.get_device_name(0)}" if _cuda_available else ", no GPU found")
+            + ")"
+        )
 
     # Auto-generate checkpoint dir if not specified: checkpoints/phase{N}_run{next}
     if args.checkpoint_dir is None:
@@ -197,6 +254,14 @@ def main() -> None:
         checkpoint_dir = Path(args.checkpoint_dir)
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     log.info(f"Checkpoint dir: {checkpoint_dir}")
+
+    # Snapshot the exact ai_config.json this run started with -- config gets
+    # hand-edited between runs (as this session's own back-and-forth on
+    # direction_max_grad_norm/ent_decision_weight/etc. shows), so without
+    # this a checkpoint dir alone can't tell you what hyperparameters
+    # actually produced it later.
+    from footballcoach.ai.config import config_path
+    shutil.copy2(config_path(), checkpoint_dir / "ai_config.json")
 
     from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
     from footballcoach.ai.curriculum.phases import PHASES_BY_ID
@@ -268,6 +333,23 @@ def main() -> None:
             separate_value_net=args.separate_value_net,
         )
 
+    # --dagger-*: override bc.dagger_* (read into trainer._dagger_* at
+    # PPOTrainer.__init__) for this run only, without touching shared
+    # config. Applied before any checkpoint load below, same ordering
+    # debug_policy_net.py uses for its own CLI overrides.
+    if args.dagger_iterations is not None:
+        trainer._dagger_iterations = args.dagger_iterations
+    if args.dagger_bc_epochs_per_iter is not None:
+        trainer._dagger_bc_epochs_per_iter = args.dagger_bc_epochs_per_iter
+    if args.dagger_buffer_max_size is not None:
+        trainer._dagger_buffer_max_size = args.dagger_buffer_max_size
+    if args.dagger_max_replay_steps is not None:
+        trainer._dagger_max_replay_steps = args.dagger_max_replay_steps
+    if args.dagger_episodes_per_iteration is not None:
+        trainer._dagger_episodes_per_iteration = args.dagger_episodes_per_iteration
+    if args.dagger_n_workers is not None:
+        trainer._dagger_n_workers = args.dagger_n_workers
+
     # --latest / --latest-pretrain: auto-discover the most recent checkpoint.
     if args.latest or args.latest_pretrain:
         import glob as _glob, re as _re, os as _os
@@ -327,7 +409,7 @@ def main() -> None:
 
     # Optionally resume from checkpoint
     if args.checkpoint:
-        trainer.load_checkpoint(Path(args.checkpoint))
+        trainer.load_checkpoint(Path(args.checkpoint), reset_optimizer=args.reset_optimizer)
         if args.reset_dir_log_std:
             _reset_dir_log_std()
 
@@ -337,7 +419,7 @@ def main() -> None:
         if not ptrain_path.exists():
             log.error(f"--pretrain-from-checkpoint: file not found: {ptrain_path}")
             return
-        trainer.load_checkpoint(ptrain_path)
+        trainer.load_checkpoint(ptrain_path, reset_optimizer=args.reset_optimizer)
         trainer._total_steps = 0  # reset step counter so pretraining + full PPO run from scratch
         log.info(f"Loaded checkpoint for re-pretraining: {ptrain_path} — will still run BC/value pre-training")
         if args.reset_dir_log_std:
@@ -362,7 +444,7 @@ def main() -> None:
         if not pretrained_path.exists():
             log.error(f"--from-pretrained: file not found: {pretrained_path}")
             return
-        trainer.load_checkpoint(pretrained_path)
+        trainer.load_checkpoint(pretrained_path, reset_optimizer=args.reset_optimizer)
         if args.reset_dir_log_std:
             _reset_dir_log_std()
         log.info(f"Loaded pre-trained checkpoint: {pretrained_path} — skipping BC/value pre-training")
@@ -391,19 +473,31 @@ def main() -> None:
         # Loading .npz demonstration files (DemonstrationDataset.from_directory)
         # can take ~1 minute on a large dataset directory. If both BC-epoch
         # counts that would actually consume it are 0 (after any _from_ckpt
-        # override), the dataset would never be touched -- skip loading it
-        # entirely and run value-only pre-training instead (identical to what
-        # pretrain_combined()'s Phase 2/3 would do -- see below).
+        # override) AND DAgger is disabled, the dataset would never be
+        # touched -- skip loading it entirely and run value-only
+        # pre-training instead (identical to what pretrain_combined()'s
+        # Phase 2/3 would do -- see below). DAgger (ai/ppo/dagger.py, run
+        # from inside pretrain_combined() right after Phase 1) needs the
+        # full dataset itself -- both for its own full-dataset BC-training
+        # step and for picking random episodes to roll out from -- even
+        # when bc_pretrain_epochs/demo_value_pretrain_epochs are both 0, so
+        # it must be excluded from this skip condition; trainer._dagger_iterations
+        # is already resolved (config + --dagger-iterations override) by
+        # this point, well before this check.
         dataset = None
-        _skip_dataset_load = bool(args.bc_dataset) and bc_pretrain_epochs == 0 and _demo_epochs_eff == 0
+        _skip_dataset_load = (
+            bool(args.bc_dataset) and bc_pretrain_epochs == 0 and _demo_epochs_eff == 0
+            and trainer._dagger_iterations <= 0
+        )
         if args.bc_dataset and not _skip_dataset_load:
             dataset = DemonstrationDataset.from_directory(args.bc_dataset)
             log.info(f"Offline BC dataset: {len(dataset):,} steps from {args.bc_dataset}")
         elif _skip_dataset_load:
             log.info(
-                f"Skipping BC dataset load ({args.bc_dataset}): bc_pretrain_epochs=0 and "
-                f"demo_value_pretrain_epochs=0 (after any _from_ckpt override), so the dataset "
-                f"would never be used -- running value-only pre-training instead."
+                f"Skipping BC dataset load ({args.bc_dataset}): bc_pretrain_epochs=0, "
+                f"demo_value_pretrain_epochs=0 (after any _from_ckpt override), and DAgger "
+                f"disabled, so the dataset would never be used -- running value-only "
+                f"pre-training instead."
             )
 
         bc_pretrain_batch_size = (
@@ -484,6 +578,7 @@ def main() -> None:
                 value_epochs=value_pretrain_epochs,
                 experiment_separate_value_net=args.experiment_separate_value_net,
                 phase_id=args.phase,
+                checkpoint_dir=checkpoint_dir,
             )
         else:
             # Online BC pre-training (noisy but works without a dataset)
@@ -615,8 +710,19 @@ def main() -> None:
     if not args.no_head_freeze and phase.frozen_heads:
         trainer.set_frozen_heads(phase.frozen_heads)
 
-    # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0)
-    aux_label_fn = None if (args.no_bc_aux or label_fn is None) else label_fn
+    # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0).
+    # NOTE: PPOTrainer.train()'s bc_label_fn needs the (player, match) ->
+    # BCLabel convention (bc_label_fn_for_phase_player), NOT label_fn above
+    # (bc_label_fn_for_phase, the (env) -> BCLabel convention used for
+    # pretrainer.pretrain()/record_demonstrations.py-style callers that
+    # compute a label synchronously against a live env they already hold) --
+    # see PPOTrainer.train()'s own bc_label_fn docstring for why these are
+    # different, non-interchangeable calling conventions.
+    if args.no_bc_aux or label_fn is None:
+        aux_label_fn = None
+    else:
+        from footballcoach.ai.curriculum.envs import bc_label_fn_for_phase_player
+        aux_label_fn = bc_label_fn_for_phase_player(args.phase)
     trainer.train(env, total_steps=args.total_steps, bc_label_fn=aux_label_fn, phase_id=args.phase)
 
 

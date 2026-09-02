@@ -35,6 +35,14 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. Please do not skip any of them. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
+    - !! Are the bernoulli heads sampled to become execution inputs? They shouldnt be!!
+    - !! new training:
+        - value net pre-training (phase 0) really struggles with the invalid/timeouts, which is weird because it was doing okay on them in the debug value net. Does it definitely have that last team touched variable for example? Is the MC time-based fixed with non-uniform timesteps included? Maybe it just needs longer, val_mse was falling the whole time
+    - !! Move both rules and neural AI to have decision in integer ticks, and make them both 4/5 or so (0.25-0.3s
+    - !! entropy and KL on the decision-heads, not sure how to handle it
+        - if we BC, it might be okay? could even do it only on those heads?
+        - or, different entropy coeff on those (e.g. zero) than on the execution heads
+            - nicer solution, probably
     - !! Check all tests pass
     - !! Friction coefficient needs increasing 2-4x - need to retrain the physics model (ball only)
         - doesnt seem that awful tbh, kick factor speed is like 1.3 and it looks fine. wouldnt increase it too much

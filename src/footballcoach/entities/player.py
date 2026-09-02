@@ -17,14 +17,50 @@ if TYPE_CHECKING:
 class PlayerAI:
     """Base class for all player AI controllers.
 
-    Subclass and override ``act(player, match, trial_tick)`` to implement
-    per-player decision logic.  ``Match.step()`` calls ``player.ai.act(...)``
-    once per physics tick for every player that has an AI assigned.
+    Two ways to hook in, depending on whether the AI needs to actively
+    drive the player on EVERY tick or can tolerate a coarser decision
+    cadence:
 
-    The default implementation is a no-op (stationary / order-driven player).
+    - Override ``act(player, match, trial_tick)`` directly for full control
+      every tick. Needed by anything that sets movement intent itself with
+      no Order object behind it (e.g. NeuralPlayerAI/HybridPlayerAI, which
+      must re-apply their last sampled action on ticks they don't sample a
+      fresh one -- nothing else would keep the player moving).
+    - Override ``decide(player, match, trial_tick)`` instead and leave
+      ``act()`` as this base implementation, to get decision-cadence
+      throttling for free, with no per-subclass boilerplate: this base
+      ``act()`` calls ``decide()`` once every ``decision_interval_ticks``
+      ticks and does nothing on the ticks in between. Safe for anything
+      whose actual moment-to-moment movement is driven by an Order object
+      (rules-based AI), since ``Match._process_orders`` calls
+      ``order.execute()`` unconditionally every tick regardless of this
+      AI's own decision cadence -- throttling here only delays how often
+      the AI reconsiders WHICH order/target to use, not the continuous
+      steering underneath it. See rules_ai.py's ``_RulesBasedAI``, which
+      every rules-based AI in this codebase is built on, for the actual
+      base most subclasses use (it also resolves a sensible config-driven
+      default for ``decision_interval_ticks`` -- matching the real trained
+      policy's own decision cadence -- rather than everyone defaulting to
+      "every tick" independently).
+
+    ``Match.step()`` calls ``player.ai.act(...)`` once per physics tick for
+    every player that has an AI assigned. The default implementation (no
+    subclass override at all) is a no-op (stationary / order-driven
+    player).
     """
 
-    def act(self, player: "Player", match: "Match", trial_tick: int) -> None:  # noqa: ARG002
+    def __init__(self, decision_interval_ticks: int = 1) -> None:
+        self.decision_interval_ticks = max(1, decision_interval_ticks)
+        self._ticks_since_decision = self.decision_interval_ticks  # decide on first tick
+
+    def act(self, player: "Player", match: "Match", trial_tick: int) -> None:
+        self._ticks_since_decision += 1
+        if self._ticks_since_decision < self.decision_interval_ticks:
+            return
+        self._ticks_since_decision = 0
+        self.decide(player, match, trial_tick)
+
+    def decide(self, player: "Player", match: "Match", trial_tick: int) -> None:  # noqa: ARG002
         pass
 
 

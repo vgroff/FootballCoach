@@ -67,7 +67,9 @@ def _real_phase1_max_episode_s() -> float:
     return float(PHASE_1_GET_POSSESSION.env_kwargs["max_episode_s"])
 
 
-def _env_worker_factory(ball_max_speed_mps: float, max_episode_s: float) -> tuple:
+def _env_worker_factory(
+    ball_max_speed_mps: float, max_episode_s: float, decision_interval_ticks: int = 1,
+) -> tuple:
     """Module-level (picklable) factory: rules-AI trainee, opponent type
     drawn from the real curriculum config ratios (build_1v1_scenario's own
     opponent_rules_prob/opponent_immobile_prob defaults -- immobile-only
@@ -88,7 +90,7 @@ def _env_worker_factory(ball_max_speed_mps: float, max_episode_s: float) -> tupl
 
     def _build(*args, **kwargs):
         match = build_1v1_scenario(*args, ball_max_speed_mps=ball_max_speed_mps, **kwargs)
-        match.player_by_id("trainee").ai = Phase1RulesAI()
+        match.player_by_id("trainee").ai = Phase1RulesAI(decision_interval_ticks=decision_interval_ticks)
         # Opponent AI (rules/immobile/neural-less) is already assigned by
         # build_1v1_scenario itself according to opponent_rules_prob/
         # opponent_immobile_prob -- nothing to override here.
@@ -122,6 +124,13 @@ def main() -> None:
                           "value (ai_config.json curriculum.phase1_max_episode_s, 18.5s) -- "
                           "NOT ScenarioEnv's own generic default (120s), which would silently "
                           "suppress almost all real timeouts.")
+    ap.add_argument("--decision-interval-ticks", type=int, default=1,
+                     help="Throttle the rules-AI trainee's order/sprint-flag decision to once "
+                          "every N physics ticks (dt_s=0.06s -> N=2 is ~0.12s, N=4 is ~0.24s), "
+                          "instead of every tick (default 1, unchanged). NOTE: per-tick steering "
+                          "(the intercept solve inside order.execute()) still runs every tick "
+                          "regardless -- see Phase1RulesAI's own docstring for why this only "
+                          "throttles the higher-level order choice, not continuous movement.")
     ap.add_argument("--n-parallel-workers", type=int, default=8)
     ap.add_argument("--extra-seeds", type=str, default=",".join(str(s) for s in KNOWN_SEEDS),
                      help="Comma-separated seeds always folded into the sample, on top of the "
@@ -136,10 +145,13 @@ def main() -> None:
     extra_seeds = [int(s) for s in args.extra_seeds.split(",") if s.strip()]
     seeds = list(range(args.seed_base, args.seed_base + args.n_episodes)) + extra_seeds
     import functools
-    worker_factory = functools.partial(_env_worker_factory, args.ball_max_speed_mps, max_episode_s)
+    worker_factory = functools.partial(
+        _env_worker_factory, args.ball_max_speed_mps, max_episode_s, args.decision_interval_ticks,
+    )
 
     log.info(f"Running {len(seeds)} phase-1 episodes (rules trainee, ball_max_speed_mps="
               f"{args.ball_max_speed_mps}, max_episode_s={max_episode_s}, "
+              f"decision_interval_ticks={args.decision_interval_ticks}, "
               f"seeds {seeds[0]}..{seeds[args.n_episodes - 1]} + {len(extra_seeds)} known)...")
     if args.n_parallel_workers > 1:
         result = run_seeded_evaluation_parallel(worker_factory, seeds, repeats_per_seed=1, n_workers=args.n_parallel_workers)
@@ -174,6 +186,7 @@ def main() -> None:
     d = result.as_dict()
     d["ball_max_speed_mps"] = args.ball_max_speed_mps
     d["max_episode_s"] = max_episode_s
+    d["decision_interval_ticks"] = args.decision_interval_ticks
     d["known_seeds"] = known_results
     with open(out_path, "w") as f:
         json.dump(d, f, indent=2)

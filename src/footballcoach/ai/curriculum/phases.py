@@ -58,15 +58,18 @@ PHASE_1_GET_POSSESSION = CurriculumPhase(
     # Gradually unfreeze as per the curriculum (this is done manually by the
     # training script, not automatically here).
     frozen_heads=[
-        "shoot_logit", "pass_logit", "tackle_logit", "get_possession_raw",
+        "shoot_logit", "pass_logit", "tackle_logit",
         "mark_logit", "hold_position_logit",
         "pass_target_logits", "tackle_target_logits", "mark_target_logits",
     ],
     reward_phase=1,
     description=(
         "1v1 scenario: learn to get possession and bring the ball toward the "
-        "opponent box.  Decision network frozen except Move/GetPossession and "
-        "latent vector."
+        "opponent box.  Decision network frozen except Move/GetPossession "
+        "and the shared latent vector -- Move and GetPossession are the "
+        "only two decision-level actions the rules-AI actually exercises "
+        "in this scenario, kept together deliberately (confirmed "
+        "2026-09-01): either both stay trainable or neither does."
     ),
 )
 

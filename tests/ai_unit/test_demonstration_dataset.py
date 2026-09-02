@@ -466,9 +466,11 @@ class TestDownsampleTrivial:
             value=torch.zeros(1, 1),
         )
         e_heads = ExecutionHeadsRaw(
-            move_direction=torch.zeros(1, 2), exec_move_logit=torch.zeros(1, 1),
+            move_direction=torch.zeros(1, 2), move_direction_unnormalized=torch.zeros(1, 2),
+            exec_move_logit=torch.zeros(1, 1),
             sprint_logit=torch.zeros(1, 1), kick_logit=torch.zeros(1, 1),
-            kick_direction=torch.zeros(1, 2), kick_power=torch.zeros(1, 1),
+            kick_direction=torch.zeros(1, 2), kick_direction_unnormalized=torch.zeros(1, 2),
+            kick_power=torch.zeros(1, 1),
             kick_spin=torch.zeros(1, 3), tackle_attempt_logit=torch.zeros(1, 1),
             value=torch.zeros(1, 1),
         )

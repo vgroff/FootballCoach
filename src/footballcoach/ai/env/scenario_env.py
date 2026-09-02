@@ -101,6 +101,19 @@ class ScenarioEnv:
         # When set, neural actions are applied to secondary players each step
         # and their transitions are stored in last_secondary_results.
         self.sample_action_fn = None
+        # Optional Callable[[Player, Match], BCLabel] (e.g.
+        # footballcoach.ai.ppo.bc.phase1_labels_for_player), threaded into
+        # the TRAINEE's NeuralPlayerAI only (see reset() below) -- NOT
+        # secondary players, matching existing behaviour (secondary-player
+        # transitions have never carried a bc_label; see
+        # always_compute_secondary_reward's own docstring on the adjacent
+        # asymmetry between trainee/secondary handling). Must be set (like
+        # sample_action_fn) BEFORE reset(), since that's where it gets
+        # passed into NeuralPlayerAI's constructor. See NeuralPlayerAI.
+        # bc_label_fn's own docstring for why this has to be computed
+        # SYNCHRONOUSLY inside NeuralPlayerAI.act(), not by a caller after
+        # env.step() returns.
+        self.bc_label_fn = None
         # Opt-in, off by default: when True, last_secondary_results gets an
         # entry for EVERY configured secondary player every step, computed via
         # the same _compute_phase1_reward_for_player() the trainee/neural
@@ -175,7 +188,7 @@ class ScenarioEnv:
         # Per-secondary-player pending-loss state, mirrors _trainee_pending_loss.
         self._sec_pending_loss: dict = {}
         # Populated after each step(); drained by PPOTrainer for the rollout buffer.
-        # last_trainee_transition: dict with obs/action/log_prob/value/raw_exec/illegal_action
+        # last_trainee_transition: dict with obs/action/log_prob/value/bc_label/raw_exec/illegal_action
         # last_secondary_results: list of same dicts for secondary neural players
         self.last_trainee_transition: Optional[dict] = None
         self.last_secondary_results: list = []
@@ -275,6 +288,7 @@ class ScenarioEnv:
                     max_episode_s=self.max_episode_s,
                     ema_smoothed=self._ema.smoothed,
                     rng=self.rng,
+                    bc_label_fn=self.bc_label_fn,
                 )
             except KeyError:
                 pass

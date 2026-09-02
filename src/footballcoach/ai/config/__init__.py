@@ -16,3 +16,10 @@ def load_ai_config() -> dict:
 
 def clear_ai_config_cache() -> None:
     load_ai_config.cache_clear()
+
+
+def config_path() -> Path:
+    """Path to the live ai_config.json this process loads from -- e.g. so a
+    training run can snapshot a copy of it into its checkpoint dir at
+    startup, to know exactly what config produced that run later."""
+    return _CONFIG_PATH

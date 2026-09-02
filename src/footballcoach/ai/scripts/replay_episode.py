@@ -80,6 +80,39 @@ def _phase1_opponent_probs() -> tuple[float, float]:
     return rules_prob, immobile_prob
 
 
+def apply_phase1_opponent_roll(match, opponent, seed: int) -> None:
+    """Apply the SECOND, OVERRIDING phase-1 opponent-type roll to an
+    already-constructed Match + opponent Player, regardless of which
+    construction path built them (``build_1v1_scenario`` via
+    ``build_replay_match()``/``ScenarioLoop``, or ``ScenarioEnv.reset()``
+    via a fresh phase-1 env) -- call this AFTER construction. Mutates
+    ``opponent.ai``, ``match._opponent_use_rules_ai``,
+    ``match._opponent_is_immobile`` in place.
+
+    See ``build_replay_match()``'s docstring for WHY this second roll
+    exists (record_demonstrations.py never trusts build_1v1_scenario's own
+    internal seed-determined roll). Single source of truth for this logic --
+    previously duplicated inline in ``build_replay_match()``, ``run_headless()``
+    (which was missing the ``_opponent_use_rules_ai``/``_opponent_is_immobile``
+    assignments -- fixed by routing through here), and ``debug_policy_net.py``.
+    """
+    import random as _random
+
+    from footballcoach.rules_ai import Phase1RulesAI
+
+    opponent_rules_prob, opponent_immobile_prob = _phase1_opponent_probs()
+    roll = _random.Random(seed).random()
+    if roll < opponent_rules_prob:
+        opponent.ai = Phase1RulesAI()
+        match._opponent_use_rules_ai, match._opponent_is_immobile = True, False
+    elif opponent_immobile_prob is not None and roll >= opponent_rules_prob + opponent_immobile_prob:
+        opponent.ai = Phase1RulesAI()
+        match._opponent_use_rules_ai, match._opponent_is_immobile = True, False
+    else:
+        opponent.ai = None
+        match._opponent_use_rules_ai, match._opponent_is_immobile = False, True
+
+
 def build_replay_match(seed: int, *, rng_reduction: float = 0.3):
     """Rebuild the EXACT ``Match`` a phase-1 demonstration episode with this
     seed would have been recorded from, including AI assignment
@@ -104,8 +137,6 @@ def build_replay_match(seed: int, *, rng_reduction: float = 0.3):
     build_1v1_scenario's own (overridden, and therefore never actually
     observed during real recording) internal choice.
     """
-    import random as _random
-
     from footballcoach.rules_ai import Phase1RulesAI
     from footballcoach.ui.scenarios import build_1v1_scenario
 
@@ -122,19 +153,7 @@ def build_replay_match(seed: int, *, rng_reduction: float = 0.3):
     trainee.ai = Phase1RulesAI()
 
     opponent = match.player_by_id("opponent")
-    _roll = _random.Random(seed).random()
-    if _roll < opponent_rules_prob:
-        opponent.ai = Phase1RulesAI()
-        match._opponent_use_rules_ai = True
-        match._opponent_is_immobile = False
-    elif opponent_immobile_prob is not None and _roll >= opponent_rules_prob + opponent_immobile_prob:
-        opponent.ai = Phase1RulesAI()
-        match._opponent_use_rules_ai = True
-        match._opponent_is_immobile = False
-    else:
-        opponent.ai = None
-        match._opponent_use_rules_ai = False
-        match._opponent_is_immobile = True
+    apply_phase1_opponent_roll(match, opponent, seed)
 
     return match
 
@@ -190,23 +209,15 @@ def run_headless(seed: int, output: str, *, rng_reduction: float = 0.3) -> None:
     # here; a prior version of this line hardcoded dt_s=1/30 AFTER
     # construction, silently overwriting whatever the real config-derived
     # value would otherwise have been.
-    # Same AI assignment / overriding second roll as build_replay_match()
-    # (duplicated inline rather than reusing that function directly, since
-    # it builds its OWN Match rather than accepting an existing one --
-    # ScenarioLoop must own construction here so its native trial-outcome
-    # detection applies). Keep in sync with build_replay_match() by hand if
-    # this ever changes.
+    # Same AI assignment / overriding second roll as build_replay_match(),
+    # via the shared apply_phase1_opponent_roll() -- ScenarioLoop must own
+    # construction here so its native trial-outcome detection applies, so
+    # this can't just call build_replay_match() directly, but the roll
+    # logic itself is no longer duplicated.
     from footballcoach.rules_ai import Phase1RulesAI
-    import random as _random
     loop.match.player_by_id("trainee").ai = Phase1RulesAI()
     opponent = loop.match.player_by_id("opponent")
-    _roll = _random.Random(seed).random()
-    if _roll < opponent_rules_prob:
-        opponent.ai = Phase1RulesAI()
-    elif opponent_immobile_prob is not None and _roll >= opponent_rules_prob + opponent_immobile_prob:
-        opponent.ai = Phase1RulesAI()
-    else:
-        opponent.ai = None
+    apply_phase1_opponent_roll(loop.match, opponent, seed)
 
     logger = MatchLogger()
     loop.match.match_logger = logger

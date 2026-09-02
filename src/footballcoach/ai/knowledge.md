@@ -24,28 +24,87 @@ network. They are NEVER a source for deriving execution-network labels.**
   purpose is correct.
 - **Execution network** (`move_direction`, `sprint`, `exec_move`, `kick_*`,
   `tackle_attempt`): these must ONLY be derived from what actually lands on
-  the `Player` object after the engine/order machinery runs — i.e.
-  `player.desired_direction`, `player.desired_speed_mode`,
+  the `Player` object after running the decided order's `execute()` **as a
+  counterfactual** — i.e. `player.desired_direction`, `player.desired_speed_mode`,
   `player.kicked_this_tick`/`last_kick_direction`/`last_kick_power_fraction`/
-  `last_kick_spin`. **Never** by re-deriving geometry from an order's fields
-  (e.g. `normalize(order.target_position - player.position)`) or reading
-  `order.sprint` directly — that bypasses the real physics/turning/braking/
-  repulsion/push-kick logic in `_compute_movement_intent()`/`step_player_towards()`
-  and produces execution labels that don't match what the rules AI actually
+  `last_kick_spin`/`kick_armed`/`kick_armed_direction`/`kick_armed_power_fraction`/
+  `tackle_armed`, all read from the SNAPSHOT/RESET/EXECUTE/RESTORE sandbox
+  below, never from the real, already-executed state of whichever AI is
+  actually driving the player. **Never** by re-deriving geometry from an
+  order's fields (e.g. `normalize(order.target_position - player.position)`)
+  or reading `order.sprint` directly — that bypasses the real physics/
+  turning/braking/repulsion/push-kick logic in
+  `_compute_movement_intent()`/`step_player_towards()`/`_try_push_kick()` and
+  produces execution labels that don't match what the rules AI actually
   physically does that tick.
+  - **A second, subtler version of this same bug (fixed 2026-09)**: reading
+    the RIGHT fields (`player.kicked_this_tick`/`kick_armed`/`tackle_armed`)
+    but from the REAL, already-executed state instead of the counterfactual
+    one. These are Player-level flags, equally real regardless of which AI
+    set them — during recorded demonstrations `Phase1RulesAI` really is
+    driving, so reading them "for real" happened to be correct; during
+    on-policy PPO/DAgger training the trainee's own `NeuralPlayerAI` is
+    driving instead, so the exact same code silently echoed the STUDENT's
+    own kick/tackle behaviour back at it, with zero corrective signal. Watch
+    for this pattern specifically: an execution field being read from a
+    Player/engine-level flag is not enough by itself to prove it's a genuine
+    rules-AI counterfactual — confirm it's being read from *inside* the
+    snapshot/execute/restore sandbox, not from real pre-existing state.
+  - **A third bug (fixed 2026-09), about WHEN the counterfactual runs, not
+    WHAT it reads**: `phase1_labels()`'s counterfactual reads whatever
+    state `player`/`match` are in AT THE MOMENT it's called. `Match.step()`
+    runs `_process_orders(dt)` (real decisions + the observation
+    `NeuralPlayerAI` encodes, using state as of the START of the tick)
+    BEFORE `_apply_movement(dt)` (which actually advances position/
+    velocity/heading). Calling the label function from a rollout-loop
+    caller AFTER a full `env.step()` had already returned — the pattern
+    `PPOTrainer.train()`/`rollout_worker.py`/`ai/ppo/dagger.py` all used —
+    meant it saw POST-movement state, one physics tick later than the
+    observation it was meant to accompany. Small for move_direction, large
+    for kick (`_try_push_kick`'s geometric gates and run-compensated power
+    are sensitive to instantaneous position/heading/velocity, and can flip
+    a fire/no-fire boolean right at a threshold). Fixed by moving WHERE the
+    label is computed, not by anything inside `phase1_labels()` itself:
+    `NeuralPlayerAI` gained an optional `bc_label_fn` (see its own
+    docstring in `rules_ai.py`), called from INSIDE `act()` at the exact
+    instant the observation is encoded — callers now set
+    `env.bc_label_fn` (mirroring `env.sample_action_fn`) instead of calling
+    a label function themselves after the fact. `phase1_labels()` was
+    split into `phase1_labels(env, player_id=None)` (a thin wrapper, still
+    fine for callers like `record_demonstrations.py` that already compute
+    obs+label together, synchronously, from a live `env` they hold) and the
+    real logic, `phase1_labels_for_player(player, match)` (the function
+    `NeuralPlayerAI.bc_label_fn` actually calls). See
+    `curriculum.envs.bc_label_fn_for_phase()` (env-based) vs
+    `bc_label_fn_for_phase_player()` (player/match-based) — these are
+    NOT interchangeable, using the wrong one for a given call site silently
+    reintroduces either this bug or a `TypeError`.
+  - **A fourth bug, found while fixing the third**: the counterfactual
+    `order.execute()` can cause a real push-kick to fire, and
+    `Player.kick_direct()` draws its yaw/pitch noise from `match.rng` — ONE
+    `random.Random` shared by the whole simulation (every kick, tackle
+    roll, etc.). Without protecting it, this exploratory call silently
+    consumed real draws from that stream, desyncing every subsequent
+    genuine random outcome in the match. Fixed with
+    `match.rng.getstate()`/`setstate()` around the same snapshot/restore
+    block that already protects position/velocity/kick_armed/etc.
 - The current order's *type* IS legitimate INPUT CONTEXT to the execution
   network (e.g. `ai_type`/context features) — reading order type for context
   is fine; reading order *fields* to derive execution *labels* is not.
 
 **This bug has recurred multiple times** — always audit any BC-label-
-generation code that reads an Order's fields and ask: "is this deriving a
-decision-level label (OK) or an execution-level label (NOT OK, must come
-from `player.desired_direction`/`desired_speed_mode`/`kick_direct` output
-instead)?" See `agent_plans/bc_execution_label_boundary_and_followups.md`
-for the concrete fix history and rationale. Implementation: `phase1_labels()`
-in `ai/ppo/bc.py` snapshots player/ball state, runs the decided order's
-`execute()` once, reads back `desired_direction`/`desired_speed_mode`, then
-restores everything — this makes the exploratory call invisible to the real
+generation code that reads an Order's fields OR a Player's real physics
+flags and ask: "is this deriving a decision-level label (OK, order fields
+are fine there) or an execution-level label (NOT OK unless it's read from
+inside the counterfactual sandbox, never from real order fields or real
+already-executed Player state)?" Implementation: `phase1_labels()` in
+`ai/ppo/bc.py` snapshots player/ball state (including the arm-state fields
+above), resets `kicked_this_tick`/`kick_armed`/`tackle_armed` to match what
+`Match._process_orders()` itself does before a real order's `execute()`
+(so the counterfactual run is genuinely stateless, not contaminated by
+whatever really happened this tick), runs the decided order's `execute()`
+once, reads back every execution field from the result, then restores
+everything — this makes the exploratory call invisible to the real
 simulation.
 
 ## Package layout
