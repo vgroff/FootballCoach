@@ -1269,7 +1269,7 @@ def build_1v1_scenario(
     through real play).
 
     Ball velocity is resampled (up to 20 times) until a linear extrapolation
-    at the initial speed for 3 seconds stays in bounds (ignoring friction -
+    at the initial speed for 2.0 seconds stays in bounds (ignoring friction -
     conservative).  If all attempts fail the ball starts at rest.
 
     Restitution: sampled from Gaussian(base_restitution, sigma=0.08),
@@ -1312,11 +1312,24 @@ def build_1v1_scenario(
         trainee_team = rng.choice([Team.LEFT, Team.RIGHT])
     opponent_team = Team.RIGHT if trainee_team == Team.LEFT else Team.LEFT
 
+    _movement_params = MovementParams.from_config()
+
+    def _rand_capped_velocity(attrs: PlayerAttributes, stamina: float) -> Vector3:
+        """Random direction, magnitude uniform in [0, this player's own
+        effective_top_speed] at their sampled stamina -- has_ball=False
+        (nobody starts in possession here) and is_goalkeeper=False (no
+        goalkeepers in this 1v1 scenario)."""
+        max_speed = effective_top_speed(_movement_params, attrs.top_speed, stamina, has_ball=False)
+        speed = rng.uniform(0.0, max_speed)
+        direction = rng.uniform(-math.pi, math.pi)
+        return Vector3(math.cos(direction) * speed, math.sin(direction) * speed, 0.0)
+
     # --- Trainee (random team) ---
     trainee_attrs = generate_attributes(tier=trainee_tier, rng=rng)
     trainee = Player.create("trainee", trainee_team, trainee_attrs, position=_rand_pos())
     trainee.stamina = rng.uniform(stamina_min, stamina_max)
     trainee.heading_rad = rng.uniform(-math.pi, math.pi)
+    trainee.velocity = _rand_capped_velocity(trainee_attrs, trainee.stamina)
 
     # --- Opponent (opposite team) --- immobile, no order ---
     opponent_attrs = generate_attributes(tier=opponent_tier, rng=rng)
@@ -1334,6 +1347,16 @@ def build_1v1_scenario(
     opponent = Player.create("opponent", opponent_team, opponent_attrs, position=_opp_pos)
     opponent.stamina = rng.uniform(stamina_min, stamina_max)
     opponent.heading_rad = rng.uniform(-math.pi, math.pi)
+    # NOTE: when this opponent ends up immobile (no AI/order, the common
+    # case -- opponent_immobile_prob default 1.0), it never calls
+    # step_player_towards again, so Match._apply_movement's "no order this
+    # tick" branch just coasts it at this exact CONSTANT velocity (no
+    # deceleration/friction applied at all) for the rest of the episode --
+    # a genuinely "immobile" opponent will now drift in a straight line
+    # instead of standing still. Deliberate per this being applied to both
+    # players uniformly; revisit (e.g. skip this for the immobile case) if
+    # a drifting "immobile" opponent turns out to be an unwanted side effect.
+    opponent.velocity = _rand_capped_velocity(opponent_attrs, opponent.stamina)
 
     # --- Ball: random placement within ball_max_dist_from_trainee_m of trainee, in bounds ---
     for _ball_attempt in range(50):
@@ -1352,9 +1375,19 @@ def build_1v1_scenario(
         direction = rng.uniform(-math.pi, math.pi)
         vx = math.cos(direction) * speed
         vy = math.sin(direction) * speed
-        # Conservative (no-friction) 3-second extrapolation check
-        if (abs(ball_pos.x + vx * 3.0) < pitch.half_length
-                and abs(ball_pos.y + vy * 3.0) < pitch.half_width):
+        # Conservative (no-friction) 2.5-second extrapolation check (lowered
+        # from 3.0s -- the longer window was suppressing genuinely-escaping-
+        # ball trajectories almost entirely: 20,000 recorded demo episodes
+        # and a live 300-episode PPO-scenario sample both came back at 0%
+        # "invalid" outcome. Still rules out a ball that's an instant
+        # write-off, but lets through faster/closer-to-boundary draws that
+        # take a bit longer to actually exit -- combined with
+        # ball_max_dist_from_trainee_m, the trainee should now sometimes
+        # genuinely fail to reach it in time. Empirically (300-episode
+        # sample, at other threshold values tried along the way):
+        # 3.0s->0% invalid, 2.0s->3.7%, 1.5s->9%.)
+        if (abs(ball_pos.x + vx * 2.5) < pitch.half_length
+                and abs(ball_pos.y + vy * 2.5) < pitch.half_width):
             ball_vel = Vector3(vx, vy, 0.0)
             break
         max_speed = max(1.0, max_speed * 0.7)
@@ -1454,6 +1487,131 @@ def build_1v1_scenario(
             # whatever the last candidate was, same lenient philosophy as the
             # ball-placement loop above.
 
+    return match
+
+
+# ---------------------------------------------------------------------------
+# 1v1 escaping-ball scenario (deliberately produces "invalid" outcomes)
+# ---------------------------------------------------------------------------
+
+def build_1v1_escaping_ball_scenario(
+    rng_reduction: float = 0.3,
+    *,
+    trainee_tier: str | None = None,
+    opponent_tier: str | None = None,
+    ball_speed_mps: float | None = None,
+    stamina_min: float | None = None,
+    stamina_max: float | None = None,
+    trainee_team: "Team | None" = None,
+    sim_dt_s: float = 1.0 / 30.0,
+    seed: int | None = None,
+) -> Match:
+    """1v1 variant deliberately engineered to produce a genuine "invalid"
+    outcome (ball leaves the pitch with nobody having touched it -- see
+    ai/env/outcome.py's remap_phase1_outcome) at a realistic, non-trivial
+    rate: the ball starts near a random pitch corner aimed outward (away
+    from the pitch centre, toward that corner's own boundary), and the
+    trainee starts near the DIAGONALLY OPPOSITE corner -- far enough away
+    that reaching the ball before it exits is not realistic, unlike
+    build_1v1_scenario's own ball placement/velocity sampling, which
+    deliberately keeps the ball within ball_max_dist_from_trainee_m and
+    resamples any velocity that would exit within 3 seconds specifically
+    to AVOID this outcome (see that function's own docstring) -- this is
+    the intentional inverse of that safeguard, for recording/eval runs that
+    specifically want "invalid" coverage rather than trying to eliminate it.
+
+    Opponent is always immobile (this scenario is about the trainee's own
+    inability to reach a fast, distant ball -- an opponent isn't part of
+    the point). The trainee still gets no initial order, so real AI
+    (e.g. Phase1RulesAI during demo recording) genuinely attempts the chase
+    and realistically fails -- the recorded states are "gave chase, didn't
+    make it", not an artificially inert trainee.
+
+    ``seed``: fully deterministic for a given value (matches
+    build_1v1_scenario's own convention), including which corner is picked.
+    """
+    _cfg = _phase1_scenario_cfg()
+    if trainee_tier is None:
+        trainee_tier = str(_cfg.get("trainee_tier", "generic"))
+    if opponent_tier is None:
+        opponent_tier = str(_cfg.get("opponent_tier", "generic"))
+    if ball_speed_mps is None:
+        ball_speed_mps = float(_cfg.get("ball_max_speed_mps", 10.0))
+    if stamina_min is None:
+        stamina_min = float(_cfg.get("stamina_min", 0.3))
+    if stamina_max is None:
+        stamina_max = float(_cfg.get("stamina_max", 1.0))
+
+    rng = random.Random(seed)
+    pitch = Pitch.standard()
+
+    if trainee_team is None:
+        trainee_team = rng.choice([Team.LEFT, Team.RIGHT])
+    opponent_team = Team.RIGHT if trainee_team == Team.LEFT else Team.LEFT
+
+    # --- Pick a ball corner and its diagonally opposite trainee corner ---
+    corner_margin_m = 3.0  # how far in from the true corner point to start (avoid the exact edge)
+    corner_signs = rng.choice([(1, 1), (1, -1), (-1, 1), (-1, -1)])
+    bx_sign, by_sign = corner_signs
+    ball_corner = Vector3(
+        bx_sign * (pitch.half_length - corner_margin_m),
+        by_sign * (pitch.half_width - corner_margin_m),
+        0.0,
+    )
+    trainee_corner = Vector3(-ball_corner.x, -ball_corner.y, 0.0)
+
+    def _jitter(base: Vector3, spread_m: float) -> Vector3:
+        return Vector3(
+            max(-pitch.half_length + 0.5, min(pitch.half_length - 0.5, base.x + rng.uniform(-spread_m, spread_m))),
+            max(-pitch.half_width + 0.5, min(pitch.half_width - 0.5, base.y + rng.uniform(-spread_m, spread_m))),
+            0.0,
+        )
+
+    ball_pos = _jitter(ball_corner, 4.0)
+    trainee_pos = _jitter(trainee_corner, 4.0)
+
+    # --- Trainee ---
+    trainee_attrs = generate_attributes(tier=trainee_tier, rng=rng)
+    trainee = Player.create("trainee", trainee_team, trainee_attrs, position=trainee_pos)
+    trainee.stamina = rng.uniform(stamina_min, stamina_max)
+    trainee.heading_rad = rng.uniform(-math.pi, math.pi)
+
+    # --- Opponent: always immobile, parked well out of the way ---
+    opponent_attrs = generate_attributes(tier=opponent_tier, rng=rng)
+    opponent = Player.create("opponent", opponent_team, opponent_attrs, position=Vector3(0.0, 0.0, 0.0))
+    opponent.stamina = rng.uniform(stamina_min, stamina_max)
+    opponent.heading_rad = rng.uniform(-math.pi, math.pi)
+    opponent.ai = None
+
+    # --- Ball: aimed from its corner toward the NEAREST boundary intersection
+    # (i.e. straight out through that same corner), small angular jitter so
+    # episodes vary without ever pointing back into the pitch. ---
+    outward_angle = math.atan2(ball_corner.y, ball_corner.x)
+    angle = outward_angle + rng.uniform(-math.radians(20.0), math.radians(20.0))
+    speed = rng.uniform(0.6 * ball_speed_mps, ball_speed_mps)
+    ball_vel = Vector3(math.cos(angle) * speed, math.sin(angle) * speed, 0.0)
+    ball_spin = Vector3(rng.gauss(0.0, 1.0), rng.gauss(0.0, 1.0), rng.gauss(0.0, 1.5))
+    ball = Ball.at_rest(ball_pos)
+    ball.velocity = ball_vel
+    ball.spin = ball_spin
+
+    base_params = BallPhysicsParams.from_config()
+    restitution = max(0.2, min(0.95, rng.gauss(base_params.bounce_restitution_vertical, 0.08)))
+    ball_params = replace(base_params, bounce_restitution_vertical=restitution)
+
+    ui_cfg = load_gameplay_config().get("ui", {})
+    match = Match(
+        pitch=pitch,
+        players=[trainee, opponent],
+        ball=ball,
+        rng_reduction=rng_reduction,
+        rng=rng,
+        ball_physics_params=ball_params,
+        goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
+        dt_s=sim_dt_s,
+    )
+    match._opponent_use_rules_ai = False
+    match._opponent_is_immobile = True
     return match
 
 

@@ -180,10 +180,20 @@ def rebuild_inference_trainer(
     trainer = PPOTrainer.from_config(
         device=torch.device("cpu"), inference_only=True, separate_value_net=separate_value_net,
     )
-    trainer.decision_net.load_state_dict(decision_state)
-    trainer.execution_net.load_state_dict(execution_state)
+    # Tolerant, not module.load_state_dict(..., strict=...) directly: a
+    # physics-encoder-enabled DecisionNetwork's state_dict() deliberately
+    # excludes ball_physics_encoder.*/player_physics_encoder.* (see that
+    # method's own docstring -- they're an external checkpoint artifact,
+    # never part of the main PPO checkpoint), but a freshly-constructed
+    # DecisionNetwork here still HAS those params (loaded fresh from their
+    # own physics_pretrain checkpoint path by from_config() above) -- a
+    # strict load would then fail on "missing keys" for something that was
+    # never supposed to travel through decision_state at all. Mirrors
+    # load_checkpoint()'s own tolerant load for the exact same reason.
+    _load_state_dict_tolerant(trainer.decision_net, decision_state, "decision_net")
+    _load_state_dict_tolerant(trainer.execution_net, execution_state, "execution_net")
     if value_state is not None and trainer.value_net is not None:
-        trainer.value_net.load_state_dict(value_state)
+        _load_state_dict_tolerant(trainer.value_net, value_state, "value_net")
     return trainer
 
 
@@ -1885,7 +1895,21 @@ class PPOTrainer:
                     list(self.decision_net.parameters()),
                     lr=self._demo_value_pretrain_lr, eps=1e-5,
                 )
-                _value_opt = self.value_net_optimizer
+                # Fresh optimizer, NOT self.value_net_optimizer -- that one is
+                # built at ppo.value_learning_rate (5e-5 by default), tuned
+                # for gentle per-rollout updates against a slowly-shifting
+                # on-policy return distribution during real PPO, not a bulk
+                # offline regression pass over the full demo dataset. Reusing
+                # it here made Phase 0 (and Phase 1's later separate-value
+                # branch, before this fix) converge far slower than
+                # demo_value_pretrain_lr actually allows, and dragged
+                # whatever Adam momentum state this builds up straight into
+                # real PPO training afterward. demo_value_pretrain_lr is the
+                # same rate Phase 1's own separate-value branch now uses, for
+                # the identical underlying task (demo-return regression).
+                _value_opt = torch.optim.Adam(
+                    self.value_net.parameters(), lr=self._demo_value_pretrain_lr, eps=1e-5,
+                )
                 _value_clip_params = list(self.value_net.parameters())
             else:
                 demo_opt = torch.optim.Adam(
@@ -2154,29 +2178,54 @@ class PPOTrainer:
         _save_pretrain_checkpoint("Phase 0")
 
         # --- Phase 1: BC epochs over the dataset ---
-        # If dataset has reward data and demo_value_bc_coef > 0, also add a
-        # value loss term (MSE against demo returns) in the same backward pass.
-        # Disabled when separate_value_net is enabled -- this term trains
-        # execution_net.value_head, which is unused/frozen in that mode (see
-        # Phase 0 comment above); self.value_net gets its warm-up purely from
-        # Phase 0 (demo returns) and pretrain_value()'s MSE-only loop, never
-        # mixed with Phase 1's BC gradients.
+        # If dataset has reward data and bc_value_coef > 0, also train value
+        # against demo returns every minibatch. Two different mechanisms
+        # depending on separate_value_net:
+        #   - not separate_value_net: value loss (against execution_net.
+        #     value_head) is folded into total_loss and shares bc_opt's
+        #     single backward/step with the BC loss -- see total_loss below.
+        #   - separate_value_net: value loss (against the independent
+        #     self.value_net) gets its OWN backward()/self.value_net_
+        #     optimizer.step(), computed from a DETACHED d_heads, so it
+        #     never contributes gradient into decision_net and never
+        #     touches bc_opt/bc_losses/_eval_bc_val_loss's early-stop
+        #     patience -- mirrors _ppo_update's identical detach-before-
+        #     value_net pattern (see _detach_decision_heads' call sites),
+        #     and fixes the gap where self.value_net previously only ever
+        #     got demo-return training from Phase 0 (a separate, usually
+        #     much shorter epoch budget), never from the bulk of Phase 1.
         _use_joint_val = (
             not self.separate_value_net
             and self._bc_value_coef > 0.0
             and dataset.has_rewards
         )
-        if _use_joint_val:
+        _use_separate_value_training = (
+            self.separate_value_net
+            and self._bc_value_coef > 0.0
+            and dataset.has_rewards
+        )
+        if _use_joint_val or _use_separate_value_training:
             _joint_returns = dataset.compute_returns(gamma=self._demo_value_pretrain_gamma)
             _joint_ret_std = float(np.std(_joint_returns).clip(1.0))
             log.info(
-                f"Phase 1 BC epochs will include joint value loss "
-                f"(coef={self._bc_value_coef}, gamma={self._demo_value_pretrain_gamma}, "
+                f"Phase 1 BC epochs will include "
+                f"{'joint' if _use_joint_val else 'separate (self.value_net, detached from decision_net)'} "
+                f"value loss (coef={self._bc_value_coef}, gamma={self._demo_value_pretrain_gamma}, "
                 f"returns std={_joint_ret_std:.2f})"
             )
         else:
             _joint_returns = None
             _joint_ret_std = 1.0
+        # Fresh optimizer, NOT self.value_net_optimizer -- see Phase 0's
+        # identical fix/rationale above (that one is tuned for gentle
+        # per-rollout PPO updates, ~20x slower than demo_value_pretrain_lr,
+        # and reusing it here also drags Phase 1's momentum state into real
+        # PPO training afterward). Only actually built/used when
+        # _use_separate_value_training is True.
+        _sep_value_opt = (
+            torch.optim.Adam(self.value_net.parameters(), lr=self._demo_value_pretrain_lr, eps=1e-5)
+            if _use_separate_value_training else None
+        )
 
         # Do BC first so the rollout is collected with the BC-warmed policy,
         # giving on-policy value targets instead of random-init targets.
@@ -2252,6 +2301,8 @@ class PPOTrainer:
             bc_floors = []
             val_losses: list[float] = []
             val_raw_mse_losses: list[float] = []
+            sep_val_losses: list[float] = []
+            sep_val_raw_mse_losses: list[float] = []
             dir_cosines: list[float] = []
             kick_dir_cosines: list[float] = []
             move_probs: list[float] = []
@@ -2296,7 +2347,7 @@ class PPOTrainer:
                 downsample_trivial_exclude_radius_steps=self._downsample_trivial_exclude_radius_steps,
                 indices_override=_bc_train_idx,
             ):
-                if _use_joint_val:
+                if _use_joint_val or _use_separate_value_training:
                     obs_dict, bc_labels, ret_batch = mb
                 else:
                     obs_dict, bc_labels = mb
@@ -2336,12 +2387,13 @@ class PPOTrainer:
                 )
                 dir_mag_reg = direction_magnitude_reg(e_heads, self._bc_dir_mag_reg_coef)
                 total_loss = bc_loss + dir_mag_reg
-                if ret_batch is not None:
+                if _use_joint_val and ret_batch is not None:
                     # Single value head: execution_net only (decision_net.value
-                    # is frozen — see __init__ note). ret_batch is always None
-                    # here when separate_value_net is enabled (_use_joint_val
-                    # forces it off above), so this branch never touches
-                    # self.value_net.
+                    # is frozen — see __init__ note). Folded into total_loss,
+                    # sharing bc_opt's one backward/step with the BC loss --
+                    # only reached when NOT separate_value_net (see
+                    # _use_separate_value_training's own detached branch
+                    # below for that case).
                     v_exc = e_heads.value.squeeze(-1)
                     val_loss = F.mse_loss(v_exc, ret_batch) / (_joint_ret_std ** 2)
                     total_loss = bc_loss + dir_mag_reg + self._bc_value_coef * val_loss
@@ -2358,6 +2410,41 @@ class PPOTrainer:
                         self._bc_max_grad_norm,
                     )
                 bc_opt.step()
+
+                if _use_separate_value_training and ret_batch is not None:
+                    # Own backward/optimizer step, entirely separate from
+                    # bc_opt/total_loss above -- d_heads is detached first so
+                    # this loss contributes ZERO gradient to decision_net
+                    # (mirrors _ppo_update's identical pattern, see
+                    # _detach_decision_heads' other call sites/docstring).
+                    # Deliberately NOT scaled by self._bc_value_coef: that
+                    # coefficient exists to balance a value term AGAINST a BC
+                    # term sharing the same backward pass (the _use_joint_val
+                    # branch above) -- here value_loss is the only term in
+                    # its own graph, so scaling it would just be equivalent
+                    # to rescaling _sep_value_opt's own LR, adding a second,
+                    # redundant knob for the same effect. Does NOT feed
+                    # bc_losses/_eval_bc_val_loss, so it has no effect on
+                    # Phase 1's BC early-stop patience (that stays a pure
+                    # BC-only metric). Uses _sep_value_opt (fresh, demo_value_
+                    # pretrain_lr), NOT self.value_net_optimizer -- see that
+                    # variable's own setup comment above for why.
+                    d_heads_for_value = _detach_decision_heads(d_heads)
+                    e_heads_value = self.value_net(
+                        obs_dict["self_feat"], obs_dict["other_feat"], obs_dict["exists_mask"],
+                        obs_dict["ball_feat"], obs_dict["global_feat"], d_heads_for_value, _sat, _oat,
+                    )
+                    v_sep = e_heads_value.value.squeeze(-1)
+                    sep_val_loss = F.mse_loss(v_sep, ret_batch) / (_joint_ret_std ** 2)
+                    _sep_value_opt.zero_grad()
+                    sep_val_loss.backward()
+                    if self._bc_max_grad_norm is not None:
+                        nn.utils.clip_grad_norm_(list(self.value_net.parameters()), self._bc_max_grad_norm)
+                    _sep_value_opt.step()
+                    sep_val_losses.append(sep_val_loss.item())
+                    with torch.no_grad():
+                        sep_raw_mse = F.mse_loss(v_sep, ret_batch)
+                        sep_val_raw_mse_losses.append(sep_raw_mse.item())
                 bc_losses.append(bc_loss.item())
                 bc_floors.append(compute_bc_loss_floor(
                     bc_labels,
@@ -2454,6 +2541,18 @@ class PPOTrainer:
                 )
             else:
                 val_str = ""
+            if sep_val_losses:
+                # Separate, detached self.value_net training (see
+                # _use_separate_value_training above) -- NOT scaled by
+                # self._bc_value_coef (no combined loss to weight against),
+                # so no "(x coef)=" term here unlike val_str above.
+                sep_val_rmse = float(np.sqrt(np.mean(sep_val_raw_mse_losses))) if sep_val_raw_mse_losses else float('nan')
+                sep_val_str = (
+                    f"    value_net  loss={np.mean(sep_val_losses):.4f}  "
+                    f"rmse={sep_val_rmse:.2f} (returns std={_joint_ret_std:.1f}, detached from decision_net)"
+                )
+            else:
+                sep_val_str = ""
             _epoch_elapsed = time.monotonic() - _epoch_t0
             # Tabulated multi-line epoch summary (readability refactor only — every
             # field from the old single-line format is preserved, just grouped, with
@@ -2473,6 +2572,8 @@ class PPOTrainer:
                 f"               tackle: p={tk_prec:.3f}  r={tk_rec:.3f}  f1={tk_f1:.3f}  "
                 f"(tp={_tackle_tp:.0f} fp={_tackle_fp:.0f} fn={_tackle_fn:.0f})",
             ]
+            if sep_val_str:
+                _bc_lines.append(sep_val_str)
             if bkdn_str:
                 _bkdn_parts = bkdn_str.split("  ")
                 _mid = (len(_bkdn_parts) + 1) // 2

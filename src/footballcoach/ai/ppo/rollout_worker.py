@@ -65,7 +65,7 @@ def _worker_main(
 
     from footballcoach.ai.curriculum.envs import build_env, bc_label_fn_for_phase_player
     from footballcoach.ai.curriculum.phases import PHASES_BY_ID
-    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _load_state_dict_tolerant
     from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
     from footballcoach.ai.progress import ProgressReporter
 
@@ -246,10 +246,18 @@ def _worker_main(
             conn.send(result)
             buffer.clear()  # after send: result["buffer"] IS this same object
         elif cmd == "set_weights":
-            trainer.decision_net.load_state_dict(msg["decision_net"])
-            trainer.execution_net.load_state_dict(msg["execution_net"])
+            # Tolerant, not a direct strict load: a physics-encoder-enabled
+            # DecisionNetwork's state_dict() deliberately excludes
+            # ball_physics_encoder.*/player_physics_encoder.* (external,
+            # frozen checkpoint artifact, never part of the main PPO
+            # checkpoint -- see DecisionNetwork.state_dict()'s own
+            # docstring), but this worker's own trainer.decision_net still
+            # HAS those params (loaded fresh from config at worker startup)
+            # -- see rebuild_inference_trainer's identical fix/rationale.
+            _load_state_dict_tolerant(trainer.decision_net, msg["decision_net"], "decision_net")
+            _load_state_dict_tolerant(trainer.execution_net, msg["execution_net"], "execution_net")
             if msg.get("value_net") is not None and trainer.value_net is not None:
-                trainer.value_net.load_state_dict(msg["value_net"])
+                _load_state_dict_tolerant(trainer.value_net, msg["value_net"], "value_net")
             conn.send({"ok": True})
         elif cmd == "close":
             break
