@@ -33,6 +33,7 @@ from footballcoach.engine.kicking import (
 )
 from footballcoach.entities.ball import Ball
 from footballcoach.mathutils import Vector3
+from footballcoach.ui import style
 
 # Simulation step: match the engine tick rate (30 Hz), but sub-step for
 # smoother trajectory preview.
@@ -166,6 +167,40 @@ def compute_error_sigma(
     dir_precision_mult = running_direction_precision_multiplier(player_velocity, aim_dir, params)
     effective_precision = kick_precision * dir_precision_mult
     return kick_sigma_rad(params, effective_precision, power_fraction, rng_reduction=0.0)
+
+
+def height_to_colour(
+    height_m: float,
+    goal_height_m: float,
+    max_height_m: float = style.TRAJ_HIGH_HEIGHT_M,
+) -> tuple[int, int, int]:
+    """Maps a trajectory point's height to a colour on a two-segment gradient:
+    darkish blue at ground level, reaching red by `goal_height_m`, then
+    continuing to redden up to `max_height_m` (clamped beyond that).
+
+    Two segments (0->goal_height_m, goal_height_m->max_height_m) rather than
+    one continuous ramp so the trajectory is unambiguously red as soon as
+    it's above the goal frame, instead of only reddening near the very top
+    of the whole range.
+    """
+    low, mid, high = style.TRAJ_LOW_COLOUR, style.TRAJ_GOAL_COLOUR, style.TRAJ_HIGH_COLOUR
+
+    if height_m <= 0.0:
+        return low
+    if height_m <= goal_height_m:
+        t = height_m / max(goal_height_m, 1e-6)
+        c0, c1 = low, mid
+    elif height_m <= max_height_m:
+        t = (height_m - goal_height_m) / max(max_height_m - goal_height_m, 1e-6)
+        c0, c1 = mid, high
+    else:
+        return high
+
+    return (
+        int(c0[0] + (c1[0] - c0[0]) * t),
+        int(c0[1] + (c1[1] - c0[1]) * t),
+        int(c0[2] + (c1[2] - c0[2]) * t),
+    )
 
 
 def spin_from_mouse(

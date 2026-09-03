@@ -84,6 +84,20 @@ class PassingParams:
     min_speed_mps: float
     max_speed_mps: float
     pass_aim_height_m: float  # height to aim at (and thus launch angle); 0.11=flat, higher=lofted
+    # Multiplicative boost on pass_speed_mps's auto-paced launch speed
+    # (2026-09-03), compensating for ball_physics.py's ground-contact
+    # spin-up cost: a pass is launched spin-free (see pass_ball's
+    # docstring for why it doesn't just impart matching spin instead), so
+    # it now pays a real sliding-to-rolling transition loss the original
+    # power_overshoot_factor calibration didn't have to account for -- see
+    # agent_plans/physics_update.md section 8. Linear in distance
+    # (boost = base + per_m*distance_m) because the required compensation
+    # was empirically found to grow with distance (faster passes spend
+    # longer paying the spin-up cost before genuinely rolling) -- a flat
+    # constant undershot short passes or overshot long ones. base=1.0,
+    # per_m=0.0 = no compensation.
+    spinup_speed_boost_base: float = 1.0
+    spinup_speed_boost_per_m: float = 0.0
 
     @staticmethod
     def from_config() -> "PassingParams":
@@ -95,6 +109,8 @@ class PassingParams:
             min_speed_mps=d["min_speed_mps"],
             max_speed_mps=d["max_speed_mps"],
             pass_aim_height_m=d["pass_aim_height_m"],
+            spinup_speed_boost_base=d.get("spinup_speed_boost_base", 1.0),
+            spinup_speed_boost_per_m=d.get("spinup_speed_boost_per_m", 0.0),
         )
 
 
@@ -253,7 +269,8 @@ def pass_speed_mps(params: PassingParams, distance_m: float, gravity_mps2: float
     """
     base_speed = math.sqrt(max(0.0, 2.0 * rolling_friction_coefficient * gravity_mps2 * distance_m))
     overshoot = params.power_overshoot_factor + params.overshoot_drag_factor * (distance_m ** params.overshoot_drag_exponent)
-    speed = base_speed * overshoot
+    spinup_boost = params.spinup_speed_boost_base + params.spinup_speed_boost_per_m * distance_m
+    speed = base_speed * overshoot * spinup_boost
     return max(params.min_speed_mps, min(params.max_speed_mps, speed))
 
 
@@ -312,6 +329,15 @@ def solve_launch_pitch_rad(
     return math.atan(flatter_t)
 
 
+# Tolerance (metres) for "the ball is resting on/near the ground at the
+# instant of a kick" in _release_kick's grounded-downward-kick reflection
+# below -- deliberately not exact-equality against ball.radius_m, since the
+# ball's resting height can sit a hair off radius_m from float accumulation
+# in step_ball's own ground-clamp, and a kick can legitimately fire on a
+# tick where the ball hasn't been re-clamped to EXACTLY radius_m yet.
+_GROUNDED_KICK_REFLECT_TOLERANCE_M = 0.03
+
+
 def _release_kick(
     ball: Ball,
     kicker_position: Vector3,
@@ -329,13 +355,31 @@ def _release_kick(
     ball-release physics happens -- both `_launch_ball` (solves yaw/pitch
     from an aim point first) and `kick_ball_from_direction` (already has
     yaw/pitch directly from a given 3D direction, no solve needed) end here,
-    so a kick launched either way stays bit-identical past this point."""
+    so a kick launched either way stays bit-identical past this point.
+
+    Grounded-downward reflection: if the ball is already resting on/near the
+    ground (within _GROUNDED_KICK_REFLECT_TOLERANCE_M of ball.radius_m) and
+    the noisy final_pitch aims the kick further downward, there's nowhere
+    for that velocity to go but immediately trigger step_ball's ground-
+    bounce branch on the very next physics tick -- which applies BOTH
+    bounce_restitution_vertical and a friction/spin-coupled horizontal
+    speed cut (see ball_physics.py's _resolve_bounce_friction), a real and mostly
+    unintended energy loss for what's usually just an ordinary flat-ish kick
+    that happened to sample a touch of downward angle noise, not a
+    deliberate stab into the turf. Reflecting vertical_speed's sign here
+    instead launches the ball upward at the same speed a real bounce would
+    eventually produce, without paying that restitution loss at all -- no
+    other kicker in the match (rules-AI push-kicks, shots, passes) ever
+    deliberately aims downward from ground level either, so this only ever
+    changes behaviour for a case nobody actually wants."""
     launch_position = kicker_position.with_z(ball.position.z)
     final_yaw = yaw + rng.gauss(0.0, sigma)
     final_pitch = pitch + rng.gauss(0.0, sigma)
 
     horizontal_speed = speed * math.cos(final_pitch)
     vertical_speed = speed * math.sin(final_pitch)
+    if vertical_speed < 0.0 and ball.position.z <= ball.radius_m + _GROUNDED_KICK_REFLECT_TOLERANCE_M:
+        vertical_speed = -vertical_speed
 
     velocity = Vector3(
         math.cos(final_yaw) * horizontal_speed,
@@ -536,6 +580,12 @@ def pass_ball(
         base_power_fraction=base_power_fraction,
     )
 
+    # Launched spin-free (2026-09-03: reverted an earlier attempt to give
+    # passes matching rolling spin -- that broke the NN-replay-equivalence
+    # contract, since the neural network's own kick path is hardcoded
+    # spin-free and can't reproduce it; see agent_plans/physics_update.md
+    # section 8 for the full history). Compensated instead via
+    # pass_speed_mps's spinup_speed_boost -- see PassingParams.
     _launch_ball(ball, kicker_position, aim_point, speed, sigma, Vector3.zero(), r, gravity_mps2)
 
 def kick_ball_from_direction(

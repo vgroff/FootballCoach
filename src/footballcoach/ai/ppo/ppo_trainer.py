@@ -2564,6 +2564,7 @@ class PPOTrainer:
                     episodes_per_iteration=self._dagger_episodes_per_iteration,
                     n_workers=self._dagger_n_workers,
                     batch_size=batch_size,
+                    checkpoint_fn=_save_pretrain_checkpoint,
                 )
                 _save_pretrain_checkpoint("DAgger")
                 log.info("Evaluating policy after DAgger...")

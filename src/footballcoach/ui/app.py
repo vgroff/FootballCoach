@@ -79,6 +79,11 @@ class ScenarioParamsUIState:
 
 
 class App:
+    # Below this, HUD chrome (hotkey bar, game log, help button, ...) has
+    # nowhere left to lay out -- see _handle_resize.
+    _MIN_WINDOW_W = 640
+    _MIN_WINDOW_H = 480
+
     def __init__(self) -> None:
         pygame.init()
         pygame.display.set_caption("Football Coach")
@@ -96,13 +101,19 @@ class App:
         self._physics_acc_s: float = 0.0
         self._fps_smooth: float = float(self._target_fps)
 
-        # SCALED lets SDL2 handle DPI/upscaling at hardware level instead of the OS compositor.
-        self.surface = pygame.display.set_mode((self.camera.screen_width, self.camera.screen_height), pygame.SCALED)
+        # RESIZABLE: window size is user-controlled (drag-resize, OS
+        # maximise/restore) -- see Camera.resize/App._handle_resize, which
+        # derive zoom from whatever the actual window size is, rather than
+        # window size being a fixed function of a configured zoom level.
+        # config's camera.pixels_per_metre only picks the STARTING size here.
+        self.surface = pygame.display.set_mode(
+            (self.camera.screen_width, self.camera.screen_height), pygame.RESIZABLE,
+        )
+        self.camera.resize(self.camera.screen_width, self.camera.screen_height)
         try:
             desktop_sizes = pygame.display.get_desktop_sizes()
             window_size = pygame.display.get_window_size()
-            ppm = _cam_cfg.get('pixels_per_metre', 9.0)
-            print(f"[UI] Desktop monitors: {desktop_sizes}  window size: {window_size}  logical surface: {self.camera.screen_width}x{self.camera.screen_height}  pixels_per_metre: {ppm}  physics_hz: {self._physics_tick_hz}  target_fps: {self._target_fps}")
+            print(f"[UI] Desktop monitors: {desktop_sizes}  window size: {window_size}  logical surface: {self.camera.screen_width}x{self.camera.screen_height}  pixels_per_metre: {self.camera.pixels_per_metre:.2f}  physics_hz: {self._physics_tick_hz}  target_fps: {self._target_fps}")
         except Exception as _e:
             print(f"[UI] Display info unavailable: {_e}")
         self.clock = pygame.time.Clock()
@@ -118,6 +129,8 @@ class App:
         self._scenario_loop: scenarios.ScenarioLoop | None = None
         self.show_help = False
         self.help_button_rect = pygame.Rect(0, 0, 90, 32)
+        self._speed_minus_rect = pygame.Rect(0, 0, 0, 0)
+        self._speed_plus_rect = pygame.Rect(0, 0, 0, 0)
 
         # Game log
         self.game_log = GameLog(max_entries=50)
@@ -140,10 +153,11 @@ class App:
         self._scenario_params_ui = ScenarioParamsUIState()
 
         # Simulation speed in match-seconds per real-second (1.0 = real-time, 2.0 = 2x speed).
-        # Cycle with ] (faster) and [ (slower). Steps/frame = round(physics_tick_hz * speed / target_fps).
+        # Cycle with ] (faster) and [ (slower), or the on-screen [-]/[+] control
+        # next to the Help button. Steps/frame = round(physics_tick_hz * speed / target_fps).
         _default_sim_speed = float(load_gameplay_config().get("ui", {}).get("default_sim_speed", 2.0))
         self._sim_speed: float = _default_sim_speed
-        self._SIM_SPEED_OPTIONS: tuple[float, ...] = (0.5, 1.0, 2.0, 4.0, 8.0)
+        self._SIM_SPEED_OPTIONS: tuple[float, ...] = (0.2, 0.5, 1.0, 2.0, 4.0, 8.0)
 
         # Training mode: neural control toggle for the trainee (see `N` hotkey
         # in _handle_keydown / _toggle_training_ai_mode). None = human control
@@ -180,10 +194,25 @@ class App:
 
     # -- event handling -----------------------------------------------------
 
+    def _handle_resize(self, w: int, h: int) -> None:
+        """Window resized (drag, or OS-level maximise/restore -- pygame
+        delivers those as ordinary VIDEORESIZE events too since the window
+        is created with pygame.RESIZABLE). Clamp to a sane minimum (below
+        this, HUD chrome has nowhere left to lay out) and re-derive zoom
+        from the new size -- see Camera.resize's own docstring for why
+        this is the inverse of the old "window size is a function of
+        zoom" relationship."""
+        w = max(w, self._MIN_WINDOW_W)
+        h = max(h, self._MIN_WINDOW_H)
+        self.surface = pygame.display.set_mode((w, h), pygame.RESIZABLE)
+        self.camera.resize(w, h)
+
     def _handle_events(self) -> None:
         for event in pygame.event.get():
             if event.type == pygame.QUIT:
                 self.running = False
+            elif event.type == pygame.VIDEORESIZE:
+                self._handle_resize(event.w, event.h)
             elif event.type == pygame.KEYDOWN:
                 self._handle_keydown(event.key)
             elif self.screen == Screen.MENU and event.type == pygame.MOUSEBUTTONDOWN:
@@ -197,6 +226,10 @@ class App:
                     )
             elif self.screen == Screen.MATCH and event.type == pygame.MOUSEBUTTONDOWN and self.help_button_rect.collidepoint(event.pos):
                 self.show_help = not self.show_help
+            elif self.screen == Screen.MATCH and not self.show_help and event.type == pygame.MOUSEBUTTONDOWN and self._speed_minus_rect.collidepoint(event.pos):
+                self._cycle_sim_speed(-1)
+            elif self.screen == Screen.MATCH and not self.show_help and event.type == pygame.MOUSEBUTTONDOWN and self._speed_plus_rect.collidepoint(event.pos):
+                self._cycle_sim_speed(1)
             elif self.screen == Screen.MATCH and not self.show_help:
                 self._handle_match_mouse_event(event)
 
@@ -263,14 +296,19 @@ class App:
         elif key == pygame.K_n and self.is_training_mode:
             self._toggle_training_ai_mode()
         elif key == pygame.K_RIGHTBRACKET:
-            # Snap to nearest option then advance.
-            opts = self._SIM_SPEED_OPTIONS
-            idx = min(range(len(opts)), key=lambda i: abs(opts[i] - self._sim_speed))
-            self._sim_speed = opts[(idx + 1) % len(opts)]
+            self._cycle_sim_speed(1)
         elif key == pygame.K_LEFTBRACKET:
-            opts = self._SIM_SPEED_OPTIONS
-            idx = min(range(len(opts)), key=lambda i: abs(opts[i] - self._sim_speed))
-            self._sim_speed = opts[(idx - 1) % len(opts)]
+            self._cycle_sim_speed(-1)
+
+    def _cycle_sim_speed(self, direction: int) -> None:
+        """Steps `self._sim_speed` to the next (`direction=1`) or previous
+        (`direction=-1`) entry in `_SIM_SPEED_OPTIONS`, snapping to the
+        nearest option first (so this is well-defined even if `_sim_speed`
+        was set to a value not in the list, e.g. via `_start_scenario`).
+        Shared by the `]`/`[` hotkeys and the on-screen [-]/[+] control."""
+        opts = self._SIM_SPEED_OPTIONS
+        idx = min(range(len(opts)), key=lambda i: abs(opts[i] - self._sim_speed))
+        self._sim_speed = opts[(idx + direction) % len(opts)]
 
     def _handle_match_mouse_event(self, event: pygame.event.Event) -> None:
         if self.input_controller is None:
@@ -841,6 +879,9 @@ class App:
                 hud_lines.append(f"Selected: {selected_id}")
         self.renderer.draw_hud_text(self.surface, hud_lines)
         self._draw_help_button()
+        self._speed_minus_rect, self._speed_plus_rect = self.renderer.draw_speed_control(
+            self.surface, self._sim_speed, self.help_button_rect.x - 12,
+        )
         self.renderer.draw_hotkey_bar(self.surface, self._hotkey_entries())
         # Expose linger progress to the game-log renderer (0.0 = not lingering).
         if self._scenario_loop is not None and self._scenario_loop._pending_outcome is not None:
@@ -913,7 +954,8 @@ class App:
             "N (training mode only)   - cycle trainee: human -> neural (checkpoint 1) -> ... -> human.",
             "                           While neural, clicks/kicks still take over for one order.",
             "Space                    - pause/resume the simulation",
-            "] / [                    - increase / decrease simulation speed (1x / 2x / 4x / 8x)",
+            "] / [                    - increase / decrease simulation speed (0.2x-8x)",
+            "[-]/[+] control (top right) - same simulation speed control, via mouse",
             "H or Help button         - toggle this help overlay",
             "L                        - cycle game log level (INFO / DEBUG)",
             "Esc                      - close this overlay, or return to the menu / quit",

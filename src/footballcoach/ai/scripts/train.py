@@ -196,6 +196,16 @@ def main() -> None:
                              "--pretrain-from-checkpoint, --from-pretrained, --latest[-pretrain]). "
                              "Useful when a loaded policy's log_std has drifted/collapsed and is "
                              "causing move_dir KL to dominate early-stop.")
+    parser.add_argument("--reset-kick-power-log-std", action="store_true",
+                        help="Reset kick_power_log_std to ppo.kick_power_log_std_init from "
+                             "ai_config.json after loading any checkpoint (same checkpoint-loading "
+                             "call sites/timing as --reset-dir-log-std, but this is a SEPARATE flag "
+                             "-- kick_power_log_std is never touched by --reset-dir-log-std). Useful "
+                             "for the same reason: BC/DAgger pretraining never trains this parameter "
+                             "at all (it has no gradient path through the BC loss, which only ever "
+                             "supervises the mean), so it sits at whatever it was initialised/left "
+                             "at, producing real per-kick power sampling noise BC's own loss/metrics "
+                             "can't see.")
     parser.add_argument("--reset-optimizer", action="store_true",
                         help="Skip restoring Adam's optimizer state (per-param running "
                              "m/v moment estimates + step count) when loading any checkpoint "
@@ -407,11 +417,20 @@ def main() -> None:
             trainer.execution_net.kick_dir_log_std.fill_(kick_init)
         log.info(f"--reset-dir-log-std: move_dir_log_std={move_init}  kick_dir_log_std={kick_init}")
 
+    def _reset_kick_power_log_std() -> None:
+        ppo_cfg_r = cfg.get("ppo", {})
+        kp_init = float(ppo_cfg_r.get("kick_power_log_std_init", 0.0))
+        with torch.no_grad():
+            trainer.execution_net.kick_power_log_std.fill_(kp_init)
+        log.info(f"--reset-kick-power-log-std: kick_power_log_std={kp_init}")
+
     # Optionally resume from checkpoint
     if args.checkpoint:
         trainer.load_checkpoint(Path(args.checkpoint), reset_optimizer=args.reset_optimizer)
         if args.reset_dir_log_std:
             _reset_dir_log_std()
+        if args.reset_kick_power_log_std:
+            _reset_kick_power_log_std()
 
     # --pretrain-from-checkpoint: load weights but still run pretraining
     if args.pretrain_from_checkpoint:
@@ -424,6 +443,8 @@ def main() -> None:
         log.info(f"Loaded checkpoint for re-pretraining: {ptrain_path} — will still run BC/value pre-training")
         if args.reset_dir_log_std:
             _reset_dir_log_std()
+        if args.reset_kick_power_log_std:
+            _reset_kick_power_log_std()
         if not args.bc_dataset:
             log.warning(
                 "--pretrain-from-checkpoint used without --bc-dataset: "
@@ -447,6 +468,8 @@ def main() -> None:
         trainer.load_checkpoint(pretrained_path, reset_optimizer=args.reset_optimizer)
         if args.reset_dir_log_std:
             _reset_dir_log_std()
+        if args.reset_kick_power_log_std:
+            _reset_kick_power_log_std()
         log.info(f"Loaded pre-trained checkpoint: {pretrained_path} — skipping BC/value pre-training")
 
     # Pre-training phase: BC + value jointly when a dataset is available,

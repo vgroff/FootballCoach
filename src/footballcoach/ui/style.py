@@ -35,9 +35,13 @@ HOTKEY_DISABLED = (80, 80, 92)   # dim but still readable
 HOTKEY_ACTIVE = (120, 200, 255)  # accent: current mode is active (same as HUD_ACCENT)
 
 # Multi-phase kick UI: trajectory colour coding and 1-sigma error cone.
-TRAJ_ASCENDING = (30, 30, 30)       # black-ish — ascending, below goal height
-TRAJ_DESCENDING = (80, 140, 255)    # blue — descending, below goal height
-TRAJ_ABOVE_GOAL = (255, 60, 60)     # red — above goal height (highest priority)
+# Height gradient (see kick_trajectory.height_to_colour): darkish blue at
+# ground level, reaching TRAJ_GOAL_COLOUR by goal height, then continuing to
+# redden up to TRAJ_HIGH_COLOUR at TRAJ_HIGH_HEIGHT_M (clamped beyond).
+TRAJ_LOW_COLOUR = (25, 45, 120)     # darkish blue — ground level
+TRAJ_GOAL_COLOUR = (215, 45, 45)    # red — reached at goal height
+TRAJ_HIGH_COLOUR = (255, 15, 15)    # reddest — at/above TRAJ_HIGH_HEIGHT_M
+TRAJ_HIGH_HEIGHT_M = 4.0            # height at which the gradient maxes out
 TRAJ_CONE_RGB = (255, 255, 255)     # white fill for the 1-sigma error cone
 TRAJ_CONE_ALPHA = 35                 # translucency (0-255) of the error cone fill
 

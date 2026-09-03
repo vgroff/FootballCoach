@@ -223,6 +223,21 @@ class PlayerDynamicsLinearDecoder(nn.Module):
         all_out = self._heads_out(latent)
         return [self._pad(all_out[:, i, :]) for i in range(1, len(self._horizons))]
 
+    @property
+    def unpadded_output_dim(self) -> int:
+        """See BallDynamicsLinearDecoder.unpadded_output_dim's identical rationale."""
+        return self.n_horizons * N_LINEAR_DECODER_TARGET_FIELDS
+
+    def forward_all_unpadded(self, latent: torch.Tensor) -> torch.Tensor:
+        """See BallDynamicsLinearDecoder.forward_all_unpadded's identical rationale
+        (player analogue: pos_x/pos_y/vel_x/vel_y per horizon, no padding).
+        Also mirrors its leading-dims-preserving shape handling -- needed
+        here in particular, since PlayerPhysicsFeatureBlock's other_feat
+        call passes a 3D (batch, MAX_OTHER_PLAYERS, latent_dim) latent."""
+        leading_shape = latent.shape[:-1]
+        all_out = self.net(latent).view(*leading_shape, len(self._horizons), N_LINEAR_DECODER_TARGET_FIELDS)
+        return all_out[..., 1:, :].reshape(*leading_shape, -1)
+
     def has_horizon(self, horizon_s: float) -> bool:
         return any(abs(horizon_s - h) <= _LINEAR_DECODER_HORIZON_ATOL for h in self._horizons)
 

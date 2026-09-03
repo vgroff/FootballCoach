@@ -19,28 +19,42 @@ from footballcoach.ai.physics_pretrain.live_encoder_features import (
     PhysicsPitchConstants,
     ball_live_to_physics_input,
     load_frozen_ball_encoder,
+    load_frozen_ball_linear_decoder,
     load_frozen_player_encoder,
+    load_frozen_player_linear_decoder,
     load_physics_pitch_constants,
     player_obs_to_physics_input,
 )
 
 
 class BallPhysicsFeatureBlock(nn.Module):
-    """Frozen BallDynamicsEncoder + its frozen auxiliary heads, combined into
-    one (batch, output_dim) tensor per forward call -- latent concatenated
-    with every auxiliary head's output, matching
-    physics_value_net.py's ``ball_full = torch.cat([ball_latent, *ball_aux], dim=-1)``
-    pattern. Not trainable: both the encoder and the aux heads are already
-    frozen (requires_grad_(False)) by load_frozen_ball_encoder(), never given
-    an optimizer param group, and excluded from PPOTrainer's saved
-    checkpoint state_dict()."""
+    """Frozen BallDynamicsEncoder + its frozen auxiliary heads (+ its frozen
+    linear decoder, when the checkpoint has one), combined into one
+    (batch, output_dim) tensor per forward call -- latent concatenated with
+    every auxiliary head's output and, if present, every registered
+    horizon's unpadded pos+vel prediction, matching physics_value_net.py's
+    ``ball_full = torch.cat([ball_latent, *ball_aux], dim=-1)`` pattern.
+    ``self.linear_decoder`` is None when the checkpoint was trained with the
+    shared, horizon-conditioned decoder instead of physics_pretrain.ball.
+    linear_decoder_enabled=true -- that decoder takes a horizon/time INPUT
+    at query time (see BallDynamicsDecoder.forward_at), so there's no fixed
+    set of per-horizon predictions to bake into a static live feature vector
+    the way the linear decoder's independent per-horizon heads allow. Not
+    trainable: encoder, aux heads, and (if present) linear decoder are all
+    already frozen (requires_grad_(False)) by their respective loaders,
+    never given an optimizer param group, and excluded from PPOTrainer's
+    saved checkpoint state_dict()."""
 
     def __init__(self, checkpoint_path: str):
         super().__init__()
         encoder, aux_heads, cfg = load_frozen_ball_encoder(checkpoint_path)
         self.encoder = encoder
         self.aux_heads = aux_heads
-        self.output_dim = int(cfg["latent_dim"]) + sum(h.out_features for h in aux_heads.values())
+        self.linear_decoder = load_frozen_ball_linear_decoder(checkpoint_path)
+        output_dim = int(cfg["latent_dim"]) + sum(h.out_features for h in aux_heads.values())
+        if self.linear_decoder is not None:
+            output_dim += self.linear_decoder.unpadded_output_dim
+        self.output_dim = output_dim
         self.pitch_constants = load_physics_pitch_constants()
 
         from footballcoach.ai.config import load_ai_config
@@ -57,23 +71,35 @@ class BallPhysicsFeatureBlock(nn.Module):
             )
             latent = self.encoder(x)
             aux_outputs = [head(latent) for head in self.aux_heads.values()]
-            return torch.cat([latent, *aux_outputs], dim=-1)
+            parts = [latent, *aux_outputs]
+            if self.linear_decoder is not None:
+                parts.append(self.linear_decoder.forward_all_unpadded(latent))
+            return torch.cat(parts, dim=-1)
 
 
 class PlayerPhysicsFeatureBlock(nn.Module):
-    """Frozen PlayerDynamicsEncoder + its frozen auxiliary heads, combined
-    exactly like BallPhysicsFeatureBlock above. forward() accepts either
-    self_feat (batch, PLAYER_FEATURE_DIM) or other_feat
+    """Frozen PlayerDynamicsEncoder + its frozen auxiliary heads (+ its
+    frozen linear decoder, when present), combined exactly like
+    BallPhysicsFeatureBlock above -- see that class's docstring for the
+    linear-vs-shared-decoder rationale (self.linear_decoder is None unless
+    the checkpoint was trained with physics_pretrain.player.
+    linear_decoder_enabled=true). forward() accepts either self_feat
+    (batch, PLAYER_FEATURE_DIM) or other_feat
     (batch, MAX_OTHER_PLAYERS, PLAYER_FEATURE_DIM) -- player_obs_to_physics_input
-    and the frozen encoder/heads both broadcast over the extra leading dim
-    for free, so the same block instance handles both call shapes."""
+    and the frozen encoder/heads/decoder all broadcast over the extra
+    leading dim for free, so the same block instance handles both call
+    shapes."""
 
     def __init__(self, checkpoint_path: str):
         super().__init__()
         encoder, aux_heads, cfg = load_frozen_player_encoder(checkpoint_path)
         self.encoder = encoder
         self.aux_heads = aux_heads
-        self.output_dim = int(cfg["latent_dim"]) + sum(h.out_features for h in aux_heads.values())
+        self.linear_decoder = load_frozen_player_linear_decoder(checkpoint_path)
+        output_dim = int(cfg["latent_dim"]) + sum(h.out_features for h in aux_heads.values())
+        if self.linear_decoder is not None:
+            output_dim += self.linear_decoder.unpadded_output_dim
+        self.output_dim = output_dim
         self.pitch_constants = load_physics_pitch_constants()
         self.eval()
 
@@ -82,4 +108,7 @@ class PlayerPhysicsFeatureBlock(nn.Module):
             x = player_obs_to_physics_input(player_feat, global_feat, self.pitch_constants)
             latent = self.encoder(x)
             aux_outputs = [head(latent) for head in self.aux_heads.values()]
-            return torch.cat([latent, *aux_outputs], dim=-1)
+            parts = [latent, *aux_outputs]
+            if self.linear_decoder is not None:
+                parts.append(self.linear_decoder.forward_all_unpadded(latent))
+            return torch.cat(parts, dim=-1)

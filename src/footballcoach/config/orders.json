@@ -66,6 +66,8 @@
     "_comment_min_dist": "Don't push-kick when this close to the destination.",
     "speed_factor": 1.28,
     "_comment_speed_factor": "Ball is kicked at speed_factor x carrier's free-sprint speed, ensuring it stays ahead of the running player.",
+    "spinup_speed_boost": 1.3,
+    "_comment_spinup_speed_boost": "Multiplicative boost on push-kick power_fraction (2026-09-03), compensating for ball_physics.py's ground-contact spin-up cost (a push-kick launches spin-free, so it now pays a real sliding-to-rolling transition loss it didn't before -- see agent_plans/physics_update.md section 8). Tune empirically against tests/scenario/test_move_order.py::test_push_kick_box_to_box_realistic_kick_count and any other push-kick-distance-sensitive test; 1.0 = no compensation, start there and increase.",
     "clearance_margin": 1.4,
     "_comment_clearance": "ETA safety margin: if any opponent's ETA to landing spot < carrier's ETA x clearance_margin, skip the kick. 0.95 = 5% margin.",
     "max_heading_error_deg": 15.0,

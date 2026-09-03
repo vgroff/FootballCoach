@@ -530,6 +530,7 @@ class Renderer:
             compute_launch_velocity,
             compute_speed_mps,
             build_cone_boundaries,
+            height_to_colour,
             simulate_trajectory,
         )
         from footballcoach.ui.input import KickPhase
@@ -605,15 +606,7 @@ class Renderer:
             s0 = self.camera.world_to_screen(p0.x, p0.y)
             s1 = self.camera.world_to_screen(p1.x, p1.y)
 
-            above_goal = p0.z > goal_height_m
-            ascending = p1.z > p0.z
-
-            if above_goal:
-                colour = style.TRAJ_ABOVE_GOAL
-            elif ascending:
-                colour = style.TRAJ_ASCENDING
-            else:
-                colour = style.TRAJ_DESCENDING
+            colour = height_to_colour(p0.z, goal_height_m)
 
             # Two offset aalines approximate a smooth 2px-wide antialiased line.
             dx, dy = s1[0] - s0[0], s1[1] - s0[1]
@@ -641,7 +634,7 @@ class Renderer:
                     ox, oy = -tdy / tlen, tdx / tlen
                     half = 6
                     pygame.draw.aaline(
-                        surface, style.TRAJ_ASCENDING,
+                        surface, height_to_colour(points[i].z, goal_height_m),
                         (sx - ox * half, sy - oy * half),
                         (sx + ox * half, sy + oy * half),
                     )
@@ -649,7 +642,7 @@ class Renderer:
         # --- Endpoint dot ---------------------------------------------------
         last = points[-1]
         end_screen = self.camera.world_to_screen(last.x, last.y)
-        _end_col = style.TRAJ_ABOVE_GOAL if last.z > goal_height_m else style.TRAJ_DESCENDING
+        _end_col = height_to_colour(last.z, goal_height_m)
         pygame.gfxdraw.aacircle(surface, end_screen[0], end_screen[1], 4, _end_col)
         pygame.gfxdraw.filled_circle(surface, end_screen[0], end_screen[1], 4, _end_col)
 
@@ -797,6 +790,44 @@ class Renderer:
         surface.blit(bg, (box_x, box_y))
         pygame.draw.rect(surface, style.HUD_ACCENT, (box_x, box_y, box_w, box_h), 2, border_radius=6)
         surface.blit(text_surf, (box_x + padding_x, box_y + padding_y))
+
+    def draw_speed_control(
+        self,
+        surface: pygame.Surface,
+        sim_speed: float,
+        right_x: int,
+        top_y: int = 8,
+    ) -> tuple[pygame.Rect, pygame.Rect]:
+        """Draws a compact ``[-]  <speed>x  [+]`` control, right-aligned to
+        `right_x` (same [-]/value/[+] look as `draw_scenario_params`'s numeric
+        rows). Returns `(minus_rect, plus_rect)` for click handling."""
+        btn_w, btn_h = 28, 32
+        val_w = 56
+        gap = 4
+        mouse_pos = pygame.mouse.get_pos()
+
+        plus_rect = pygame.Rect(right_x - btn_w, top_y, btn_w, btn_h)
+        val_rect = pygame.Rect(plus_rect.x - gap - val_w, top_y, val_w, btn_h)
+        minus_rect = pygame.Rect(val_rect.x - gap - btn_w, top_y, btn_w, btn_h)
+
+        pygame.draw.rect(surface, (50, 50, 65), val_rect, border_radius=6)
+        val_surf = self.hud_font.render(f"{sim_speed:g}x", True, style.HUD_ACCENT)
+        surface.blit(val_surf, (
+            val_rect.centerx - val_surf.get_width() // 2,
+            val_rect.centery - val_surf.get_height() // 2,
+        ))
+
+        for rect, symbol in ((minus_rect, "-"), (plus_rect, "+")):
+            hovered = rect.collidepoint(mouse_pos)
+            bg_colour = (70, 70, 90) if hovered else (50, 50, 65)
+            pygame.draw.rect(surface, bg_colour, rect, border_radius=6)
+            sym_surf = self.hud_font.render(symbol, True, style.HUD_ACCENT)
+            surface.blit(sym_surf, (
+                rect.centerx - sym_surf.get_width() // 2,
+                rect.centery - sym_surf.get_height() // 2,
+            ))
+
+        return minus_rect, plus_rect
 
     def draw_scenario_params(
         self,

@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import logging
 import random as _random
+from typing import Callable
 
 import torch
 
@@ -459,10 +460,19 @@ def collect_dagger_rollout(trainer, seed: int, max_steps: int):
 
     n_kicks counts real, physics-executed kicks only (the trainee's own
     Player.kicked_this_tick flag -- set exactly the tick kick_direct()
-    actually fires, per entities/player.py's own docstring). Checked every
-    physics tick, not gated on last_trainee_transition being set, since a
-    kick can land on a tick that isn't itself a full decision step. This is
-    what the trainee's OWN policy actually did.
+    actually fires, per entities/player.py's own docstring). Read from
+    StepInfo.trainee_kicks_this_step, which env.step() itself accumulates by
+    scanning EVERY physics tick of its internal decision interval -- env.
+    step() is not one physics tick, it's self._ticks_per_decision of them
+    (~4-15 depending on config), and kicked_this_tick resets every physics
+    tick (Match._process_orders), so a single post-hoc read of the flag
+    after env.step() returns only ever sees whichever tick happened to be
+    last, silently undercounting real kicks landing on any earlier tick in
+    the interval (confirmed live 2026-09: real kicks missed entirely on
+    seeds where the kick landed mid-interval). Fixed 2026-09 -- this used to
+    read env._loop.match.player_by_id("trainee").kicked_this_tick directly
+    here, once per env.step() call. This is what the trainee's OWN policy
+    actually did.
 
     n_kicks_labelled counts decision steps where the collected BC label's
     own kick_this_tick was >= 0.5 -- a genuine, independent "would
@@ -490,8 +500,7 @@ def collect_dagger_rollout(trainer, seed: int, max_steps: int):
     with torch.no_grad():
         for n_steps in range(1, max_steps + 1):
             _, reward, done, info = env.step()
-            if env._loop.match.player_by_id("trainee").kicked_this_tick:
-                n_kicks += 1
+            n_kicks += info.trainee_kicks_this_step
             tr = env.last_trainee_transition
             if tr is not None:
                 total_reward += reward
@@ -587,6 +596,7 @@ def run_dagger_phase(
     iterations: int, bc_epochs_per_iter: int, buffer_max_size: int,
     max_replay_steps: int, batch_size: int, episodes_per_iteration: int = 1,
     n_workers: int = 1, log_every: int = 1,
+    checkpoint_fn: Callable[[str], None] | None = None,
 ) -> None:
     """DAgger outer loop: each iteration picks `episodes_per_iteration` NEW
     random episodes (used only to seed that many rollouts, each reproducing
@@ -613,6 +623,16 @@ def run_dagger_phase(
     is by far the slowest part of each iteration (real env physics ticks,
     not GPU-batched like the BC training step), so this is usually where
     parallelism matters most.
+
+    checkpoint_fn: optional callback(phase_label: str), called after each
+    iteration's training step (i.e. once weights have actually moved this
+    round). None (default) = no checkpointing here -- the caller
+    (pretrain_combined()) already saves once before DAgger starts (end of
+    Phase 1) and once after the whole phase ends, so this is opt-in extra
+    granularity for a phase that can run for a long time, so a crash/kill
+    partway through doesn't lose every iteration's progress since the last
+    save. Pass PPOTrainer.pretrain_combined()'s own `_save_pretrain_checkpoint`
+    closure -- same one every other phase in that function already uses.
     """
     from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
     from footballcoach.ai.progress import ProgressReporter
@@ -650,14 +670,13 @@ def run_dagger_phase(
             log.info(
                 f"  [dagger] iteration {it}/{iterations} rollout {ep_i}/{episodes_per_iteration}: "
                 f"seed={seed}  outcome={summary['outcome']}  steps={summary['n_steps']}  "
-                # kicks=<real NN kicks>/<BC-labelled kick_this_tick ticks>. The
-                # second number is NOT an independent rules-AI recommendation
-                # during this on-policy rollout -- it echoes the acting (NN)
-                # player's own kicked_this_tick/kick_armed state, so it tracks
-                # the first number almost exactly (superset: also counts
-                # armed-but-not-yet-touched approach ticks). See
+                # kicks=<real NN kicks>/<BC-labelled kick_this_tick decision
+                # ticks>. The second number IS an independent rules-AI
+                # counterfactual ("would Phase1RulesAI have kicked from this
+                # exact state") -- not an echo of the first. The two
+                # diverging is expected and healthy; see
                 # collect_dagger_rollout()'s own docstring for the full
-                # rationale/gap this reflects.
+                # rationale.
                 f"kicks={summary['n_kicks']}/{summary['n_kicks_labelled']}  "
                 f"reward={summary['total_reward']:.2f}  aggregated_buffer_size={len(aggregated)}"
             )
@@ -670,5 +689,7 @@ def run_dagger_phase(
             max_epochs=bc_epochs_per_iter, batch_size=batch_size, log_every=log_every,
             extra_obs=extra_obs, extra_bc_labels=extra_bc_labels,
         )
+        if checkpoint_fn is not None:
+            checkpoint_fn(f"DAgger iter {it}/{iterations}")
         _iter_progress.update(it)
     _iter_progress.finish(iterations)

@@ -651,8 +651,24 @@ def _migrate_crossing_head_state_dict(state_dict: dict, model: BallDynamicsAutoe
     key_w, key_b = "crossing_head.weight", "crossing_head.bias"
     if key_w not in state_dict:
         return state_dict
+    old_out, new_out = state_dict[key_w].shape[0], model.crossing_head.weight.shape[0]
+    # CRITICAL: bail out immediately if shapes already match. The current
+    # model's crossing_head is always 4 outputs now (pos_x, pos_y,
+    # crosses_logit, delta_t), which is numerically indistinguishable by
+    # shape alone from the OLDER 4-output (pos_x, pos_y, height, delta_t)
+    # layout the branch below exists to migrate -- without this guard, a
+    # checkpoint that's ALREADY in the current, correctly-trained format
+    # (old_out == 4 == new_out) would incorrectly hit that branch too, get
+    # its real trained crosses_logit row misread as the legacy height row
+    # and dropped, then get BOTH crosses_logit and delta_t reset to fresh
+    # init by the second migration step below -- silently destroying a
+    # fully-trained crossing_head on every resume. Confirmed happening in
+    # practice 2026-09-03: a checkpoint with crosses_acc=0.997 dropped to
+    # ~0.28 (near-random) after one resume, purely from this missing check
+    # -- see physics_runs.md and agent_plans/physics_update.md.
+    if old_out == new_out:
+        return state_dict
     state_dict = dict(state_dict)
-    old_out = state_dict[key_w].shape[0]
     if old_out == 4 and model.crossing_head.weight.shape[0] in (3, 4):
         keep_rows = [0, 1, 3]  # pos_x, pos_y, delta_t -- drops row 2 (height)
         state_dict[key_w] = state_dict[key_w][keep_rows]

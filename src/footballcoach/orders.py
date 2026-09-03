@@ -207,6 +207,17 @@ def _compute_movement_intent(
         if heading_error > op.brake_turn_angle_rad:
             speed_mode = SpeedMode.STANDSTILL
 
+    # Player.desired_direction enforces unit-xy-or-zero (see its own
+    # setter's docstring) -- adj_dir up to this point has been carried
+    # around as a raw, un-normalized direction (this function's own
+    # target_direction param is explicitly documented as such), used only
+    # for magnitude-invariant checks above (.length()>eps, .normalized(),
+    # .angle_xy()), so normalizing only here, right before every caller
+    # assigns it to player.desired_direction, is a pure no-op for actual
+    # movement behaviour (step_player_towards() re-normalizes internally
+    # regardless) but fixes the live desired_dir_x/y observation feature,
+    # which is not magnitude-invariant to its consumers.
+    adj_dir = adj_dir.xy().normalized()
     return adj_dir, speed_mode
 
 
@@ -232,6 +243,11 @@ def _continue_current_motion(
         else Vector3.from_angle_xy(player.heading_rad)
     )
     speed_mode = SpeedMode.SPRINT if sprint else SpeedMode.JOG
+    # See _compute_movement_intent's identical normalize-before-return
+    # comment -- direction here is the player's raw velocity (magnitude =
+    # current speed_mps), not a unit vector; Player.desired_direction's
+    # setter now enforces unit-xy-or-zero.
+    direction = direction.xy().normalized()
     return direction, speed_mode
 
 
@@ -295,6 +311,14 @@ def _push_kick_power_fraction(player: "Player", match: "Match", speed_factor: fl
     stamina-adjusted). Using max speed alone overstates how fast the player
     will actually be moving by the time they reach the ball, especially
     early in an approach.
+
+    ``spinup_speed_boost`` (orders.json's push_kick section, 2026-09-03)
+    compensates for ball_physics.py's ground-contact spin-up cost: a
+    push-kick is launched spin-free (see _try_push_kick's docstring for why
+    it doesn't just impart matching spin instead), so it now pays a real,
+    roughly-1/(1+ball_inertia_shell_factor) transition cost before it's
+    genuinely rolling -- kicking harder up front compensates for that loss
+    empirically, rather than avoiding it.
     """
     from footballcoach.engine.kicking import max_kick_speed_mps
     from footballcoach.engine.movement import effective_top_speed
@@ -305,7 +329,8 @@ def _push_kick_power_fraction(player: "Player", match: "Match", speed_factor: fl
     )
     reference_speed = (player.speed_mps + max_sprint_speed) / 2.0
     max_kick = max_kick_speed_mps(match.kicking_params, player.attributes.kick_power)
-    return min(1.0, reference_speed * speed_factor / max(max_kick, 0.1))
+    spinup_speed_boost = _push_kick_params().get("spinup_speed_boost", 1.0)
+    return min(1.0, reference_speed * speed_factor * spinup_speed_boost / max(max_kick, 0.1))
 
 
 def _push_kick_is_clear(
@@ -409,6 +434,13 @@ def _try_push_kick(
     min_dist_m gate is what stops repeated push-kicks from overshooting
     target_position as the player closes in -- there's no separate cap on
     the kick's own travel distance.
+
+    Launched spin-free (2026-09-03: reverted an earlier attempt to give
+    push-kicks matching rolling spin -- that broke the NN-replay-equivalence
+    contract, since the neural network's own kick path is hardcoded
+    spin-free and can't reproduce it; see agent_plans/physics_update.md
+    section 8 for the full history). Compensated instead via
+    `_push_kick_power_fraction`'s `spinup_speed_boost`.
     """
     from footballcoach.engine.movement import angle_diff, effective_top_speed
     from footballcoach.engine.kicking import running_power_multiplier, compensate_power_for_run_mult

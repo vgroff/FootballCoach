@@ -51,6 +51,13 @@ class StepInfo:
     ticks_elapsed: int = 0
     is_rules_episode: bool = False    # True when opponent is rules-based
     is_immobile_episode: bool = False  # True when opponent is immobile
+    # Real, physics-executed trainee kicks (Player.kicked_this_tick firing),
+    # scanned every physics tick of this decision interval inside step()'s own
+    # loop -- NOT read off the player once after the whole interval elapses,
+    # since kicked_this_tick resets every physics tick and one step() call
+    # spans self._ticks_per_decision (>1) of them. Same rationale as the
+    # trainee_gained_count/trainee_lost_count possession scan below.
+    trainee_kicks_this_step: int = 0
 
 
 class ScenarioEnv:
@@ -385,6 +392,10 @@ class ScenarioEnv:
         _trainee_pending_loss = self._trainee_pending_loss
         trainee_gained_count = 0
         trainee_lost_count = 0
+        # Per-tick kick scan -- see StepInfo.trainee_kicks_this_step's own
+        # comment for why a single post-loop read would silently miss kicks
+        # that land on any tick but the last one of this decision interval.
+        trainee_kicks_this_step = 0
         _sec_poss_prev = {pid: self._sec_had_possession_last_step.get(pid, False) for pid in sec_pre}
         _sec_pending_loss = {pid: self._sec_pending_loss.get(pid, False) for pid in sec_pre}
         sec_gained_count = {pid: 0 for pid in sec_pre}
@@ -409,6 +420,8 @@ class ScenarioEnv:
 
             tick_done = self._loop.step()
             self._episode_ticks += 1
+            if player.kicked_this_tick:
+                trainee_kicks_this_step += 1
 
             if tick_done:
                 # Break BEFORE reading any match state. When linger_s=0
@@ -642,6 +655,7 @@ class ScenarioEnv:
         info.is_rules_episode = getattr(match, "_opponent_use_rules_ai", False)
         info.is_immobile_episode = getattr(match, "_opponent_is_immobile", False)
         info.ticks_elapsed = self._episode_ticks
+        info.trainee_kicks_this_step = trainee_kicks_this_step
 
         # --- Collect trainee transition from NeuralPlayerAI ---
         if hasattr(player, "ai") and player.ai is not None and hasattr(player.ai, "last_transition"):

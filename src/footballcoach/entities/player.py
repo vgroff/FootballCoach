@@ -191,7 +191,9 @@ class Player:
     # Movement intent — set by execute() / AI each tick, consumed by match._apply_movement().
     # Orders/AI MUST NOT call step_player_towards directly; they set these two fields and the
     # engine applies them via step_player_towards.  desired_speed_mode=None means no movement.
-    desired_direction: Vector3 = field(default_factory=Vector3.zero, repr=False, compare=False)
+    # Backing field for the `desired_direction` property below (enforces unit-or-zero) —
+    # assign via `player.desired_direction = ...`, never this private name directly.
+    _desired_direction: Vector3 = field(default_factory=Vector3.zero, repr=False, compare=False)
     desired_speed_mode: object | None = field(default=None, repr=False, compare=False)  # SpeedMode at runtime
 
     # Mirrors desired_speed_mode but is NEVER reset to None by
@@ -229,6 +231,54 @@ class Player:
     @property
     def speed_mps(self) -> float:
         return self.velocity.length_xy()
+
+    @property
+    def desired_direction(self) -> Vector3:
+        return self._desired_direction
+
+    @desired_direction.setter
+    def desired_direction(self, value: Vector3) -> None:
+        """Enforces the unit-xy-or-exactly-zero invariant every consumer of
+        this field already assumes: step_player_towards() only ever cares
+        about direction (it normalizes internally regardless -- magnitude
+        here is never physically meaningful), and ai/obs/encoder.py's
+        PlayerFeatures.desired_dir_x/y passes this straight through as a
+        live observation feature documented as a unit vector. A rules-AI
+        order handing this a raw, un-normalized target/velocity vector (as
+        orders.py's target_direction docstring explicitly allows for ITS
+        OWN local parameter) silently corrupted that observation feature
+        for any rules-AI-driven player -- confirmed 2026-09 via the frozen
+        player-physics-encoder's live inference blowing up (400+ metre
+        horizon predictions) specifically for a Phase1RulesAI-driven
+        trainee. Fixed at the two shared chokepoints every Order assignment
+        goes through (orders.py's _compute_movement_intent/
+        _continue_current_motion, both now normalize their own return
+        value) -- this setter is the backstop that turns any FUTURE
+        violation (a new call site, a refactor that skips those helpers)
+        into an immediate, loud failure instead of another silent
+        out-of-distribution observation bug.
+        """
+        # Tolerance 1e-2, not float-exact: the network path normalizes via
+        # raw/(||raw||+eps) (execution_network.py), never a true division by
+        # exact norm, so its output deviates from 1.0 by an amount that
+        # grows as ||raw|| shrinks (e.g. ||raw||=0.06, a real value seen
+        # during grad-norm debugging, gives ||d||=0.999983 -- deviation
+        # 1.7e-5; ||raw||=0.001 gives deviation ~1e-3) -- a tight tolerance
+        # here would false-positive on ordinary, healthy network output. A
+        # genuinely wrong (unnormalized) vector is off by orders of
+        # magnitude more than this (the bug this setter exists to catch had
+        # length_xy()=4.2), so 1e-2 stays comfortably below any real bug
+        # while clearing legitimate eps-normalized outputs down to a fairly
+        # small ||raw||~1e-4 before it starts rejecting genuinely-degenerate
+        # near-zero raw vectors (also a real thing worth catching).
+        length = value.length_xy()
+        if length > 1e-9 and abs(length - 1.0) > 1e-2:
+            raise ValueError(
+                f"Player.desired_direction must be a unit xy-vector or exactly zero "
+                f"(zero = stop) -- got {value!r} with length_xy()={length!r}. "
+                f"Normalize before assigning (Vector3.xy().normalized())."
+            )
+        self._desired_direction = value
 
     def is_available_to_tackle(self) -> bool:
         return self.state != PlayerState.INACTIVE_TACKLED

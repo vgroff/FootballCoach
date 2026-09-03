@@ -142,8 +142,13 @@ def build_replay_match(seed: int, *, rng_reduction: float = 0.3):
 
     opponent_rules_prob, opponent_immobile_prob = _phase1_opponent_probs()
 
+    # ball_max_speed_mps deliberately NOT passed (was hardcoded to 10.0 until
+    # 2026-09-03) -- omitting it matches build_1v1_scenario's own
+    # config-driven default (ai_config.json["phase1_scenario"]
+    # ["ball_max_speed_mps"]), which is what real training/recording now
+    # actually uses too (see curriculum/envs.py's own matching fix).
     match = build_1v1_scenario(
-        rng_reduction, seed=seed, ball_max_speed_mps=10.0,
+        rng_reduction, seed=seed,
         opponent_rules_prob=opponent_rules_prob,
         opponent_immobile_prob=opponent_immobile_prob,
         sim_dt_s=_real_sim_dt_s(),

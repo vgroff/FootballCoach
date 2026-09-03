@@ -96,7 +96,15 @@ def _build_phase1_env(phase: CurriculumPhase):
         description="1v1 scenario for curriculum phase 1",
         build=functools.partial(
             build_1v1_scenario,
-            ball_max_speed_mps=10.0,
+            # ball_max_speed_mps deliberately NOT passed here (was hardcoded
+            # to 10.0 until 2026-09-03) -- omitting it lets build_1v1_scenario
+            # fall back to its own config-driven default
+            # (ai_config.json["phase1_scenario"]["ball_max_speed_mps"]),
+            # matching every other scenario param in this call. The hardcoded
+            # literal meant this config value had zero effect on real
+            # training regardless of what it was set to; found while
+            # debugging why debug_rulesai_score.py's outcomes looked
+            # suspiciously clean.
             opponent_rules_prob=_rules_prob,
             opponent_immobile_prob=_immobile_prob,
         ),

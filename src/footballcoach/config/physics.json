@@ -74,8 +74,8 @@
     "running_direction_precision_penalty_mid": 0.25,
     "running_direction_precision_penalty_max": 0.75,
     "running_direction_min_speed_mps": 1.0,
-    "max_spin_base_rad_s": 13.0,
-    "max_spin_precision_scale": 32.0
+    "max_spin_base_rad_s": 20.0,
+    "max_spin_precision_scale": 35.0
   },
   "passing": {
     "_comment": "Auto-pace for a grounded pass: v = overshoot_factor * sqrt(2*mu_roll*g*distance), clamped to [min,max]. Error model is now unified with kicking (KickingParams) - sigma scales with both precision and effective power.",
@@ -84,7 +84,10 @@
     "overshoot_drag_exponent": 1.0,
     "min_speed_mps": 2.0,
     "max_speed_mps": 25.0,
-    "pass_aim_height_m": 0.11
+    "pass_aim_height_m": 0.11,
+    "spinup_speed_boost_base": 1.29,
+    "spinup_speed_boost_per_m": 0.0025,
+    "_comment_spinup_speed_boost": "Multiplicative boost on the auto-paced launch speed (2026-09-03), compensating for ball_physics.py's ground-contact spin-up cost -- a pass launches spin-free, so it now pays a real sliding-to-rolling transition loss the original power_overshoot_factor calibration didn't account for. Linear in distance (boost = base + per_m*distance_m) since the required compensation grows with distance -- empirically fit against direct stopping-distance measurements at 10/25/40/60/65m (required boost ranged ~1.26 at 10m to ~1.57 at 65m, closely linear). See agent_plans/physics_update.md section 8. Tune further against tests/balance/test_pass_balance.py if needed; base=1.0, per_m=0.0 = no compensation."
   },
   "goalkeeping": {
     "_comment": "'Save' action: predicts where an incoming shot crosses the keeper's own goal line and moves the keeper there. See engine/knowledge.md for the crossing-point prediction and the ball-freeze-on-pickup rule that makes saves work with the generic possession model. early_intercept_max_distance_m: GK only attempts early interception when ball is within this range.",
@@ -121,15 +124,18 @@
     "drag_coefficient": 0.2,
     "magnus_coefficient": 0.25,
     "bounce_restitution_vertical": 0.75,
-    "bounce_restitution_horizontal": 0.8,
+    "ground_friction_coefficient": 0.4,
+    "ball_inertia_shell_factor": 0.5,
     "bounce_spin_retention": 0.5,
-    "rolling_friction_coefficient": 0.05,
+    "rolling_friction_coefficient": 0.08,
     "spin_decay_per_s": 0.12,
     "block_restitution": 0.35,
     "just_bounced_display_duration_s": 0.45,
     "goal_net_restitution": 0.1,
     "bounce_threshold_mps": 0.5,
-    "_comment_bounce_threshold": "Min incoming vertical speed to count as a real bounce (apply restitution) vs. resting/rolling ground contact. Prevents a resting ball's per-tick gravity integration from being misread as a full bounce and repeatedly damping horizontal speed. See engine/knowledge.md 'ground contact' note."
+    "_comment_bounce_threshold": "Min incoming vertical speed (for a ball that was actually airborne this tick, see ball_physics.py's was_grounded_before_tick gate) to count as a real bounce (apply restitution) vs. resting/rolling ground contact. Prevents a resting ball's per-tick gravity integration from being misread as a full bounce and repeatedly damping horizontal speed -- the was_grounded_before_tick gate makes this dt_s-independent by construction (fixed 2026-09-03; previously this threshold alone was only safe below dt_s ~= threshold/(gravity*bounce_restitution_vertical) =~ 0.068s, and training's sim_dt_s=0.06 was sitting at only a ~12% margin from that boundary). See engine/knowledge.md 'ground contact' note.",
+    "_comment_bounce_friction": "Replaces the old flat bounce_restitution_horizontal constant (2026-09-03). Horizontal bounce speed and spin are now derived together from a Coulomb-friction impulse at the contact point (see ball_physics.py's _resolve_bounce_friction), coupling to incident topspin/backspin/sidespin instead of applying the same fixed retention to every bounce regardless of spin. ground_friction_coefficient (mu) is the ball-on-grass friction coefficient -- used both for a bounce's instantaneous impact and (2026-09-03) for ordinary ground contact spinning a ball up toward true rolling (see _comment_ground_friction below); 0.4 is a plausible mid-range value for a football on grass (no round-ball-specific figure was found in the literature consulted -- see agent_plans/physics_update.md). ball_inertia_shell_factor is k in I = k*m*r^2 -- a ball that fully grips (bounce or ground contact alike) retains exactly 1/(1+k) of its pre-slip horizontal speed, independent of mu. The idealized thin-pressurized-shell value is 2/3 (retention 0.6); set to 0.5 (2026-09-03, retention 0.667) as a deliberate, still-physically-defensible softening -- a real ball's panels/bladder aren't an infinitely thin shell, so a little short of the idealized 2/3 limit (but well short of 0.4 = 2/5, a solid sphere, which the ball demonstrably isn't) is a reasonable middle ground. Lowering k this way also widens the grip-vs-slide window (more bounces grip, not fewer), unlike lowering mu which would narrow it -- see agent_plans/physics_update.md.",
+    "_comment_ground_friction": "Added 2026-09-03 (see agent_plans/physics_update.md). A ball that's grounded but not yet rolling without slipping (spin doesn't match v=r*omega -- e.g. any ball launched or kicked with less spin than true rolling needs, including a plain zero-spin roll) now pays a real spin-up cost via _resolve_ground_friction, using the SAME ground_friction_coefficient/ball_inertia_shell_factor physics as a bounce, before rolling_friction_coefficient's much gentler ongoing decay takes over. This was previously unmodeled: a rolling ball's spin was never touched by ground contact at all, so 'rolling' was really 'sliding with a flat friction constant' -- physically closer to how real rolling resistance behaves, but missing the real, larger sliding-to-rolling transition cost that precedes it."
   },
   "control_time": {
     "_comment": "Time (s) for a player to bring a ball under control on first touch. See knowledge.md in engine/ for full derivation. Jump zone (above player_height_m=1.8m): outfield_jump_scale_at_max_reach multiplies the (height_factor-1) term at outfield_max_reach_height_m; GK's height_factor_scale interpolates toward gk jump_scale_at_max_reach at gk_max_reach_height_m.",

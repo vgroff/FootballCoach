@@ -167,52 +167,128 @@ mind.
 
 ## `ball_physics.py` - free-flight ball physics
 
-Standard projectile physics with drag and Magnus effect, all in SI units:
+Standard projectile physics with drag and Magnus effect, all in SI units.
+**These values live in `config/physics.json`'s `ball_physics` section --
+treat that as authoritative over the prose below if they ever disagree; this
+section was found to have drifted from the live config once already
+(2026-09-03 audit, see `agent_plans/physics_update.md`) and was corrected
+then.**
 
 - **Gravity**: `F = -m*g`, straightforward.
 - **Drag**: `F = -0.5 * rho_air * C_d * A * |v| * v` (quadratic drag, the
   standard model for a sphere at football speeds/Reynolds numbers).
-  `C_d = 0.25` is a commonly-cited value for a football.
+  `C_d = 0.2` sits at the low end of the literature range for a
+  hard-struck ball above the aerodynamic "drag crisis" (real footballs have
+  speed-dependent drag, higher at slow rolling/passing speeds -- this sim
+  uses one fixed value, deliberately on the low-energy-loss end).
 - **Magnus effect**: `F = rho_air * A * r_ball * C_L * (omega x v)`. This is
   a simplified/tuned proxy for the real (much messier) aerodynamic Magnus
   force, per Idea.md's explicit instruction to "approximate" this rather
   than model it exactly. `C_L = 0.25` was chosen to produce a visible but
   not absurd curve on a hard, heavily-spun shot over ~20-30m - tune if shots
   curve too much or too little.
-- **Ground bounce**: vertical restitution `e_v = 0.6`, horizontal retention
-  `e_h = 0.8` (bounces lose more vertical energy than horizontal, matching
-  real ball behaviour), spin halves on each bounce. `e_v = 0.6` is in the
-  right ballpark for a football's official rebound-height spec (a ball
-  dropped from 2m should rebound roughly 1.0-1.5m, and
-  `sqrt(rebound_height/drop_height) ≈ 0.6` for the middle of that range).
-- **Rolling friction**: once the ball is settled on the ground
-  (`|v_z| < 0.05`), horizontal speed decays via `a = mu_roll * g`,
-  `mu_roll = 0.06`, chosen so a ball rolled at ~5 m/s travels roughly 20m
-  before stopping - a plausible distance for a firm pass along real grass.
+- **Ground bounce - vertical**: restitution `e_v = 0.75`. This is already
+  at/above the realistic ceiling for a grass pitch (artificial turf is
+  typically measured around 0.65; a rigid-surface FIFA ball-quality test
+  wants ~0.79-0.88) -- i.e. already tuned toward the low-energy-loss end.
+- **Ground bounce - horizontal/spin (friction-coupled, not a flat
+  constant)**: unlike vertical restitution, real tangential bounce behaviour
+  is governed by friction and spin at the contact point, not a fixed
+  retention fraction -- a ball with topspin loses little horizontal speed on
+  a bounce, one with backspin or no spin loses much more (Cross, "Bounce of
+  an oval shaped football," Physics Dept., Univ. of Sydney). `step_ball`'s
+  `_resolve_bounce_friction` implements this directly: the ball's
+  ground-contact-point slip velocity is computed from its horizontal
+  velocity and horizontal-axis spin (`spin.x`/`spin.y` -- see
+  `ui/kick_trajectory.py`'s topspin/backspin/sidespin convention, unchanged
+  by this), then a Coulomb friction impulse (capped by
+  `bounce_friction_coefficient * normal_impulse`, or the smaller impulse
+  needed to fully cancel the slip if the ball "grips" mid-bounce -- the
+  common case per Cross's force-plate measurements) simultaneously reduces
+  horizontal speed and changes horizontal-axis spin, coupled through the
+  ball's assumed moment of inertia (`ball_inertia_shell_factor`, k in
+  `I = k*m*r^2`). A gripped, no-spin bounce retains exactly `1/(1+k)` of its
+  horizontal speed -- 2/3 (0.667) is the idealized thin-pressurized-shell
+  value (retention 0.6); tuned down to **0.5** (retention 0.667) as a
+  deliberate softening, still short of 2/5 (a solid sphere, which the ball
+  demonstrably isn't). `spin.z`
+  (vertical-axis spin) doesn't couple to this planar model and keeps the old
+  flat `bounce_spin_retention` decay. Added 2026-09-03, replacing a flat
+  `bounce_restitution_horizontal` constant that ignored spin entirely --
+  see `agent_plans/physics_update.md` for the derivation and the literature
+  this is based on.
+- **Ground-contact spin-up** (`_resolve_ground_friction`, added
+  2026-09-03): a grounded ball that ISN'T yet rolling without slipping
+  (spin doesn't match `v = r*omega` at the contact point -- e.g. any ball
+  launched or kicked with less spin than true rolling needs, including a
+  plain zero-spin roll) pays a real, physically-derived cost spinning up
+  to true rolling, via the same Coulomb friction/moment-of-inertia physics
+  as a bounce (`_apply_ground_friction_impulse`, shared by both). A ball
+  that fully grips retains exactly `1/(1+k)` of its pre-slip speed
+  (`k = ball_inertia_shell_factor`) -- the same relationship behind the
+  textbook "5/7 v0" result for a solid sphere sliding-to-rolling under
+  friction. This was previously unmodeled entirely: ground contact never
+  touched spin at all, so "rolling" was really "sliding with a flat
+  friction constant," missing the real (and larger) transition cost that
+  precedes true rolling. Once the ball IS rolling without slipping, this
+  is a no-op and the much gentler `rolling_friction_coefficient` below
+  takes over -- critically, that ongoing decay now also scales spin down
+  in lockstep with velocity (both by the same factor each tick), keeping
+  `v = r*omega` true as the ball slows; without that, the next tick would
+  reopen slip and re-trigger the much stronger ground-friction correction
+  forever, instead of ever actually settling into gentle rolling decay
+  (see `step_ball`'s `remaining_slip` check). See
+  `agent_plans/physics_update.md` for the derivation, and the follow-on
+  fix this required in `kicking.py`'s `pass_ball`/`orders.py`'s
+  `_try_push_kick` (both now launch with matching rolling spin, since
+  their calibration assumed no spin-up cost existed).
+- **Rolling friction**: once the ball is ALREADY rolling without slipping
+  (`|v_z| < bounce_threshold_mps` AND no meaningful contact-point slip),
+  horizontal speed decays via `a = mu_roll * g`, `mu_roll = 0.05`, chosen
+  so a ball rolled at ~5 m/s travels roughly 20m before stopping - a
+  plausible distance for a firm pass along real grass, and already at the
+  low-friction end of grass's realistic range (~0.03-0.10).
 - **Possessed ball**: `step_ball()` is a no-op if `ball.possessed_by` is
   set - `Match._sync_possessed_ball()` handles that ball's motion instead
   (it's glued to the carrying player, not simulated freely).
 
-**Bug fix - "bounce" vs "resting contact" (BOUNCE_THRESHOLD_MPS):** the
-ground-collision code distinguishes a genuine bounce from ordinary
-resting/rolling ground contact by checking whether the incoming vertical
-velocity exceeds `BOUNCE_THRESHOLD_MPS` (0.5 m/s), applying restitution
-(which scales horizontal velocity too) only in the former case. This
-matters because gravity's per-tick integration nudges a *resting* ball's
-next-tick z-position slightly below `ball_radius_m` every single tick,
-giving `new_velocity.z` a small negative value purely as an artefact of
-that integration - not a real bounce. An earlier version of this code
-treated *any* negative `new_velocity.z` while grounded as a full bounce,
-applying `bounce_restitution_horizontal` (0.8) to horizontal speed on
-*every* tick (~30x/second) instead of the intended, much gentler
-`rolling_friction_coefficient` - this decayed any grounded/rolling ball's
-speed almost instantly (a ball passed at 5 m/s would stop within about a
-metre instead of the intended ~20m). See
-`tests/unit/test_ball_physics.py`'s
+**Bug fix - "bounce" vs "resting contact" (`was_grounded_before_tick` +
+`BOUNCE_THRESHOLD_MPS`):** the ground-collision code distinguishes a genuine
+bounce from ordinary resting/rolling ground contact. This matters because
+gravity's per-tick integration nudges a *resting* ball's next-tick
+z-position slightly below `ball_radius_m` every single tick, giving
+`new_velocity.z` a small negative value purely as an artefact of that
+integration - not a real bounce. An earlier version of this code treated
+*any* negative `new_velocity.z` while grounded as a full bounce, applying
+horizontal restitution on *every* tick (~30x/second) instead of the
+intended, much gentler `rolling_friction_coefficient` - this decayed any
+grounded/rolling ball's speed almost instantly (a ball passed at 5 m/s would
+stop within about a metre instead of the intended ~20m).
+
+The first fix for this was a velocity check, `BOUNCE_THRESHOLD_MPS`
+(0.5 m/s): only treat a tick as a real bounce if the incoming vertical
+velocity exceeds it. **This alone is dt_s-dependent** -- the per-tick
+gravity-integration artefact is ~`gravity_mps2 * dt_s`, so the check is only
+safe below `dt_s ≈ bounce_threshold_mps / (gravity_mps2 *
+bounce_restitution_vertical) ≈ 0.068s (~14.7Hz)`. The UI's 30Hz tick has a
+comfortable margin; training's `sim_dt_s` (0.06 as of this writing, ~16.7Hz)
+was sitting at only a ~12% margin from that boundary, and the "faster
+training" `sim_dt_s` value `ai_config.json`'s own comment used to suggest
+(0.067s) was at 98.6% of it -- one nudge from silently reintroducing this
+exact bug (confirmed 2026-09-03: a resting ball misfired as a full bounce at
+`dt_s=0.07` and above). **Fixed (2026-09-03) by gating on
+`ball.is_grounded()` checked BEFORE this tick's integration**
+(`was_grounded_before_tick` in `step_ball`): an already-grounded ball can
+never misfire as a bounce regardless of `dt_s`, since the classification no
+longer depends on a single tick's gravity-integration artefact at all. A
+ball that was genuinely airborne and only now reaches the ground still
+carries real, multi-tick-accumulated fall velocity, so
+`BOUNCE_THRESHOLD_MPS` remains meaningful (and now dt_s-independent) for
+that case. See `tests/unit/test_ball_physics.py`'s
 `test_rolling_ball_decelerates_at_the_analytically_correct_rate` and
 `test_rolling_ball_travels_plausible_distance_before_stopping` for
 regression tests against this. If you ever see a rolling ball stopping
-suspiciously fast again, check this threshold first.
+suspiciously fast again, check this gate first.
 
 ## `kicking.py` - power, direction, spin, and error
 
@@ -292,6 +368,28 @@ reusing `KickingParams`:
   `solve_launch_pitch_rad`, then perturb yaw/pitch by Gaussian noise) - a
   pass just always aims at `target_position.with_z(0)` (ground level) at
   its auto-computed (or overridden) pace.
+- **Still launched spin-free, compensated via extra speed instead**
+  (2026-09-03): `ball_physics.py`'s ground-contact spin-up cost
+  (`_resolve_ground_friction`) means a spin-free pass now pays a real
+  transition cost before it's genuinely rolling, which broke essentially
+  every pass-balance/behaviour test. The fix tried first -- giving passes
+  matching rolling spin at launch, via a `rolling_spin_for_direction`
+  helper -- worked physically but broke something more important: the
+  neural network's own kick path is hardcoded spin-free
+  (`ai/action/apply_nn_action.py`, see `agent_plans/spin_implementation_plan.md`),
+  so it could no longer replay a spin-imparting rules-AI kick exactly,
+  breaking `test_rules_ai_nn_replay_equivalence.py`. Reverted in favour of
+  `spinup_speed_boost_base`/`spinup_speed_boost_per_m`
+  (`PassingParams`/`pass_speed_mps`) -- launch harder instead of avoiding
+  the cost, keeping every kick path spin-free and NN-replayable. Rules-AI
+  push-kicks (`orders.py`'s `_try_push_kick` /
+  `_push_kick_power_fraction`) get the equivalent treatment via
+  `orders.json`'s `push_kick.spinup_speed_boost`. See
+  `agent_plans/physics_update.md` section 8 for the full history,
+  including why the compensation can't fully restore the original
+  long-pass (60m+) accuracy -- more launch speed also means more angular
+  error (`kick_sigma_rad`'s power coupling), so past a point boosting
+  speed further stops helping distance and only hurts accuracy.
 
 ## `possession.py` - first-touch control-time model
 

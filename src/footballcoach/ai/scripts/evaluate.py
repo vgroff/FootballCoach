@@ -315,7 +315,14 @@ def _baseline_env_worker_factory(opponent: str = "rules") -> tuple:
 
     def _env_factory(seed: int) -> ScenarioEnv:
         def _build(*_a, **_kw):
-            return _baseline_build(*_a, ball_max_speed_mps=4.0, seed=seed, **_kw)
+            # ball_max_speed_mps deliberately NOT passed (was hardcoded to
+            # 4.0 until 2026-09-03) -- omitting it matches build_1v1_scenario's
+            # own config-driven default (ai_config.json["phase1_scenario"]
+            # ["ball_max_speed_mps"]), which is what real training now
+            # actually uses too (see curriculum/envs.py's matching fix) --
+            # this baseline was previously measuring a materially different,
+            # unrelated ball-speed regime from what it's meant to baseline.
+            return _baseline_build(*_a, seed=seed, **_kw)
 
         defn = ScenarioDefinition(
             key="baseline_1v1",

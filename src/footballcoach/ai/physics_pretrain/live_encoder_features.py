@@ -33,8 +33,16 @@ import torch
 import torch.nn as nn
 
 from footballcoach.config import load_physics_config, require_section
-from footballcoach.ai.physics_pretrain.ball_dynamics_net import BallDynamicsEncoder
-from footballcoach.ai.physics_pretrain.player_dynamics_net import PlayerDynamicsEncoder
+from footballcoach.ai.physics_pretrain.ball_dynamics_net import (
+    BallDynamicsEncoder,
+    BallDynamicsLinearDecoder,
+    N_LINEAR_DECODER_TARGET_FIELDS as _BALL_N_LINEAR_DECODER_TARGET_FIELDS,
+)
+from footballcoach.ai.physics_pretrain.player_dynamics_net import (
+    PlayerDynamicsEncoder,
+    PlayerDynamicsLinearDecoder,
+    N_LINEAR_DECODER_TARGET_FIELDS as _PLAYER_N_LINEAR_DECODER_TARGET_FIELDS,
+)
 from footballcoach.ai.physics_pretrain.ball_episode_gen import (
     BALL_SPIN_NORM_DIVISOR_RAD_S,
     N_INPUT_FIELDS as BALL_N_INPUT_FIELDS,
@@ -450,20 +458,84 @@ def load_frozen_player_encoder(
     return encoder, aux_heads, cfg
 
 
-def _peek_physics_output_dim(checkpoint_path: str | Path, aux_head_dims: dict[str, int]) -> int:
-    """latent_dim + sum(aux_head_dims) for a checkpoint, WITHOUT constructing
-    the encoder/aux-head modules -- just enough of a read to size a sibling
-    network's input layers (e.g. ExecutionNetwork.from_config(), which needs
-    the same widened ball_dim/self_dim as DecisionNetwork but never builds
-    its own BallPhysicsFeatureBlock/PlayerPhysicsFeatureBlock -- see
+def _load_frozen_linear_decoder(
+    checkpoint_path: str | Path, decoder_cls: type, latent_dim: int, horizons_s: list[float],
+) -> nn.Module:
+    """Build a frozen decoder_cls(latent_dim, horizons_s) and load its sole
+    learnable submodule ("net.weight"/"net.bias") from the checkpoint's full
+    model_state_dict under the "decoder." prefix -- BallDynamicsAutoencoder/
+    PlayerDynamicsAutoencoder always name their decoder submodule "decoder"
+    regardless of shared-vs-linear type (see their own __init__), so this
+    prefix is stable across both."""
+    ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    decoder = decoder_cls(latent_dim=latent_dim, horizons_s=horizons_s)
+    decoder.load_state_dict({
+        "net.weight": ckpt["model_state_dict"]["decoder.net.weight"],
+        "net.bias": ckpt["model_state_dict"]["decoder.net.bias"],
+    })
+    decoder.eval()
+    for p in decoder.parameters():
+        p.requires_grad_(False)
+    return decoder
+
+
+def load_frozen_ball_linear_decoder(checkpoint_path: str | Path) -> "BallDynamicsLinearDecoder | None":
+    """Returns the checkpoint's frozen BallDynamicsLinearDecoder, or None if
+    it wasn't trained with physics_pretrain.ball.linear_decoder_enabled=true
+    (the shared, horizon-conditioned decoder has no fixed per-horizon
+    structure to expose as static live features -- see this module's
+    "only the linear decode ones, not the time-dependent one" rationale in
+    ai/models/physics_encoders.py). Deliberately a SEPARATE, additive
+    function rather than widening load_frozen_ball_encoder's own return
+    tuple, so every existing caller of that function (e.g.
+    physics_value_net.py) is unaffected -- the one-time extra
+    torch.load() this costs when both are used together (ai/models/
+    physics_encoders.py) is negligible next to model construction cost."""
+    ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    cfg = ckpt["config_snapshot"]
+    if not cfg.get("linear_decoder_enabled", False):
+        return None
+    return _load_frozen_linear_decoder(
+        checkpoint_path, BallDynamicsLinearDecoder, int(cfg["latent_dim"]), cfg["horizons_s"],
+    )
+
+
+def load_frozen_player_linear_decoder(checkpoint_path: str | Path) -> "PlayerDynamicsLinearDecoder | None":
+    """Mirrors load_frozen_ball_linear_decoder for PlayerDynamicsLinearDecoder."""
+    ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
+    cfg = ckpt["config_snapshot"]
+    if not cfg.get("linear_decoder_enabled", False):
+        return None
+    return _load_frozen_linear_decoder(
+        checkpoint_path, PlayerDynamicsLinearDecoder, int(cfg["latent_dim"]), cfg["horizons_s"],
+    )
+
+
+def _peek_physics_output_dim(
+    checkpoint_path: str | Path, aux_head_dims: dict[str, int], linear_decoder_target_fields: int,
+) -> int:
+    """latent_dim + sum(aux_head_dims) [+ n_horizons * linear_decoder_target_
+    fields, when the checkpoint was trained with linear_decoder_enabled=true
+    -- see load_frozen_ball_linear_decoder's docstring for why only the
+    linear decoder's fixed per-horizon heads are exposed as live features,
+    never the shared time-conditioned decoder] for a checkpoint, WITHOUT
+    constructing the encoder/aux-head/decoder modules -- just enough of a
+    read to size a sibling network's input layers (e.g.
+    ExecutionNetwork.from_config(), which needs the same widened ball_dim/
+    self_dim as DecisionNetwork but never builds its own
+    BallPhysicsFeatureBlock/PlayerPhysicsFeatureBlock -- see
     models/physics_encoders.py)."""
     ckpt = torch.load(str(checkpoint_path), map_location="cpu", weights_only=False)
-    return int(ckpt["config_snapshot"]["latent_dim"]) + sum(aux_head_dims.values())
+    cfg = ckpt["config_snapshot"]
+    dim = int(cfg["latent_dim"]) + sum(aux_head_dims.values())
+    if cfg.get("linear_decoder_enabled", False):
+        dim += len(cfg["horizons_s"]) * linear_decoder_target_fields
+    return dim
 
 
 def peek_ball_physics_output_dim(checkpoint_path: str | Path) -> int:
-    return _peek_physics_output_dim(checkpoint_path, BALL_AUX_HEAD_DIMS)
+    return _peek_physics_output_dim(checkpoint_path, BALL_AUX_HEAD_DIMS, _BALL_N_LINEAR_DECODER_TARGET_FIELDS)
 
 
 def peek_player_physics_output_dim(checkpoint_path: str | Path) -> int:
-    return _peek_physics_output_dim(checkpoint_path, PLAYER_AUX_HEAD_DIMS)
+    return _peek_physics_output_dim(checkpoint_path, PLAYER_AUX_HEAD_DIMS, _PLAYER_N_LINEAR_DECODER_TARGET_FIELDS)

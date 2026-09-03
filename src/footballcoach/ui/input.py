@@ -16,9 +16,11 @@ Multi-phase kick UI (replaces the old click-drag kick):
     MAX_KICK_DRAG_M).  A live trajectory + 1-sigma error cone are drawn.
     Click anywhere to commit XY and advance to Phase 2.
   Phase 2 - AIM_Z: mouse distance from the player controls elevation angle
-    (close = high loft, far = flat).  The trajectory is redrawn with height
-    colour-coding (black=ascending/safe, blue=descending/safe, red=above
-    goal height).  Click anywhere to commit elevation and advance to Phase 3.
+    (close = high loft, far = flat).  The trajectory is redrawn with a
+    height colour gradient (darkish blue at ground level, reddening by goal
+    height, continuing to redden up to ~4m) via
+    kick_trajectory.height_to_colour.  Click anywhere to commit elevation
+    and advance to Phase 3.
   Phase 3 - SPIN: mouse angle around the player controls spin axis; distance
     from player controls spin magnitude.  Trajectory updates to show the
     Magnus-effect curve.  Click anywhere to fire the kick.

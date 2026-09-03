@@ -6,15 +6,18 @@ Exists as a fast "before vs after" sanity check for engine-behaviour changes
 (e.g. the boundary-braking/pickup-radius work) -- run once before a change,
 once after, diff the percentages. Not the same thing as evaluate.py's
 ``--baseline-only`` baseline: that one is a fixed rules-vs-rules/rules-vs-
-immobile NOISE-FLOOR probe and deliberately caps ``ball_max_speed_mps`` at
-4.0 for a calmer, low-variance reference point. This script instead
-reproduces the REAL phase-1 training/demonstration distribution -- same
-``build_1v1_scenario`` call the curriculum env (``curriculum/envs.py``) and
-``record_demonstrations.py`` actually use, including the real
-``ball_max_speed_mps=10.0`` and the config-driven opponent-type mix
-(``ai_config.json["curriculum"]`` phase1_opponent_*_ratio, immobile by
-default) -- so the outcome mix here should match what shows up in real
-recorded episodes, not a separate easier regime.
+immobile NOISE-FLOOR probe. This script instead reproduces the REAL phase-1
+training/demonstration distribution -- same ``build_1v1_scenario`` call the
+curriculum env (``curriculum/envs.py``) and ``record_demonstrations.py``
+actually use, including the real, config-driven ``ball_max_speed_mps``
+(``ai_config.json["phase1_scenario"]["ball_max_speed_mps"]``) and the
+config-driven opponent-type mix (``ai_config.json["curriculum"]``
+phase1_opponent_*_ratio, immobile by default) -- so the outcome mix here
+should match what shows up in real recorded episodes, not a separate easier
+regime. (Until 2026-09-03, ``curriculum/envs.py`` and this script's own
+``--ball-max-speed-mps`` default both silently hardcoded 10.0 instead of
+reading ``phase1_scenario.ball_max_speed_mps`` -- found and fixed together;
+see ``debug_rulesai_score.py``'s matching fix for the full story.)
 
 Every run is fully deterministic (same seed -> byte-identical episode, see
 _env_worker_factory's own docstring) and always includes KNOWN_SEEDS -- a
@@ -112,13 +115,24 @@ def _env_worker_factory(
     return _env_factory, None
 
 
+def _real_ball_max_speed_mps() -> float:
+    """The actual phase-1 ball speed cap (ai_config.json["phase1_scenario"]
+    ["ball_max_speed_mps"]) -- what curriculum/envs.py's real training env
+    now actually uses (fixed 2026-09-03; previously hardcoded 10.0 and
+    never read this config value at all). Mirrors
+    _real_phase1_max_episode_s()'s pattern so this script's own default can
+    never silently drift from what real training uses again."""
+    from footballcoach.ai.config import load_ai_config
+    return float(load_ai_config().get("phase1_scenario", {}).get("ball_max_speed_mps", 10.0))
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--n-episodes", type=int, default=500)
     ap.add_argument("--seed-base", type=int, default=DEFAULT_SEED_BASE)
-    ap.add_argument("--ball-max-speed-mps", type=float, default=10.0,
-                     help="Matches curriculum/envs.py's real phase-1 default (10.0), NOT "
-                          "evaluate.py's baseline (4.0).")
+    ap.add_argument("--ball-max-speed-mps", type=float, default=_real_ball_max_speed_mps(),
+                     help="Default: ai_config.json's phase1_scenario.ball_max_speed_mps -- "
+                          "the same value curriculum/envs.py's real training env now uses.")
     ap.add_argument("--max-episode-s", type=float, default=None,
                      help="Episode timeout in sim-seconds. Default: the real phase-1 config "
                           "value (ai_config.json curriculum.phase1_max_episode_s, 18.5s) -- "

@@ -354,6 +354,35 @@ class BallDynamicsLinearDecoder(nn.Module):
         all_out = self._heads_out(latent)
         return [self._pad(all_out[:, i, :]) for i in range(1, len(self._horizons))]
 
+    @property
+    def unpadded_output_dim(self) -> int:
+        """n_horizons * N_LINEAR_DECODER_TARGET_FIELDS -- the flat width
+        forward_all_unpadded() returns, so a caller (e.g.
+        ai/models/physics_encoders.py) can size a downstream layer without
+        importing N_LINEAR_DECODER_TARGET_FIELDS itself."""
+        return self.n_horizons * N_LINEAR_DECODER_TARGET_FIELDS
+
+    def forward_all_unpadded(self, latent: torch.Tensor) -> torch.Tensor:
+        """(..., unpadded_output_dim) -- every registered REAL horizon's raw
+        pos+vel prediction (excludes the extra t=0-only head, matching
+        forward()'s own horizon selection), flattened in horizons_s order,
+        with NONE of forward()/forward_at()'s zero-padding out to
+        N_TARGET_FIELDS_PER_HORIZON -- that padding exists only so this
+        decoder's output shape matches BallDynamicsDecoder's for the
+        training-time loss/breakdown functions; a live per-tick feature
+        consumer (ai/models/physics_encoders.py's BallPhysicsFeatureBlock)
+        has no such shape constraint and would otherwise carry
+        n_horizons * (N_TARGET_FIELDS_PER_HORIZON - N_LINEAR_DECODER_TARGET_
+        FIELDS) always-zero, always-wasted columns for nothing.
+
+        Preserves whatever leading dims `latent` has (unlike _heads_out,
+        which hardcodes a single leading batch dim) -- PlayerPhysicsFeatureBlock's
+        analogous call can pass a 3D (batch, MAX_OTHER_PLAYERS, latent_dim)
+        latent for the "other players" slot batch, not just a 2D one."""
+        leading_shape = latent.shape[:-1]
+        all_out = self.net(latent).view(*leading_shape, len(self._horizons), N_LINEAR_DECODER_TARGET_FIELDS)
+        return all_out[..., 1:, :].reshape(*leading_shape, -1)
+
     def has_horizon(self, horizon_s: float) -> bool:
         return any(abs(horizon_s - h) <= _LINEAR_DECODER_HORIZON_ATOL for h in self._horizons)
 

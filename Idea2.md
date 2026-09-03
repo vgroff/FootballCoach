@@ -24,9 +24,11 @@ Extending training:
     - Sould be able to do some nice OOP here, a class that has the player in question and it's rewards and outcomes, or whatever, let's make it clean
     - Might be some useful notes in agent_plans/reward_fixes.md if it hasn't already been implemented
     - Should also apply to the diagnotics during training, should be able to count outcomes/rewards per-player and print them sensibly 
+- Spin needs adding in
 Notes to self:
 - GK needs fixing - he saves no shots in the close rnage scenario
 - When running these messy/random scenarios, we might need to decide (maye using a value network) whcih runs are actually good (advantage-wise and in absolute)
+- Need to implement spin
 
 
 
@@ -35,6 +37,8 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. Please do not skip any of them. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
+    - !! remove downward kicks when the ball is on the floor already - just make it reflect the velocity upwards?
+    - !! Seperate kick z vs. x/y log dir std and therefore entropy calculations?
     - !! Are the bernoulli heads sampled to become execution inputs? They shouldnt be!!
     - !! new training:
         - value net pre-training (phase 0) really struggles with the invalid/timeouts, which is weird because it was doing okay on them in the debug value net. Does it definitely have that last team touched variable for example? Is the MC time-based fixed with non-uniform timesteps included? Maybe it just needs longer, val_mse was falling the whole time
@@ -47,8 +51,14 @@ Current notes:
     - !! Friction coefficient needs increasing 2-4x - need to retrain the physics model (ball only)
         - doesnt seem that awful tbh, kick factor speed is like 1.3 and it looks fine. wouldnt increase it too much
         - IS air drag stronger than frctions? Is that weird? Do some real physics on this
+        - can't kick a ball down if its alrady on the floor?
         - horizontal bounce resitution is too low (0.8)
+            - should spin affect this/bouncing in general?
         - does the dt affect the physics? surely not right?
+        - bouncing bug raised by the AI - probably a big issue
+            bounce_threshold_mps (0.5) exists to tell a genuine bounce apart from ordinary resting ground contact, by checking whether the outgoing vertical speed after restitution (g·dt·bounce_restitution_vertical) exceeds it. That quantity scales with dt, so the check is only safe below dt* = 0.5/(9.81×0.75) ≈ 0.068s. Training's sim_dt_s=0.06 is currently under that line (12% margin) — not broken today — but ai_config.json's own comment suggests 0.067s as a "faster training" option, which sits at 98.6% of the boundary, one nudge from silently reintroducing the exact "resting ball treated as a real bounce" bug this threshold was built to prevent (horizontal speed gets wrongly slashed by bounce_restitution_horizontal every tick, and the ball gets phantom upward velocity). No existing test would catch it — everything hardcodes dt=1/30.
+
+            Since actually fixing the coupling (deriving the threshold from dt, or switching to a dt-independent contact test) changes ball dynamics your checkpoints are trained against, the low-cost interim fix is a guardrail, not a physics change: add a startup assertion (e.g. in BallPhysicsParams/Match construction) that fails loudly if bounce_threshold_mps <= gravity_mps2 * dt_s * bounce_restitution_vertical. Zero behavior change today, just prevents anyone from picking an unsafe dt by accident later
     - !! Broken current order stuff AI has found bugs!!
     - !! real neural net: don't normalise by pitch half diag, just normalise by base pitch half diag
         - players/ball may need pitch size now
@@ -215,7 +225,7 @@ NB Immediate Immediate:
 - Kicking and running - this should be possible, and faster than running with the ball. Do some tests, and then add it to Phase 1 AI (and/or MoveOrder) 
 - kicking direction needs working - can’t kick at 90 degrees upward, even less with the same power
 - Allow pausing and going back in time (up to 30s)
-- Control - should set the ball to ground level, snap for now but improve it later? Also how long are the control delays vs real life? Also implement failed control - rebounds. What happens during control, does a player have ball possession and can he be tackled while controlling? Shouldn’t be possible until ball on floor
+- Control - should set the ball to ground level, snap for now but improve it later? Also how long are the control delays vs real life? Also implement failed control - rebounds. What happens during control, does a player have ball possession and can he be tackled while controlling? Shouldn’t be possible until ball on floor. Can he kick during control? I think no, either volley/head it first time or finish controlling it - but can arm a kick? Doess ball control even do much atm?
 - Heading - should reduce shot power (and precision) 
 - Give the ball some dots and make them spin during spinning
 - Possible later optimisation - the execution network could have only decisions+latent space as input, with none of the other current inputs present? Or way fewer at least? Would make it run faster, it can be smaller, the larger decision network can run less often
