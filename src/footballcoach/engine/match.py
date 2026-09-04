@@ -182,6 +182,48 @@ class Match:
 
     def __post_init__(self) -> None:
         self.pickup_radius_m = self.ball_pickup_params.pickup_radius_m
+        self._validate_heading_velocity_alignment()
+
+    def _validate_heading_velocity_alignment(self) -> None:
+        """Fail loudly if any player is constructed facing a direction other
+        than the one they're moving in -- a real scenario-construction bug
+        (confirmed: ui/scenarios.py used to draw heading_rad and velocity's
+        direction as two INDEPENDENT random values, so a moving player's
+        heading only matched its velocity by a ~1.4% coincidence). Skipped
+        for near-stationary players (speed below _min_speed_mps), whose
+        heading isn't physically constrained by anything.
+
+        A player facing a direction other than the one they're moving in is
+        never physically valid -- there is no legitimate case for it, so
+        this is a hard raise, not a warning. Known casualty: tests/scenario/
+        test_control_behaviour.py's aerial-ball-control/head-on-tackle-
+        immunity fixture constructs a receiver facing backward relative to
+        its velocity for reasons unrelated to what it's testing -- fix that
+        fixture's heading_rad rather than relaxing this check.
+
+        Only checked ONCE, here at construction -- not re-validated every
+        tick. After t=0, step_player_towards turns heading toward whatever
+        direction the player is actually moving/steering at a bounded rate
+        (see its own turn-rate-limited rotation), so real, gradual heading/
+        velocity divergence mid-turn during normal play is expected and
+        correct, not a bug to flag.
+        """
+        _min_speed_mps = 0.05
+        _max_misalignment_deg = 5.0
+        for p in self.players:
+            speed = p.velocity.length_xy()
+            if speed < _min_speed_mps:
+                continue
+            vel_heading = math.atan2(p.velocity.y, p.velocity.x)
+            diff_deg = math.degrees(abs(angle_diff(p.heading_rad, vel_heading)))
+            if diff_deg > _max_misalignment_deg:
+                raise ValueError(
+                    f"Player {p.player_id!r} constructed with heading_rad={p.heading_rad:.3f} "
+                    f"but velocity {p.velocity!r} points at {vel_heading:.3f} rad "
+                    f"({diff_deg:.1f} deg apart, speed={speed:.2f} m/s) -- heading and "
+                    f"velocity must agree at match construction time (derive heading "
+                    f"from velocity's direction, not an independent random draw)."
+                )
 
     def player_by_id(self, player_id: str) -> Player:
         for p in self.players:
@@ -281,20 +323,33 @@ class Match:
 
         Orders and AI set ``player.desired_direction`` and ``player.desired_speed_mode`` each tick.
         This is the ONLY place ``step_player_towards`` and stamina drain are called for locomotion.
-        Players with ``desired_speed_mode=None`` had no movement intent this tick (e.g. a brief gap
-        between one order completing and the AI deciding the next one) — velocity/heading are left
-        unchanged, but position still advances from the existing velocity (basic inertial coasting;
-        no deceleration/turning, since there's no intent to decelerate or turn towards). Without
-        this, a player with nonzero velocity would freeze in place for any no-intent tick, which
-        step_player_towards's own physics never does (it always advances position from velocity).
+
+        Every player must have an active AI or Order setting movement intent every tick -- either
+        via a persistent Order's execute() (called unconditionally every tick regardless of AI
+        decision cadence, see _RulesBasedAI/_process_orders) or via a neural AI re-applying its
+        cached gating on non-decision ticks (see NeuralPlayerAI.act()). A player that should just
+        stand there needs an explicit AI/Order that says so (e.g. StopWhenIdleAI, or a persistent
+        StopOrder) -- NOT the absence of one. ``desired_speed_mode is None`` here means NOTHING set
+        an intent this tick: always a real bug (a player with no AI and no order, or an AI/order
+        that silently failed to re-assert intent) -- fail loudly rather than silently defaulting to
+        any particular behaviour (coasting on stale velocity, or an implicit brake-to-standstill),
+        which would just as easily paper over a real AI/order bug as it would a deliberately-idle
+        test player. Mirrors _process_orders' own "every order must explicitly decide movement
+        intent... fail loudly instead of coasting" check for the order-executed-but-forgot-to-set-
+        intent case -- this is the analogous check for the "nothing ran at all" case.
         ``desired_speed_mode`` is cleared to ``None`` after application so each tick is independent.
         ``player.last_desired_speed_mode`` is set to whatever was just consumed and is NOT cleared --
         see its docstring on ``Player`` (used by ai/obs/encoder.py to read "current movement intent").
         """
         for player in self.players:
             if player.desired_speed_mode is None:
-                player.position = player.position + player.velocity * dt
-                continue
+                raise RuntimeError(
+                    f"{player.player_id!r} has no movement intent this tick (desired_speed_mode "
+                    f"is None) -- every player must have an active AI or order setting this every "
+                    f"tick (ai={player.ai!r}, current_order={player.current_order!r}). A player "
+                    f"that should just stand still needs an explicit AI/Order that says so (e.g. "
+                    f"StopWhenIdleAI), not the absence of one."
+                )
             has_ball = (
                 self.ball.possessed_by == player.player_id
                 or player.state == PlayerState.CONTROLLING_BALL

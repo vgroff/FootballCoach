@@ -13,6 +13,7 @@ from footballcoach.entities import Ball, Pitch, PlayerAttributes, Team
 from footballcoach.entities.player import Player, PlayerState
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import GetPossessionOrder, PassOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from footballcoach.ui.scenarios import _pass_on_tick, _PASS_SCENARIO_GET_POSSESSION_RADIUS_M
 
 
@@ -30,6 +31,13 @@ def _make_pass_match(passer_x: float = -10.0, receiver_x: float = 10.0) -> Match
 
     passer = Player.create("passer", Team.LEFT, attrs, position=passer_pos)
     receiver = Player.create("receiver", Team.LEFT, attrs, position=receiver_pos)
+    # PassOrder fires and completes in one tick, leaving the passer with no
+    # order/AI to reassert movement intent afterwards. The receiver has no
+    # order at all until _pass_on_tick gives it a GetPossessionOrder once the
+    # ball is close enough. Both need the idle-fallback AI to stand still in
+    # the meantime -- it steps aside automatically once a real order is set.
+    passer.ai = StopWhenIdleAI()
+    receiver.ai = StopWhenIdleAI()
 
     ball = Ball.at_rest(passer_pos)
     ball.possessed_by = passer.player_id

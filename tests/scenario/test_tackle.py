@@ -11,7 +11,7 @@ from footballcoach.mathutils import Vector3
 from footballcoach.engine.collision import are_touching
 from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.orders import ChaseTackleOrder, GetPossessionOrder
-from footballcoach.rules_ai import Phase1RulesAI
+from footballcoach.rules_ai import Phase1RulesAI, StopWhenIdleAI
 from tests.conftest import make_player
 
 
@@ -19,6 +19,7 @@ def test_tackle_wins_ball_from_carrier():
     pitch = Pitch.standard()
     tackler = make_player("tackler", Team.LEFT, position=Vector3(0, 0, 0), tackling=0.9)
     carrier = make_player("carrier", Team.RIGHT, position=Vector3(0.5, 0, 0), dribbling=0.1)
+    carrier.ai = StopWhenIdleAI()  # stationary ball-holder; not under test
 
     ball = Ball.at_rest(Vector3(0.5, 0, 0))
     ball.possessed_by = carrier.player_id
@@ -44,6 +45,7 @@ def test_phase1_rules_ai_approach_fires_explicit_tackle():
                          tackling=0.9, dribbling=0.1)
     carrier = make_player("carrier", Team.RIGHT, position=Vector3(0.0, 0.0, 0.0),
                           dribbling=0.1)
+    carrier.ai = StopWhenIdleAI()  # stationary ball-holder; not under test
 
     ball = Ball.at_rest(carrier.position)
     ball.possessed_by = carrier.player_id
@@ -85,6 +87,7 @@ def test_armed_tackle_fires_before_autotackle_on_sprint_into_range():
     pitch = Pitch.standard()
     carrier = make_player("carrier", Team.RIGHT, position=Vector3(0.0, 0.0, 0.0),
                           dribbling=0.1)
+    carrier.ai = StopWhenIdleAI()  # stationary ball-holder; not under test
     chaser = make_player("chaser", Team.LEFT, tackling=0.9, dribbling=0.1)
 
     params = MovementParams.from_config()

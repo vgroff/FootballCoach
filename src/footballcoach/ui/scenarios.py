@@ -30,17 +30,19 @@ from footballcoach.engine.kicking import PassingParams, pass_speed_mps
 from footballcoach.engine.match import Match
 from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.entities import Ball, Pitch, PlayerAttributes, Team
-from footballcoach.entities.player import Player
+from footballcoach.entities.player import Player, PlayerAI
 from footballcoach.generation import generate_attributes
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import (
     ChaseTackleOrder,
     GetPossessionOrder,
+    JogOrder,
     KickOrder,
     MoveOrder,
     PassOrder,
     SaveOrder,
     ShootOrder,
+    StopOrder,
 )
 
 
@@ -272,6 +274,11 @@ def build_tackle_scenario(
     )
     attacker.current_order = MoveOrder(target_position=far_point, sprint=False)
     defender.current_order = ChaseTackleOrder(target_player_id=attacker.player_id)
+    # Both orders self-complete (MoveOrder on arrival; ChaseTackleOrder once
+    # contact is resolved) -- neither player has any other AI to pick up
+    # movement intent afterwards, so hold position rather than crash/coast.
+    attacker.ai = StopWhenIdleAI()
+    defender.ai = StopWhenIdleAI()
     return match
 
 
@@ -358,6 +365,9 @@ def build_goal_to_goal_sprint_scenario(
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
     )
     player.current_order = MoveOrder(target_position=target, sprint=True, arrival_tolerance_m=1.0)
+    # MoveOrder self-completes on arrival at the far goal line; nothing else
+    # drives this player afterwards, so hold position instead of crashing.
+    player.ai = StopWhenIdleAI()
     return match
 
 
@@ -532,7 +542,12 @@ def build_pass_scenario(
     )
     passer.current_order = PassOrder(target_position=receiver_pos)
     passer.ai = StopWhenIdleAI()
-    receiver.ai = PassReceiverAI(get_possession_radius_m=8.0)
+    # PassReceiverAI leaves current_order untouched while still waiting for
+    # the ball to come within range (see _IdleFallbackAI's own docstring for
+    # why that gap can't just be closed with an initial order at build time)
+    # -- wrap it so the receiver has movement intent set every tick even
+    # before the ball is close enough to react to.
+    receiver.ai = _IdleFallbackAI(PassReceiverAI(get_possession_radius_m=8.0))
     return match
 
 
@@ -549,6 +564,44 @@ from footballcoach.rules_ai import (
     SprintWaypointAI,
     StopWhenIdleAI,
 )
+
+
+class _IdleFallbackAI(PlayerAI):
+    """Wraps another ``PlayerAI`` and, after delegating to it each tick,
+    re-issues a ``StopOrder`` if the wrapped AI left ``current_order`` as
+    ``None``.
+
+    A couple of shared ``rules_ai.py`` AIs have a genuinely-idle branch that
+    deliberately leaves ``current_order`` untouched instead of setting a
+    fresh order every tick -- e.g. ``StagedGoalkeeperAI`` once parked at goal
+    centre (only fixes heading, see ``_face_outfield_if_parked``), and
+    ``PassReceiverAI`` while still waiting for the ball to come within
+    ``get_possession_radius_m`` (its docstring even says to pair it with an
+    initial persistent order at build time -- but any such order, e.g.
+    ``StopOrder``/``MoveOrder`` to a stationary target, self-completes and
+    clears itself the very first tick since the player is already at rest,
+    which just relocates the gap by one tick instead of closing it). Both
+    were harmless before ``Match._apply_movement`` started requiring every
+    player to have movement intent set EVERY tick (see its docstring) --
+    the player was already at ~0 velocity, so silently coasting looked like
+    standing still. Now it has to be an explicit ``StopOrder``, same as
+    everywhere else in this codebase (see ``StopWhenIdleAI``, whose
+    docstring explicitly invites reusing this exact one-line pattern).
+
+    Deliberately NOT folded into ``rules_ai.py`` itself: both wrapped AIs are
+    shared well beyond this file's own scenarios (real matches, other tests),
+    so the fix is composed locally here instead of changing their shared
+    behaviour.
+    """
+
+    def __init__(self, inner: PlayerAI) -> None:
+        super().__init__()
+        self._inner = inner
+
+    def act(self, player: Player, match: Match, trial_tick: int) -> None:
+        self._inner.act(player, match, trial_tick)
+        if player.current_order is None:
+            player.current_order = StopOrder()
 
 
 def _2v2_cfg() -> dict:
@@ -676,13 +729,23 @@ def build_2v2_scenario(
     gk.current_order = MoveOrder(target_position=pitch.right_goal_centre, sprint=False,
                                   max_speed_on_arrival_mps=0.0)
 
+    # attacker_a's PassOrder always completes in a single tick; nothing else
+    # drives it afterwards, so hold position instead of crashing next tick.
+    attacker_a.ai = StopWhenIdleAI()
+
     # goal_aim_point omitted -> BallCarrierAttackerAI (via BallReceiverThenShootAI)
     # picks a live, goalkeeper-aware corner at the moment of shooting.
-    attacker_b.ai = BallReceiverThenShootAI(
+    # Wrapped: BallCarrierAttackerAI.decide()'s "lost the ball" branch (used
+    # once attacker_b is delegated to it, post-reception) deliberately
+    # abandons current_order without setting a fresh one -- see
+    # _IdleFallbackAI's own docstring.
+    attacker_b.ai = _IdleFallbackAI(BallReceiverThenShootAI(
         shoot_immediately=rng.random() < shoot_immediately_probability,
-    )
+    ))
+    # Phase1RulesAI.decide() unconditionally sets a fresh order every call
+    # (see its own docstring) -- no idle-fallback gap to wrap.
     defender.ai = Phase1RulesAI()
-    gk.ai = StagedGoalkeeperAI()
+    gk.ai = _IdleFallbackAI(StagedGoalkeeperAI())
     return match
 
 
@@ -784,9 +847,14 @@ def build_1v2_scenario(
 
     # aim_point omitted -> BallCarrierAttackerAI picks a live, goalkeeper-aware
     # corner at the moment of shooting (see shot_selection.choose_shot_target).
-    attacker.ai = BallCarrierAttackerAI(power_fraction=0.9)
+    # Wrapped: its decide() deliberately abandons current_order without
+    # setting a fresh one once the attacker loses the ball (e.g. after
+    # shooting) -- see _IdleFallbackAI's own docstring.
+    attacker.ai = _IdleFallbackAI(BallCarrierAttackerAI(power_fraction=0.9))
+    # Phase1RulesAI.decide() unconditionally sets a fresh order every call
+    # (see its own docstring) -- no idle-fallback gap to wrap.
     defender.ai = Phase1RulesAI()
-    gk.ai = StagedGoalkeeperAI()
+    gk.ai = _IdleFallbackAI(StagedGoalkeeperAI())
     return match
 
 
@@ -860,6 +928,12 @@ def build_repulsion_obstacle_scenario(
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
     )
     attacker.current_order = MoveOrder(target_position=target, sprint=True)
+    # obstacle never gets any order at all (it's meant to just stand there);
+    # attacker's MoveOrder self-completes on arrival at the far side with
+    # nothing else to pick up movement intent afterwards. Both need an
+    # explicit idle AI rather than being left to crash/coast.
+    obstacle.ai = StopWhenIdleAI()
+    attacker.ai = StopWhenIdleAI()
     return match
 
 
@@ -1126,9 +1200,16 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         opponent_trainer = None if opponent_immobile else _resolve_trainer_from_name(opponent_checkpoint, opponent_rules)
         state["trainee_trainer"] = trainee_trainer
         state["opponent_trainer"] = opponent_trainer
-        state["ticks_trainee"] = 0
-        state["ticks_opponent"] = 0
         state["decision_interval_ticks"] = max(1, round(decision_interval_ms / 1000.0 * UI_TICK_HZ))
+        # Start already "due" for a decision (matches PlayerAI.__init__'s own
+        # "decide on first tick" convention) rather than 0 -- on_tick's first
+        # call increments this before comparing against decision_interval_
+        # ticks, so starting at 0 meant the very first tick of every fresh
+        # trial took the "reapply cached action" branch below with no cached
+        # action yet to reapply (nothing had ever been decided), leaving the
+        # trainee/opponent with no movement intent set at all that tick.
+        state["ticks_trainee"] = state["decision_interval_ticks"]
+        state["ticks_opponent"] = state["decision_interval_ticks"]
 
         match = build_1v1_scenario(
             rng_reduction,
@@ -1314,22 +1395,29 @@ def build_1v1_scenario(
 
     _movement_params = MovementParams.from_config()
 
-    def _rand_capped_velocity(attrs: PlayerAttributes, stamina: float) -> Vector3:
-        """Random direction, magnitude uniform in [0, this player's own
-        effective_top_speed] at their sampled stamina -- has_ball=False
+    def _rand_capped_velocity(attrs: PlayerAttributes, stamina: float, direction_rad: float) -> Vector3:
+        """Magnitude uniform in [0, this player's own effective_top_speed] at
+        their sampled stamina, in the given direction -- has_ball=False
         (nobody starts in possession here) and is_goalkeeper=False (no
-        goalkeepers in this 1v1 scenario)."""
+        goalkeepers in this 1v1 scenario). direction_rad is passed in
+        (rather than drawn here) so the caller can reuse the SAME angle for
+        heading_rad -- a player's heading and velocity should never be two
+        independent random draws (see below)."""
         max_speed = effective_top_speed(_movement_params, attrs.top_speed, stamina, has_ball=False)
         speed = rng.uniform(0.0, max_speed)
-        direction = rng.uniform(-math.pi, math.pi)
-        return Vector3(math.cos(direction) * speed, math.sin(direction) * speed, 0.0)
+        return Vector3(math.cos(direction_rad) * speed, math.sin(direction_rad) * speed, 0.0)
 
     # --- Trainee (random team) ---
     trainee_attrs = generate_attributes(tier=trainee_tier, rng=rng)
     trainee = Player.create("trainee", trainee_team, trainee_attrs, position=_rand_pos())
     trainee.stamina = rng.uniform(stamina_min, stamina_max)
-    trainee.heading_rad = rng.uniform(-math.pi, math.pi)
-    trainee.velocity = _rand_capped_velocity(trainee_attrs, trainee.stamina)
+    # heading_rad and velocity share ONE random draw, not two independent
+    # ones -- a player facing a direction other than the one they're moving
+    # in is a real Match invariant violation (see Match.__init__'s heading/
+    # velocity alignment check) that used to happen here silently.
+    _trainee_dir_rad = rng.uniform(-math.pi, math.pi)
+    trainee.heading_rad = _trainee_dir_rad
+    trainee.velocity = _rand_capped_velocity(trainee_attrs, trainee.stamina, _trainee_dir_rad)
 
     # --- Opponent (opposite team) --- immobile, no order ---
     opponent_attrs = generate_attributes(tier=opponent_tier, rng=rng)
@@ -1346,17 +1434,15 @@ def build_1v1_scenario(
                 break
     opponent = Player.create("opponent", opponent_team, opponent_attrs, position=_opp_pos)
     opponent.stamina = rng.uniform(stamina_min, stamina_max)
-    opponent.heading_rad = rng.uniform(-math.pi, math.pi)
-    # NOTE: when this opponent ends up immobile (no AI/order, the common
-    # case -- opponent_immobile_prob default 1.0), it never calls
-    # step_player_towards again, so Match._apply_movement's "no order this
-    # tick" branch just coasts it at this exact CONSTANT velocity (no
-    # deceleration/friction applied at all) for the rest of the episode --
-    # a genuinely "immobile" opponent will now drift in a straight line
-    # instead of standing still. Deliberate per this being applied to both
-    # players uniformly; revisit (e.g. skip this for the immobile case) if
-    # a drifting "immobile" opponent turns out to be an unwanted side effect.
-    opponent.velocity = _rand_capped_velocity(opponent_attrs, opponent.stamina)
+    _opponent_dir_rad = rng.uniform(-math.pi, math.pi)
+    opponent.heading_rad = _opponent_dir_rad
+    # When this opponent ends up immobile (no AI, the common case --
+    # opponent_immobile_prob default 1.0), it's given a JogOrder below in
+    # this same direction instead of being left to coast forever on this
+    # raw initial velocity (Match._apply_movement's "no order this tick"
+    # branch applies zero deceleration and never updates heading) -- see
+    # JogOrder's own docstring (orders.py).
+    opponent.velocity = _rand_capped_velocity(opponent_attrs, opponent.stamina, _opponent_dir_rad)
 
     # --- Ball: random placement within ball_max_dist_from_trainee_m of trainee, in bounds ---
     for _ball_attempt in range(50):
@@ -1426,7 +1512,16 @@ def build_1v1_scenario(
         match._opponent_use_rules_ai = True
         match._opponent_is_immobile = False
     elif _r < opponent_rules_prob + opponent_immobile_prob:
+        # ai stays None (Phase1RulesAI.decide() and others key off `opponent.
+        # ai is None` as their "can this opponent ever move/contest" signal
+        # -- see JogOrder's own docstring for why this must not become a real
+        # AI) -- but current_order is set directly so the opponent still
+        # moves like a real player (proper accel/turn-rate/heading) instead
+        # of coasting forever on its raw initial velocity.
         opponent.ai = None
+        opponent.current_order = JogOrder(
+            direction=Vector3(math.cos(_opponent_dir_rad), math.sin(_opponent_dir_rad), 0.0)
+        )
         match._opponent_use_rules_ai = False
         match._opponent_is_immobile = True
     else:
@@ -1436,9 +1531,12 @@ def build_1v1_scenario(
         match._opponent_is_immobile = False
 
     if match._opponent_is_immobile:
-        # An immobile opponent issues no order/AI of its own, so its
-        # position never changes UNDER ITS OWN POWER -- but it is not
-        # perfectly frozen: resolve_all_overlaps() (engine/collision.py)
+        # This re-roll only protects the STARTING position -- "immobile" now
+        # jogs (see the JogOrder assigned above), so it can still walk into
+        # its own box over the course of an episode even after spawning
+        # clear of it. Not handled here (yet): revisit if that shows up as a
+        # real problem in practice. It is also not perfectly frozen even
+        # ignoring JogOrder: resolve_all_overlaps() (engine/collision.py)
         # pushes apart any overlapping ACTIVE players purely from physical
         # collision, with no regard for whether either side has an AI. If
         # the trainee repeatedly contests the ball right next to the
@@ -1487,6 +1585,32 @@ def build_1v1_scenario(
             # whatever the last candidate was, same lenient philosophy as the
             # ball-placement loop above.
 
+    return match
+
+
+def _build_1v1_phase1_ui_scenario(rng_reduction: float = 0.3, **kwargs) -> Match:
+    """SCENARIOS["1v1_phase1"]'s ``build`` -- thin wrapper around
+    ``build_1v1_scenario`` that explicitly assigns the trainee's AI.
+
+    ``build_1v1_scenario`` itself deliberately leaves ``trainee.ai`` unset
+    (see its own docstring: "Trainee ... has no initial order so the AI can
+    drive it") so its real callers -- PPO training/eval/recording
+    (ai/scripts/train.py, evaluate.py, record_demonstrations.py,
+    ppo_trainer.py, ...) -- can assign whatever drives the trainee
+    themselves (a NeuralPlayerAI wired up outside player.ai, or nothing at
+    all if the env steps it directly); build_1v1_scenario is shared with all
+    of those non-test callers, so it must not gain a hardcoded trainee AI.
+    This "1v1: Phase 1 get possession (rules-based only)" UI/test scenario
+    entry has no such external driver, so -- mirroring exactly what
+    ai/scripts/replay_episode.py's own UI launch path already does for the
+    same reason (see its comment there) -- assign Phase1RulesAI here,
+    locally, rather than changing the shared builder.
+    """
+    match = build_1v1_scenario(rng_reduction, **kwargs)
+    try:
+        match.player_by_id("trainee").ai = Phase1RulesAI()
+    except KeyError:
+        pass
     return match
 
 
@@ -1661,6 +1785,12 @@ def build_mark_standoff_scenario(
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
     )
     carrier.stop()  # carrier stays put holding the ball
+    # StopOrder self-completes the instant the player is already at rest
+    # (carrier and target both start stationary), so without a fallback AI
+    # both would be left with current_order=None after tick 1. marker's
+    # MarkOrder is persistent (never auto-completes) so it needs no fallback.
+    carrier.ai = StopWhenIdleAI()
+    target.ai = StopWhenIdleAI()
     marker.mark_player(target_player_id=target.player_id)
     return match
 
@@ -1712,6 +1842,9 @@ def build_penalty_corner_accuracy_scenario(
         aim_point=aim_point, power_fraction=0.9,
         spin=Vector3.zero(), compensate_for_run=False,
     )
+    # KickOrder always completes in a single tick; nothing else drives the
+    # kicker afterwards, so hold position instead of crashing next tick.
+    kicker.ai = StopWhenIdleAI()
     return match
 
 
@@ -1776,6 +1909,11 @@ def build_gk_far_post_scenario(
         aim_point=aim_point, power_fraction=0.95,
         spin=Vector3.zero(), compensate_for_run=False,
     )
+    # SaveOrder self-completes once a goal is scored (stands down during the
+    # goal linger); KickOrder always completes in a single tick. Neither
+    # player has any other AI to pick up movement intent afterwards.
+    gk.ai = StopWhenIdleAI()
+    shooter.ai = StopWhenIdleAI()
     return match
 
 
@@ -1829,7 +1967,7 @@ SCENARIOS: list[ScenarioDefinition] = [
             "Both players randomly placed, random ball, random attributes. "
             "Phase 1 curriculum scenario. Trainee chases ball; opponent immobile."
         ),
-        build=build_1v1_scenario,
+        build=_build_1v1_phase1_ui_scenario,
         on_tick=_1v1_on_tick,
         params=[
             ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 60.0, 0.5, 10.0),

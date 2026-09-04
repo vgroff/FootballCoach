@@ -18,6 +18,7 @@ from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.entities.player import PlayerState
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import ChaseTackleOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 
@@ -87,6 +88,11 @@ def _make_gk_in_box_match(rng_reduction: float = 1.0) -> tuple[Match, object, ob
     tackler_pos = Vector3(-pitch.half_length + 5.5, 0.0, 0.0)
 
     gk = make_player("gk", Team.LEFT, 0.7, position=gk_pos, is_goalkeeper=True)
+    # GK never gets an order in this helper (the tackler's ChaseTackleOrder
+    # is assigned by the caller after construction) -- StopWhenIdleAI keeps
+    # it stationary (holding the ball) rather than crashing on the
+    # movement-intent invariant.
+    gk.ai = StopWhenIdleAI()
     tackler = make_player("tackler", Team.RIGHT, 0.8, position=tackler_pos)
 
     ball = Ball(position=Vector3(-pitch.half_length + 5.41, 0.0, 0.11),

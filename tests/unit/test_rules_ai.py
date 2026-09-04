@@ -14,7 +14,7 @@ import pytest
 from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import GetPossessionOrder, MoveOrder, SaveOrder, ShootOrder
+from footballcoach.orders import GetPossessionOrder, MoveOrder, SaveOrder, ShootOrder, StopOrder
 from footballcoach.rules_ai import (
     BallCarrierAttackerAI,
     BallReceiverThenShootAI,
@@ -314,7 +314,10 @@ class TestStagedGoalkeeperAI:
         p1.ai = StagedGoalkeeperAI(decision_interval_ticks=1)
         p1.current_order = None
         p1.ai.act(p1, match, 0)
-        assert p1.current_order is None
+        # No SaveOrder while the ball is possessed -- may still get a
+        # MoveOrder-to-goal-centre fallback (not None) so the GK always has
+        # movement intent, see Match._apply_movement.
+        assert not isinstance(p1.current_order, SaveOrder)
 
     def test_does_not_replace_existing_order(self):
         match, p1, _ = _make_simple_match()
@@ -348,7 +351,10 @@ class TestBallCarrierAttackerAI:
         match, p1, _ = _make_simple_match()
         p1.ai = BallCarrierAttackerAI(self._aim(), decision_interval_ticks=1)
         p1.ai.act(p1, match, 0)
-        assert p1.current_order is None
+        # No attacking order (MoveOrder/ShootOrder) -- falls back to
+        # StopOrder (not None) so the player still has movement intent
+        # every tick, see Match._apply_movement.
+        assert isinstance(p1.current_order, StopOrder)
 
     def test_issues_shoot_order_when_has_ball_and_no_order(self):
         match, p1, _ = _make_simple_match(ball_possessed_by="p1")
@@ -472,4 +478,6 @@ class TestSprintWaypointAI:
         p1.current_order = None
         ai = SprintWaypointAI(waypoints, start_idx=1, decision_interval_ticks=1)  # start_idx beyond list
         ai.act(p1, match, 0)
-        assert p1.current_order is None  # no more waypoints
+        # No more waypoints -- falls back to StopOrder (not None) so the
+        # runner still has movement intent every tick, see Match._apply_movement.
+        assert isinstance(p1.current_order, StopOrder)

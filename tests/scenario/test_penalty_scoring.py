@@ -11,6 +11,7 @@ from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import KickOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 
@@ -18,6 +19,9 @@ def test_penalty_scores_and_goal_recorded():
     pitch = Pitch.standard()
     penalty_spot = pitch.penalty_spot(left=False)  # attacking the right goal
     kicker = make_player("p1", team=Team.LEFT, position=penalty_spot, kick_precision=0.9, kick_power=0.9)
+    # KickOrder fires and completes in a single tick; give the kicker the
+    # idle-fallback AI so it still has movement intent on every later tick.
+    kicker.ai = StopWhenIdleAI()
 
     ball = Ball.at_rest(penalty_spot)
     ball.possessed_by = kicker.player_id

@@ -15,6 +15,7 @@ from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import KickOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 RNG_REDUCTION = 0.3
@@ -50,6 +51,12 @@ def _run_shot_trial_with_run_direction(
     perp = Vector3(-aim_dir.y, aim_dir.x, 0)
     kicker.velocity = (aim_dir * run_cos_sim + perp * sin_sim) * run_speed
     kicker.heading_rad = math.atan2(kicker.velocity.y, kicker.velocity.x)
+    # KickOrder (issued by actions.shoot below) always completes in one
+    # tick -- fallback AI keeps the kicker in place afterwards instead of
+    # crashing on the movement-intent invariant for the rest of the loop.
+    # This does not affect the run-direction-at-the-moment-of-the-kick setup
+    # above, which is what this test is actually validating.
+    kicker.ai = StopWhenIdleAI()
 
     match = Match(
         pitch=pitch, players=[kicker], ball=ball,
@@ -125,6 +132,9 @@ def test_shooting_below_min_speed_no_penalty(balance_recorder):
             kick_precision=precision, kick_power=0.7,
         )
         kicker.velocity = Vector3.zero()
+        # KickOrder always completes in one tick -- see the fallback AI note
+        # in _run_shot_trial_with_run_direction above.
+        kicker.ai = StopWhenIdleAI()
         ball = Ball.at_rest(kicker.position)
         ball.possessed_by = kicker.player_id
         match = Match(
@@ -174,6 +184,13 @@ def test_pass_accuracy_forward_beats_backward_run(balance_recorder):
         perp = Vector3(-aim_dir.y, aim_dir.x, 0)
         passer.velocity = (aim_dir * run_cos_sim + perp * sin_sim) * run_speed
         passer.heading_rad = math.atan2(passer.velocity.y, passer.velocity.x)
+        # PassOrder always completes in one tick, and the receiver never
+        # gets an order/AI of its own -- fallback AI for both keeps them
+        # from crashing on the movement-intent invariant for the rest of
+        # the loop. Doesn't affect the run-direction-at-pass-time setup
+        # above, which is what this test actually validates.
+        passer.ai = StopWhenIdleAI()
+        receiver.ai = StopWhenIdleAI()
 
         match = Match(
             pitch=pitch, players=[passer, receiver], ball=ball,

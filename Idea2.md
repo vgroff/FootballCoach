@@ -37,7 +37,11 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. Please do not skip any of them. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
-    - !! remove downward kicks when the ball is on the floor already - just make it reflect the velocity upwards?
+        - Okay now let's chat about the rules AI:
+        - Take me through your fix for the tackling again.
+        - Do rules ai players sprint towards the opposition box when they have the ball or are doing push-kicking if the opponent is near them or catching up to them?
+        - I wonder if the rules AI should have some logic where if the opponent looks like they're going to get the ball first, try to get in between them and the box instead of chasing them, better chance of success. Not sure where that should go or be wired in though, maybe a new order? WE
+        -  I'd like all of these checked on the evaluation (rules vs rules) before and after to see the improvement, 500 episodes
     - !! Seperate kick z vs. x/y log dir std and therefore entropy calculations?
     - !! Are the bernoulli heads sampled to become execution inputs? They shouldnt be!!
     - !! new training:
@@ -225,7 +229,7 @@ NB Immediate Immediate:
 - Kicking and running - this should be possible, and faster than running with the ball. Do some tests, and then add it to Phase 1 AI (and/or MoveOrder) 
 - kicking direction needs working - can’t kick at 90 degrees upward, even less with the same power
 - Allow pausing and going back in time (up to 30s)
-- Control - should set the ball to ground level, snap for now but improve it later? Also how long are the control delays vs real life? Also implement failed control - rebounds. What happens during control, does a player have ball possession and can he be tackled while controlling? Shouldn’t be possible until ball on floor. Can he kick during control? I think no, either volley/head it first time or finish controlling it - but can arm a kick? Doess ball control even do much atm?
+- Control - should set the ball to ground level, snap for now but improve it later? Also how long are the control delays vs real life? Also implement failed control - rebounds. What happens during control, does a player have ball possession and can he be tackled while controlling? Shouldn’t be possible until ball on floor. Can he kick during control? I think no, either volley/head it first time or finish controlling it - but can arm a kick? Doess ball control even do much atm? Should be able to arm a control/let a ball run through (unless it "really" contacts)
 - Heading - should reduce shot power (and precision) 
 - Give the ball some dots and make them spin during spinning
 - Possible later optimisation - the execution network could have only decisions+latent space as input, with none of the other current inputs present? Or way fewer at least? Would make it run faster, it can be smaller, the larger decision network can run less often

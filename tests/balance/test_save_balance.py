@@ -17,6 +17,7 @@ from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import KickOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 RNG_REDUCTION = 0.3
@@ -54,6 +55,11 @@ def _run_save_trial(
                                     has_ball=True, ball_control_attr=shooter.attributes.ball_control)
     shooter.velocity = Vector3(-run_speed, 0.0, 0.0)
     shooter.heading_rad = math.pi  # facing left, matches velocity
+    # KickOrder (assigned below) always completes in one tick -- give the
+    # shooter a fallback AI so it stays put (not crashing on the
+    # movement-intent invariant) for the rest of the trial loop. The GK's
+    # SaveOrder never auto-completes, so it needs no such fallback.
+    shooter.ai = StopWhenIdleAI()
     ball = Ball.at_rest(shooter.position)
     ball.possessed_by = shooter.player_id
     match = Match(pitch=pitch, players=[gk, shooter], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))

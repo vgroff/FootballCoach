@@ -15,6 +15,7 @@ from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.entities.player import PlayerState
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import GetPossessionOrder, MarkOrder, MoveOrder, OrderStatus
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 
@@ -43,6 +44,7 @@ def test_marker_moves_toward_standoff_position():
     ball = Ball.at_rest(Vector3(30, 0, 0))
     marker = make_player("marker", Team.LEFT, position=Vector3(25, 2, 0), attr_value=0.8)
     target = make_player("target", Team.RIGHT, position=Vector3(20, 0, 0))
+    target.ai = StopWhenIdleAI()  # stationary reference point; not under test
 
     match = _make_match([marker, target], ball)
     actions.mark(marker, target)
@@ -68,6 +70,7 @@ def test_marker_never_autocompletes_in_standoff_mode():
     ball = Ball.at_rest(Vector3(30, 0, 0))
     marker = make_player("marker", Team.LEFT, position=Vector3(0, 0, 0), attr_value=0.7)
     target = make_player("target", Team.RIGHT, position=Vector3(20, 0, 0))
+    target.ai = StopWhenIdleAI()  # stationary reference point; not under test
 
     match = _make_match([marker, target], ball)
     actions.mark(marker, target)
@@ -84,6 +87,7 @@ def test_standoff_position_tracks_moving_target():
     ball = Ball.at_rest(Vector3(30, 0, 0))
     marker = make_player("marker", Team.LEFT, position=Vector3(10, 5, 0), attr_value=0.9)
     target = make_player("target", Team.RIGHT, position=Vector3(20, 0, 0))
+    target.ai = StopWhenIdleAI()  # stationary/teleported reference point; not under test
 
     match = _make_match([marker, target], ball)
     actions.mark(marker, target)
@@ -121,6 +125,7 @@ def test_mark_switches_to_chase_when_ball_within_intercept_radius():
     marker = make_player("marker", Team.LEFT, position=Vector3(0, 0, 0), attr_value=0.8)
     # Target far away from ball so target_has_ball is False.
     target = make_player("target", Team.RIGHT, position=Vector3(-20, 0, 0))
+    target.ai = StopWhenIdleAI()  # stationary reference point; not under test
 
     match = _make_match([marker, target], ball)
     actions.mark(marker, target)
@@ -144,6 +149,7 @@ def test_mark_no_intercept_mode_beyond_radius():
     ball = Ball.at_rest(Vector3(ball_x, 0, 0))
     marker = make_player("marker", Team.LEFT, position=Vector3(0, 0, 0), attr_value=0.8)
     target = make_player("target", Team.RIGHT, position=Vector3(-15, 0, 0))
+    target.ai = StopWhenIdleAI()  # stationary reference point; not under test
 
     match = _make_match([marker, target], ball)
     actions.mark(marker, target)
@@ -172,6 +178,7 @@ def test_intercept_radius_boundary_inside():
     ball = Ball.at_rest(Vector3(ball_dist, 0, 0))
     marker = make_player("marker", Team.LEFT, position=Vector3(0, 0, 0), attr_value=0.8)
     target = make_player("target", Team.RIGHT, position=Vector3(-20, 0, 0))
+    target.ai = StopWhenIdleAI()  # stationary reference point; not under test
 
     match = _make_match([marker, target], ball)
     actions.mark(marker, target)
@@ -189,6 +196,7 @@ def test_intercept_radius_boundary_outside():
     ball = Ball.at_rest(Vector3(ball_dist, 0, 0))
     marker = make_player("marker", Team.LEFT, position=Vector3(0, 0, 0), attr_value=0.8)
     target = make_player("target", Team.RIGHT, position=Vector3(-15, 0, 0))
+    target.ai = StopWhenIdleAI()  # stationary reference point; not under test
 
     match = _make_match([marker, target], ball)
     actions.mark(marker, target)
@@ -221,6 +229,7 @@ def test_mark_switches_to_tackle_when_target_gets_ball():
                          attr_value=0.8, tackling=0.9)
     target = make_player("target", Team.RIGHT, position=Vector3(5, 0, 0),
                          attr_value=0.4, dribbling=0.2)
+    target.ai = StopWhenIdleAI()  # stationary ball-holder; not under test
     # Marker faces the target.
     import math
     marker.heading_rad = math.pi  # facing -x toward target
@@ -249,6 +258,7 @@ def test_mark_switches_when_target_controlling_ball():
                          attr_value=0.8, tackling=0.95)
     target = make_player("target", Team.RIGHT, position=Vector3(5, 0, 0),
                          attr_value=0.3, ball_control=0.2)
+    target.ai = StopWhenIdleAI()  # stationary ball-holder; not under test
 
     target.state = PlayerState.CONTROLLING_BALL
     target.state_timer_s = 0.5
@@ -278,6 +288,7 @@ def test_mark_order_never_completes_after_winning_ball():
                          attr_value=0.9, tackling=0.99)
     target = make_player("target", Team.RIGHT, position=Vector3(5, 0, 0),
                          attr_value=0.1, dribbling=0.01)
+    target.ai = StopWhenIdleAI()  # stationary ball-holder; not under test
 
     import math
     marker.heading_rad = math.pi

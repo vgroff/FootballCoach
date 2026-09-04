@@ -56,6 +56,7 @@ from footballcoach.ai.obs.encoder import encode_observation
 from footballcoach.ai.physics_pretrain.live_encoder_features import load_physics_pitch_constants
 from footballcoach.engine.movement import SpeedMode
 from footballcoach.mathutils import Vector3
+from footballcoach.rules_ai import StopWhenIdleAI
 from footballcoach.ui.scenarios import build_1v1_scenario
 
 BALL_CKPT = Path("checkpoints/physics_pretrain/ball_encoder_70.midtrain_latest.pt")
@@ -93,8 +94,12 @@ def _run_ball_case(block: BallPhysicsFeatureBlock, seed: int, start_z: float, st
     """Ball loose, far from both (AI-less) players, real Match.step()
     physics for max(horizons_s). Returns {horizon_s: error_m}."""
     match = build_1v1_scenario(seed=seed, opponent_immobile_prob=1.0, sim_dt_s=SIM_DT_S)
-    match.player_by_id(TRAINEE_ID).ai = None
-    match.player_by_id("opponent").ai = None
+    # Neither player should move for this check (ball physics only) -- give
+    # them StopWhenIdleAI instead of leaving ai=None, since Match now raises
+    # if a player has no movement intent for even one tick (see match.py's
+    # _apply_movement docstring).
+    match.player_by_id(TRAINEE_ID).ai = StopWhenIdleAI()
+    match.player_by_id("opponent").ai = StopWhenIdleAI()
     match.player_by_id(TRAINEE_ID).position = Vector3(-50.0, -30.0, 0.0)
     match.player_by_id("opponent").position = Vector3(-50.0, 30.0, 0.0)
     match.ball.position = Vector3(0.0, 0.0, start_z)
@@ -132,7 +137,9 @@ def _run_player_case(block: PlayerPhysicsFeatureBlock, seed: int, direction_deg:
     trainee = match.player_by_id(TRAINEE_ID)
     trainee.ai = None
     trainee.current_order = None
-    match.player_by_id("opponent").ai = None
+    # Opponent should stay put -- StopWhenIdleAI instead of ai=None, since
+    # Match now raises if a player has no movement intent for even one tick.
+    match.player_by_id("opponent").ai = StopWhenIdleAI()
     match.player_by_id("opponent").position = Vector3(-50.0, 30.0, 0.0)
     trainee.position = Vector3(0.0, 0.0, 0.0)
     trainee.velocity = Vector3.zero()

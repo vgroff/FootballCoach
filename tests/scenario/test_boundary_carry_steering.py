@@ -28,6 +28,7 @@ from footballcoach.entities import Ball, Pitch
 from footballcoach.entities.player import Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import MoveOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 
@@ -98,18 +99,21 @@ def test_carrier_far_from_boundary_is_unaffected():
     start = Vector3(-20.0, 0.0, 0.0)  # pitch centre in y, far from either sideline
     player = make_player("p1", Team.LEFT, attr_value=0.9, position=start)
     player.heading_rad = 0.0
+    # Idle-fallback AI: once the bare MoveOrder below completes (arrives +
+    # brakes to jog speed) there is nothing left to reissue movement intent
+    # each tick, so this stands the player still afterwards rather than
+    # leaving them with no intent at all.
+    player.ai = StopWhenIdleAI()
     ball = Ball.at_rest(start)
     ball.possessed_by = "p1"
     match = Match(pitch=pitch, players=[player], ball=ball, rng_reduction=1.0, rng=random.Random(0))
     target = Vector3(0.0, 0.0, 0.0)
     player.current_order = MoveOrder(target_position=target, sprint=True)
 
-    # Track the CLOSEST approach rather than final position -- this is a
-    # bare MoveOrder with no controlling AI to reissue it, so once it
-    # completes (arrives + brakes to jog speed) the player just coasts
-    # onward forever with no AI to stop it (see test_ball_out_overrun.py's
-    # own docstring note on this exact test-harness artefact) -- final
-    # position isn't a meaningful thing to assert on here.
+    # Track the CLOSEST approach rather than final position -- the MoveOrder
+    # completes on arrival and the idle-fallback AI then holds the player at
+    # the target, so final position is a meaningful-but-redundant check;
+    # closest approach is what actually exercises the sprint-in behaviour.
     min_dist = float("inf")
     for _ in range(30 * 6):
         match.step()

@@ -26,6 +26,7 @@ from footballcoach.entities.pitch import Pitch
 from footballcoach.entities.player import PlayerState, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import MoveOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 
 from tests.conftest import make_player
 
@@ -196,6 +197,11 @@ class TestStepWiringCapturesPreMovementPosition:
         bug (e.g. accidentally comparing a point to itself)."""
         ball = Ball.at_rest(Vector3(0.0, 0.0, 0.0))
         player = make_player("p", Team.LEFT, position=Vector3(-2.0, 5.0, 0), attr_value=0.0)
+        # No order/AI is under test here -- the player just needs to stand
+        # still (attr_value=0.0 already makes them essentially motionless) so
+        # give them the idle-fallback AI to satisfy the movement-intent
+        # invariant.
+        player.ai = StopWhenIdleAI()
         m = Match(pitch=Pitch.standard(), players=[player], ball=ball, rng=random.Random(0))
         m.step()
         assert m.ball.possessed_by is None

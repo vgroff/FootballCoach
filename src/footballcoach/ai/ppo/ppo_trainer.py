@@ -60,6 +60,7 @@ from footballcoach.ai.progress import ProgressReporter
 from footballcoach.ai.obs.canonical import (
     CanonicalNetworkWrapper,
     canonicalize_bc_labels,
+    canonicalize_obs,
     mirror_x,
     x_sign_of,
 )
@@ -2159,7 +2160,7 @@ class PPOTrainer:
                             _p0_stopped_early = True
                             break
             if _p0_stopped_early and _p0_best_state is not None:
-                self.decision_net.load_state_dict(_p0_best_state["decision_net"])
+                _load_state_dict_tolerant(self.decision_net, _p0_best_state["decision_net"], "decision_net")
                 if self.separate_value_net:
                     self.value_net.load_state_dict(_p0_best_state["value_net"])
                 else:
@@ -2291,6 +2292,54 @@ class PPOTrainer:
             self.decision_net.train()
             self.execution_net.train()
             return float(np.mean(_losses)) if _losses else float("nan")
+
+        def _eval_p1_value_val_loss() -> tuple[float, float]:
+            """Mean value MSE (normalized) + RMSE (raw), no grad, over the
+            held-out val rows -- mirrors _eval_bc_val_loss but for the value
+            head/net (execution_net.value_head, or self.value_net when
+            separate_value_net), so Phase 1's value loss has a genuine
+            held-out counterpart. Only meaningful when _use_joint_val or
+            _use_separate_value_training (returns are otherwise undefined)."""
+            self.decision_net.eval()
+            if _use_separate_value_training:
+                self.value_net.eval()
+            else:
+                self.execution_net.eval()
+            _losses: list[float] = []
+            _raw_mses: list[float] = []
+            with torch.no_grad():
+                for _obs_v, _lbl_v, _ret_v in dataset.iterate_minibatches(
+                    batch_size=batch_size, shuffle=False, device=self.device,
+                    indices_override=_bc_val_idx, returns=_joint_returns,
+                ):
+                    _sat_v, _oat_v = _ai_types(_obs_v)
+                    _d_v = self.decision_net(
+                        _obs_v["self_feat"], _obs_v["other_feat"], _obs_v["exists_mask"],
+                        _obs_v["ball_feat"], _obs_v["global_feat"], _sat_v, _oat_v,
+                    )
+                    if _use_separate_value_training:
+                        _d_v_for_value = _detach_decision_heads(_d_v)
+                        _e_v = self.value_net(
+                            _obs_v["self_feat"], _obs_v["other_feat"], _obs_v["exists_mask"],
+                            _obs_v["ball_feat"], _obs_v["global_feat"], _d_v_for_value, _sat_v, _oat_v,
+                        )
+                    else:
+                        _e_v = self.execution_net(
+                            _obs_v["self_feat"], _obs_v["other_feat"], _obs_v["exists_mask"],
+                            _obs_v["ball_feat"], _obs_v["global_feat"], _d_v, _sat_v, _oat_v,
+                        )
+                    _v = _e_v.value.squeeze(-1)
+                    _raw_mse = F.mse_loss(_v, _ret_v)
+                    _raw_mses.append(_raw_mse.item())
+                    _losses.append((_raw_mse / (_joint_ret_std ** 2)).item())
+            self.decision_net.train()
+            if _use_separate_value_training:
+                self.value_net.train()
+            else:
+                self.execution_net.train()
+            if not _losses:
+                return float("nan"), float("nan")
+            return float(np.mean(_losses)), float(np.sqrt(np.mean(_raw_mses)))
 
         _p1_n_epochs = 0 if self._bc_train_value_only else n_epochs
         if self._bc_train_value_only:
@@ -2532,10 +2581,15 @@ class PPOTrainer:
                 for k, v in _bkdn_acc.items()
             ) if _bkdn_n else ""
             if val_losses:
+                # NOTE: despite the name, val_losses/val_rmse below are accumulated
+                # over TRAINING minibatches (_bc_train_idx), not the held-out val
+                # split -- they're the epoch's mean training-batch value loss. See
+                # the genuine held-out "value_val_loss=" figure on the "val" line
+                # further down (_eval_p1_value_val_loss) for an actual val metric.
                 val_rmse = float(np.sqrt(np.mean(val_raw_mse_losses))) if val_raw_mse_losses else float('nan')
                 _mean_val = np.mean(val_losses)
                 val_str = (
-                    f"  val_loss={_mean_val:.4f}"
+                    f"  train_value_loss={_mean_val:.4f}"
                     f"(x{self._bc_value_coef})={_mean_val * self._bc_value_coef:.4f}"
                     f"  rmse={val_rmse:.2f} (returns std={_joint_ret_std:.1f})"
                 )
@@ -2545,10 +2599,12 @@ class PPOTrainer:
                 # Separate, detached self.value_net training (see
                 # _use_separate_value_training above) -- NOT scaled by
                 # self._bc_value_coef (no combined loss to weight against),
-                # so no "(x coef)=" term here unlike val_str above.
+                # so no "(x coef)=" term here unlike val_str above. Same
+                # training-batch-not-held-out-val caveat as val_str above --
+                # see "value_val_loss=" on the "val" line for the real metric.
                 sep_val_rmse = float(np.sqrt(np.mean(sep_val_raw_mse_losses))) if sep_val_raw_mse_losses else float('nan')
                 sep_val_str = (
-                    f"    value_net  loss={np.mean(sep_val_losses):.4f}  "
+                    f"    value_net  train_loss={np.mean(sep_val_losses):.4f}  "
                     f"rmse={sep_val_rmse:.2f} (returns std={_joint_ret_std:.1f}, detached from decision_net)"
                 )
             else:
@@ -2590,17 +2646,24 @@ class PPOTrainer:
             _bkdn_n = 0
 
             # --- BC pretrain val loss, reported every epoch; early stop is opt-in
-            # (see bc.bc_pretrain_early_stop_patience) ---
+            # (see bc.bc_pretrain_early_stop_patience). Also reports a genuine
+            # held-out value loss/RMSE (_eval_p1_value_val_loss) on the same line
+            # when a value term is being trained this phase -- separate from the
+            # "train_value_loss="/"value_net  train_loss=" figures printed above,
+            # which are training-batch metrics, not a val-set metric, despite the
+            # similar name. Does NOT feed BC's own early-stop bookkeeping below
+            # (that stays a pure BC-only metric, see _use_separate_value_training's
+            # own note above for why). ---
             if len(_bc_val_idx) > 0:
                 _bc_val_loss = _eval_bc_val_loss()
                 _improved = _bc_val_loss < (_bc_best_val_loss - self._bc_pretrain_early_stop_min_delta)
+                _val_line = f"    val        bc_val_loss={_bc_val_loss:.4f}  best={min(_bc_best_val_loss, _bc_val_loss):.4f}"
                 if _bc_early_stop_enabled:
-                    log.info(
-                        f"    val        bc_val_loss={_bc_val_loss:.4f}  best={min(_bc_best_val_loss, _bc_val_loss):.4f}"
-                        + ("  (improved)" if _improved else f"  (patience {_bc_patience_ctr + 1}/{self._bc_pretrain_early_stop_patience})")
-                    )
-                else:
-                    log.info(f"    val        bc_val_loss={_bc_val_loss:.4f}")
+                    _val_line += ("  (improved)" if _improved else f"  (patience {_bc_patience_ctr + 1}/{self._bc_pretrain_early_stop_patience})")
+                if _use_joint_val or _use_separate_value_training:
+                    _val_value_loss, _val_value_rmse = _eval_p1_value_val_loss()
+                    _val_line += f"  value_val_loss={_val_value_loss:.4f}  rmse={_val_value_rmse:.2f}"
+                log.info(_val_line)
                 if _bc_early_stop_enabled and _improved:
                     _bc_best_val_loss = _bc_val_loss
                     _bc_best_state = {
@@ -2619,7 +2682,7 @@ class PPOTrainer:
                         _bc_stopped_early = True
                         break
         if _bc_stopped_early and _bc_best_state is not None:
-            self.decision_net.load_state_dict(_bc_best_state["decision_net"])
+            _load_state_dict_tolerant(self.decision_net, _bc_best_state["decision_net"], "decision_net")
             self.execution_net.load_state_dict(_bc_best_state["execution_net"])
             log.info(f"  [BC pretrain] restored best-val weights (bc_val_loss={_bc_best_val_loss:.4f})")
         if bc_losses:
@@ -4081,6 +4144,55 @@ class PPOTrainer:
             batch = augment_batch(batch, self.augment_n_slot_shuffles, self._aug_rng)
 
         n = len(batch["log_probs"])
+
+        # --- Precompute frozen physics-encoder features ONCE for this
+        # rollout's batch (fixed by this point -- augmentation above, if
+        # any, has already run and will not run again for this batch),
+        # instead of letting every one of the ppo.n_epochs passes below
+        # (plus the value-only/bc-only continuation passes and diagnostics
+        # further down, all of which replay this exact same batch) re-run
+        # the frozen ball_physics_encoder/player_physics_encoder from
+        # scratch on the exact same rows. Their output depends only on
+        # these (now-fixed) input features, not on the policy's own
+        # changing weights, so it is provably identical across every pass
+        # over this batch -- unlike the rest of decision_net's forward
+        # pass, which genuinely must be recomputed every epoch since its
+        # trainable weights change. Computed in CANONICAL frame via the
+        # same canonicalize_obs() helper CanonicalNetworkWrapper itself
+        # uses internally (not a re-derivation of that logic), chunked by
+        # minibatch_size like the pre-update value-loss pass below to
+        # bound peak memory. Cached as ordinary "obs/*" batch entries
+        # (moved back to CPU, matching every other batch["obs/..."]
+        # tensor's storage convention -- see the .to(self.device) calls at
+        # every mb_obs/_pre_obs/diag_obs construction site below) so the
+        # existing generic per-minibatch slicing loops pick them up for
+        # free; only the self.decision_net(...) call sites themselves need
+        # to pass them through via the ball_physics_full/self_physics_full/
+        # other_physics_full kwargs (see DecisionNetwork.forward()). ---
+        if self.decision_net.ball_physics_encoder is not None or self.decision_net.player_physics_encoder is not None:
+            _phys_ball_parts: list[torch.Tensor] = []
+            _phys_self_parts: list[torch.Tensor] = []
+            _phys_other_parts: list[torch.Tensor] = []
+            with torch.no_grad():
+                for _pstart in range(0, n, self.minibatch_size):
+                    _pidx = torch.arange(_pstart, min(_pstart + self.minibatch_size, n))
+                    _psf_c, _pof_c, _pbf_c, _ = canonicalize_obs(
+                        batch["obs/self_feat"][_pidx].to(self.device),
+                        batch["obs/other_feat"][_pidx].to(self.device),
+                        batch["obs/ball_feat"][_pidx].to(self.device),
+                    )
+                    _pgf_c = batch["obs/global_feat"][_pidx].to(self.device)
+                    if self.decision_net.ball_physics_encoder is not None:
+                        _phys_ball_parts.append(self.decision_net.ball_physics_encoder(_pbf_c, _pgf_c).cpu())
+                    if self.decision_net.player_physics_encoder is not None:
+                        _phys_self_parts.append(self.decision_net.player_physics_encoder(_psf_c, _pgf_c).cpu())
+                        _phys_other_parts.append(self.decision_net.player_physics_encoder(_pof_c, _pgf_c).cpu())
+            if _phys_ball_parts:
+                batch["obs/ball_physics_full"] = torch.cat(_phys_ball_parts, dim=0)
+            if _phys_self_parts:
+                batch["obs/self_physics_full"] = torch.cat(_phys_self_parts, dim=0)
+                batch["obs/other_physics_full"] = torch.cat(_phys_other_parts, dim=0)
+
         clip = self.schedules.clip(progress)
         lr = self.schedules.lr(progress)
         value_lr = self.schedules.value_lr(progress)
@@ -4218,7 +4330,12 @@ class PPOTrainer:
                 _psf, _pof, _pem = _pre_obs["self_feat"], _pre_obs["other_feat"], _pre_obs["exists_mask"]
                 _pbf, _pgf = _pre_obs["ball_feat"], _pre_obs["global_feat"]
                 _psat, _poat = _ai_types(_pre_obs)
-                _pd_heads = self.decision_net(_psf, _pof, _pem, _pbf, _pgf, _psat, _poat)
+                _pd_heads = self.decision_net(
+                    _psf, _pof, _pem, _pbf, _pgf, _psat, _poat,
+                    ball_physics_full=_pre_obs.get("ball_physics_full"),
+                    self_physics_full=_pre_obs.get("self_physics_full"),
+                    other_physics_full=_pre_obs.get("other_physics_full"),
+                )
                 if self.separate_value_net:
                     _pd_heads_v = _detach_decision_heads(_pd_heads)
                     _pe_heads = self.value_net(_psf, _pof, _pem, _pbf, _pgf, _pd_heads_v, _psat, _poat)
@@ -4277,7 +4394,12 @@ class PPOTrainer:
                 gf = mb_obs["global_feat"]
                 sat, oat = _ai_types(mb_obs)
 
-                d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                d_heads = self.decision_net(
+                    sf, of, em, bf, gf, sat, oat,
+                    ball_physics_full=mb_obs.get("ball_physics_full"),
+                    self_physics_full=mb_obs.get("self_physics_full"),
+                    other_physics_full=mb_obs.get("other_physics_full"),
+                )
                 e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
 
                 # Snapshot BEFORE the optimiser step, for the drift diagnostics
@@ -4524,7 +4646,20 @@ class PPOTrainer:
                     _dir_params_before = [p.detach().clone() for p in _direction_params]
 
                 _gn_names = list(_gn_tensors.keys())
-                _gn_vals = dict(zip(_gn_names, torch.stack([_gn_tensors[k] for k in _gn_names]).tolist()))
+                # torch.nn.utils.clip_grad_norm_ returns a CPU tensor (not on
+                # the parameters' own device) whenever every parameter in that
+                # call's group has .grad is None -- e.g. a head that happened
+                # to get zero gradient this exact minibatch (frozen from the
+                # PPO ratio for this curriculum phase and BC aux already
+                # annealed to ~0, or simply no rows touching that head this
+                # step). torch.stack() below then fails cross-device against
+                # the other (real, self.device-resident) norms. .to(self.device)
+                # is a no-op when already on the right device, so this doesn't
+                # change anything for the common case.
+                _gn_vals = dict(zip(
+                    _gn_names,
+                    torch.stack([_gn_tensors[k].to(self.device) for k in _gn_names]).tolist(),
+                ))
 
                 for _head_name, _attr in EXEC_HEAD_MODULES:
                     _gnk = f"head:{_head_name}"
@@ -4552,7 +4687,12 @@ class PPOTrainer:
 
                 # After step: measure KL and direction mean shift
                 with torch.no_grad():
-                    d_after = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                    d_after = self.decision_net(
+                        sf, of, em, bf, gf, sat, oat,
+                        ball_physics_full=mb_obs.get("ball_physics_full"),
+                        self_physics_full=mb_obs.get("self_physics_full"),
+                        other_physics_full=mb_obs.get("other_physics_full"),
+                    )
                     e_after = self.execution_net(sf, of, em, bf, gf, d_after, sat, oat)
                     lp_after = self._recompute_log_prob(d_after, e_after, mb_actions, em)
                     # Kept as tensors (not .item()'d) -- see the single
@@ -4719,7 +4859,12 @@ class PPOTrainer:
                     sat, oat = _ai_types(mb_obs)
 
                     with torch.no_grad():
-                        d_heads_vo = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                        d_heads_vo = self.decision_net(
+                            sf, of, em, bf, gf, sat, oat,
+                            ball_physics_full=mb_obs.get("ball_physics_full"),
+                            self_physics_full=mb_obs.get("self_physics_full"),
+                            other_physics_full=mb_obs.get("other_physics_full"),
+                        )
                     if self.separate_value_net:
                         e_heads_vo = self.value_net(sf, of, em, bf, gf, d_heads_vo, sat, oat)
                     else:
@@ -4799,7 +4944,12 @@ class PPOTrainer:
                     gf = mb_obs["global_feat"]
                     sat, oat = _ai_types(mb_obs)
 
-                    d_heads_bo = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                    d_heads_bo = self.decision_net(
+                        sf, of, em, bf, gf, sat, oat,
+                        ball_physics_full=mb_obs.get("ball_physics_full"),
+                        self_physics_full=mb_obs.get("self_physics_full"),
+                        other_physics_full=mb_obs.get("other_physics_full"),
+                    )
                     e_heads_bo = self.execution_net(sf, of, em, bf, gf, d_heads_bo, sat, oat)
 
                     bc_loss_bo, _ = bc_loss_from_tensor(
@@ -4907,6 +5057,9 @@ class PPOTrainer:
                     diag_obs["self_feat"], diag_obs["other_feat"],
                     diag_obs["exists_mask"], diag_obs["ball_feat"], diag_obs["global_feat"],
                     _sat_d, _oat_d,
+                    ball_physics_full=diag_obs.get("ball_physics_full"),
+                    self_physics_full=diag_obs.get("self_physics_full"),
+                    other_physics_full=diag_obs.get("other_physics_full"),
                 )
                 e_d = self.execution_net(
                     diag_obs["self_feat"], diag_obs["other_feat"],

@@ -51,7 +51,13 @@ class TestTransparentDelegation:
         with torch.no_grad():
             for p in wrapped.parameters():
                 p.add_(1.0)
-        wrapped.load_state_dict(sd)
+        # strict=False: DecisionNetwork.state_dict() deliberately excludes
+        # ball_physics_encoder.*/player_physics_encoder.* keys when those
+        # (opt-in, frozen) encoders are configured (see DecisionNetwork.
+        # state_dict()'s own docstring) -- those params still exist on the
+        # live module, so a strict reload of state_dict()'s own trimmed
+        # output would fail even though nothing is actually missing.
+        wrapped.load_state_dict(sd, strict=False)
         for (k, v) in wrapped.state_dict().items():
             assert torch.allclose(v, sd[k])
 

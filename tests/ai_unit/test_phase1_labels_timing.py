@@ -348,13 +348,23 @@ class TestNeuralPlayerAIBcLabelFn:
 
         saw_a_decision_tick = False
         for _ in range(60):
-            env.step()
+            _obs, _reward, done, _info = env.step()
             tr = env.last_trainee_transition
             if tr is not None:
                 saw_a_decision_tick = True
                 assert "bc_label" in tr, "NeuralPlayerAI.act() did not attach a bc_label to last_transition"
                 assert tr["bc_label"] is not None
                 assert tr["bc_label"].shape[0] > 0
+            if done:
+                # A trial (miss/goal) can end well within this loop's 60
+                # ticks -- ScenarioLoop then rebuilds a brand-new Match with
+                # a fresh trainee that has no AI wired up yet (only
+                # env.reset() assigns NeuralPlayerAI, see ScenarioEnv.reset()
+                # docstring). Every real caller (PPOTrainer's rollout loops)
+                # always calls env.reset() immediately after done=True before
+                # stepping again -- mirror that here instead of stepping a
+                # fresh, AI-less trainee.
+                env.reset(seed=1)
         assert saw_a_decision_tick, "no decision tick observed in 60 ticks -- widen the loop"
 
     def test_bc_label_absent_when_bc_label_fn_not_configured(self):
@@ -369,11 +379,16 @@ class TestNeuralPlayerAIBcLabelFn:
 
         saw_a_decision_tick = False
         for _ in range(60):
-            env.step()
+            _obs, _reward, done, _info = env.step()
             tr = env.last_trainee_transition
             if tr is not None:
                 saw_a_decision_tick = True
                 assert tr.get("bc_label") is None
+            if done:
+                # See the sibling test above for why this reset is needed --
+                # a trial can end within this loop's 60 ticks, and only
+                # env.reset() re-wires the new trial's trainee with a real AI.
+                env.reset(seed=1)
         assert saw_a_decision_tick
 
     def test_bc_label_matches_direct_call_at_same_state(self):

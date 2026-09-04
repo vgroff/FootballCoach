@@ -19,6 +19,7 @@ import pytest
 from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, Player, PlayerAttributes, Team
 from footballcoach.mathutils import Vector3
+from footballcoach.rules_ai import StopWhenIdleAI
 from footballcoach.steering import RepulsionParams, compute_repulsion
 from tests.conftest import make_player
 
@@ -151,6 +152,13 @@ def test_off_collision_course_players_overlap(balance_recorder):
     from footballcoach.orders import MoveOrder
     p0.current_order = MoveOrder(target_position=Vector3(3.0, 0.0, 0.0))
     p1.current_order = MoveOrder(target_position=Vector3(-3.0, 0.0, 0.0))
+    # MoveOrder completes (and clears current_order) once the player reaches
+    # its target -- with repulsion off they run straight through each other
+    # and arrive well before the 40-tick loop ends. Fallback AI keeps them
+    # in place afterwards instead of crashing on the movement-intent
+    # invariant.
+    p0.ai = StopWhenIdleAI()
+    p1.ai = StopWhenIdleAI()
 
     import logging
     logging.basicConfig(level=logging.DEBUG, format="%(name)s  %(message)s", force=True)
@@ -220,6 +228,10 @@ def test_on_collision_course_players_avoid(balance_recorder):
     from footballcoach.orders import MoveOrder
     p0.current_order = MoveOrder(target_position=Vector3(3.0, 0.0, 0.0))
     p1.current_order = MoveOrder(target_position=Vector3(-3.0, 0.0, 0.0))
+    # See test_off_collision_course_players_overlap: MoveOrder can complete
+    # (arrival) before the step loop ends, so a fallback AI is needed.
+    p0.ai = StopWhenIdleAI()
+    p1.ai = StopWhenIdleAI()
 
     match = _make_match([p0, p1], ball)
     n_steps = 60  # 2s
@@ -269,7 +281,13 @@ def test_ball_carrier_avoidance_and_slowdown(balance_recorder):
 
         from footballcoach.orders import MoveOrder, SaveOrder
         carrier.current_order = MoveOrder(target_position=Vector3(8.0, 0.0, 0.0))
+        # Fallback AI in case the carrier's MoveOrder completes (arrival)
+        # before the step loop ends.
+        carrier.ai = StopWhenIdleAI()
         # Obstacle has no order — stays where it is (no MoveOrder → no repulsion applied to it).
+        # It still needs SOME movement intent set every tick though, so give
+        # it the same idle fallback rather than leaving it without an AI.
+        obstacle.ai = StopWhenIdleAI()
 
         if carrier_has_ball:
             ball.possessed_by = carrier.player_id
@@ -367,12 +385,19 @@ def test_three_plus_neighbours_no_crash(balance_recorder):
     n1 = make_player("n1", Team.RIGHT, 0.5, position=Vector3(1.5, 0.0, 0.0))
     n2 = make_player("n2", Team.RIGHT, 0.5, position=Vector3(-0.75, 1.3, 0.0))
     n3 = make_player("n3", Team.RIGHT, 0.5, position=Vector3(-0.75, -1.3, 0.0))
-    # Neighbours are stationary, no orders.
+    # Neighbours are stationary, no orders -- still need a fallback AI to
+    # satisfy the movement-intent invariant every tick.
+    n1.ai = StopWhenIdleAI()
+    n2.ai = StopWhenIdleAI()
+    n3.ai = StopWhenIdleAI()
 
     ball = Ball(position=Vector3(50.0, 0.0, 0.0))
 
     from footballcoach.orders import MoveOrder
     center.current_order = MoveOrder(target_position=Vector3(10.0, 0.0, 0.0))
+    # Fallback AI in case center's MoveOrder completes (arrival) before the
+    # step loop ends.
+    center.ai = StopWhenIdleAI()
 
     match = _make_match([center, n1, n2, n3], ball)
     initial_x = center.position.x

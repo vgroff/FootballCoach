@@ -19,6 +19,7 @@ from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.entities.player import PlayerState
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import KickOrder, SaveOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 
@@ -45,6 +46,11 @@ def _make_save_match(
         position=Vector3(shot_x, 0, 0),
         kick_precision=precision, kick_power=0.9,
     )
+    # KickOrder (issued below) fires and completes in a single tick, so the
+    # shooter needs the idle-fallback AI to keep satisfying the
+    # movement-intent invariant afterwards. The gk's SaveOrder is persistent
+    # (never auto-completes) so it needs no AI of its own.
+    shooter.ai = StopWhenIdleAI()
     ball = Ball.at_rest(shooter.position)
     ball.possessed_by = shooter.player_id
 

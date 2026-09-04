@@ -15,6 +15,7 @@ from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, PlayerAttributes, Team
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
+from footballcoach.rules_ai import StopWhenIdleAI
 
 
 def _make_goal_match(goal_linger_s: float = 0.0) -> Match:
@@ -26,6 +27,9 @@ def _make_goal_match(goal_linger_s: float = 0.0) -> Match:
     pitch = Pitch.standard()
     attrs = PlayerAttributes(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
     player = Player.create("p", Team.LEFT, attrs, position=Vector3(0, 0, 0))
+    # Player is irrelevant to goal-linger timing -- just needs the idle
+    # fallback AI to satisfy Match._apply_movement's movement-intent invariant.
+    player.ai = StopWhenIdleAI()
     # Place ball inside the right goal: x > half_length, |y| < half_goal_width.
     ball = Ball.at_rest(Vector3(pitch.half_length + 0.5, 0.0, 0.1))
     ball.possessed_by = None

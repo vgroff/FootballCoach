@@ -18,6 +18,7 @@ from footballcoach.engine.match import Match
 from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 RNG_REDUCTION = 0.3
@@ -28,6 +29,12 @@ MAX_TICKS = 400
 def _run_pass_trial(pitch: Pitch, precision: float, target_position: Vector3, seed: int) -> bool:
     passer = make_player("p", Team.LEFT, position=Vector3(0, 0, 0), kick_precision=precision)
     receiver = make_player("r", Team.LEFT, position=target_position)
+    # PassOrder always completes in one tick, and the receiver never gets an
+    # order/AI of its own -- StopWhenIdleAI keeps both stationary (holding
+    # position, not testing movement) instead of crashing on the "nothing
+    # set movement intent" invariant for the remaining trial ticks.
+    passer.ai = StopWhenIdleAI()
+    receiver.ai = StopWhenIdleAI()
     ball = Ball.at_rest(passer.position)
     ball.possessed_by = passer.player_id
     match = Match(pitch=pitch, players=[passer, receiver], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))
@@ -137,6 +144,11 @@ def _run_long_pass_trial(pitch: Pitch, precision: float, distance: float, seed: 
     top_speed = effective_top_speed(mvmt, passer.attributes.top_speed, 1.0,
                                     has_ball=True, ball_control_attr=passer.attributes.ball_control)
     passer.velocity = Vector3(top_speed * 0.5, 0.0, 0.0)
+    # See _run_pass_trial: PassOrder completes in one tick and the receiver
+    # never gets an order -- both need a fallback AI to satisfy the
+    # movement-intent invariant for the rest of the trial.
+    passer.ai = StopWhenIdleAI()
+    receiver.ai = StopWhenIdleAI()
     ball = Ball.at_rest(passer.position)
     ball.possessed_by = passer.player_id
     match = Match(pitch=pitch, players=[passer, receiver], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))

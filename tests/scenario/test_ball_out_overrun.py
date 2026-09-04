@@ -46,7 +46,7 @@ from footballcoach.entities import Ball, Pitch
 from footballcoach.entities.player import Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import GetPossessionOrder
-from footballcoach.rules_ai import Phase1RulesAI
+from footballcoach.rules_ai import Phase1RulesAI, StopWhenIdleAI
 from tests.conftest import make_player
 
 
@@ -66,8 +66,11 @@ def test_player_chasing_slow_ball_near_sideline_does_not_carry_it_out():
     player = make_player("p1", Team.LEFT, attr_value=0.9, position=Vector3(0.0, ball_y - 15.0, 0.0))
     player.heading_rad = 1.5708  # facing +y, straight at the ball
     player.ai = Phase1RulesAI()
-    # A second player is required by Phase1RulesAI's opponent lookups.
+    # A second player is required by Phase1RulesAI's opponent lookups. It never
+    # gets its own order/AI decision here, so give it the idle-fallback AI to
+    # satisfy the movement-intent invariant while it just stands there.
     opponent = make_player("opp", Team.RIGHT, attr_value=0.5, position=Vector3(30.0, 0.0, 0.0))
+    opponent.ai = StopWhenIdleAI()
 
     match = Match(pitch=pitch, players=[player, opponent], ball=ball, rng_reduction=1.0, rng=random.Random(0))
 
@@ -103,6 +106,7 @@ def test_player_chasing_slow_ball_near_goal_line_does_not_carry_it_out():
     player.heading_rad = 0.0  # facing +x, straight at the ball
     player.ai = Phase1RulesAI()
     opponent = make_player("opp", Team.RIGHT, attr_value=0.5, position=Vector3(0.0, 0.0, 0.0))
+    opponent.ai = StopWhenIdleAI()
 
     match = Match(pitch=pitch, players=[player, opponent], ball=ball, rng_reduction=1.0, rng=random.Random(0))
 
@@ -147,6 +151,7 @@ def test_hopeless_chase_is_abandoned_instead_of_carrying_ball_out():
     player.heading_rad = 1.5708  # facing +y, straight at the ball
     player.ai = Phase1RulesAI()
     opponent = make_player("opp", Team.RIGHT, attr_value=0.5, position=Vector3(30.0, 0.0, 0.0))
+    opponent.ai = StopWhenIdleAI()
 
     match = Match(pitch=pitch, players=[player, opponent], ball=ball, rng_reduction=1.0, rng=random.Random(0))
     assert match.ball.last_touched_by_player_id is None  # nobody's touched it yet -- abandon logic applies
@@ -187,6 +192,7 @@ def test_own_team_touched_last_overrides_abandon_and_still_goes_for_it():
     player.heading_rad = 1.5708
     player.ai = Phase1RulesAI()
     opponent = make_player("opp", Team.RIGHT, attr_value=0.5, position=Vector3(30.0, 0.0, 0.0))
+    opponent.ai = StopWhenIdleAI()
 
     match = Match(pitch=pitch, players=[player, opponent], ball=ball, rng_reduction=1.0, rng=random.Random(0))
 

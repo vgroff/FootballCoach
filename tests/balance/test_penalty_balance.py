@@ -20,6 +20,7 @@ from footballcoach.engine.movement import MovementParams, effective_top_speed
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import KickOrder, ShootOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 N_TRIALS = 2000
@@ -57,6 +58,10 @@ def _run_penalty_trials(
             has_ball=True, ball_control_attr=kicker.attributes.ball_control,
         )
         kicker.velocity = Vector3(v_run, 0.0, 0.0)
+        # KickOrder/ShootOrder (assigned below) always complete in one tick
+        # -- fallback AI keeps the kicker stationary afterwards instead of
+        # crashing on the movement-intent invariant for the rest of the loop.
+        kicker.ai = StopWhenIdleAI()
 
         ball = Ball.at_rest(penalty_spot)
         ball.possessed_by = kicker.player_id

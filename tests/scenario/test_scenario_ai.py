@@ -11,7 +11,7 @@ import random
 from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
-from footballcoach.orders import MoveOrder, SaveOrder, ShootOrder
+from footballcoach.orders import MoveOrder, SaveOrder, ShootOrder, StopOrder
 from footballcoach.rules_ai import BallCarrierAttackerAI, StagedGoalkeeperAI
 
 # decision_interval_ticks=1 throughout this file: these tests check
@@ -100,7 +100,10 @@ class TestBallCarrierAttackerAI:
         ai = BallCarrierAttackerAI(aim, decision_interval_ticks=1)
 
         ai.act(player, match, 0)
-        assert player.current_order is None, "AI should not act when player lacks the ball"
+        # No attacking order (MoveOrder/ShootOrder) -- falls back to
+        # StopOrder (not None) so the player still has movement intent
+        # every tick, see Match._apply_movement.
+        assert isinstance(player.current_order, StopOrder), "AI should not issue an attacking order when player lacks the ball"
 
     def test_resets_prev_dist_when_ball_lost(self):
         """After the attacker loses the ball, _prev_dist_to_target is reset so
@@ -247,6 +250,19 @@ class TestStagedGoalkeeperAI:
 
 # ---------------------------------------------------------------------------
 # Integration: 1v2 scenario completes within timeout
+#
+# NOT FIXED (out of scope): as of this invariant change, build_1v2_scenario
+# deterministically hits Match._apply_movement's new "no movement intent"
+# RuntimeError from a cold start -- first via StagedGoalkeeperAI.decide()
+# (rules_ai.py), whose "ball possessed by someone else, no current_order"
+# branch only fixes heading when already parked at goal centre and never
+# assigns a fallback order otherwise, then (once that is worked around) via
+# BallCarrierAttackerAI leaving the attacker with current_order=None and no
+# re-issued intent at some point in the run. These are real bugs in
+# rules_ai.py / ui/scenarios.py, not a missing-AI test-fixture gap -- fixing
+# them is outside this test file's scope (see task instructions: don't
+# touch src files other than match.py's invariant itself, which is not to
+# be touched either).
 # ---------------------------------------------------------------------------
 
 def test_1v2_scenario_completes_within_timeout():
@@ -265,6 +281,13 @@ def test_1v2_scenario_completes_within_timeout():
 
 # ---------------------------------------------------------------------------
 # Integration: 2v2 scenario completes within timeout
+#
+# NOT FIXED (out of scope): same class of real, pre-existing bug as the 1v2
+# test above -- build_2v2_scenario deterministically hits the same
+# RuntimeError, first via StagedGoalkeeperAI's idle-with-no-order gap, then
+# (once that's worked around) because attacker "atk_a" ends up with
+# ai=None entirely. See the comment above test_1v2_scenario_completes_
+# within_timeout for the full explanation; out of scope for this test file.
 # ---------------------------------------------------------------------------
 
 def test_2v2_scenario_completes_within_timeout():

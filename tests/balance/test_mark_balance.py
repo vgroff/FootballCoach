@@ -17,6 +17,7 @@ from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.entities.player import PlayerState
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import GetPossessionOrder, MarkOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 RNG_REDUCTION = 0.3
@@ -33,6 +34,9 @@ def _measure_standoff_stability(seed: int, n_ticks: int = 200) -> dict:
     # Marker starts on the correct side (beyond the target, toward the ball)
     # so it doesn't have to pass through the target to reach the standoff point.
     target = make_player("target", Team.RIGHT, position=Vector3(20, 0, 0))
+    # Target never gets an order/AI of its own -- it's just a stationary mark
+    # target here, not under test itself, so StopWhenIdleAI keeps it in place.
+    target.ai = StopWhenIdleAI()
     marker = make_player("marker", Team.LEFT, position=Vector3(23, 2, 0), attr_value=0.8)
 
     match = Match(
@@ -106,6 +110,8 @@ def _run_mark_intercept_trial(seed: int) -> bool:
         attr_value=0.5,
         dribbling=0.6,
     )
+    # Target (the ball carrier being tackled) has no order/AI of its own.
+    target.ai = StopWhenIdleAI()
 
     match = Match(
         pitch=pitch,
@@ -137,6 +143,8 @@ def _run_get_possession_intercept_trial(seed: int) -> bool:
         attr_value=0.5,
         dribbling=0.6,
     )
+    # Target (the ball carrier being tackled) has no order/AI of its own.
+    target.ai = StopWhenIdleAI()
 
     match = Match(
         pitch=pitch,

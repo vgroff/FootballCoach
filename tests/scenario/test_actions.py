@@ -10,6 +10,7 @@ from footballcoach import actions
 from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 
@@ -34,6 +35,10 @@ def test_shoot_scores_from_close_range_no_keeper():
     pitch = Pitch.standard()
     position = Vector3(pitch.half_length - 5, 0, 0)
     kicker = make_player("k", Team.LEFT, position=position, kick_precision=0.9, kick_power=0.9)
+    # KickOrder is a fire-and-forget, single-tick order (see orders.py) -- once it
+    # fires there's nothing left to reissue movement intent each tick, so this
+    # player needs an idle-fallback AI to satisfy _apply_movement's invariant.
+    kicker.ai = StopWhenIdleAI()
     ball = Ball.at_rest(position)
     ball.possessed_by = kicker.player_id
     match = Match(pitch=pitch, players=[kicker], ball=ball, rng_reduction=1.0, rng=random.Random(0))
@@ -53,6 +58,12 @@ def test_pass_to_reaches_teammate():
     pitch = Pitch.standard()
     passer = make_player("passer", Team.LEFT, position=Vector3(0, 0, 0), kick_precision=0.8)
     receiver = make_player("receiver", Team.LEFT, position=Vector3(15, 0, 0))
+    # PassOrder fires and completes in a single tick; the receiver never gets
+    # an order/AI of its own in this test (the ball simply arrives at its
+    # stationary position). Both need the idle-fallback AI so every tick has
+    # movement intent even once they've got nothing active to do.
+    passer.ai = StopWhenIdleAI()
+    receiver.ai = StopWhenIdleAI()
     ball = Ball.at_rest(passer.position)
     ball.possessed_by = passer.player_id
     match = Match(pitch=pitch, players=[passer, receiver], ball=ball, rng_reduction=1.0, rng=random.Random(0))
@@ -72,6 +83,12 @@ def test_tackle_chases_and_wins_ball():
     pitch = Pitch.standard()
     defender = make_player("d", Team.LEFT, position=Vector3(0, 0, 0), tackling=0.9, top_speed=0.8, acceleration=0.8)
     attacker = make_player("a", Team.RIGHT, position=Vector3(10, 0, 0), dribbling=0.1)
+    # Attacker just stands there holding the ball -- give it the idle-fallback
+    # AI rather than leaving it with no AI/order at all. The defender's
+    # GetPossessionOrder (issued below via actions.tackle) completes the
+    # instant it wins the ball, and the test loop breaks that same tick, so
+    # the defender never needs one.
+    attacker.ai = StopWhenIdleAI()
     ball = Ball.at_rest(attacker.position)
     ball.possessed_by = attacker.player_id
     match = Match(pitch=pitch, players=[defender, attacker], ball=ball, rng_reduction=1.0, rng=random.Random(0))
@@ -96,6 +113,11 @@ def test_save_intercepts_shot_on_target():
     shooter = make_player(
         "shooter", Team.RIGHT, position=Vector3(-25, 0, 0), kick_precision=0.9, kick_power=0.7,
     )
+    # KickOrder is fire-and-forget (completes in one tick); nothing reissues
+    # movement intent for the shooter afterwards without this fallback. The
+    # gk's SaveOrder (issued below via actions.save) is persistent and never
+    # auto-completes, so it needs no AI of its own.
+    shooter.ai = StopWhenIdleAI()
     ball = Ball.at_rest(shooter.position)
     ball.possessed_by = shooter.player_id
     match = Match(pitch=pitch, players=[gk, shooter], ball=ball, rng_reduction=1.0, rng=random.Random(0))

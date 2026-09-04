@@ -22,6 +22,7 @@ from footballcoach import actions
 from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 RNG_REDUCTION = 0.3
@@ -39,6 +40,10 @@ def _run_tackle_trial(pitch: Pitch, tackling: float, dribbling: float, distance:
         dribbling=dribbling, top_speed=0.6, acceleration=0.6,
     )
     attacker.heading_rad = math.pi  # faces toward the defender
+    # Attacker just stands there holding the ball while the defender chases
+    # -- it never gets an order/AI of its own, so StopWhenIdleAI keeps it in
+    # place instead of crashing on the movement-intent invariant.
+    attacker.ai = StopWhenIdleAI()
     ball = Ball.at_rest(attacker.position)
     ball.possessed_by = attacker.player_id
     match = Match(pitch=pitch, players=[defender, attacker], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))
@@ -65,6 +70,8 @@ def _run_tackle_trial_from_behind(pitch: Pitch, tackling: float, dribbling: floa
         dribbling=dribbling, top_speed=0.6, acceleration=0.6,
     )
     # heading_rad=0 is the default: attacker faces +x, away from the defender
+    # Attacker just stands there holding the ball -- see _run_tackle_trial.
+    attacker.ai = StopWhenIdleAI()
     ball = Ball.at_rest(attacker.position)
     ball.possessed_by = attacker.player_id
     match = Match(pitch=pitch, players=[defender, attacker], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))

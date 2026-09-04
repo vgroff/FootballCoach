@@ -11,6 +11,7 @@ import random
 from footballcoach import actions
 from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, Team
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 RNG_REDUCTION = 0.3
@@ -34,6 +35,10 @@ def _run_shoot_trial(pitch, precision: float, power: float, x: float, y: float, 
         "k", Team.LEFT, position=Vector3(x, y, 0),
         kick_precision=precision, kick_power=power,
     )
+    # KickOrder (issued by actions.shoot) always completes in one tick --
+    # give the kicker a fallback AI so it stays stationary (not crashing on
+    # the movement-intent invariant) for the rest of the trial loop.
+    kicker.ai = StopWhenIdleAI()
     ball = Ball.at_rest(kicker.position)
     ball.possessed_by = kicker.player_id
     match = Match(pitch=pitch, players=[kicker], ball=ball, rng_reduction=RNG_REDUCTION, rng=random.Random(seed))

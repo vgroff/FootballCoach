@@ -14,6 +14,7 @@ from footballcoach.entities import Ball, Pitch, PlayerAttributes, Team
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import ChaseTackleOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from footballcoach.ui.gamelog import GameLog, LogLevel
 
 
@@ -94,6 +95,11 @@ def _make_tackle_match(rng_reduction: float = 1.0) -> tuple[Match, Player, Playe
     )
     defender = Player.create("def", Team.LEFT, defender_attrs, position=Vector3(0, 0, 0))
     attacker = Player.create("atk", Team.RIGHT, attacker_attrs, position=Vector3(0.5, 0, 0))
+    # Attacker is just standing there holding the ball -- not the subject of
+    # this test (tackle mechanics/logging are) -- so give it the idle
+    # fallback AI to satisfy Match._apply_movement's movement-intent
+    # invariant rather than any specific real order.
+    attacker.ai = StopWhenIdleAI()
     ball = Ball.at_rest(Vector3(0.5, 0, 0))
     ball.possessed_by = attacker.player_id
     match = Match(
@@ -133,6 +139,7 @@ def test_tackle_loss_produces_log_entry():
     )
     defender = Player.create("def2", Team.LEFT, defender_attrs, position=Vector3(0, 0, 0))
     attacker = Player.create("atk2", Team.RIGHT, attacker_attrs, position=Vector3(0.5, 0, 0))
+    attacker.ai = StopWhenIdleAI()  # idle ball-holder; see _make_tackle_match
     ball = Ball.at_rest(Vector3(0.5, 0, 0))
     ball.possessed_by = attacker.player_id
     match = Match(
@@ -174,6 +181,7 @@ def test_gk_in_box_auto_fail_logs_distinctly():
     # Place GK inside the left box.
     gk_pos = Vector3(-pitch.half_length + 5.0, 0.0, 0)
     gk = Player.create("gk", Team.LEFT, gk_attrs, position=gk_pos, is_goalkeeper=True)
+    gk.ai = StopWhenIdleAI()  # idle ball-holder; see _make_tackle_match
     # Defender just touching the GK.
     def_pos = Vector3(gk_pos.x + 0.5, 0.0, 0)
     outfielder = Player.create("out", Team.RIGHT, defender_attrs, position=def_pos)

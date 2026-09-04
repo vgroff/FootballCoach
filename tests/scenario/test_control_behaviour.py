@@ -14,11 +14,13 @@ import random
 import pytest
 
 from footballcoach.engine.match import Match
+from footballcoach.engine.movement import SpeedMode, effective_top_speed
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.pitch import Pitch
 from footballcoach.entities.player import PlayerState, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import GetPossessionOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 
 from tests.conftest import make_player
 
@@ -41,6 +43,8 @@ def test_possession_granted_immediately_on_control_start():
     """The moment a player begins CONTROLLING_BALL the ball is possessed by
     them — not after the timer expires."""
     receiver = make_player("rcv", Team.LEFT, attr_value=0.5, position=Vector3(0, 0, 0))
+    # Idle receiver -- this test is about possession timing, not motion.
+    receiver.ai = StopWhenIdleAI()
     ball = Ball(position=Vector3(0.3, 0, 0.11), velocity=Vector3(0, 0, 0), spin=Vector3.zero())
 
     match = Match(
@@ -65,7 +69,6 @@ def test_speed_reduced_on_control_start():
     """A sprinting player's speed is multiplied by control_speed_multiplier
     the instant they start controlling the ball."""
     receiver = make_player("rcv", Team.LEFT, attr_value=0.5, position=Vector3(0, 0, 0))
-    receiver.velocity = Vector3(8.0, 0, 0)  # fast sprint
 
     ball = Ball(position=Vector3(0.3, 0, 0.11), velocity=Vector3(0, 0, 0), spin=Vector3.zero())
 
@@ -77,7 +80,21 @@ def test_speed_reduced_on_control_start():
         rng=random.Random(0),
     )
 
-    pre_speed = receiver.velocity.length_xy()
+    # Sprinting EXACTLY at this player's own effective top speed, heading
+    # already aligned, with an explicit "keep sprinting straight" intent --
+    # step_player_towards's accel-limited step is then a true no-op this
+    # tick (target speed == current speed, zero heading turn), isolating
+    # JUST the ball-control speed reduction below. A bare, order-less
+    # receiver would otherwise get Match._apply_movement's implicit
+    # STANDSTILL braking (see its own docstring) on this same tick,
+    # confounding the exact-value assertion below with an unrelated effect.
+    pre_speed = effective_top_speed(
+        match.movement_params, receiver.attributes.top_speed, receiver.stamina, has_ball=False,
+    )
+    receiver.velocity = Vector3(pre_speed, 0, 0)
+    receiver.heading_rad = 0.0
+    receiver.desired_direction = Vector3(1.0, 0.0, 0.0)
+    receiver.desired_speed_mode = SpeedMode.SPRINT
     match.step()
 
     assert receiver.state == PlayerState.CONTROLLING_BALL
@@ -98,6 +115,8 @@ def test_controlling_ground_ball_can_be_tackled():
     timing issues (very easy balls complete in < 1 tick).
     """
     receiver = make_player("rcv", Team.LEFT, attr_value=0.5, position=Vector3(0, 0, 0))
+    # Idle receiver -- test is about tackle mechanics, not receiver motion.
+    receiver.ai = StopWhenIdleAI()
     # Tackler touching-close; high tackling guarantees win at rng_reduction=1.
     tackler = make_player("tkl", Team.RIGHT, attr_value=0.0, tackling=1.0,
                           position=Vector3(0.59, 0, 0))
@@ -195,6 +214,16 @@ def test_controlling_aerial_ball_immune_to_head_on_tackle():
     # Both moving toward each other to ensure closing speed threshold is met.
     receiver.velocity = Vector3(-1.0, 0, 0)
     tackler.velocity = Vector3(-1.0, 0, 0)
+    # Match now requires heading to agree with velocity's direction at
+    # construction time -- both default to heading_rad=0.0 (+x) otherwise.
+    receiver.heading_rad = tackler.heading_rad = receiver.velocity.angle_xy()
+    # This test is about tackle-immunity (the height check), not about
+    # either player's exact motion -- the idle fallback AI decelerates them
+    # from their pre-set closing velocity via normal braking physics, which
+    # stays comfortably above auto_tackle_min_closing_mps (0.2 m/s) for the
+    # single tick this test steps.
+    receiver.ai = StopWhenIdleAI()
+    tackler.ai = StopWhenIdleAI()
 
     waist_h = 0.95
     ball = Ball(

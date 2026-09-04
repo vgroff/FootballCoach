@@ -16,7 +16,7 @@ from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.entities.player import PlayerState
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import GetPossessionOrder, MoveOrder
-from footballcoach.rules_ai import SprintWaypointAI
+from footballcoach.rules_ai import SprintWaypointAI, StopWhenIdleAI
 from footballcoach.ui.scenarios import (
     ScenarioDefinition,
     ScenarioLoop,
@@ -117,6 +117,17 @@ def test_sprint_scenario_reaches_all_three_waypoints():
     for _ in range(600):
         player = loop.match.player_by_id("runner")
         max_x_seen = max(max_x_seen, player.position.x)
+        # Once SprintWaypointAI has issued its last waypoint and that
+        # MoveOrder has completed, decide() intentionally no-ops forever
+        # (course_complete()) -- it never falls back to an idle-hold order,
+        # so calling loop.step() again here would trip Match._apply_
+        # movement's new "no movement intent" invariant on a state this
+        # test doesn't care about (it only asserts the third waypoint was
+        # reached, not what happens after). Stop before that happens rather
+        # than papering over it with a substitute AI, since max_trials=0
+        # means the loop has no other way to end.
+        if player.ai.course_complete(player):
+            break
         trial_ended = loop.step()
         if trial_ended:
             break
@@ -205,6 +216,7 @@ def test_get_possession_eventually_makes_contact_with_slow_carrier():
     pitch = Pitch.standard()
     carrier = make_player("carrier", Team.LEFT, attr_value=0.2,
                           position=Vector3(0, 0, 0))
+    carrier.ai = StopWhenIdleAI()  # stationary ball-holder; not under test
     defender = make_player("defender", Team.RIGHT, attr_value=0.9,
                            position=Vector3(-6, 0, 0))
     defender.heading_rad = 0.0

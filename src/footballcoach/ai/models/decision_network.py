@@ -207,26 +207,46 @@ class DecisionNetwork(nn.Module):
         global_feat: torch.Tensor,  # (batch, global_dim)
         self_ai_type: Optional[torch.Tensor] = None,   # (batch, AI_TYPE_ONE_HOT_DIM)
         other_ai_type: Optional[torch.Tensor] = None,  # (batch, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM)
+        ball_physics_full: Optional[torch.Tensor] = None,
+        self_physics_full: Optional[torch.Tensor] = None,
+        other_physics_full: Optional[torch.Tensor] = None,
     ) -> DecisionHeadsRaw:
         # --- Frozen physics-encoder features (see __init__), computed at
         # most once per observation -- ExecutionNetwork reuses these via the
-        # DecisionHeadsRaw fields set below instead of recomputing. ---
-        ball_physics_full = None
-        self_physics_full = None
-        other_physics_full = None
+        # DecisionHeadsRaw fields set below instead of recomputing. The three
+        # ball_physics_full/self_physics_full/other_physics_full PARAMS above
+        # let a caller that already has these (same ball_feat/self_feat/
+        # other_feat reused across several forward() calls -- e.g. PPOTrainer.
+        # _ppo_update() replaying one augmented rollout batch across
+        # ppo.n_epochs passes, see that call site) pass the RAW encoder output
+        # straight through instead of re-running the frozen encoder for every
+        # pass. Entirely optional -- None (default) recomputes exactly as
+        # before. Ignored if the corresponding encoder is disabled. Must be
+        # the encoder's RAW output (pre is_loose-masking below), not already
+        # masked -- masking is always (re)applied here from the current
+        # ball_feat so it can never go stale even when the physics features
+        # themselves are reused across calls. ---
         ball_feat_aug = ball_feat
         self_feat_aug = self_feat
         other_feat_aug = other_feat
         if self.ball_physics_encoder is not None:
-            ball_physics_full = self.ball_physics_encoder(ball_feat, global_feat)
+            if ball_physics_full is None:
+                ball_physics_full = self.ball_physics_encoder(ball_feat, global_feat)
             is_loose = ball_feat[..., -1:]  # BallFeatures.is_loose is always the last field
             ball_physics_full = ball_physics_full * is_loose
             ball_feat_aug = torch.cat([ball_feat, ball_physics_full], dim=-1)
+        else:
+            ball_physics_full = None
         if self.player_physics_encoder is not None:
-            self_physics_full = self.player_physics_encoder(self_feat, global_feat)
-            other_physics_full = self.player_physics_encoder(other_feat, global_feat)
+            if self_physics_full is None:
+                self_physics_full = self.player_physics_encoder(self_feat, global_feat)
+            if other_physics_full is None:
+                other_physics_full = self.player_physics_encoder(other_feat, global_feat)
             self_feat_aug = torch.cat([self_feat, self_physics_full], dim=-1)
             other_feat_aug = torch.cat([other_feat, other_physics_full], dim=-1)
+        else:
+            self_physics_full = None
+            other_physics_full = None
 
         entity_ctx, self_embed_raw, other_embed_raw = self.entity_encoder(
             self_feat_aug, other_feat_aug, exists_mask, return_embeds=True,

@@ -30,7 +30,7 @@ from __future__ import annotations
 from footballcoach.ai.env.scenario_env import ScenarioEnv
 from footballcoach.entities.player import Team
 from footballcoach.mathutils import Vector3
-from footballcoach.rules_ai import Phase1RulesAI
+from footballcoach.rules_ai import Phase1RulesAI, StopWhenIdleAI
 from footballcoach.ui.scenarios import ScenarioDefinition, build_1v1_scenario
 
 
@@ -64,11 +64,17 @@ def _force_opponent_in_trainee_box_with_possession(env: ScenarioEnv) -> None:
     match.ball.velocity = Vector3.zero()
     match._set_possession(opponent.player_id)
 
-    # Trainee parked well away, stationary, no order/AI -- nothing should
-    # move this tick regardless of outcome.
+    # Trainee parked well away, stationary, no order -- nothing should move
+    # this tick regardless of outcome. Give it StopWhenIdleAI (rather than
+    # leaving ai=None) so Match._apply_movement's "every player needs a
+    # movement intent every tick" invariant is satisfied without changing
+    # this idle bystander's own (already-stationary) behaviour -- these
+    # tests are about the opponent/secondary's terminal-condition gating,
+    # not the trainee's own movement.
     trainee.position = Vector3(0.0, 20.0, 0.0)
     trainee.velocity = Vector3.zero()
     trainee.current_order = None
+    trainee.ai = StopWhenIdleAI()
 
 
 class TestImmobileOpponentCannotTriggerLossTerminal:

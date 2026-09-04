@@ -399,10 +399,21 @@ class StagedGoalkeeperAI(_RulesBasedAI):
                 match._log_debug(f"[AI] {player.player_id}: back to goal centre (ball possessed)")
             elif player.current_order is None:
                 # Idle while someone else has the ball (e.g. the attacker's
-                # build-up run) -- this is the common case, so make sure
-                # heading gets fixed here too, not just in the "ball loose"
-                # branch below.
-                self._face_outfield_if_parked(player, match)
+                # build-up run) -- same fallback as the "ball loose but not
+                # threatening" branch below: park at goal centre if not
+                # already there, otherwise just fix heading. Every player
+                # needs an active order/AI setting movement intent every
+                # tick (see Match._apply_movement) -- previously this branch
+                # only fixed heading once already parked and left the GK
+                # with no order (and thus no intent) the rest of the time.
+                target = self._goal_centre(player, match)
+                dist = player.position.xy().distance_to(target.xy())
+                if dist <= _GK_PARKED_TOLERANCE_M and player.speed_mps < 0.05:
+                    self._face_outfield_if_parked(player, match)
+                else:
+                    player.current_order = MoveOrder(
+                        target_position=target, sprint=False, max_speed_on_arrival_mps=0.0,
+                    )
             return
 
         # Ball is loose — enter SaveOrder if aimed at our goal.
@@ -465,6 +476,14 @@ class BallCarrierAttackerAI(_RulesBasedAI):
     def decide(self, player: Player, match: Match, trial_tick: int) -> None:
         if match.ball.possessed_by != player.player_id:
             self._prev_dist_to_target = None
+            # This AI only manages the "carrying the ball" phase -- whoever
+            # doesn't have the ball needs SOME fallback so they still have
+            # movement intent every tick (see Match._apply_movement). A
+            # caller that wants this player actively doing something else
+            # while not carrying (chasing, marking, ...) should give them an
+            # order for that themselves; this is just the safe default.
+            if player.current_order is None:
+                player.current_order = StopOrder()
             return
         order = player.current_order
         if isinstance(order, MoveOrder):
@@ -641,6 +660,12 @@ class SprintWaypointAI(_RulesBasedAI):
 
     def decide(self, player: Player, match: Match, trial_tick: int) -> None:
         if self._next_idx >= len(self.waypoints):
+            # Course complete -- fall back to StopOrder so the runner still
+            # has movement intent every tick (see Match._apply_movement)
+            # instead of being left with no order at all once the last
+            # waypoint's MoveOrder clears itself.
+            if player.current_order is None:
+                player.current_order = StopOrder()
             return
         if player.current_order is None:
             player.current_order = MoveOrder(

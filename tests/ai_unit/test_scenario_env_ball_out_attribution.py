@@ -15,6 +15,7 @@ from __future__ import annotations
 from footballcoach.ai.env.scenario_env import ScenarioEnv
 from footballcoach.entities.player import Team
 from footballcoach.mathutils import Vector3
+from footballcoach.rules_ai import StopWhenIdleAI
 from footballcoach.ui.scenarios import ScenarioDefinition, build_1v1_scenario
 
 
@@ -98,6 +99,13 @@ class TestBallOutAttribution:
         env.reset()
         match = env._loop.match
         trainee = match.player_by_id("trainee")
+        # No sample_action_fn is wired up on this env, so the trainee has no
+        # real AI -- give it StopWhenIdleAI (rather than leaving ai=None) so
+        # Match._apply_movement's "every player needs a movement intent
+        # every tick" invariant is satisfied for the real (non-monkeypatched)
+        # env.step() call below; this test is about ball-out toucher
+        # attribution, not the trainee's own movement.
+        trainee.ai = StopWhenIdleAI()
 
         # Trainee possesses the ball for a step, safely away from any line.
         # set_initial_possession() (not a raw possessed_by assignment) so
@@ -130,6 +138,13 @@ class TestBallOutAttribution:
         env = _make_env()
         env.reset()
         match = env._loop.match
+        # No sample_action_fn is wired up on this env, so the trainee has no
+        # real AI -- give it StopWhenIdleAI (rather than leaving ai=None) so
+        # Match._apply_movement's "every player needs a movement intent
+        # every tick" invariant is satisfied for the real (non-monkeypatched)
+        # env.step() call below; this test is about ball-out toucher
+        # attribution, not the trainee's own movement.
+        match.player_by_id("trainee").ai = StopWhenIdleAI()
         match.ball.possessed_by = None
         match.ball.position = Vector3(match.pitch.half_length + 5.0, 0.0, 0.0)
         match.ball.velocity = Vector3(5.0, 0.0, 0.0)

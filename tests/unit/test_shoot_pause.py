@@ -16,6 +16,7 @@ from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import MoveOrder, ShootOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 
@@ -34,6 +35,13 @@ def _setup_match(shooter_pos: Vector3, aim_point: Vector3,
     shooter = make_player("shooter", Team.LEFT, position=shooter_pos, kick_precision=0.8, kick_power=0.8)
     ball = Ball.at_rest(shooter_pos)
     ball.possessed_by = shooter.player_id
+
+    # extra_players (blockers/teammates) are just standing in place for these
+    # tests -- not the subject under test -- so give them the idle fallback
+    # AI to satisfy Match._apply_movement's movement-intent invariant.
+    for extra in extra_players:
+        if extra.ai is None:
+            extra.ai = StopWhenIdleAI()
 
     players = [shooter, *extra_players]
     match = Match(pitch=pitch, players=players, ball=ball,

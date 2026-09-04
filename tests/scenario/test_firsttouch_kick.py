@@ -10,9 +10,11 @@ import pytest
 from footballcoach.engine.match import Match
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.pitch import Pitch
+from footballcoach.engine.movement import SpeedMode
 from footballcoach.entities.player import PlayerState, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.orders import GetPossessionOrder, KickOrder, MoveOrder
+from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 
@@ -30,6 +32,9 @@ def _match(players, ball, *, rng_reduction=1.0):
 def test_kick_during_controlling_ball_clears_state():
     """KickOrder fired while CONTROLLING_BALL must leave the player ACTIVE."""
     player = make_player("p1", Team.LEFT, position=Vector3(0, 0, 0))
+    # Idle until the KickOrder is issued below -- this test is about the
+    # CONTROLLING_BALL -> kick state transition, not player motion.
+    player.ai = StopWhenIdleAI()
     ball = Ball(position=Vector3(0.3, 0, 0.05), velocity=Vector3(0, 0, 0), spin=Vector3.zero())
     match = _match([player], ball)
 
@@ -69,6 +74,7 @@ def test_normal_kick_does_not_touch_state():
 def test_firsttime_difficulty_stored_for_fast_aerial_ball():
     """A fast chest-height ball must produce firsttime_difficulty > 0."""
     player = make_player("p1", Team.LEFT, position=Vector3(0, 0, 0))
+    player.ai = StopWhenIdleAI()  # idle receiver; test is about firsttime_difficulty, not motion
     ball = Ball(position=Vector3(0.3, 0, 0.9), velocity=Vector3(-8, 0, 0), spin=Vector3.zero())
     match = _match([player], ball)
     match.step()
@@ -80,6 +86,7 @@ def test_firsttime_difficulty_stored_for_fast_aerial_ball():
 def test_firsttime_difficulty_near_zero_for_stationary_ground_ball():
     """A stationary ball at floor level must produce firsttime_difficulty ≈ 0."""
     player = make_player("p1", Team.LEFT, position=Vector3(0, 0, 0))
+    player.ai = StopWhenIdleAI()  # idle receiver; test is about firsttime_difficulty, not motion
     ball = Ball(position=Vector3(0.3, 0, 0.05), velocity=Vector3(0, 0, 0), spin=Vector3.zero())
     match = _match([player], ball)
     match.step()
@@ -92,6 +99,7 @@ def test_firsttime_difficulty_larger_for_harder_ball():
     """A fast aerial ball must produce higher difficulty than a slow ground ball."""
     def _difficulty_for(ball_pos, ball_vel):
         player = make_player("p1", Team.LEFT, position=Vector3(0, 0, 0))
+        player.ai = StopWhenIdleAI()  # idle receiver; test is about firsttime_difficulty
         ball = Ball(position=ball_pos, velocity=ball_vel, spin=Vector3.zero())
         match = _match([player], ball)
         match.step()
@@ -115,6 +123,12 @@ def test_push_kick_during_controlling_ball_clears_state():
     ball = Ball(position=Vector3(-9.7, 0, 0.05), velocity=Vector3(0, 0, 0), spin=Vector3.zero())
     match = _match([player], ball)
 
+    # Preserve the pre-set rightward motion for the pickup tick (rather than
+    # StopWhenIdleAI's braking, which would confound "already moving
+    # rightward" before the push-kick order is even issued below): explicit
+    # sprint-straight-ahead intent matching the velocity already set above.
+    player.desired_direction = player.velocity.xy().normalized()
+    player.desired_speed_mode = SpeedMode.SPRINT
     match.step()  # pickup -> CONTROLLING_BALL
     assert player.state == PlayerState.CONTROLLING_BALL
 
@@ -159,6 +173,10 @@ def _1v1_get_possession_match(
     player.heading_rad = 0.0
     player.velocity = Vector3(7.0, 0, 0)  # already sprinting
     opponent = make_player("opp", Team.RIGHT, attr_value=0.6, position=opponent_position)
+    # Opponent is just a stationary "threat" reference point for the
+    # clearance check -- not the subject of this test -- so give it the idle
+    # fallback AI to satisfy Match._apply_movement's movement-intent invariant.
+    opponent.ai = StopWhenIdleAI()
     ball = Ball.at_rest(Vector3(0.3, 0, 0))
     match = Match(
         pitch=Pitch.standard(), players=[player, opponent], ball=ball,
@@ -249,6 +267,8 @@ def test_get_possession_order_push_kick_fires_without_controlling_ball_slowdown(
     player = make_player("p1", Team.LEFT, attr_value=0.6, position=Vector3(0, 0, 0))
     player.heading_rad = 0.0
     opponent = make_player("opp", Team.RIGHT, attr_value=0.6, position=Vector3(0, -34, 0))
+    # Opponent is a stationary reference point, not the subject of this test.
+    opponent.ai = StopWhenIdleAI()
     ball = Ball.at_rest(Vector3(2, 0, 0))
     match = Match(
         pitch=Pitch.standard(), players=[player, opponent], ball=ball,

@@ -876,6 +876,40 @@ class StopOrder:
 
 
 @dataclass
+class JogOrder:
+    """Jogs indefinitely in a fixed direction; never completes.
+
+    Gives an otherwise order-less player continuous, physically real
+    locomotion (proper accel/turn-rate/heading via step_player_towards)
+    instead of coasting forever on stale initial velocity -- see
+    Match._apply_movement's "no order this tick" branch, which advances
+    position from velocity with no deceleration or heading update at all
+    when desired_speed_mode is never set. Used by e.g. phase1_scenario's
+    "immobile" opponent so it moves like a real (if simple) player rather
+    than a frictionless drifting object.
+
+    Deliberately NOT driven by player.ai -- assign this directly to
+    player.current_order and leave player.ai as whatever it already was
+    (None for the immobile-opponent case). Phase1RulesAI.decide() (and any
+    other call site) uses `opponent.ai is None` as its "can this opponent
+    ever move/contest the ball" signal; giving this opponent a real AI
+    instead would silently break that check.
+    """
+    direction: Vector3
+    status: OrderStatus = OrderStatus.PENDING
+    on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+
+    def execute(self, player: "Player", match: "Match", dt: float) -> bool:
+        from footballcoach.engine.movement import SpeedMode
+
+        self.status = OrderStatus.IN_PROGRESS
+        dir_xy = self.direction.xy()
+        player.desired_direction = dir_xy.normalized() if dir_xy.length() > 1e-9 else Vector3.zero()
+        player.desired_speed_mode = SpeedMode.JOG
+        return False
+
+
+@dataclass
 class GetPossessionOrder:
     """Runs straight at the ball and acquires it.
 
