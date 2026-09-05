@@ -14,6 +14,7 @@ future changes to pretrain_combined()/pretrain_value().
 from __future__ import annotations
 
 import numpy as np
+import pytest
 import torch
 
 from footballcoach.ai.bc.dataset import DemonstrationDataset
@@ -99,11 +100,25 @@ def _make_env() -> ScenarioEnv:
     )
 
 
-def test_pretrain_combined_smoke():
+@pytest.fixture(scope="module")
+def shared_dataset() -> DemonstrationDataset:
+    """One 32-row synthetic dataset shared across every test in this file
+    instead of rebuilding it (32 real physics-simulated env.step() calls +
+    32 phase1_labels() counterfactual queries) fresh per test. Safe to
+    share: DemonstrationDataset's only mutable state is lazily-computed,
+    pure caches derived solely from its immutable underlying arrays
+    (_trivial_mask_cache etc.), and iterate_minibatches()'s shuffling never
+    reads/writes instance state -- it takes a fresh or explicitly-passed RNG
+    each call. No test mutates the dataset itself (they all only train the
+    PPOTrainer consuming it), so there's no cross-test leakage risk."""
+    return _make_synthetic_dataset(_make_env(), n=32)
+
+
+def test_pretrain_combined_smoke(shared_dataset):
     torch.manual_seed(0)
     np.random.seed(0)
 
-    dataset = _make_synthetic_dataset(_make_env(), n=32)
+    dataset = shared_dataset
     env = _make_env()
     trainer = PPOTrainer.from_config()
 
@@ -122,7 +137,7 @@ def test_pretrain_combined_smoke():
         assert torch.isfinite(p).all(), "Non-finite parameter after pretrain_combined()"
 
 
-def test_pretrain_combined_populates_ai_type_side_channel():
+def test_pretrain_combined_populates_ai_type_side_channel(shared_dataset):
     """W6 regression guard: pretrain_combined()'s dataset-driven minibatches
     (both Phase 0's decision-only path and Phase 1's BC epochs) must actually
     carry a populated self_ai_type/other_ai_type side-channel through to the
@@ -135,7 +150,7 @@ def test_pretrain_combined_populates_ai_type_side_channel():
     """
     from footballcoach.ai.ppo.ppo_trainer import _ai_types
 
-    dataset = _make_synthetic_dataset(_make_env(), n=32)
+    dataset = shared_dataset
 
     saw_self_ai_type = False
     saw_nonzero_other_ai_type = False
@@ -179,7 +194,7 @@ def test_pretrain_value_returns_rollout_stats():
     assert isinstance(stats["outcomes_vs_neural"], list)
 
 
-def test_bc_train_value_only_freezes_policy_and_restores_after():
+def test_bc_train_value_only_freezes_policy_and_restores_after(shared_dataset):
     """bc.bc_train_value_only=True must (1) leave decision_net completely
     unchanged, (2) leave execution_net's non-value-head params completely
     unchanged, (3) actually train the value head, and (4) restore every
@@ -190,7 +205,7 @@ def test_bc_train_value_only_freezes_policy_and_restores_after():
     torch.manual_seed(0)
     np.random.seed(0)
 
-    dataset = _make_synthetic_dataset(_make_env(), n=32)
+    dataset = shared_dataset
     env = _make_env()
     trainer = PPOTrainer.from_config()
 
@@ -226,7 +241,7 @@ def test_bc_train_value_only_freezes_policy_and_restores_after():
     )
 
 
-def test_bc_train_value_only_with_separate_value_net_trains_only_value_net():
+def test_bc_train_value_only_with_separate_value_net_trains_only_value_net(shared_dataset):
     """Same guarantee as above, but for separate_value_net=True: decision_net
     AND execution_net (the unused critic in this mode) must both stay
     completely frozen, and only trainer.value_net should move -- confirms
@@ -235,7 +250,7 @@ def test_bc_train_value_only_with_separate_value_net_trains_only_value_net():
     torch.manual_seed(0)
     np.random.seed(0)
 
-    dataset = _make_synthetic_dataset(_make_env(), n=32)
+    dataset = shared_dataset
     env = _make_env()
     trainer = PPOTrainer.from_config(separate_value_net=True)
     trainer._bc_train_value_only = True
@@ -259,7 +274,7 @@ def test_bc_train_value_only_with_separate_value_net_trains_only_value_net():
     assert len(valnet_changed) > 0, "value_net should have trained but did not change at all"
 
 
-def test_phase0_optimizer_includes_trunk_and_encoder_params():
+def test_phase0_optimizer_includes_trunk_and_encoder_params(shared_dataset):
     """Regression guard for decision #13: Phase 0 must train ALL of
     decision_net's parameters (encoders + trunk + value_head), not just the
     value head. Directly inspects the optimizer built inside
@@ -267,7 +282,7 @@ def test_phase0_optimizer_includes_trunk_and_encoder_params():
     torch.manual_seed(0)
     np.random.seed(0)
 
-    dataset = _make_synthetic_dataset(_make_env(), n=32)
+    dataset = shared_dataset
     env = _make_env()
     trainer = PPOTrainer.from_config()
 

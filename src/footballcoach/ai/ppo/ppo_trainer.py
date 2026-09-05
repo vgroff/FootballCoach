@@ -4797,7 +4797,11 @@ class PPOTrainer:
 
                 _ppo_mb_done += 1
                 _ppo_progress.update(
-                    _ppo_mb_done, postfix=f"epoch={epoch_i + 1}/{self.n_epochs}  kl={kl_after_step:.4f}"
+                    _ppo_mb_done,
+                    postfix=(
+                        f"epoch={epoch_i + 1}/{self.n_epochs}  pol={_policy_loss_f:.4f}"
+                        f"  kl={kl_after_step:.4f}  grad={raw_grad_norm:.2f}"
+                    ),
                 )
 
                 # Early stop per-minibatch: limits drift to O(1) gradient step

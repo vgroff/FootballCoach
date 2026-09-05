@@ -375,7 +375,10 @@ def _jockey_target_position(player, match, blend_factor: float):
     return ball_pt + (opp_target_pt - ball_pt) * blend_factor
 
 
-_JOCKEY_DYNAMIC_BLEND_CANDIDATES: tuple[float, ...] = (0.98, 0.95, 0.9, 0.8, 0.6)
+# Ascending (most attacking/closest-to-ball tried first) to match the live
+# production default (orders.json["jockey"]["blend_candidates"]) -- see that
+# config's own comment for why ascending was chosen over descending.
+_JOCKEY_DYNAMIC_BLEND_CANDIDATES: tuple[float, ...] = (0.05, 0.1, 0.15, 0.2, 0.3, 0.4, 0.5, 0.7, 0.85)
 
 
 def _dynamic_jockey_target(player, match, opp, opp_eta_to_ball: float, blend_candidates=_JOCKEY_DYNAMIC_BLEND_CANDIDATES):
@@ -384,10 +387,14 @@ def _dynamic_jockey_target(player, match, opp, opp_eta_to_ball: float, blend_can
     the opponent's own box target), highest (most defensive) first, and pick
     the first one the player can reach in sprint-ETA <= opp_eta_to_ball --
     i.e. the most defensive position still reachable BEFORE the opponent
-    actually gets the ball and starts running with it. Falls back to the
-    smallest (least defensive, most reachable) candidate if none qualify --
-    still strictly better positioning than doing nothing, even if we can't
-    fully cut off the opponent's run.
+    actually gets the ball and starts running with it. Falls back to
+    whichever candidate has the LOWEST sprint-ETA (i.e. is actually closest
+    to the player right now) if none qualify -- NOT simply the smallest
+    blend value: blend interpolates between the ball and the opponent's box
+    target, so which candidate is geometrically nearest the player depends
+    on where the player is currently standing relative to that line, not on
+    blend order. A middle blend value can easily be closer than the
+    smallest one.
 
     blend_candidates must be given highest-first. opp/opp_eta_to_ball are
     the SAME winning opponent and ETA _opponent_clearly_wins_loose_ball_race
@@ -402,14 +409,18 @@ def _dynamic_jockey_target(player, match, opp, opp_eta_to_ball: float, blend_can
     ball_pt = match.ball.position
     opp_target_pt = _nearest_box_point(opp, match)
 
-    target = ball_pt  # overwritten every iteration; final (smallest-blend) value is the fallback
+    closest_target = ball_pt
+    closest_eta = float("inf")
     for blend in blend_candidates:
         target = ball_pt + (opp_target_pt - ball_pt) * blend
         dist = (target - player.position).length()
         self_eta = sprint_eta(dist, player.speed_mps, self_top, self_accel)
         if self_eta <= opp_eta_to_ball:
             return target
-    return target
+        if self_eta < closest_eta:
+            closest_eta = self_eta
+            closest_target = target
+    return closest_target
 
 
 # Trigger-rate instrumentation for the jockey feature -- module-level so it
@@ -475,8 +486,18 @@ class TackleAngleAwareRulesAI(Phase1RulesAI):
         carrier = match.ball_carrier()
         if carrier is None:
             # Loose ball -- check whether the opponent clearly wins the race
-            # before committing to a likely-hopeless chase.
-            if self.jockey_give_up_margin is not None:
+            # before committing to a likely-hopeless chase. Restricted to
+            # the OPENING scramble only (mirrors production's rules_ai.py):
+            # once the ball has been touched by anyone this match
+            # (Ball.last_touched_by_player_id != None, set forever after the
+            # first touch), jockeying never fires again for the rest of the
+            # match -- giving up on a live-in-play loose ball isn't the same
+            # "clearly hopeless" situation the opening scramble is. NOTE:
+            # every jockey sweep result recorded earlier this session
+            # predates this restriction (jockeying could fire on ANY loose
+            # ball, any time) -- those numbers reflect the more liberal
+            # behaviour, not this one; re-sweep if this needs re-validating.
+            if self.jockey_give_up_margin is not None and match.ball.last_touched_by_player_id is None:
                 _jockey_trigger_stats["loose_ball_decisions"] += 1
                 opponent_wins, _opp, _opp_eta = _opponent_clearly_wins_loose_ball_race(
                     player, match, self.jockey_give_up_margin,

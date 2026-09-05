@@ -69,6 +69,72 @@ class OrderLayerParams:
         )
 
 
+@dataclass(frozen=True)
+class TackleApproachParams:
+    """Tackle-angle-aware carrier chase (Match._run_get_possession_behaviour's
+    carrier-chase branch, shared by GetPossessionOrder and MarkOrder's tackle
+    fallback): while the approach angle is still bad (see
+    engine/tackling.py's tackle_angle_modifier() -- same geometric
+    convention), blend in repulsion steering WITHOUT excluding the carrier
+    (unlike every other repulsion call site, which always excludes
+    match.ball.possessed_by) so the chaser actually curves onto a better
+    tackle angle instead of running straight up the carrier's back. Once the
+    angle is good enough, repulsion switches off and the chase closes in on
+    the intercept point directly. Loaded from config/orders.json["tackle_approach"].
+    """
+    good_angle_cos_threshold: float
+    intercept_ahead_s: float
+
+    @staticmethod
+    def from_config() -> "TackleApproachParams":
+        d = require_section(load_orders_config(), "tackle_approach", "orders.json")
+        return TackleApproachParams(
+            good_angle_cos_threshold=d.get("good_angle_cos_threshold", -0.25),
+            intercept_ahead_s=d.get("intercept_ahead_s", 0.0),
+        )
+
+
+@dataclass(frozen=True)
+class JockeyParams:
+    """Phase1RulesAI's loose-ball decision (rules_ai.py), restricted to the
+    OPENING SCRAMBLE only (before the ball has ever been touched this match
+    -- see Ball.last_touched_by_player_id, None until the first touch by
+    either side, then set forever after): when a real (non-immobile)
+    opponent's sprint-ETA to the loose ball comfortably beats ours (self_eta
+    > opp_eta * give_up_margin), position defensively between the ball and
+    where the opponent will run once they gain possession, instead of
+    committing to a likely-hopeless chase. Once the ball has been touched by
+    anyone, this never fires again for the rest of the match -- giving up on
+    a live-in-play loose ball is a real net loss, not the same "clearly
+    hopeless" situation the opening scramble is.
+
+    blend_candidates (0.0 = stand on the ball / most attacking, 1.0 = stand
+    on the opponent's own scoring-box target / most defensive) are tried in
+    the GIVEN order -- each decision tick, the first candidate the player
+    can reach in sprint-ETA <= the winning opponent's own ETA to the ball is
+    used, falling back to whichever candidate has the lowest sprint-ETA
+    (i.e. is actually closest to the player right now, NOT necessarily the
+    first-tried candidate -- see _dynamic_jockey_target's own docstring) if
+    none qualify. The live config orders this ascending (most attacking/
+    closest-to-ball tried first, escalating toward more defensive positions
+    only if that isn't reachable in time) -- a deliberate preference for
+    contesting the ball over retreating; the reverse (descending,
+    most-defensive-first) ordering was tried too and came back statistically
+    indistinguishable, so this is a design choice, not a measured
+    difference. Loaded from config/orders.json["jockey"].
+    """
+    give_up_margin: float
+    blend_candidates: "tuple[float, ...]"
+
+    @staticmethod
+    def from_config() -> "JockeyParams":
+        d = require_section(load_orders_config(), "jockey", "orders.json")
+        return JockeyParams(
+            give_up_margin=d.get("give_up_margin", 1.5),
+            blend_candidates=tuple(d.get("blend_candidates", [0.98, 0.95, 0.9, 0.85, 0.8, 0.7, 0.6])),
+        )
+
+
 def braking_speed_mode(
     dist: float,
     current_speed: float,

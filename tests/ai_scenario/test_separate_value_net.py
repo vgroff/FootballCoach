@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import math
 
+import pytest
 import torch
 
 from footballcoach.ai.env.scenario_env import ScenarioEnv
@@ -90,14 +91,29 @@ def _run_ppo_update(trainer: PPOTrainer, buffer: RolloutBuffer, last_obs):
 
 
 class TestConstruction:
-    def test_disabled_by_default(self):
-        trainer = PPOTrainer.from_config()
+    # Class-scoped: these 4 tests are all pure read-only assertions on a
+    # freshly-constructed trainer (attribute/id/requires_grad checks) --
+    # none of them train, step an optimizer, or otherwise mutate the
+    # trainer, so building each config's PPOTrainer (a real, if now-
+    # shrunk-for-tests, DecisionNetwork+ExecutionNetwork[+value_net])
+    # exactly ONCE per class and sharing it across the 4 tests is safe,
+    # instead of paying full construction cost 4 times over.
+    @pytest.fixture(scope="class")
+    def trainer_default(self) -> PPOTrainer:
+        return PPOTrainer.from_config()
+
+    @pytest.fixture(scope="class")
+    def trainer_sep(self) -> PPOTrainer:
+        return PPOTrainer.from_config(separate_value_net=True)
+
+    def test_disabled_by_default(self, trainer_default):
+        trainer = trainer_default
         assert trainer.separate_value_net is False
         assert trainer.value_net is None
         assert trainer.value_net_optimizer is None
 
-    def test_enabled_constructs_independent_network(self):
-        trainer = PPOTrainer.from_config(separate_value_net=True)
+    def test_enabled_constructs_independent_network(self, trainer_sep):
+        trainer = trainer_sep
         assert trainer.separate_value_net is True
         assert trainer.value_net is not None
         assert trainer.value_net_optimizer is not None
@@ -107,8 +123,8 @@ class TestConstruction:
         value_ids = {id(p) for p in trainer.value_net.parameters()}
         assert exec_ids.isdisjoint(value_ids)
 
-    def test_execution_net_value_head_frozen_when_enabled(self):
-        trainer = PPOTrainer.from_config(separate_value_net=True)
+    def test_execution_net_value_head_frozen_when_enabled(self, trainer_sep):
+        trainer = trainer_sep
         for p in trainer.execution_net.value_head.parameters():
             assert p.requires_grad is False
         for p in trainer.execution_net.value_ai_type_channel.parameters():
@@ -116,8 +132,8 @@ class TestConstruction:
         # value_net itself IS trainable.
         assert all(p.requires_grad for p in trainer.value_net.parameters())
 
-    def test_main_optimizer_excludes_value_net_params(self):
-        trainer = PPOTrainer.from_config(separate_value_net=True)
+    def test_main_optimizer_excludes_value_net_params(self, trainer_sep):
+        trainer = trainer_sep
         main_opt_param_ids = {
             id(p) for pg in trainer.optimizer.param_groups for p in pg["params"]
         }

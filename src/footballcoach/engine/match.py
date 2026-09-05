@@ -46,6 +46,7 @@ from footballcoach.mathutils import Vector3
 from footballcoach.orders import (
     ChaseTackleOrder,
     GetPossessionOrder,
+    JockeyParams,
     KickOrder,
     MarkOrder,
     MoveOrder,
@@ -55,6 +56,7 @@ from footballcoach.orders import (
     SaveOrder,
     ShootOrder,
     StopOrder,
+    TackleApproachParams,
 )
 from footballcoach.steering import RepulsionParams, compute_repulsion
 
@@ -152,6 +154,8 @@ class Match:
     marking_params: MarkingParams = field(default_factory=MarkingParams.from_config)
     ball_pickup_params: BallPickupParams = field(default_factory=BallPickupParams.from_config)
     boundary_braking_params: BoundaryBrakingParams = field(default_factory=BoundaryBrakingParams.from_config)
+    tackle_approach_params: TackleApproachParams = field(default_factory=TackleApproachParams.from_config)
+    jockey_params: JockeyParams = field(default_factory=JockeyParams.from_config)
     interception_params: InterceptionParams = field(default_factory=InterceptionParams.from_config)
 
     paused: bool = False
@@ -484,13 +488,74 @@ class Match:
         if carrier is not None and carrier.player_id != player.player_id:
             # Arm the tackle; _check_armed_tackles resolves it when in contact range.
             player.tackle_armed = True
-            from footballcoach.orders import _compute_movement_intent
             intercept = self._intercept_target(player, carrier.position, carrier.velocity)
-            adj_dir, sm = _compute_movement_intent(
-                player, intercept - player.position, self,
-                sprint=sprint, arrival_dist=None,
-                use_repulsion=False, use_brake_to_turn=True,
-            )
+            tap = self.tackle_approach_params
+            if tap.intercept_ahead_s > 0.0:
+                # Match._intercept_target solves for the EARLIEST meeting
+                # point -- when catching up from behind, that sits right on
+                # the carrier's heels, leaving repulsion below no room to
+                # curve the approach before contact. This pushes the aim
+                # point further along the carrier's CURRENT velocity beyond
+                # that earliest point (extra lead distance, not a different/
+                # later solve), aiming at open ground ahead of the carrier
+                # instead of their exact backside.
+                intercept = intercept + carrier.velocity * tap.intercept_ahead_s
+            direction = intercept - player.position
+
+            # Tackle-angle-aware approach: same geometric convention as
+            # engine/tackling.py's tackle_angle_modifier() -- angle between
+            # the CARRIER's facing direction and the vector from the carrier
+            # to US. cos ~ +1 means we're positioned where they're facing
+            # (frontal, good angle); cos ~ -1 means directly behind them
+            # (worst tackle_angle_modifier outcome). While this angle is
+            # still bad, blend in repulsion steering -- WITHOUT excluding
+            # the carrier (ball_carrier_id=None below), unlike every other
+            # repulsion call site -- so the chase actually curves onto a
+            # better angle instead of running straight up the carrier's
+            # back. Once the angle is good enough, repulsion switches off
+            # and we close in on the same intercept point directly.
+            dribbler_dir = carrier.velocity.xy()
+            if dribbler_dir.length() < 1e-9:
+                dribbler_dir = Vector3.from_angle_xy(carrier.heading_rad, 1.0).xy()
+            d_to_t = (player.position - carrier.position).xy()
+            d_to_t_len = d_to_t.length()
+            cos_angle = dribbler_dir.normalized().dot(d_to_t.normalized()) if d_to_t_len > 1e-9 else 1.0
+
+            if cos_angle < tap.good_angle_cos_threshold:
+                adj_dir, speed_mult = compute_repulsion(
+                    player, direction, self.players, None, self.repulsion_params, self.pitch,
+                )
+                sm = SpeedMode.SPRINT if sprint else SpeedMode.JOG
+                # Same "repulsion strong enough -> don't sprint through it"
+                # rule _compute_movement_intent applies, for consistency
+                # with how every other order treats a heavy push.
+                if sm is SpeedMode.SPRINT and speed_mult < 0.75:
+                    sm = SpeedMode.JOG
+                adj_dir = adj_dir.xy().normalized() if adj_dir.length_xy() > 1e-9 else Vector3.zero()
+                # Brake-to-turn: _compute_movement_intent applies this for
+                # every other movement path (see its own use_brake_to_turn
+                # docstring); this branch bypasses that helper entirely
+                # (needed for the carrier-NOT-excluded repulsion above,
+                # which _compute_movement_intent's built-in repulsion can't
+                # do), so it must replicate the check itself. Without it, a
+                # sharp heading change straight into this branch (e.g. right
+                # after jockeying in a very different direction) never
+                # brakes to reorient -- turn rate is capped by lateral_
+                # accel/speed (engine/movement.py's max_turn_rate_rad_s), so
+                # at full speed it just carves a slow, wide arc instead.
+                op = self.order_params
+                if (sm is not SpeedMode.STANDSTILL and adj_dir.length() > 1e-9
+                        and player.speed_mps > op.brake_min_speed_mps):
+                    heading_error = abs(angle_diff(player.heading_rad, adj_dir.angle_xy()))
+                    if heading_error > op.brake_turn_angle_rad:
+                        sm = SpeedMode.STANDSTILL
+            else:
+                from footballcoach.orders import _compute_movement_intent
+                adj_dir, sm = _compute_movement_intent(
+                    player, direction, self,
+                    sprint=sprint, arrival_dist=None,
+                    use_repulsion=False, use_brake_to_turn=True,
+                )
             player.desired_direction = adj_dir
             player.desired_speed_mode = sm
             if are_touching(player, carrier):

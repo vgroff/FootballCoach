@@ -39,6 +39,99 @@ from footballcoach.orders import (
 )
 
 
+def _opponent_clearly_wins_loose_ball_race(
+    player: Player, match: Match, give_up_margin: float,
+) -> "tuple[bool, Player | None, float | None]":
+    """True (plus the winning opponent and their ETA) iff a real
+    (non-immobile) opponent's sprint-ETA to the loose ball is COMFORTABLY
+    better than ours -- i.e. self_eta > opp_eta * give_up_margin.
+    give_up_margin > 1.0 means the opponent must be at least that much
+    faster than merely tying us before we treat the race as lost.
+
+    Deliberately a STRICTER bar than OrderLayerParams.sprint_to_ball_
+    clearance_margin's own race check (which is built to say "sprint"
+    liberally, not "give up" liberally) -- jockeying away from a genuinely
+    contestable ball instead of contesting it would be a real net loss, not
+    a gain, so this must only fire when the race is clearly lost, not
+    merely close.
+
+    Immobile opponents (opp.ai is None) are skipped entirely -- they can
+    never truly "win" a race in the sense that matters here (they'd just
+    coast to a stop near the ball, not actually control it purposefully).
+
+    Returns (won, winning_opponent, winning_opponent_eta_to_ball) --
+    (False, None, None) if no opponent clearly wins. The ETA is returned so
+    _dynamic_jockey_target can reuse the exact same "opponent's ETA to the
+    loose ball" figure as its own reachability bar, rather than a second,
+    potentially-diverging solve.
+    """
+    ball_pos = match.ball.position
+    dist_self = (ball_pos - player.position).length()
+    self_top = effective_top_speed(match.movement_params, player.attributes.top_speed, player.stamina, has_ball=False)
+    self_accel = effective_acceleration(match.movement_params, player.attributes.acceleration, player.stamina)
+    self_eta = sprint_eta(dist_self, player.speed_mps, self_top, self_accel)
+
+    for opp in match.players:
+        if opp.player_id == player.player_id or opp.team == player.team or opp.ai is None:
+            continue
+        dist_opp = (ball_pos - opp.position).length()
+        opp_top = effective_top_speed(match.movement_params, opp.attributes.top_speed, opp.stamina, has_ball=False)
+        opp_accel = effective_acceleration(match.movement_params, opp.attributes.acceleration, opp.stamina)
+        opp_eta = sprint_eta(dist_opp, opp.speed_mps, opp_top, opp_accel)
+        if self_eta > opp_eta * give_up_margin:
+            return True, opp, opp_eta
+    return False, None, None
+
+
+def _dynamic_jockey_target(
+    player: Player, match: Match, opp: Player, opp_eta_to_ball: float,
+    blend_candidates: "tuple[float, ...]",
+) -> Vector3:
+    """Defensive position between the loose ball and where `opp` will run
+    once they gain possession -- approximated as their own scoring-box
+    target point (_nearest_box_point, the SAME target Phase1RulesAI itself
+    aims for once IT has the ball), since every opponent modelled here
+    behaves deterministically on pickup (runs straight for its own box).
+
+    Tries each candidate blend (0.0 = stand on the ball / most attacking,
+    1.0 = stand on the opponent's own box target / most defensive) in the
+    GIVEN order, and picks the first one reachable in sprint-ETA <=
+    opp_eta_to_ball -- i.e. the first (by caller-chosen priority) position
+    still reachable BEFORE the opponent actually gets the ball and starts
+    running with it. The live config orders candidates ascending (most
+    attacking/closest-to-ball first, escalating toward more defensive
+    positions only if that isn't reachable in time) -- a caller preference,
+    not something this function assumes. Falls back to whichever candidate
+    has the LOWEST sprint-ETA (i.e. is actually closest to the player right
+    now) if none qualify -- NOT simply the first-tried candidate: blend
+    interpolates between the ball and the opponent's box target, so which
+    candidate is geometrically nearest the player depends on where the
+    player is currently standing relative to that line, not on try order. A
+    middle blend value can easily be closer than either end.
+
+    Called fresh from decide() every decision tick, not cached -- ball and
+    opponent state keep changing, and Phase1RulesAI.decide() is deliberately
+    memoryless/idempotent (see its own docstring).
+    """
+    self_top = effective_top_speed(match.movement_params, player.attributes.top_speed, player.stamina, has_ball=False)
+    self_accel = effective_acceleration(match.movement_params, player.attributes.acceleration, player.stamina)
+    ball_pt = match.ball.position
+    opp_target_pt = _nearest_box_point(opp, match)
+
+    closest_target = ball_pt
+    closest_eta = float("inf")
+    for blend in blend_candidates:
+        target = ball_pt + (opp_target_pt - ball_pt) * blend
+        dist = (target - player.position).length()
+        self_eta = sprint_eta(dist, player.speed_mps, self_top, self_accel)
+        if self_eta <= opp_eta_to_ball:
+            return target
+        if self_eta < closest_eta:
+            closest_eta = self_eta
+            closest_target = target
+    return closest_target
+
+
 def _default_decision_interval_ticks() -> int:
     """Ticks between decisions for rules-based AI, defaulting to MATCH the
     real trained policy's own decision cadence -- ai_config.json's
@@ -147,8 +240,39 @@ class Phase1RulesAI(_RulesBasedAI):
                 push_kick_enabled=True,
             )
         else:
-            # Don't have the ball — chase it.  Recalculate sprint every tick
-            # so the decision tracks changing distances.
+            # Don't have the ball. If the ball has NEVER been touched yet
+            # this match (the opening scramble) and a real (non-immobile)
+            # opponent will clearly beat us to it, position defensively
+            # ("jockey") instead of committing to a likely-hopeless chase --
+            # see JockeyParams' own docstring for exactly what "clearly beat
+            # us" and the target position mean. Deliberately restricted to
+            # the opening scramble only, via Ball.last_touched_by_player_id
+            # (None until the very first touch, by either side, then set
+            # forever after -- Match._set_possession's single authoritative
+            # write-path for this fact): once the ball has been live in play
+            # at all, giving up on a loose-ball race and retreating instead
+            # of contesting it is a real net loss, not the same "clearly
+            # hopeless, no point chasing" situation the opening scramble is.
+            # This check is itself a pure function of (player, match) -- no
+            # new instance state -- so it stays consistent with decide()'s
+            # own memoryless contract (see this method's own docstring
+            # above).
+            if match.ball.possessed_by is None and match.ball.last_touched_by_player_id is None:
+                jp = match.jockey_params
+                opponent_wins, winning_opp, opp_eta = _opponent_clearly_wins_loose_ball_race(
+                    player, match, jp.give_up_margin,
+                )
+                if opponent_wins:
+                    target = _dynamic_jockey_target(player, match, winning_opp, opp_eta, jp.blend_candidates)
+                    if not isinstance(player.current_order, MoveOrder):
+                        match._log_info(f"[AI] {player.player_id}: MoveOrder (jockey)")
+                    player.current_order = MoveOrder(
+                        target_position=target, sprint=True, max_speed_on_arrival_mps=0.0,
+                    )
+                    return
+
+            # Chase it.  Recalculate sprint every tick so the decision
+            # tracks changing distances.
             #
             # Against an immobile opponent (can never move or contest the
             # ball), _should_sprint_to_ball's opponent-relative race check
