@@ -98,6 +98,7 @@ def apply_phase1_opponent_roll(match, opponent, seed: int) -> None:
     """
     import random as _random
 
+    from footballcoach.orders import JogOrder
     from footballcoach.rules_ai import Phase1RulesAI
 
     opponent_rules_prob, opponent_immobile_prob = _phase1_opponent_probs()
@@ -109,7 +110,14 @@ def apply_phase1_opponent_roll(match, opponent, seed: int) -> None:
         opponent.ai = Phase1RulesAI()
         match._opponent_use_rules_ai, match._opponent_is_immobile = True, False
     else:
+        # ai stays None (Phase1RulesAI.decide() and others key off
+        # `opponent.ai is None` as their "can this opponent ever move/
+        # contest" signal -- see JogOrder's own docstring) -- but
+        # current_order is set directly so the opponent still moves like a
+        # real player instead of Match._apply_movement's "no order this
+        # tick" branch, which now RAISES rather than silently coasting.
         opponent.ai = None
+        opponent.current_order = JogOrder(direction=opponent.velocity)
         match._opponent_use_rules_ai, match._opponent_is_immobile = False, True
 
 

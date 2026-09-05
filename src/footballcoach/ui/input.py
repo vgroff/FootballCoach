@@ -2,14 +2,22 @@
 the currently selected player.
 
 Interaction scheme:
-- Click a player -> select them. Click a different same-team player to
-  switch selection (no deselection on same-player click).
-- Click an opposing-team player while one of your players is selected ->
-  GetPossessionOrder (chase the ball carrier).
+- Left-click ANY player (either team) -> select them. Selecting a player --
+  own or opposing -- shows their AI type, current order, and attributes in
+  a side panel (renderer.py's draw_player_inspector). Selecting an opposing
+  player is inspection-only: the normal order-issuing paths below only ever
+  target whoever is selected, so you can look at an opponent without being
+  able to command them any differently than before.
+- Right-click an opposing player while a DIFFERENT-team player is selected
+  -> GetPossessionOrder on the selected player (chase/tackle whoever you
+  right-clicked). This is the "do something" action that left-click used to
+  perform on an opposing-team click, before left-click became select-only.
 - Click empty ground while a player is selected -> MoveOrder to that point
   (default OrderMode.MOVE).
 
-Multi-phase kick UI (replaces the old click-drag kick):
+Multi-phase kick UI (replaces the old click-drag kick; its own right-click,
+regress one phase, takes priority over the GetPossessionOrder shortcut
+above whenever the kick UI is active -- see app.py's dispatch):
   Phase 1 - AIM_XY: click the already-selected player who has the ball to
     enter kick-aim mode.  Moving the mouse sets the XY direction (world-space
     vector from player to mouse) and power (mouse distance, capped at
@@ -127,6 +135,28 @@ class MatchInputController:
             if p.player_id == self.selected_player_id:
                 return p
         return None
+
+    def panel_player(self) -> Player | None:
+        """Who the AI/order/attributes inspector panel should describe
+        this frame -- just whoever is selected (left-click now selects any
+        player, either team, purely for inspection; see module docstring),
+        so the panel always mirrors selected_player()."""
+        return self.selected_player()
+
+    def handle_right_click(self, screen_pos: tuple[int, int]) -> None:
+        """Right-click (outside the kick UI, see app.py's dispatch, which
+        takes priority) an OPPOSING-team player while a player is selected
+        -> GetPossessionOrder on the selected player (chase/tackle whoever
+        was right-clicked). The "do something" action that left-click used
+        to perform on an opposing-team click before left-click became
+        select-only (see module docstring). No-op for a same-team click,
+        a click with nothing selected, or a click on empty ground --
+        there's no analogous action for those."""
+        clicked = self._player_at_screen_pos(screen_pos)
+        selected = self.selected_player()
+        if clicked is None or selected is None or clicked.team == selected.team:
+            return
+        self._issue_order(selected, GetPossessionOrder(), "Get Possession")
 
     def kick_ui_state(self) -> KickUIState | None:
         """Returns the active kick UI state for the renderer, or None."""
@@ -367,13 +397,17 @@ class MatchInputController:
             if clicked_player.team == selected.team:
                 if self.order_mode == OrderMode.PASS:
                     self._issue_transient_order(selected, PassOrder(target_position=clicked_player.position), "Pass")
-                elif self.order_mode == OrderMode.SHOOT:
+                    return
+                if self.order_mode == OrderMode.SHOOT:
                     self._issue_transient_order(selected, ShootOrder(aim_point=clicked_player.position, power_fraction=1.0), "Shoot")
-                else:
-                    self.selected_player_id = clicked_player.player_id
-                return
-            # Opposing player - chase and get possession.
-            self._issue_order(selected, GetPossessionOrder(), "Get Possession")
+                    return
+            # Any other player click -- same-team outside Pass/Shoot mode, OR
+            # an opposing-team click in any mode -- just switches selection.
+            # Opposing-team selection is inspection-only: the "do something
+            # to them" action moved to right-click (handle_right_click's
+            # GetPossessionOrder) when left-click became select-only for
+            # both teams -- see module docstring.
+            self.selected_player_id = clicked_player.player_id
             return
 
         # Empty ground.

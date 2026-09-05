@@ -53,11 +53,18 @@ def _rules_vs_rules_1v1_build(*args, **kwargs):
 
 def _immobile_1v1_build(*args, **kwargs):
     """Module-level (picklable) scenario builder for pre-PPO immobile-opponent eval."""
+    from footballcoach.orders import JogOrder
     from footballcoach.ui.scenarios import build_1v1_scenario
 
     match = build_1v1_scenario(*args, **kwargs)
     opp = match.player_by_id("opponent")
+    # ai stays None (Phase1RulesAI.decide() and others key off `opponent.ai
+    # is None` as their "can this opponent ever move/contest" signal) --
+    # but current_order is set directly so the opponent still moves like a
+    # real player instead of Match._apply_movement's "no order this tick"
+    # branch, which now RAISES rather than silently coasting.
     opp.ai = None
+    opp.current_order = JogOrder(direction=opp.velocity)
     match._opponent_use_rules_ai = False
     match._opponent_is_immobile = True
     return match

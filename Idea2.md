@@ -37,13 +37,10 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. Please do not skip any of them. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
-        - Okay now let's chat about the rules AI:
-        - Take me through your fix for the tackling again.
-        - Do rules ai players sprint towards the opposition box when they have the ball or are doing push-kicking if the opponent is near them or catching up to them?
-        - I wonder if the rules AI should have some logic where if the opponent looks like they're going to get the ball first, try to get in between them and the box instead of chasing them, better chance of success. Not sure where that should go or be wired in though, maybe a new order? WE
-        -  I'd like all of these checked on the evaluation (rules vs rules) before and after to see the improvement, 500 episodes
+    - show policy loss, new AI, boost/widen patsy, new demo data/dagger, more rollout steps, more epochs, 
     - !! Seperate kick z vs. x/y log dir std and therefore entropy calculations?
     - !! Are the bernoulli heads sampled to become execution inputs? They shouldnt be!!
+    - Every attribute should be like dribbling = 0.1 + driblling_skill*0.9 or smth, so that no rolls are totally 0 success
     - !! new training:
         - value net pre-training (phase 0) really struggles with the invalid/timeouts, which is weird because it was doing okay on them in the debug value net. Does it definitely have that last team touched variable for example? Is the MC time-based fixed with non-uniform timesteps included? Maybe it just needs longer, val_mse was falling the whole time
     - !! Move both rules and neural AI to have decision in integer ticks, and make them both 4/5 or so (0.25-0.3s
@@ -229,6 +226,7 @@ NB Immediate Immediate:
 - Kicking and running - this should be possible, and faster than running with the ball. Do some tests, and then add it to Phase 1 AI (and/or MoveOrder) 
 - kicking direction needs working - can’t kick at 90 degrees upward, even less with the same power
 - Allow pausing and going back in time (up to 30s)
+- Tackling - should be harder to tackle when you and/or target is moving fast (especially you). with dribbling its a little harder if you're moving fast
 - Control - should set the ball to ground level, snap for now but improve it later? Also how long are the control delays vs real life? Also implement failed control - rebounds. What happens during control, does a player have ball possession and can he be tackled while controlling? Shouldn’t be possible until ball on floor. Can he kick during control? I think no, either volley/head it first time or finish controlling it - but can arm a kick? Doess ball control even do much atm? Should be able to arm a control/let a ball run through (unless it "really" contacts)
 - Heading - should reduce shot power (and precision) 
 - Give the ball some dots and make them spin during spinning

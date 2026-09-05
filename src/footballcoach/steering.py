@@ -33,7 +33,7 @@ class RepulsionParams:
     ball_carrier_speed_penalty_max: float
     speed_penalty_scale: float
     alignment_dot_threshold: float
-    min_orthogonal_adjust_mps: float
+    max_tangent_deg: float
     max_deflection_deg: float = 90.0
     behind_tolerance_m: float = 1.2
     velocity_lookahead_s: float = 0.4
@@ -50,7 +50,7 @@ class RepulsionParams:
             ball_carrier_speed_penalty_max=d["ball_carrier_speed_penalty_max"],
             speed_penalty_scale=d["speed_penalty_scale"],
             alignment_dot_threshold=d["alignment_dot_threshold"],
-            min_orthogonal_adjust_mps=d["min_orthogonal_adjust_mps"],
+            max_tangent_deg=d["max_tangent_deg"],
             max_deflection_deg=d.get("max_deflection_deg", 90.0),
             behind_tolerance_m=d.get("behind_tolerance_m", 1.2),
             velocity_lookahead_s=d.get("velocity_lookahead_s", 0.4),
@@ -94,7 +94,8 @@ def compute_repulsion(
     -------
     adjusted_direction:
         A ``Vector3`` (z=0) giving the blended direction after repulsion
-        and any orthogonal nudge.  If ``desired_dir`` is the zero vector,
+        (including its smooth per-obstacle tangential rotation -- see
+        ``max_tangent_deg``).  If ``desired_dir`` is the zero vector,
         returns ``Vector3.zero()`` unchanged (nothing to blend).
     speed_multiplier:
         A value in ``[0, 1]``.  ``1.0`` means no speed change; lower
@@ -152,8 +153,75 @@ def compute_repulsion(
         # Repulsion: away from other, linear falloff.
         strength = params.strength_base * (1.0 - dist / params.radius_m)
         inv_dist = 1.0 / dist
-        net_rep_x += dx * inv_dist * strength
-        net_rep_y += dy * inv_dist * strength
+        radial_x = dx * inv_dist
+        radial_y = dy * inv_dist
+
+        # dot = closing-velocity alignment: rel_vel projected onto the
+        # radial (away-from-obstacle) direction, normalised. -1 = closing
+        # dead head-on, 0 = neutral/tangential pass, +1 = retreating dead
+        # straight away. Falls back to -1 (treated as fully closing) when
+        # there's no relative-velocity signal at all (both stationary or
+        # moving identically) -- personal-space separation still applies
+        # there since there's no directional information to gate it by,
+        # only the (separate, velocity-driven) rotation below skips in
+        # that case, since there's no meaningful heading to rotate around.
+        rvx = player.velocity.x - other.velocity.x
+        rvy = player.velocity.y - other.velocity.y
+        rv_len = (rvx * rvx + rvy * rvy) ** 0.5
+        dot = (rvx * radial_x + rvy * radial_y) / rv_len if rv_len > 1e-9 else -1.0
+
+        # Scale magnitude by closing velocity: full push while closing
+        # head-on, tapering linearly to ZERO once we're moving away from
+        # THIS obstacle (dot >= 0) -- a player already retreating from an
+        # obstacle has no real collision risk left to react to, so pushing
+        # them further is spurious deflection with no avoidance benefit.
+        # Distance-only potential fields (the previous version of this
+        # function) are the classic case that gets this wrong; velocity-
+        # obstacle methods (RVO/ORCA) only ever constrain velocities that
+        # would actually lead to a future collision, which this mirrors in
+        # spirit without a full rewrite.
+        closing_factor = -dot if dot < 0.0 else 0.0
+        closing_factor = 1.0 if closing_factor > 1.0 else closing_factor
+        strength *= closing_factor
+
+        # Smooth tangential rotation ("spiral field"): as our closing
+        # velocity toward THIS obstacle becomes more directly head-on, rotate
+        # its radial repulsion vector toward tangential (curve around it)
+        # instead of pushing straight backward. Replaces the old separate,
+        # single-nearest-neighbour, fixed-magnitude "orthogonal nudge" that
+        # snapped on/off at alignment_dot_threshold -- same threshold still
+        # marks where the effect starts (dot == alignment_dot_threshold -> no
+        # rotation), now ramping continuously to a full max_tangent_deg
+        # rotation at dot == -1 (dead head-on), with no discontinuity at the
+        # boundary. Applies individually to EVERY obstacle in range, not
+        # just whichever one happens to be nearest.
+        rx, ry = radial_x, radial_y
+        if params.max_tangent_deg > 0.0 and rv_len > 1e-9:
+            span = params.alignment_dot_threshold - (-1.0)
+            t = (params.alignment_dot_threshold - dot) / span if span > 1e-9 else (
+                1.0 if dot < params.alignment_dot_threshold else 0.0
+            )
+            t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
+            if t > 0.0:
+                # Which side to curve toward -- same cross-product
+                # convention the old orthogonal nudge used. This only
+                # degenerates (near-zero, numerically unstable sign)
+                # exactly when radial_* and the desired direction are
+                # near-antiparallel -- an inherent ambiguity of any
+                # symmetric head-on approach (a stateless function of
+                # the current tick can't fully resolve which way a
+                # dead-straight-on encounter should break either way),
+                # not something this rotation introduces.
+                cross_z = radial_x * dd_y - radial_y * dd_x
+                sign = 1.0 if cross_z >= 0.0 else -1.0
+                theta = math.radians(params.max_tangent_deg) * t * sign
+                cos_t = math.cos(theta)
+                sin_t = math.sin(theta)
+                rx = radial_x * cos_t - radial_y * sin_t
+                ry = radial_x * sin_t + radial_y * cos_t
+
+        net_rep_x += rx * strength
+        net_rep_y += ry * strength
 
         if dist < nearest_dist:
             nearest_dist = dist
@@ -205,42 +273,12 @@ def compute_repulsion(
         )
         speed_multiplier = 1.0 - speed_penalty
 
-    # ── Orthogonal nudge when heading nearly straight into nearest obstacle
-    ortho_x: float = 0.0
-    ortho_y: float = 0.0
-    if nearest_other is not None and params.min_orthogonal_adjust_mps > 0.0:
-        net_rep_len = (net_rep_x * net_rep_x + net_rep_y * net_rep_y) ** 0.5
-        if net_rep_len > 1e-9:
-            # rel_vel = player.velocity - nearest_other.velocity (xy only)
-            rvx = player.velocity.x - nearest_other.velocity.x
-            rvy = player.velocity.y - nearest_other.velocity.y
-            rv_len = (rvx * rvx + rvy * rvy) ** 0.5
-            if rv_len > 1e-9:
-                # Dot of normalised rel_vel with normalised net_repulsion.
-                # net_repulsion points AWAY from obstacle.
-                # rel_vel pointing OPPOSITE to repulsion → heading into obstacle.
-                dot = (rvx / rv_len) * (net_rep_x / net_rep_len) + (rvy / rv_len) * (net_rep_y / net_rep_len)
-                if dot < params.alignment_dot_threshold:
-                    # Orthogonal to repulsion direction; pick the side closer
-                    # to the desired direction via the 2D cross product sign.
-                    # cross_z(net_rep, desired_dir) = net_rep_x*desired_y - net_rep_y*desired_x
-                    cross_z = net_rep_x * desired_dir.y - net_rep_y * desired_dir.x
-                    if cross_z >= 0.0:
-                        # Desired is to the left of repulsion → nudge left
-                        # Left perpendicular of (x,y) = (-y, x)
-                        perp_x = -net_rep_y / net_rep_len
-                        perp_y = net_rep_x / net_rep_len
-                    else:
-                        # Desired is to the right → nudge right
-                        # Right perpendicular of (x,y) = (y, -x)
-                        perp_x = net_rep_y / net_rep_len
-                        perp_y = -net_rep_x / net_rep_len
-                    ortho_x = perp_x * params.min_orthogonal_adjust_mps
-                    ortho_y = perp_y * params.min_orthogonal_adjust_mps
-
-    # ── Blend: final_dir = normalise(desired_dir_norm + net_rep + ortho) ─
-    final_x = dd_x + net_rep_x + ortho_x
-    final_y = dd_y + net_rep_y + ortho_y
+    # ── Blend: final_dir = normalise(desired_dir_norm + net_rep) ──────────
+    # (net_rep already carries its own smooth tangential rotation per
+    # obstacle, computed in the loop above -- no separate orthogonal term
+    # to add here any more.)
+    final_x = dd_x + net_rep_x
+    final_y = dd_y + net_rep_y
     final_len = (final_x * final_x + final_y * final_y) ** 0.5
     if final_len < 1e-9:
         # Vectors cancelled completely — fall back to original desired dir.
@@ -251,12 +289,11 @@ def compute_repulsion(
 
     log.debug(
         "[repulsion] pid=%s  has_ball=%s  nearest=%.2fm  "
-        "net_rep=(%.3f,%.3f)  ortho=(%.3f,%.3f)  "
+        "net_rep=(%.3f,%.3f)  "
         "raw_dir=(%.3f,%.3f)  blended=(%.3f,%.3f)  speed_mult=%.3f",
         player.player_id, has_ball,
         nearest_dist if nearest_other else float("inf"),
         net_rep_x, net_rep_y,
-        ortho_x, ortho_y,
         dd_x, dd_y,
         fn_x, fn_y,
         speed_multiplier,

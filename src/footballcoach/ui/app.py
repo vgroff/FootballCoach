@@ -323,6 +323,8 @@ class App:
         elif event.type == pygame.MOUSEBUTTONDOWN and event.button == 3:
             if self.input_controller.kick_ui_state() is not None:
                 self.input_controller.regress_kick_ui()
+            else:
+                self.input_controller.handle_right_click(event.pos)
         elif event.type == pygame.MOUSEWHEEL:
             self.input_controller.handle_mouse_wheel(event.y)
 
@@ -671,7 +673,14 @@ class App:
             self._training_checkpoint_idx = -1
 
         if self._training_checkpoint_idx == -1:
-            player.ai = None
+            # StopWhenIdleAI, not None -- fills in a StopOrder whenever
+            # current_order goes back to None between human click/key-issued
+            # orders, so Match._apply_movement (which now RAISES if a player
+            # has no movement intent) is satisfied. input.py only special-
+            # cases isinstance(player.ai, HybridPlayerAI), so this is a safe
+            # drop-in that doesn't change how human order-issuing is routed.
+            from footballcoach.rules_ai import StopWhenIdleAI
+            player.ai = StopWhenIdleAI()
             self._log(LogLevel.INFO, "Training mode: trainee -> human control")
             return
 
@@ -682,7 +691,8 @@ class App:
             if err:
                 self._log(LogLevel.INFO, f"Training mode: failed to load {ckpt_path} ({err}) — staying human")
                 self._training_checkpoint_idx = -1
-                player.ai = None
+                from footballcoach.rules_ai import StopWhenIdleAI
+                player.ai = StopWhenIdleAI()
                 return
             self._training_trainer_cache[ckpt_path] = trainer
 
@@ -883,6 +893,9 @@ class App:
             self.surface, self._sim_speed, self.help_button_rect.x - 12,
         )
         self.renderer.draw_hotkey_bar(self.surface, self._hotkey_entries())
+        panel_player = self.input_controller.panel_player()
+        if panel_player is not None:
+            self.renderer.draw_player_inspector(self.surface, panel_player)
         # Expose linger progress to the game-log renderer (0.0 = not lingering).
         if self._scenario_loop is not None and self._scenario_loop._pending_outcome is not None:
             loop = self._scenario_loop
@@ -943,7 +956,7 @@ class App:
         lines = [
             "Click a player           - select them (click again to deselect)",
             "Click a team-mate        - switch selection (or pass to them in Pass mode)",
-            "Click an opponent        - get possession: chase whoever has the ball and tackle them",
+            "Click an opponent        - select them too, for inspection only (see side panel below)",
             "Click empty ground       - move there (sprinting)",
             "Click-drag from selected - kick: drag direction=aim, length=power (only if they have the ball)",
             "Hold Shift while dragging- loft/chip the kick instead of driving it low",
@@ -951,6 +964,9 @@ class App:
             "K                        - shoot mode: next click sets the aim point for a full-power shot",
             "S                        - issue a Save order (goalkeeper only): tracks and blocks shots",
             "X                        - stop: decelerate selected player to a standstill",
+            "Selecting a player       - side panel shows their AI type, current order, attributes",
+            "Right-click an opponent  - get possession: selected player chases/tackles them",
+            "                           (this replaces the old left-click-opponent behaviour)",
             "N (training mode only)   - cycle trainee: human -> neural (checkpoint 1) -> ... -> human.",
             "                           While neural, clicks/kicks still take over for one order.",
             "Space                    - pause/resume the simulation",
@@ -1001,12 +1017,13 @@ class App:
             ("[K]",   "Shoot",  has_ball,    mode == OrderMode.SHOOT),
             ("[S]",   "Save",   is_gk,       False),
             ("[X]",   "Stop",   is_selected, False),
+            ("[RClk]", "Get Possession", is_selected, False),
             ("[H]",   "Help",   True,        self.show_help),
             ("[Esc]", "Menu",   True,        False),
         ]
         if self.is_training_mode:
             is_neural = self._training_checkpoint_idx != -1
-            entries.insert(5, ("[N]", "Neural AI" if not is_neural else "Human", True, is_neural))
+            entries.insert(6, ("[N]", "Neural AI" if not is_neural else "Human", True, is_neural))
         return entries
 
 

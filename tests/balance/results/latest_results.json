@@ -93,19 +93,18 @@
     "result": "overlap_occurred"
   },
   "repulsion_on_collision_avoidance": {
-    "min_separation_m": 1.2014,
+    "min_separation_m": 0.8054,
     "sum_radii_m": 0.6,
-    "clearance_m": 0.6014,
+    "clearance_m": 0.2054,
     "p0_arrived_within_2s": false,
     "p1_arrived_within_2s": false,
     "direct_travel_ticks": 25
   },
   "repulsion_ball_carrier_avoidance": {
-    "min_sep_with_ball_m": 2.4916,
-    "min_sep_without_ball_m": 1.7504,
-    "mean_close_approach_speed_with_ball_mps": 7.993,
-    "mean_close_approach_speed_without_ball_mps": 8.788,
-    "carrier_is_slower": true
+    "min_sep_with_ball_m": 1.7739,
+    "min_sep_without_ball_m": 1.5534,
+    "carrier_sprint_downgraded_to_jog": false,
+    "non_carrier_sprint_downgraded_to_jog": false
   },
   "dribble_penalty_near_zero_margin": {
     "speed_multiplier": 0.2205920205920201
@@ -268,8 +267,8 @@
   },
   "repulsion_three_neighbours": {
     "initial_x": 0.0,
-    "final_x": 2.307,
-    "displacement_m": 2.307,
+    "final_x": 2.767,
+    "displacement_m": 2.767,
     "made_forward_progress": true
   },
   "repulsion_oscillation_check": {

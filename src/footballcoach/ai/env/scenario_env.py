@@ -32,7 +32,11 @@ from footballcoach.ai.action.apply_nn_action import (
     encode_slot_player_ids,
 )
 from footballcoach.ai.config import load_ai_config
-from footballcoach.ai.env.outcome import remap_phase1_outcome
+from footballcoach.ai.env.outcome import (
+    can_score_box_terminal,
+    detect_phase1_box_terminal,
+    remap_phase1_outcome,
+)
 from footballcoach.ai.env.reward import EMAFilter, phase1_reward, phase2_reward
 from footballcoach.ai.obs.encoder import MAX_OTHER_PLAYERS, encode_observation
 from footballcoach.ai.obs.schema import ObservationBatch
@@ -535,11 +539,23 @@ class ScenarioEnv:
         # start-vs-end-of-interval delta.
         ball_progress = trainee_prog_accum
 
-        # Reached opponent box with possession (phase 1 terminal — trainee wins)
-        in_opponent_box = match.pitch.is_in_box(
-            match.ball.position,
-            left=(player.team == Team.RIGHT),  # opponent's box
-        )
+        # Reached opponent box with possession (phase 1 terminal — trainee
+        # wins) / opponent reached trainee's box with possession (trainee
+        # loses). Single shared detector (ai/env/outcome.py's
+        # detect_phase1_box_terminal, gated via can_score_box_terminal so a
+        # player with no real controller — e.g. an immobile opponent sitting
+        # in its own box by pure spawn coincidence — can never trigger this)
+        # -- also used by ScenarioLoop/detect_trial_outcome for the UI/debug-
+        # script path (see ScenarioLoop._trial_outcome), so the two can never
+        # independently drift apart again. This used to be duplicated inline
+        # here with a SEPARATE, ungated, trainee-unaware version living in
+        # detect_trial_outcome's generic box-possession check -- confirmed to
+        # genuinely disagree on real episodes (a UI/debug-script playback
+        # could declare a winner before the event eval's own check correctly
+        # waited for had even happened).
+        _phase1_terminal = detect_phase1_box_terminal(match, trainee_player_id=self.trainee_player_id)
+        box_terminal = _phase1_terminal == "box_possession"
+        opponent_box_terminal = _phase1_terminal == "opponent_box_possession"
         # Use the per-tick scan (trainee_gained_count/trainee_lost_count) instead
         # of a simple before/after comparison, so gain/lose transitions that
         # both happen within this single decision interval (e.g. tackle then
@@ -549,45 +565,6 @@ class ScenarioEnv:
         lost_possession = trainee_lost_count
         self._trainee_had_possession_last_step = trainee_has_possession_now
         self._trainee_pending_loss = _trainee_pending_loss
-        box_terminal = (
-            in_opponent_box
-            and trainee_has_possession_now
-            and self._can_score_box_terminal(player)
-        )
-
-        # Opponent reached trainee's box with possession (phase 1 terminal — trainee loses).
-        # Excluded when the ball carrier has no real controller (see
-        # _can_score_box_terminal): it never chases or holds a defensive
-        # line, so the only way it could ever satisfy this otherwise would
-        # be a pure coincidence of spawn position (and/or incidental
-        # collision push-apart nudging it there — see ui/scenarios.py's
-        # build_1v1_scenario, which also re-rolls the immobile opponent's
-        # spawn away from its own box with a clearance margin,
-        # belt-and-braces). Gating the terminal condition itself here is
-        # the actually-robust fix: it holds regardless of how the immobile
-        # opponent's position ever got wherever it is, rather than trying
-        # to prevent every possible geometric path to this outcome.
-        #
-        # Looked up generically by whoever is actually carrying the ball
-        # (not hardcoded to "the opponent") so this holds even once a
-        # scenario has more than one non-trainee player.
-        in_trainee_box = match.pitch.is_in_box(
-            match.ball.position,
-            left=(player.team == Team.LEFT),  # trainee's own box
-        )
-        _carrier_id = match.ball.possessed_by
-        _carrier_can_score = False
-        if _carrier_id is not None and _carrier_id != self.trainee_player_id:
-            try:
-                _carrier_can_score = self._can_score_box_terminal(match.player_by_id(_carrier_id))
-            except KeyError:
-                _carrier_can_score = False
-        opponent_box_terminal = (
-            in_trainee_box
-            and _carrier_id is not None
-            and _carrier_id != self.trainee_player_id
-            and _carrier_can_score
-        )
 
         timeout = self._episode_ticks >= int(self.max_episode_s / self._dt_s)
         if self.phase == 1:
@@ -702,7 +679,7 @@ class ScenarioEnv:
                 match.ball.position,
                 left=(sec_player.team == Team.RIGHT),
             )
-            # Gated via the SAME shared _can_score_box_terminal() used by
+            # Gated via the SAME shared can_score_box_terminal() used by
             # box_terminal/opponent_box_terminal above -- note
             # sec_box_terminal does NOT feed into the real episode-ending
             # `done` below, so leaving it ungated (as it was before this
@@ -714,7 +691,7 @@ class ScenarioEnv:
             sec_box_terminal = (
                 sec_in_atk_box
                 and match.ball.possessed_by == pid
-                and self._can_score_box_terminal(sec_player)
+                and can_score_box_terminal(sec_player)
             )
 
             if self.phase == 1:
@@ -899,36 +876,9 @@ class ScenarioEnv:
             _cos = 1.0  # neutral: no penalty when stationary or at ball
         return _speed, _cos
 
-    @staticmethod
-    def _can_score_box_terminal(player_obj) -> bool:
-        """True iff `player_obj` has a real controller and can therefore
-        legitimately trigger a box-terminal event (reaching a scoring box
-        with possession).
-
-        Shared by EVERY phase-1 box-terminal check below (`box_terminal` --
-        trainee win, `opponent_box_terminal` -- trainee loss, and
-        `sec_box_terminal` -- each secondary player's own reward) -- do not
-        re-derive this gate at a second call site. Before this helper
-        existed, each of those three sites independently decided whether to
-        exclude an immobile player (via a single match-level
-        `_opponent_is_immobile` flag, checked at some call sites and not
-        others) instead of asking a genuinely player-scoped question --
-        `sec_box_terminal` missed the gate entirely, letting a ball that
-        settled near an immobile demo-recording opponent by physics
-        coincidence re-fire the one-time box/speed-bonus reward every tick
-        for as long as the fluke held (confirmed: 64 consecutive ticks in
-        one real recorded episode) instead of once.
-
-        `player_obj.ai is None` means no controller was ever assigned (the
-        immobile-opponent build path) -- a player with no controller can
-        never intentionally "reach" anything, so the ball settling near
-        them isn't a real terminal event. This is per-player rather than a
-        single global match flag, so it generalises correctly to however
-        many non-trainee players a scenario ever has, unlike
-        `_opponent_is_immobile` (see ai/knowledge.md's "hardcoded to
-        exactly 2 players" note).
-        """
-        return player_obj.ai is not None
+    # can_score_box_terminal moved to ai/env/outcome.py (shared with
+    # ScenarioLoop/detect_trial_outcome, see that module's docstring) --
+    # imported at module level above.
 
     def _compute_phase1_reward_for_player(
         self,

@@ -23,17 +23,102 @@ if TYPE_CHECKING:
     from footballcoach.ui.input import KickUIState
     from footballcoach.ui.scenarios import AnyScenarioParam, ScenarioBoolParam, ScenarioChoiceParam, ScenarioParam
 
+def _describe_player_ai(player: Player) -> str:
+    """Short label for the inspector panel: what's actually driving this
+    player right now. Switches on rules_ai.py's AI hierarchy -- ``ai is
+    None`` means the player is order-driven only (no per-tick AI callback
+    at all, e.g. a human-controlled trainee); ``HybridPlayerAI`` is a
+    neural net with an optional human/rules order-override channel (see
+    its own docstring); any other ``PlayerAI`` subclass is a rules-based
+    AI, labelled by its concrete class name."""
+    from footballcoach.rules_ai import HybridPlayerAI, NeuralPlayerAI
+
+    ai = player.ai
+    if ai is None:
+        return "No AI (order-driven only)"
+    if isinstance(ai, HybridPlayerAI):
+        return "Neural net (hybrid" + (", override active" if ai.order_override_active else "") + ")"
+    if isinstance(ai, NeuralPlayerAI):
+        return "Neural net"
+    return f"Rules ({type(ai).__name__})"
+
+
+def _format_order_value(value: object) -> str:
+    from enum import Enum
+    if isinstance(value, Vector3):
+        return f"({value.x:.1f}, {value.y:.1f}, {value.z:.1f})"
+    if isinstance(value, float):
+        return f"{value:.2f}"
+    if isinstance(value, Enum):
+        return value.name
+    if callable(value):
+        return "<fn>"
+    return repr(value)
+
+
+# PlayerAttributes field name -> short display label, in display order.
+# See entities/attributes.py -- every field is a [0.0, 1.0] rating, so no
+# per-attribute scale/unit conversion is needed for the gradient bars below.
+_ATTRIBUTE_LABELS = [
+    ("top_speed", "Top Speed"),
+    ("acceleration", "Accel"),
+    ("stamina", "Stamina"),
+    ("kick_precision", "Kick Prec"),
+    ("kick_power", "Kick Power"),
+    ("dribbling", "Dribbling"),
+    ("ball_control", "Ball Ctrl"),
+    ("tackling", "Tackling"),
+]
+
+
+def _attribute_bar_colour(value: float) -> tuple[int, int, int]:
+    """Red (0.0) -> green (1.0) via HSV hue interpolation (0 deg = red,
+    120 deg = green) rather than a raw RGB lerp -- lerping (255,0,0) to
+    (0,255,0) directly passes through a muddy brown/olive at the midpoint
+    instead of a clean yellow, since RGB isn't a perceptually-ordered space
+    for this."""
+    value = max(0.0, min(1.0, value))
+    colour = pygame.Color(0)
+    colour.hsva = (value * 120.0, 75.0, 85.0, 100.0)
+    return (colour.r, colour.g, colour.b)
+
+
+def _format_order_lines(order: object) -> list[str]:
+    """(order type name, then one "field: value" line per dataclass field)
+    -- generic over every Order in orders.py via ``dataclasses.fields()``,
+    so a newly added Order type or field shows up here automatically with
+    no per-Order-type code. Skips ``on_complete`` (an internal callback,
+    not a player-facing argument) and any leading-underscore private
+    bookkeeping field (e.g. MoveOrder's ``_overshoot_timer_s``)."""
+    import dataclasses
+    lines = [type(order).__name__]
+    for f in dataclasses.fields(order):
+        if f.name == "on_complete" or f.name.startswith("_"):
+            continue
+        lines.append(f"  {f.name}: {_format_order_value(getattr(order, f.name))}")
+    return lines
+
+
 # Font family names tried in order when searching for a font that can render
 # Unicode emoji/symbols.  The monochrome Noto Emoji font is best on Linux;
 # Symbola is a good fallback; if none match we fall back to the pygame default
 # (icons will render as replacement boxes on unsupported fonts, which is benign).
+#
+# NOTE: pygame.font.match_font() matches against the font's registered family
+# name (spaces/case stripped), NOT its filename -- "segoeuiemoji" is required
+# here, not "seguiemj" (the .ttf filename on disk). The old "seguiemj" entry
+# never matched anything, so match_font() returned None for every candidate on
+# Windows and silently fell back to the plain pygame default font, which has
+# no emoji glyphs at all -- that's why action icons showed as blank/broken
+# boxes on Windows despite Segoe UI Emoji being installed and rendering fine
+# once actually loaded (confirmed: real colour glyph data, not blank).
 _EMOJI_FONT_CANDIDATES = [
     "noto emoji",
     "notoemoji",
     "noto color emoji",
     "symbola",
     "unifont",
-    "seguiemj",
+    "segoeuiemoji",
 ]
 
 
@@ -790,6 +875,68 @@ class Renderer:
         surface.blit(bg, (box_x, box_y))
         pygame.draw.rect(surface, style.HUD_ACCENT, (box_x, box_y, box_w, box_h), 2, border_radius=6)
         surface.blit(text_surf, (box_x + padding_x, box_y + padding_y))
+
+    def draw_player_inspector(self, surface: pygame.Surface, player: Player) -> None:
+        """Side info panel (top-right, below the help button/speed control
+        row) for the currently-selected player (either team -- selecting
+        an opponent is inspection-only, see input.py's module docstring):
+        which AI (if any) drives them, their active order's type and every
+        field's current value, and their attribute ratings as red->green
+        gradient bars. Read-only, no game-logic dependency beyond
+        inspecting plain attribute/dataclass state already on
+        Player/PlayerAI/Order/PlayerAttributes."""
+        team_label = "LEFT" if player.team == Team.LEFT else "RIGHT"
+        text_lines = [f"{player.player_id}  ({team_label})", _describe_player_ai(player)]
+        order = player.current_order
+        if order is not None:
+            text_lines.append("")
+            text_lines.extend(_format_order_lines(order))
+        else:
+            text_lines.append("(no active order)")
+        text_lines.append("")
+        text_lines.append("Attributes")
+
+        line_h = self.hud_font.get_height() + 2
+        padding = 8
+        text_rendered = [
+            self.hud_font.render(line[:60], True, style.HUD_ACCENT if i < 2 else style.HUD_TEXT)
+            for i, line in enumerate(text_lines)
+        ]
+
+        bar_label_w, bar_w, bar_value_w, bar_h = 78, 100, 34, 10
+        attrs_row_w = bar_label_w + bar_w + bar_value_w
+        attrs_h = len(_ATTRIBUTE_LABELS) * line_h
+
+        box_w = max(max((r.get_width() for r in text_rendered), default=0), attrs_row_w) + padding * 2
+        box_h = len(text_lines) * line_h + attrs_h + padding * 2
+        box_x = surface.get_width() - box_w - 6
+        box_y = 48  # below the help button / speed control row
+
+        bg = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        bg.fill((10, 10, 18, 200))
+        surface.blit(bg, (box_x, box_y))
+        pygame.draw.rect(surface, style.HUD_ACCENT, (box_x, box_y, box_w, box_h), 1, border_radius=6)
+
+        y = box_y + padding
+        for text_surf in text_rendered:
+            surface.blit(text_surf, (box_x + padding, y))
+            y += line_h
+
+        attrs = player.attributes
+        for field_name, label in _ATTRIBUTE_LABELS:
+            value = getattr(attrs, field_name)
+            label_surf = self.hud_font.render(label, True, style.HUD_TEXT)
+            surface.blit(label_surf, (box_x + padding, y))
+
+            bar_x = box_x + padding + bar_label_w
+            bar_y = y + (line_h - bar_h) // 2
+            pygame.draw.rect(surface, (50, 50, 62), (bar_x, bar_y, bar_w, bar_h), border_radius=3)
+            fill_w = max(1, int(bar_w * max(0.0, min(1.0, value))))
+            pygame.draw.rect(surface, _attribute_bar_colour(value), (bar_x, bar_y, fill_w, bar_h), border_radius=3)
+
+            value_surf = self.hud_font.render(f"{value:.2f}", True, style.HUD_TEXT)
+            surface.blit(value_surf, (bar_x + bar_w + 6, y))
+            y += line_h
 
     def draw_speed_control(
         self,

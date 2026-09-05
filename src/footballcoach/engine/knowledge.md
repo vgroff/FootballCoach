@@ -97,6 +97,10 @@ mind.
 
 ## `movement.py` - movement, stamina, turning
 
+**Numeric constants in this section were found to have drifted from
+`config/physics.json["movement"]` (2026-09-05 audit) and were corrected —
+treat `physics.json` as authoritative over this prose if they disagree again.**
+
 - **Velocity invariant**: `step_player_towards` is the **only** function
   permitted to write `player.velocity`.  All callers pass a `SpeedMode` enum
   value (`SPRINT`, `JOG`, or `STANDSTILL`); the function owns all kinematics.
@@ -108,17 +112,17 @@ mind.
 
 - **Goalkeeper movement boosts**: goalkeepers get two flat multipliers from
   `physics.json` applied on top of their attribute-driven movement:
-  - `goalkeeper_accel_multiplier` (currently 3.1 in physics.json): applied
+  - `goalkeeper_accel_multiplier` (currently **3.3** in physics.json): applied
     to straight-line acceleration (`effective_acceleration`), lateral/turning
     acceleration (`lateral_accel_capability`), and thus turn rate
     (`max_turn_rate_rad_s`). **Must be applied to all three** - an earlier
     version only boosted straight-line acceleration, which caused overshoot
     and oscillation as the keeper built speed faster than they could correct
     direction when the predicted crossing point shifted each tick.
-  - `goalkeeper_speed_multiplier` (currently 1.45): applied to top speed
+  - `goalkeeper_speed_multiplier` (currently **1.23**): applied to top speed
     in `effective_top_speed`. Effective GK top speed is therefore
-    `(5.0 + 4.5*attr) * 1.45`, ranging from ~7.25 m/s (attr=0) to
-    ~13.8 m/s (attr=1.0). Simulates explosive diving reach. Applied after
+    `(5.4 + 4.7*attr) * 1.23`, ranging from ~6.6 m/s (attr=0) to
+    ~12.4 m/s (attr=1.0). Simulates explosive diving reach. Applied after
     stamina/ball-carry penalties so it stacks multiplicatively.
   Both multipliers are applied automatically via `player.is_goalkeeper`
   inside `step_player_towards`, so no call-site changes are needed for new
@@ -133,16 +137,21 @@ mind.
   covering overshoot, tunneling, and drift.
 
 - **Top speed / acceleration**: linear in the attribute,
-  `v_max = 5.0 + 4.5*top_speed` m/s (5.0-9.5 m/s), `a_max = 2.5 + 5.0*accel`
-  m/s² (2.5-7.5 m/s²). 9.5 m/s is a very fast but real football sprint
-  speed; 5.0 m/s is a brisk jog, deliberately never "slow" per Idea.md's
+  `v_max = 5.4 + 4.7*top_speed` m/s (5.4-10.1 m/s), `a_max = 3.3 + 2.4*accel`
+  m/s² (3.3-5.7 m/s²). ~10 m/s is a very fast but real football sprint
+  speed; 5.4 m/s is a brisk jog, deliberately never "slow" per Idea.md's
   "League Three should still be competent" requirement.
-- **Stamina multiplier**: `1 - 0.65*(1 - stamina_fraction)`, i.e. exactly
-  the "reduces speed/acceleration by up to 65%" from Idea.md. At full
-  stamina the multiplier is 1 (no penalty); at 0 stamina it's 0.35.
-- **Ball-carry speed multiplier**: `0.75 + 0.22*ball_control`, capped at
-  0.97 even at `ball_control=1.0` - Idea.md explicitly requires dribbling to
-  never be as fast as running free, "even at 1.0 dribbling".
+- **Stamina multiplier**: `1 - stamina_speed_penalty_max*(1 - stamina_fraction)`,
+  `stamina_speed_penalty_max = 0.63`, i.e. roughly the "reduces speed/
+  acceleration by up to 65%" from Idea.md. At full stamina the multiplier is
+  1 (no penalty); at 0 stamina it's 0.37.
+- **Ball-carry speed multiplier**: `ball_carry_speed_mult_base (0.77) +
+  ball_carry_speed_mult_scale (0.19) * ball_control`, capped at 0.96 even at
+  `ball_control=1.0` - Idea.md explicitly requires dribbling to never be as
+  fast as running free, "even at 1.0 dribbling". This is also snapshotted
+  once more at the very *start* of a first touch — see `control_speed_
+  multiplier` in the `possession.py` section below, a separate, one-time
+  cut applied on top of (not instead of) this ongoing multiplier.
 - **Turning**: modelled via a max *lateral acceleration* budget
   `a_lat = 4.0 + 4.0*accel_attr` m/s², from which a max turn rate is derived
   as `omega_max = a_lat / max(speed, min_speed)`. This is the key modelling
@@ -156,8 +165,11 @@ mind.
   speed penalty). A large heading change also caps the *target* speed for
   that tick (`turn_speed_penalty`), so you can't "moonwalk" instantly from
   full speed forward to full speed sideways.
-- **Stamina drain/regen**: `drain_rate = base * (1.6 - 1.2*stamina_attr)`,
-  `regen_rate = base * (0.6 + 0.8*stamina_attr)`. Chosen so a continuous
+- **Stamina drain/regen**: `drain_rate = base * lerp(stamina_drain_attr_lo
+  (1.6), stamina_drain_attr_hi (1.1), stamina_attr)` = `base * (1.6 -
+  0.5*stamina_attr)`, `regen_rate = base * lerp(stamina_regen_attr_lo (0.7),
+  stamina_regen_attr_hi (0.9), stamina_attr)` = `base * (0.7 +
+  0.2*stamina_attr)`. Chosen so a continuous
   sprint drains a mid-attribute (0.5) player to near-zero over roughly
   60-90 seconds - fast enough to matter within a single passage of play,
   slow enough that short sprints aren't punished. See
@@ -393,6 +405,10 @@ reusing `KickingParams`:
 
 ## `possession.py` - first-touch control-time model
 
+**The height/timing constants below were found to have drifted from
+`config/physics.json["control_time"]` (2026-09-05 audit) and were
+corrected.**
+
 Models how long it takes a player to bring a loose ball under control on
 first touch, as a function of the ball's height, the relative velocity
 between ball and player, the player's own speed, and their `ball_control`
@@ -407,7 +423,7 @@ hard percentage targets.
   - flat at `f=1.0` for anything at or below knee height (0.49m) - a
     rolling or bouncing low ball is roughly as easy to control regardless
     of exact height.
-  - rises quadratically to `f=2.0` at waist height (0.95m) - a knee-to-waist
+  - rises quadratically to `f=1.5` at waist height (0.95m) - a knee-to-waist
     ball requires real technique, and the *quadratic* shape (rather than
     linear) means it stays easy near the knee and gets meaningfully harder
     only as it approaches the waist.
@@ -428,8 +444,8 @@ hard percentage targets.
     (never fully to zero), consistent with the "never perfect" philosophy
     applied everywhere else in this codebase (kicks, tackles).
 - **Final formula**: `t_control = t_base + t_scale * extra`, with
-  `t_base = 0.1s` (an irreducible minimum reaction/first-touch time) and
-  `t_scale = 0.3s`.
+  `t_base = 0.04s` (an irreducible minimum reaction/first-touch time) and
+  `t_scale = 0.17s`.
 - **Goalkeeper-in-box special case**: per Idea.md, goalkeepers in their own
   box control the ball much more easily (they can use their hands) - modeled
   with a lower `t_base_gk = 0.08s`, a height-factor scaled down to 40% of
@@ -444,6 +460,26 @@ hard percentage targets.
   and the per-metre penalty is lower (GK advantage). Below head height,
   outfield players are completely unaffected by this extension (regression
   safe). Config keys in `physics.json["control_time"]`.
+- **First-touch speed snap** (`control_speed_multiplier`, not previously
+  documented here): the instant a loose ball is picked up and
+  `player.state` becomes `CONTROLLING_BALL`, `Match._update_loose_ball_
+  pickup` immediately multiplies the player's *current* velocity by
+  `movement_params.control_speed_multiplier` (**0.6**, i.e. a 40% cut) —
+  a one-time snap, separate from (and on top of) the ongoing ball-carry
+  top-speed multiplier in `movement.py`. The player then coasts at that
+  reduced speed for the rest of the control-time window (`t_control`
+  above) before normal movement resumes.
+  - **Exception — armed one-touch redirect**: if the player had already
+    committed to a push-kick via `kick_armed`/`kick_armed_direction` (see
+    `orders.py`'s `_try_push_kick` and `apply_nn_action.py`), the pickup
+    skips `CONTROLLING_BALL` (and this speed snap) entirely and redirects
+    the ball immediately with no control-time delay at all — the actual
+    one-touch path. Gated on `ball_settled` (`|ball.velocity.z| <
+    ball_pickup_params.armed_redirect_settle_vz_mps`) so an armed redirect
+    can't fire while the ball still has real vertical velocity (e.g.
+    mid-bounce from the same player's own prior kick) — see the long
+    comment at `Match._update_loose_ball_pickup`'s armed-kick branch for
+    the bug history this guards against.
 - A small proportional Gaussian noise term (`noise_sigma_fraction = 0.1`,
   scaled by `rng_reduction`) is added on top of the deterministic
   `t_control` in `Match._update_loose_ball_pickup`, so touches aren't
@@ -454,32 +490,78 @@ hard percentage targets.
 
 ## `tackling.py` - tackle skill checks
 
-A single RNG skill check per Idea.md's spec:
-`tackler_roll = skill_roll(tackling_attr * 1.2, rng_reduction)` vs
-`dribbler_roll = skill_roll(dribbling_attr, rng_reduction)`, tackler wins if
-`tackler_roll > dribbler_roll`. The `1.2` tackler boost is Idea.md's
-explicit instruction ("tackling always gets a 20% boost... to favour the
-defender... they can then roll higher than 1"). Analytically, at the
-default `rng_reduction=0.3`, tackling=0.8 vs dribbling=0.6 gives the tackler
-a ~82.5% win rate, matching the design target of 70-90%
-(`tests/balance/test_tackling_balance.py` verifies this empirically over
-5000 trials and also reports a full win-rate grid across many attribute
-pairs for balance inspection).
+**This section was found to have drifted significantly from the live code
+(2026-09-05 audit) and was rewritten from scratch against
+`tackling.py`/`match.py`/`physics.json["tackling"]` — treat the numbers below
+as authoritative over any other doc/comment that disagrees.**
 
-On a successful tackle in `Match._process_orders`, the tackled player
-enters `PlayerState.INACTIVE_TACKLED` for `inactive_duration_s` (0.6s by
-default), during which they can't tackle and (per Idea.md) should have
-reduced speed - the reduced-speed-while-inactive multiplier
-(`inactive_speed_penalty`) is defined in config but not yet wired into
-`movement.py`'s speed calculation; this is a known gap to close before this
-mechanic is fully complete (see "Known gaps" below).
+`attempt_tackle()` runs a skill check with an angle-dependent boost:
 
-A **failed** tackle attempt also briefly incapacitates the *tackler* (not
-just a successful one dispossessing the victim): `player.state` is set to
-`INACTIVE_TACKLED` for `tackler_miss_inactive_duration_s` (shorter than the
-victim's `inactive_duration_s`, since a mistimed lunge leaves you
-momentarily off-balance but not as badly as actually being dispossessed).
-Applies in the `ChaseTackleOrder` branch of `Match._process_orders`.
+```
+effective_boost = base_boost * (1 + angle_modifier)
+tackler_roll  = skill_roll(tackling_attr * effective_boost, rng_reduction)
+dribbler_roll = skill_roll(effective_dribbling_attr, rng_reduction)
+tackler wins iff tackler_roll >= dribbler_roll
+```
+
+- `base_boost` is `tackler_boost` (**1.25**, +25%) for an outfield tackler,
+  or `goalkeeper_tackle_boost` (**2.0**, +100%) if the tackler is a
+  goalkeeper — a keeper coming to punch/collect is a much stronger
+  challenge than an outfield tackle.
+- `angle_modifier` (`tackle_angle_modifier`) depends on which direction the
+  tackle comes from relative to the dribbler's *heading* (not the tackler's
+  own heading): **+0.10** tackling from directly in front
+  (`angle_modifier_frontal`), **-0.05** side-on (`angle_modifier_side`),
+  **-0.5** from directly behind (`angle_modifier_behind`) — piecewise-linear
+  in `cos(angle)`. A tackler blindsiding a dribbler from behind is
+  meaningfully weaker than one standing square in their path.
+- `effective_dribbling_attr` is the target's `dribbling` attribute, reduced
+  by the CONTROLLING_BALL penalty below where applicable.
+
+At the default `rng_reduction=0.3`, tackling=0.8 vs dribbling=0.6 (no angle
+modifier) still lands the tackler a win rate in the 70-90% design-target
+band — see `tests/balance/test_tackling_balance.py`, which verifies this
+empirically over 5000 trials and reports a full win-rate grid across
+attribute pairs. That test predates the angle modifier and doesn't vary it,
+so it's exercising the side-on-equivalent (`angle_modifier≈0`) case.
+
+### Speed consequences — one-time snaps at the resolution instant
+
+`apply_tackle_result()` is the only place velocity is written for a tackle
+outcome; it applies **once**, not as an ongoing debuff:
+
+- **Always, to both players regardless of outcome**: tackler
+  `velocity *= tackle_attempt_tackler_speed_mult` (**0.5**), tacklee
+  `velocity *= tackle_attempt_tacklee_speed_mult` (**0.8**) — contact costs
+  both players pace even before considering who won.
+- **The loser** (whichever roll was lower) additionally loses
+  `min(|tackler_roll - dribbler_roll| * loser_speed_penalty_scale (1.2),
+  loser_speed_penalty_max (0.8))` on top of their base multiplier — a
+  convincingly-lost challenge costs real pace, a close one barely more than
+  the base contact cost.
+- **If the dribbler wins**, how convincingly they won also matters for
+  *their own* speed (independent of the loser-penalty above, which in this
+  branch applies to the tackler instead): margin `>= dribble_beaten_speed_
+  threshold` (**0.35**, i.e. the dribbler's winning roll beat the tackler's
+  by ≥35%) → dribbler keeps full speed; a narrower win scales down linearly
+  to `1 - dribble_beaten_max_penalty` (**0.8**) at a near-zero margin — even
+  "winning" a tackle attempt can cost a dribbler most of their speed if it
+  was close.
+
+### Inactivity — unified for both players, every attempt
+
+`apply_tackle_result()` sets **both** the tackler and the tacklee to
+`PlayerState.INACTIVE_TACKLED` for `tackle_cooldown_s` (**1.2s**) on *every*
+resolved attempt, win or lose — there is no separate shorter "failed lunge"
+duration any more; both parties get the same cooldown regardless of outcome.
+While inactive a player: can't tackle or be tackled
+(`Player.is_available_to_tackle()`), is excluded from push-apart collision
+resolution (but *not* from velocity damping — see `collision.py` below), and
+does not regen stamina (`Match._update_state_timers` only regens `ACTIVE`
+players). There is **no ongoing speed penalty** for being inactive itself —
+`inactive_speed_penalty` doesn't exist in `physics.json` (removed at some
+point after being originally planned; the only speed effect of a tackle is
+the one-time snap above, after which normal deceleration/physics take over).
 
 ### Phase B tackle modifiers (added after initial implementation)
 
@@ -489,9 +571,10 @@ function signature clean:
 
 **1. GK outside-box penalty** (`gk_outside_box: bool = False`):
 - If the tackler is a goalkeeper and is **outside** their own penalty box,
-  their effective `tackling_attr` is multiplied by
-  `(1 - goalkeeper_outside_box_tackle_penalty)` (currently `0.4` → 40%
-  penalty, i.e. GK tackles at 60% effectiveness outside the box).
+  their `effective_boost` (already the 2.0 GK boost, see above) is
+  multiplied by `(1 - goalkeeper_outside_box_tackle_penalty)` (currently
+  `0.4` → 40% penalty), bringing the boost down to ~1.2 — roughly outfield
+  level, so a roaming keeper isn't a supertackler everywhere outside their box.
 - Convention: `Team.LEFT` GK defends the box at the left end of the pitch
   (x ≤ `pitch.left_box_max_x`); `Team.RIGHT` GK defends the right end.
 - Call sites check `player.is_goalkeeper and not pitch.is_in_own_box(player)`.
@@ -510,11 +593,20 @@ function signature clean:
   their effective `dribbling_attr` is penalised based on how long they've
   been in that state: `penalty_frac = min(1.0, state_timer_s /
   control_time_penalty_reference_s)`, effective dribbling =
-  `dribbling_attr * (1 - 0.25 * penalty_frac)`.
+  `dribbling_attr * (1 - 0.25 * penalty_frac)` (`Match._effective_dribbling`).
 - Config: `physics.json["tackling"]["control_time_penalty_reference_s"]`
   (currently `0.3s`).
 - If the tackler wins against a `CONTROLLING_BALL` target, the tackler is
   given the ball (not just the target losing possession).
+- **Asymmetry (currently real, not obviously intentional)**: this penalty is
+  only applied via `Match._attempt_tackle_contact` — the armed-tackle path
+  used by `ChaseTackleOrder`/`GetPossessionOrder`. `Match._check_head_on_
+  tackles` (the collision-based auto-tackle fallback) calls `attempt_tackle`
+  with `carrier.attributes.dribbling` raw, never routing through
+  `_effective_dribbling()`. So a player mid-first-touch is easier to
+  dispossess via a deliberate chase-tackle than via an incidental head-on
+  collision, for no documented reason — flag to the project owner if this
+  should be unified.
 
 **4. Aerial-ball tackle immunity — currently DEAD CODE, deferred on
 purpose**:
@@ -720,8 +812,6 @@ there's no "single order resolution while otherwise paused" mode yet).
 
 ## Known gaps / explicitly deferred (not oversights - flagging for future work)
 
-- `inactive_speed_penalty` (reduced speed while `INACTIVE_TACKLED`) is
-  defined in config but not yet applied in `movement.py`.
 - `PassOrder` now exists distinct from a generic `KickOrder` (see
   `pass_ball` above), but offside checks (`check_offside_on_pass`) still
   aren't wired into `Match` - there's no possession-change/whistle handling

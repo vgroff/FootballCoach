@@ -241,6 +241,7 @@ def record_episodes(
     # reads reward/done off these rows, never feeds them into a PPO buffer.
     env.always_compute_secondary_reward = True
     from footballcoach.rules_ai import Phase1RulesAI
+    from footballcoach.orders import JogOrder
     from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS
 
     if sample_every_n_decisions < 1:
@@ -609,7 +610,21 @@ def record_episodes(
                 match._opponent_use_rules_ai = True
                 match._opponent_is_immobile = False
             else:
+                # ai stays None (Phase1RulesAI.decide() and others key off
+                # `opponent.ai is None` as their "can this opponent ever
+                # move/contest" signal -- see JogOrder's own docstring) --
+                # but current_order is set directly so the opponent still
+                # moves like a real player (accel/turn-rate/heading via
+                # step_player_towards) instead of Match._apply_movement's
+                # "no order this tick" branch, which now RAISES rather than
+                # silently coasting (see that method's docstring) -- this
+                # mirrors the identical fix already applied to
+                # build_1v1_scenario's own internal immobile-opponent roll
+                # in ui/scenarios.py; this is the separate, deliberately-
+                # duplicated roll described above, so it needed the same
+                # fix applied here too.
                 opp.ai = None
+                opp.current_order = JogOrder(direction=opp.velocity)
                 match._opponent_use_rules_ai = False
                 match._opponent_is_immobile = True
             opp.on_kick = _make_on_kick("opponent", "opponent")

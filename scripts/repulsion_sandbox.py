@@ -27,7 +27,7 @@ PARAMS = RepulsionParams(
     ball_carrier_speed_penalty_max=0.4,
     speed_penalty_scale=0.0847,
     alignment_dot_threshold=-0.7,
-    min_orthogonal_adjust_mps=1.5,
+    max_tangent_deg=70.0,
 )
 
 DT = 0.1          # seconds per tick

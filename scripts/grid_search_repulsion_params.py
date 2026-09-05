@@ -43,7 +43,7 @@ GRID = {
     "strength_base":               [2.2, 2.5, 2.8],
     "ball_carrier_repulsion_mult": [1.8, 2.0, 2.2],
     "speed_penalty_scale":         [0.10, 0.12, 0.14],
-    "min_orthogonal_adjust_mps":   [0.75, 1.0, 1.25],
+    "max_tangent_deg":             [45.0, 70.0, 90.0],
 }
 
 # These were insensitive across prior sweeps — fixed at known-good values

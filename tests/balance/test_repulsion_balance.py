@@ -46,7 +46,7 @@ def _zero_repulsion_params() -> RepulsionParams:
         ball_carrier_speed_penalty_max=0.0,
         speed_penalty_scale=0.0,
         alignment_dot_threshold=-0.7,
-        min_orthogonal_adjust_mps=0.0,
+        max_tangent_deg=0.0,
     )
 
 
@@ -265,12 +265,24 @@ def test_on_collision_course_players_avoid(balance_recorder):
 def test_ball_carrier_avoidance_and_slowdown(balance_recorder):
     """Ball carrier running toward an obstacle should:
     (a) maintain separation (avoidance succeeds), AND
-    (b) be measurably slower during close approach than a non-carrier."""
+    (b) get its SPRINT downgraded to JOG at some point during close approach
+        -- the actual mechanic ball_carrier_speed_penalty_max/speed_penalty_scale
+        drive (see orders.py: `if speed_mode is SpeedMode.SPRINT and speed_mult
+        < 0.75: speed_mode = SpeedMode.JOG`). Raw mean speed during close
+        approach (the original metric here) is NOT a reliable proxy for this:
+        it's sensitive to the exact curving path taken, which can legitimately
+        differ a lot between two repulsion configs (e.g. the tangential-
+        rotation redesign's smooth dodge vs. the old push-straight-back
+        behaviour) independent of whether the downgrade itself ever fired --
+        confirmed the hard way when this test started failing on a config
+        that WAS applying the ball-carrier penalty correctly, just via a
+        different, faster-clearing trajectory shape."""
+    from footballcoach.engine.movement import SpeedMode
     N_STEPS = 45
     sum_radii = 0.6
 
-    def _run_carrier(carrier_has_ball: bool) -> tuple[float, float]:
-        """Returns (min_separation, mean_speed_during_close_approach)."""
+    def _run_carrier(carrier_has_ball: bool) -> tuple[float, bool]:
+        """Returns (min_separation, sprint_downgraded_to_jog_during_close_approach)."""
         carrier = make_player("carrier", Team.LEFT, 0.9, position=Vector3(-3.0, 0.0, 0.0))
         obstacle = make_player("obstacle", Team.RIGHT, 0.9, position=Vector3(3.0, 0.0, 0.0))
         carrier.velocity = Vector3(7.0, 0.0, 0.0)
@@ -279,8 +291,8 @@ def test_ball_carrier_avoidance_and_slowdown(balance_recorder):
 
         ball = Ball(position=Vector3(-3.0 + 0.41, 0.0, 0.11))
 
-        from footballcoach.orders import MoveOrder, SaveOrder
-        carrier.current_order = MoveOrder(target_position=Vector3(8.0, 0.0, 0.0))
+        from footballcoach.orders import MoveOrder
+        carrier.current_order = MoveOrder(target_position=Vector3(8.0, 0.0, 0.0), sprint=True)
         # Fallback AI in case the carrier's MoveOrder completes (arrival)
         # before the step loop ends.
         carrier.ai = StopWhenIdleAI()
@@ -297,7 +309,7 @@ def test_ball_carrier_avoidance_and_slowdown(balance_recorder):
 
         match = _make_match([carrier, obstacle], ball)
         separations = []
-        close_approach_speeds = []
+        jog_downgrade_fired = False
 
         for _ in range(N_STEPS):
             match.step()
@@ -305,32 +317,36 @@ def test_ball_carrier_avoidance_and_slowdown(balance_recorder):
             obs = match.players[1]  # obstacle
             sep = p.position.xy().distance_to(obs.position.xy())
             separations.append(sep)
-            if sep < 4.0:  # within repulsion radius
-                close_approach_speeds.append(p.speed_mps)
+            if sep < 4.0 and p.desired_speed_mode == SpeedMode.JOG:  # within repulsion radius
+                jog_downgrade_fired = True
 
-        min_sep = min(separations)
-        mean_speed = (sum(close_approach_speeds) / len(close_approach_speeds)
-                      if close_approach_speeds else 0.0)
-        return min_sep, mean_speed
+        return min(separations), jog_downgrade_fired
 
-    min_sep_carrier, mean_speed_carrier = _run_carrier(True)
-    min_sep_no_carrier, mean_speed_no_carrier = _run_carrier(False)
+    min_sep_carrier, carrier_downgraded = _run_carrier(True)
+    min_sep_no_carrier, no_carrier_downgraded = _run_carrier(False)
 
     balance_recorder.report("repulsion_ball_carrier_avoidance", {
         "min_sep_with_ball_m": round(min_sep_carrier, 4),
         "min_sep_without_ball_m": round(min_sep_no_carrier, 4),
-        "mean_close_approach_speed_with_ball_mps": round(mean_speed_carrier, 3),
-        "mean_close_approach_speed_without_ball_mps": round(mean_speed_no_carrier, 3),
-        "carrier_is_slower": mean_speed_carrier < mean_speed_no_carrier,
+        "carrier_sprint_downgraded_to_jog": carrier_downgraded,
+        "non_carrier_sprint_downgraded_to_jog": no_carrier_downgraded,
     })
     # (a) Avoidance succeeds for both
     assert min_sep_carrier >= sum_radii - 0.1, (
         f"Ball carrier overlap: min_sep={min_sep_carrier:.3f}m"
     )
-    # (b) Carrier measurably slower during close approach
-    assert mean_speed_carrier < mean_speed_no_carrier, (
-        f"Expected carrier to be slower near obstacle: "
-        f"carrier={mean_speed_carrier:.2f} vs non-carrier={mean_speed_no_carrier:.2f}"
+    # (b) Carrier's ball-carrier-specific speed penalty actually fired
+    assert carrier_downgraded, (
+        "Expected the ball carrier's SPRINT to be downgraded to JOG at some "
+        "point during close approach to the obstacle -- ball_carrier_speed_"
+        "penalty_max/speed_penalty_scale never triggered."
+    )
+    # Non-carrier should never get this -- has_ball=False skips the whole
+    # speed-penalty branch in compute_repulsion (speed_mult always 1.0).
+    assert not no_carrier_downgraded, (
+        "Non-carrier unexpectedly got the ball-carrier-specific speed "
+        "downgrade -- should be impossible since has_ball=False skips that "
+        "branch in compute_repulsion entirely."
     )
 
 

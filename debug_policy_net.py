@@ -297,7 +297,16 @@ def _build_replay_env(trainer, seed: int, *, deterministic: bool = True):
         opponent.ai = Phase1RulesAI()
         match._opponent_use_rules_ai, match._opponent_is_immobile = True, False
     else:
+        # ai stays None (Phase1RulesAI.decide() and others key off
+        # `opponent.ai is None` as their "can this opponent ever move/
+        # contest" signal) -- but current_order is set directly so the
+        # opponent still moves like a real player instead of Match.
+        # _apply_movement's "no order this tick" branch, which now RAISES
+        # rather than silently coasting. Same fix as replay_episode.py's
+        # apply_phase1_opponent_roll() (this is its duplicate, see above).
+        from footballcoach.orders import JogOrder
         opponent.ai = None
+        opponent.current_order = JogOrder(direction=opponent.velocity)
         match._opponent_use_rules_ai, match._opponent_is_immobile = False, True
     return env
 

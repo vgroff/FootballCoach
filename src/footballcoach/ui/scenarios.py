@@ -205,8 +205,18 @@ class ScenarioDefinition:
     """Optional per-outcome label transformer called as remap(match, raw_outcome,
     last_ball_toucher_id) before the outcome is recorded.  Used by phase1 to
     apply the same label transforms ScenarioEnv does (goal→miss, miss→invalid
-    when untouched, box_possession→opponent_box_possession when it's the
-    opponent in the box) so UI tallies match training/eval breakdowns exactly."""
+    when untouched) so UI tallies match training/eval breakdowns exactly."""
+    phase1_trainee_player_id: str | None = None
+    """player_id of the trainee, for phase-1 1v1 scenarios only. When set,
+    forwarded to detect_trial_outcome() (ai/env/outcome.py) so box-possession
+    detection uses the SAME trainee/opponent-differentiated, can_score_box_
+    terminal()-gated check ScenarioEnv (training/eval) uses -- instead of the
+    generic "any player, any box" check every other scenario gets. Without
+    this, a UI/debug-script playback of a phase-1 1v1 scenario can end (and
+    declare a winner) purely because the ball first neared a box, on a trial
+    eval's own gated check would correctly keep running and score the other
+    way once the ball changed hands again -- confirmed as a real, repeated
+    source of "the UI shows a different outcome than eval recorded" bugs."""
 
 
 def build_penalty_scenario(rng_reduction: float = 0.3) -> Match:
@@ -937,6 +947,51 @@ def build_repulsion_obstacle_scenario(
     return match
 
 
+def build_repulsion_obstacle_no_ball_scenario(
+    rng_reduction: float = 0.3,
+    *,
+    obstacle_on_path: float = 1.0,
+    attacker_skill: float = 0.9,
+) -> Match:
+    """Identical to build_repulsion_obstacle_scenario except the runner never
+    takes possession of the ball -- isolates the pure movement/repulsion
+    avoidance mechanic from ball-carrying effects (effective_top_speed's
+    has_ball speed reduction, dribble-loss risk) that the possessed version
+    always has active. Ball sits at rest at the start position, uninvolved."""
+    pitch = Pitch.standard()
+    rng = random.Random()
+
+    start = Vector3(-20.0, 0.0, 0.0)
+    target = Vector3(20.0, 0.0, 0.0)
+    obstacle_y = (1.0 - obstacle_on_path) * 5.0
+
+    obstacle = Player.create(
+        "obstacle", Team.RIGHT,
+        PlayerAttributes.average(0.5),
+        position=Vector3(0.0, obstacle_y, 0.0),
+    )
+    runner = Player.create(
+        "attacker", Team.LEFT,
+        PlayerAttributes.average(attacker_skill),
+        position=start,
+    )
+    # Parked well off the x=-20->+20, y~0 run path (not just unpossessed --
+    # if it sat at `start` like the ball-carrier version does, the runner
+    # would be within the 0.55m auto-pickup radius on the very first tick
+    # and pick it up immediately regardless of set_initial_possession).
+    ball = Ball.at_rest(Vector3(0.0, pitch.half_width - 5.0, 0.0))
+    ui_cfg = load_gameplay_config().get("ui", {})
+    match = Match(
+        pitch=pitch, players=[runner, obstacle], ball=ball,
+        rng_reduction=rng_reduction, rng=rng,
+        goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
+    )
+    runner.current_order = MoveOrder(target_position=target, sprint=True)
+    obstacle.ai = StopWhenIdleAI()
+    runner.ai = StopWhenIdleAI()
+    return match
+
+
 # ---------------------------------------------------------------------------
 # Phase 1 curriculum: 1v1 get-possession / move-toward-goal
 # ---------------------------------------------------------------------------
@@ -1224,14 +1279,22 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
 
         try:
             if trainee_immobile:
-                match.player_by_id("trainee").ai = None
+                # ai stays None (see JogOrder's own docstring) -- current_order
+                # set directly so Match._apply_movement (which now RAISES if a
+                # player has no movement intent, rather than silently coasting)
+                # is satisfied.
+                _trainee = match.player_by_id("trainee")
+                _trainee.ai = None
+                _trainee.current_order = JogOrder(direction=_trainee.velocity)
             else:
                 match.player_by_id("trainee").ai = None if trainee_trainer is not None else Phase1RulesAI()
         except KeyError:
             pass
         try:
             if opponent_immobile:
-                match.player_by_id("opponent").ai = None
+                _opponent = match.player_by_id("opponent")
+                _opponent.ai = None
+                _opponent.current_order = JogOrder(direction=_opponent.velocity)
             else:
                 match.player_by_id("opponent").ai = None if opponent_trainer is not None else Phase1RulesAI()
         except KeyError:
@@ -1705,7 +1768,14 @@ def build_1v1_escaping_ball_scenario(
     opponent = Player.create("opponent", opponent_team, opponent_attrs, position=Vector3(0.0, 0.0, 0.0))
     opponent.stamina = rng.uniform(stamina_min, stamina_max)
     opponent.heading_rad = rng.uniform(-math.pi, math.pi)
+    # ai stays None (see JogOrder's own docstring for why) -- current_order
+    # set directly instead, so Match._apply_movement (which now RAISES if a
+    # player has no movement intent, rather than silently coasting) is
+    # satisfied. opponent.velocity is zero here, so JogOrder resolves to
+    # "stay put forever" via its own zero-direction handling -- exactly
+    # matching this scenario's "always immobile, parked" intent.
     opponent.ai = None
+    opponent.current_order = JogOrder(direction=opponent.velocity)
 
     # --- Ball: aimed from its corner toward the NEAREST boundary intersection
     # (i.e. straight out through that same corner), small angular jitter so
@@ -1973,6 +2043,7 @@ SCENARIOS: list[ScenarioDefinition] = [
             ScenarioParam("ball_max_speed_mps", "Ball max speed (m/s)", 0.0, 60.0, 0.5, 10.0),
             ScenarioParam("restitution_sigma", "Restitution randomness (sigma)", 0.0, 1.0, 0.01, 0.08),
         ],
+        phase1_trainee_player_id="trainee",
     ),
     # ---- Balance scenarios ----
     ScenarioDefinition(
@@ -2070,6 +2141,16 @@ SCENARIOS: list[ScenarioDefinition] = [
         label="Repulsion: ball carrier past stationary obstacle",
         description="Ball carrier runs x=-20 to x=+20 with a stationary player on the path. obstacle_on_path=1 is dead-centre, 0 is 5 m aside.",
         build=build_repulsion_obstacle_scenario,
+        params=[
+            ScenarioParam("obstacle_on_path", "Obstacle on path (1=centre, 0=5m aside)", 0.0, 1.0, 0.1, 1.0),
+            ScenarioParam("attacker_skill", "Attacker skill", 0.3, 1.0, 0.05, 0.9),
+        ],
+    ),
+    ScenarioDefinition(
+        key="repulsion_obstacle_no_ball",
+        label="Repulsion: player past stationary obstacle (no ball)",
+        description="Same as the ball-carrier repulsion scenario, but the runner never takes possession -- isolates the avoidance steering from ball-carrying speed/dribble effects.",
+        build=build_repulsion_obstacle_no_ball_scenario,
         params=[
             ScenarioParam("obstacle_on_path", "Obstacle on path (1=centre, 0=5m aside)", 0.0, 1.0, 0.1, 1.0),
             ScenarioParam("attacker_skill", "Attacker skill", 0.3, 1.0, 0.05, 0.9),
@@ -2329,6 +2410,7 @@ class ScenarioLoop:
             box_possession_terminal=self.definition.box_possession_terminal,
             trial_tick=self._trial_tick,
             timeout_ticks=self.timeout_ticks,
+            phase1_trainee_player_id=self.definition.phase1_trainee_player_id,
         )
         if outcome is None:
             return None, 0.0
