@@ -23,6 +23,7 @@ Usage:
 """
 from __future__ import annotations
 
+import collections
 import copy
 import dataclasses
 import logging
@@ -140,6 +141,10 @@ REWARD_COMP_LABELS: list[tuple[str, str]] = [
 
 # Execution-network head name -> nn.Module attribute name, used for the
 # per-head gradient-norm / logit-drift diagnostics in _ppo_update().
+_GRAD_NORM_SPIKE_TOP_K = 15  # how many params to show in a grad-norm-spike breakdown, see PPOTrainer.grad_norm_spike_k
+_GRAD_NORM_SPIKE_HISTORY_MAXLEN = 200  # rolling window size for the adaptive spike bar's running mean/std
+_GRAD_NORM_SPIKE_MIN_SAMPLES = 20  # don't check for spikes until the running history has at least this many samples
+
 EXEC_HEAD_MODULES: list[tuple[str, str]] = [
     ("move_direction", "move_direction"),
     ("exec_move", "exec_move_logit"),
@@ -150,6 +155,193 @@ EXEC_HEAD_MODULES: list[tuple[str, str]] = [
     ("kick_spin", "kick_spin"),
     ("tackle_attempt", "tackle_attempt_logit"),
 ]
+
+
+def _maybe_log_grad_norm_spike(
+    trainer: "PPOTrainer", label: str, epoch_i: int, mb_i: int, raw_grad_norm: float,
+) -> None:
+    """Adaptive grad-norm-spike diagnostic, shared by PPO/BC/DAgger's
+    minibatch loops (_ppo_update, pretrain_combined()'s Phase 1, dagger.py's
+    train_bc_epochs()). Maintains a bounded rolling history of raw grad
+    norms on the trainer (trainer._grad_norm_history, most-recent
+    _GRAD_NORM_SPIKE_HISTORY_MAXLEN samples pooled across ALL THREE training
+    loops -- deliberately not reset per-epoch/per-phase, since "is this
+    minibatch's grad norm unusually large FOR THIS RUN" is the question, and
+    a brand new run naturally starts the window empty again anyway).
+
+    Fires a [grad norm SPIKE] warning with a top-K per-parameter-tensor
+    breakdown whenever raw_grad_norm exceeds (running_mean +
+    trainer.grad_norm_spike_k * running_std) of that history -- adaptive to
+    whatever scale a given run/config actually produces, instead of a fixed
+    absolute number that needs re-tuning any time the typical scale changes
+    (confirmed necessary: a real run with mean~5 max~200 needs a very
+    different absolute bar than a small smoke-test with mean~4.6 max~14.3).
+    Requires at least _GRAD_NORM_SPIKE_MIN_SAMPLES observations before
+    checking at all -- an empty/tiny history has a meaningless mean/std and
+    would otherwise flag the first few minibatches of every run as "spikes"
+    against almost no baseline. The just-observed raw_grad_norm is appended
+    to the history AFTER computing the bar, so it never inflates its own
+    baseline.
+
+    Must be called with .grad still populated on trainer.decision_net/
+    execution_net (i.e. after backward(), before optimizer.step()/
+    zero_grad()) -- the per-parameter breakdown reads those .grad tensors
+    directly. `label` is a short tag (e.g. "PPO", "BC", "DAgger") included
+    in the log line so it's clear which training loop an outlier fired from.
+    """
+    if trainer.grad_norm_spike_k is None:
+        return
+    history = trainer._grad_norm_history
+    if len(history) >= _GRAD_NORM_SPIKE_MIN_SAMPLES:
+        running_mean = float(np.mean(history))
+        running_std = float(np.std(history))
+        spike_bar = running_mean + trainer.grad_norm_spike_k * running_std
+        if raw_grad_norm > spike_bar:
+            from footballcoach.ai.obs.schema import BallFeatures, GlobalFeatures, PlayerFeatures
+            # "First touch" Linear layers -- the ones whose in_features IS
+            # the raw named feature schema (not a hidden/intermediate
+            # width) -- keyed by parameter-name SUFFIX (matched via
+            # str.endswith below) so both decision_net's and execution_net's
+            # copies match regardless of module-path prefix.
+            _first_touch_layer_schemas = {
+                "entity_encoder.per_entity_mlp.0.weight": PlayerFeatures,
+                "entity_encoder.ball_query_proj.weight": BallFeatures,
+                "entity_encoder.global_query_proj.weight": GlobalFeatures,
+                "self_mlp.0.weight": PlayerFeatures,
+                "ball_mlp.0.weight": BallFeatures,
+                "global_mlp.0.weight": GlobalFeatures,
+            }
+            _named_params = [
+                (f"{_net_name}.{_n}", _n, _p)
+                for _net_name, _net in (("decision_net", trainer.decision_net), ("execution_net", trainer.execution_net))
+                for _n, _p in _net.named_parameters()
+                if _p.grad is not None
+            ]
+            _named_grad_norms = [(_full, _p.grad.norm().item()) for _full, _n, _p in _named_params]
+            _named_grad_norms.sort(key=lambda kv: kv[1], reverse=True)
+            _top_spike = _named_grad_norms[:_GRAD_NORM_SPIKE_TOP_K]
+            _spike_str = "  ".join(f"{name}={norm:.2f}" for name, norm in _top_spike)
+            log.warning(
+                f"[grad norm SPIKE][{label}] epoch={epoch_i} mb={mb_i} raw={raw_grad_norm:.2f} "
+                f"(running mean={running_mean:.2f} std={running_std:.2f} "
+                f"bar=mean+{trainer.grad_norm_spike_k:.1f}*std={spike_bar:.2f}, n={len(history)}) -- "
+                f"top {len(_top_spike)} params: {_spike_str}"
+            )
+            # Per-input-COLUMN gradient norm for whichever "first touch"
+            # Linear layers (the ones whose in_features are the raw named
+            # feature schema itself, not a hidden/intermediate width) appear
+            # among this spike's parameters -- a genuine causal decomposition
+            # of the SAME weight.grad tensor already read above (weight.grad
+            # has shape (out_features, in_features), and column i is BY
+            # CONSTRUCTION exactly the gradient signal attributable to input
+            # feature i: grad_W[j,i] = sum_batch grad_output[b,j]*input[b,i]).
+            # Free -- no extra backward pass, no hooks, no per-sample loop,
+            # just a different reduction on a tensor we already have. This is
+            # the principled alternative to the raw-feature-range heuristic
+            # below, which only measures coincidental correlation with
+            # magnitude and can mislead (e.g. distance_m/ball_distance_m
+            # routinely reach ~2.0 for two entities near opposite pitch
+            # corners -- a mundane geometric fact, unrelated to gradient
+            # magnitude, that would otherwise look like a smoking gun).
+            _seen_param_ids: set[int] = set()
+            for _full, _n, _p in _named_params:
+                if id(_p) in _seen_param_ids:
+                    continue  # shared tensor (e.g. share_entity_encoder) already reported once
+                for _suffix, _schema in _first_touch_layer_schemas.items():
+                    if _n.endswith(_suffix):
+                        _seen_param_ids.add(id(_p))
+                        _cols_str = _describe_weight_grad_columns(_p, _schema)
+                        if _cols_str:
+                            log.warning(f"  [grad norm SPIKE][{label}] {_full} per-input-column grad norm: {_cols_str}")
+                        break
+    history.append(raw_grad_norm)
+
+
+_GRAD_COLUMN_TOP_K = 5  # how many named input columns to show per weight tensor in a grad-norm-spike breakdown
+
+
+def _describe_weight_grad_columns(
+    weight: "torch.Tensor", schema_dataclass: "type | None", top_k: int = _GRAD_COLUMN_TOP_K,
+) -> str:
+    """Per-INPUT-COLUMN gradient norm for a Linear layer's weight tensor
+    (shape (out_features, in_features)). weight.grad[:, i] is, BY
+    CONSTRUCTION, exactly the gradient signal attributable to input feature
+    i (grad_W[j,i] = sum_batch grad_output[b,j] * input[b,i]) -- so this is
+    a genuine causal decomposition of an already-computed gradient tensor,
+    unlike _describe_feature_extremes' raw-magnitude heuristic above, which
+    only measures coincidental correlation with input VALUE and can mislead
+    (confirmed in practice: distance_m/ball_distance_m routinely reach ~2.0
+    for two entities merely near opposite pitch corners -- a mundane
+    geometric fact with no causal relationship to gradient magnitude, that
+    still looked like a smoking gun under the magnitude-only heuristic).
+
+    Free to compute -- reads weight.grad.norm(dim=0), no extra backward
+    pass, no hooks, no per-sample loop, just a different reduction on a
+    tensor already sitting in memory after backward().
+
+    Only meaningful for a layer's FIRST touch of named raw features -- a
+    schema_dataclass is expected to have exactly as many fields as
+    weight.shape[1] (in_features); if it doesn't (e.g. physics-encoder
+    features concatenated on, extending in_features beyond the named
+    schema -- see DecisionNetwork's self_dim_eff/ball_dim_eff), falls back
+    to anonymous "col_i" labels rather than mis-naming columns.
+    """
+    if weight.grad is None:
+        return ""
+    col_norms = weight.grad.norm(dim=0)
+    names = None
+    if schema_dataclass is not None:
+        _candidate_names = [f.name for f in dataclasses.fields(schema_dataclass)]
+        if len(_candidate_names) == col_norms.shape[0]:
+            names = _candidate_names
+    if names is None:
+        names = [f"col_{i}" for i in range(col_norms.shape[0])]
+    k = min(top_k, len(names))
+    top_vals, top_idx = col_norms.topk(k)
+    return "  ".join(f"{names[i]}={v:.3f}" for i, v in zip(top_idx.tolist(), top_vals.tolist()))
+
+
+def _measure_exec_head_grad_norms_and_maybe_log_spike(
+    trainer: "PPOTrainer", label: str, epoch_i: int, mb_i: int,
+) -> dict[str, float]:
+    """Measurement-only (max_norm=inf, never rescales) per-execution-head
+    grad norm snapshot for BC/DAgger's minibatch loops (pretrain_combined()'s
+    Phase 1, dagger.py's train_bc_epochs()) -- mirrors PPO's own per-head
+    grad-norm diagnostic (_ppo_update's [exec head grad norm]) so BC/DAgger
+    rounds get the same per-head visibility PPO already has, instead of only
+    a single aggregate clip norm. Also runs the grad-norm-spike diagnostic
+    (see _maybe_log_grad_norm_spike) against the same combined
+    decision_net+execution_net raw norm PPO's own spike check uses, so an
+    outlier minibatch during BC/DAgger gets the same per-parameter-tensor
+    breakdown PPO gets.
+
+    Must be called AFTER loss.backward() and BEFORE the caller's own real
+    clip_grad_norm_()/optimizer.step() (grads must still reflect the
+    ORIGINAL, un-clipped magnitudes for this measurement to mean anything --
+    this function never itself clips; the caller's real cap is unaffected).
+
+    Returns {head_name: grad_norm}, plus "raw" for the combined norm across
+    both networks. `label` is a short tag (e.g. "BC", "DAgger") passed
+    through to _maybe_log_grad_norm_spike.
+    """
+    _gn_tensors: dict[str, torch.Tensor] = {}
+    for _head_name, _attr in EXEC_HEAD_MODULES:
+        _head_params = list(getattr(trainer.execution_net, _attr).parameters())
+        if _head_params:
+            _gn_tensors[_head_name] = torch.nn.utils.clip_grad_norm_(_head_params, float("inf"))
+    _gn_tensors["raw"] = torch.nn.utils.clip_grad_norm_(
+        list(trainer.decision_net.parameters()) + list(trainer.execution_net.parameters()),
+        float("inf"),
+    )
+    _gn_names = list(_gn_tensors.keys())
+    _gn_vals = dict(zip(
+        _gn_names,
+        torch.stack([_gn_tensors[k].to(trainer.device) for k in _gn_names]).tolist(),
+    ))
+
+    _maybe_log_grad_norm_spike(trainer, label, epoch_i, mb_i, _gn_vals["raw"])
+    return _gn_vals
+
 
 # decision_net attribute names of the 7 Bernoulli heads that participate in
 # PPO's log_prob/entropy computation (_recompute_log_prob/_compute_entropy)
@@ -470,6 +662,33 @@ class PPOTrainer:
         # _log_rollout_summary. None until the first rollout completes.
         self._prev_entropy_breakdown: Optional[dict] = None
         self.max_grad_norm = float(ppo_cfg.get("max_grad_norm", 0.5))
+        # None (disabled) or a float k: whenever a minibatch's raw (pre-clip)
+        # grad norm exceeds (running_mean + k*running_std) of a rolling
+        # window of recent raw grad norms (pooled across PPO/BC/DAgger --
+        # see _grad_norm_history below), dump a per-parameter-tensor
+        # breakdown (top _GRAD_NORM_SPIKE_TOP_K by norm) for THAT minibatch
+        # only -- see _maybe_log_grad_norm_spike(). Adaptive rather than a
+        # fixed absolute number because "typical scale" varies a lot by
+        # run/config (confirmed: a real run with mean~5 max~200 needs a very
+        # different bar than a small smoke-test with mean~4.6 max~14.3) --
+        # k=5 means "more than 5 standard deviations above this run's own
+        # recent average," regardless of what that average actually is.
+        # Diagnostic for "why is raw grad norm occasionally way above its
+        # typical value" -- the existing [exec head grad norm]/main-vs-dir
+        # summaries are aggregated over a whole rollout/epoch and only split
+        # by execution-head, not by which specific parameter tensor (across
+        # BOTH decision_net and execution_net, including encoders/trunk) is
+        # actually driving an individual spike.
+        _gn_spike_cfg = ppo_cfg.get("grad_norm_spike_k", 5.0)
+        self.grad_norm_spike_k = float(_gn_spike_cfg) if _gn_spike_cfg is not None else None
+        # Rolling window feeding the adaptive spike bar above -- shared
+        # (same deque instance) across every call from _ppo_update, Phase
+        # 1's BC loop, and DAgger's train_bc_epochs(), so "this run's recent
+        # typical grad norm" reflects whichever of those actually ran most
+        # recently, not three separate disconnected baselines.
+        self._grad_norm_history: "collections.deque[float]" = collections.deque(
+            maxlen=_GRAD_NORM_SPIKE_HISTORY_MAXLEN,
+        )
         self.n_epochs = int(ppo_cfg.get("n_epochs", 4))
         _value_only_cont = ppo_cfg.get("value_only_continuation_epochs")
         self.value_only_continuation_epochs = int(_value_only_cont) if _value_only_cont is not None else self.n_epochs
@@ -2344,6 +2563,16 @@ class PPOTrainer:
         _p1_n_epochs = 0 if self._bc_train_value_only else n_epochs
         if self._bc_train_value_only:
             log.info("  Phase 1 skipped (bc_train_value_only=True) -- Phase 0 already covers value training.")
+        # Per-execution-head grad norm, accumulated across every epoch/
+        # minibatch of Phase 1 -- same diagnostic PPO's _ppo_update already
+        # gets (see _measure_exec_head_grad_norms_and_maybe_log_spike),
+        # summarized once at the end of Phase 1 below. Also runs the
+        # grad-norm-spike per-parameter breakdown inline, same as PPO.
+        _bc_head_grad_norm: dict[str, list[float]] = {name: [] for name, _ in EXEC_HEAD_MODULES}
+        # Total (combined decision_net+execution_net, pre-clip) grad norm
+        # per minibatch -- Phase 1 never logged this at all before (only
+        # DAgger's mean_grad_norm did, and only a mean, not the full spread).
+        _bc_raw_grad_norm: list[float] = []
         for epoch in range(_p1_n_epochs):
             _epoch_t0 = time.monotonic()
             bc_losses = []
@@ -2388,14 +2617,14 @@ class PPOTrainer:
                 len(_bc_train_idx), prefix=f"  Phase 1 epoch {epoch + 1}/{_p1_n_epochs}: ",
             )
             _p1_rows_done = 0
-            for mb in dataset.iterate_minibatches(
+            for _p1_mb_i, mb in enumerate(dataset.iterate_minibatches(
                 batch_size=batch_size, shuffle=True, device=self.device,
                 valid_only=True, returns=_joint_returns,
                 downsample_trivial_frac=_ds_frac,
                 downsample_trivial_cos_threshold=self._downsample_trivial_cos_threshold,
                 downsample_trivial_exclude_radius_steps=self._downsample_trivial_exclude_radius_steps,
                 indices_override=_bc_train_idx,
-            ):
+            )):
                 if _use_joint_val or _use_separate_value_training:
                     obs_dict, bc_labels, ret_batch = mb
                 else:
@@ -2453,6 +2682,11 @@ class PPOTrainer:
                         val_raw_mse_losses.append(raw_mse.item())
                 bc_opt.zero_grad()
                 total_loss.backward()
+                _bc_gn_vals = _measure_exec_head_grad_norms_and_maybe_log_spike(self, "BC", epoch, _p1_mb_i)
+                for _head_name, _ in EXEC_HEAD_MODULES:
+                    if _head_name in _bc_gn_vals:
+                        _bc_head_grad_norm[_head_name].append(_bc_gn_vals[_head_name])
+                _bc_raw_grad_norm.append(_bc_gn_vals["raw"])
                 if self._bc_max_grad_norm is not None:
                     nn.utils.clip_grad_norm_(
                         list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
@@ -2637,6 +2871,20 @@ class PPOTrainer:
                 if _bkdn_parts[_mid:]:
                     _bc_lines.append(f"                           {'  '.join(_bkdn_parts[_mid:])}")
             log.info("\n".join(_bc_lines))
+            if _bc_raw_grad_norm:
+                log.info(
+                    f"    [BC grad norm total] mean={np.mean(_bc_raw_grad_norm):.3f}  "
+                    f"min={np.min(_bc_raw_grad_norm):.3f}  max={np.max(_bc_raw_grad_norm):.3f}  "
+                    f"std={np.std(_bc_raw_grad_norm):.3f}  (n={len(_bc_raw_grad_norm)})"
+                )
+            _bc_raw_grad_norm.clear()
+            if any(_bc_head_grad_norm.values()):
+                _bc_head_gn_str = "  ".join(
+                    f"{name}={np.mean(vals):.3f}" for name, vals in _bc_head_grad_norm.items() if vals
+                )
+                log.info(f"    [BC exec head grad norm] {_bc_head_gn_str}")
+            for _v in _bc_head_grad_norm.values():
+                _v.clear()
             dir_cosines.clear()
             kick_dir_cosines.clear()
             move_probs.clear()
@@ -2660,17 +2908,29 @@ class PPOTrainer:
                 _val_line = f"    val        bc_val_loss={_bc_val_loss:.4f}  best={min(_bc_best_val_loss, _bc_val_loss):.4f}"
                 if _bc_early_stop_enabled:
                     _val_line += ("  (improved)" if _improved else f"  (patience {_bc_patience_ctr + 1}/{self._bc_pretrain_early_stop_patience})")
+                elif _improved:
+                    _val_line += "  (improved, checkpointed)"
                 if _use_joint_val or _use_separate_value_training:
                     _val_value_loss, _val_value_rmse = _eval_p1_value_val_loss()
                     _val_line += f"  value_val_loss={_val_value_loss:.4f}  rmse={_val_value_rmse:.2f}"
                 log.info(_val_line)
-                if _bc_early_stop_enabled and _improved:
+                # Best-val tracking/checkpointing is independent of whether
+                # early STOPPING is enabled (patience=0 = report-only for
+                # the stop decision, but "checkpoint the actual best" is
+                # useful regardless) -- previously this whole block was
+                # gated on _bc_early_stop_enabled, so with early stop
+                # disabled (the default), a new best was never captured
+                # in memory OR on disk at all, and a crash mid-Phase-1
+                # lost all progress back to whatever Phase 0 left on disk.
+                if _improved:
                     _bc_best_val_loss = _bc_val_loss
                     _bc_best_state = {
                         "decision_net": copy.deepcopy(self.decision_net.state_dict()),
                         "execution_net": copy.deepcopy(self.execution_net.state_dict()),
                     }
-                    _bc_patience_ctr = 0
+                    _save_pretrain_checkpoint(f"Phase 1 (new best bc_val_loss={_bc_best_val_loss:.4f}, epoch {epoch + 1})")
+                    if _bc_early_stop_enabled:
+                        _bc_patience_ctr = 0
                 elif _bc_early_stop_enabled:
                     _bc_patience_ctr += 1
                     if _bc_patience_ctr >= self._bc_pretrain_early_stop_patience:
@@ -2681,10 +2941,19 @@ class PPOTrainer:
                         )
                         _bc_stopped_early = True
                         break
-        if _bc_stopped_early and _bc_best_state is not None:
+        # Restore the best-val weights before Phase 1's own final checkpoint
+        # below, regardless of whether early stop actually triggered --
+        # otherwise a full (non-early-stopped) run's final on-disk state is
+        # just whatever the LAST epoch happened to leave (which can be worse
+        # than an earlier epoch, e.g. from overfitting), silently overwriting
+        # every "new best" checkpoint saved above with something worse.
+        if _bc_best_state is not None:
             _load_state_dict_tolerant(self.decision_net, _bc_best_state["decision_net"], "decision_net")
             self.execution_net.load_state_dict(_bc_best_state["execution_net"])
-            log.info(f"  [BC pretrain] restored best-val weights (bc_val_loss={_bc_best_val_loss:.4f})")
+            log.info(
+                f"  [BC pretrain] restored best-val weights (bc_val_loss={_bc_best_val_loss:.4f})"
+                + ("" if _bc_stopped_early else " before final Phase 1 checkpoint")
+            )
         if bc_losses:
             log.info(f"BC pre-training done ({n_epochs} epoch(s), final bc_loss={np.mean(bc_losses):.4f})")
         else:
@@ -4668,6 +4937,19 @@ class PPOTrainer:
                 if "mv_log_std_grad" in _gn_vals:
                     all_mv_log_std_grad.append(_gn_vals["mv_log_std_grad"])
                 raw_grad_norm = _gn_vals["raw"]
+                # Spike diagnostic: the [exec head grad norm]/main-vs-dir
+                # summaries logged at the end of a rollout are aggregated
+                # over every minibatch and only split by execution-head --
+                # neither tells you which specific parameter TENSOR (across
+                # BOTH decision_net and execution_net, including encoders/
+                # trunk, not just the execution heads) drove an individual
+                # outlier step. Shared with BC/DAgger's own minibatch loops
+                # (see _maybe_log_grad_norm_spike's own docstring for the
+                # adaptive running-mean/std bar and why it isn't a fixed
+                # absolute number). Must read .grad here, before
+                # self.optimizer.step() below (which doesn't zero grads
+                # itself, but there's no reason to risk it).
+                _maybe_log_grad_norm_spike(self, "PPO", epoch_i, start // self.minibatch_size, raw_grad_norm)
                 _gn_main = _gn_vals["main"]
                 all_grad_norm_main.append(_gn_main)
                 if _gn_main > self.max_grad_norm:

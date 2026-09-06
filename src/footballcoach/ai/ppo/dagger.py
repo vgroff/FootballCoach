@@ -216,7 +216,10 @@ def train_bc_epochs(
         direction_magnitude_reg,
     )
     from footballcoach.ai.obs.canonical import canonicalize_bc_labels, x_sign_of
-    from footballcoach.ai.ppo.ppo_trainer import _ai_types, _binary_confusion_counts, _precision_recall_f1
+    from footballcoach.ai.ppo.ppo_trainer import (
+        EXEC_HEAD_MODULES, _ai_types, _binary_confusion_counts, _precision_recall_f1,
+        _measure_exec_head_grad_norms_and_maybe_log_spike,
+    )
     from footballcoach.ai.progress import ProgressReporter
 
     if len(train_idx) == 0:
@@ -244,6 +247,11 @@ def train_bc_epochs(
     for epoch in range(1, max_epochs + 1):
         losses = []
         grad_norms: list[float] = []
+        # Per-execution-head grad norm + grad-norm-spike diagnostic -- same
+        # instrumentation Phase 1's own BC epoch loop gets (ppo_trainer.py),
+        # via the shared helper, so DAgger rounds get the same per-head
+        # visibility instead of only the single aggregate grad_norm above.
+        _head_grad_norm: dict[str, list[float]] = {name: [] for name, _ in EXEC_HEAD_MODULES}
         # Same per-epoch diagnostics Phase 1 logs (ppo_trainer.py's own BC
         # epoch loop) -- direction/kick-direction cosine similarity, mean
         # predicted probability per Bernoulli head, precision/recall/F1 for
@@ -267,9 +275,9 @@ def train_bc_epochs(
             len(train_idx), prefix=f"    [dagger bc] epoch {epoch}/{max_epochs}: ",
         )
         _rows_done = 0
-        for obs_dict, bc_labels in dataset.iterate_minibatches(
+        for _mb_i, (obs_dict, bc_labels) in enumerate(dataset.iterate_minibatches(
             batch_size, shuffle=True, device=device, valid_only=True, indices_override=train_idx,
-        ):
+        )):
             _rows_done += bc_labels.shape[0]
             if extra_n > 0:
                 # Bounded, freshly-resampled slice of the aggregated buffer
@@ -373,6 +381,10 @@ def train_bc_epochs(
 
             opt.zero_grad()
             loss.backward()
+            _gn_vals = _measure_exec_head_grad_norms_and_maybe_log_spike(trainer, "DAgger", epoch, _mb_i)
+            for _head_name, _ in EXEC_HEAD_MODULES:
+                if _head_name in _gn_vals:
+                    _head_grad_norm[_head_name].append(_gn_vals[_head_name])
             clip_limit = trainer._bc_max_grad_norm if trainer._bc_max_grad_norm is not None else float("inf")
             grad_norm = torch.nn.utils.clip_grad_norm_(all_params, clip_limit).item()
             opt.step()
@@ -383,6 +395,9 @@ def train_bc_epochs(
         mean_loss = float(sum(losses) / len(losses))
         if epoch == 1 or epoch % log_every == 0 or epoch == max_epochs:
             mean_grad_norm = float(sum(grad_norms) / len(grad_norms))
+            min_grad_norm = float(min(grad_norms))
+            max_grad_norm = float(max(grad_norms))
+            std_grad_norm = float(np.std(grad_norms))
             mean_cos = float(np.mean(dir_cosines)) if dir_cosines else float("nan")
             mean_kick_cos = float(np.mean(kick_dir_cosines)) if kick_dir_cosines else float("nan")
             mean_mv = float(np.mean(move_probs)) if move_probs else float("nan")
@@ -420,7 +435,18 @@ def train_bc_epochs(
                 _lines.append(f"      breakdown (floor-adj)  {'  '.join(_bkdn_parts[:_mid])}")
                 if _bkdn_parts[_mid:]:
                     _lines.append(f"                             {'  '.join(_bkdn_parts[_mid:])}")
+            _lines.append(
+                f"      [dagger grad norm total] mean={mean_grad_norm:.3f}  min={min_grad_norm:.3f}  "
+                f"max={max_grad_norm:.3f}  std={std_grad_norm:.3f}  (n={len(grad_norms)})"
+            )
+            if any(_head_grad_norm.values()):
+                _head_gn_str = "  ".join(
+                    f"{name}={np.mean(vals):.3f}" for name, vals in _head_grad_norm.items() if vals
+                )
+                _lines.append(f"      [exec head grad norm] {_head_gn_str}")
             log.info("\n".join(_lines))
+            for _v in _head_grad_norm.values():
+                _v.clear()
         if target_loss_margin is not None and floor is not None and (mean_loss - floor) <= target_loss_margin:
             log.info(f"    [dagger bc] converged at epoch {epoch}: loss={mean_loss:.4f}  floor={floor:.4f}")
             return mean_loss, floor, epoch
@@ -487,7 +513,6 @@ def collect_dagger_rollout(trainer, seed: int, max_steps: int):
     """
     from footballcoach.ai.ppo.bc import _I_KICK_THIS_TICK
     from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
-    from footballcoach.ai.progress import ProgressReporter
 
     env = build_phase1_replay_env(trainer, seed)
     buf = RolloutBuffer()
@@ -496,7 +521,6 @@ def collect_dagger_rollout(trainer, seed: int, max_steps: int):
     n_steps = 0
     n_kicks = 0
     n_kicks_labelled = 0
-    _progress = ProgressReporter(max_steps, prefix="    [dagger rollout] ")
     with torch.no_grad():
         for n_steps in range(1, max_steps + 1):
             _, reward, done, info = env.step()
@@ -514,36 +538,34 @@ def collect_dagger_rollout(trainer, seed: int, max_steps: int):
                     obs=tr["obs"], action={}, log_prob=0.0, value=0.0,
                     reward=0.0, done=0.0, bc_label=bc_label_arr,
                 )
-            _progress.update(
-                n_steps, postfix=f"reward={total_reward:.2f}  kicks={n_kicks}/{n_kicks_labelled}"
-            )
             if done:
                 outcome = info.trial_outcome
                 break
-    _progress.finish(n_steps)
     return buf, {
         "outcome": outcome, "n_steps": n_steps, "total_reward": total_reward,
         "n_kicks": n_kicks, "n_kicks_labelled": n_kicks_labelled,
     }
 
 
-def _dagger_rollout_worker_entry(
-    decision_state: dict, execution_state: dict, separate_value_net: bool,
-    value_state: dict | None, seed_chunk: list[int], max_replay_steps: int,
-) -> list:
-    """Module-level (picklable) subprocess entry point for parallel DAgger
-    rollout collection -- each worker rebuilds its own inference-only
-    PPOTrainer via ppo_trainer.rebuild_inference_trainer() (live nn.Module
-    objects aren't picklable across a process boundary), then runs
-    collect_dagger_rollout() sequentially for every seed in its assigned
-    chunk. Mirrors ai/eval/seeded_eval.py's _eval_worker_entry -- same
-    "rebuild from state dict, torch.set_num_threads(1), process an assigned
-    chunk" shape, generalized here so it isn't re-invented a third time the
-    next time this repo needs parallel closed-loop policy rollouts.
+# Module-level, set once per worker process by _dagger_pool_worker_init --
+# live nn.Module objects aren't picklable across a process boundary, so each
+# worker builds its OWN inference-only PPOTrainer exactly once (at Pool
+# startup, via the initializer= mechanism below) and every task that worker
+# subsequently runs reuses it, rather than rebuilding per seed.
+_worker_trainer = None
 
-    Returns a list of (seed, (buffer, summary)) tuples, one per seed in
-    seed_chunk, in that same order.
-    """
+
+def _dagger_pool_worker_init(
+    decision_state: dict, execution_state: dict, separate_value_net: bool, value_state: dict | None,
+) -> None:
+    """``Pool(initializer=...)`` target -- runs once when a worker process
+    starts, before it's given any task. Mirrors ai/eval/seeded_eval.py's
+    per-worker rebuild-from-state-dict pattern, but as a persistent
+    initializer rather than something repeated inside every task, so
+    ``collect_dagger_rollouts_parallel`` can dispatch one task PER SEED
+    (via ``imap_unordered``) instead of pre-chunking seeds across workers --
+    that's what lets the driver see (and progress-bar) each seed's
+    completion as it happens instead of waiting for an entire chunk."""
     import torch as _torch
     # Each worker only ever runs ONE env forward-pass at a time (no internal
     # batching), so letting torch/BLAS use its default multi-threaded pool
@@ -551,10 +573,19 @@ def _dagger_rollout_worker_entry(
     # over the same cores -- mirrors rollout_worker.py's/seeded_eval.py's
     # worker_torch_threads=1 default, same rationale.
     _torch.set_num_threads(1)
+    global _worker_trainer
     from footballcoach.ai.ppo.ppo_trainer import rebuild_inference_trainer
 
-    trainer = rebuild_inference_trainer(decision_state, execution_state, separate_value_net, value_state)
-    return [(seed, collect_dagger_rollout(trainer, seed, max_replay_steps)) for seed in seed_chunk]
+    _worker_trainer = rebuild_inference_trainer(decision_state, execution_state, separate_value_net, value_state)
+
+
+def _dagger_pool_worker_task(seed: int, max_replay_steps: int):
+    """Pool task body -- one seed, using the trainer ``_dagger_pool_worker_
+    init`` already built for this worker process. Returns
+    ``(seed, (buffer, summary))``, same per-seed result shape
+    ``collect_dagger_rollouts_parallel`` already returns for its serial
+    path."""
+    return seed, collect_dagger_rollout(_worker_trainer, seed, max_replay_steps)
 
 
 def collect_dagger_rollouts_parallel(
@@ -567,28 +598,60 @@ def collect_dagger_rollouts_parallel(
     fallback convention ai/eval/seeded_eval.py's run_seeded_evaluation_parallel()
     uses, so a caller doesn't need its own separate serial/parallel branch.
 
+    Reports ONE overall progress bar over episode COUNT (not step count, and
+    not one bar per episode/worker) -- with n_workers>1 dispatching one task
+    per seed via imap_unordered (rather than pre-chunked per-worker batches,
+    see _dagger_pool_worker_init's docstring), the driver sees each seed's
+    completion as it actually happens and can update this bar live, instead
+    of every worker's own per-episode bar (there wasn't a shared bar before)
+    all landing on stdout in one unreadable burst whenever a chunk finished.
+    Not step-accurate (a rollout can end anywhere from a few dozen to
+    max_replay_steps ticks) -- doesn't need to be, this is a "how far into
+    the episode batch are we" indicator, not an ETA guarantee.
+
     Returns a list of (seed, (buffer, summary)) tuples covering every seed
-    in `seeds`, in arbitrary order (chunk completion order, not necessarily
+    in `seeds`, in arbitrary order (completion order, not necessarily
     matching `seeds`' own order) -- callers that need per-seed correspondence
     should keep their own seed -> result mapping via the returned seed value.
     """
-    if n_workers <= 1:
-        return [(seed, collect_dagger_rollout(trainer, seed, max_replay_steps)) for seed in seeds]
+    from footballcoach.ai.progress import ProgressReporter
 
+    progress = ProgressReporter(len(seeds), prefix="  [dagger rollout] ")
+    results: list = []
+    if n_workers <= 1:
+        for seed in seeds:
+            results.append((seed, collect_dagger_rollout(trainer, seed, max_replay_steps)))
+            progress.update(len(results))
+        progress.finish(len(results), n_episodes=len(results))
+        return results
+
+    import functools
     import multiprocessing as mp
 
     decision_state, execution_state, value_state = trainer._cpu_state_dicts()
     separate_value_net = trainer.separate_value_net
     ctx = mp.get_context("spawn")
-    chunks = [c for c in (seeds[i::n_workers] for i in range(n_workers)) if c]
-    log.info(f"  [dagger rollout] running {len(seeds)} episode(s) across {len(chunks)} worker process(es)...")
-    with ctx.Pool(processes=len(chunks)) as pool:
-        chunk_results = pool.starmap(
-            _dagger_rollout_worker_entry,
-            [(decision_state, execution_state, separate_value_net, value_state, chunk, max_replay_steps)
-             for chunk in chunks],
-        )
-    return [item for chunk_result in chunk_results for item in chunk_result]
+    n_procs = min(n_workers, len(seeds))
+    # Nothing prints between here and this function's first progress.update()
+    # call (that only fires once a worker's FIRST rollout actually completes)
+    # -- and everything in between (spawning n_procs fresh interpreter
+    # processes, each re-importing torch/numpy/footballcoach, then rebuilding
+    # a full inference trainer including a fresh disk read of the frozen
+    # physics-pretrain encoder checkpoints, see _dagger_pool_worker_init) can
+    # legitimately take a while with nothing else to show for it in the
+    # meantime. This line exists purely so that gap has a visible start time
+    # instead of looking like a hang.
+    log.info(f"  [dagger rollout] spinning up {n_procs} worker process(es)...")
+    with ctx.Pool(
+        processes=n_procs, initializer=_dagger_pool_worker_init,
+        initargs=(decision_state, execution_state, separate_value_net, value_state),
+    ) as pool:
+        task = functools.partial(_dagger_pool_worker_task, max_replay_steps=max_replay_steps)
+        for result in pool.imap_unordered(task, seeds):
+            results.append(result)
+            progress.update(len(results))
+    progress.finish(len(results), n_episodes=len(results))
+    return results
 
 
 def run_dagger_phase(
@@ -665,22 +728,29 @@ def run_dagger_phase(
             seeds.append(picked[2])
 
         results = collect_dagger_rollouts_parallel(trainer, seeds, max_replay_steps, n_workers=n_workers)
-        for ep_i, (seed, (new_buf, summary)) in enumerate(results, start=1):
+        for _seed, (new_buf, _summary) in results:
             extend_buffer(aggregated, new_buf)
-            log.info(
-                f"  [dagger] iteration {it}/{iterations} rollout {ep_i}/{episodes_per_iteration}: "
-                f"seed={seed}  outcome={summary['outcome']}  steps={summary['n_steps']}  "
-                # kicks=<real NN kicks>/<BC-labelled kick_this_tick decision
-                # ticks>. The second number IS an independent rules-AI
-                # counterfactual ("would Phase1RulesAI have kicked from this
-                # exact state") -- not an echo of the first. The two
-                # diverging is expected and healthy; see
-                # collect_dagger_rollout()'s own docstring for the full
-                # rationale.
-                f"kicks={summary['n_kicks']}/{summary['n_kicks_labelled']}  "
-                f"reward={summary['total_reward']:.2f}  aggregated_buffer_size={len(aggregated)}"
-            )
         subsample_buffer(aggregated, buffer_max_size, rng)
+
+        import numpy as np
+
+        from footballcoach.ai.ppo.ppo_trainer import _PHASE1_OUTCOME_LEGEND, outcome_breakdown
+
+        summaries = [summary for _seed, (_buf, summary) in results]
+        rewards = [s["total_reward"] for s in summaries]
+        # kicks: <real NN kicks>/<BC-labelled kick_this_tick decision ticks>
+        # summed across this round's rollouts. The second number is an
+        # independent rules-AI counterfactual ("would Phase1RulesAI have
+        # kicked from this exact state"), not an echo of the first -- see
+        # collect_dagger_rollout()'s own docstring for the full rationale.
+        total_kicks = sum(s["n_kicks"] for s in summaries)
+        total_kicks_labelled = sum(s["n_kicks_labelled"] for s in summaries)
+        log.info(
+            f"  [dagger] iteration {it}/{iterations}: {len(summaries)} rollout(s) -- "
+            f"outcomes[{_PHASE1_OUTCOME_LEGEND}]={outcome_breakdown([s['outcome'] for s in summaries])}  "
+            f"reward mean={float(np.mean(rewards)):.2f} std={float(np.std(rewards)):.2f}  "
+            f"kicks={total_kicks}/{total_kicks_labelled}  aggregated_buffer_size={len(aggregated)}"
+        )
 
         extra_obs, extra_bc_labels = dagger_extra_tensors(aggregated, trainer.device)
         log.info(f"  [dagger] iteration {it}/{iterations}: BC training ({len(aggregated)} aggregated rows so far)")

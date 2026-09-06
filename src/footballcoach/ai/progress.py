@@ -93,6 +93,18 @@ class ProgressReporter:
         if finished:
             self._done = True
 
+    @staticmethod
+    def _timestamp() -> str:
+        """"%Y-%m-%d %H:%M:%S,mmm" -- matches logging's default asctime
+        format exactly (see train.py's logging.basicConfig(format=
+        "%(asctime)s %(levelname)s %(message)s"), no datefmt override).
+        ProgressReporter renders via plain print(), not the logging module,
+        so without this its lines are the only ones in a training log with
+        no timestamp at all -- can't tell how long a gap before/after a bar
+        actually was just from the log."""
+        now = time.time()
+        return time.strftime("%Y-%m-%d %H:%M:%S", time.localtime(now)) + f",{int(now % 1 * 1000):03d}"
+
     def _render_live(self, current: int, now: float, postfix: str = "") -> None:
         elapsed = max(now - self._start, 1e-9)
         rate = current / elapsed
@@ -104,7 +116,7 @@ class ProgressReporter:
         end = "\n" if current >= self.total else ""
         suffix = f"  {postfix}" if postfix else ""
         print(
-            f"\r{self.prefix}[{bar}] {current}/{self.total} ({frac * 100:5.1f}%)  "
+            f"\r{self._timestamp()} {self.prefix}[{bar}] {current}/{self.total} ({frac * 100:5.1f}%)  "
             f"{rate:6.1f} steps/s  eta {eta_str}{suffix}",
             end=end, file=self.stream, flush=True,
         )
@@ -115,7 +127,7 @@ class ProgressReporter:
         frac = min(current / self.total, 1.0)
         suffix = f"  {postfix}" if postfix else ""
         print(
-            f"{self.prefix}{current}/{self.total} ({frac * 100:5.1f}%)  {rate:6.1f} steps/s{suffix}",
+            f"{self._timestamp()} {self.prefix}{current}/{self.total} ({frac * 100:5.1f}%)  {rate:6.1f} steps/s{suffix}",
             file=self.stream, flush=True,
         )
 
@@ -128,7 +140,7 @@ class ProgressReporter:
         exited, so this is called explicitly, once, after that loop ends."""
         elapsed = max(time.monotonic() - self._start, 1e-9)
         per_step_ms = 1000.0 * elapsed / max(current, 1)
-        msg = f"{self.prefix}done: {elapsed:.1f}s total  ({per_step_ms:.2f} ms/step"
+        msg = f"{self._timestamp()} {self.prefix}done: {elapsed:.1f}s total  ({per_step_ms:.2f} ms/step"
         if n_episodes:
             msg += f", {elapsed / n_episodes:.2f} s/episode over {n_episodes} episode(s)"
         msg += ")"

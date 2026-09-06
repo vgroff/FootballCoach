@@ -26,6 +26,38 @@ from footballcoach.ai.physics_pretrain.live_encoder_features import (
     player_obs_to_physics_input,
 )
 
+# Which (aux head name -> output column indices) are raw BCE-with-logits
+# classifier outputs at physics_pretrain TRAINING time (train_ball_dynamics.
+# py's _crossing_head_loss/_event_head_loss, train_player_dynamics.py's
+# _crossing_head_loss -- both call F.binary_cross_entropy_with_logits on
+# exactly these columns), as opposed to the heads' other columns, which are
+# plain regression targets already trained to a roughly O(1) scale (see
+# e.g. train_player_dynamics.py's crossing_dt_norm_s comment). A raw logit
+# is UNBOUNDED by construction -- a confident classification routinely
+# produces |logit| in the 10s (confirmed live: crossing_head's crosses_logit
+# hit 25-50 on real recorded rows) -- which is 10-50x the scale of every
+# other feature in the same concatenated vector once fed into per_entity_
+# mlp's first Linear layer, and was confirmed (via debug_grad_norm_spikes.py)
+# to be the actual root cause of this project's grad-norm spikes. Squashing
+# these specific columns with sigmoid() below -- not a generic LayerNorm
+# over the whole block -- recovers the actual [0,1] probability the logit
+# already represents, which is what the downstream network should see
+# rather than an arbitrarily rescaled number. Column indices are the "pos_x,
+# pos_y, crosses_logit, delta_t" / "oob_logit, goal_logit" layouts documented
+# on each head's own loss function in train_*_dynamics.py.
+_PLAYER_LOGIT_HEAD_COLUMNS: dict[str, list[int]] = {"crossing_head": [2]}
+_BALL_LOGIT_HEAD_COLUMNS: dict[str, list[int]] = {"crossing_head": [2], "event_head": [0, 1]}
+
+
+def _apply_logit_sigmoid(aux_outputs: dict[str, torch.Tensor], logit_columns: dict[str, list[int]]) -> None:
+    """In-place: sigmoid the columns named in `logit_columns` within each
+    matching tensor of `aux_outputs` (name -> this head's raw (..., out_dim)
+    output). No-op for any head/column not listed (plain regression
+    outputs, left exactly as the frozen head produced them)."""
+    for name, cols in logit_columns.items():
+        if name in aux_outputs:
+            aux_outputs[name][..., cols] = torch.sigmoid(aux_outputs[name][..., cols])
+
 
 class BallPhysicsFeatureBlock(nn.Module):
     """Frozen BallDynamicsEncoder + its frozen auxiliary heads (+ its frozen
@@ -70,8 +102,9 @@ class BallPhysicsFeatureBlock(nn.Module):
                 live_ball_spin_nn_norm_rad_s=self._spin_norm, live_height_norm_m=self._height_norm,
             )
             latent = self.encoder(x)
-            aux_outputs = [head(latent) for head in self.aux_heads.values()]
-            parts = [latent, *aux_outputs]
+            aux_outputs = {name: head(latent) for name, head in self.aux_heads.items()}
+            _apply_logit_sigmoid(aux_outputs, _BALL_LOGIT_HEAD_COLUMNS)
+            parts = [latent, *aux_outputs.values()]
             if self.linear_decoder is not None:
                 parts.append(self.linear_decoder.forward_all_unpadded(latent))
             return torch.cat(parts, dim=-1)
@@ -107,8 +140,9 @@ class PlayerPhysicsFeatureBlock(nn.Module):
         with torch.no_grad():
             x = player_obs_to_physics_input(player_feat, global_feat, self.pitch_constants)
             latent = self.encoder(x)
-            aux_outputs = [head(latent) for head in self.aux_heads.values()]
-            parts = [latent, *aux_outputs]
+            aux_outputs = {name: head(latent) for name, head in self.aux_heads.items()}
+            _apply_logit_sigmoid(aux_outputs, _PLAYER_LOGIT_HEAD_COLUMNS)
+            parts = [latent, *aux_outputs.values()]
             if self.linear_decoder is not None:
                 parts.append(self.linear_decoder.forward_all_unpadded(latent))
             return torch.cat(parts, dim=-1)
