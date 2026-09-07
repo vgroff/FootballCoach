@@ -23,6 +23,15 @@ if TYPE_CHECKING:
     from footballcoach.ui.input import KickUIState
     from footballcoach.ui.scenarios import AnyScenarioParam, ScenarioBoolParam, ScenarioChoiceParam, ScenarioParam
 
+def _format_match_clock(time_s: float) -> str:
+    """MM:SS.mmm elapsed match time, e.g. "07:23.451" -- millisecond
+    precision so events logged close together (draw_game_log's own display,
+    and e.g. a suspected double-tackle) are actually distinguishable rather
+    than all showing the same whole-second timestamp."""
+    minutes, seconds = divmod(max(0.0, time_s), 60.0)
+    return f"{int(minutes):02d}:{seconds:06.3f}"
+
+
 def _describe_player_ai(player: Player) -> str:
     """Short label for the inspector panel: what's actually driving this
     player right now. Switches on rules_ai.py's AI hierarchy -- ``ai is
@@ -815,10 +824,24 @@ class Renderer:
         game_log: "GameLog",
         min_level: "LogLevel",
         max_lines: int = 8,
+        mouse_pos: tuple[int, int] | None = None,
     ) -> None:
         """Draws the most recent log entries as a scrolling text box in the
         bottom-right corner of the screen.  Newest entries at the bottom.
         No interactive scrollbar — intentionally simple for a playtesting tool.
+        Each row is prefixed with its ``entry.time_s`` as elapsed match
+        clock, MM:SS.mmm (``_format_match_clock``) -- millisecond precision
+        so events logged close together are distinguishable, not all
+        showing the same whole second.
+
+        Entries carrying ``LogEntry.detail`` (see ui/gamelog.py -- e.g. a
+        tackle's skill-check roll/modifier breakdown) get a dim
+        ``[Explain]`` suffix; hovering ANYWHERE on that entry's row (not
+        just the suffix text, which is a small target) shows its detail as
+        a tooltip, positioned to the left of the log box. ``mouse_pos``
+        (typically ``pygame.mouse.get_pos()``) is None in headless/test use,
+        which simply skips the hover check -- no behaviour change from
+        before this param existed.
         """
         from footballcoach.ui.gamelog import LogLevel
         entries = game_log.entries_above(min_level)[-max_lines:]
@@ -841,10 +864,32 @@ class Renderer:
         bg.fill((10, 10, 18, 180))
         surface.blit(bg, (box_x, box_y))
 
+        hovered_detail: str | None = None
+        hovered_row_y = box_y
         for i, entry in enumerate(entries):
             colour = style.HUD_TEXT if entry.level == LogLevel.INFO else style.HOTKEY_DISABLED
-            text = self.hud_font.render(entry.message[:72], True, colour)
-            surface.blit(text, (box_x + 4, box_y + 3 + i * line_h))
+            row_y = box_y + 3 + i * line_h
+
+            clock = self.hud_font.render(_format_match_clock(entry.time_s), True, style.HOTKEY_DISABLED)
+            surface.blit(clock, (box_x + 4, row_y))
+            msg_x = box_x + 4 + clock.get_width() + 8
+
+            # Shorter than before this row also carried a clock prefix --
+            # box_w is a fixed width, not sized to content, so truncation
+            # length has to leave room for it.
+            line_text = entry.message[:44] if entry.detail is not None else entry.message[:56]
+            text = self.hud_font.render(line_text, True, colour)
+            surface.blit(text, (msg_x, row_y))
+            if entry.detail is not None:
+                suffix = self.hud_font.render(" [Explain]", True, style.HUD_ACCENT)
+                surface.blit(suffix, (msg_x + text.get_width(), row_y))
+                row_rect = pygame.Rect(box_x, row_y, box_w, line_h)
+                if mouse_pos is not None and row_rect.collidepoint(mouse_pos):
+                    hovered_detail = entry.detail
+                    hovered_row_y = row_y
+
+        if hovered_detail is not None:
+            self._draw_log_tooltip(surface, hovered_detail, box_x, hovered_row_y)
 
         if show_linger:
             outcome_str = getattr(game_log, "linger_outcome", None) or "resetting"
@@ -856,6 +901,30 @@ class Renderer:
             filled_w = max(2, int((box_w - 8) * linger_frac))
             pygame.draw.rect(surface, (40, 40, 60), (box_x + 4, bar_y, box_w - 8, line_h - 4), border_radius=3)
             pygame.draw.rect(surface, style.HUD_ACCENT, (box_x + 4, bar_y, filled_w, line_h - 4), border_radius=3)
+
+    def _draw_log_tooltip(self, surface: pygame.Surface, detail: str, log_box_x: int, row_y: int) -> None:
+        """Tooltip for a hovered game-log entry's ``detail`` -- same panel
+        style as draw_player_inspector/draw_pause_notification (translucent
+        dark background + accent border), positioned to the LEFT of the
+        log box (which sits in the bottom-right corner, so there's room),
+        vertically anchored to the hovered row and clamped on-screen."""
+        padding = 8
+        line_h = self.hud_font.get_height() + 2
+        lines = detail.split("\n")
+        rendered = [self.hud_font.render(line[:80], True, style.HUD_TEXT) for line in lines]
+
+        box_w = max((r.get_width() for r in rendered), default=0) + padding * 2
+        box_h = len(rendered) * line_h + padding * 2
+        box_x = max(4, log_box_x - box_w - 8)
+        box_y = min(max(4, row_y), surface.get_height() - box_h - 4)
+
+        bg = pygame.Surface((box_w, box_h), pygame.SRCALPHA)
+        bg.fill((10, 10, 18, 235))
+        surface.blit(bg, (box_x, box_y))
+        pygame.draw.rect(surface, style.HUD_ACCENT, (box_x, box_y, box_w, box_h), 1, border_radius=6)
+
+        for i, text_surf in enumerate(rendered):
+            surface.blit(text_surf, (box_x + padding, box_y + padding + i * line_h))
 
     def draw_pause_notification(self, surface: pygame.Surface, message: str) -> None:
         """Draws a prominent centred banner when the game is auto-paused after

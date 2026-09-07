@@ -554,7 +554,7 @@ class App:
     def _wire_match_log(self, match: Match) -> None:
         """Attach the game log callback to a newly created Match."""
         game_log = self.game_log
-        match.log_callback = lambda level, msg: game_log.add(level, msg, match.time_s)
+        match.log_callback = lambda level, msg, detail=None: game_log.add(level, msg, match.time_s, detail)
 
     def _wire_player_icon_callbacks(self, match: Match) -> None:
         """Wire on_kick / on_tackle / on_possession_gained callbacks on every
@@ -907,7 +907,7 @@ class App:
         else:
             self.game_log.linger_frac = 0.0
             self.game_log.linger_outcome = None
-        self.renderer.draw_game_log(self.surface, self.game_log, self.log_min_level)
+        self.renderer.draw_game_log(self.surface, self.game_log, self.log_min_level, mouse_pos=pygame.mouse.get_pos())
         if self._pause_notification:
             self.renderer.draw_pause_notification(self.surface, self._pause_notification)
 

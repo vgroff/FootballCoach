@@ -2,8 +2,11 @@
 
 Also tests the tackle-logging plumbing in Match: that a resolved tackle
 (both win and loss, at rng_reduction=1.0 for determinism) produces exactly
-one log entry containing the expected participant ids and outcome text, and
-that the GK-in-box auto-fail short-circuit produces a distinct log entry.
+one log entry containing the expected participant ids and outcome text,
+that the GK-in-box auto-fail short-circuit produces a distinct log entry,
+and that a resolved tackle's roll/modifier breakdown is attached to that
+SAME entry as LogEntry.detail (a hover-only tooltip in the UI) rather than
+a separate always-visible DEBUG-level line.
 """
 from __future__ import annotations
 
@@ -107,7 +110,7 @@ def _make_tackle_match(rng_reduction: float = 1.0) -> tuple[Match, Player, Playe
         rng_reduction=rng_reduction, rng=random.Random(42),
     )
     game_log = GameLog()
-    match.log_callback = lambda level, msg: game_log.add(level, msg, match.time_s)
+    match.log_callback = lambda level, msg, detail=None: game_log.add(level, msg, match.time_s, detail)
     return match, defender, attacker, game_log
 
 
@@ -147,7 +150,7 @@ def test_tackle_loss_produces_log_entry():
         rng_reduction=1.0, rng=random.Random(42),
     )
     game_log = GameLog()
-    match.log_callback = lambda level, msg: game_log.add(level, msg, match.time_s)
+    match.log_callback = lambda level, msg, detail=None: game_log.add(level, msg, match.time_s, detail)
     defender.current_order = ChaseTackleOrder(target_player_id=attacker.player_id)
     match.step()
     combined = " ".join(e.message for e in game_log.entries_above(LogLevel.INFO))
@@ -155,15 +158,17 @@ def test_tackle_loss_produces_log_entry():
     assert "atk2" in combined
 
 
-def test_debug_entries_contain_roll_values():
-    """The DEBUG-level tackle log entry must mention both rolled values."""
+def test_info_entry_detail_contains_roll_values():
+    """The tackle outcome's INFO entry must carry a `.detail` breakdown
+    (the hover-tooltip text, see ui/gamelog.py's LogEntry.detail) with both
+    rolled values -- this replaced a separate always-visible DEBUG-level
+    line with the same numbers attached directly to the INFO entry."""
     match, defender, attacker, game_log = _make_tackle_match(rng_reduction=1.0)
     defender.current_order = ChaseTackleOrder(target_player_id=attacker.player_id)
     match.step()
-    debug_entries = game_log.entries_above(LogLevel.DEBUG)
-    # At least one DEBUG entry should contain "tackler_roll" and "dribbler_roll".
-    roll_entries = [e for e in debug_entries if "tackler_roll" in e.message]
-    assert len(roll_entries) >= 1, "Expected DEBUG entry with roll values"
+    info_entries = game_log.entries_above(LogLevel.INFO)
+    detail_entries = [e for e in info_entries if e.detail is not None and "roll" in e.detail]
+    assert len(detail_entries) >= 1, "Expected an INFO entry with a roll-value detail breakdown"
 
 
 def test_gk_in_box_auto_fail_logs_distinctly():
@@ -192,7 +197,7 @@ def test_gk_in_box_auto_fail_logs_distinctly():
         rng_reduction=1.0, rng=random.Random(0),
     )
     game_log = GameLog()
-    match.log_callback = lambda level, msg: game_log.add(level, msg, match.time_s)
+    match.log_callback = lambda level, msg, detail=None: game_log.add(level, msg, match.time_s, detail)
     outfielder.current_order = ChaseTackleOrder(target_player_id=gk.player_id)
     match.step()
     combined = " ".join(e.message for e in game_log.entries_above(LogLevel.INFO))

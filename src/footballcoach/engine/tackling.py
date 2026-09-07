@@ -111,12 +111,20 @@ class TackleResult:
     ``tackler_roll`` / ``dribbler_roll``: the actual skill-roll values drawn
     during the contest, exposed so callers (e.g. the game log) can show the
     exact numbers without re-deriving them from ``skill_roll`` internals.
+
+    ``effective_boost``: the tackler's final boost multiplier AFTER the
+    goalkeeper bonus/outside-box penalty and the angle modifier are both
+    applied (``attempt_tackle``'s own ``effective_boost = boost * (1.0 +
+    angle_modifier)``) -- exposed for the same reason as the rolls above,
+    so a caller building a human-readable breakdown ("tackling 0.65 x
+    boost 1.13 = ...") doesn't have to re-derive it from the raw inputs.
     """
     tackler_won: bool
     tackler_speed_mult: float
     tacklee_speed_mult: float
     tackler_roll: float = 0.0
     dribbler_roll: float = 0.0
+    effective_boost: float = 0.0
 
 def apply_tackle_result(
     result: "TackleResult",
@@ -205,6 +213,7 @@ def attempt_tackle(
             tacklee_speed_mult=base_tacklee * loser_extra_mult,
             tackler_roll=t_roll,
             dribbler_roll=d_roll,
+            effective_boost=effective_boost,
         )
     else:
         # Dribbler wins: tackler is the loser; dribbler speed depends on
@@ -224,4 +233,5 @@ def attempt_tackle(
             tacklee_speed_mult=dribbler_mult,
             tackler_roll=t_roll,
             dribbler_roll=d_roll,
+            effective_boost=effective_boost,
         )

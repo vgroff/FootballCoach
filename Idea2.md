@@ -37,8 +37,14 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. Please do not skip any of them. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
-    - retrain player physics model, new demo data/dagger 
-    -  Tests take forever, which ones are responsible and can they be reduced? what is min_speed_for_turn_mps?  reduce ball control penalty? whats responsible for the gardient spikes, what inputs and outputs? what rng reduction is running on training?
+    - Cut some data before next run
+    - stamina v speed reward/penalties? make it step-based sprinting penalty
+    - !!!! Physics fixes:
+        - stamina penalty on speed seems brutal, reduce to 0.3
+        - speed base is a bit low - increase to 6.2 (and reduce the scale param)
+        - retrain player encoder!!
+        - mayeb should weaken all your abilties
+    - do label smoothing or smth similar on the physics encoders, the logits are for sure fucking it
     - !! Seperate kick z vs. x/y log dir std and therefore entropy calculations?
     - !! Are the bernoulli heads sampled to become execution inputs? They shouldnt be!!
     - Every attribute should be like dribbling = 0.1 + driblling_skill*0.9 or smth, so that no rolls are totally 0 success
@@ -228,7 +234,7 @@ NB Immediate Immediate:
 - kicking direction needs working - can’t kick at 90 degrees upward, even less with the same power
 - Allow pausing and going back in time (up to 30s)
 - Tackling - should be harder to tackle when you and/or target is moving fast (especially you). with dribbling its a little harder if you're moving fast
-- Control - should set the ball to ground level, snap for now but improve it later? Also how long are the control delays vs real life? Also implement failed control - rebounds. What happens during control, does a player have ball possession and can he be tackled while controlling? Shouldn’t be possible until ball on floor. Can he kick during control? I think no, either volley/head it first time or finish controlling it - but can arm a kick? Doess ball control even do much atm? Should be able to arm a control/let a ball run through (unless it "really" contacts). Speed penalty during ball control is flat atm, it should depend on control skill
+- Control - should set the ball to ground level, snap for now but improve it later? Also how long are the control delays vs real life? Also implement failed control - rebounds or pass-throughs (depending if it hits the cylinder and random chance). I guess if they fail the control check the ball just keeps flying and it can hit them and/or tunnel through them maybe? easier tunneling if they failed a control/tackle already. Control difficulty should depend on speed/angle to heading. What happens during control, does a player have ball possession and can he be tackled while controlling? Shouldn’t be possible until ball on floor. Can he kick during control? I think no, either volley/head it first time or finish controlling it - but can arm a kick? Doess ball control skill even do much atm? Should be able to arm a control/let a ball run through (unless it "really" contacts). Speed penalty during ball control is flat atm, it should depend on control skill. Turning with the ball should be slower than without. A lot of this will require player physics encoder re-training but that's not an issue
 - Heading - should reduce shot power (and precision) 
 - Give the ball some dots and make them spin during spinning
 - Possible later optimisation - the execution network could have only decisions+latent space as input, with none of the other current inputs present? Or way fewer at least? Would make it run faster, it can be smaller, the larger decision network can run less often

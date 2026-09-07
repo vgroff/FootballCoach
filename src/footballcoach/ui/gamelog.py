@@ -21,13 +21,20 @@ class LogEntry:
     time_s: float
     level: LogLevel
     message: str
+    # Optional multi-line ("\n"-separated) breakdown shown in a hover
+    # tooltip next to this entry in the UI (renderer.py's draw_game_log) --
+    # e.g. a tackle's skill-check roll/modifier numbers. None = no hover
+    # detail, the common case. Generic over any future caller: nothing
+    # here is tackle-specific, so any _log_info(msg, detail=...) call gets
+    # the same hover-explain treatment for free.
+    detail: str | None = None
 
 
 class GameLog:
     """Ring-buffer log of match events for UI display.
 
     ``max_entries`` — maximum entries kept (oldest evicted automatically).
-    ``add(level, msg, time_s)`` — append a new entry.
+    ``add(level, msg, time_s, detail)`` — append a new entry.
     ``entries_above(min_level)`` — iterate entries at or above min_level in
     insertion order (oldest first, newest last).
     """
@@ -36,8 +43,8 @@ class GameLog:
         self._entries: collections.deque[LogEntry] = collections.deque(maxlen=max_entries)
         self.max_entries = max_entries
 
-    def add(self, level: LogLevel, message: str, time_s: float = 0.0) -> None:
-        self._entries.append(LogEntry(time_s=time_s, level=level, message=message))
+    def add(self, level: LogLevel, message: str, time_s: float = 0.0, detail: str | None = None) -> None:
+        self._entries.append(LogEntry(time_s=time_s, level=level, message=message, detail=detail))
 
     def entries_above(self, min_level: LogLevel) -> list[LogEntry]:
         """Return all entries at or above *min_level* in insertion order.

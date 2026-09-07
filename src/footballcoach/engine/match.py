@@ -176,9 +176,11 @@ class Match:
     goal_linger_s: float = 0.0
     _goal_linger_remaining_s: float = field(default=0.0, init=False, repr=False)
 
-    # Optional callback invoked with (level, message) for UI game-log display.
+    # Optional callback invoked with (level, message, detail) for UI game-log
+    # display -- detail is an optional "\n"-separated hover breakdown (see
+    # ui/gamelog.py's LogEntry.detail), None for the common no-detail case.
     # None by default so tests / headless use incur zero cost.
-    log_callback: Callable[["LogLevel", str], None] | None = field(default=None, repr=False)
+    log_callback: Callable[["LogLevel", str, str | None], None] | None = field(default=None, repr=False)
 
     # Optional match event logger for post-hoc inspection.  None by default
     # so training/tests incur zero cost when logging is not needed.
@@ -298,15 +300,15 @@ class Match:
 
     # -- logging helpers (zero cost when log_callback is None) ---------------
 
-    def _log_info(self, msg: str) -> None:
+    def _log_info(self, msg: str, detail: str | None = None) -> None:
         if self.log_callback is not None:
             from footballcoach.ui.gamelog import LogLevel  # local import: only paid when UI is live
-            self.log_callback(LogLevel.INFO, msg)
+            self.log_callback(LogLevel.INFO, msg, detail)
 
-    def _log_debug(self, msg: str) -> None:
+    def _log_debug(self, msg: str, detail: str | None = None) -> None:
         if self.log_callback is not None:
             from footballcoach.ui.gamelog import LogLevel
-            self.log_callback(LogLevel.DEBUG, msg)
+            self.log_callback(LogLevel.DEBUG, msg, detail)
 
     def _complete_order(self, order) -> None:
         """Transition *order* to COMPLETE and fire its on_complete callback if set."""
@@ -1095,6 +1097,10 @@ class Match:
                 if self.match_logger is not None:
                     self.match_logger.notify_tackle_attempt(self.time_s, self.ball.position, other, carrier)
                 return
+            angle_mod = tackle_angle_modifier(
+                carrier.heading_rad, carrier.position, other.position, self.tackling_params
+            )
+            gk_outside_box = self._gk_outside_own_box(other)  # Phase B: GK penalty
             result = attempt_tackle(
                 other.attributes.tackling,
                 carrier.attributes.dribbling,
@@ -1102,12 +1108,14 @@ class Match:
                 self.rng,
                 self.tackling_params,
                 is_goalkeeper_tackle=other.is_goalkeeper,
-                angle_modifier=tackle_angle_modifier(
-                    carrier.heading_rad, carrier.position, other.position, self.tackling_params
-                ),
-                gk_outside_box=self._gk_outside_own_box(other),  # Phase B: GK penalty
+                angle_modifier=angle_mod,
+                gk_outside_box=gk_outside_box,
             )
-            self._log_tackle_result(other.player_id, carrier.player_id, result, "head-on")
+            self._log_tackle_result(
+                other.player_id, carrier.player_id, result,
+                other.attributes.tackling, carrier.attributes.dribbling,
+                other.is_goalkeeper, angle_mod, gk_outside_box, "head-on",
+            )
             if result.tackler_won:
                 self._set_possession(other.player_id)
             apply_tackle_result(result, other, carrier, self.tackling_params)
@@ -1134,17 +1142,46 @@ class Match:
         tackler_id: str,
         dribbler_id: str,
         result: "TackleResult",  # type: ignore[name-defined]  # noqa: F821
+        tackling_attr: float,
+        dribbling_attr: float,
+        is_goalkeeper_tackle: bool,
+        angle_modifier: float,
+        gk_outside_box: bool,
         modifier_notes: str = "",
     ) -> None:
-        """Emit tackle outcome to log_callback (if set)."""
+        """Emit tackle outcome to log_callback (if set) as ONE INFO entry
+        with a hover-detail breakdown of the skill check attached (see
+        ui/gamelog.py's LogEntry.detail) -- attribute values, boost/angle
+        modifiers, and the actual rolls, replacing what used to be a
+        separate DEBUG-only line.
+
+        ``tackling_attr``/``dribbling_attr``/``is_goalkeeper_tackle``/
+        ``angle_modifier``/``gk_outside_box`` are the exact values the
+        caller passed into ``attempt_tackle()`` for this contest;
+        ``result.effective_boost`` is the boost ``attempt_tackle`` already
+        derived from them (see ``TackleResult``'s docstring) -- passed
+        through rather than recomputed here.
+        """
         if self.log_callback is None:
             return
         outcome = "tackled" if result.tackler_won else "failed tackle on"
-        self._log_info(f"{tackler_id} {outcome} {dribbler_id}")
-        notes = f"  tackler_roll={result.tackler_roll:.3f}  dribbler_roll={result.dribbler_roll:.3f}"
+        msg = f"{tackler_id} {outcome} {dribbler_id}"
+
+        boost_kind = "GK" if is_goalkeeper_tackle else "outfield"
+        if is_goalkeeper_tackle and gk_outside_box:
+            boost_kind += " (outside-box penalty applied)"
+        lines = [
+            f"Tackler {tackler_id}: tackling attr={tackling_attr:.2f}, boost={boost_kind},"
+            f" angle modifier={angle_modifier:+.2f} -> effective boost={result.effective_boost:.2f}",
+            f"  roll = {result.tackler_roll:.3f}  (rng_reduction={self.rng_reduction:.2f})",
+            f"Dribbler {dribbler_id}: dribbling attr={dribbling_attr:.2f}",
+            f"  roll = {result.dribbler_roll:.3f}",
+            f"Winner: {tackler_id if result.tackler_won else dribbler_id}"
+            f" (margin {abs(result.tackler_roll - result.dribbler_roll):.3f})",
+        ]
         if modifier_notes:
-            notes += f"  [{modifier_notes}]"
-        self._log_debug(notes)
+            lines.append(f"Detected via: {modifier_notes}")
+        self._log_info(msg, detail="\n".join(lines))
 
     # ── Phase B helpers ────────────────────────────────────────────────────
 
@@ -1229,19 +1266,26 @@ class Match:
                 f"{player.player_id} tackle on {target.player_id} auto-failed [GK in own box]"
             )
         else:
+            angle_mod = tackle_angle_modifier(
+                target.heading_rad, target.position, player.position, self.tackling_params
+            )
+            gk_outside_box = self._gk_outside_own_box(player)
+            effective_dribbling = self._effective_dribbling(target)
             result = attempt_tackle(
                 player.attributes.tackling,
-                self._effective_dribbling(target),
+                effective_dribbling,
                 self.rng_reduction,
                 self.rng,
                 self.tackling_params,
                 is_goalkeeper_tackle=player.is_goalkeeper,
-                angle_modifier=tackle_angle_modifier(
-                    target.heading_rad, target.position, player.position, self.tackling_params
-                ),
-                gk_outside_box=self._gk_outside_own_box(player),
+                angle_modifier=angle_mod,
+                gk_outside_box=gk_outside_box,
             )
-            self._log_tackle_result(player.player_id, target.player_id, result)
+            self._log_tackle_result(
+                player.player_id, target.player_id, result,
+                player.attributes.tackling, effective_dribbling,
+                player.is_goalkeeper, angle_mod, gk_outside_box,
+            )
             if result.tackler_won and self._target_has_or_controls_ball(target):
                 self._set_possession(player.player_id)
             apply_tackle_result(result, player, target, self.tackling_params)

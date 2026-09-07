@@ -169,8 +169,9 @@ def _maybe_log_grad_norm_spike(
     minibatch's grad norm unusually large FOR THIS RUN" is the question, and
     a brand new run naturally starts the window empty again anyway).
 
-    Fires a [grad norm SPIKE] warning with a top-K per-parameter-tensor
-    breakdown whenever raw_grad_norm exceeds (running_mean +
+    Logs a [grad norm SPIKE] DEBUG line (visible with train.py's --verbose
+    flag) with a top-K per-parameter-tensor breakdown whenever raw_grad_norm
+    exceeds (running_mean +
     trainer.grad_norm_spike_k * running_std) of that history -- adaptive to
     whatever scale a given run/config actually produces, instead of a fixed
     absolute number that needs re-tuning any time the typical scale changes
@@ -221,7 +222,15 @@ def _maybe_log_grad_norm_spike(
             _named_grad_norms.sort(key=lambda kv: kv[1], reverse=True)
             _top_spike = _named_grad_norms[:_GRAD_NORM_SPIKE_TOP_K]
             _spike_str = "  ".join(f"{name}={norm:.2f}" for name, norm in _top_spike)
-            log.warning(
+            # DEBUG, not WARNING -- gated behind train.py's --verbose flag
+            # (sets the "footballcoach.ai" parent logger to DEBUG, which
+            # this "footballcoach.ai.ppo" child inherits). Was WARNING while
+            # this diagnostic was actively hunting the crossing_head/
+            # crosses_logit scale bug (see physics_encoders.py's _apply_
+            # logit_sigmoid) -- now that that's fixed, remaining spikes are
+            # the ordinary "categorical/context flags carry a lot of
+            # gradient" pattern, not something worth surfacing by default.
+            log.debug(
                 f"[grad norm SPIKE][{label}] epoch={epoch_i} mb={mb_i} raw={raw_grad_norm:.2f} "
                 f"(running mean={running_mean:.2f} std={running_std:.2f} "
                 f"bar=mean+{trainer.grad_norm_spike_k:.1f}*std={spike_bar:.2f}, n={len(history)}) -- "
@@ -252,7 +261,7 @@ def _maybe_log_grad_norm_spike(
                         _seen_param_ids.add(id(_p))
                         _cols_str = _describe_weight_grad_columns(_p, _schema)
                         if _cols_str:
-                            log.warning(f"  [grad norm SPIKE][{label}] {_full} per-input-column grad norm: {_cols_str}")
+                            log.debug(f"  [grad norm SPIKE][{label}] {_full} per-input-column grad norm: {_cols_str}")
                         break
     history.append(raw_grad_norm)
 
@@ -4506,6 +4515,14 @@ class PPOTrainer:
         all_tackle_prob: list[float] = []       # mean sigmoid(tackle_attempt_logit) per mb
         all_kick_prob: list[float] = []         # mean sigmoid(kick_logit) per mb
         all_ratios: list[torch.Tensor] = []
+        # Tracks the single highest-ratio sample seen across the WHOLE update
+        # (every epoch/minibatch), captured at the exact (row, weight
+        # snapshot) that produced it -- unlike the [worst sample]/[top-2
+        # highest-ratio] diagnostic below, which only re-examines the first
+        # 256 buffer rows under the FINAL post-update weights and is not
+        # necessarily the same sample (or even the same epoch) that produced
+        # the true max reported in the [ratio] percentile line.
+        _ratio_spike: dict = {"ratio": float("-inf")}
         all_mv_log_std_grad: list[float] = []  # grad on move_dir_log_std after each backward
         # --- Extra diagnostics: advantage stats, ratio stats, per-execution-head
         # grad norm, continuous/discrete head drift, per-head KL. All aggregated
@@ -4633,6 +4650,7 @@ class PPOTrainer:
 
         for epoch_i in range(self.n_epochs):
             epoch_start = time.perf_counter()
+            _epoch_slice_start = len(all_policy_loss)
             indices = torch.randperm(n)
             for start in range(0, n, self.minibatch_size):
                 mb_idx = indices[start:start + self.minibatch_size]
@@ -4750,6 +4768,26 @@ class PPOTrainer:
                 # PPO clipped objective (weighted by per-sample importance weights)
                 ratio = torch.exp(new_log_probs - mb_old_lp)
                 all_ratios.append(ratio.detach().cpu())
+                with torch.no_grad():
+                    _mb_max_ratio_t, _mb_max_local = ratio.max(dim=0)
+                    _mb_max_ratio_f = float(_mb_max_ratio_t)
+                    if _mb_max_ratio_f > _ratio_spike["ratio"]:
+                        _row = int(_mb_max_local)
+                        # Same (d_heads, e_heads) snapshot that produced this
+                        # minibatch's ratio -- pre-step, matching new_log_probs.
+                        _per_head_row = self._per_head_new_log_probs(
+                            d_heads, e_heads, mb_actions, em
+                        )[_row].detach().cpu()
+                        _ratio_spike = {
+                            "ratio": _mb_max_ratio_f,
+                            "epoch": epoch_i,
+                            "mb": start // self.minibatch_size,
+                            "row": int(mb_idx[_row]),
+                            "old_lp": float(mb_old_lp[_row]),
+                            "new_lp": float(new_log_probs[_row]),
+                            "adv": float(mb_adv[_row]),
+                            "per_head_new": _per_head_row,
+                        }
                 # Kept as a tensor (not .item()'d) until the batched sync
                 # below, alongside tackle_prob/kick_prob/bc_loss_val -- same
                 # value, one CPU<->GPU round trip instead of four.
@@ -5112,8 +5150,25 @@ class PPOTrainer:
                     break
 
             epoch_times.append((time.perf_counter() - epoch_start) * 1000)
-            mean_kl_epoch = float(np.mean(all_kl[-32:])) if all_kl else 0.0
-            log.debug(f"  [epoch {epoch_i}] kl={mean_kl_epoch:.5f}  t={epoch_times[-1]:.0f}ms")
+            # Full-epoch means (every minibatch this epoch actually ran, not
+            # just the last 32) -- the per-minibatch [ppo update] progress
+            # line only samples ~10 single minibatches across the WHOLE
+            # update (roughly once every 2-3 epochs), so two consecutive
+            # printed pol=/kl= values are effectively independent random
+            # minibatches, not a smooth trend -- easy to misread ordinary
+            # sampling noise (e.g. pol swinging between -0.017 and +0.026,
+            # all of it close to zero) as the policy getting worse or better
+            # within the update. This line answers "does this actually
+            # degrade deeper into the update" directly, once per epoch,
+            # instead of guessing from ~10 sparse single-minibatch snapshots.
+            _epoch_pol = all_policy_loss[_epoch_slice_start:]
+            _epoch_kl = all_kl[_epoch_slice_start:]
+            mean_pol_epoch = float(np.mean(_epoch_pol)) if _epoch_pol else 0.0
+            mean_kl_epoch = float(np.mean(_epoch_kl)) if _epoch_kl else 0.0
+            log.info(
+                f"  [epoch {epoch_i + 1}/{self.n_epochs}] pol_mean={mean_pol_epoch:.4f}  "
+                f"kl_mean={mean_kl_epoch:.4f}  (n={len(_epoch_kl)} minibatch(es), {epoch_times[-1]:.0f}ms)"
+            )
             if _early_stopped:
                 break
 
@@ -5624,6 +5679,30 @@ class PPOTrainer:
                 f"  min={_ratios_all.min():.4f}"
                 f"  max={_ratios_all.max():.4f}"
                 f"  clipped={_ratio_clip_frac * 100:.1f}%"
+            )
+        if _ratio_spike["ratio"] > float("-inf"):
+            _spike_row = _ratio_spike["row"]
+            _new_head_row = _ratio_spike["per_head_new"].tolist()
+            if "head_log_probs" in batch:
+                _old_head_row = batch["head_log_probs"][_spike_row].tolist()
+                _deltas = list(zip(HEAD_LP_KEYS, (nv - ov for nv, ov in zip(_new_head_row, _old_head_row))))
+            else:
+                _deltas = list(zip(HEAD_LP_KEYS, _new_head_row))
+            _deltas.sort(key=lambda kv: abs(kv[1]), reverse=True)
+            _spike_delta_str = "  ".join(f"{k}:{v:+.3f}" for k, v in _deltas if abs(v) > 0.02)
+            _rcomp_list = batch.get("reward_comps_raw", [])
+            _outcome_list = batch.get("step_outcomes", [])
+            _rc = _rcomp_list[_spike_row] if _spike_row < len(_rcomp_list) else {}
+            _rcomp_str = "  ".join(f"{k}={v:+.3f}" for k, v in _rc.items() if abs(v) > 0.001) or "n/a"
+            _oc = _outcome_list[_spike_row] if _spike_row < len(_outcome_list) else ""
+            _spike_outcome_str = f"terminal:{_oc}" if _oc else "mid-ep"
+            log.info(
+                f"  [ratio spike] max={_ratio_spike['ratio']:.3f}"
+                f"  epoch={_ratio_spike['epoch'] + 1}/{self.n_epochs}  mb={_ratio_spike['mb']}"
+                f"  row={_spike_row}(global)  adv={_ratio_spike['adv']:+.3f}"
+                f"  old_lp={_ratio_spike['old_lp']:.3f}  new_lp={_ratio_spike['new_lp']:.3f}\n"
+                f"    rew_breakdown: {_rcomp_str}  outcome={_spike_outcome_str}\n"
+                f"    per-head Δ(new-old), sorted by |Δ|: {_spike_delta_str}"
             )
         _head_grad_norm_str = "  ".join(
             f"{name}={np.mean(vals):.3f}" for name, vals in all_head_grad_norm.items() if vals

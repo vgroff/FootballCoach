@@ -132,11 +132,26 @@ def build_phase1_replay_env(trainer, seed: int, *, deterministic: bool = False):
     return env
 
 
-def pick_random_dagger_episode(dataset, rng: _random.Random):
-    """Uniformly-random (start, end, seed) over every full-dataset episode
-    that has a recorded seed (episode_seed() returns non-None) -- episodes
-    predating meta_episode_seeds are skipped. Returns None if the dataset
-    has no seeded episode at all.
+def dagger_episode_candidates(dataset) -> list[tuple[int, int, int]]:
+    """[(start, end, seed), ...] over every full-dataset episode that has a
+    recorded seed (episode_seed() returns non-None) -- episodes predating
+    meta_episode_seeds are skipped.
+
+    Expensive -- dataset.episode_row_ranges(dataset.valid_indices()) walks
+    every row of valid_indices() in a plain Python loop (not vectorized) to
+    find episode boundaries within that filtered pool, then episode_seed()
+    is called once per episode found. For a multi-million-row dataset this
+    is a genuinely slow pass (confirmed: several million valid rows -> a
+    multi-second-plus pure-Python loop). MUST be called ONCE per DAgger
+    phase (see run_dagger_phase), not once per seed needed -- it used to be
+    embedded directly in pick_random_dagger_episode() and called once per
+    seed (500/iteration in a real run), which meant this entire expensive,
+    dataset-invariant pass was redone hundreds of times before the first
+    rollout could even start, with no log output anywhere in that loop to
+    show why -- confirmed live as several minutes of apparent "hang" per
+    DAgger iteration, every iteration, all of it before collect_dagger_
+    rollouts_parallel's own "spinning up worker process(es)" log line ever
+    had a chance to print.
     """
     ranges = dataset.episode_row_ranges(dataset.valid_indices())
     candidates = []
@@ -144,6 +159,14 @@ def pick_random_dagger_episode(dataset, rng: _random.Random):
         seed = dataset.episode_seed(end)
         if seed is not None:
             candidates.append((start, end, seed))
+    return candidates
+
+
+def pick_random_dagger_episode(candidates: list[tuple[int, int, int]], rng: _random.Random):
+    """Uniformly-random (start, end, seed) from a candidate list already
+    built by dagger_episode_candidates() -- cheap, just an rng.choice().
+    Returns None if `candidates` is empty (dataset has no seeded episode at
+    all)."""
     if not candidates:
         return None
     return rng.choice(candidates)
@@ -697,11 +720,29 @@ def run_dagger_phase(
     save. Pass PPOTrainer.pretrain_combined()'s own `_save_pretrain_checkpoint`
     closure -- same one every other phase in that function already uses.
     """
+    import time
+
     from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
     from footballcoach.ai.progress import ProgressReporter
 
     rng = trainer._aug_rng
     aggregated = RolloutBuffer()
+
+    # Computed ONCE for the whole phase, not once per seed needed -- see
+    # dagger_episode_candidates()'s own docstring for why this used to be
+    # embedded in the per-seed picker instead (a genuinely slow, dataset-
+    # size-scaling pass, redone hundreds of times per iteration for no
+    # reason, entirely before any rollout or worker-pool log line could
+    # print -- confirmed live as several minutes of apparently-hung silence
+    # before the very first DAgger rollout of a run).
+    log.info("[dagger] building episode candidate list from dataset (once for this phase)...")
+    _t0 = time.monotonic()
+    candidates = dagger_episode_candidates(dataset)
+    log.info(f"[dagger] found {len(candidates)} seeded episode(s) in {time.monotonic() - _t0:.1f}s")
+    if not candidates:
+        log.warning("[dagger] no seeded episode available in dataset -- DAgger phase skipped entirely.")
+        return
+
     # Coarse, iteration-granularity bar for overall DAgger-phase ETA (each
     # iteration itself contains its own finer BC-epoch/rollout-tick bars
     # below) -- live=False (milestone lines only) since this phase can run
@@ -719,18 +760,23 @@ def run_dagger_phase(
         # iteration's training step, including the first, sees on-policy
         # correction data from the CURRENT policy (Phase 1's fresh weights,
         # for iteration 1), and no rollout ever goes to waste.
-        seeds = []
-        for _ in range(episodes_per_iteration):
-            picked = pick_random_dagger_episode(dataset, rng)
-            if picked is None:
-                log.warning("[dagger] no seeded episode available in dataset -- skipping remaining rollouts/iterations.")
-                return
-            seeds.append(picked[2])
+        _iter_t0 = time.monotonic()
+        log.info(f"[dagger] iteration {it}/{iterations}: starting")
+        seeds = [pick_random_dagger_episode(candidates, rng)[2] for _ in range(episodes_per_iteration)]
 
+        log.info(f"[dagger] iteration {it}/{iterations}: picked {len(seeds)} episode seed(s), starting rollout collection...")
+        _rollout_t0 = time.monotonic()
         results = collect_dagger_rollouts_parallel(trainer, seeds, max_replay_steps, n_workers=n_workers)
+        _rollout_elapsed = time.monotonic() - _rollout_t0
         for _seed, (new_buf, _summary) in results:
             extend_buffer(aggregated, new_buf)
+        _pre_subsample_n = len(aggregated)
         subsample_buffer(aggregated, buffer_max_size, rng)
+        if len(aggregated) < _pre_subsample_n:
+            log.info(
+                f"[dagger] iteration {it}/{iterations}: aggregated buffer exceeded cap "
+                f"({_pre_subsample_n} > {buffer_max_size}), subsampled down to {len(aggregated)}"
+            )
 
         import numpy as np
 
@@ -746,20 +792,30 @@ def run_dagger_phase(
         total_kicks = sum(s["n_kicks"] for s in summaries)
         total_kicks_labelled = sum(s["n_kicks_labelled"] for s in summaries)
         log.info(
-            f"  [dagger] iteration {it}/{iterations}: {len(summaries)} rollout(s) -- "
+            f"[dagger] iteration {it}/{iterations}: {len(summaries)} rollout(s) in {_rollout_elapsed:.1f}s -- "
             f"outcomes[{_PHASE1_OUTCOME_LEGEND}]={outcome_breakdown([s['outcome'] for s in summaries])}  "
             f"reward mean={float(np.mean(rewards)):.2f} std={float(np.std(rewards)):.2f}  "
             f"kicks={total_kicks}/{total_kicks_labelled}  aggregated_buffer_size={len(aggregated)}"
         )
 
         extra_obs, extra_bc_labels = dagger_extra_tensors(aggregated, trainer.device)
-        log.info(f"  [dagger] iteration {it}/{iterations}: BC training ({len(aggregated)} aggregated rows so far)")
+        log.info(f"[dagger] iteration {it}/{iterations}: BC training starting ({len(aggregated)} aggregated rows so far)...")
+        _bc_t0 = time.monotonic()
         train_bc_epochs(
             trainer, dataset, train_idx, opt,
             max_epochs=bc_epochs_per_iter, batch_size=batch_size, log_every=log_every,
             extra_obs=extra_obs, extra_bc_labels=extra_bc_labels,
         )
+        _bc_elapsed = time.monotonic() - _bc_t0
+        log.info(f"[dagger] iteration {it}/{iterations}: BC training took {_bc_elapsed:.1f}s")
+
         if checkpoint_fn is not None:
+            _ckpt_t0 = time.monotonic()
             checkpoint_fn(f"DAgger iter {it}/{iterations}")
+            log.info(f"[dagger] iteration {it}/{iterations}: checkpoint saved in {time.monotonic() - _ckpt_t0:.1f}s")
+        log.info(
+            f"[dagger] iteration {it}/{iterations}: done in {time.monotonic() - _iter_t0:.1f}s total "
+            f"(rollout {_rollout_elapsed:.1f}s, BC training {_bc_elapsed:.1f}s)"
+        )
         _iter_progress.update(it)
     _iter_progress.finish(iterations)
