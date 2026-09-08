@@ -1,7 +1,9 @@
 """Unit tests for action/distributions.py.
 
-Covers IndependentBernoulli, MaskedCategorical, SquashedNormalHead, and
-DirectionHead.  These are the lowest-level building blocks of PPO log_prob
+Covers IndependentBernoulli, MaskedCategorical, SquashedNormalHead,
+VonMisesDirectionHead, KickDirectionHead, and the legacy DirectionHead
+(superseded but kept for any external caller/test still using it).  These
+are the lowest-level building blocks of PPO log_prob
 computation - any bug here silently corrupts the training signal across
 every single update step.
 
@@ -22,8 +24,11 @@ import torch
 from footballcoach.ai.action.distributions import (
     DirectionHead,
     IndependentBernoulli,
+    KickDirectionHead,
     MaskedCategorical,
     SquashedNormalHead,
+    VonMisesDirectionHead,
+    _von_mises_entropy,
 )
 
 
@@ -340,3 +345,147 @@ class TestDirectionHead:
         assert torch.all(torch.isfinite(phys))
         # Should be approximately unit (epsilon prevents div-by-zero)
         assert float(phys.norm()) <= 1.0 + 1e-3
+
+
+# ---------------------------------------------------------------------------
+# VonMisesDirectionHead (move_direction: 2D, azimuthal-only)
+# ---------------------------------------------------------------------------
+
+class TestVonMisesDirectionHead:
+
+    def test_sample_raw_is_unit_vector(self):
+        raw = torch.randn(4, 2)
+        head = VonMisesDirectionHead(raw, torch.full((1,), 2.0))
+        for _ in range(20):
+            sampled = head.sample_raw()
+            norm = sampled.norm(dim=-1)
+            for n in norm:
+                assert float(n) == pytest.approx(1.0, abs=1e-4)
+
+    def test_mode_physical_is_unit_vector_and_matches_mean(self):
+        raw = torch.tensor([[1.0, 0.0]])
+        head = VonMisesDirectionHead(raw, torch.full((1,), 2.0))
+        phys = head.mode_physical()
+        assert float(phys.norm()) == pytest.approx(1.0, abs=1e-5)
+        assert float(phys[0, 0]) == pytest.approx(1.0, abs=1e-4)
+        assert float(phys[0, 1]) == pytest.approx(0.0, abs=1e-4)
+
+    def test_log_prob_finite_and_no_nan(self):
+        raw = torch.randn(8, 2)
+        head = VonMisesDirectionHead(raw, torch.full((1,), 2.0))
+        sampled = head.sample_raw()
+        lp = head.log_prob(sampled)
+        assert torch.all(torch.isfinite(lp))
+        assert not torch.any(torch.isnan(lp))
+
+    def test_log_prob_higher_at_mean_than_far_away(self):
+        raw = torch.tensor([[1.0, 0.0]])
+        head = VonMisesDirectionHead(raw, torch.full((1,), 3.0))
+        lp_at_mean = head.log_prob(torch.tensor([[1.0, 0.0]]))
+        lp_opposite = head.log_prob(torch.tensor([[-1.0, 0.0]]))
+        assert float(lp_at_mean) > float(lp_opposite)
+
+    def test_entropy_decreases_as_kappa_increases(self):
+        e_low = float(_von_mises_entropy(torch.tensor([1.0])))
+        e_high = float(_von_mises_entropy(torch.tensor([10.0])))
+        assert e_low > e_high
+
+    def test_entropy_matches_head_entropy(self):
+        raw = torch.tensor([[1.0, 0.0]])
+        head = VonMisesDirectionHead(raw, torch.full((1,), 4.0))
+        assert float(head.entropy()) == pytest.approx(
+            float(_von_mises_entropy(torch.exp(torch.tensor([4.0])))), abs=1e-5
+        )
+
+    def test_log_kappa_is_clamped(self):
+        raw = torch.tensor([[1.0, 0.0]])
+        head = VonMisesDirectionHead(raw, torch.tensor([999.0]),
+                                      log_kappa_min=-2.0, log_kappa_max=10.0)
+        assert torch.isfinite(head._kappa)
+        assert float(head._kappa) == pytest.approx(math.exp(10.0), rel=1e-4)
+
+    def test_scale_invariant_to_raw_vector_magnitude(self):
+        """atan2 is scale-invariant -- a raw vector and any positive multiple
+        of it should produce the same mean angle/log_prob."""
+        raw_small = torch.tensor([[0.01, 0.0]])
+        raw_large = torch.tensor([[100.0, 0.0]])
+        h_small = VonMisesDirectionHead(raw_small, torch.full((1,), 2.0))
+        h_large = VonMisesDirectionHead(raw_large, torch.full((1,), 2.0))
+        action = torch.tensor([[0.0, 1.0]])
+        assert float(h_small.log_prob(action)) == pytest.approx(float(h_large.log_prob(action)), abs=1e-5)
+
+
+# ---------------------------------------------------------------------------
+# KickDirectionHead (kick_direction: 3D, azimuthal von Mises x elevation Normal)
+# ---------------------------------------------------------------------------
+
+class TestKickDirectionHead:
+
+    def test_sample_raw_is_unit_vector(self):
+        raw = torch.randn(4, 3)
+        head = KickDirectionHead(raw, torch.full((1,), 2.0), torch.full((1,), -1.0))
+        for _ in range(20):
+            sampled = head.sample_raw()
+            norm = sampled.norm(dim=-1)
+            for n in norm:
+                assert float(n) == pytest.approx(1.0, abs=1e-4)
+
+    def test_mode_physical_is_unit_vector(self):
+        raw = torch.tensor([[1.0, 0.0, 0.5]])
+        head = KickDirectionHead(raw, torch.full((1,), 2.0), torch.full((1,), -1.0))
+        phys = head.mode_physical()
+        assert float(phys.norm()) == pytest.approx(1.0, abs=1e-5)
+
+    def test_log_prob_finite_and_no_nan(self):
+        raw = torch.randn(8, 3)
+        head = KickDirectionHead(raw, torch.full((1,), 2.0), torch.full((1,), -1.0))
+        sampled = head.sample_raw()
+        lp = head.log_prob(sampled)
+        assert torch.all(torch.isfinite(lp))
+        assert not torch.any(torch.isnan(lp))
+
+    def test_log_prob_higher_at_mode_than_far_away(self):
+        raw = torch.tensor([[1.0, 0.0, 0.5]])
+        head = KickDirectionHead(raw, torch.full((1,), 3.0), torch.full((1,), -1.0))
+        mode = head.mode_physical()
+        far = torch.tensor([[-1.0, 0.0, -0.5]])
+        far = far / far.norm(dim=-1, keepdim=True)
+        assert float(head.log_prob(mode)) > float(head.log_prob(far))
+
+    def test_entropy_finite_and_matches_sum_of_components(self):
+        raw = torch.tensor([[1.0, 0.0, 0.5]])
+        log_kappa = torch.full((1,), 3.0)
+        log_std_z = torch.full((1,), -1.0)
+        head = KickDirectionHead(raw, log_kappa, log_std_z)
+        ent = head.entropy()
+        assert torch.isfinite(ent)
+        expected = _von_mises_entropy(torch.exp(log_kappa)) + head.dist_z.entropy()
+        assert float(ent) == pytest.approx(float(expected), abs=1e-5)
+
+    def test_z_is_unconstrained_no_squash(self):
+        """z has no bounded range -- an extreme raw z should still reconstruct
+        to a valid (near-vertical) unit vector, not NaN/clamp artifacts."""
+        raw = torch.tensor([[1.0, 0.0, 50.0]])
+        head = KickDirectionHead(raw, torch.full((1,), 2.0), torch.full((1,), -1.0))
+        phys = head.mode_physical()
+        assert torch.all(torch.isfinite(phys))
+        assert float(phys.norm()) == pytest.approx(1.0, abs=1e-4)
+        # z=50 should dominate -- direction should be very close to +z.
+        assert float(phys[0, 2]) > 0.999
+
+    def test_z_zero_gives_pure_in_plane_kick(self):
+        raw = torch.tensor([[1.0, 0.0, 0.0]])
+        head = KickDirectionHead(raw, torch.full((1,), 2.0), torch.full((1,), -1.0))
+        phys = head.mode_physical()
+        assert float(phys[0, 2]) == pytest.approx(0.0, abs=1e-5)
+
+    def test_log_prob_near_pole_stays_finite(self):
+        """A stored action with |a_z| extremely close to 1 (near-vertical
+        kick) exercises the eps-guarded z-inversion singularity."""
+        raw = torch.tensor([[1.0, 0.0, 0.5]])
+        head = KickDirectionHead(raw, torch.full((1,), 2.0), torch.full((1,), -1.0))
+        pole = torch.tensor([[1e-4, 0.0, 0.999999999]])
+        pole = pole / pole.norm(dim=-1, keepdim=True)
+        lp = head.log_prob(pole)
+        assert torch.isfinite(lp)
+        assert not torch.isnan(lp)

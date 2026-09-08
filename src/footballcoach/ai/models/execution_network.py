@@ -22,7 +22,7 @@ Outputs:
 """
 from __future__ import annotations
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import torch.nn as nn
@@ -119,8 +119,9 @@ class ExecutionNetwork(nn.Module):
         global_mlp_hidden: int = 32,
         decision_mlp_hidden: int = 64,
         trunk_hidden: int = 256,
-        dir_log_std_init: float = -2.0,
-        kick_dir_log_std_init: Optional[float] = None,
+        dir_log_kappa_init: float = 2.7,
+        kick_dir_log_kappa_init: Optional[float] = None,
+        kick_dir_z_log_std_init: float = -1.15,
         kick_power_log_std_init: float = 0.0,
         kick_spin_log_std_init: float = 0.0,
         value_extra_hidden: int = 16,
@@ -235,20 +236,22 @@ class ExecutionNetwork(nn.Module):
                 nn.Linear(value_in_dim, 1),
             )
 
-        # Learnable log_std for direction heads (move_dir, kick_dir).
-        # Single scalar (isotropic) rather than one-per-axis: the direction
-        # heads output a unit vector, so the x/y Gaussian error is really a
-        # proxy for angular error, and there is no principled reason for the
-        # x and y axes to have independently-tunable spreads. A single log_std
-        # broadcasts against both dims in DirectionHead's Normal(...) — see
-        # ai_trainer_knowledge.md "Direction heads: log_std and KL".
-        # Initialized from config (dir_log_std_init). Lower = tighter sampling
-        # (σ≈0.13 at -2.0, σ≈0.22 at -1.5, σ≈0.37 at -1.0).
-        # KL spikes if too tight: a 4° mean shift at σ=0.13 → ratio~50×.
-        # Clamped during forward() to [dir_log_std_min, dir_log_std_max].
-        self.move_dir_log_std = nn.Parameter(torch.full((1,), dir_log_std_init))
-        _kick_ls_init = kick_dir_log_std_init if kick_dir_log_std_init is not None else dir_log_std_init
-        self.kick_dir_log_std = nn.Parameter(torch.full((1,), _kick_ls_init))
+        # Learnable log-concentration (log_kappa) for the direction heads'
+        # von Mises azimuthal component (move_dir, kick_dir xy), plus a
+        # separate plain log_std for kick_dir's elevation (z) component --
+        # see ai_trainer_knowledge.md "Direction heads: von Mises". A single
+        # scalar kappa/log_std (not one-per-axis): there's no principled
+        # reason for independently-tunable spreads across the azimuthal
+        # circle, and elevation is a single scalar to begin with.
+        # log_kappa is the INVERSE of the old log_std's relationship to
+        # spread: larger log_kappa = narrower/more concentrated (unlike
+        # log_std, where larger = wider). Clamped during forward() to
+        # [dir_log_kappa_min, dir_log_kappa_max] / [kick_dir_z_log_std_min,
+        # kick_dir_z_log_std_max].
+        self.move_dir_log_kappa = nn.Parameter(torch.full((1,), dir_log_kappa_init))
+        _kick_lk_init = kick_dir_log_kappa_init if kick_dir_log_kappa_init is not None else dir_log_kappa_init
+        self.kick_dir_log_kappa = nn.Parameter(torch.full((1,), _kick_lk_init))
+        self.kick_dir_z_log_std = nn.Parameter(torch.full((1,), kick_dir_z_log_std_init))
         # kick_power/kick_spin log_std: previously fixed at torch.zeros(...) and
         # never actually read anywhere -- both heads were applied fully
         # deterministically (sigmoid(mean) / raw mean, no sampling, no PPO
@@ -271,7 +274,26 @@ class ExecutionNetwork(nn.Module):
         decision_heads: DecisionHeadsRaw,  # from DecisionNetwork.forward()
         self_ai_type: Optional[torch.Tensor] = None,   # (batch, AI_TYPE_ONE_HOT_DIM)
         other_ai_type: Optional[torch.Tensor] = None,  # (batch, MAX_OTHER_PLAYERS, AI_TYPE_ONE_HOT_DIM)
-    ) -> ExecutionHeadsRaw:
+        value_only: bool = False,
+    ) -> Union[ExecutionHeadsRaw, torch.Tensor]:
+        """value_only=True (used when this instance is acting as a pure
+        critic -- either PPOTrainer.value_net under separate_value_net, or
+        this same execution_net called ONLY for its value head): skips
+        projecting the 8 actor heads (move/kick direction, exec_move/
+        sprint/kick/tackle_attempt logits, kick_power, kick_spin) --
+        profiled at ~19% of this network's own forward cost, pure waste
+        when nothing reads them -- and returns the value tensor (batch, 1)
+        DIRECTLY instead of wrapping it in ExecutionHeadsRaw. This is a
+        deliberately different return type (not ExecutionHeadsRaw with
+        the other fields None/zeroed): a caller that wrongly expects the
+        full dataclass fails immediately and loudly (AttributeError) on
+        the very first call instead of silently reading a placeholder
+        value for e.g. .kick_direction. Safe for ANY caller that only
+        reads `.value` from a normal (value_only=False) call: value_input
+        (below) is fully built before any of the 8 skipped heads are
+        touched, so they have zero effect on the value output -- skipping
+        them is a pure no-op on `.value`'s numerics, not an approximation.
+        """
         dec_flat = flatten_decision_heads(decision_heads)
 
         # --- Reuse DecisionNetwork's already-computed physics features
@@ -314,6 +336,9 @@ class ExecutionNetwork(nn.Module):
         )
         elapsed_norm = 1.0 - global_feat[:, 1:2]
         value_input = torch.cat([h, value_extra, elapsed_norm], dim=-1)
+
+        if value_only:
+            return self.value_head(value_input)
 
         eps = 1e-6
         raw_move = self.move_direction(h)
@@ -400,8 +425,9 @@ class ExecutionNetwork(nn.Module):
             global_mlp_hidden=cfg["global_mlp_hidden"],
             decision_mlp_hidden=cfg["decision_mlp_hidden"],
             trunk_hidden=trunk,
-            dir_log_std_init=ppo_cfg.get("dir_log_std_init", -2.0),
-            kick_dir_log_std_init=ppo_cfg.get("kick_dir_log_std_init", None),
+            dir_log_kappa_init=ppo_cfg.get("dir_log_kappa_init", 2.7),
+            kick_dir_log_kappa_init=ppo_cfg.get("kick_dir_log_kappa_init", None),
+            kick_dir_z_log_std_init=ppo_cfg.get("kick_dir_z_log_std_init", -1.15),
             kick_power_log_std_init=ppo_cfg.get("kick_power_log_std_init", 0.0),
             kick_spin_log_std_init=ppo_cfg.get("kick_spin_log_std_init", 0.0),
             value_extra_hidden=cfg.get("value_extra_hidden", 16),

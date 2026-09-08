@@ -148,7 +148,7 @@ Not affected: `retr`, `appr_sq` retreat side, `poss`, `hdg`, `out`, `ill`, `box`
 | `src/footballcoach/ai/models/execution_network.py` | `ExecutionNetwork.from_config()` |
 | `src/footballcoach/ai/action/gating.py` | `select_action()` — winner-take-all, NO gradients |
 | `src/footballcoach/ai/action/apply_nn_action.py` | Applies execution outputs DIRECTLY to player — **no Orders**. Sets `desired_direction`, `desired_speed_mode`, calls `kick_with_direction()`, sets `tackle_armed = True` (no `tackle_direct()` method exists) |
-| `src/footballcoach/ai/action/distributions.py` | `IndependentBernoulli`, `MaskedCategorical`, `SquashedNormalHead`, `DirectionHead` |
+| `src/footballcoach/ai/action/distributions.py` | `IndependentBernoulli`, `MaskedCategorical`, `SquashedNormalHead`, `VonMisesDirectionHead`, `KickDirectionHead` (legacy `DirectionHead` kept unused) |
 | `src/footballcoach/ai/obs/augment.py` | Geometric + slot-permutation augmentation. **CRITICAL**: target slot indices (pass/tackle/mark) are remapped through the inverse permutation — do not remove this |
 
 ### !!!! CRITICAL ARCHITECTURE RULE — THE NETWORK NEVER ISSUES ORDERS !!!!
@@ -890,13 +890,13 @@ step=28,679 | rew=8.76 | pol=0.02 val=1.00 ent=0.25 kl=0.16  bc=2.84(x0.17) | 28
 | `kl` | Approximate KL divergence from old policy.  >0.1 = large update (KL diagnostics printed separately). Repeated >1.0 = policy diverging |
 | `bc=X(xY)` | BC auxiliary loss value × current annealing coefficient (`bc.aux_coeff_start/end/aux_coeff_anneal_fraction`).  Disappears once coeff reaches 0 |
 | `sps` | Decision steps per second |
-| `mv_ls` | `move_direction` log-std for both output dimensions (tracks direction head confidence; effective σ = exp(mv_ls), clamped to `[exp(ppo.dir_log_std_min), exp(ppo.dir_log_std_max)]`) — see "Direction heads: log_std and KL" below |
+| `mv_ls` | `move_direction` log-kappa (tracks direction head confidence; effective κ = exp(mv_ls), clamped to `[exp(ppo.dir_log_kappa_min), exp(ppo.dir_log_kappa_max)]` — NOTE larger = MORE confident/narrower, the inverse of the old log_std) — see "Direction heads: von Mises" below |
 | `act: mv=XX gp=XX emv=XX spr=XX kck=XX tk=XX sh=XX hld=XX` | Per-head mean activation rate (0–100%) from stored buffer actions. Values near 0 or 100 = saturated head (collapse warning, or frozen/unused head in this phase — e.g. `kck`/`tk` near 0 in Phase 1). Zero extra compute — reads from buffer directly |
 | `ta_p` / `kk_p` | Mean predicted probability (`sigmoid(logit)`, pre-sampling) of `tackle_attempt` / `kick_this_tick` this rollout, printed to 4 decimal places. Distinct from `act: tk=`/`kck=` (post-sampling 0/1 activation rate) — `ta_p`/`kk_p` show the underlying continuous probability even when the sampled/gated action never actually fires, so they're the better signal for "is the head learning anything at all" vs. "is it ever selected" |
 | `vs_rules(N): W%/L%/T%/M%[/O%]` | Full outcome breakdown (`outcome_breakdown()` in `ppo_trainer.py`) over the N **rules-based opponent** episodes this rollout: trainee win% / opponent win% / timeout% / ball-out(miss)% (only present if `curriculum.phase1_opponent_rules_prob > 0`). A trailing `/O%` ("other") appears only if some outcome isn't one of those four known keys. Previously this only showed W%/L%, silently lumping timeouts and ball-out-of-play into an invisible remainder — use the fuller breakdown to tell whether a win% swing is from more losses vs. more timeouts vs. more ball-out |
 | `vs_neural(N): W%/L%/T%/M%[/O%]` | Same breakdown for **neural opponent** episodes (shared-weight self-play).  Compare to `vs_rules` to see if improvement is vs the rules AI or just self-play |
 | `|adv|` (in the `value` line, next to `V=`/`R=`/`adv=`) | Mean **absolute** advantage this rollout (`adv_mean`/`adv_std` are signed and average toward ~0, masking magnitude). This is the companion number for reading a rising `entropy=`: the entropy bonus's pull on the loss is `ent_coef * entropy` with a FIXED `ent_coef` every rollout, while the policy-gradient term's pull scales with `|advantage|`. As a policy converges, advantages shrink (there's less room to improve, and the critic gets better at predicting outcomes) — so a shrinking `|adv|` alongside a still-rising `entropy` is the numeric signature of the entropy term starting to win the "tug of war" essentially unopposed, not a sign the policy still needs more exploration. |
-| `entropy` line (`shoot=... pass_=... move=... ... sprint=... move_dir=... kick_dir=...`) | Per-head decomposition of the aggregate `entropy=` scalar (same terms `_compute_entropy()` sums, individually), with `(+Δ)`/`(-Δ)` vs. the previous rollout in parens. Printed every rollout (not gated behind a KL threshold like `[per-head KL]`). Use this to see WHICH heads are actually driving a rising total — e.g. a couple of Bernoulli heads saturating toward `p=0.5`, or `move_dir`/`kick_dir` climbing toward their `dir_log_std_max` clamp — rather than only the opaque summed total. `sprint`/`move_dir`/`kick_dir` are already `E[parent active]`-weighted, matching what's actually added into the loss (see `_compute_entropy`'s docstring). |
+| `entropy` line (`shoot=... pass_=... move=... ... sprint=... move_dir=... kick_dir=...`) | Per-head decomposition of the aggregate `entropy=` scalar (same terms `_compute_entropy()` sums, individually), with `(+Δ)`/`(-Δ)` vs. the previous rollout in parens. Printed every rollout (not gated behind a KL threshold like `[per-head KL]`). Use this to see WHICH heads are actually driving a rising total — e.g. a couple of Bernoulli heads saturating toward `p=0.5`, or `move_dir`/`kick_dir` climbing toward their `dir_log_kappa_min` clamp (lower κ = more entropy, the inverse direction of the old log_std_max) — rather than only the opaque summed total. `sprint`/`move_dir`/`kick_dir` are already `E[parent active]`-weighted, matching what's actually added into the loss (see `_compute_entropy`'s docstring). |
 
 **Entropy has no built-in "fight back" mechanism with a fixed `ent_coef`.** It's easy to expect PPO to naturally sharpen its own distribution as it converges — and early in training it does, because the policy-gradient term (∝ `|advantage|`, which is large when the policy is still bad) dominates a comparatively small, fixed entropy bonus. But nothing makes the entropy term's own strength shrink as training progresses — `ent_coef * entropy`'s gradient pushes toward more randomness by the same fixed amount at step 6,000,000 as at step 32,000. Meanwhile the policy-gradient term naturally *weakens* over training (advantages shrink as the critic and policy both improve — there's less room left to correct). Late in training the entropy term isn't beating a strong opponent, it's coasting against a weak one. This is why every mature PPO implementation either anneals `ent_coef` to a small/zero floor or picks a constant small enough that it's never a factor — a fixed, non-trivial `ent_coef` (this repo's default `0.05` is on the higher end of common ranges) is not something the algorithm self-corrects. See `checkpoints/phase1_run110`'s 6M-step run for a concrete case: entropy climbed monotonically the entire run (0.60 → 4.69, still rising at the final rollout) while `vs_immobile` win rate rose 58%→92% then fell back to 81% once the accumulated randomness in execution-critical heads (kick/tackle/braking timing) started costing real points (`miss`/`timeout` outcome counts rose from ~0 at the peak to a recurring share by the end).
 
@@ -909,16 +909,69 @@ When a minibatch's KL exceeds `ppo.target_kl`, the epoch loop early-stops and up
 1. **Value-only continuation** (`ppo.value_only_continuation_epochs`) — trains only `value_head`/`value_ai_type_channel` (or `value_net` when `--separate-value-net` is enabled — see "Separate value network" below), always runs on early-stop.
 2. **BC-only continuation** (`bc.bc_only_continuation_epochs`, default `0` = disabled) — trains `decision_net`/`execution_net` via BC loss only, runs after value-only continuation, opt-in.
 
-If `mean_kl` for the whole rollout exceeds `KL_DIAG_THRESHOLD` (hardcoded `0.04` in `ppo_trainer.py`), a `[KL=... > ...] ratio percentiles: ...` block plus a `[per-head new lp means, n=256]` breakdown is also printed — this shows per-head log-prob contributions (`move_dir`/`kick_dir` will look "big" in magnitude, e.g. `-3.0`, purely because they're continuous Gaussian log-densities, not bounded like Bernoulli head log-probs which sit near 0 when confident — see "Direction heads: log_std and KL" below for the math). `kick_dir` is correctly gated to `0.000` whenever `kick` never fires that rollout (matches the real training-path gating in `_compute_log_prob`/`_recompute_log_prob`).
+If `mean_kl` for the whole rollout exceeds `KL_DIAG_THRESHOLD` (hardcoded `0.04` in `ppo_trainer.py`), a `[KL=... > ...] ratio percentiles: ...` block plus a `[per-head new lp means, n=256]` breakdown is also printed — this shows per-head log-prob contributions (`move_dir`/`kick_dir` will look "big" in magnitude, e.g. `-3.0`, purely because they're continuous log-densities (von Mises for the angular components, plain Gaussian for kick_dir's elevation), not bounded like Bernoulli head log-probs which sit near 0 when confident — see "Direction heads: von Mises" below for the math). `kick_dir` is correctly gated to `0.000` whenever `kick` never fires that rollout (matches the real training-path gating in `_compute_log_prob`/`_recompute_log_prob`).
 
-### Direction heads: log_std and KL
+### Direction heads: von Mises
 
-`move_direction`/`kick_direction` are modelled as an isotropic 2D Gaussian (`DirectionHead` in `action/distributions.py`) with mean = the network's (L2-normalized) output vector and learned std = `exp(move_dir_log_std)` / `exp(kick_dir_log_std)`, clamped every use to `[exp(ppo.dir_log_std_min), exp(ppo.dir_log_std_max)]`.
+`move_direction` (2D) is modelled as a true circular distribution — a von
+Mises (`VonMisesDirectionHead` in `action/distributions.py`, wrapping
+`torch.distributions.VonMises`) with mean angle = `atan2` of the network's
+output vector and learned concentration `κ = exp(move_dir_log_kappa)`,
+clamped every use to `[exp(ppo.dir_log_kappa_min), exp(ppo.dir_log_kappa_max)]`.
+`kick_direction` (3D — it has an elevation/loft component move_direction
+doesn't) is decomposed into an azimuthal angle (its own von Mises, `κ =
+exp(kick_dir_log_kappa)`) times a **plain, unconstrained** Gaussian on the
+elevation `z` component (`kick_dir_z_log_std`, clamped to
+`[exp(ppo.kick_dir_z_log_std_min), exp(ppo.kick_dir_z_log_std_max)]`) —
+`KickDirectionHead` in the same file. This replaced an earlier isotropic
+Gaussian on the raw (x,y[,z]) unit vector (scored via chordal/Euclidean
+distance, not a true angular density) — that approximation is kept as the
+unused legacy `DirectionHead` class. A full 3D von Mises-Fisher (the proper
+spherical analog for kick_direction) has no PyTorch built-in and needs a
+nontrivial custom rejection sampler, hence the azimuthal-von-Mises ×
+elevation-Normal decomposition instead — not a true rotationally-symmetric
+spherical distribution, but a deliberate, physically-reasonable
+approximation (elevation genuinely is a distinct axis from the two in-plane
+directions for a kick).
 
-- For small mean-shifts, `KL ≈ (Δμ)² / (2σ²)` — **larger σ directly reduces how much a given angular drift contributes to per-minibatch KL**, which is one lever for reducing `target_kl` early-stops (in addition to `target_kl` itself and `minibatch_size`).
-- `ppo.ent_dir_weight` controls how much the direction heads' entropy contributes to the entropy bonus; raising it pushes the optimizer to prefer a larger learned σ (more exploration credit for less certainty) — a widely-used indirect way to loosen the KL budget for direction drift specifically, at the cost of noisier/less confident direction output.
-- **`ent_dir_weight` is entropy-bonus-only** — it does NOT scale the direction heads' contribution to `_compute_log_prob`/`_recompute_log_prob`/`_per_head_new_log_probs` (the actual PPO ratio) any more. It used to: at a small value (e.g. `0.002`), that coupling silently raised the direction heads' TRUE probability ratio to the power `ent_dir_weight` (`ratio_true^ent_dir_weight`), compressing any real drift toward `ratio≈1` — defeating PPO's clip/KL trust-region protection for those heads specifically (large true drift never triggered clipping or early-stop) while also attenuating the real policy-gradient signal reaching them by the same factor, compounding with (not replaced by) `direction_learning_rate`/`direction_max_grad_norm` below. This is the likely explanation for `move_direction`/`kick_direction` log_std barely moving (`dlog_std≈0.00001`, `Δσ°≈0.000/step`) across essentially every rollout in every run analysed before this fix. `direction_max_grad_norm` was raised `0.015→0.3` at the same time since gradients reaching these params are now much larger — re-tune by watching the `[grad clip] direction: N/M steps clipped` log line, this is an informed guess not a calibrated value.
-- `ppo.dir_log_std_init` only sets the *initial* value of the learned `nn.Parameter` at network construction — it does not bound anything after training starts (that's `dir_log_std_min`/`dir_log_std_max`'s job). Current tuned values: `dir_log_std_init=-1.0` (σ≈0.37, ~21° angular std), `dir_log_std_min=-2.5` (σ≈0.082, ~4.7°), `dir_log_std_max=-0.3` (σ≈0.74, ~42°) — a tighter range than earlier experiments (`dir_log_std_max=0.8`, σ up to ≈2.23, ~85°+ angular std) that produced excessive KL from direction drift alone.
+**`log_kappa` is the INVERSE of the old `log_std`'s relationship to spread**:
+larger `log_kappa` = MORE concentrated/narrower (unlike `log_std`, where
+larger = wider). `kick_dir_z_log_std` keeps the old, familiar relationship
+(larger = wider) since it's still a plain Gaussian.
+
+- For small mean-shifts, `KL ≈ (Δθ)² · κ / 2` for the von Mises component (the
+  same qualitative shape as the old Gaussian's `KL ≈ (Δμ)²/(2σ²)`, just with
+  `κ` playing an inverted role to `1/σ²`) — **smaller κ directly reduces how
+  much a given angular drift contributes to per-minibatch KL**, which is one
+  lever for reducing `target_kl` early-stops (in addition to `target_kl`
+  itself and `minibatch_size`). This is the opposite direction of dial
+  compared to the old "widen σ" advice — now it's "lower κ".
+- `torch.distributions.VonMises` has no `.entropy()` — computed via the
+  closed-form `H(κ) = log(2π·I₀(κ)) - κ·I₁(κ)/I₀(κ)`, using the
+  numerically-stable exponentially-scaled Bessel functions
+  `torch.special.i0e`/`i1e` (`_von_mises_entropy()` in `distributions.py`) so
+  it stays well-conditioned across the whole realistic κ range (`I₀(κ)`
+  itself overflows float32 beyond κ≈90). Entropy is **monotonically
+  DECREASING in κ** — the inverse of the old log_std relationship.
+- `ppo.ent_dir_weight` controls how much the direction heads' entropy
+  contributes to the entropy bonus; raising it pushes the optimizer to
+  prefer a SMALLER learned κ (more exploration credit for less certainty,
+  same intent as before, just via the opposite end of the parameter) — a
+  widely-used indirect way to loosen the KL budget for direction drift
+  specifically, at the cost of noisier/less confident direction output.
+- **`ent_dir_weight` is entropy-bonus-only** — it does NOT scale the
+  direction heads' contribution to `_compute_log_prob`/
+  `_recompute_log_prob`/`_per_head_new_log_probs` (the actual PPO ratio).
+- `ppo.dir_log_kappa_init`/`kick_dir_log_kappa_init`/`kick_dir_z_log_std_init`
+  only set the *initial* value of the learned `nn.Parameter`s at network
+  construction — they don't bound anything after training starts (that's
+  `dir_log_kappa_min`/`max`/`kick_dir_z_log_std_min`/`max`'s job). An old
+  checkpoint's `move_dir_log_std`/`kick_dir_log_std` is migrated on load via
+  `_migrate_direction_log_std_to_kappa()` in `ppo_trainer.py` (`κ≈1/σ²`,
+  a small-angle approximation, not exact — and `kick_dir_z_log_std` is
+  seeded from the OLD `kick_dir_log_std` value directly, since there's no
+  analog for an elevation-only component in the old isotropic-3D
+  parameterization).
 
 Offline BC epoch lines (during `pretrain_combined`):
 ```
@@ -1068,8 +1121,8 @@ The PPO importance ratio `exp(new_lp - old_lp)` requires that `old_lp` and
 bugs caused `old_lp` to include terms that `new_lp` never matched:
 1. `sprint/kick/tackle_attempt` were stored as `0.0` (fixed: stored from samples)
 2. `move_dir_raw/kick_dir_raw` were not stored at all (fixed: stored + recomputed
-   via `DirectionHead` in `_recompute_log_prob`; direction heads are now
-   included in the PPO ratio — see design doc 8.6)
+   via `VonMisesDirectionHead`/`KickDirectionHead` in `_recompute_log_prob`;
+   direction heads are now included in the PPO ratio)
 3. `bc_loss_val` was not detached before `.item()` (fixed: `.detach().item()`)
 
 Symptoms of a recurrence: `approx_kl` > 10 at step 1, `value_loss` doubling

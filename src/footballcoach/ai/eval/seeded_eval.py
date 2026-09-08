@@ -231,7 +231,7 @@ def run_seeded_evaluation(
     )
 
 
-def _merge_eval_results(results: list[SeededEvalResult], repeats_per_seed: int) -> SeededEvalResult:
+def merge_eval_results(results: list[SeededEvalResult], repeats_per_seed: int) -> SeededEvalResult:
     from footballcoach.ai.ppo.ppo_trainer import outcome_breakdown
 
     rewards: list[float] = []
@@ -328,4 +328,4 @@ def run_seeded_evaluation_parallel(
             [(worker_factory, chunk, repeats_per_seed, win_outcome) for chunk in chunks],
         )
     log.info("  [seeded eval] all workers finished, merging results.")
-    return _merge_eval_results(results, repeats_per_seed)
+    return merge_eval_results(results, repeats_per_seed)

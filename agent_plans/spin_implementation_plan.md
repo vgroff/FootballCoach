@@ -1,5 +1,16 @@
 # Spin Implementation Plan — Neural AI Kick Spin
 
+> **STALE NOTE (post von-Mises migration):** this plan proposes reusing
+> `DirectionHead` (isotropic Gaussian on a raw unit vector) for a new
+> `kick_spin_axis` head. `move_direction`/`kick_direction` no longer use
+> `DirectionHead` — they use `VonMisesDirectionHead`/`KickDirectionHead`
+> (see `ai_trainer_knowledge.md` "Direction heads: von Mises" and
+> `ai/action/distributions.py`). `DirectionHead` itself still exists,
+> unused, so this plan isn't broken outright, but its premise ("architecturally
+> identical to move_dir/kick_dir") no longer holds — reconcile which
+> parameterization `kick_spin_axis` should actually use before implementing
+> this plan.
+
 ## Status quo (as of this document)
 
 The neural network is currently **hardcoded to always kick with

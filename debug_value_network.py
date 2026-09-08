@@ -1721,29 +1721,32 @@ def _reset_value_head(net) -> None:
 
 
 def _reset_dir_log_std(net) -> None:
-    """Reinitialise ``net.move_dir_log_std``/``net.kick_dir_log_std`` (the
-    learned direction-head exploration std -- see ai_trainer_knowledge.md
-    "Direction heads: log_std and KL") back to their ``ai_config.json``
-    ``ppo.dir_log_std_init``/``ppo.kick_dir_log_std_init`` values, in place.
+    """Reinitialise ``net.move_dir_log_kappa``/``net.kick_dir_log_kappa``/
+    ``net.kick_dir_z_log_std`` (the learned direction-head exploration
+    concentration/std -- see ai_trainer_knowledge.md "Direction heads: von
+    Mises") back to their ``ai_config.json``
+    ``ppo.dir_log_kappa_init``/``ppo.kick_dir_log_kappa_init``/
+    ``ppo.kick_dir_z_log_std_init`` values, in place.
 
     Unlike ``_reset_value_head()``, this affects ACTION SAMPLING, not just
-    the critic -- a checkpoint whose direction std has collapsed toward
-    near-deterministic sampling (small std) would otherwise bias
+    the critic -- a checkpoint whose direction concentration has collapsed
+    toward near-deterministic sampling (large kappa) would otherwise bias
     --checkpoint rollout collection away from the exploration noise real
     training actually used, which matters if you're trying to reproduce
     "what did on-policy collection look like during training" rather than
     "what does this checkpoint do at (near-)greedy inference". Used by
     --reset-dir-log-std. ``net`` may be a plain ``ExecutionNetwork`` or a
     ``CanonicalNetworkWrapper`` around one -- both transparently forward
-    ``.move_dir_log_std``/``.kick_dir_log_std`` attribute access. Must be
-    called BEFORE rollout collection (unlike the value-head reset, which
-    only matters for the later fitting stage) since it changes how actions
-    are actually sampled."""
+    ``.move_dir_log_kappa``/``.kick_dir_log_kappa``/``.kick_dir_z_log_std``
+    attribute access. Must be called BEFORE rollout collection (unlike the
+    value-head reset, which only matters for the later fitting stage) since
+    it changes how actions are actually sampled."""
     from footballcoach.ai.models.execution_network import ExecutionNetwork
 
     fresh = ExecutionNetwork.from_config()
-    net.move_dir_log_std.data.copy_(fresh.move_dir_log_std.data)
-    net.kick_dir_log_std.data.copy_(fresh.kick_dir_log_std.data)
+    net.move_dir_log_kappa.data.copy_(fresh.move_dir_log_kappa.data)
+    net.kick_dir_log_kappa.data.copy_(fresh.kick_dir_log_kappa.data)
+    net.kick_dir_z_log_std.data.copy_(fresh.kick_dir_z_log_std.data)
 
 
 def _save_value_net_checkpoint(
@@ -2289,13 +2292,14 @@ def main() -> None:
                              "--entity-embed-dim capacity overrides are allowed again in this "
                              "case) -- still uses the checkpoint's decision_net for context.")
     parser.add_argument("--reset-dir-log-std", action="store_true", default=False,
-                        help="Only with --checkpoint. Reinitialise move_dir_log_std/"
-                             "kick_dir_log_std (the learned direction-head exploration std) back "
-                             "to ai_config.json's ppo.dir_log_std_init/kick_dir_log_std_init "
+                        help="Only with --checkpoint. Reinitialise move_dir_log_kappa/"
+                             "kick_dir_log_kappa/kick_dir_z_log_std (the learned direction-head "
+                             "exploration concentration/std) back to ai_config.json's "
+                             "ppo.dir_log_kappa_init/kick_dir_log_kappa_init/kick_dir_z_log_std_init "
                              "before COLLECTING the rollout (not just before fitting, unlike "
                              "--reset-value-weights) -- unlike the value-head reset, this changes "
-                             "action sampling itself. Useful if a checkpoint's direction std has "
-                             "collapsed toward near-deterministic sampling, which would otherwise "
+                             "action sampling itself. Useful if a checkpoint's direction concentration "
+                             "has collapsed toward near-deterministic sampling, which would otherwise "
                              "bias --checkpoint rollout collection away from the exploration "
                              "noise real training actually used. Applied independently in every "
                              "parallel worker too (each worker loads its own copy of the "
@@ -2595,8 +2599,8 @@ def main() -> None:
             # independently inside each worker (see _rollout_worker_entry),
             # since each worker loads its own separate copy of the checkpoint.
             _reset_dir_log_std(ckpt_trainer.execution_net)
-            log.info("--reset-dir-log-std: reset move_dir_log_std/kick_dir_log_std to "
-                     "config init values before rollout collection.")
+            log.info("--reset-dir-log-std: reset move_dir_log_kappa/kick_dir_log_kappa/"
+                     "kick_dir_z_log_std to config init values before rollout collection.")
         if args.data:
             # --data given alongside --checkpoint: use the pre-recorded dataset
             # instead of collecting a fresh rollout -- ckpt_trainer is still

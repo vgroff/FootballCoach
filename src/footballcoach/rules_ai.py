@@ -937,6 +937,64 @@ class NeuralPlayerAI(PlayerAI):
         }
 
 
+def maybe_assign_neural_opponent(
+    match, player_id: str, sample_action_fn, *,
+    decision_interval_ticks: int = 15,
+    max_episode_s: float = 120.0,
+    ema_smoothed: float = 0.0,
+    rng=None,
+    bc_label_fn=None,
+) -> bool:
+    """Assign ``NeuralPlayerAI`` to ``player_id`` IFF the match's own
+    opponent-type roll (``build_1v1_scenario``'s ``_opponent_use_rules_ai``/
+    ``_opponent_is_immobile`` flags) picked "neural" for it. Rules-based and
+    immobile opponents already have their ``ai``/order set directly by the
+    scenario build function and are left untouched. Returns whether an
+    assignment was made, so a caller that also wants a fallback (e.g. "if
+    still None, hold position") can tell the difference from "already
+    rules/immobile, nothing to do here".
+
+    The single source of truth for "is this episode's opponent supposed to
+    be neural, and if so who drives it" -- shared by ``ScenarioEnv.reset()``
+    (RL training/eval self-play, ``ai/env/scenario_env.py``) and the UI's
+    scenario-launch path (``ui/app.py``), which used to leave the opponent's
+    ``ai`` at its build-time ``None`` with nothing ever assigning it a real
+    AI (silently inert, indistinguishable from a crashed/immobile opponent)
+    since the UI's ``ScenarioLoop`` builds a ``Match`` directly and was never
+    routed through ``ScenarioEnv``, the only place this used to live.
+    """
+    # A scenario build function that already gave every player its own
+    # final, explicit .ai (e.g. the UI's checkpoint-picker scenario) can set
+    # match._ai_fully_wired = True to opt out unconditionally, regardless of
+    # what build_1v1_scenario's own opponent-type roll flags happen to say --
+    # those flags can be forced to "neural" purely to get a clean
+    # current_order slate, with the actual .ai choice made elsewhere.
+    if getattr(match, "_ai_fully_wired", False):
+        return False
+    # Require the flag to be explicitly PRESENT, not just falsy-by-absence:
+    # a scenario that never participates in the rules/immobile/neural roll
+    # at all (anything other than build_1v1_scenario's own convention) must
+    # be a no-op here, not misread as "rolled neural" and have some
+    # unrelated player's already-intentional ai silently overwritten.
+    if not hasattr(match, "_opponent_use_rules_ai"):
+        return False
+    if getattr(match, "_opponent_use_rules_ai") or getattr(match, "_opponent_is_immobile", False):
+        return False
+    try:
+        player = match.player_by_id(player_id)
+    except KeyError:
+        return False
+    player.ai = NeuralPlayerAI(
+        sample_action_fn,
+        decision_interval_ticks=decision_interval_ticks,
+        max_episode_s=max_episode_s,
+        ema_smoothed=ema_smoothed,
+        rng=rng,
+        bc_label_fn=bc_label_fn,
+    )
+    return True
+
+
 class HybridPlayerAI(NeuralPlayerAI):
     """``NeuralPlayerAI`` plus two independent human/rules-based override
     channels, so a single player can be a mix of neural network control and

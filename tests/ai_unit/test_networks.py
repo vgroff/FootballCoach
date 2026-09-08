@@ -240,6 +240,77 @@ class TestExecutionNetwork:
 
 
 # ---------------------------------------------------------------------------
+# ExecutionNetwork value_only fast path (skips the 8 actor heads --
+# move/kick direction, exec_move/sprint/kick/tackle_attempt logits,
+# kick_power, kick_spin -- when only the critic estimate is needed, e.g.
+# PPOTrainer._value_heads()/self.value_net calls). See execution_network.py
+# forward()'s own docstring for the contract: value_only=True returns the
+# raw value TENSOR directly, not an ExecutionHeadsRaw, precisely so a caller
+# that wrongly expects the full dataclass fails loudly (AttributeError)
+# instead of silently reading a stale/placeholder field.
+# ---------------------------------------------------------------------------
+
+class TestExecutionNetworkValueOnly:
+
+    def _fwd_kwargs(self, decision_net, batch_size=2):
+        batch = _make_batch(batch_size)
+        d_heads = decision_net(**batch)
+        return dict(
+            self_feat=batch["self_feat"], other_feat=batch["other_feat"],
+            exists_mask=batch["exists_mask"], ball_feat=batch["ball_feat"],
+            global_feat=batch["global_feat"], decision_heads=d_heads,
+        )
+
+    def test_value_only_returns_raw_tensor_not_dataclass(self, decision_net, execution_net):
+        from footballcoach.ai.action.schema import ExecutionHeadsRaw
+        kwargs = self._fwd_kwargs(decision_net)
+        result = execution_net(**kwargs, value_only=True)
+        assert isinstance(result, torch.Tensor)
+        assert not isinstance(result, ExecutionHeadsRaw)
+
+    def test_value_only_shape(self, decision_net, execution_net):
+        kwargs = self._fwd_kwargs(decision_net, batch_size=3)
+        result = execution_net(**kwargs, value_only=True)
+        assert result.shape == (3, 1)
+
+    def test_value_only_matches_full_forward_exactly(self, decision_net, execution_net):
+        """The 8 skipped actor heads are pure Linear(h) projections computed
+        AFTER value_input is already built -- they can have zero effect on
+        `.value`'s numerics. value_only=True must therefore reproduce the
+        exact same value as a full forward pass on identical input, not an
+        approximation."""
+        execution_net.eval()
+        kwargs = self._fwd_kwargs(decision_net, batch_size=4)
+        with torch.no_grad():
+            full = execution_net(**kwargs)
+            fast = execution_net(**kwargs, value_only=True)
+        assert torch.equal(full.value, fast), (
+            "value_only=True produced a different value than the full forward pass"
+        )
+
+    def test_value_only_default_is_false(self, decision_net, execution_net):
+        """Omitting value_only must keep returning the full ExecutionHeadsRaw
+        -- a regression here would silently break every existing caller that
+        doesn't pass the new kwarg at all."""
+        from footballcoach.ai.action.schema import ExecutionHeadsRaw
+        kwargs = self._fwd_kwargs(decision_net)
+        result = execution_net(**kwargs)
+        assert isinstance(result, ExecutionHeadsRaw)
+
+    def test_value_only_no_nan(self, decision_net, execution_net):
+        torch.manual_seed(2)
+        kwargs = self._fwd_kwargs(decision_net, batch_size=4)
+        result = execution_net(**kwargs, value_only=True)
+        assert not torch.any(torch.isnan(result))
+        assert not torch.any(torch.isinf(result))
+
+    def test_value_only_batch_size_one(self, decision_net, execution_net):
+        kwargs = self._fwd_kwargs(decision_net, batch_size=1)
+        result = execution_net(**kwargs, value_only=True)
+        assert result.shape == (1, 1)
+
+
+# ---------------------------------------------------------------------------
 # flatten_decision_heads dimension consistency
 # ---------------------------------------------------------------------------
 

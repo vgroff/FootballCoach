@@ -102,6 +102,13 @@ breaks the total down by source key:
   step  — flat per-step penalty (encourages finishing faster; every step incl. terminal)
   stam  — stamina usage penalty (episode-end only). (1 - final_stamina), never
           (start_stamina - final_stamina) — see module invariant above.
+  sprint — sprint penalty. -sprint_penalty_per_s * decision_interval_s
+          whenever the player was sprinting this step, 0 otherwise. Applied
+          every DECISION step (this function's own per-call granularity --
+          see phase1_reward's decision_interval_s arg), scaled by the
+          decision interval's real duration in seconds (not a flat
+          per-step cost) so the total per-second cost of sprinting stays
+          the same regardless of decision_interval_s tuning.
 """
 from __future__ import annotations
 
@@ -181,6 +188,8 @@ def phase1_reward(
     heading_cos_sim: float = 1.0,
     player_speed_mps: float = 0.0,
     stamina_used: float = 0.0,
+    is_sprinting: bool = False,
+    decision_interval_s: float = 0.0,
     episode_done: bool = False,
     prog_reward_clamp: float | None = None,
     appr_sq_approach_reward_clamp: float | None = None,
@@ -349,6 +358,15 @@ def phase1_reward(
     stam_r = -_stam_coef * stamina_used if (episode_done and _stam_coef > 0.0) else 0.0
     r += stam_r
     comps["stam"] = stam_r
+
+    # Sprint penalty — every DECISION step (this function's own call
+    # granularity, not every raw engine tick), scaled by the real elapsed
+    # decision-interval duration so the total per-second cost of sprinting
+    # doesn't silently change if decision_interval_s is retuned later.
+    _sprint_coef = float(cfg.get("sprint_penalty_per_s", 0.0))
+    sprint_r = -_sprint_coef * decision_interval_s if (is_sprinting and _sprint_coef > 0.0) else 0.0
+    r += sprint_r
+    comps["sprint"] = sprint_r
 
     return r, comps, cumulative_state_after
 

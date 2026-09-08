@@ -153,7 +153,7 @@ class CanonicalNetworkWrapper(torch.nn.Module):
     ``PPOTrainer._sample_action()`` (via ``mirror_x()``).
 
     Transparently forwards attribute access (``.value_head``,
-    ``.move_dir_log_std``, etc.) and ``state_dict()``/``parameters()`` to
+    ``.move_dir_log_kappa``, etc.) and ``state_dict()``/``parameters()`` to
     the wrapped module via ``__getattr__``, so existing code that reaches
     through ``self.execution_net.value_head`` or similar continues to work
     without modification.
@@ -181,7 +181,7 @@ class CanonicalNetworkWrapper(torch.nn.Module):
         # nn.Module.__getattr__ already checks self._modules (where
         # self._wrapped lives) before raising — this override only adds a
         # SECOND fallback onto the wrapped module's own non-module attrs
-        # (e.g. execution_net.move_dir_log_std, a plain nn.Parameter, IS
+        # (e.g. execution_net.move_dir_log_kappa, a plain nn.Parameter, IS
         # found via the first fallback already; this covers plain python
         # attributes some call sites might reach for).
         try:

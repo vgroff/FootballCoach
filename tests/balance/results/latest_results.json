@@ -62,20 +62,20 @@
     "tackling=0.95_vs_dribbling=0.95": 66.1
   },
   "turning_reversal_scenario_accel_0.5": {
-    "reference_speed_mps": 8.14,
-    "time_to_start_reversing_s": 1.033,
-    "separation_after_10s_m": 144.04
+    "reference_speed_mps": 8.83,
+    "time_to_start_reversing_s": 1.1,
+    "separation_after_10s_m": 155.82
   },
   "turning_reversal_accel_comparison": {
     "low_accel_attr_0.1": {
-      "reference_speed_mps": 8.14,
-      "time_to_start_reversing_s": 1.333,
-      "separation_after_10s_m": 138.56
+      "reference_speed_mps": 8.83,
+      "time_to_start_reversing_s": 1.433,
+      "separation_after_10s_m": 149.66
     },
     "high_accel_attr_0.9": {
-      "reference_speed_mps": 8.14,
-      "time_to_start_reversing_s": 0.833,
-      "separation_after_10s_m": 147.19
+      "reference_speed_mps": 8.83,
+      "time_to_start_reversing_s": 0.9,
+      "separation_after_10s_m": 159.78
     }
   },
   "shoot_order_penalty_precision_0.8_corner_aim": {
@@ -88,7 +88,7 @@
     "speed_mult": 1.0
   },
   "repulsion_off_collision_min_separation_m": {
-    "min_separation_m": 0.0086,
+    "min_separation_m": 0.0089,
     "sum_radii_m": 0.6,
     "result": "overlap_occurred"
   },
@@ -101,8 +101,8 @@
     "direct_travel_ticks": 25
   },
   "repulsion_ball_carrier_avoidance": {
-    "min_sep_with_ball_m": 1.7835,
-    "min_sep_without_ball_m": 1.2976,
+    "min_sep_with_ball_m": 1.7682,
+    "min_sep_without_ball_m": 1.2981,
     "carrier_sprint_downgraded_to_jog": false,
     "non_carrier_sprint_downgraded_to_jog": false
   },
@@ -177,18 +177,18 @@
     "precision=0.8_six_yard_box": 100.0
   },
   "sprint_100m_top_attrs_no_ball_seconds": {
-    "time_s": 10.97
+    "time_s": 10.37
   },
   "sprint_100m_bottom_attrs_no_ball_seconds": {
-    "time_s": 19.93
+    "time_s": 17.5
   },
   "sprint_100m_top_vs_bottom_seconds": {
-    "top_attrs_s": 10.97,
-    "bottom_attrs_s": 19.93
+    "top_attrs_s": 10.37,
+    "bottom_attrs_s": 17.5
   },
   "sprint_100m_with_vs_without_ball_seconds": {
-    "no_ball_s": 13.3,
-    "with_ball_s": 14.6
+    "no_ball_s": 12.3,
+    "with_ball_s": 13.5
   },
   "pass_random_scenarios_good_vs_bad": {
     "n_scenarios": 150,
@@ -267,8 +267,8 @@
   },
   "repulsion_three_neighbours": {
     "initial_x": 0.0,
-    "final_x": 2.783,
-    "displacement_m": 2.783,
+    "final_x": 2.785,
+    "displacement_m": 2.785,
     "made_forward_progress": true
   },
   "repulsion_oscillation_check": {
@@ -291,8 +291,8 @@
   },
   "shoot_run_backward_cos-1.0": {
     "n_trials": 300,
-    "scored": 223,
-    "score_rate_pct": 74.33,
+    "scored": 219,
+    "score_rate_pct": 73.0,
     "run_cos_sim": -1.0
   },
   "shoot_stationary_no_penalty": {
@@ -302,7 +302,7 @@
   },
   "pass_run_forward": {
     "n_trials": 300,
-    "success_rate_pct": 92.0
+    "success_rate_pct": 92.67
   },
   "pass_run_backward": {
     "n_trials": 300,
@@ -316,7 +316,7 @@
   "tackle_action_0.8_vs_0.6_frontal_vs_behind": {
     "n": 500,
     "frontal_win_pct": 87.4,
-    "behind_win_pct": 23.4
+    "behind_win_pct": 24.0
   },
   "tackle_action_weak_vs_strong": {
     "n_trials": 300,
@@ -398,8 +398,8 @@
   "save_far_post_fast_vs_slow_gk": {
     "fast_gk": {
       "n_trials": 300,
-      "saved": 166,
-      "save_rate_pct": 55.33
+      "saved": 148,
+      "save_rate_pct": 49.33
     },
     "slow_gk": {
       "n_trials": 300,
@@ -421,14 +421,14 @@
   },
   "save_rate_grid_pct": {
     "gk_speed=0.1_near_post": 77.3,
-    "gk_speed=0.1_centre": 99.3,
+    "gk_speed=0.1_centre": 100.0,
     "gk_speed=0.1_far_post": 0.0,
     "gk_speed=0.5_near_post": 77.3,
     "gk_speed=0.5_centre": 100.0,
-    "gk_speed=0.5_far_post": 4.7,
+    "gk_speed=0.5_far_post": 8.0,
     "gk_speed=0.9_near_post": 77.3,
     "gk_speed=0.9_centre": 100.0,
-    "gk_speed=0.9_far_post": 45.3
+    "gk_speed=0.9_far_post": 57.3
   },
   "save_random_scenarios_good_vs_bad": {
     "n_scenarios": 300,
@@ -498,9 +498,9 @@
     "success_rate_pct": 24.5
   },
   "sprint_100m_ball_control_effect_seconds": {
-    "no_ball_s": 13.3,
-    "with_ball_low_control_s": 16.1,
-    "with_ball_high_control_s": 13.8
+    "no_ball_s": 12.3,
+    "with_ball_low_control_s": 14.8,
+    "with_ball_high_control_s": 12.77
   },
   "stamina_drain_over_120s_sprint_attr_0.5": {
     "t=10s": 0.918,
@@ -521,14 +521,14 @@
   },
   "stamina_speed_multiplier_table": {
     "stamina=1.0": 1.0,
-    "stamina=0.75": 0.843,
-    "stamina=0.5": 0.685,
-    "stamina=0.25": 0.527,
-    "stamina=0.0": 0.37
+    "stamina=0.75": 0.938,
+    "stamina=0.5": 0.875,
+    "stamina=0.25": 0.812,
+    "stamina=0.0": 0.75
   },
   "stamina_full_cycle_low_attr_player": {
     "stamina_after_60s_sprint": 0.432,
-    "speed_multiplier_at_exhaustion": 0.642,
+    "speed_multiplier_at_exhaustion": 0.858,
     "stamina_after_60s_further_rest": 0.72
   },
   "gk_in_box_untackleable_stochastic": {

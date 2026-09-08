@@ -302,7 +302,7 @@ def _move_dir_why(trainer, frame_locals: dict, batch: dict, hook_state: dict) ->
     with torch.no_grad():
         stored_raw = mb_actions["move_dir_raw"]  # (1, 2) -- action sampled at collection time
         current_mean = e_heads.move_direction  # (1, 2) -- unit vector, CURRENT policy's mean
-        log_std_move = trainer.execution_net.move_dir_log_std.to(trainer.device)
+        log_std_move = trainer.execution_net.move_dir_log_kappa.to(trainer.device)
 
         exec_move_on = bool(mb_actions["exec_move"].item() > 0.5)
         # _per_head_new_log_probs()/_recompute_log_prob() gate move_dir's
@@ -329,8 +329,16 @@ def _move_dir_why(trainer, frame_locals: dict, batch: dict, hook_state: dict) ->
         # fixed-variance Gaussian (KL ~ (delta_mean)^2 / sigma^2) -- sigma
         # amplifies both the KL AND this gradient term identically, it is
         # not "either/or".
+        # STALE as of the von Mises migration: move_dir is no longer an
+        # isotropic Gaussian on the unit vector (see VonMisesDirectionHead in
+        # ai/action/distributions.py) -- this formula (and std_move/
+        # log_std_move below) is kept renamed-but-otherwise-unmodified so the
+        # script still runs, but the reconstructed gradient estimate below is
+        # no longer analytically correct for the current distribution. A real
+        # fix would use the von Mises log_prob's actual derivative w.r.t.
+        # theta_mean instead.
         std_move = float(torch.exp(log_std_move.clamp(
-            trainer.move_dir_log_std_min, trainer.move_dir_log_std_max
+            trainer.move_dir_log_kappa_min, trainer.move_dir_log_kappa_max
         )).mean().item())
         diff_norm = float((stored_raw - current_mean).norm().item())
         d_logprob_d_mean_norm = (diff_norm / (std_move ** 2)) if exec_move_on else 0.0
@@ -348,7 +356,7 @@ def _move_dir_why(trainer, frame_locals: dict, batch: dict, hook_state: dict) ->
         result = {
             "advantage": float(mb_adv.item()),
             "exec_move_on": exec_move_on,
-            "move_dir_log_std": float(log_std_move.mean().item()),
+            "move_dir_log_std": float(log_std_move.mean().item()),  # actually log_kappa now, key name kept for output-format stability
             "move_dir_std": std_move,
             "move_dir_new_logprob": move_dir_new_lp,
             "stored_action_angle_deg": angle_stored,
@@ -597,18 +605,18 @@ def main() -> None:
     # _top_level_name() above works around.
     _move_dir_ids = {
         id(p) for name, p in trainer.execution_net._wrapped.named_parameters()
-        if name.startswith("move_direction.") or name == "move_dir_log_std"
+        if name.startswith("move_direction.") or name == "move_dir_log_kappa"
     }
     _kick_dir_ids = {
         id(p) for name, p in trainer.execution_net._wrapped.named_parameters()
-        if name.startswith("kick_direction.") or name == "kick_dir_log_std"
+        if name.startswith("kick_direction.") or name in ("kick_dir_log_kappa", "kick_dir_z_log_std")
     }
     trainer.direction_param_ids = _move_dir_ids | _kick_dir_ids
     log.info(f"Reconstructed direction_param_ids: {len(trainer.direction_param_ids)} params "
              f"(move_direction={len(_move_dir_ids)}, kick_direction={len(_kick_dir_ids)})")
 
     layer_labels = _build_param_layer_labels(trainer)
-    dir_top_level = {"move_direction", "kick_direction", "move_dir_log_std", "kick_dir_log_std"}
+    dir_top_level = {"move_direction", "kick_direction", "move_dir_log_kappa", "kick_dir_log_kappa", "kick_dir_z_log_std"}
 
     seed = args.seed if args.seed is not None else _random.randint(0, 2**31 - 1)
     log.info(f"Collecting one episode (seed={seed}, deterministic={args.deterministic})...")
@@ -742,7 +750,7 @@ def main() -> None:
             _ratio = w.get("move_dir_ratio")
             log.info(
                 f"           why(move_dir): adv={w['advantage']:+.3f}  exec_move_on={w['exec_move_on']}  "
-                f"log_std={w['move_dir_log_std']:.3f} (σ≈{math.exp(w['move_dir_log_std']):.3f})"
+                f"log_kappa={w['move_dir_log_std']:.3f} (kappa≈{math.exp(w['move_dir_log_std']):.3f})"
             )
             log.info(
                 f"           stored_action_angle={w['stored_action_angle_deg']:+.1f}°  "

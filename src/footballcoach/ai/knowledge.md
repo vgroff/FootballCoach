@@ -121,7 +121,7 @@ ai/
     encoder.py        # encode_observation(match, player_id, time_remaining_s) -> ObservationBatch
   action/
     schema.py         # DecisionHeadsRaw, DecisionAction, ExecutionHeadsRaw, ExecutionAction
-    distributions.py  # IndependentBernoulli, MaskedCategorical, SquashedNormalHead, DirectionHead
+    distributions.py  # IndependentBernoulli, MaskedCategorical, SquashedNormalHead, VonMisesDirectionHead, KickDirectionHead
     gating.py         # select_action() - pure Python winner-take-all, NEVER in gradient graph
     apply_nn_action.py # Execution outputs -> DIRECT player physics (NO ORDERS - see below)
   models/

@@ -40,11 +40,26 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
+# Rollout collection is CPU-inference-bound (profiled: ~88% of per-step
+# wall time is _sample_action, of which only ~11% is actual matmul FLOPs --
+# the rest is Python/PyTorch dispatch overhead on tiny batch-of-1 calls).
+# torch.distributions' default validate_args=True re-checks every
+# distribution's parameters/sample against its support on EVERY
+# construction and every .log_prob()/.sample() call -- pure assertion
+# overhead in this hot path, not something PPO relies on (log_prob/sample
+# numerics are unaffected either way). Disabling it globally measured ~13%
+# faster single-env rollout stepping (48.0 -> 55.4 steps/s) with zero
+# behavior change. Set once at import time so it's in effect in the main
+# process, every rollout_worker.py subprocess, and every eval_worker.py
+# subprocess (all import this module for PPOTrainer/rebuild_inference_trainer).
+torch.distributions.Distribution.set_default_validate_args(False)
+
 from footballcoach.ai.action.distributions import (
-    DirectionHead,
     IndependentBernoulli,
+    KickDirectionHead,
     MaskedCategorical,
     SquashedNormalHead,
+    VonMisesDirectionHead,
 )
 from footballcoach.ai.action.gating import select_action
 from footballcoach.ai.action.schema import DecisionAction, DecisionHeadsRaw, ExecutionAction
@@ -102,6 +117,64 @@ def _load_state_dict_tolerant(module: torch.nn.Module, ckpt_sd: dict, label: str
         )
 
 
+def _migrate_direction_log_std_to_kappa(state_dict: dict) -> dict:
+    """Backward-compat shim for the move_dir_log_std/kick_dir_log_std ->
+    move_dir_log_kappa/kick_dir_log_kappa/kick_dir_z_log_std rename (see
+    ai_trainer_knowledge.md "Direction heads: von Mises"). Unlike
+    _migrate_crossing_head_state_dict's shape-only migrations, this is a
+    same-shape RENAME plus a numeric transform, since log_kappa is not the
+    same quantity as log_std (kappa ~= 1/sigma^2, an inverted, approximate
+    relationship, not an exact one).
+
+    Guarded against double-application: a checkpoint already saved under the
+    new names is left untouched (checked BEFORE looking for old keys, same
+    ordering rationale as _migrate_crossing_head_state_dict's shape-match
+    guard -- a checkpoint in the current format must never be reinterpreted
+    as if it were the old one). Returns a NEW dict (does not mutate
+    state_dict); a no-op if neither old key is present (checkpoint predates
+    these params entirely, or already uses the new names).
+    """
+    old_move_key, new_move_key = "move_dir_log_std", "move_dir_log_kappa"
+    old_kick_key, new_kick_kappa_key, new_kick_z_key = (
+        "kick_dir_log_std", "kick_dir_log_kappa", "kick_dir_z_log_std",
+    )
+    if new_move_key in state_dict or new_kick_kappa_key in state_dict:
+        return state_dict
+    if old_move_key not in state_dict and old_kick_key not in state_dict:
+        return state_dict
+    state_dict = dict(state_dict)
+    if old_move_key in state_dict:
+        old_log_std = state_dict.pop(old_move_key)
+        sigma = torch.exp(old_log_std)
+        new_log_kappa = torch.log(1.0 / (sigma * sigma))
+        state_dict[new_move_key] = new_log_kappa
+        log.info(
+            f"Migrated checkpoint's move_dir_log_std={float(old_log_std):.4f} "
+            f"(sigma={float(sigma):.4f}) to move_dir_log_kappa={float(new_log_kappa):.4f} "
+            f"via kappa=1/sigma^2 (small-angle approximation)."
+        )
+    if old_kick_key in state_dict:
+        old_log_std = state_dict.pop(old_kick_key)
+        sigma = torch.exp(old_log_std)
+        new_log_kappa = torch.log(1.0 / (sigma * sigma))
+        state_dict[new_kick_kappa_key] = new_log_kappa
+        # No analog for the new elevation-only z component in the old
+        # (single, isotropic-3D) parameterization -- seed it from the SAME
+        # old value directly (same numeric scale, an approximate starting
+        # guess, not an exact conversion) rather than a fresh random init,
+        # so kick_dir's exploration magnitude doesn't jump discontinuously
+        # on resume.
+        state_dict[new_kick_z_key] = old_log_std.clone()
+        log.info(
+            f"Migrated checkpoint's kick_dir_log_std={float(old_log_std):.4f} "
+            f"(sigma={float(sigma):.4f}) to kick_dir_log_kappa={float(new_log_kappa):.4f} "
+            f"(via kappa=1/sigma^2) and seeded kick_dir_z_log_std={float(old_log_std):.4f} "
+            f"from the same old value (approximate starting guess -- the old "
+            f"parameterization had no separate elevation component)."
+        )
+    return state_dict
+
+
 def _detach_decision_heads(d_heads: DecisionHeadsRaw) -> DecisionHeadsRaw:
     """Return a copy of d_heads with every field detached (see separate_value_net).
 
@@ -137,6 +210,7 @@ REWARD_COMP_LABELS: list[tuple[str, str]] = [
     ("prox",  "proximity_bonus"),
     ("step",  "step_penalty"),
     ("stam",  "stamina_penalty"),
+    ("sprint", "sprint_penalty"),
 ]
 
 # Execution-network head name -> nn.Module attribute name, used for the
@@ -399,20 +473,17 @@ def rebuild_inference_trainer(
     return trainer
 
 
-def _eval_worker_factory(
-    decision_state: dict, execution_state: dict, separate_value_net: bool,
-    value_state: Optional[dict], use_rules_ai: bool, max_episode_s: float,
-) -> tuple:
-    """Module-level (picklable) zero-arg-after-partial factory for parallel
-    seeded eval (ai/eval/seeded_eval.py's run_seeded_evaluation_parallel) --
-    each subprocess rebuilds its own inference-only PPOTrainer from the
-    passed state dicts via rebuild_inference_trainer(), mirroring
-    ai/ppo/rollout_worker.py."""
+def _build_eval_env_factory(use_rules_ai: bool, max_episode_s: float):
+    """Builds a ``seed -> ScenarioEnv`` factory for periodic phase-1 eval
+    (rules or immobile opponent). Extracted out of ``_eval_worker_factory``
+    below so ``ai/eval/eval_worker.py``'s PERSISTENT eval workers can reuse
+    the exact same env-building logic without also paying for a trainer
+    rebuild on every eval call -- their trainer is cached across many eval
+    calls and only refreshed on an explicit ``set_weights`` message, unlike
+    the throwaway-Pool path below which rebuilds fresh every single call."""
     from footballcoach.rules_ai import Phase1RulesAI
     from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
     from footballcoach.ai.env.scenario_env import ScenarioEnv
-
-    trainer = rebuild_inference_trainer(decision_state, execution_state, separate_value_net, value_state)
 
     _label = "rules" if use_rules_ai else "immobile"
 
@@ -432,7 +503,20 @@ def _eval_worker_factory(
             max_episode_s=max_episode_s,
         )
 
-    return _eval_env_factory, trainer._sample_action
+    return _eval_env_factory
+
+
+def _eval_worker_factory(
+    decision_state: dict, execution_state: dict, separate_value_net: bool,
+    value_state: Optional[dict], use_rules_ai: bool, max_episode_s: float,
+) -> tuple:
+    """Module-level (picklable) zero-arg-after-partial factory for parallel
+    seeded eval (ai/eval/seeded_eval.py's run_seeded_evaluation_parallel) --
+    each subprocess rebuilds its own inference-only PPOTrainer from the
+    passed state dicts via rebuild_inference_trainer(), mirroring
+    ai/ppo/rollout_worker.py."""
+    trainer = rebuild_inference_trainer(decision_state, execution_state, separate_value_net, value_state)
+    return _build_eval_env_factory(use_rules_ai, max_episode_s), trainer._sample_action
 
 
 def _ai_types(obs_dict: dict) -> tuple:
@@ -719,14 +803,18 @@ class PPOTrainer:
         self.target_kl = float(ppo_cfg.get("target_kl", 0.02))
         self.rollout_steps = int(ppo_cfg.get("rollout_steps", 2048))
         self.dir_l2_coef = float(ppo_cfg.get("dir_l2_coef", 0.01))
-        self.move_dir_log_std_min = float(ppo_cfg.get("move_dir_log_std_min", ppo_cfg.get("dir_log_std_min", -5.0)))
-        self.move_dir_log_std_max = float(ppo_cfg.get("move_dir_log_std_max", ppo_cfg.get("dir_log_std_max", 2.0)))
-        self.move_dir_log_std_target = float(ppo_cfg.get("move_dir_log_std_target", ppo_cfg.get("dir_log_std_target", self.move_dir_log_std_min)))
-        self.move_dir_log_std_reg_coef = float(ppo_cfg.get("move_dir_log_std_reg_coef", ppo_cfg.get("dir_log_std_reg_coef", 0.0)))
-        self.kick_dir_log_std_min = float(ppo_cfg.get("kick_dir_log_std_min", ppo_cfg.get("dir_log_std_min", -5.0)))
-        self.kick_dir_log_std_max = float(ppo_cfg.get("kick_dir_log_std_max", ppo_cfg.get("dir_log_std_max", 2.0)))
-        self.kick_dir_log_std_target = float(ppo_cfg.get("kick_dir_log_std_target", ppo_cfg.get("dir_log_std_target", self.kick_dir_log_std_min)))
-        self.kick_dir_log_std_reg_coef = float(ppo_cfg.get("kick_dir_log_std_reg_coef", ppo_cfg.get("dir_log_std_reg_coef", 0.0)))
+        self.move_dir_log_kappa_min = float(ppo_cfg.get("move_dir_log_kappa_min", ppo_cfg.get("dir_log_kappa_min", -2.0)))
+        self.move_dir_log_kappa_max = float(ppo_cfg.get("move_dir_log_kappa_max", ppo_cfg.get("dir_log_kappa_max", 10.0)))
+        self.move_dir_log_kappa_target = float(ppo_cfg.get("move_dir_log_kappa_target", ppo_cfg.get("dir_log_kappa_target", self.move_dir_log_kappa_max)))
+        self.move_dir_log_kappa_reg_coef = float(ppo_cfg.get("move_dir_log_kappa_reg_coef", ppo_cfg.get("dir_log_kappa_reg_coef", 0.0)))
+        self.kick_dir_log_kappa_min = float(ppo_cfg.get("kick_dir_log_kappa_min", ppo_cfg.get("dir_log_kappa_min", -2.0)))
+        self.kick_dir_log_kappa_max = float(ppo_cfg.get("kick_dir_log_kappa_max", ppo_cfg.get("dir_log_kappa_max", 10.0)))
+        self.kick_dir_log_kappa_target = float(ppo_cfg.get("kick_dir_log_kappa_target", ppo_cfg.get("dir_log_kappa_target", self.kick_dir_log_kappa_max)))
+        self.kick_dir_log_kappa_reg_coef = float(ppo_cfg.get("kick_dir_log_kappa_reg_coef", ppo_cfg.get("dir_log_kappa_reg_coef", 0.0)))
+        self.kick_dir_z_log_std_min = float(ppo_cfg.get("kick_dir_z_log_std_min", -5.0))
+        self.kick_dir_z_log_std_max = float(ppo_cfg.get("kick_dir_z_log_std_max", 2.0))
+        self.kick_dir_z_log_std_target = float(ppo_cfg.get("kick_dir_z_log_std_target", self.kick_dir_z_log_std_min))
+        self.kick_dir_z_log_std_reg_coef = float(ppo_cfg.get("kick_dir_z_log_std_reg_coef", 0.0))
         self.ent_dir_weight = float(ppo_cfg.get("ent_dir_weight", 1.0))
         self.ent_kick_power_weight = float(ppo_cfg.get("ent_kick_power_weight", 1.0))
         self.ent_kick_spin_weight = float(ppo_cfg.get("ent_kick_spin_weight", 1.0))
@@ -741,6 +829,25 @@ class PPOTrainer:
         self._eval_seeds = default_eval_seeds(cfg)
         self._eval_repeats_per_seed = int(eval_cfg.get("eval_repeats_per_seed", 2))
         self._eval_n_parallel_workers = int(eval_cfg.get("eval_n_parallel_workers", 1))
+        # Set only by _train_parallel() (see ai/eval/eval_worker.py) for the
+        # duration of that call -- a persistent eval worker pool that
+        # _eval_vs_opponent_type() reuses instead of spinning up a fresh
+        # multiprocessing.Pool on every periodic eval. None everywhere else
+        # (single-process train(), evaluate.py CLI, standalone use).
+        self._persistent_eval_workers = None
+        # If the curriculum never actually trains against an immobile
+        # opponent (ratio 0), the periodic eval-vs-immobile check is pure
+        # sanity insurance, not a tracked metric -- cut its trial count down
+        # (see _eval_vs_opponent_type) instead of spending the full
+        # eval_seeds x eval_repeats_per_seed budget on it every rollout.
+        self._phase1_opponent_immobile_ratio = float(
+            cfg.get("curriculum", {}).get("phase1_opponent_immobile_ratio", 1.0)
+        )
+        # Rules-AI-vs-rules-AI baseline on the SAME eval seed set as the
+        # periodic "[eval vs rules]" check -- computed once and cached (see
+        # _compute_rules_vs_rules_baseline), since it never changes: same
+        # seeds, same deterministic-ish rules-AI opponent logic.
+        self._rules_vs_rules_baseline = None
         self.n_parallel_envs = int(ppo_cfg.get("n_parallel_envs", 1))
         self.worker_torch_threads = int(ppo_cfg.get("worker_torch_threads", 1))
         self._aug_rng = random.Random()
@@ -848,7 +955,7 @@ class PPOTrainer:
         # disabled, matching prior behaviour.
         value_weight_decay = float(ppo_cfg.get("value_weight_decay", 0.0))
         # Optional separate LR for the direction heads (move_direction, kick_direction,
-        # move_dir_log_std, kick_dir_log_std). None (default) = share the "policy"
+        # move_dir_log_kappa, kick_dir_log_kappa, kick_dir_z_log_std). None (default) = share the "policy"
         # param group's LR, matching prior behaviour. Set ppo.direction_learning_rate
         # to give these params their own (typically smaller) step size, independent
         # of the rest of the policy — see also direction_max_grad_norm below, which
@@ -883,8 +990,11 @@ class PPOTrainer:
                     value_param_ids.add(id(p))
             # Separate param group for the direction heads (see direction_lr/
             # direction_max_grad_norm comments above). Named params only (not raw
-            # nn.Parameter attributes like move_dir_log_std/kick_dir_log_std, which
-            # named_parameters() also yields with their attribute names).
+            # nn.Parameter attributes like move_dir_log_kappa/kick_dir_log_kappa/
+            # kick_dir_z_log_std, which named_parameters() also yields with their
+            # attribute names). kick_dir_z_log_std is grouped with the rest of the
+            # kick direction params (simplest default -- same LR/clip treatment as
+            # kick_dir_log_kappa, not split into its own group).
             direction_param_ids = set()
             direction_params = []
             move_dir_param_ids = set()
@@ -894,10 +1004,10 @@ class PPOTrainer:
             for name, p in execution_net.named_parameters():
                 if id(p) in value_param_ids:
                     continue
-                if name.startswith("move_direction.") or name == "move_dir_log_std":
+                if name.startswith("move_direction.") or name == "move_dir_log_kappa":
                     move_dir_params.append(p)
                     move_dir_param_ids.add(id(p))
-                elif name.startswith("kick_direction.") or name == "kick_dir_log_std":
+                elif name.startswith("kick_direction.") or name in ("kick_dir_log_kappa", "kick_dir_z_log_std"):
                     kick_dir_params.append(p)
                     kick_dir_param_ids.add(id(p))
             direction_param_ids = move_dir_param_ids | kick_dir_param_ids
@@ -1009,8 +1119,9 @@ class PPOTrainer:
             for p in self.execution_net.value_ai_type_channel.parameters():
                 p.requires_grad_(False)
 
-    def _value_heads(self, sf, of, em, bf, gf, d_heads, sat, oat):
-        """Return the ExecutionHeadsRaw whose .value is THE critic estimate.
+    def _value_heads(self, sf, of, em, bf, gf, d_heads, sat, oat) -> "torch.Tensor":
+        """Return THE critic value estimate (batch, 1) -- and ONLY that,
+        every caller of this method must never need anything else.
 
         When ``separate_value_net`` is disabled (default), this is just
         ``self.execution_net(...)`` (the normal shared-trunk forward pass,
@@ -1019,13 +1130,17 @@ class PPOTrainer:
         one path). When enabled, forwards through the dedicated
         ``self.value_net`` instead — a fully independent ExecutionNetwork
         with its own trunk/encoders, never touched by BC losses. Both take
-        identical inputs (same decision_heads too), so this slots in as a
-        drop-in replacement for ``self.execution_net(...)`` wherever only
-        the returned ``.value`` field is actually used downstream.
+        identical inputs (same decision_heads too).
+
+        Always calls with ``value_only=True`` (see ExecutionNetwork.forward's
+        own docstring) -- this returns the raw value tensor directly, NOT an
+        ExecutionHeadsRaw, so a caller that (wrongly) expected e.g.
+        ``.move_direction`` off the result fails immediately and loudly
+        rather than silently reading a stale/placeholder field.
         """
         if self.separate_value_net:
-            return self.value_net(sf, of, em, bf, gf, d_heads, sat, oat)
-        return self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
+            return self.value_net(sf, of, em, bf, gf, d_heads, sat, oat, value_only=True)
+        return self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat, value_only=True)
 
     # -----------------------------------------------------------------------
     # Curriculum helpers
@@ -1520,46 +1635,50 @@ class PPOTrainer:
         mv_ls = metrics.get('move_log_std', [])
         kk_ls = metrics.get('kick_log_std', [])
         mv_ls_grad = metrics.get('mv_ls_grad', 0.0)
-        # Effective sigma (exp(log_std)) in both raw units and approx degrees
-        # of angular std, since log_std alone isn't very human-readable and
-        # this is the number that actually controls how tightly direction
-        # samples cluster around the predicted mean (see ai_trainer_knowledge.md
-        # "Direction heads: log_std and KL"). Delta vs the previous rollout's
-        # value shows whether log_std is actually moving at all (it was
-        # observed to sit frozen at its init value across many rollouts when
-        # the policy LR is tiny and early-stop cuts gradient steps short).
-        def _sigma_deg(ls_pair):
+        # These are actually log_kappa now (von Mises concentration), not
+        # log_std -- see ai_trainer_knowledge.md "Direction heads: von Mises".
+        # kappa=exp(log_kappa); for large kappa a von Mises approaches a
+        # wrapped normal with variance ~= 1/kappa, so degrees(sqrt(1/kappa))
+        # is the (approximate) angular std this actually controls -- the
+        # NUMBER that actually controls how tightly direction samples
+        # cluster around the predicted mean, same role log_std's sigma
+        # played before, just via the inverse relationship (larger kappa =
+        # narrower). Delta vs the previous rollout's value shows whether
+        # log_kappa is actually moving at all (it was observed to sit frozen
+        # at its init value across many rollouts when the policy LR is tiny
+        # and early-stop cuts gradient steps short).
+        def _kappa_deg(ls_pair):
             if not ls_pair:
                 return None
-            sig = [math.exp(v) for v in ls_pair]
-            deg = [math.degrees(s) for s in sig]
-            return sig, deg
-        _mv_sig = _sigma_deg(mv_ls)
-        _kk_sig = _sigma_deg(kk_ls)
+            kappa = [math.exp(v) for v in ls_pair]
+            deg = [math.degrees(math.sqrt(1.0 / k)) if k > 0 else float("inf") for k in kappa]
+            return kappa, deg
+        _mv_sig = _kappa_deg(mv_ls)
+        _kk_sig = _kappa_deg(kk_ls)
         _prev_mv_ls = self._prev_move_log_std if hasattr(self, "_prev_move_log_std") else None
         _prev_kk_ls = self._prev_kick_log_std if hasattr(self, "_prev_kick_log_std") else None
         _mv_delta_str = ""
         if mv_ls and _prev_mv_ls:
             _d = [b - a for a, b in zip(_prev_mv_ls, mv_ls)]
-            # Show Δlog_std and the resulting change in σ expressed in degrees
+            # Show Δlog_kappa and the resulting change in angular std (degrees)
             _mv_dstd_deg = [
-                abs(math.degrees(math.exp(b)) - math.degrees(math.exp(a)))
+                abs(math.degrees(math.sqrt(1.0 / math.exp(b))) - math.degrees(math.sqrt(1.0 / math.exp(a))))
                 for a, b in zip(_prev_mv_ls, mv_ls)
             ]
             _mv_delta_str = (
                 f"  d_move=[{','.join(f'{v:+.4f}' for v in _d)}]"
-                f" (Δσ≈{','.join(f'{v:.3f}°' for v in _mv_dstd_deg)})"
+                f" (Δ(ang std)≈{','.join(f'{v:.3f}°' for v in _mv_dstd_deg)})"
             )
         _kk_delta_str = ""
         if kk_ls and _prev_kk_ls:
             _d = [b - a for a, b in zip(_prev_kk_ls, kk_ls)]
             _kk_dstd_deg = [
-                abs(math.degrees(math.exp(b)) - math.degrees(math.exp(a)))
+                abs(math.degrees(math.sqrt(1.0 / math.exp(b))) - math.degrees(math.sqrt(1.0 / math.exp(a))))
                 for a, b in zip(_prev_kk_ls, kk_ls)
             ]
             _kk_delta_str = (
                 f"  d_kick=[{','.join(f'{v:+.4f}' for v in _d)}]"
-                f" (Δσ≈{','.join(f'{v:.3f}°' for v in _kk_dstd_deg)})"
+                f" (Δ(ang std)≈{','.join(f'{v:.3f}°' for v in _kk_dstd_deg)})"
             )
         self._prev_move_log_std = list(mv_ls) if mv_ls else None
         self._prev_kick_log_std = list(kk_ls) if kk_ls else None
@@ -1567,14 +1686,14 @@ class PPOTrainer:
         if mv_ls:
             mv_ls_str = f"  mv_ls=[{','.join(f'{v:.4f}' for v in mv_ls)}]"
             if _mv_sig:
-                _sig, _deg = _mv_sig
-                mv_ls_str += f" (\u03c3\u2248{','.join(f'{s:.2f}' for s in _sig)}, \u2248{','.join(f'{d:.0f}\u00b0' for d in _deg)})"
+                _kap, _deg = _mv_sig
+                mv_ls_str += f" (\u03ba\u2248{','.join(f'{k:.2f}' for k in _kap)}, ang std\u2248{','.join(f'{d:.0f}\u00b0' for d in _deg)})"
             mv_ls_str += f" g={mv_ls_grad:.2e}" + _mv_delta_str
         if kk_ls:
             mv_ls_str += f"\n  kk_ls=[{','.join(f'{v:.4f}' for v in kk_ls)}]"
             if _kk_sig:
-                _sig, _deg = _kk_sig
-                mv_ls_str += f" (\u03c3\u2248{','.join(f'{s:.2f}' for s in _sig)}, \u2248{','.join(f'{d:.0f}\u00b0' for d in _deg)})"
+                _kap, _deg = _kk_sig
+                mv_ls_str += f" (\u03ba\u2248{','.join(f'{k:.2f}' for k in _kap)}, ang std\u2248{','.join(f'{d:.0f}\u00b0' for d in _deg)})"
             mv_ls_str += _kk_delta_str
         ha = metrics.get("head_act", {})
         _ta_p = ha.get('ta_p', float('nan'))
@@ -1769,6 +1888,21 @@ class PPOTrainer:
             phase_id, n_workers, base_seed, self.separate_value_net, self.worker_torch_threads,
             progress_value=_progress_value,
         )
+        # Persistent eval worker pool (see ai/eval/eval_worker.py's module
+        # docstring): spawned once here, alongside the rollout workers,
+        # rather than _eval_vs_opponent_type() spinning a fresh
+        # multiprocessing.Pool on every single periodic eval call -- that
+        # used to mean every rollout cycle re-paid a full torch/
+        # footballcoach re-import per eval worker for no reason. Stored on
+        # self so _eval_vs_opponent_type() (called from deep inside the loop
+        # below) can reach it without threading it through every call.
+        eval_workers = None
+        if self._eval_n_parallel_workers > 1:
+            from footballcoach.ai.eval.eval_worker import spawn_eval_workers
+            eval_workers = spawn_eval_workers(
+                self._eval_n_parallel_workers, self.separate_value_net, self.worker_torch_threads,
+            )
+        self._persistent_eval_workers = eval_workers
         try:
             _steps_at_call_start = self._total_steps
             target_steps = _steps_at_call_start + total_steps
@@ -1888,6 +2022,10 @@ class PPOTrainer:
                     self._eval_vs_rules(max_episode_s)
         finally:
             close_workers(workers)
+            if eval_workers is not None:
+                from footballcoach.ai.eval.eval_worker import close_eval_workers
+                close_eval_workers(eval_workers)
+            self._persistent_eval_workers = None
 
         if self.checkpoint_dir is not None:
             self._save_checkpoint(self._total_steps)
@@ -1910,6 +2048,58 @@ class PPOTrainer:
     def _eval_vs_immobile(self, max_episode_s: float) -> None:
         """Seeded eval vs a standing-still opponent -- see _eval_vs_rules()."""
         self._eval_vs_opponent_type(max_episode_s, use_rules_ai=False)
+
+    def _compute_rules_vs_rules_baseline(self, max_episode_s: float):
+        """Rules-AI-vs-rules-AI reference point on the EXACT SAME fixed eval
+        seed set (self._eval_seeds/_eval_repeats_per_seed) as the periodic
+        "[eval vs rules]" check, so a trained policy's numbers can be
+        compared directly against "what does a rules-AI trainee itself score
+        on these scenarios" -- e.g. beating this baseline's win rate is a
+        much more meaningful bar than 0%/100%.
+
+        Computed and cached ONCE (returns the cached result on every
+        subsequent call) since it never changes: same seeds, same
+        deterministic rules-AI decision logic on both sides (only residual
+        match-physics RNG varies run to run, which repeats_per_seed already
+        averages over the same way the main eval does). Deliberately
+        sequential, not parallel like _eval_vs_opponent_type's main path --
+        this only ever runs once per training process, so the extra
+        worker-pool code path isn't worth it for a one-time cost.
+        """
+        if self._rules_vs_rules_baseline is not None:
+            return self._rules_vs_rules_baseline
+        from footballcoach.rules_ai import Phase1RulesAI
+        from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
+        from footballcoach.ai.env.scenario_env import ScenarioEnv
+
+        def _baseline_env_factory(seed: int) -> ScenarioEnv:
+            def _build(*_a, **_kw):
+                _m = build_1v1_scenario(*_a, seed=seed, **_kw)
+                for p in _m.players:
+                    p.ai = Phase1RulesAI()
+                _m._opponent_use_rules_ai = True
+                _m._opponent_is_immobile = False
+                return _m
+
+            return ScenarioEnv(
+                ScenarioDefinition(key="_eval_rules_vs_rules", label="eval_rules_vs_rules",
+                                   description="rules-vs-rules eval baseline", build=_build),
+                trainee_player_id="trainee",
+                max_episode_s=max_episode_s,
+            )
+
+        try:
+            # sample_action_fn=None: trainee's ai is already Phase1RulesAI()
+            # from _build above, so ScenarioEnv.reset() never assigns a
+            # NeuralPlayerAI (see its "if self.sample_action_fn is not None"
+            # gate) -- both players stay pure rules-AI.
+            self._rules_vs_rules_baseline = run_seeded_evaluation(
+                _baseline_env_factory, None, self._eval_seeds, self._eval_repeats_per_seed,
+            )
+        except Exception as _e:
+            log.warning(f"  [eval baseline rules-vs-rules] failed: {_e}")
+            self._rules_vs_rules_baseline = False  # sentinel: tried, failed, don't retry every rollout
+        return self._rules_vs_rules_baseline
 
     def _cpu_state_dicts(self) -> tuple[dict, dict, Optional[dict]]:
         """Snapshot (decision_state, execution_state, value_state) as plain
@@ -1935,14 +2125,58 @@ class PPOTrainer:
         )
         return decision_state, execution_state, value_state
 
+    def _run_persistent_eval(
+        self, workers, decision_state: dict, execution_state: dict, value_state: Optional[dict],
+        seeds: list[int], repeats_per_seed: int, use_rules_ai: bool, max_episode_s: float,
+        win_outcome: str = "box_possession",
+    ):
+        """Dispatch one seeded eval across an already-running persistent
+        eval worker pool (see ai/eval/eval_worker.py), mirroring
+        run_seeded_evaluation_parallel()'s seed-chunking/merge but without
+        spawning a fresh Pool -- the workers were spawned once by
+        _train_parallel() and are reused every call."""
+        from footballcoach.ai.eval.seeded_eval import merge_eval_results
+
+        for w in workers:
+            w.set_weights(decision_state, execution_state, value_state)
+        chunks = [c for c in (seeds[i::len(workers)] for i in range(len(workers))) if c]
+        active = workers[:len(chunks)]
+        for w, chunk in zip(active, chunks):
+            w.eval(chunk, repeats_per_seed, use_rules_ai, max_episode_s, win_outcome)
+        results = [w.recv_result() for w in active]
+        return merge_eval_results(results, repeats_per_seed)
+
     def _eval_vs_opponent_type(self, max_episode_s: float, use_rules_ai: bool) -> None:
         _label = "rules" if use_rules_ai else "immobile"
+        # If the curriculum never actually trains against an immobile
+        # opponent, this check is pure sanity insurance (catching e.g. a
+        # "runs in circles vs immobile" regression), not a tracked metric --
+        # cut it down to 10 total episodes instead of the full
+        # eval_seeds x eval_repeats_per_seed budget every rollout.
+        if not use_rules_ai and self._phase1_opponent_immobile_ratio == 0:
+            _seeds = self._eval_seeds[:10]
+            _repeats = 1
+        else:
+            _seeds = self._eval_seeds
+            _repeats = self._eval_repeats_per_seed
         try:
-            if self._eval_n_parallel_workers > 1:
-                # Parallel path: each subprocess rebuilds its own trainer
-                # from these state dicts (see _eval_worker_factory) -- must
-                # snapshot weights now, not capture self._sample_action,
-                # since bound methods/live nn.Modules aren't picklable.
+            _persistent_workers = getattr(self, "_persistent_eval_workers", None)
+            if self._eval_n_parallel_workers > 1 and _persistent_workers:
+                # Persistent-pool path (see ai/eval/eval_worker.py): workers
+                # were already spawned once by _train_parallel() -- just
+                # push current weights and dispatch, no process spawn here.
+                _decision_state, _execution_state, _value_state = self._cpu_state_dicts()
+                result = self._run_persistent_eval(
+                    _persistent_workers, _decision_state, _execution_state, _value_state,
+                    _seeds, _repeats, use_rules_ai, max_episode_s,
+                )
+            elif self._eval_n_parallel_workers > 1:
+                # Fallback parallel path (no persistent pool available --
+                # e.g. evaluate.py CLI or the single-process train() loop):
+                # each subprocess rebuilds its own trainer from these state
+                # dicts (see _eval_worker_factory) -- must snapshot weights
+                # now, not capture self._sample_action, since bound methods/
+                # live nn.Modules aren't picklable.
                 import functools
                 _decision_state, _execution_state, _value_state = self._cpu_state_dicts()
                 worker_factory = functools.partial(
@@ -1950,7 +2184,7 @@ class PPOTrainer:
                     self.separate_value_net, _value_state, use_rules_ai, max_episode_s,
                 )
                 result = run_seeded_evaluation_parallel(
-                    worker_factory, self._eval_seeds, self._eval_repeats_per_seed,
+                    worker_factory, _seeds, _repeats,
                     n_workers=self._eval_n_parallel_workers,
                 )
             else:
@@ -1976,17 +2210,27 @@ class PPOTrainer:
 
                 result = run_seeded_evaluation(
                     _eval_env_factory, self._sample_action,
-                    self._eval_seeds, self._eval_repeats_per_seed,
+                    _seeds, _repeats,
                 )
             log.info(
                 f"  [eval vs {_label}] step={self._total_steps:,}  "
-                f"seeds={len(self._eval_seeds)}x{self._eval_repeats_per_seed}  "
+                f"seeds={len(_seeds)}x{_repeats}  "
                 f"win={result.win_rate_pct:.0f}%  "
                 f"mean_rew={result.mean_reward:.3f}±{result.std_reward:.3f} "
                 f"(sem={result.sem_reward:.3f})  "
                 f"V={result.mean_value_pred:.3f}  gap={result.mean_value_pred - result.mean_reward:+.3f}  "
                 f"outcomes={result.outcomes}"
             )
+            if use_rules_ai:
+                _baseline = self._compute_rules_vs_rules_baseline(max_episode_s)
+                if _baseline:
+                    log.info(
+                        f"  [eval baseline rules-vs-rules] seeds={len(self._eval_seeds)}x{self._eval_repeats_per_seed}  "
+                        f"win={_baseline.win_rate_pct:.0f}%  "
+                        f"mean_rew={_baseline.mean_reward:.3f}±{_baseline.std_reward:.3f} "
+                        f"(sem={_baseline.sem_reward:.3f})  "
+                        f"outcomes={_baseline.outcomes}"
+                    )
         except Exception as _e:
             log.warning(f"  [eval vs {_label}] failed: {_e}")
     # -----------------------------------------------------------------------
@@ -2222,12 +2466,12 @@ class PPOTrainer:
                             dec_label_smoothing=self._bc_dec_label_smoothing,
                             has_exec=False,
                         )
-                        _e_v = self._value_heads(
+                        _value_v = self._value_heads(
                             _obs_v["self_feat"], _obs_v["other_feat"],
                             _obs_v["exists_mask"], _obs_v["ball_feat"], _obs_v["global_feat"],
                             _d_v, _sat_v, _oat_v,
                         )
-                        _pred_v = _e_v.value.squeeze(-1)
+                        _pred_v = _value_v.squeeze(-1)
                         _mse_v = F.mse_loss(_pred_v, _ret_v) / (ret_std ** 2)
                         _v_losses.append((_bc_v + self._phase0_value_coef * _mse_v).item())
                         _v_bc_losses.append(_bc_v.item())
@@ -2309,12 +2553,12 @@ class PPOTrainer:
                     # otherwise execution_net.value_head (via demo_opt). No
                     # other execution-network output (move/kick/tackle/etc
                     # heads) is used or optimized in this phase.
-                    e_heads = self._value_heads(
+                    _value = self._value_heads(
                         obs_dict["self_feat"], obs_dict["other_feat"],
                         obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
                         d_heads, _sat, _oat,
                     )
-                    val_loss = F.mse_loss(e_heads.value.squeeze(-1), ret_batch) / (ret_std ** 2)
+                    val_loss = F.mse_loss(_value.squeeze(-1), ret_batch) / (ret_std ** 2)
                     combined = dec_bc_loss + self._phase0_value_coef * val_loss
                     demo_opt.zero_grad()
                     if _value_opt is not None:
@@ -2547,16 +2791,18 @@ class PPOTrainer:
                     )
                     if _use_separate_value_training:
                         _d_v_for_value = _detach_decision_heads(_d_v)
-                        _e_v = self.value_net(
+                        _value_v = self.value_net(
                             _obs_v["self_feat"], _obs_v["other_feat"], _obs_v["exists_mask"],
                             _obs_v["ball_feat"], _obs_v["global_feat"], _d_v_for_value, _sat_v, _oat_v,
+                            value_only=True,
                         )
                     else:
-                        _e_v = self.execution_net(
+                        _value_v = self.execution_net(
                             _obs_v["self_feat"], _obs_v["other_feat"], _obs_v["exists_mask"],
                             _obs_v["ball_feat"], _obs_v["global_feat"], _d_v, _sat_v, _oat_v,
+                            value_only=True,
                         )
-                    _v = _e_v.value.squeeze(-1)
+                    _v = _value_v.squeeze(-1)
                     _raw_mse = F.mse_loss(_v, _ret_v)
                     _raw_mses.append(_raw_mse.item())
                     _losses.append((_raw_mse / (_joint_ret_std ** 2)).item())
@@ -2722,11 +2968,12 @@ class PPOTrainer:
                     # pretrain_lr), NOT self.value_net_optimizer -- see that
                     # variable's own setup comment above for why.
                     d_heads_for_value = _detach_decision_heads(d_heads)
-                    e_heads_value = self.value_net(
+                    _value_sep = self.value_net(
                         obs_dict["self_feat"], obs_dict["other_feat"], obs_dict["exists_mask"],
                         obs_dict["ball_feat"], obs_dict["global_feat"], d_heads_for_value, _sat, _oat,
+                        value_only=True,
                     )
-                    v_sep = e_heads_value.value.squeeze(-1)
+                    v_sep = _value_sep.squeeze(-1)
                     sep_val_loss = F.mse_loss(v_sep, ret_batch) / (_joint_ret_std ** 2)
                     _sep_value_opt.zero_grad()
                     sep_val_loss.backward()
@@ -3224,12 +3471,12 @@ class PPOTrainer:
                             _sat_r, _oat_r,
                         )
                         _val_net_r = self.value_net if self.separate_value_net else self.execution_net
-                        e_vr = _val_net_r(
+                        _value_vr = _val_net_r(
                             mb_obs_r["self_feat"], mb_obs_r["other_feat"],
                             mb_obs_r["exists_mask"], mb_obs_r["ball_feat"], mb_obs_r["global_feat"],
-                            d_vr, _sat_r, _oat_r,
+                            d_vr, _sat_r, _oat_r, value_only=True,
                         )
-                        pred_vr = e_vr.value.squeeze(-1)  # single critic (execution_net, or self.value_net)
+                        pred_vr = _value_vr.squeeze(-1)  # single critic (execution_net, or self.value_net)
                         val_losses_r.append(F.mse_loss(pred_vr, mb_ret_r).item() / (ret_std ** 2).item())
                 _kick_bkdn_keys = {"kick", "kick_direction", "kick_power", "kick_spin"}
                 # Floor-adjusted, same rationale as the main BC epoch loop above —
@@ -3680,11 +3927,12 @@ class PPOTrainer:
                         mb_obs["ball_feat"], mb_obs["global_feat"], sat, oat,
                     )
                     _val_net = self.value_net if self.separate_value_net else self.execution_net
-                    e_heads = _val_net(
+                    _value = _val_net(
                         mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"],
                         mb_obs["ball_feat"], mb_obs["global_feat"], d_heads, sat, oat,
+                        value_only=True,
                     )
-                    preds = e_heads.value.squeeze(-1)
+                    preds = _value.squeeze(-1)
                     total_sq += float(((preds - mb_ret) ** 2).sum())
                     n_rows += len(mb_ret)
             mse = total_sq / max(n_rows, 1)
@@ -3740,8 +3988,8 @@ class PPOTrainer:
                     # gradient too under the old convention).
                     with torch.no_grad():
                         d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
-                    e_heads = self.value_net(sf, of, em, bf, gf, d_heads, sat, oat)
-                    new_values = e_heads.value.squeeze(-1)
+                    _value = self.value_net(sf, of, em, bf, gf, d_heads, sat, oat, value_only=True)
+                    new_values = _value.squeeze(-1)
 
                     value_loss = F.mse_loss(new_values, mb_ret) / (ret_std ** 2)
 
@@ -3752,8 +4000,8 @@ class PPOTrainer:
                     ep_losses.append(value_loss.item())
                 else:
                     d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
-                    e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
-                    new_values = e_heads.value.squeeze(-1)  # single value head (execution_net)
+                    _value = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat, value_only=True)
+                    new_values = _value.squeeze(-1)  # single value head (execution_net)
 
                     # Normalised MSE so the loss is O(1) regardless of return scale
                     value_loss = F.mse_loss(new_values, mb_ret) / (ret_std ** 2)
@@ -3780,8 +4028,8 @@ class PPOTrainer:
                 # .backward() call above).
                 if _sep_net is not None:
                     d_heads_detached = _detach_decision_heads(d_heads)
-                    e_heads_sep = _sep_net(sf, of, em, bf, gf, d_heads_detached, sat, oat)
-                    new_values_sep = e_heads_sep.value.squeeze(-1)
+                    _value_sep2 = _sep_net(sf, of, em, bf, gf, d_heads_detached, sat, oat, value_only=True)
+                    new_values_sep = _value_sep2.squeeze(-1)
                     value_loss_sep = F.mse_loss(new_values_sep, mb_ret) / (ret_std ** 2)
 
                     _sep_opt.zero_grad()
@@ -3809,23 +4057,25 @@ class PPOTrainer:
                         val_obs_dict["global_feat"], _sat_v, _oat_v,
                     )
                     _val_net = self.value_net if self.separate_value_net else self.execution_net
-                    e_v = _val_net(
+                    _value_v = _val_net(
                         val_obs_dict["self_feat"], val_obs_dict["other_feat"],
                         val_obs_dict["exists_mask"], val_obs_dict["ball_feat"],
                         val_obs_dict["global_feat"], d_v, _sat_v, _oat_v,
+                        value_only=True,
                     )
-                    _val_preds = e_v.value.squeeze(-1)
+                    _val_preds = _value_v.squeeze(-1)
                     _vl = float(F.mse_loss(_val_preds, val_returns_t) / (ret_std ** 2))
                     _val_pred_mean = float(_val_preds.mean().item())
                     _val_ret_mean = float(val_returns_t.mean().item())
                     if _sep_net is not None:
-                        e_v_sep = _sep_net(
+                        _value_v_sep = _sep_net(
                             val_obs_dict["self_feat"], val_obs_dict["other_feat"],
                             val_obs_dict["exists_mask"], val_obs_dict["ball_feat"],
                             val_obs_dict["global_feat"], d_v, _sat_v, _oat_v,
+                            value_only=True,
                         )
                         _vl_sep = float(F.mse_loss(
-                            e_v_sep.value.squeeze(-1), val_returns_t
+                            _value_v_sep.squeeze(-1), val_returns_t
                         ) / (ret_std ** 2))
                         _val_rmse_sep = float(ret_std) * math.sqrt(_vl_sep)
                 _val_rmse = float(ret_std) * math.sqrt(_vl)
@@ -3896,15 +4146,18 @@ class PPOTrainer:
     # Policy sampling
     # -----------------------------------------------------------------------
 
-    def _move_dir_head(self, raw_vec: torch.Tensor, log_std_param: torch.Tensor) -> "DirectionHead":
-        return DirectionHead(raw_vec, log_std_param,
-                             log_std_min=self.move_dir_log_std_min,
-                             log_std_max=self.move_dir_log_std_max)
+    def _move_dir_head(self, raw_vec: torch.Tensor, log_kappa_param: torch.Tensor) -> "VonMisesDirectionHead":
+        return VonMisesDirectionHead(raw_vec, log_kappa_param,
+                             log_kappa_min=self.move_dir_log_kappa_min,
+                             log_kappa_max=self.move_dir_log_kappa_max)
 
-    def _kick_dir_head(self, raw_vec: torch.Tensor, log_std_param: torch.Tensor) -> "DirectionHead":
-        return DirectionHead(raw_vec, log_std_param,
-                             log_std_min=self.kick_dir_log_std_min,
-                             log_std_max=self.kick_dir_log_std_max)
+    def _kick_dir_head(self, raw_vec: torch.Tensor, log_kappa_param: torch.Tensor,
+                        log_std_z_param: torch.Tensor) -> "KickDirectionHead":
+        return KickDirectionHead(raw_vec, log_kappa_param, log_std_z_param,
+                             log_kappa_min=self.kick_dir_log_kappa_min,
+                             log_kappa_max=self.kick_dir_log_kappa_max,
+                             log_std_z_min=self.kick_dir_z_log_std_min,
+                             log_std_z_max=self.kick_dir_z_log_std_max)
 
     def _kick_power_head(self, raw_mean: torch.Tensor, log_std_param: torch.Tensor) -> "SquashedNormalHead":
         """kick_power: sigmoid-squashed scalar in [0,1] (power_fraction).
@@ -3913,9 +4166,10 @@ class PPOTrainer:
         sampling/log_prob/entropy) -- see agent_plans/spin_implementation_plan.md
         section 6. SquashedNormalHead internally clamps its own log_std to
         (-5.0, 2.0), so no extra config bounds are needed here (unlike the
-        DirectionHead heads above, which take externally-configured clamp
-        bounds because their log_std also feeds an explicit restoring-force
-        regularizer this scoped fix does not add for kick_power/kick_spin).
+        VonMisesDirectionHead/KickDirectionHead heads above, which take
+        externally-configured clamp bounds because their log_kappa/log_std
+        also feed an explicit restoring-force regularizer this scoped fix
+        does not add for kick_power/kick_spin).
         """
         return SquashedNormalHead(raw_mean, log_std_param, low=0.0, high=1.0, squash="sigmoid")
 
@@ -3924,8 +4178,8 @@ class PPOTrainer:
 
         kick_spin has no bounded physical range wired up (it's still disabled
         at the apply_nn_action.py chokepoint -- real spin physics/clamping is
-        deferred, see the plan doc). Neither DirectionHead (which forces a
-        unit-vector mean) nor SquashedNormalHead (which forces a squashed
+        deferred, see the plan doc). Neither VonMisesDirectionHead/
+        KickDirectionHead (which force a unit-vector mean) nor SquashedNormalHead (which forces a squashed
         [low,high] range) fits an unbounded raw vector, so this uses
         torch.distributions.Normal directly -- same log_std clamp convention
         as SquashedNormalHead (-5.0, 2.0) for consistency.
@@ -3948,20 +4202,21 @@ class PPOTrainer:
         def _b(logit, key):
             return IndependentBernoulli(logit).log_prob(mb_actions[key]).squeeze(-1)
 
-        log_std_move = self.execution_net.move_dir_log_std.to(self.device)
-        log_std_kick = self.execution_net.kick_dir_log_std.to(self.device)
+        log_kappa_move = self.execution_net.move_dir_log_kappa.to(self.device)
+        log_kappa_kick = self.execution_net.kick_dir_log_kappa.to(self.device)
+        log_std_z_kick = self.execution_net.kick_dir_z_log_std.to(self.device)
         log_std_power = self.execution_net.kick_power_log_std.to(self.device)
         log_std_spin = self.execution_net.kick_spin_log_std.to(self.device)
         exec_move_mask = (mb_actions["exec_move"].squeeze(-1) > 0.5).float()
         kick_mask = (mb_actions["kick"].squeeze(-1) > 0.5).float()
 
         lp_move_dir = exec_move_mask * (
-            self._move_dir_head(e_heads.move_direction, log_std_move).log_prob(
+            self._move_dir_head(e_heads.move_direction, log_kappa_move).log_prob(
                 mb_actions["move_dir_raw"]
             )
         )
         lp_kick_dir = kick_mask * (
-            self._kick_dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+            self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).log_prob(
                 mb_actions["kick_dir_raw"]
             )
         )
@@ -4132,15 +4387,18 @@ class PPOTrainer:
         kick = kick_dist.mode() if det_decision else kick_dist.sample()
         tackle_attempt = tackle_attempt_dist.mode() if det_decision else tackle_attempt_dist.sample()
 
-        # Direction heads: sample from Normal(mean, std) per design doc 8.6.
+        # Direction heads: move_dir is a von Mises (azimuthal-only); kick_dir
+        # is a von Mises (azimuthal) x plain Normal (elevation) composite --
+        # see VonMisesDirectionHead/KickDirectionHead in ai/action/distributions.py.
         # We store the noisy raw sample (not the mean) so that log_prob ratios
         # during the PPO update are meaningful — new_mean vs stored sample.
         # In deterministic (direction) mode we use the (normalized) mean direction instead.
         eps = 1e-6
-        log_std_move = self.execution_net.move_dir_log_std
-        log_std_kick = self.execution_net.kick_dir_log_std
-        move_dir_head = self._move_dir_head(e_heads.move_direction, log_std_move)
-        kick_dir_head = self._kick_dir_head(e_heads.kick_direction, log_std_kick)
+        log_kappa_move = self.execution_net.move_dir_log_kappa
+        log_kappa_kick = self.execution_net.kick_dir_log_kappa
+        log_std_z_kick = self.execution_net.kick_dir_z_log_std
+        move_dir_head = self._move_dir_head(e_heads.move_direction, log_kappa_move)
+        kick_dir_head = self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick)
         if det_direction:
             move_dir_raw = move_dir_head.mode_physical()  # (1, 2)
             kick_dir_raw = kick_dir_head.mode_physical()   # (1, 3)
@@ -4189,7 +4447,7 @@ class PPOTrainer:
         # separate_value_net is enabled (see _value_heads() docstring).
         if self.separate_value_net:
             with torch.no_grad():
-                value = float(self.value_net(sf, of, em, bf, gf, d_heads, sat, oat).value.mean())
+                value = float(self.value_net(sf, of, em, bf, gf, d_heads, sat, oat, value_only=True).mean())
         else:
             value = float(e_heads.value.mean())
         log_prob = self._compute_log_prob(d_heads, e_heads, {
@@ -4203,8 +4461,9 @@ class PPOTrainer:
         }, em)
 
         # Per-head log_probs for DEBUG KL breakdown (stored alongside total in buffer)
-        _lsm = self.execution_net.move_dir_log_std
-        _lsk = self.execution_net.kick_dir_log_std
+        _lsm = self.execution_net.move_dir_log_kappa
+        _lsk = self.execution_net.kick_dir_log_kappa
+        _lskz = self.execution_net.kick_dir_z_log_std
         # Debug per-head log_probs: apply same masking as _compute_log_prob
         # so these values match what went into the stored total log_prob.
         # Frozen/masked decision heads (self._ppo_lp_masked_heads, set via
@@ -4235,7 +4494,7 @@ class PPOTrainer:
             # move_dir: only when exec_move=True
             float(self._move_dir_head(e_heads.move_direction, _lsm).log_prob(move_dir_raw)) if _exec_move_active else 0.0,
             # kick_dir: only when kick=True
-            float(self._kick_dir_head(e_heads.kick_direction, _lsk).log_prob(kick_dir_raw)) if _kick_active else 0.0,
+            float(self._kick_dir_head(e_heads.kick_direction, _lsk, _lskz).log_prob(kick_dir_raw)) if _kick_active else 0.0,
             # kick_power: only when kick=True (same gating as kick_dir --
             # only ever used downstream inside the `if kick_this_tick:` block)
             float(kick_power_head.log_prob(kick_power_raw)) if _kick_active else 0.0,
@@ -4297,8 +4556,8 @@ class PPOTrainer:
         sat = obs_dict["self_ai_type"].to(self.device) if "self_ai_type" in obs_dict else None
         oat = obs_dict["other_ai_type"].to(self.device) if "other_ai_type" in obs_dict else None
         d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
-        e_heads = self._value_heads(sf, of, em, bf, gf, d_heads, sat, oat)
-        return float(e_heads.value.mean())  # single critic (execution_net, or self.value_net)
+        _value = self._value_heads(sf, of, em, bf, gf, d_heads, sat, oat)
+        return float(_value.mean())  # single critic (execution_net, or self.value_net)
 
     def _bootstrap_last_values(self, env, next_obs, buffer: "RolloutBuffer") -> dict[str, float]:
         """Per-track bootstrap values for ``RolloutBuffer.compute_gae()``.
@@ -4374,21 +4633,22 @@ class PPOTrainer:
         # Sub-parameters gated by parent action — only contribute to log_prob
         # when the parent was actually taken.  Unconditional inclusion injects
         # large-variance noise from unused heads and inflates KL divergence.
-        log_std_move = self.execution_net.move_dir_log_std
-        log_std_kick = self.execution_net.kick_dir_log_std
+        log_kappa_move = self.execution_net.move_dir_log_kappa
+        log_kappa_kick = self.execution_net.kick_dir_log_kappa
+        log_std_z_kick = self.execution_net.kick_dir_z_log_std
         log_std_power = self.execution_net.kick_power_log_std
         log_std_spin = self.execution_net.kick_spin_log_std
         # sprint + move_dir: only when exec_move=True (player was moving)
         if float(samples["exec_move"]) > 0.5:
             lp += IndependentBernoulli(e_heads.sprint_logit).log_prob(samples["sprint"]).sum()
-            lp += self._move_dir_head(e_heads.move_direction, log_std_move).log_prob(
+            lp += self._move_dir_head(e_heads.move_direction, log_kappa_move).log_prob(
                 samples["move_dir_raw"]
             )
         # kick_dir/kick_power: only when kick=True (a kick was taken) -- both
         # are only ever consumed downstream inside the engine's
         # `if kick_this_tick:` block.
         if float(samples["kick"]) > 0.5:
-            lp += self._kick_dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+            lp += self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).log_prob(
                 samples["kick_dir_raw"]
             )
             lp += self._kick_power_head(e_heads.kick_power, log_std_power).log_prob(
@@ -4523,7 +4783,7 @@ class PPOTrainer:
         # necessarily the same sample (or even the same epoch) that produced
         # the true max reported in the [ratio] percentile line.
         _ratio_spike: dict = {"ratio": float("-inf")}
-        all_mv_log_std_grad: list[float] = []  # grad on move_dir_log_std after each backward
+        all_mv_log_std_grad: list[float] = []  # grad on move_dir_log_kappa after each backward
         # --- Extra diagnostics: advantage stats, ratio stats, per-execution-head
         # grad norm, continuous/discrete head drift, per-head KL. All aggregated
         # over the rollout and printed once at the end (see below, near the
@@ -4537,6 +4797,13 @@ class PPOTrainer:
         all_head_kl: list[torch.Tensor] = []  # per-mb (13,) per-head KL, after step
         all_continuous_mean_shift: dict[str, list[float]] = {"move_direction": [], "kick_direction": []}
         all_continuous_log_std_shift: dict[str, list[float]] = {"move_direction": [], "kick_direction": []}
+        # kick_dir_z_log_std (elevation, plain Gaussian) has no per-head KL/
+        # entropy slot of its own -- KickDirectionHead sums it into the same
+        # combined "kick_dir" number as the azimuthal von Mises component
+        # everywhere that's already a single scalar (entropy, KL, log_prob).
+        # Its own VALUE/drift has no such existing home, so it gets a
+        # dedicated tracker here instead of being silently invisible.
+        all_kickz_log_std_shift: list[float] = []
         all_discrete_logit_shift: dict[str, list[float]] = {
             name: [] for name in ("exec_move", "sprint", "kick", "tackle_attempt")
         }
@@ -4551,7 +4818,7 @@ class PPOTrainer:
         clip_triggered_dir = 0
         # Actual applied parameter-delta norm for the direction group -- i.e.
         # ||params_after - params_before|| across move_direction/kick_direction/
-        # move_dir_log_std/kick_dir_log_std, measured directly around
+        # move_dir_log_kappa/kick_dir_log_kappa/kick_dir_z_log_std, measured directly around
         # optimizer.step() (see below). Separate from all_grad_norm_dir (the
         # pre-clip GRADIENT norm): Adam's real step size is m_hat/sqrt(v_hat),
         # a RATIO, not a direct function of the clipped gradient -- especially
@@ -4584,11 +4851,12 @@ class PPOTrainer:
 
         _diag_done = False  # print per-head breakdown only once
         _early_stopped = False
-        # Snapshot the continuous-head log_std at the very start of this update
+        # Snapshot the continuous-head log_kappa at the very start of this update
         # ("before the optimiser step", rollout-wide) so the final summary can
         # report start -> end drift across the whole rollout, not just per-mb.
-        _move_ls_start = float(self.execution_net.move_dir_log_std.mean().item())
-        _kick_ls_start = float(self.execution_net.kick_dir_log_std.mean().item())
+        _move_ls_start = float(self.execution_net.move_dir_log_kappa.mean().item())
+        _kick_ls_start = float(self.execution_net.kick_dir_log_kappa.mean().item())
+        _kickz_ls_start = float(self.execution_net.kick_dir_z_log_std.mean().item())
 
         # --- Pre-update value loss: a genuinely held-out-ish generalisation
         # diagnostic, computed on this rollout's FULL batch with the current
@@ -4624,10 +4892,10 @@ class PPOTrainer:
                 )
                 if self.separate_value_net:
                     _pd_heads_v = _detach_decision_heads(_pd_heads)
-                    _pe_heads = self.value_net(_psf, _pof, _pem, _pbf, _pgf, _pd_heads_v, _psat, _poat)
+                    _pvalue = self.value_net(_psf, _pof, _pem, _pbf, _pgf, _pd_heads_v, _psat, _poat, value_only=True)
                 else:
-                    _pe_heads = self.execution_net(_psf, _pof, _pem, _pbf, _pgf, _pd_heads, _psat, _poat)
-                _pred = _pe_heads.value.squeeze(-1)
+                    _pvalue = self.execution_net(_psf, _pof, _pem, _pbf, _pgf, _pd_heads, _psat, _poat, value_only=True)
+                _pred = _pvalue.squeeze(-1)
                 _pret = returns[_idx].to(self.device)
                 _pre_sq_err_sum += F.mse_loss(_pred, _pret, reduction="sum").item()
                 _pre_n += len(_idx)
@@ -4691,8 +4959,9 @@ class PPOTrainer:
 
                 # Snapshot BEFORE the optimiser step, for the drift diagnostics
                 # printed once at the end of _ppo_update (see EXEC_HEAD_MODULES).
-                _log_std_move_before = self.execution_net.move_dir_log_std.detach().clone()
-                _log_std_kick_before = self.execution_net.kick_dir_log_std.detach().clone()
+                _log_std_move_before = self.execution_net.move_dir_log_kappa.detach().clone()
+                _log_std_kick_before = self.execution_net.kick_dir_log_kappa.detach().clone()
+                _log_std_kickz_before = self.execution_net.kick_dir_z_log_std.detach().clone()
                 _exec_move_logit_before = e_heads.exec_move_logit.detach().clone()
                 _sprint_logit_before = e_heads.sprint_logit.detach().clone()
                 _kick_logit_before = e_heads.kick_logit.detach().clone()
@@ -4706,8 +4975,8 @@ class PPOTrainer:
                 # critic trunk fully independent of the (BC-primed) policy trunk.
                 if self.separate_value_net:
                     d_heads_for_value = _detach_decision_heads(d_heads)
-                    e_heads_value = self.value_net(sf, of, em, bf, gf, d_heads_for_value, sat, oat)
-                    new_values = e_heads_value.value.squeeze(-1)
+                    _value = self.value_net(sf, of, em, bf, gf, d_heads_for_value, sat, oat, value_only=True)
+                    new_values = _value.squeeze(-1)
                 else:
                     new_values = e_heads.value.squeeze(-1)
 
@@ -4733,10 +5002,11 @@ class PPOTrainer:
                         lp_sprint   = _blp(e_heads.sprint_logit, "sprint")
                         lp_kick     = _blp(e_heads.kick_logit, "kick")
                         lp_tackle_a = _blp(e_heads.tackle_attempt_logit, "tackle_attempt")
-                        log_std_move = self.execution_net.move_dir_log_std.to(self.device)
-                        log_std_kick = self.execution_net.kick_dir_log_std.to(self.device)
-                        lp_movedir  = self._move_dir_head(e_heads.move_direction, log_std_move).log_prob(mb_actions["move_dir_raw"]).mean().item()
-                        lp_kickdir  = self._kick_dir_head(e_heads.kick_direction, log_std_kick).log_prob(mb_actions["kick_dir_raw"]).mean().item()
+                        log_kappa_move = self.execution_net.move_dir_log_kappa.to(self.device)
+                        log_kappa_kick = self.execution_net.kick_dir_log_kappa.to(self.device)
+                        log_std_z_kick = self.execution_net.kick_dir_z_log_std.to(self.device)
+                        lp_movedir  = self._move_dir_head(e_heads.move_direction, log_kappa_move).log_prob(mb_actions["move_dir_raw"]).mean().item()
+                        lp_kickdir  = self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).log_prob(mb_actions["kick_dir_raw"]).mean().item()
                         lp_new_mb   = new_log_probs.mean().item()
                         lp_old_mb   = mb_old_lp.mean().item()
                         ratio_mb    = torch.exp(new_log_probs - mb_old_lp)
@@ -4758,7 +5028,7 @@ class PPOTrainer:
                         f"    gp={lp_gp:.3f} mark={lp_mark:.3f} hold={lp_hold:.3f}\n"
                         f"    exec_mv={lp_exec_mv:.3f} sprint={lp_sprint:.3f} kick={lp_kick:.3f} t_attempt={lp_tackle_a:.3f}\n"
                         f"    move_dir={lp_movedir:.3f} kick_dir={lp_kickdir:.3f}\n"
-                        f"    move_dir log_std={self.execution_net.move_dir_log_std.data.tolist()}\n"
+                        f"    move_dir log_kappa={self.execution_net.move_dir_log_kappa.data.tolist()}\n"
                         f"    [move_dir] cur_norm={current_norm.mean():.3f}  stored_norm={stored_norm.mean():.3f}"
                         f"  angle={angle_deg:.1f}deg"
                     )
@@ -4811,23 +5081,30 @@ class PPOTrainer:
                 # No dir_l2 penalty needed: direction means are unit-normalized in
                 # forward() so their magnitude is always 1 — penalizing it is a no-op.
 
-                # log_std restoring force: without this, ent_dir_weight * entropy
-                # is a one-directional force that only ever inflates move_dir_log_std/
-                # kick_dir_log_std (entropy is monotonic increasing in log_std), and
-                # nothing in the PPO/BC losses pulls it back down (the mean is
-                # unit-normalized so dir_l2 above is a no-op on log_std too). This
-                # term adds an explicit L2 pull toward dir_log_std_target, independent
-                # of clamp (which only caps the value fed into the distribution and
-                # zeroes the gradient once the raw parameter drifts past the bound —
-                # see ai_trainer_knowledge.md / DirectionHead for the clamp mechanism).
+                # log_kappa/log_std restoring force: without this, ent_dir_weight *
+                # entropy is a one-directional force that only ever DEFLATES
+                # move_dir_log_kappa/kick_dir_log_kappa (entropy is monotonic
+                # DECREASING in log_kappa -- the inverse relationship of the old
+                # log_std, where entropy increased with it) and inflates
+                # kick_dir_z_log_std (still a plain log_std, same direction as
+                # before), and nothing in the PPO/BC losses pulls either back the
+                # other way (the mean is unit-normalized so dir_l2 above is a
+                # no-op on these too). This term adds an explicit L2 pull toward
+                # each target, independent of clamp (which only caps the value
+                # fed into the distribution and zeroes the gradient once the raw
+                # parameter drifts past the bound — see ai_trainer_knowledge.md /
+                # VonMisesDirectionHead/KickDirectionHead for the clamp mechanism).
                 # Coefficient 0.0 (default) fully disables this — opt-in.
                 dir_log_std_reg = torch.zeros(1, device=self.device)
-                _lsm_raw = self.execution_net.move_dir_log_std
-                _lsk_raw = self.execution_net.kick_dir_log_std
-                if self.move_dir_log_std_reg_coef > 0.0:
-                    dir_log_std_reg = dir_log_std_reg + self.move_dir_log_std_reg_coef * ((_lsm_raw - self.move_dir_log_std_target) ** 2).mean()
-                if self.kick_dir_log_std_reg_coef > 0.0:
-                    dir_log_std_reg = dir_log_std_reg + self.kick_dir_log_std_reg_coef * ((_lsk_raw - self.kick_dir_log_std_target) ** 2).mean()
+                _lsm_raw = self.execution_net.move_dir_log_kappa
+                _lsk_raw = self.execution_net.kick_dir_log_kappa
+                _lskz_raw = self.execution_net.kick_dir_z_log_std
+                if self.move_dir_log_kappa_reg_coef > 0.0:
+                    dir_log_std_reg = dir_log_std_reg + self.move_dir_log_kappa_reg_coef * ((_lsm_raw - self.move_dir_log_kappa_target) ** 2).mean()
+                if self.kick_dir_log_kappa_reg_coef > 0.0:
+                    dir_log_std_reg = dir_log_std_reg + self.kick_dir_log_kappa_reg_coef * ((_lsk_raw - self.kick_dir_log_kappa_target) ** 2).mean()
+                if self.kick_dir_z_log_std_reg_coef > 0.0:
+                    dir_log_std_reg = dir_log_std_reg + self.kick_dir_z_log_std_reg_coef * ((_lskz_raw - self.kick_dir_z_log_std_target) ** 2).mean()
 
                 # Raw-vector magnitude regularizer for move_direction/
                 # kick_direction (see direction_magnitude_reg()'s own
@@ -4921,8 +5198,8 @@ class PPOTrainer:
                     if _head_params:
                         _gn_tensors[f"head:{_head_name}"] = torch.nn.utils.clip_grad_norm_(_head_params, float("inf"))
 
-                # Capture dir_log_std gradient before it is zeroed
-                _mv_ls_grad = self.execution_net.move_dir_log_std.grad
+                # Capture dir_log_kappa gradient before it is zeroed
+                _mv_ls_grad = self.execution_net.move_dir_log_kappa.grad
                 if _mv_ls_grad is not None:
                     _gn_tensors["mv_log_std_grad"] = _mv_ls_grad.norm()
 
@@ -4932,7 +5209,7 @@ class PPOTrainer:
                     float("inf"),  # don't clip yet, just measure
                 )
                 # Direction-head params (move_direction/kick_direction weights +
-                # move_dir_log_std/kick_dir_log_std) are clipped in their own
+                # move_dir_log_kappa/kick_dir_log_kappa/kick_dir_z_log_std) are clipped in their own
                 # isolated group via direction_max_grad_norm, so a single sample's
                 # large direction gradient can no longer force a proportional
                 # shrink of every other head's gradient in the same step (and a
@@ -5024,7 +5301,7 @@ class PPOTrainer:
                     kickdir_mean_shift_t = (e_after.kick_direction - e_heads.kick_direction).norm(dim=-1).mean()
                     # Actual KL contribution from move_direction (now included in ratio).
                     _stored_raw_mb = mb_actions["move_dir_raw"]
-                    _log_std_move  = self.execution_net.move_dir_log_std.to(self.device)
+                    _log_std_move  = self.execution_net.move_dir_log_kappa.to(self.device)
                     _lp_movedir_before = self._move_dir_head(e_heads.move_direction, _log_std_move).log_prob(_stored_raw_mb)
                     _lp_movedir_after  = self._move_dir_head(e_after.move_direction, _log_std_move).log_prob(_stored_raw_mb)
                     movedir_hyp_kl_t = (_lp_movedir_before - _lp_movedir_after).mean()
@@ -5046,8 +5323,9 @@ class PPOTrainer:
                         "movedir_mean_shift": movedir_mean_shift_t,
                         "kickdir_mean_shift": kickdir_mean_shift_t,
                         "movedir_hyp_kl": movedir_hyp_kl_t,
-                        "log_std_shift_move": (self.execution_net.move_dir_log_std.detach() - _log_std_move_before).abs().mean(),
-                        "log_std_shift_kick": (self.execution_net.kick_dir_log_std.detach() - _log_std_kick_before).abs().mean(),
+                        "log_std_shift_move": (self.execution_net.move_dir_log_kappa.detach() - _log_std_move_before).abs().mean(),
+                        "log_std_shift_kick": (self.execution_net.kick_dir_log_kappa.detach() - _log_std_kick_before).abs().mean(),
+                        "log_std_shift_kickz": (self.execution_net.kick_dir_z_log_std.detach() - _log_std_kickz_before).abs().mean(),
                         "logit_shift_exec_move": (e_after.exec_move_logit - _exec_move_logit_before).abs().mean(),
                         "logit_shift_sprint": (e_after.sprint_logit - _sprint_logit_before).abs().mean(),
                         "logit_shift_kick": (e_after.kick_logit - _kick_logit_before).abs().mean(),
@@ -5078,6 +5356,7 @@ class PPOTrainer:
                 all_continuous_mean_shift["kick_direction"].append(kickdir_mean_shift)
                 all_continuous_log_std_shift["move_direction"].append(_shift_vals["log_std_shift_move"])
                 all_continuous_log_std_shift["kick_direction"].append(_shift_vals["log_std_shift_kick"])
+                all_kickz_log_std_shift.append(_shift_vals["log_std_shift_kickz"])
                 all_discrete_logit_shift["exec_move"].append(_shift_vals["logit_shift_exec_move"])
                 all_discrete_logit_shift["sprint"].append(_shift_vals["logit_shift_sprint"])
                 all_discrete_logit_shift["kick"].append(_shift_vals["logit_shift_kick"])
@@ -5207,10 +5486,10 @@ class PPOTrainer:
                             other_physics_full=mb_obs.get("other_physics_full"),
                         )
                     if self.separate_value_net:
-                        e_heads_vo = self.value_net(sf, of, em, bf, gf, d_heads_vo, sat, oat)
+                        _value_vo = self.value_net(sf, of, em, bf, gf, d_heads_vo, sat, oat, value_only=True)
                     else:
-                        e_heads_vo = self.execution_net(sf, of, em, bf, gf, d_heads_vo, sat, oat)
-                    new_values_vo = e_heads_vo.value.squeeze(-1)
+                        _value_vo = self.execution_net(sf, of, em, bf, gf, d_heads_vo, sat, oat, value_only=True)
+                    new_values_vo = _value_vo.squeeze(-1)
 
                     ret_var = returns.var().clamp(min=1.0)
                     value_loss_vo = F.mse_loss(new_values_vo, mb_ret) / ret_var
@@ -5365,8 +5644,8 @@ class PPOTrainer:
         # plain mean via nonlinear log-ratio blowup without any real broad drift
         # — median is robust to that and shows whether "real" typical KL is low.
         median_kl = float(np.median(all_kl)) if all_kl else 0.0
-        move_log_std = self.execution_net.move_dir_log_std.data.tolist()
-        kick_log_std = self.execution_net.kick_dir_log_std.data.tolist()
+        move_log_std = self.execution_net.move_dir_log_kappa.data.tolist()
+        kick_log_std = self.execution_net.kick_dir_log_kappa.data.tolist()
         mean_mv_ls_grad = float(np.mean(all_mv_log_std_grad)) if all_mv_log_std_grad else 0.0
         if mean_kl > KL_DIAG_THRESHOLD and all_ratios:
             ratios_t = torch.cat(all_ratios)
@@ -5378,7 +5657,7 @@ class PPOTrainer:
                 f"  p75={ratios_t.quantile(0.75):.3f}"
                 f"  p95={ratios_t.quantile(0.95):.3f}"
                 f"  max={ratios_t.max():.3f}\n"
-                f"  move_dir_log_std={move_log_std}  kick_dir_log_std={kick_log_std}"
+                f"  move_dir_log_kappa={move_log_std}  kick_dir_log_kappa={kick_log_std}"
             )
             # Per-head new log_prob means on stored actions (first 256 transitions)
             diag_n = min(256, n)
@@ -5439,12 +5718,13 @@ class PPOTrainer:
                     lp_mark_d = torch.zeros_like(lp_mark_d)
                 if "hold_position_logit" in _masked_diag:
                     lp_hold_d = torch.zeros_like(lp_hold_d)
-                _lsm = self.execution_net.move_dir_log_std.to(self.device)
-                _lsk = self.execution_net.kick_dir_log_std.to(self.device)
+                _lsm = self.execution_net.move_dir_log_kappa.to(self.device)
+                _lsk = self.execution_net.kick_dir_log_kappa.to(self.device)
+                _lskz = self.execution_net.kick_dir_z_log_std.to(self.device)
                 _lspow = self.execution_net.kick_power_log_std.to(self.device)
                 _lsspin = self.execution_net.kick_spin_log_std.to(self.device)
                 lp_mvdir_d  = self._move_dir_head(e_d.move_direction, _lsm).log_prob(diag_act["move_dir_raw"])
-                lp_kkdir_d  = self._kick_dir_head(e_d.kick_direction, _lsk).log_prob(diag_act["kick_dir_raw"])
+                lp_kkdir_d  = self._kick_dir_head(e_d.kick_direction, _lsk, _lskz).log_prob(diag_act["kick_dir_raw"])
                 lp_kkpow_d  = self._kick_power_head(e_d.kick_power, _lspow).log_prob(diag_act["kick_power_raw"])
                 # kick_spin is permanently frozen (see agent_plans/spin_implementation_plan.md
                 # section 0) -- masked to zero here too, matching the real training
@@ -5490,8 +5770,8 @@ class PPOTrainer:
 
                 # Full-minibatch angular_diff distribution (not just the single
                 # worst sample above) -- distinguishes "one freak outlier sample"
-                # (expected even for a tiny mean shift, if move_dir_log_std is
-                # narrow enough) from "the whole batch's move_dir target
+                # (expected even for a tiny mean shift, if move_dir_log_kappa is
+                # high (narrow) enough) from "the whole batch's move_dir target
                 # genuinely shifted a lot" (a different, more concerning
                 # failure mode). Same diag_n-row slice as everything else here.
                 _stored_angles_all = torch.atan2(diag_act["move_dir_raw"][:, 1], diag_act["move_dir_raw"][:, 0])
@@ -5709,24 +5989,30 @@ class PPOTrainer:
         )
         if _head_grad_norm_str:
             log.info(f"  [exec head grad norm] {_head_grad_norm_str}")
-        _move_ls_end = float(self.execution_net.move_dir_log_std.mean().item())
-        _kick_ls_end = float(self.execution_net.kick_dir_log_std.mean().item())
+        _move_ls_end = float(self.execution_net.move_dir_log_kappa.mean().item())
+        _kick_ls_end = float(self.execution_net.kick_dir_log_kappa.mean().item())
+        _kickz_ls_end = float(self.execution_net.kick_dir_z_log_std.mean().item())
         log.info(
-            f"  [exec continuous log_std] move_direction: start={_move_ls_start:.4f} end={_move_ls_end:.4f}"
+            f"  [exec continuous log_kappa] move_direction: start={_move_ls_start:.4f} end={_move_ls_end:.4f}"
             f"   kick_direction: start={_kick_ls_start:.4f} end={_kick_ls_end:.4f}"
+            f"   kick_direction_z (log_std): start={_kickz_ls_start:.4f} end={_kickz_ls_end:.4f}"
         )
         # Build per-step and per-epoch Δ strings, with angular interpretations.
         # dmean is the per-step L2 shift of the unit-vector mean; for unit vectors
-        # |u-v|=d → angle θ = arccos(1 - d²/2). dlog_std is the mean absolute
-        # per-step log_std change; angular effect = dσ° = degrees(exp(ls)) change.
+        # |u-v|=d → angle θ = arccos(1 - d²/2). dlog_kappa is the mean absolute
+        # per-step log_kappa change; angular effect uses the large-kappa von
+        # Mises approximation (variance ~= 1/kappa), same as _kappa_deg() above.
         def _angular_dmean_deg(dmean: float) -> float:
             """L2 shift of unit-vector mean → approx angular shift in degrees."""
             cos_theta = max(-1.0, min(1.0, 1.0 - dmean ** 2 / 2.0))
             return math.degrees(math.acos(cos_theta))
 
-        def _angular_dlog_std_deg(dlog_std: float, ls_end: float) -> float:
-            """Change in log_std → change in σ expressed in degrees."""
-            return abs(math.degrees(math.exp(ls_end)) - math.degrees(math.exp(ls_end - dlog_std)))
+        def _angular_dlog_std_deg(dlog_kappa: float, ls_end: float) -> float:
+            """Change in log_kappa -> change in angular std, in degrees."""
+            return abs(
+                math.degrees(math.sqrt(1.0 / math.exp(ls_end)))
+                - math.degrees(math.sqrt(1.0 / math.exp(ls_end - dlog_kappa)))
+            )
 
         _ls_end_by_name = {"move_direction": _move_ls_end, "kick_direction": _kick_ls_end}
         _cont_shift_parts = []
@@ -5745,7 +6031,23 @@ class PPOTrainer:
             _cont_shift_parts.append(
                 f"{name}("
                 f"dmean={mean_dmean:.4f}≈{mean_deg:.2f}°/step  epoch≈{epoch_deg:.1f}°  "
-                f"dlog_std={mean_dlog_std:.5f}  Δσ°={mean_dstd_deg:.3f}/step)"
+                f"dlog_kappa={mean_dlog_std:.5f}  Δ(ang std)°={mean_dstd_deg:.3f}/step)"
+            )
+        # kick_dir_z_log_std is a plain Gaussian log_std (not a von Mises
+        # log_kappa), so it uses the direct sigma->degrees approximation
+        # (small-z regime: z itself approximates an elevation angle in
+        # radians) rather than _angular_dlog_std_deg's inverse-sqrt-kappa
+        # formula above. No corresponding "mean shift" entry -- kick_dir's
+        # combined 3D mean-shift (kickdir_mean_shift above) already reflects
+        # z's contribution as part of the whole vector's movement.
+        if all_kickz_log_std_shift:
+            mean_dlog_stdz = float(np.mean(all_kickz_log_std_shift))
+            mean_dstdz_deg = abs(
+                math.degrees(math.exp(_kickz_ls_end))
+                - math.degrees(math.exp(_kickz_ls_end - mean_dlog_stdz))
+            )
+            _cont_shift_parts.append(
+                f"kick_direction_z(dlog_std={mean_dlog_stdz:.5f}  Δσ°≈{mean_dstdz_deg:.3f}/step)"
             )
         if _cont_shift_parts:
             log.info(f"  [exec continuous \u0394 per opt step] {'  '.join(_cont_shift_parts)}")
@@ -5911,20 +6213,21 @@ class PPOTrainer:
         # kick_dir only contributes when kick=True.
         # Without this gating, unused heads inject large-variance log_prob noise
         # that inflates KL and triggers spurious early stops every rollout.
-        log_std_move = self.execution_net.move_dir_log_std.to(self.device)
-        log_std_kick = self.execution_net.kick_dir_log_std.to(self.device)
+        log_kappa_move = self.execution_net.move_dir_log_kappa.to(self.device)
+        log_kappa_kick = self.execution_net.kick_dir_log_kappa.to(self.device)
+        log_std_z_kick = self.execution_net.kick_dir_z_log_std.to(self.device)
         log_std_power = self.execution_net.kick_power_log_std.to(self.device)
         log_std_spin = self.execution_net.kick_spin_log_std.to(self.device)
         exec_move_mask = (mb_actions["exec_move"].squeeze(-1) > 0.5).float()
         kick_mask = (mb_actions["kick"].squeeze(-1) > 0.5).float()
         lp += exec_move_mask * _b(e_heads.sprint_logit, "sprint")
         lp += exec_move_mask * (
-            self._move_dir_head(e_heads.move_direction, log_std_move).log_prob(
+            self._move_dir_head(e_heads.move_direction, log_kappa_move).log_prob(
                 mb_actions["move_dir_raw"]
             )
         )
         lp += kick_mask * (
-            self._kick_dir_head(e_heads.kick_direction, log_std_kick).log_prob(
+            self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).log_prob(
                 mb_actions["kick_dir_raw"]
             )
         )
@@ -6015,15 +6318,16 @@ class PPOTrainer:
             ent += h
             _bkdn_tensors[name] = h
         # Sub-parameters: scale by E[parent active] to match masked log_prob.
-        log_std_move = self.execution_net.move_dir_log_std
-        log_std_kick = self.execution_net.kick_dir_log_std
+        log_kappa_move = self.execution_net.move_dir_log_kappa
+        log_kappa_kick = self.execution_net.kick_dir_log_kappa
+        log_std_z_kick = self.execution_net.kick_dir_z_log_std
         log_std_power = self.execution_net.kick_power_log_std
         log_std_spin = self.execution_net.kick_spin_log_std
         p_exec_move = torch.sigmoid(e_heads.exec_move_logit).mean()
         p_kick = torch.sigmoid(e_heads.kick_logit).mean()
         h_sprint = p_exec_move * IndependentBernoulli(e_heads.sprint_logit).entropy().mean()
-        h_move_dir = p_exec_move * self.ent_dir_weight * self._move_dir_head(e_heads.move_direction, log_std_move).entropy().mean()
-        h_kick_dir = p_kick * self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_std_kick).entropy().mean()
+        h_move_dir = p_exec_move * self.ent_dir_weight * self._move_dir_head(e_heads.move_direction, log_kappa_move).entropy().mean()
+        h_kick_dir = p_kick * self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).entropy().mean()
         h_kick_power = p_kick * self.ent_kick_power_weight * self._kick_power_head(e_heads.kick_power, log_std_power).entropy().mean()
         # kick_spin is permanently frozen (see agent_plans/spin_implementation_plan.md
         # section 0) -- its entropy term is masked to exactly zero rather than
@@ -6161,10 +6465,17 @@ class PPOTrainer:
         # otherwise raise "missing keys" for a submodule that's already
         # correctly populated from its own physics_pretrain checkpoint path.
         _load_state_dict_tolerant(self.decision_net, ckpt["decision_net"], "decision_net")
-        _load_state_dict_tolerant(self.execution_net, ckpt["execution_net"], "execution_net")
+        _execution_sd = _migrate_direction_log_std_to_kappa(ckpt["execution_net"])
+        _load_state_dict_tolerant(self.execution_net, _execution_sd, "execution_net")
         if self.value_net is not None:
             if "value_net" in ckpt:
-                _load_state_dict_tolerant(self.value_net, ckpt["value_net"], "value_net")
+                # value_net reuses the whole ExecutionNetwork class (only its
+                # .value output is ever read) so it carries the same stray
+                # move_dir_log_std/kick_dir_log_std keys under an old
+                # checkpoint -- migrate here too, purely for a clean load
+                # (these params are never actually used by the critic).
+                _value_sd = _migrate_direction_log_std_to_kappa(ckpt["value_net"])
+                _load_state_dict_tolerant(self.value_net, _value_sd, "value_net")
                 if not reset_optimizer and self.value_net_optimizer is not None and "value_net_optimizer" in ckpt:
                     self.value_net_optimizer.load_state_dict(ckpt["value_net_optimizer"])
             else:

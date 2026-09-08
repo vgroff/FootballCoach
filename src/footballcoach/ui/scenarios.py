@@ -568,6 +568,7 @@ def build_pass_scenario(
 from footballcoach.rules_ai import (
     BallCarrierAttackerAI,
     BallReceiverThenShootAI,
+    NeuralPlayerAI,
     PassReceiverAI,
     StagedGoalkeeperAI,
     Phase1RulesAI,
@@ -1058,68 +1059,6 @@ def _discover_checkpoints(checkpoint_dir: str) -> list[str]:
     return numbered
 
 
-def _apply_neural_action(trainer, match: Match, player_id: str, trial_tick: int) -> None:
-    """Run one neural decision for player_id; falls back to GetPossessionOrder on error."""
-    import torch
-    from footballcoach.ai.obs.encoder import encode_observation, MAX_OTHER_PLAYERS
-    from footballcoach.ai.action.apply_nn_action import apply_action_to_player
-    from footballcoach.ai.action.gating import select_action
-
-    try:
-        player = match.player_by_id(player_id)
-    except KeyError:
-        return
-    try:
-        time_remaining = max(0.0, 120.0 - trial_tick / 30.0)
-        obs = encode_observation(match=match, player_id=player_id, time_remaining_s=time_remaining)
-        obs_dict = obs.to_torch_dict()  # _sample_action adds the batch dim internally
-        with torch.no_grad():
-            result = trainer._sample_action(obs_dict)
-        (_action, _lp, _val, decision_probs, exec_phys, dec_phys, target_slots, _raw_exec, _head_log_probs) = result
-        # Build slot_player_ids as [None]*MAX_OTHER_PLAYERS (target resolution not needed for UI)
-        slot_player_ids = [None] * MAX_OTHER_PLAYERS
-        gating = select_action(
-            decision_probs=decision_probs,
-            execution_physical=exec_phys,
-            target_slots=target_slots,
-        )
-        # Cache gating on player so between-decision ticks can re-apply direction/speed
-        player._cached_nn_gating = gating
-        player._cached_nn_slot_player_ids = slot_player_ids
-        player._cached_nn_dec_phys = dec_phys
-        apply_action_to_player(
-            gating=gating,
-            player=player,
-            match=match,
-            slot_player_ids=slot_player_ids,
-            decision_physical=dec_phys,
-        )
-    except Exception:
-        if player.current_order is None:
-            player.current_order = GetPossessionOrder()
-
-
-def _reapply_cached_neural_action(match: Match, player_id: str) -> None:
-    """Re-apply the last cached neural gating on between-decision ticks so the player keeps moving."""
-    from footballcoach.ai.action.apply_nn_action import apply_action_to_player
-    try:
-        player = match.player_by_id(player_id)
-    except KeyError:
-        return
-    gating = getattr(player, "_cached_nn_gating", None)
-    if gating is None:
-        return
-    slot_player_ids = getattr(player, "_cached_nn_slot_player_ids", [None] * 21)
-    dec_phys = getattr(player, "_cached_nn_dec_phys", {})
-    apply_action_to_player(
-        gating=gating,
-        player=player,
-        match=match,
-        slot_player_ids=slot_player_ids,
-        decision_physical=dec_phys,
-    )
-
-
 def _phase1_scenario_cfg() -> dict:
     """Return the phase1_scenario section from ai_config.json, with fallback defaults."""
     try:
@@ -1130,7 +1069,10 @@ def _phase1_scenario_cfg() -> dict:
 
 
 def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
-    """Factory returning (build_fn, on_tick_fn, params_list) for the Phase 1 UI scenario.
+    """Factory returning (build_fn, None, params_list) for the Phase 1 UI scenario
+    -- the second element is always None; neural players are driven by a plain
+    ``player.ai = NeuralPlayerAI(...)`` assignment in ``build()`` (Match.step()
+    calls it once per tick like any other AI), not a per-tick scenario hook.
 
     Params:
       trainee_checkpoint   — ScenarioChoiceParam dropdown over all .pt files in checkpoint_dir
@@ -1158,14 +1100,6 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
                 log_ui.warning(f"Phase 1 UI: {err} — using rules-based AI")
             _trainer_cache[checkpoint_path] = trainer
         return _trainer_cache[checkpoint_path]
-
-    state: dict = {
-        "trainee_trainer": None,
-        "opponent_trainer": None,
-        "ticks_trainee": 0,
-        "ticks_opponent": 0,
-        "decision_interval_ticks": max(1, round(DECISION_INTERVAL_MS_DEFAULT / 1000.0 * UI_TICK_HZ)),
-    }
 
     # Build the params list: scan ALL phase1_run* dirs and longterm/ so
     # checkpoints from every run are visible, not just the one dir passed in.
@@ -1249,23 +1183,34 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         **_ignored,  # absorb sim_dt_s etc injected by ScenarioEnv
     ) -> Match:
         # immobile takes priority over both the checkpoint and rules-based
-        # override — an immobile player never gets a trainer (no neural
-        # driving in on_tick) and never gets Phase1RulesAI (ai stays None).
+        # override — an immobile player never gets a trainer and never gets
+        # Phase1RulesAI (ai stays None, current_order set directly instead).
         trainee_trainer = None if trainee_immobile else _resolve_trainer_from_name(trainee_checkpoint, trainee_rules)
         opponent_trainer = None if opponent_immobile else _resolve_trainer_from_name(opponent_checkpoint, opponent_rules)
-        state["trainee_trainer"] = trainee_trainer
-        state["opponent_trainer"] = opponent_trainer
-        state["decision_interval_ticks"] = max(1, round(decision_interval_ms / 1000.0 * UI_TICK_HZ))
-        # Start already "due" for a decision (matches PlayerAI.__init__'s own
-        # "decide on first tick" convention) rather than 0 -- on_tick's first
-        # call increments this before comparing against decision_interval_
-        # ticks, so starting at 0 meant the very first tick of every fresh
-        # trial took the "reapply cached action" branch below with no cached
-        # action yet to reapply (nothing had ever been decided), leaving the
-        # trainee/opponent with no movement intent set at all that tick.
-        state["ticks_trainee"] = state["decision_interval_ticks"]
-        state["ticks_opponent"] = state["decision_interval_ticks"]
+        decision_interval_ticks = max(1, round(decision_interval_ms / 1000.0 * UI_TICK_HZ))
 
+        # opponent_rules_prob/opponent_immobile_prob=0.0: this scenario has
+        # its OWN complete, explicit control over both players via the UI's
+        # checkpoint/rules/immobile params below -- without this,
+        # build_1v1_scenario falls back to ITS OWN defaults
+        # (opponent_immobile_prob=1.0), unconditionally builds an opponent
+        # JogOrder (see JogOrder's own docstring: "never completes" -- it
+        # re-asserts a FIXED direction every tick via the engine's own order
+        # execution, unconditionally, regardless of what player.ai does),
+        # and hands it to code below that only ever meant to override
+        # `.ai`, not clean up a `.current_order` it didn't know existed.
+        # That mismatch was a real, shipped bug: the opponent's NeuralPlayerAI
+        # was correctly assigned and correctly deciding every tick, but the
+        # engine kept re-applying the never-cleared JogOrder right on top of
+        # it every tick after, so the opponent visibly just jogged in a fixed
+        # line regardless of what the network wanted -- indistinguishable
+        # from "immobile" to the eye, and to a naive "did it move at all"
+        # check. Passing explicit zero probabilities here means
+        # build_1v1_scenario's own roll always lands on its "neural" branch
+        # (ai=None, no order touched at all -- see its own opponent-roll
+        # comment), leaving a clean slate for the assignment below with
+        # nothing left over to clean up, rather than relying on remembering
+        # to undo a side effect of a roll this scenario never wanted run.
         match = build_1v1_scenario(
             rng_reduction,
             trainee_tier=trainee_tier,
@@ -1275,8 +1220,31 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
             ball_max_dist_from_trainee_m=ball_max_dist_from_trainee_m,
             stamina_min=stamina_min,
             stamina_max=stamina_max,
+            opponent_rules_prob=0.0,
+            opponent_immobile_prob=0.0,
         )
 
+        # Neural driving goes through NeuralPlayerAI directly (Match.step()
+        # calls player.ai.act() once per tick, which already handles the
+        # decision-interval gating/cached-direction-reapplication this used
+        # to hand-roll via a bespoke on_tick hook -- see git history for the
+        # old _apply_neural_action/_reapply_cached_neural_action, removed
+        # because that hook fires TWICE per physics tick (ScenarioLoop.step()
+        # calls definition.on_tick both before AND after match.step(), see
+        # its own docstring), silently double-counting a hand-rolled
+        # decision-interval counter and leaving the opponent's ai at None
+        # forever in at least one code path -- a real, previously-shipped
+        # bug this refactor removes by construction, not by patching it.
+        #
+        # current_order is explicitly cleared in the non-immobile branches
+        # below too (belt-and-suspenders, not just relying on the clean-slate
+        # roll above) -- a player driven by ai must never also have a stale
+        # current_order lying around: the engine's order-processing step
+        # executes ANY current_order every tick unconditionally, regardless
+        # of what ai.act() just decided, and would silently win/fight over
+        # desired_direction/desired_speed_mode exactly like the JogOrder bug
+        # above -- this is a real, general hazard whenever code reassigns
+        # `.ai` without also touching `.current_order`, not unique to jogging.
         try:
             if trainee_immobile:
                 # ai stays None (see JogOrder's own docstring) -- current_order
@@ -1286,8 +1254,18 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
                 _trainee = match.player_by_id("trainee")
                 _trainee.ai = None
                 _trainee.current_order = JogOrder(direction=_trainee.velocity)
+            elif trainee_trainer is not None:
+                _trainee = match.player_by_id("trainee")
+                _trainee.current_order = None
+                _trainee.ai = NeuralPlayerAI(
+                    trainee_trainer._sample_action,
+                    decision_interval_ticks=decision_interval_ticks,
+                    max_episode_s=1e9,
+                )
             else:
-                match.player_by_id("trainee").ai = None if trainee_trainer is not None else Phase1RulesAI()
+                _trainee = match.player_by_id("trainee")
+                _trainee.current_order = None
+                _trainee.ai = Phase1RulesAI()
         except KeyError:
             pass
         try:
@@ -1295,41 +1273,48 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
                 _opponent = match.player_by_id("opponent")
                 _opponent.ai = None
                 _opponent.current_order = JogOrder(direction=_opponent.velocity)
+            elif opponent_trainer is not None:
+                _opponent = match.player_by_id("opponent")
+                _opponent.current_order = None
+                _opponent.ai = NeuralPlayerAI(
+                    opponent_trainer._sample_action,
+                    decision_interval_ticks=decision_interval_ticks,
+                    max_episode_s=1e9,
+                )
             else:
-                match.player_by_id("opponent").ai = None if opponent_trainer is not None else Phase1RulesAI()
+                _opponent = match.player_by_id("opponent")
+                _opponent.current_order = None
+                _opponent.ai = Phase1RulesAI()
         except KeyError:
             pass
+
+        # This build() already gave BOTH players their final, explicit .ai
+        # (checkpoint-picked NeuralPlayerAI, Phase1RulesAI, or immobile
+        # JogOrder) from the UI's own params -- not from build_1v1_scenario's
+        # opponent-type roll, which was only forced to its "neural" branch
+        # above for a clean current_order slate (see the opponent_rules_prob/
+        # opponent_immobile_prob=0.0 comment on the build_1v1_scenario call).
+        # That means match._opponent_use_rules_ai/_opponent_is_immobile are
+        # now ALWAYS False/False here regardless of what the user actually
+        # selected, so app.py's generic _wire_fresh_match ->
+        # maybe_assign_neural_opponent("opponent", ...) would otherwise treat
+        # every trial as "rolled neural" and silently re-assign the opponent
+        # a SECOND NeuralPlayerAI (always the latest checkpoint) on top of
+        # whatever this function just picked -- overriding a user-selected
+        # non-latest checkpoint, or a rules/immobile choice, right after this
+        # function set it correctly. Marking the match as fully wired here
+        # makes maybe_assign_neural_opponent a guaranteed no-op on it.
+        match._ai_fully_wired = True
 
         tr_label = "immobile" if trainee_immobile else (trainee_checkpoint if not trainee_rules else "rules")
         op_label = "immobile" if opponent_immobile else (opponent_checkpoint if not opponent_rules else "rules")
         log_ui.info(f"Phase 1 UI: trainee={tr_label}  opponent={op_label}")
         return match
 
-    def on_tick(match: Match, trial_tick: int) -> None:
-        trainee_trainer = state["trainee_trainer"]
-        opponent_trainer = state["opponent_trainer"]
-        decision_interval_ticks = state["decision_interval_ticks"]
-
-        if trainee_trainer is not None:
-            state["ticks_trainee"] += 1
-            if state["ticks_trainee"] >= decision_interval_ticks:
-                state["ticks_trainee"] = 0
-                _apply_neural_action(trainee_trainer, match, "trainee", trial_tick)
-            else:
-                _reapply_cached_neural_action(match, "trainee")
-
-        if opponent_trainer is not None:
-            state["ticks_opponent"] += 1
-            if state["ticks_opponent"] >= decision_interval_ticks:
-                state["ticks_opponent"] = 0
-                _apply_neural_action(opponent_trainer, match, "opponent", trial_tick)
-            else:
-                _reapply_cached_neural_action(match, "opponent")
-
     # Attach the params list so the SCENARIOS entry can reference it
     build._phase1_params = params_list  # type: ignore[attr-defined]
 
-    return build, on_tick
+    return build, None
 
 
 def _phase1_outcome_remap(match: Match, outcome: str, last_toucher_id: str | None) -> str:

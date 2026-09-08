@@ -170,6 +170,7 @@ class TestPhase1Reward:
         assert set(comps.keys()) == {
             "appr", "retr", "appr_sq", "hdg", "poss", "prog", "out", "ill",
             "box", "spd", "lpos", "lterm", "tout", "prox", "stam", "step",
+            "sprint",
         }
 
     def test_total_always_equals_sum_of_components(self):

@@ -37,13 +37,14 @@ Current notes:
 - " [task] : read ai_trainer_knoweldge.md, ai_config.json and training_Runs.log entirely. Please do not skip any of them. what do we think of how the training is going? "
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
-    - Cut some data before next run
-    - stamina v speed reward/penalties? make it step-based sprinting penalty
-    - !!!! Physics fixes:
-        - stamina penalty on speed seems brutal, reduce to 0.3
-        - speed base is a bit low - increase to 6.2 (and reduce the scale param)
-        - retrain player encoder!!
-        - mayeb should weaken all your abilties
+    - Next run:
+        - faster rollouts - more cores?
+        - consider non-separate value net
+        - fix tests!
+        - neural v neural - test it in the UI!!
+        - !!! remove "[ppo update]" line, keep the kl/loss mean ones
+    - maybe stamina should weaken all your abilities
+    - !! collision shouldn't happen on a tick with a failed auto-tackle, is that the case? then no more collisions till the next tick or smth
     - do label smoothing or smth similar on the physics encoders, the logits are for sure fucking it
     - !! Seperate kick z vs. x/y log dir std and therefore entropy calculations?
     - !! Are the bernoulli heads sampled to become execution inputs? They shouldnt be!!

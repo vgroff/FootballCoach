@@ -42,6 +42,7 @@ from footballcoach.ai.obs.encoder import MAX_OTHER_PLAYERS, encode_observation
 from footballcoach.ai.obs.schema import ObservationBatch
 from footballcoach.engine.match import Match
 from footballcoach.engine.match_logger import MatchLogger
+from footballcoach.engine.movement import SpeedMode
 from footballcoach.entities.player import Team
 from footballcoach.ui.scenarios import ScenarioDefinition, ScenarioLoop
 
@@ -233,7 +234,7 @@ class ScenarioEnv:
         ``sim_dt_s`` below. ``None`` (default) -- the scenario builder draws
         its own unseeded (OS-entropy) rng, matching prior behaviour exactly.
         """
-        from footballcoach.rules_ai import NeuralPlayerAI
+        from footballcoach.rules_ai import NeuralPlayerAI, maybe_assign_neural_opponent
         # Inject sim_dt_s so build functions can pass it to Match.
         # This has no effect on builds that don't accept it (e.g. phase 2).
         build_kwargs = {**self.scenario_kwargs, "sim_dt_s": self._dt_s}
@@ -304,23 +305,16 @@ class ScenarioEnv:
             except KeyError:
                 pass
 
-            is_rules_episode = getattr(match, "_opponent_use_rules_ai", False)
-            is_immobile_episode = getattr(match, "_opponent_is_immobile", False)
-            if not is_rules_episode and not is_immobile_episode:
-                for pid in self.secondary_player_ids:
-                    try:
-                        sec_player = match.player_by_id(pid)
-                        if pid not in self._sec_ema:
-                            self._sec_ema[pid] = EMAFilter.from_config()
-                        sec_player.ai = NeuralPlayerAI(
-                            self.sample_action_fn,
-                            decision_interval_ticks=self._ticks_per_decision,
-                            max_episode_s=self.max_episode_s,
-                            ema_smoothed=self._sec_ema[pid].smoothed,
-                            rng=self.rng,
-                        )
-                    except KeyError:
-                        pass
+            for pid in self.secondary_player_ids:
+                if pid not in self._sec_ema:
+                    self._sec_ema[pid] = EMAFilter.from_config()
+                maybe_assign_neural_opponent(
+                    match, pid, self.sample_action_fn,
+                    decision_interval_ticks=self._ticks_per_decision,
+                    max_episode_s=self.max_episode_s,
+                    ema_smoothed=self._sec_ema[pid].smoothed,
+                    rng=self.rng,
+                )
 
         # Initialise per-secondary-player state
         for pid in self.secondary_player_ids:
@@ -924,6 +918,11 @@ class ScenarioEnv:
         """
         _speed, _hdg_cos = self._player_speed_and_heading_cos(player_obj, ball_pos)
         _stamina_used = (1.0 - player_obj.stamina) if episode_done else 0.0
+        # last_desired_speed_mode (NOT desired_speed_mode, which Match._apply_movement
+        # clears every tick once consumed) is the "what did they actually just do"
+        # signal used elsewhere for the same reason -- see ai/obs/encoder.py's
+        # identical convention for the live desired-speed-mode observation feature.
+        _is_sprinting = player_obj.last_desired_speed_mode is SpeedMode.SPRINT
         return phase1_reward(
             prev_ball_dist=prev_ball_dist,
             curr_ball_dist=curr_ball_dist,
@@ -947,6 +946,8 @@ class ScenarioEnv:
             heading_cos_sim=_hdg_cos,
             player_speed_mps=_speed,
             stamina_used=_stamina_used,
+            is_sprinting=_is_sprinting,
+            decision_interval_s=self._decision_interval_s,
             prog_reward_clamp=self._reward_cfg["phase1"].get("ball_progress_reward_clamp"),
             appr_sq_approach_reward_clamp=self._reward_cfg["phase1"].get("ball_approach_speed_reward_clamp"),
             appr_sq_retreat_reward_clamp=self._reward_cfg["phase1"].get("ball_retreat_speed_reward_clamp"),

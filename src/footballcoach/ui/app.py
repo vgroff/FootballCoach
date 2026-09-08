@@ -501,18 +501,9 @@ class App:
         self._pause_notification = "Kick fired — Space to resume"
 
     def _start_match(self, match: Match, label: str, is_training_mode: bool = False) -> None:
-        match.dt_s = 1.0 / self._physics_tick_hz
         self._physics_acc_s = 0.0
         self.match = match
-        self._wire_match_log(match)
-        self._wire_player_icon_callbacks(match)
-        self._action_icons.clear()
-        self.input_controller = MatchInputController(match=match, camera=self.camera)
-        self.input_controller.on_order_complete = self._on_human_order_complete
-        self.input_controller.on_new_order = self._on_new_order
-        self.input_controller.on_kick_ui_entered = self._on_kick_ui_entered
-        self.input_controller.on_kick_issued = self._on_kick_issued
-        self.input_controller.on_order_issued = self._on_human_order_issued
+        self._wire_fresh_match(match)
         self.mode_label = label
         self.screen = Screen.MATCH
         self.is_training_mode = is_training_mode
@@ -532,18 +523,9 @@ class App:
         self._sim_speed = sim_speed
         loop = scenarios.ScenarioLoop(definition=definition, kwargs=kwargs or {}, timeout_ticks=timeout_ticks)
         self._scenario_loop = loop
-        loop.match.dt_s = 1.0 / self._physics_tick_hz
         self._physics_acc_s = 0.0
         self.match = loop.match
-        self._wire_match_log(loop.match)
-        self._wire_player_icon_callbacks(loop.match)
-        self._action_icons.clear()
-        self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
-        self.input_controller.on_order_complete = self._on_human_order_complete
-        self.input_controller.on_new_order = self._on_new_order
-        self.input_controller.on_kick_ui_entered = self._on_kick_ui_entered
-        self.input_controller.on_kick_issued = self._on_kick_issued
-        self.input_controller.on_order_issued = self._on_human_order_issued
+        self._wire_fresh_match(loop.match)
         self.mode_label = f"Balance scenario: {definition.label}"
         self.screen = Screen.MATCH
         self.is_training_mode = False
@@ -580,6 +562,41 @@ class App:
             player.on_tackle = _tackle_cb
             player.on_possession_gained = _possession_cb
 
+    def _wire_fresh_match(self, match: Match) -> None:
+        """Everything a newly-(re)built balance-scenario Match needs before
+        it's steppable: log/icon callbacks, a fresh input controller, and —
+        if the scenario's own opponent-type roll picked "neural" — a real
+        neural AI on the opponent (see ``maybe_assign_neural_opponent``).
+
+        Shared by ``_start_scenario`` (first trial) and ``_step_match``'s
+        "a new trial just started" branch (every trial after), which used to
+        duplicate this wiring inline in both places.
+
+        Before this, a "neural" opponent-type roll left the opponent's
+        ``ai`` at its build-time ``None`` with nothing here ever assigning
+        it a real AI — silently inert (indistinguishable from a stuck/
+        crashed opponent), since the UI's ``ScenarioLoop`` builds a ``Match``
+        directly and was never routed through ``ScenarioEnv``, the only
+        place that assignment used to happen (for RL training/eval
+        self-play). Same root cause the eval self-play path never hit,
+        because it already goes through the real ``ScenarioEnv``.
+        """
+        match.dt_s = 1.0 / self._physics_tick_hz
+        self._wire_match_log(match)
+        self._wire_player_icon_callbacks(match)
+        self._action_icons.clear()
+        self.input_controller = MatchInputController(match=match, camera=self.camera)
+        self.input_controller.on_order_complete = self._on_human_order_complete
+        self.input_controller.on_new_order = self._on_new_order
+        self.input_controller.on_kick_ui_entered = self._on_kick_ui_entered
+        self.input_controller.on_kick_issued = self._on_kick_issued
+        self.input_controller.on_order_issued = self._on_human_order_issued
+
+        from footballcoach.rules_ai import maybe_assign_neural_opponent
+        trainer = self._opponent_trainer_for_scenario()
+        if trainer is not None:
+            maybe_assign_neural_opponent(match, "opponent", trainer._sample_action, max_episode_s=1e9)
+
     def _poll_action_icons(self, match: Match) -> None:
         """After each physics step, harvest `player.action_icon` signals set by
         the engine and record them in `self._action_icons` with a wall-clock
@@ -614,17 +631,8 @@ class App:
                     return
                 self.renderer.record_trail(self.match.ball)
                 if trial_ended:
-                    # New trial started — patch dt_s and wire log/icon callbacks to the fresh match.
-                    loop.match.dt_s = 1.0 / self._physics_tick_hz
-                    self._wire_match_log(loop.match)
-                    self._wire_player_icon_callbacks(loop.match)
-                    self._action_icons.clear()
-                    self.input_controller = MatchInputController(match=loop.match, camera=self.camera)
-                    self.input_controller.on_order_complete = self._on_human_order_complete
-                    self.input_controller.on_new_order = self._on_new_order
-                    self.input_controller.on_kick_ui_entered = self._on_kick_ui_entered
-                    self.input_controller.on_kick_issued = self._on_kick_issued
-                    self.input_controller.on_order_issued = self._on_human_order_issued
+                    # New trial started — re-wire everything for the fresh match.
+                    self._wire_fresh_match(loop.match)
                     break  # render one frame of the new trial before stepping further
                 else:
                     if self.input_controller is not None:
@@ -699,6 +707,30 @@ class App:
         from footballcoach.rules_ai import HybridPlayerAI
         player.ai = HybridPlayerAI(trainer._sample_action, max_episode_s=1e9)
         self._log(LogLevel.INFO, f"Training mode: trainee -> neural ({Path(ckpt_path).name})")
+
+    def _opponent_trainer_for_scenario(self):
+        """Trainer to drive a "neural" opponent roll in a balance scenario
+        (see ``_wire_fresh_match``), or ``None`` if no checkpoint is
+        available. Reuses the exact same checkpoint discovery/cache as the
+        trainee's own `N`-hotkey neural toggle (``_training_checkpoints``/
+        ``_training_trainer_cache``) -- always the LATEST discovered
+        checkpoint (``[-1]``, see ``discover_all_phase1_checkpoints``'s own
+        ordering guarantee), since there's no per-opponent checkpoint picker
+        in the UI yet and "latest" is the most useful default.
+        """
+        if not self._training_checkpoints:
+            self._training_checkpoints = scenarios.discover_all_phase1_checkpoints()
+        if not self._training_checkpoints:
+            return None
+        ckpt_path = self._training_checkpoints[-1]
+        trainer = self._training_trainer_cache.get(ckpt_path)
+        if trainer is None:
+            trainer, err = scenarios.load_trainer_for_ui(ckpt_path)
+            if err:
+                self._log(LogLevel.INFO, f"Neural opponent: failed to load {ckpt_path} ({err})")
+                return None
+            self._training_trainer_cache[ckpt_path] = trainer
+        return trainer
 
     def _reset_training_positions(self) -> None:
         """Training mode: reposition the player to start after a goal."""

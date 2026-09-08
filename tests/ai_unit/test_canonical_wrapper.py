@@ -71,7 +71,7 @@ class TestTransparentDelegation:
     def test_attribute_passthrough(self):
         net = ExecutionNetwork.from_config()
         wrapped = CanonicalNetworkWrapper(net)
-        assert wrapped.move_dir_log_std is net.move_dir_log_std
+        assert wrapped.move_dir_log_kappa is net.move_dir_log_kappa
         assert wrapped.value_head is net.value_head
 
     def test_train_eval_mode_propagates(self):

@@ -198,10 +198,11 @@ def main() -> None:
                              "with --pretrain-from-checkpoint). Resets the step counter. "
                              "Requires --bc-dataset for combined pre-training.")
     parser.add_argument("--reset-dir-log-std", action="store_true",
-                        help="Reset move_dir_log_std/kick_dir_log_std to ppo.dir_log_std_init "
+                        help="Reset move_dir_log_kappa/kick_dir_log_kappa/kick_dir_z_log_std to "
+                             "ppo.dir_log_kappa_init/kick_dir_log_kappa_init/kick_dir_z_log_std_init "
                              "from ai_config.json after loading any checkpoint (--checkpoint, "
                              "--pretrain-from-checkpoint, --from-pretrained, --latest[-pretrain]). "
-                             "Useful when a loaded policy's log_std has drifted/collapsed and is "
+                             "Useful when a loaded policy's log_kappa has drifted/collapsed and is "
                              "causing move_dir KL to dominate early-stop.")
     parser.add_argument("--reset-kick-power-log-std", action="store_true",
                         help="Reset kick_power_log_std to ppo.kick_power_log_std_init from "
@@ -417,12 +418,17 @@ def main() -> None:
 
     def _reset_dir_log_std() -> None:
         ppo_cfg_r = cfg.get("ppo", {})
-        move_init = float(ppo_cfg_r.get("dir_log_std_init", -2.0))
-        kick_init = float(ppo_cfg_r.get("kick_dir_log_std_init", move_init))
+        move_init = float(ppo_cfg_r.get("dir_log_kappa_init", 2.7))
+        kick_init = float(ppo_cfg_r.get("kick_dir_log_kappa_init", move_init))
+        kick_z_init = float(ppo_cfg_r.get("kick_dir_z_log_std_init", -1.15))
         with torch.no_grad():
-            trainer.execution_net.move_dir_log_std.fill_(move_init)
-            trainer.execution_net.kick_dir_log_std.fill_(kick_init)
-        log.info(f"--reset-dir-log-std: move_dir_log_std={move_init}  kick_dir_log_std={kick_init}")
+            trainer.execution_net.move_dir_log_kappa.fill_(move_init)
+            trainer.execution_net.kick_dir_log_kappa.fill_(kick_init)
+            trainer.execution_net.kick_dir_z_log_std.fill_(kick_z_init)
+        log.info(
+            f"--reset-dir-log-std: move_dir_log_kappa={move_init}  "
+            f"kick_dir_log_kappa={kick_init}  kick_dir_z_log_std={kick_z_init}"
+        )
 
     def _reset_kick_power_log_std() -> None:
         ppo_cfg_r = cfg.get("ppo", {})
