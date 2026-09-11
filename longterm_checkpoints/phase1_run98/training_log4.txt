@@ -1,0 +1,101 @@
+2026-09-11 13:19:43,851 INFO Logging to checkpoints\phase1_run98\training_log4.txt
+2026-09-11 13:19:46,329 INFO   [eval vs immobile] step=24,016,323  seeds=10x1  win=100%  mean_rew=4.019±0.144 (sem=0.046)  V=3.006  gap=-1.013  outcomes={'box_possession': 10}
+2026-09-11 13:19:56,640 INFO   [eval vs rules] step=24,016,323  seeds=36x2  win=75%  mean_rew=2.558±2.662 (sem=0.314)  V=1.944  gap=-0.614  outcomes={'box_possession': 54, 'opponent_box_possession': 10, 'miss': 2, 'invalid': 2, 'timeout': 4}
+2026-09-11 13:19:56,641 INFO   [eval baseline rules-vs-rules] seeds=36x2  win=67%  mean_rew=2.023±2.918 (sem=0.344)  outcomes={'timeout': 4, 'box_possession': 48, 'opponent_box_possession': 18, 'invalid': 2}
+2026-09-11 13:24:24,998 INFO   [epoch 1/10] pol_mean=0.0166  kl_mean=0.0919  (n=30 minibatch(es), 11264ms)
+2026-09-11 13:24:36,080 INFO   [epoch 2/10] pol_mean=0.0143  kl_mean=0.0974  (n=30 minibatch(es), 11079ms)
+2026-09-11 13:24:47,269 INFO   [epoch 3/10] pol_mean=0.0108  kl_mean=0.0982  (n=30 minibatch(es), 11189ms)
+2026-09-11 13:24:58,466 INFO   [epoch 4/10] pol_mean=0.0103  kl_mean=0.1001  (n=30 minibatch(es), 11198ms)
+2026-09-11 13:25:09,731 INFO   [epoch 5/10] pol_mean=0.0093  kl_mean=0.0988  (n=30 minibatch(es), 11265ms)
+2026-09-11 13:25:21,009 INFO   [epoch 6/10] pol_mean=0.0088  kl_mean=0.0982  (n=30 minibatch(es), 11277ms)
+2026-09-11 13:25:32,296 INFO   [epoch 7/10] pol_mean=0.0082  kl_mean=0.0991  (n=30 minibatch(es), 11287ms)
+2026-09-11 13:25:43,443 INFO   [epoch 8/10] pol_mean=0.0061  kl_mean=0.0991  (n=30 minibatch(es), 11147ms)
+2026-09-11 13:25:54,760 INFO   [epoch 9/10] pol_mean=0.0050  kl_mean=0.0987  (n=30 minibatch(es), 11317ms)
+2026-09-11 13:26:06,076 INFO   [epoch 10/10] pol_mean=0.0049  kl_mean=0.1000  (n=30 minibatch(es), 11315ms)
+2026-09-11 13:26:08,719 INFO   [KL mean=0.0982 median=0.0964 > 0.05] ratio percentiles:  p5=0.614  p25=0.911  p50=0.989  p75=1.057  p95=1.312  max=170.631
+  move_dir_log_kappa=[4.041922092437744]  kick_dir_log_kappa=[3.67399001121521]
+2026-09-11 13:26:08,768 INFO   [per-head new lp means, n=256]
+    shoot=0.000  pass=0.000  move=-0.003  tackle=0.000  gp=-0.011  mark=0.000  hold=0.000
+    sprint=-0.065  kick=-0.036  t_att=-0.632
+    move_dir=0.516 (min=-3.843 max=1.100)  kick_dir=-0.002 (min=-0.998 max=0.689)
+  [head lp deltas (new-old, |d|>0.05)] tackle_attempt:-0.30 move_dir:+0.25
+  [worst sample] idx=200  ratio=12.088  adv=+0.937  old_lp=-2.349  new_lp=0.143
+    stored move_dir=-100.1°  new_mean=-97.6°  angular_diff=2.4°
+    [move_dir angular_diff distribution, n=256]  p50=5.0°  p90=12.8°  p99=20.4°  max=24.1°  -- low p90/p99 with a high max = one outlier sample, not a broad shift
+    [worst sample per-head delta, sorted by |delta|] sprint:+0.063  move_dir:-0.029
+  [top-2 highest-ratio samples]
+    idx= 200  ratio=  12.088  adv=+0.937  lp: old=-2.349  new=0.143
+      rew=-0.0050  ret=+2.6481  val=+1.7116  outcome=terminal:box_possession
+      rew_breakdown: sprint=-0.005
+      head_deltas: sprint:+0.063  move_dir:-0.029
+      saturation: exec_move_p_new=0.1328  sprint_p_new=0.6232  kick_p_new=0.0186  tackle_attempt_p_new=0.6610
+    idx= 141  ratio=   7.406  adv=-0.353  lp: old=-4.056  new=-2.054
+      rew=-0.0050  ret=-1.1776  val=-0.8247  outcome=terminal:box_possession
+      rew_breakdown: n/a
+      head_deltas: move_dir:-1.019  tackle_attempt:-0.729  sprint:-0.304
+      saturation: exec_move_p_new=0.0988  sprint_p_new=0.7377  kick_p_new=0.0002  tackle_attempt_p_new=0.4825
+  [best sample (highest new_lp)] idx=227  new_lp=0.952  adv=+0.012  stored move_dir=-128.3°  new_mean=-128.3°
+    per-head contributions: move_dir:1.100  tackle_attempt:-0.141
+2026-09-11 13:26:08,770 INFO   [advantage] mean=0.000  std=1.000  min=-7.606  max=7.148
+2026-09-11 13:26:08,777 INFO   [ratio] mean=0.9949  std=0.4779  min=0.0000  max=170.6310  clipped=10.0%
+2026-09-11 13:26:08,777 INFO   [ratio spike] max=170.631  epoch=1/10  mb=19  row=237301(global)  adv=-0.072  old_lp=-7.281  new_lp=-2.142
+    rew_breakdown: n/a  outcome=terminal:box_possession
+    per-head Δ(new-old), sorted by |Δ|: kick_power:+1.685  kick:+1.560  kick_dir:+0.902  tackle_attempt:+0.794  exec_move:+0.199
+2026-09-11 13:26:08,779 INFO   [exec head grad norm] move_direction=0.259  exec_move=0.092  sprint=0.076  kick=0.045  kick_direction=0.056  kick_power=0.450  kick_spin=0.000  tackle_attempt=0.248
+2026-09-11 13:26:08,779 INFO   [exec continuous log_kappa] move_direction: start=4.0400 end=4.0419   kick_direction: start=3.6700 end=3.6740   kick_direction_z (log_std): start=-1.2559 end=-1.2569
+2026-09-11 13:26:08,780 INFO   [exec continuous Δ per opt step] move_direction(dmean=0.0008≈0.05°/step  epoch≈14.3°  dlog_kappa=0.00001  Δ(ang std)°=0.000/step)  kick_direction(dmean=0.0004≈0.03°/step  epoch≈7.6°  dlog_kappa=0.00001  Δ(ang std)°=0.000/step)  kick_direction_z(dlog_std=0.00001  Δσ°≈0.000/step)
+2026-09-11 13:26:08,780 INFO   [exec discrete Δlogit per opt step] exec_move=0.0091  sprint=0.0066  kick=0.0057  tackle_attempt=0.0019
+2026-09-11 13:26:08,781 INFO   [per-head KL] shoot=+0.0000  pass_=+0.0000  move=+0.0094  tackle=+0.0000  gp_extra=+0.0085  mark=+0.0000  hold=+0.0000  exec_move=+0.0282  sprint=+0.0403  kick=+0.0299  tackle_attempt=+0.2405  move_dir=-0.1759  kick_dir=+0.0000  kick_power=+0.0013  kick_spin=+0.0000
+2026-09-11 13:26:08,782 INFO   [grad clip] main: 38/300 steps clipped (13%)  pre-clip norm mean=1.221 max=8.040  limit=1.5
+              direction: 10/300 steps clipped (3%)  pre-clip norm mean=0.269 max=2.032  limit=0.5
+2026-09-11 13:26:08,782 INFO   [direction param delta] actual ||params_after - params_before|| per opt step:  mean=0.0001  max=0.0004  (n=300)
+2026-09-11 13:26:08,782 INFO   [value RMSE by outcome] box_possession=0.647(n=1277520)  invalid=0.528(n=10520)  miss=1.216(n=49720)  opponent_box_possession=1.121(n=467620)  timeout=0.755(n=477980)  unknown=0.787(n=118140)
+2026-09-11 13:26:09,041 INFO ──────────────────────────────────────────────────────────────────────
+[PPO] step=24,136,398  speed=481/s  reward=2.33/0.08
+  loss     policy=0.0094  value=0.1430(x1.0)=0.1430  val_pre=0.1597
+           ent_coef=0.0095  entropy=0.1805  kl=0.0982
+  value    V=0.32±1.95  R=0.33±2.12  adv=0.00±0.85  |adv|=0.50
+  entropy  shoot=0.0000(+0.0000)  pass_=0.0000(+0.0000)  move=0.0000(+0.0000)  tackle=0.0000(+0.0000)  gp_extra=0.0000(+0.0000)  mark=0.0000(+0.0000)  hold=0.0000(+0.0000)  exec_move=0.0411(+0.0012)
+           kick=0.0495(+0.0048)  tackle_attempt=0.5557(+0.0134)  sprint=0.0905(+0.0037)  move_dir=-0.5412(-0.0020)  kick_dir=-0.0059(-0.0005)  kick_power=-0.0093(-0.0007)  kick_spin=0.0000(+0.0000)
+  moves    mv_ls=[4.0419] (κ≈56.94, ang std≈8°) g=5.53e-03  d_move=[+0.0019] (Δ(ang std)≈0.007°)
+           kk_ls=[3.6740] (κ≈39.41, ang std≈9°)  d_kick=[+0.0040] (Δ(ang std)≈0.018°)
+  heads    move= 32 get_poss= 68 exec_move= 91 sprint= 90 kick=  2 tackle= 60 shoot=
+           0 hold=  0 tackle_prob=0.5819 kick_prob=0.0236
+  vs       vs[win/loss/tout/miss/inval]  vs_rules(459): 79.5%/13.9%/5.2%/0.7%/0.7%  vs_neural(1262): 58.1%/26.3%/12.8%/2.1%/0.7%
+  ep_len   10.0±4.9s  (n=1721, min=0.8s, max=18.7s)
+  reward   get_possession=+1551.00  lose_possession=-324.90  ball_out=-84.00  box_possession=+3294.00
+           speed_bonus=+166.74  opponent_box=-990.00  timeout=-185.00  sprint_penalty=-291.02
+  rew/ep   (mean/std/min/max per episode, 1721 ep)
+  component           mean      std       min       max
+  --------------  --------  -------  --------  --------
+  approach          +0.000    0.000    +0.000    +0.000
+  retreat           +0.000    0.000    +0.000    +0.000
+  approach_speed    +0.000    0.000    +0.000    +0.000
+  heading           +0.000    0.000    +0.000    +0.000
+  get_possession    +0.901    0.572    +0.000    +4.000
+  progress          +0.000    0.000    +0.000    +0.000
+  lose_possession    -0.189    0.430    -2.700    +0.000
+  ball_out          -0.049    0.439    -4.000    +0.000
+  illegal           +0.000    0.000    +0.000    +0.000
+  box_possession    +1.914    1.442    +0.000    +3.000
+  speed_bonus       +0.097    0.091    +0.000    +0.288
+  opponent_box      -0.575    1.052    -2.500    +0.000
+  timeout           -0.107    0.310    -1.000    +0.000
+  proximity_bonus    +0.000    0.000    +0.000    +0.000
+  step_penalty      +0.000    0.000    +0.000    +0.000
+  stamina_penalty    +0.000    0.000    +0.000    +0.000
+  sprint_penalty    -0.169    0.091    -0.370    +0.000
+  rew/step (per-step stats, n=120075 steps; ret/gae/td at steps where component fired)
+  component        count      mean      std   mean_ret   std_ret   mean_gae  mean_sq_td   mean|td|   p95|td|
+  --------------  ------  --------  -------  ---------  --------  ---------  ----------  ---------  --------
+  get_possession    1614    +0.013    0.115     +2.415     1.702     +0.377      1.6211      0.861     2.940
+  lose_possession     374    -0.003    0.050     -0.876     1.886     -1.105      5.0540      1.893     4.213
+  ball_out            21    -0.001    0.053     -3.956     0.214     -1.459      5.8953      1.481     5.508
+  box_possession    1098    +0.027    0.286     +3.255     0.344     +0.118      0.2169      0.147     0.573
+  speed_bonus       1097    +0.001    0.016     +3.255     0.344     +0.118      0.2171      0.147     0.573
+  opponent_box       396    -0.008    0.143     -2.541     0.177     -0.288      0.5563      0.313     1.855
+  timeout            185    -0.002    0.039     -0.994     0.104     -0.004      0.1577      0.146     0.465
+  sprint_penalty   60394    -0.003    0.002     +1.135     1.984     -0.007      0.6626      0.469     1.898
+  gae/td   mean_return=+0.327  std_return=2.120  mean_gae=+0.003  mean_sq_td=0.7161
+──────────────────────────────────────────────────────────────────────
+2026-09-11 13:26:09,307 INFO Saved checkpoint: checkpoints\phase1_run98\checkpoint4.pt

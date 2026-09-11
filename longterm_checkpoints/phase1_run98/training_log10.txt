@@ -1,0 +1,12 @@
+2026-09-11 13:59:21,762 INFO Logging to checkpoints\phase1_run98\training_log10.txt
+2026-09-11 13:59:24,328 INFO   [eval vs immobile] step=24,736,866  seeds=10x1  win=90%  mean_rew=3.607±1.293 (sem=0.409)  V=3.026  gap=-0.582  outcomes={'box_possession': 9, 'timeout': 1}
+2026-09-11 13:59:38,469 INFO   [eval vs rules] step=24,736,866  seeds=36x2  win=82%  mean_rew=3.011±2.203 (sem=0.260)  V=2.024  gap=-0.987  outcomes={'box_possession': 59, 'opponent_box_possession': 7, 'invalid': 2, 'timeout': 4}
+2026-09-11 13:59:38,469 INFO   [eval baseline rules-vs-rules] seeds=36x2  win=67%  mean_rew=2.023±2.918 (sem=0.344)  outcomes={'timeout': 4, 'box_possession': 48, 'opponent_box_possession': 18, 'invalid': 2}
+2026-09-11 14:06:07,606 INFO   [epoch 1/10] pol_mean=0.0180  kl_mean=0.1041  (n=30 minibatch(es), 12998ms)
+2026-09-11 14:06:20,410 INFO   [epoch 2/10] pol_mean=0.0151  kl_mean=0.1066  (n=30 minibatch(es), 12796ms)
+2026-09-11 14:06:33,557 INFO   [epoch 3/10] pol_mean=0.0127  kl_mean=0.1077  (n=30 minibatch(es), 13147ms)
+2026-09-11 14:06:47,869 INFO   [epoch 4/10] pol_mean=0.0116  kl_mean=0.1078  (n=30 minibatch(es), 14311ms)
+2026-09-11 14:07:02,508 INFO   [epoch 5/10] pol_mean=0.0096  kl_mean=0.1069  (n=30 minibatch(es), 14639ms)
+2026-09-11 14:07:16,943 INFO   [epoch 6/10] pol_mean=0.0091  kl_mean=0.1071  (n=30 minibatch(es), 14434ms)
+2026-09-11 14:07:31,883 INFO   [epoch 7/10] pol_mean=0.0080  kl_mean=0.1082  (n=30 minibatch(es), 14940ms)
+2026-09-11 14:07:46,838 INFO   [epoch 8/10] pol_mean=0.0076  kl_mean=0.1079  (n=30 minibatch(es), 14955ms)
