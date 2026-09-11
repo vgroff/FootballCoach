@@ -1,6 +1,6 @@
 """Subprocess worker for parallel PPO rollout collection.
 
-Enabled via ``ppo.n_parallel_envs > 1`` in ai_config.json (see
+Enabled via ``ppo.n_processes > 1`` in ai_config.json (see
 ai_trainer_knowledge.md "Parallel rollout collection"). Each worker owns a
 full, independent copy of the environment AND the policy networks — there is
 no shared memory / batched inference across workers, so the existing
@@ -47,8 +47,8 @@ def _worker_main(
     # OWN internal thread pool, entirely independent of torch.set_num_threads()
     # below. Left unset, OpenBLAS defaults to one thread per LOGICAL core
     # (16 on a typical 8c/16t desktop) PER WORKER PROCESS -- with
-    # n_parallel_envs=6 that's up to 96 BLAS threads fighting over 16 cores,
-    # which is why steps/s per worker gets WORSE as n_parallel_envs increases
+    # n_processes=6 that's up to 96 BLAS threads fighting over 16 cores,
+    # which is why steps/s per worker gets WORSE as n_processes increases
     # past a small number, even though torch itself was already correctly
     # capped. The physics engine and observation encoder are numpy-heavy
     # (not torch), so this is not a hypothetical concern -- it is the

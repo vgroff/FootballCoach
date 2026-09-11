@@ -59,7 +59,7 @@ class TestMergeWorkerBatches:
 
 class TestTrainDispatch:
     def test_parallel_requires_phase_id(self):
-        """train() must reject n_parallel_envs > 1 without phase_id -- each
+        """train() must reject n_processes > 1 without phase_id -- each
         worker needs a phase id to rebuild its own env from."""
         import copy
         from footballcoach.ai.config import load_ai_config
@@ -67,9 +67,9 @@ class TestTrainDispatch:
         from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
 
         cfg = copy.deepcopy(load_ai_config())
-        cfg["ppo"]["n_parallel_envs"] = 2
+        cfg["ppo"]["n_processes"] = 2
         trainer = PPOTrainer.from_config()
-        trainer.n_parallel_envs = 2  # override without rebuilding networks
+        trainer.n_processes = 2  # override without rebuilding networks
 
         defn = ScenarioDefinition(
             key="dispatch_test", label="dispatch_test", description="",
@@ -93,7 +93,13 @@ class TestParallelTrainingSmoke:
         from footballcoach.ai.config import load_ai_config
 
         cfg = copy.deepcopy(load_ai_config())
-        cfg["ppo"]["n_parallel_envs"] = 2
+        cfg["ppo"]["n_processes"] = 2
+        # This test targets _train_parallel() (rollout_worker.py, one env per
+        # worker) specifically -- pin batched_rollout off explicitly rather
+        # than relying on it defaulting that way, since ai_config.json's own
+        # default is now True (see its own comment).
+        cfg["ppo"]["batched_rollout"] = False
+        cfg["ppo"]["envs_per_process"] = 1
         cfg["ppo"]["rollout_steps"] = 20
         cfg["ppo"]["rollout_eval_trials"] = 0  # skip the extra eval-vs-rules pass, keep it fast
 
@@ -106,7 +112,7 @@ class TestParallelTrainingSmoke:
             cfg=cfg,
             checkpoint_dir=tmp_path,
         )
-        assert trainer.n_parallel_envs == 2
+        assert trainer.n_processes == 2
 
         trainer.train(env=None, total_steps=cfg["ppo"]["rollout_steps"], phase_id=1)
 

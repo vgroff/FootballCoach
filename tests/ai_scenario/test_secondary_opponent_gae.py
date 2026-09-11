@@ -192,7 +192,7 @@ def test_ppo_update_with_neural_opponent_produces_finite_losses():
 def test_train_single_process_with_neural_opponent_end_to_end():
     """Calls the REAL ``PPOTrainer.train()`` (not a hand-rolled loop) with a
     neural secondary opponent, forcing the single-process path
-    (n_parallel_envs=1) so it stays fast and doesn't touch ai_config.json.
+    (n_processes=1) so it stays fast and doesn't touch ai_config.json.
     This is the strongest regression guard for this fix: it exercises the
     actual shipped train() code, including the track_id=sec["player_id"]
     buffer.add() call and the _bootstrap_last_values() call, rather than a
@@ -208,7 +208,7 @@ def test_train_single_process_with_neural_opponent_end_to_end():
     """
     env = _make_env_with_neural_opponent()
     trainer = PPOTrainer.from_config()
-    trainer.n_parallel_envs = 1  # force single-process path regardless of config
+    trainer.n_processes = 1  # force single-process path regardless of config
     trainer.rollout_steps = _ROLLOUT_STEPS
 
     trainer.train(env, total_steps=_ROLLOUT_STEPS)

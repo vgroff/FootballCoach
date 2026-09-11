@@ -33,7 +33,7 @@ ai = [
 testpaths = ["tests"]
 log_level = "WARNING"
 log_cli = false
-addopts = "-n 5"
+addopts = "-n 10 --dist=worksteal"
 
 [tool.uv.sources]
 torch = [

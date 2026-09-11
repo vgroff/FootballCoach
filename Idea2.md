@@ -41,9 +41,10 @@ Current notes:
         - faster rollouts - more cores?
         - consider non-separate value net
         - fix tests!
-        - neural v neural - test it in the UI!!
-        - !!! remove "[ppo update]" line, keep the kl/loss mean ones
     - maybe stamina should weaken all your abilities
+    - !!! dt in the UI should be the same as real life!!
+    - failed tackles still hamper the ball carrier - I think because the opposite player is still "in the way"
+    - decision interval in the UI should copy the real one
     - !! collision shouldn't happen on a tick with a failed auto-tackle, is that the case? then no more collisions till the next tick or smth
     - do label smoothing or smth similar on the physics encoders, the logits are for sure fucking it
     - !! Seperate kick z vs. x/y log dir std and therefore entropy calculations?

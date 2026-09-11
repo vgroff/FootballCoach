@@ -230,6 +230,7 @@ def augment_batch(
     has_head_log_probs: bool = "head_log_probs" in batch
     has_reward_comps: bool = "reward_comps_raw" in batch
     has_step_outcomes: bool = "step_outcomes" in batch
+    has_track_ids: bool = "track_ids" in batch
 
     # Pre-build index tensors once (avoids repeated Python list → tensor conv)
     _px = torch.tensor(PLAYER_FLIP_X_IDX, dtype=torch.long)
@@ -360,12 +361,20 @@ def augment_batch(
                 part["reward_comps_raw"] = batch["reward_comps_raw"]
             if has_step_outcomes:
                 part["step_outcomes"] = batch["step_outcomes"]
+            if has_track_ids:
+                # Diagnostic-only (see RolloutBuffer.as_tensors()'s own
+                # comment) -- not geometric, not consumed by any loss math,
+                # tiled per augmented copy exactly like reward_comps_raw/
+                # step_outcomes above so it doesn't silently go missing (and
+                # therefore desync row-count with everything else) the
+                # moment augmentation is enabled.
+                part["track_ids"] = batch["track_ids"]
 
             parts.append(part)
 
     # Concatenate all variants along the batch dimension
-    # List fields (reward_comps_raw, step_outcomes) are extended, not torch.cat'd.
-    _list_keys = {"reward_comps_raw", "step_outcomes"}
+    # List fields (reward_comps_raw, step_outcomes, track_ids) are extended, not torch.cat'd.
+    _list_keys = {"reward_comps_raw", "step_outcomes", "track_ids"}
     result: dict = {}
     for key in parts[0]:
         if key in _list_keys:

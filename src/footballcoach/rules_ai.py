@@ -836,6 +836,17 @@ class NeuralPlayerAI(PlayerAI):
         self._episode_ticks: int = 0
         self.last_transition = None
         self._last_gating = None  # cached gating result; re-applied every tick
+        # Set by prepare() when it returns a non-None obs_dict, consumed and
+        # cleared by the following apply() call -- see both methods' own
+        # docstrings for the required prepare()/apply() call order.
+        self._pending_obs_dict = None
+        self._pending_bc_label = None
+        # Set by an external batching caller (ai/ppo/batched_rollout_worker.py)
+        # that already called prepare()+sample_action_fn() itself (as part of
+        # a batched network call spanning multiple players/environments)
+        # BEFORE this tick's act() runs -- see act()'s own docstring for the
+        # exact mechanism and why this is the only hook batching needs.
+        self._precomputed_result = None
         # Optional Callable[[Player, Match], BCLabel] (e.g.
         # footballcoach.ai.ppo.bc.phase1_labels_for_player), called from
         # WITHIN act() -- see its call site below for why: it must run at
@@ -855,11 +866,55 @@ class NeuralPlayerAI(PlayerAI):
         self._episode_ticks = 0
         self.last_transition = None
         self._last_gating = None
+        self._pending_obs_dict = None
+        self._pending_bc_label = None
+        self._precomputed_result = None
 
-    def act(self, player: "Player", match: "Match", trial_tick: int) -> None:
-        from footballcoach.ai.obs.encoder import encode_observation, MAX_OTHER_PLAYERS
+    def is_due_for_decision(self) -> bool:
+        """True if the NEXT ``act()``/``prepare()`` call on this instance
+        will hit the real decision branch (encode a fresh observation)
+        rather than the cached-gating re-apply branch.
+
+        Exists so a caller can check due-ness WITHOUT consuming/incrementing
+        anything -- ``prepare()`` increments ``_ticks_since_decision``
+        unconditionally on every call (its very first action), so calling it
+        just to "peek" would itself count as one tick's worth of the
+        countdown, silently desyncing the cadence. Used by
+        ``ai/ppo/batched_rollout_worker.py``'s ``BatchedEnvGroup.collect()``:
+        that module's whole design rests on the assumption that a fresh
+        ``env.step()`` call always starts with the trainee due for a
+        decision, which mostly holds (``ScenarioEnv``'s per-tick loop bound
+        equals ``decision_interval_ticks`` by construction) but is NOT
+        guaranteed -- ``ScenarioEnv.step()`` has at least one legitimate
+        early-exit (trainee already in the opponent box with possession)
+        that can end a decision interval several ticks short, leaving the
+        NEXT ``env.step()`` call's trainee not-yet-due partway through it.
+        Before this method existed, that case hit an ``assert`` in
+        ``collect()`` and crashed real training -- see that method's
+        docstring for the graceful (batch this env's decision only when it's
+        actually due, let ``env.step()``'s own per-tick ``act()`` calls
+        handle the cached-gating ticks exactly like the unbatched path
+        already does) fix built on top of this.
+        """
+        return self._ticks_since_decision + 1 >= self.decision_interval_ticks
+
+    def prepare(self, player: "Player", match: "Match", trial_tick: int):
+        """First half of ``act()``: advance internal counters, and if a
+        decision is due this call, encode the observation and return its
+        torch-dict (ready to feed to ``sample_action_fn`` -- or to be
+        batched together with other players'/envs' pending observations by
+        a caller that wants ONE network call to cover many decisions at
+        once, e.g. ``ai/ppo/batched_rollout_worker.py``). If no decision is
+        due, just re-applies the cached gating exactly like today and
+        returns ``None``.
+
+        Must be followed by a call to ``apply()`` with whatever
+        ``sample_action_fn`` (or an equivalent batched substitute) returns
+        for this obs_dict, before ``prepare()`` is called again for this
+        player -- ``act()`` below does exactly that, back-to-back, for the
+        normal (unbatched) case.
+        """
         from footballcoach.ai.action.apply_nn_action import apply_action_to_player
-        from footballcoach.ai.action.gating import select_action
 
         self._episode_ticks += 1
         self._ticks_since_decision += 1
@@ -875,7 +930,10 @@ class NeuralPlayerAI(PlayerAI):
                     slot_player_ids=[None] * 21,
                     decision_physical={},
                 )
-            return
+            return None
+
+        from footballcoach.ai.obs.encoder import encode_observation
+
         # New decision interval — clear stale transition, then sample.
         self.last_transition = None
         self._ticks_since_decision = 0
@@ -906,11 +964,25 @@ class NeuralPlayerAI(PlayerAI):
         # protects against those specific flags regardless of call order, so
         # computing the label before vs. after sample_action_fn runs is
         # equivalent; before is simplest to reason about.
-        bc_label_arr = None
+        self._pending_bc_label = None
         if self.bc_label_fn is not None:
-            bc_label_arr = self.bc_label_fn(player, match).to_array()
+            self._pending_bc_label = self.bc_label_fn(player, match).to_array()
+        self._pending_obs_dict = obs_dict
 
-        result = self.sample_action_fn(obs_dict)
+        return obs_dict
+
+    def apply(self, player: "Player", match: "Match", result: tuple) -> None:
+        """Second half of ``act()``: given the ``(action, log_prob, value,
+        ...)`` tuple ``sample_action_fn`` would have returned for the
+        obs_dict ``prepare()`` just handed back, applies the gating and
+        stores ``last_transition``. See ``prepare()``'s docstring for the
+        required call order (always immediately after a ``prepare()`` call
+        that returned non-``None``, for the SAME player).
+        """
+        from footballcoach.ai.action.apply_nn_action import apply_action_to_player
+        from footballcoach.ai.action.gating import select_action
+        from footballcoach.ai.obs.encoder import MAX_OTHER_PLAYERS
+
         (action, log_prob, value, decision_probs, exec_phys,
          dec_phys, target_slots, raw_exec, head_log_probs) = result
 
@@ -925,6 +997,11 @@ class NeuralPlayerAI(PlayerAI):
             decision_physical=dec_phys,
         )
 
+        obs_dict = self._pending_obs_dict
+        self._pending_obs_dict = None
+        bc_label_arr = self._pending_bc_label
+        self._pending_bc_label = None
+
         self.last_transition = {
             "obs": {k: v.numpy() for k, v in obs_dict.items()},
             "action": action,
@@ -935,6 +1012,34 @@ class NeuralPlayerAI(PlayerAI):
             "head_log_probs": head_log_probs,
             "illegal_action": translation.illegal_action,
         }
+
+    def act(self, player: "Player", match: "Match", trial_tick: int) -> None:
+        """Drive one physics tick: ``prepare()`` then, if a decision is due,
+        ``sample_action_fn()`` then ``apply()`` -- exactly today's original
+        behavior, now expressed as those two halves called back-to-back.
+
+        Batching hook: if ``self._precomputed_result`` is already set (an
+        external caller -- ``ai/ppo/batched_rollout_worker.py`` -- already
+        called ``prepare()`` on this SAME instance itself, pooled the
+        resulting obs_dict with other players'/environments' pending
+        observations, and ran ONE batched ``sample_action_fn``-equivalent
+        call for all of them), this consumes that result via ``apply()``
+        directly and does NOT call ``prepare()`` again -- calling it twice
+        for the same tick would double-increment ``_ticks_since_decision``
+        and silently desync the decision cadence. This is the ONLY hook
+        batching needs; ``Match._process_orders()`` calls this method
+        completely unchanged, once per physics tick, exactly as always.
+        """
+        if self._precomputed_result is not None:
+            result = self._precomputed_result
+            self._precomputed_result = None
+            self.apply(player, match, result)
+            return
+        obs_dict = self.prepare(player, match, trial_tick)
+        if obs_dict is None:
+            return
+        result = self.sample_action_fn(obs_dict)
+        self.apply(player, match, result)
 
 
 def maybe_assign_neural_opponent(

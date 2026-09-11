@@ -439,6 +439,25 @@ _LP_HEAD_NAMES: tuple[str, ...] = (
 )
 
 
+def _slice_dataclass_row(obj, i: int):
+    """Return a NEW instance of ``obj``'s dataclass type with every tensor
+    field sliced to row ``i``, keeping the batch dim (shape ``(1, ...)``).
+
+    Used by ``PPOTrainer._sample_action_batch`` to run
+    ``_sample_action_from_heads``'s unchanged per-row logic on one row of an
+    already-batched ``DecisionHeadsRaw``/``ExecutionHeadsRaw``. Reflective
+    (uses ``dataclasses.fields()``) rather than hardcoding field names, so it
+    can't silently miss a field if either schema gains/loses one later;
+    ``None`` fields (e.g. the physics-encoder passthrough fields, absent
+    when that integration is disabled) pass through as ``None`` unchanged.
+    """
+    kwargs = {}
+    for f in dataclasses.fields(obj):
+        val = getattr(obj, f.name)
+        kwargs[f.name] = None if val is None else val[i:i + 1]
+    return type(obj)(**kwargs)
+
+
 def rebuild_inference_trainer(
     decision_state: dict, execution_state: dict, separate_value_net: bool = False,
     value_state: Optional[dict] = None,
@@ -848,8 +867,35 @@ class PPOTrainer:
         # _compute_rules_vs_rules_baseline), since it never changes: same
         # seeds, same deterministic-ish rules-AI opponent logic.
         self._rules_vs_rules_baseline = None
-        self.n_parallel_envs = int(ppo_cfg.get("n_parallel_envs", 1))
+        self.n_processes = int(ppo_cfg.get("n_processes", 1))
         self.worker_torch_threads = int(ppo_cfg.get("worker_torch_threads", 1))
+        # Opt-in batched-rollout mode (see ai/ppo/batched_rollout_worker.py):
+        # when True (and n_processes > 1), train() routes to
+        # _train_batched_parallel() instead of _train_parallel() --
+        # n_processes worker processes, each internally stepping
+        # envs_per_process environments (total envs = n_processes *
+        # envs_per_process) and batching their trainee decisions into one
+        # network call per round. Default False/1 = today's unchanged
+        # one-env-per-process behavior (envs_per_process ignored, implicitly
+        # 1, so n_processes alone is both the process count and total envs).
+        self.batched_rollout = bool(ppo_cfg.get("batched_rollout", False))
+        self.envs_per_process = int(ppo_cfg.get("envs_per_process", 1))
+        # Separate, deliberately DECOUPLED from n_processes above:
+        # _collect_value_pretrain_rollout() (pretrain_value()'s own rollout
+        # collection, also used by pretrain_combined()'s Phase 2/3 warm-up)
+        # has no batched_rollout-aware path of its own -- it always spawns
+        # this many plain one-env-per-process rollout_worker.py workers,
+        # regardless of batched_rollout/envs_per_process. Sharing
+        # n_processes directly would silently make this path spawn whatever
+        # (likely much larger, batching-oriented) process count the main PPO
+        # loop uses -- benchmarked this session: naive one-env-per-process
+        # oversubscription well past physical core count makes throughput
+        # WORSE, not better (25 procs measured 0.66x vs a 6-proc baseline),
+        # so a separate, deliberately modest default here protects this
+        # one-off warm-up stage from that regression.
+        self.value_pretrain_n_processes = int(
+            ppo_cfg.get("value_pretrain_n_processes", 9)
+        )
         self._aug_rng = random.Random()
         self._bc_cfg = bc_cfg
         self._bc_dir_loss_w = float(bc_cfg.get("direction_loss_weight", 3.0))
@@ -1316,7 +1362,7 @@ class PPOTrainer:
         Args:
             env: ScenarioEnv (or any env with reset()/step() returning
                  ObservationBatch, float, bool, info). Ignored (may be None)
-                 when ``ppo.n_parallel_envs > 1`` -- each rollout worker
+                 when ``ppo.n_processes > 1`` -- each rollout worker
                  builds its own env from ``phase_id`` instead.
             total_steps: Total number of decision steps to train for.
             bc_label_fn: Optional callable ``(player, match) -> BCLabel``
@@ -1335,19 +1381,22 @@ class PPOTrainer:
                 decision network's Bernoulli heads and the execution
                 network's move_direction and sprint are supervised.
             phase_id: Curriculum phase id, required only when
-                ``ppo.n_parallel_envs > 1`` (each rollout worker rebuilds its
+                ``ppo.n_processes > 1`` (each rollout worker rebuilds its
                 own env from this id via ``curriculum.envs.build_env``). See
                 ai/ppo/rollout_worker.py.
         """
-        if self.n_parallel_envs > 1:
+        if self.n_processes > 1:
             if phase_id is None:
                 raise ValueError(
-                    "ppo.n_parallel_envs > 1 requires train(phase_id=...) so "
+                    "ppo.n_processes > 1 requires train(phase_id=...) so "
                     "each rollout worker can rebuild its own environment."
                 )
             from footballcoach.ai.curriculum.phases import PHASES_BY_ID
             max_episode_s = float(PHASES_BY_ID[phase_id].env_kwargs.get("max_episode_s", 120.0))
-            self._train_parallel(total_steps, phase_id, max_episode_s)
+            if self.batched_rollout:
+                self._train_batched_parallel(total_steps, phase_id, max_episode_s)
+            else:
+                self._train_parallel(total_steps, phase_id, max_episode_s)
             return
 
         # Inject the sampling function so ScenarioEnv assigns NeuralPlayerAI to
@@ -1781,7 +1830,8 @@ class PPOTrainer:
             f"  loss     policy={metrics['policy_loss']:.4f}  "
             f"value={metrics['value_loss']:.4f}(x{self.vf_coef})={self.vf_coef * metrics['value_loss']:.4f}"
             f"  val_pre={metrics['pre_update_value_loss']:.4f}",
-            f"           entropy={metrics['entropy']:.4f}  kl={metrics['approx_kl']:.4f}"
+            f"           ent_coef={metrics['ent_coef']:.4f}  entropy={metrics['entropy']:.4f}"
+            f"  kl={metrics['approx_kl']:.4f}"
             + (f"  {bc_str.strip()}" if bc_str else ""),
             f"  value    {_val_diag_str}",
         ]
@@ -1853,7 +1903,7 @@ class PPOTrainer:
         log.info("\n".join(_lines))
 
     def _train_parallel(self, total_steps: int, phase_id: int, max_episode_s: float) -> None:
-        """Multi-process rollout collection path (``ppo.n_parallel_envs > 1``).
+        """Multi-process rollout collection path (``ppo.n_processes > 1``).
 
         Each worker runs its own full env + local policy copy (see
         ai/ppo/rollout_worker.py) — no batched/centralized inference, no
@@ -1868,7 +1918,7 @@ class PPOTrainer:
 
         from footballcoach.ai.ppo.rollout_worker import spawn_workers, close_workers
 
-        n_workers = self.n_parallel_envs
+        n_workers = self.n_processes
         steps_per_worker = max(1, self.rollout_steps // n_workers)
         base_seed = random.randint(0, 2**31 - 1)
         log.info(
@@ -2022,6 +2072,196 @@ class PPOTrainer:
                     self._eval_vs_rules(max_episode_s)
         finally:
             close_workers(workers)
+            if eval_workers is not None:
+                from footballcoach.ai.eval.eval_worker import close_eval_workers
+                close_eval_workers(eval_workers)
+            self._persistent_eval_workers = None
+
+        if self.checkpoint_dir is not None:
+            self._save_checkpoint(self._total_steps)
+            log.info("Final checkpoint saved.")
+        log.info(f"Training complete. Total steps: {self._total_steps:,}")
+
+    def _train_batched_parallel(self, total_steps: int, phase_id: int, max_episode_s: float) -> None:
+        """Batched multi-environment rollout collection path
+        (``ppo.batched_rollout=True`` alongside ``ppo.n_processes > 1``).
+
+        Opt-in alternative to ``_train_parallel()``: instead of
+        ``n_processes`` worker PROCESSES each running ONE env with its
+        own batch-of-1 network call, this runs ``n_processes`` worker
+        processes, each internally running ``envs_per_process``
+        environments (total envs = ``n_processes * envs_per_process``) and
+        batching their trainee decisions into ONE network call per round --
+        see
+        ``ai/ppo/batched_rollout_worker.py``'s module docstring for the
+        full design/measured-speedup rationale. Per-env GAE (never
+        concatenate raw transitions across envs before bootstrap), the same
+        discipline ``_train_parallel()`` uses per-worker.
+
+        This method deliberately duplicates most of ``_train_parallel()``'s
+        loop body rather than sharing it via a refactor, for now: this is a
+        new, less-battle-tested collection path (opt-in, off by default,
+        not yet validated by a real training run -- see the plan doc's
+        verification section), and refactoring the PROVEN, currently-live
+        ``_train_parallel()`` to share code with it would risk the working
+        path for the sake of the new one. Worth unifying once this path is
+        validated and its config knobs (``envs_per_process`` etc.) have
+        settled -- flagged here rather than silently left as accepted debt.
+        """
+        import multiprocessing
+        import multiprocessing.connection
+
+        from footballcoach.ai.ppo.batched_rollout_worker import spawn_batched_workers, close_batched_workers
+
+        envs_per_process = max(1, self.envs_per_process)
+        n_processes = self.n_processes
+        total_envs = n_processes * envs_per_process
+        # PER-PROCESS budget (matches _train_parallel()'s steps_per_worker
+        # convention) -- collect() aggregates across ALL envs_per_process
+        # envs a process owns, so dividing by total_envs instead of
+        # n_processes here previously made this envs_per_process times too
+        # small, forcing envs_per_process-times more outer rounds (more
+        # weight broadcasts + PPO updates per unit of data collected) than
+        # intended -- confirmed via a real benchmark: 3 processes x 4 envs
+        # needed 4 outer rounds instead of 1 to reach the same total_steps.
+        steps_per_worker = max(1, self.rollout_steps // n_processes)
+        base_seed = random.randint(0, 2**31 - 1)
+        log.info(
+            f"PPO batched-parallel training started: {n_processes} process(es) x "
+            f"{envs_per_process} env(s) = {total_envs} total envs, "
+            f"~{steps_per_worker} steps/worker/rollout, "
+            f"steps_so_far={self._total_steps:,}  target={self._total_steps + total_steps:,}"
+        )
+        workers = spawn_batched_workers(
+            phase_id, n_processes, envs_per_process, base_seed,
+            self.separate_value_net, self.worker_torch_threads,
+        )
+        # Persistent eval worker pool -- identical rationale/pattern to
+        # _train_parallel()'s own (see that method's comment).
+        eval_workers = None
+        if self._eval_n_parallel_workers > 1:
+            from footballcoach.ai.eval.eval_worker import spawn_eval_workers
+            eval_workers = spawn_eval_workers(
+                self._eval_n_parallel_workers, self.separate_value_net, self.worker_torch_threads,
+            )
+        self._persistent_eval_workers = eval_workers
+        try:
+            _steps_at_call_start = self._total_steps
+            target_steps = _steps_at_call_start + total_steps
+
+            while self._total_steps < target_steps:
+                progress = (self._total_steps - _steps_at_call_start) / total_steps
+                rollout_start = time.perf_counter()
+
+                # Broadcast current weights before collecting -- identical
+                # rationale to _train_parallel() (standard PPO already
+                # tolerates a slightly-stale behavior policy via the
+                # importance ratio correction).
+                dec_state = self.decision_net.state_dict()
+                exec_state = self.execution_net.state_dict()
+                val_state = self.value_net.state_dict() if self.value_net is not None else None
+                for w in workers:
+                    w.set_weights(dec_state, exec_state, val_state)
+
+                for w in workers:
+                    w.collect(steps_per_worker)
+                _pending = {w.conn: w for w in workers}
+                _agg_progress = ProgressReporter(
+                    n_processes, prefix=f"  [batched rollout] ({total_envs} envs, {n_processes} proc): ", live=True,
+                )
+                _n_done = 0
+                while _pending:
+                    ready = multiprocessing.connection.wait(list(_pending.keys()), timeout=0.2)
+                    for conn in ready:
+                        _pending.pop(conn, None)
+                        _n_done += 1
+                    _agg_progress.update(_n_done)
+                # Each worker process returns a list of per-env result dicts
+                # (one process may own several envs) -- flatten into ONE
+                # flat list, so everything below is byte-for-byte identical
+                # to _train_parallel()'s per-worker loop (which already
+                # receives a flat list, one entry per worker there).
+                worker_results = [w.recv_result() for w in workers]
+                results = [env_result for proc_results in worker_results for env_result in proc_results]
+
+                worker_batches = []
+                episode_rewards: list[float] = []
+                secondary_episode_rewards: list[float] = []
+                episode_outcomes_vs_rules: list[str] = []
+                episode_outcomes_vs_neural: list[str] = []
+                episode_outcomes_vs_immobile: list[str] = []
+                episode_comp_list: list[dict[str, float]] = []
+                episode_durations_s: list[float] = []
+                rollout_components: dict[str, float] = {}
+                for r in results:
+                    advantages, returns = r["buffer"].compute_gae(self.gamma, self.lam, r["last_value"])
+                    worker_batches.append(r["buffer"].as_tensors(advantages, returns))
+                    stats = r["stats"]
+                    episode_rewards.extend(stats["episode_rewards"])
+                    secondary_episode_rewards.extend(stats["secondary_episode_rewards"])
+                    episode_outcomes_vs_rules.extend(stats["episode_outcomes_vs_rules"])
+                    episode_outcomes_vs_neural.extend(stats["episode_outcomes_vs_neural"])
+                    episode_outcomes_vs_immobile.extend(stats["episode_outcomes_vs_immobile"])
+                    episode_comp_list.extend(stats["episode_comp_list"])
+                    episode_durations_s.extend(stats["episode_durations_s"])
+                    for ep in stats["episode_comp_list"]:
+                        for _k, _v in ep.items():
+                            rollout_components[_k] = rollout_components.get(_k, 0.0) + _v
+
+                batch = _merge_worker_batches(worker_batches)
+                n_collected = int(batch["rewards"].shape[0])
+                self._total_steps += n_collected
+                rollout_time = time.perf_counter() - rollout_start
+                steps_per_sec = n_collected / max(rollout_time, 1e-6)
+
+                _comp_step_stats: dict[str, dict] = {}
+                _rcomp_raw = batch.get("reward_comps_raw", [])
+                if _rcomp_raw:
+                    _rets_np = batch["returns"].numpy()
+                    _advs_np = batch["advantages"].numpy()
+                    _vals_np = batch["values"].numpy()
+                    _td_np = _rets_np - _vals_np
+                    for _ck, _clabel in REWARD_COMP_LABELS:
+                        _cvals = np.array([float(_d.get(_ck, 0.0)) for _d in _rcomp_raw])
+                        _mask = _cvals != 0.0
+                        _td_m = _td_np[_mask] if _mask.any() else np.array([])
+                        _comp_step_stats[_ck] = {
+                            "mean": float(_cvals.mean()),
+                            "std": float(_cvals.std()),
+                            "count": int(_mask.sum()),
+                            "mean_ret": float(_rets_np[_mask].mean()) if _mask.any() else float("nan"),
+                            "std_ret": float(_rets_np[_mask].std()) if _mask.any() else float("nan"),
+                            "mean_gae": float(_advs_np[_mask].mean()) if _mask.any() else float("nan"),
+                            "mean_sq_td": float((_td_m ** 2).mean()) if _mask.any() else float("nan"),
+                            "mean_abs_td": float(np.abs(_td_m).mean()) if _mask.any() else float("nan"),
+                            "p95_td": float(np.percentile(np.abs(_td_m), 95)) if _mask.any() else float("nan"),
+                            "label": _clabel,
+                        }
+
+                metrics = self._ppo_update(batch, progress)
+
+                self._log_rollout_summary(
+                    metrics=metrics,
+                    steps_per_sec=steps_per_sec,
+                    episode_rewards=episode_rewards,
+                    secondary_episode_rewards=secondary_episode_rewards,
+                    episode_outcomes_vs_rules=episode_outcomes_vs_rules,
+                    episode_outcomes_vs_immobile=episode_outcomes_vs_immobile,
+                    episode_outcomes_vs_neural=episode_outcomes_vs_neural,
+                    rollout_components=rollout_components,
+                    episode_comp_list=episode_comp_list,
+                    episode_durations_s=episode_durations_s,
+                    comp_step_stats=_comp_step_stats,
+                    n_reward_comp_steps=len(_rcomp_raw),
+                )
+
+                if self.checkpoint_dir is not None:
+                    self._save_checkpoint(self._total_steps)
+
+                if self.rollout_eval_trials > 0:
+                    self._eval_vs_rules(max_episode_s)
+        finally:
+            close_batched_workers(workers)
             if eval_workers is not None:
                 from footballcoach.ai.eval.eval_worker import close_eval_workers
                 close_eval_workers(eval_workers)
@@ -3529,22 +3769,27 @@ class PPOTrainer:
         ``episode_returns``/``outcomes_vs_rules``/``outcomes_vs_immobile``/
         ``outcomes_vs_neural`` for the caller's return value.
 
-        Single-process when ``ppo.n_parallel_envs == 1`` (uses ``env`` directly,
-        exactly the previous inline behaviour). When ``ppo.n_parallel_envs > 1``
-        and ``phase_id`` is given, reuses the SAME subprocess workers as the
-        main PPO loop (ai/ppo/rollout_worker.py) — no weight sync needed since
-        this is called once per pretraining stage, not per rollout; each
-        worker's GAE is computed independently before merging, for the same
-        reason as ``_train_parallel()`` (concatenating raw transitions across
-        worker boundaries before GAE would corrupt advantage estimates).
+        Single-process when ``ppo.value_pretrain_n_processes == 1`` (uses
+        ``env`` directly, exactly the previous inline behaviour). When
+        ``ppo.value_pretrain_n_processes > 1`` and ``phase_id`` is given,
+        spawns that many plain one-env-per-process ``rollout_worker.py``
+        workers (its own process count, DECOUPLED from the main PPO loop's
+        ``ppo.n_processes``/``ppo.batched_rollout`` -- this call has no
+        batched-rollout-aware path of its own, see ``value_pretrain_n_processes``'s
+        own config comment for why sharing ``n_processes`` directly would
+        be a regression here) -- no weight sync needed since this is called
+        once per pretraining stage, not per rollout; each worker's GAE is
+        computed independently before merging, for the same reason as
+        ``_train_parallel()`` (concatenating raw transitions across worker
+        boundaries before GAE would corrupt advantage estimates).
         """
-        if self.n_parallel_envs > 1 and phase_id is not None:
+        if self.value_pretrain_n_processes > 1 and phase_id is not None:
             import multiprocessing
             import multiprocessing.connection
 
             from footballcoach.ai.ppo.rollout_worker import spawn_workers, close_workers
 
-            n_workers = self.n_parallel_envs
+            n_workers = self.value_pretrain_n_processes
             steps_per_worker = max(1, n_steps // n_workers)
             base_seed = random.randint(0, 2**31 - 1)
             log.info(
@@ -3772,10 +4017,12 @@ class PPOTrainer:
         collection + value warm-up), which used to duplicate this logic inline.
 
         Args:
-            env: ScenarioEnv. Ignored (may be None) when ``ppo.n_parallel_envs > 1``
-                and ``phase_id`` is given -- rollout collection uses the same
-                subprocess workers as the main PPO loop instead (see
-                ai/ppo/rollout_worker.py).
+            env: ScenarioEnv. Ignored (may be None) when
+                ``ppo.value_pretrain_n_processes > 1`` and ``phase_id`` is
+                given -- rollout collection spawns its own
+                ``rollout_worker.py`` subprocess workers instead (a process
+                count decoupled from the main PPO loop's ``n_processes``,
+                see that config key's comment for why).
             n_steps: Steps to collect (should be >= rollout_steps, e.g. 4096)
             n_epochs: Epochs to fit the value network per collected rollout
             lr: Learning rate for value pre-training (higher than PPO lr, e.g. 1e-3)
@@ -3796,9 +4043,10 @@ class PPOTrainer:
                 the second network is discarded when this method returns (no
                 checkpoint save, no effect on the real value_head or PPO).
             phase_id: Curriculum phase id. Required to use parallel rollout
-                collection (``ppo.n_parallel_envs > 1``) -- each worker rebuilds
-                its own env from this id, same as the main PPO training loop.
-                Ignored when ``ppo.n_parallel_envs == 1`` (uses ``env`` directly).
+                collection (``ppo.value_pretrain_n_processes > 1``) -- each
+                worker rebuilds its own env from this id, same as the main PPO
+                training loop. Ignored when ``ppo.value_pretrain_n_processes
+                == 1`` (uses ``env`` directly).
 
         Returns:
             dict with diagnostic stats from the rollout collection:
@@ -3856,7 +4104,7 @@ class PPOTrainer:
                 val_mask[ep_starts[_i]:episode_end_idxs[_i] + 1] = True
         train_mask = ~val_mask
 
-        _LIST_KEYS = {"reward_comps_raw", "step_outcomes"}
+        _LIST_KEYS = {"reward_comps_raw", "step_outcomes", "track_ids"}
 
         def _sel(b: dict, mask: np.ndarray) -> dict:
             idx = torch.from_numpy(np.where(mask)[0]).long()
@@ -4258,14 +4506,86 @@ class PPOTrainer:
         ], dim=-1)
 
     @torch.no_grad()
-    def _sample_action(
+    def _sample_action_networks(self, obs_dict_batch: dict) -> tuple:
+        """Batched network-forward part of action sampling: decision_net +
+        execution_net + value forward passes, run ONCE for however many rows
+        ``obs_dict_batch`` holds (batch dim already present -- callers that
+        want a single row pass a batch of 1). This is the expensive,
+        batchable part -- profiled this session at ~88% of rollout wall
+        time, of which only ~11% is actual matmul compute (the rest is
+        Python/PyTorch dispatch overhead on tiny batch-of-1 calls); a direct
+        benchmark measured 6 separate batch=1 CPU calls at 51.2s vs 1 batch=6
+        CPU call at 10.5s for this exact 3-network combination (~4.88x).
+        ALL per-row sampling/log_prob/decanonicalization logic stays in
+        ``_sample_action_from_heads`` below, completely unchanged -- both the
+        single-row path (``_sample_action``) and the batched path
+        (``_sample_action_batch``) call that same method, so there is only
+        ever one implementation of the sampling/log_prob math to keep
+        correct, never a second parallel one that could silently drift.
+
+        Returns ``(d_heads, e_heads, value_batch, x_sign_batch, em)`` -- all
+        still batch-shaped ``(K, ...)``. ``em`` (exists_mask) is returned too
+        since ``_sample_action_from_heads`` needs it again for the masked
+        categorical target distributions (pass/tackle/mark target) -- it's
+        part of the original observation, not something the network forward
+        pass produces.
+        """
+        dev = self.device
+        sf = obs_dict_batch["self_feat"].to(dev)
+        of = obs_dict_batch["other_feat"].to(dev)
+        em = obs_dict_batch["exists_mask"].to(dev)
+        bf = obs_dict_batch["ball_feat"].to(dev)
+        gf = obs_dict_batch["global_feat"].to(dev)
+        sat = obs_dict_batch["self_ai_type"].to(dev) if "self_ai_type" in obs_dict_batch else None
+        oat = obs_dict_batch["other_ai_type"].to(dev) if "other_ai_type" in obs_dict_batch else None
+
+        # Canonical AI frame: mirror world-frame obs so self always attacks
+        # +x (see ai/obs/canonical.py). Reused per-row below (via
+        # _sample_action_from_heads) to decanonicalize move_direction/
+        # kick_direction before they're returned to the caller.
+        # (decision_net/execution_net wrap-canonicalize sf/of/bf automatically —
+        # see CanonicalNetworkWrapper — so only x_sign itself is needed here.)
+        # x_sign_of already returns a (K,) tensor for batched input -- see its
+        # own docstring (ai/obs/canonical.py) -- no change needed here for
+        # batch>1.
+        x_sign_batch = x_sign_of(sf)
+
+        d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
+        e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
+
+        # Single value head: execution_net only (decision_net.value_head is
+        # frozen — see __init__ note), OR self.value_net when
+        # separate_value_net is enabled (see _value_heads() docstring).
+        if self.separate_value_net:
+            with torch.no_grad():
+                value_batch = self.value_net(sf, of, em, bf, gf, d_heads, sat, oat, value_only=True).squeeze(-1)
+        else:
+            value_batch = e_heads.value.squeeze(-1)
+
+        return d_heads, e_heads, value_batch, x_sign_batch, em
+
+    @torch.no_grad()
+    def _sample_action_from_heads(
         self,
-        obs_dict: dict,
+        d_heads,
+        e_heads,
+        value: float,
+        x_sign: float,
+        em,
         deterministic: bool = False,
         deterministic_decision: bool = False,
         deterministic_direction: bool = False,
     ) -> tuple:
-        """Forward pass + sample from all distributions.
+        """Per-row sampling + log_prob + decanonicalization, given
+        already-computed batch-of-1 network output for ONE row (``d_heads``/
+        ``e_heads``/``value``/``x_sign``/``em`` -- see
+        ``_sample_action_networks``, which also returns the batch-of-1
+        ``exists_mask`` slice needed again here for the masked categorical
+        target distributions). This is ``_sample_action``'s entire original
+        body, byte-for-byte unchanged, minus the network forward passes
+        themselves (now the caller's job) -- both ``_sample_action``
+        (batch=1) and ``_sample_action_batch`` (batch=K, calling this once
+        per row) route through this exact same code.
 
         Args:
             deterministic: if True, use each head's mode/mean instead of a
@@ -4289,23 +4609,6 @@ class PPOTrainer:
         det_decision = deterministic or deterministic_decision
         det_direction = deterministic or deterministic_direction
         dev = self.device
-        sf = obs_dict["self_feat"].unsqueeze(0).to(dev)
-        of = obs_dict["other_feat"].unsqueeze(0).to(dev)
-        em = obs_dict["exists_mask"].unsqueeze(0).to(dev)
-        bf = obs_dict["ball_feat"].unsqueeze(0).to(dev)
-        gf = obs_dict["global_feat"].unsqueeze(0).to(dev)
-        sat = obs_dict["self_ai_type"].unsqueeze(0).to(dev) if "self_ai_type" in obs_dict else None
-        oat = obs_dict["other_ai_type"].unsqueeze(0).to(dev) if "other_ai_type" in obs_dict else None
-
-        # Canonical AI frame: mirror world-frame obs so self always attacks
-        # +x (see ai/obs/canonical.py). x_sign is reused below to decanonicalize
-        # move_direction/kick_direction before they're returned to the caller.
-        # (decision_net/execution_net wrap-canonicalize sf/of/bf automatically —
-        # see CanonicalNetworkWrapper — so only x_sign itself is needed here.)
-        x_sign = float(x_sign_of(sf).item())
-
-        # Decision network forward
-        d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
 
         # Sample from each decision head
         shoot_dist = IndependentBernoulli(d_heads.shoot_logit)
@@ -4374,9 +4677,6 @@ class PPOTrainer:
             "move_arrival_speed_mps": mv_speed_phys,
         }
 
-        # Execution network forward
-        e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
-
         # Sample execution heads
         exec_move_dist = IndependentBernoulli(e_heads.exec_move_logit)
         sprint_dist = IndependentBernoulli(e_heads.sprint_logit)
@@ -4442,14 +4742,8 @@ class PPOTrainer:
         }
 
         # Combined log_prob
-        # Single value head: execution_net only (decision_net.value_head is
-        # frozen — see __init__ note), OR self.value_net when
-        # separate_value_net is enabled (see _value_heads() docstring).
-        if self.separate_value_net:
-            with torch.no_grad():
-                value = float(self.value_net(sf, of, em, bf, gf, d_heads, sat, oat, value_only=True).mean())
-        else:
-            value = float(e_heads.value.mean())
+        # (value was already computed by _sample_action_networks and passed
+        # in as a plain float -- see that method's docstring.)
         log_prob = self._compute_log_prob(d_heads, e_heads, {
             "shoot": shoot, "pass_": pass_, "move": move,
             "tackle": tackle, "gp_extra": gp_extra, "mark": mark, "hold": hold,
@@ -4545,6 +4839,298 @@ class PPOTrainer:
             target_slots,
             raw_exec_samples,
             head_log_probs,
+        )
+
+    @torch.no_grad()
+    def _sample_action_from_heads_batch(
+        self,
+        d_heads,
+        e_heads,
+        value_batch: torch.Tensor,
+        x_sign_batch: torch.Tensor,
+        em,
+        deterministic: bool = False,
+        deterministic_decision: bool = False,
+        deterministic_direction: bool = False,
+    ) -> list:
+        """Vectorized tail: sampling + log_prob + decanonicalization for ALL
+        K rows in ONE pass, replacing a Python loop of K individual
+        ``_sample_action_from_heads`` calls (that loop -- still used by
+        ``_sample_action_from_heads`` itself as the single-row reference,
+        and by this method's own tests -- is ~53% of rollout decision time
+        despite the network forward pass already being batched, since every
+        distribution/log_prob/masking call it makes is batch=1). Returns a
+        list of K tuples, each identical in shape/semantics to what
+        ``_sample_action_from_heads`` returns for that row (see its
+        docstring) -- this is a drop-in replacement for
+        ``_sample_action_batch``'s inner loop, not a new/different sampling
+        policy.
+
+        Why this is safe to vectorize: every distribution class involved
+        (IndependentBernoulli, MaskedCategorical, VonMisesDirectionHead,
+        KickDirectionHead, SquashedNormalHead, torch.distributions.Normal)
+        already operates on an arbitrary leading batch dimension -- the
+        batch=1 restriction in ``_sample_action_from_heads`` came entirely
+        from ITS OWN ``.squeeze(0)``/``float()``/``.item()`` calls, never
+        from the underlying sampling machinery. Likewise ``mirror_x``/
+        ``x_sign_of`` (ai/obs/canonical.py) already accept a batched
+        x_sign. The one place with real per-row CONDITIONAL logic -- gating
+        sprint/move_dir by exec_move and kick_dir/kick_power/kick_spin by
+        kick, plus masking frozen heads (``self._ppo_lp_masked_heads``) --
+        is deliberately NOT reimplemented here: this method builds an
+        ``mb_actions`` dict from the freshly sampled actions and hands it to
+        ``_recompute_log_prob``/``_per_head_new_log_probs``, the SAME
+        already-vectorized functions the PPO update loop already calls every
+        rollout to recompute log_prob for stored actions (verified
+        line-for-line equivalent to ``_compute_log_prob``'s scalar gating
+        used above by the single-row reference). The masking logic that was
+        flagged as the highest-risk part of this vectorization therefore has
+        exactly one implementation either way, never a second one that could
+        silently drift -- this method's own new code is limited to sampling,
+        decanonicalization, and packaging already-computed batched tensors
+        into K per-row output tuples.
+        """
+        det_decision = deterministic or deterministic_decision
+        det_direction = deterministic or deterministic_direction
+        dev = self.device
+        K = int(value_batch.shape[0])
+
+        # Decision heads (Bernoulli)
+        shoot_dist = IndependentBernoulli(d_heads.shoot_logit)
+        pass_dist = IndependentBernoulli(d_heads.pass_logit)
+        move_dist = IndependentBernoulli(d_heads.move_logit)
+        tackle_dist = IndependentBernoulli(d_heads.tackle_logit)
+        gp_extra_dist = IndependentBernoulli(d_heads.get_possession_raw)
+        mark_dist = IndependentBernoulli(d_heads.mark_logit)
+        hold_dist = IndependentBernoulli(d_heads.hold_position_logit)
+        shoot = shoot_dist.mode() if det_decision else shoot_dist.sample()
+        pass_ = pass_dist.mode() if det_decision else pass_dist.sample()
+        move = move_dist.mode() if det_decision else move_dist.sample()
+        tackle = tackle_dist.mode() if det_decision else tackle_dist.sample()
+        gp_extra = gp_extra_dist.mode() if det_decision else gp_extra_dist.sample()
+        mark = mark_dist.mode() if det_decision else mark_dist.sample()
+        hold = hold_dist.mode() if det_decision else hold_dist.sample()
+
+        # Categorical targets (masked)
+        pass_tgt_dist = MaskedCategorical(d_heads.pass_target_logits, em)
+        tackle_tgt_dist = MaskedCategorical(d_heads.tackle_target_logits, em)
+        mark_tgt_dist = MaskedCategorical(d_heads.mark_target_logits, em)
+        pass_tgt = pass_tgt_dist.mode() if det_decision else pass_tgt_dist.sample()
+        tackle_tgt = tackle_tgt_dist.mode() if det_decision else tackle_tgt_dist.sample()
+        mark_tgt = mark_tgt_dist.mode() if det_decision else mark_tgt_dist.sample()
+
+        # Continuous decision heads (pre-squash raw samples for PPO)
+        mv_center_raw = d_heads.move_region_center  # (K, 2)
+        mv_size_raw = d_heads.move_region_size       # (K, 1)
+        mv_speed_raw = d_heads.move_arrival_speed    # (K, 1)
+        ad_raw = d_heads.attack_defence_raw          # (K, 1)
+
+        tackle_prob, gp_prob = derive_get_possession_prob(
+            d_heads.tackle_logit, d_heads.get_possession_raw
+        )
+        shoot_prob = torch.sigmoid(d_heads.shoot_logit)
+        pass_prob = torch.sigmoid(d_heads.pass_logit)
+        move_prob = torch.sigmoid(d_heads.move_logit)
+        mark_prob = torch.sigmoid(d_heads.mark_logit)
+        hold_prob = torch.sigmoid(d_heads.hold_position_logit)
+
+        # Physical continuous outputs (after squashing)
+        pitch_hl = 52.5  # standard half-length; TODO: get from obs if pitch varies
+        pitch_hw = 34.0
+        mv_center_phys = (
+            torch.tanh(mv_center_raw) * torch.tensor([[pitch_hl, pitch_hw]], device=dev)
+        )
+        mv_size_phys = 1.0 + 3.0 * torch.sigmoid(mv_size_raw)  # (K, 1), [1, 4] m
+        mv_speed_phys = torch.sigmoid(mv_speed_raw) * 9.5       # (K, 1), [0, v_top]
+
+        # Decanonicalize: move_region_center is a world-frame physical target.
+        mv_center_world = mirror_x(mv_center_phys, x_sign_batch)  # (K, 2)
+
+        # Sample execution heads
+        exec_move_dist = IndependentBernoulli(e_heads.exec_move_logit)
+        sprint_dist = IndependentBernoulli(e_heads.sprint_logit)
+        kick_dist = IndependentBernoulli(e_heads.kick_logit)
+        tackle_attempt_dist = IndependentBernoulli(e_heads.tackle_attempt_logit)
+        exec_move = exec_move_dist.mode() if det_decision else exec_move_dist.sample()
+        sprint = sprint_dist.mode() if det_decision else sprint_dist.sample()
+        kick = kick_dist.mode() if det_decision else kick_dist.sample()
+        tackle_attempt = tackle_attempt_dist.mode() if det_decision else tackle_attempt_dist.sample()
+
+        # Direction heads (see _sample_action_from_heads for the full
+        # rationale comment -- unchanged here, just batched).
+        eps = 1e-6
+        log_kappa_move = self.execution_net.move_dir_log_kappa
+        log_kappa_kick = self.execution_net.kick_dir_log_kappa
+        log_std_z_kick = self.execution_net.kick_dir_z_log_std
+        move_dir_head = self._move_dir_head(e_heads.move_direction, log_kappa_move)
+        kick_dir_head = self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick)
+        if det_direction:
+            move_dir_raw = move_dir_head.mode_physical()  # (K, 2)
+            kick_dir_raw = kick_dir_head.mode_physical()   # (K, 3)
+        else:
+            move_dir_raw = move_dir_head.sample_raw()  # (K, 2)
+            kick_dir_raw = kick_dir_head.sample_raw()   # (K, 3)
+        move_dir_phys = move_dir_raw / (move_dir_raw.norm(dim=-1, keepdim=True) + eps)
+        kick_dir_phys = kick_dir_raw / (kick_dir_raw.norm(dim=-1, keepdim=True) + eps)
+
+        log_std_power = self.execution_net.kick_power_log_std
+        log_std_spin = self.execution_net.kick_spin_log_std
+        kick_power_head = self._kick_power_head(e_heads.kick_power, log_std_power)
+        kick_spin_dist = self._kick_spin_dist(e_heads.kick_spin, log_std_spin)
+        if det_direction:
+            kick_power_raw = kick_power_head.dist.mean  # (K, 1), pre-squash
+            kick_spin_raw = kick_spin_dist.mean          # (K, 3)
+        else:
+            kick_power_raw = kick_power_head.sample_raw()  # (K, 1), pre-squash
+            kick_spin_raw = kick_spin_dist.rsample()        # (K, 3)
+        kick_power_phys = kick_power_head.to_physical(kick_power_raw)  # (K, 1)
+
+        # Decanonicalize: these are world-frame physical directions from here on.
+        move_dir_world = mirror_x(move_dir_phys, x_sign_batch)  # (K, 2)
+        kick_dir_world = mirror_x(kick_dir_phys, x_sign_batch)  # (K, 3)
+
+        # Combined + per-head log_prob: reuse the update-time vectorized
+        # masking (_recompute_log_prob/_per_head_new_log_probs) rather than
+        # reimplementing exec_move/kick/frozen-head gating here -- see
+        # docstring above.
+        mb_actions = {
+            "shoot": shoot, "pass_": pass_, "move": move, "tackle": tackle,
+            "get_possession_extra": gp_extra, "mark": mark, "hold_position": hold,
+            "pass_target": pass_tgt.unsqueeze(-1).float(),
+            "tackle_target": tackle_tgt.unsqueeze(-1).float(),
+            "mark_target": mark_tgt.unsqueeze(-1).float(),
+            "exec_move": exec_move, "sprint": sprint, "kick": kick,
+            "tackle_attempt": tackle_attempt,
+            "move_dir_raw": move_dir_raw, "kick_dir_raw": kick_dir_raw,
+            "kick_power_raw": kick_power_raw, "kick_spin_raw": kick_spin_raw,
+        }
+        log_prob_batch = self._recompute_log_prob(d_heads, e_heads, mb_actions, em)  # (K,)
+        head_log_probs_batch = self._per_head_new_log_probs(d_heads, e_heads, mb_actions, em)  # (K, 15)
+
+        # Unpack into K per-row tuples -- cheap indexing/dict-building only,
+        # no distribution construction or network calls below this point.
+        results = []
+        for i in range(K):
+            action = DecisionAction(
+                shoot=float(shoot[i]),
+                pass_=float(pass_[i]),
+                move=float(move[i]),
+                tackle=float(tackle[i]),
+                get_possession_extra=float(gp_extra[i]),
+                mark=float(mark[i]),
+                hold_position=float(hold[i]),
+                pass_target=int(pass_tgt[i]),
+                tackle_target=int(tackle_tgt[i]),
+                mark_target=int(mark_tgt[i]),
+                move_region_center_raw=mv_center_raw[i].cpu().numpy(),
+                move_region_size_raw=float(mv_size_raw[i]),
+                move_arrival_speed_raw=float(mv_speed_raw[i]),
+                attack_defence_raw=float(ad_raw[i]),
+            )
+            decision_probs = {
+                "shoot": float(shoot_prob[i]),
+                "pass_": float(pass_prob[i]),
+                "move": float(move_prob[i]),
+                "tackle": float(tackle_prob[i]),
+                "get_possession": float(gp_prob[i]),
+                "mark": float(mark_prob[i]),
+                "hold_position": float(hold_prob[i]),
+            }
+            target_slots = {
+                "pass_": int(pass_tgt[i]),
+                "tackle": int(tackle_tgt[i]),
+                "mark": int(mark_tgt[i]),
+            }
+            decision_physical = {
+                "move_region_center_m": mv_center_world[i].cpu().numpy(),
+                "move_region_size_m": float(mv_size_phys[i]),
+                "move_arrival_speed_mps": float(mv_speed_phys[i]),
+            }
+            execution_physical = {
+                "exec_move": bool(exec_move[i].item() > 0.5),
+                "move_direction": move_dir_world[i].cpu().numpy(),
+                "sprint": bool(sprint[i].item() > 0.5),
+                "kick_this_tick": bool(kick[i].item() > 0.5),
+                "kick_direction": kick_dir_world[i].cpu().numpy(),
+                "kick_power_fraction": float(kick_power_phys[i]),
+                "kick_spin": kick_spin_raw[i].cpu().numpy(),
+                "tackle_attempt": bool(tackle_attempt[i].item() > 0.5),
+            }
+            raw_exec_samples = {
+                "exec_move": np.array([float(exec_move[i])], dtype=np.float32),
+                "sprint": np.array([float(sprint[i])], dtype=np.float32),
+                "kick": np.array([float(kick[i])], dtype=np.float32),
+                "tackle_attempt": np.array([float(tackle_attempt[i])], dtype=np.float32),
+                "move_dir_raw": move_dir_raw[i].cpu().numpy().astype(np.float32),
+                "kick_dir_raw": kick_dir_raw[i].cpu().numpy().astype(np.float32),
+                "kick_power_raw": kick_power_raw[i].cpu().numpy().astype(np.float32),
+                "kick_spin_raw": kick_spin_raw[i].cpu().numpy().astype(np.float32),
+            }
+            results.append((
+                action,
+                float(log_prob_batch[i]),
+                float(value_batch[i]),
+                decision_probs,
+                execution_physical,
+                decision_physical,
+                target_slots,
+                raw_exec_samples,
+                head_log_probs_batch[i].cpu().numpy(),
+            ))
+        return results
+
+    @torch.no_grad()
+    def _sample_action(
+        self,
+        obs_dict: dict,
+        deterministic: bool = False,
+        deterministic_decision: bool = False,
+        deterministic_direction: bool = False,
+    ) -> tuple:
+        """Forward pass + sample from all distributions, for ONE observation.
+
+        Thin wrapper: builds a batch of 1 and routes through
+        ``_sample_action_batch`` (see its docstring, and
+        ``_sample_action_networks``/``_sample_action_from_heads``) so the
+        single-row path can never diverge from the batched path -- it IS the
+        batched path, called with batch_size=1.
+
+        See ``_sample_action_from_heads`` for the deterministic*/return-value
+        documentation (unchanged).
+        """
+        obs_batch = {k: v.unsqueeze(0) for k, v in obs_dict.items()}
+        return self._sample_action_batch(
+            obs_batch,
+            deterministic=deterministic,
+            deterministic_decision=deterministic_decision,
+            deterministic_direction=deterministic_direction,
+        )[0]
+
+    @torch.no_grad()
+    def _sample_action_batch(
+        self,
+        obs_dict_batch: dict,
+        deterministic: bool = False,
+        deterministic_decision: bool = False,
+        deterministic_direction: bool = False,
+    ) -> list:
+        """Batched variant of ``_sample_action``: ``obs_dict_batch`` already
+        has a batch dimension (K rows, K>=1). Runs the 3 network forward
+        passes ONCE (``_sample_action_networks``) and then the vectorized
+        tail (``_sample_action_from_heads_batch``) ONCE, for all K rows
+        together -- see that method's docstring for why this is safe.
+        Returns a list of K tuples, each identical in shape/semantics to
+        what a single ``_sample_action(...)`` call would return for that
+        row's own observation (see ``_sample_action_from_heads``'s
+        docstring for the exact tuple contents; ``_sample_action_from_heads_batch``
+        returns the same shape, just computed vectorized).
+        """
+        d_heads_b, e_heads_b, value_b, x_sign_b, em_b = self._sample_action_networks(obs_dict_batch)
+        return self._sample_action_from_heads_batch(
+            d_heads_b, e_heads_b, value_b, x_sign_b, em_b,
+            deterministic=deterministic,
+            deterministic_decision=deterministic_decision,
+            deterministic_direction=deterministic_direction,
         )
 
     def _get_value(self, obs_dict: dict) -> float:
@@ -4664,6 +5250,92 @@ class PPOTrainer:
             ).sum(dim=-1)
 
         return lp
+
+    # -----------------------------------------------------------------------
+    # PERMANENT: NaN/Inf diagnostic (added 2026-09-09, investigating a real
+    # self-play training crash -- root cause still open, see
+    # ai_trainer_knowledge.md/training notes). Deliberately kept in
+    # (not temporary instrumentation to strip out later): the user's explicit
+    # preference is a LOUD, immediate, richly-diagnosed halt the instant this
+    # fires again, over any kind of silent skip-and-continue recovery -- see
+    # the deliberately-declined "skip a non-finite optimizer step" guard
+    # discussed alongside this. Distinguishes forward-pass corruption (a
+    # value already NaN/Inf BEFORE backward(), e.g. bad rollout data) from
+    # backward-pass numerical instability (a perfectly finite forward value
+    # whose GRADIENT is singular/NaN -- classic examples: atan2(0, 0), a
+    # Bessel-function ratio i1e/i0e at kappa=0, sqrt(0)'s infinite
+    # derivative -- all real possibilities given the VonMises/atan2-heavy
+    # direction heads this codebase uses; confirmed for real at kappa->0,
+    # see VonMisesDirectionHead -- not yet fixed, a known-open landmine).
+    # Uses batch["track_ids"] (now threaded through
+    # RolloutBuffer.as_tensors(), see its own comment) to identify whether
+    # the offending minibatch's rows skew toward the secondary (self-play
+    # opponent) track -- a real per-row identity, not the fragile
+    # sample_weights != 1.0 proxy this used before track_ids was wired
+    # through.
+    # -----------------------------------------------------------------------
+    class _NaNReproFound(Exception):
+        """Raised by _dump_nan_diagnostic to halt training the instant a
+        non-finite loss/gradient is caught -- deliberately fatal, not
+        recoverable: the run stops immediately (before the epoch loop can
+        grind through the remaining minibatches on garbage weights, and
+        before a corrupted checkpoint can get saved), with the full
+        diagnostic dump already written to disk by the time this propagates
+        up and kills the process."""
+
+    def _dump_nan_diagnostic(
+        self, stage: str, epoch_i: int, mb_i: int, mb_idx: torch.Tensor,
+        track_ids_mb: list[str], d_heads, e_heads,
+        policy_loss: torch.Tensor, value_loss: torch.Tensor, entropy: torch.Tensor,
+    ) -> None:
+        import dataclasses
+        import json
+        import time
+
+        secondary_mask = torch.tensor([t != "trainee" for t in track_ids_mb])
+        n_secondary = int(secondary_mask.sum())
+        n_total = len(track_ids_mb)
+
+        def _field_report(heads, label):
+            out = {}
+            for f in dataclasses.fields(heads):
+                v = getattr(heads, f.name)
+                if v is None or not torch.is_tensor(v):
+                    continue
+                v = v.detach()
+                finite = torch.isfinite(v)
+                out[f.name] = {
+                    "all_finite": bool(finite.all()),
+                    "n_nonfinite": int((~finite).sum()),
+                    "n_nonfinite_secondary": int((~finite).cpu().reshape(v.shape[0], -1).any(dim=1)[secondary_mask].sum()) if n_secondary else 0,
+                    "min": float(v[finite].min()) if finite.any() else None,
+                    "max": float(v[finite].max()) if finite.any() else None,
+                }
+            return out
+
+        report = {
+            "stage": stage,
+            "epoch_i": epoch_i,
+            "mb_i": mb_i,
+            "n_rows_total": n_total,
+            "n_rows_secondary": n_secondary,
+            "secondary_fraction": n_secondary / max(n_total, 1),
+            "unique_track_ids_in_minibatch": sorted(set(track_ids_mb)),
+            "policy_loss_finite": bool(torch.isfinite(policy_loss)),
+            "value_loss_finite": bool(torch.isfinite(value_loss)),
+            "entropy_finite": bool(torch.isfinite(entropy)),
+            "d_heads": _field_report(d_heads, "d_heads"),
+            "e_heads": _field_report(e_heads, "e_heads"),
+        }
+        out_path = f"nan_diagnostic_{int(time.time())}.json"
+        with open(out_path, "w") as fh:
+            json.dump(report, fh, indent=2)
+        log.error(
+            f"[NaN DIAGNOSTIC] stage={stage} epoch={epoch_i} mb={mb_i} "
+            f"secondary_rows={n_secondary}/{n_total} ({report['secondary_fraction']:.1%}) "
+            f"-- full report written to {out_path}"
+        )
+        raise PPOTrainer._NaNReproFound(out_path)
 
     # -----------------------------------------------------------------------
     # PPO update
@@ -4901,20 +5573,6 @@ class PPOTrainer:
                 _pre_n += len(_idx)
             pre_update_value_loss = (_pre_sq_err_sum / max(_pre_n, 1)) / float(_ret_var_full)
 
-        # Progress bar for the main epoch/minibatch loop below -- otherwise
-        # nothing is printed between the rollout-collection bar reaching
-        # 100% and the "[PPO] step=..." summary line, even though this loop
-        # (n_epochs passes over the whole rollout) is a real, sometimes
-        # multi-minute chunk of wall time. Total assumes no early stop; if
-        # the per-minibatch KL early-stop below fires, the bar legitimately
-        # stops short of 100% -- that's an honest signal (this update did
-        # fewer minibatch steps than a full n_epochs pass), not a bug to
-        # paper over the way the BC downsample-undercount one was.
-        _ppo_n_mb_per_epoch = (n + self.minibatch_size - 1) // self.minibatch_size
-        _ppo_progress = ProgressReporter(
-            self.n_epochs * _ppo_n_mb_per_epoch, prefix="  [ppo update] ", live=True,
-        )
-        _ppo_mb_done = 0
 
         for epoch_i in range(self.n_epochs):
             epoch_start = time.perf_counter()
@@ -5172,6 +5830,14 @@ class PPOTrainer:
                 all_kick_prob.append(_kick_prob_f)
                 all_bc_loss.append(_bc_loss_f)
 
+                # TEMPORARY diagnostic (see _dump_nan_diagnostic docstring).
+                if not torch.isfinite(total_loss):
+                    self._dump_nan_diagnostic(
+                        "forward", epoch_i, start // self.minibatch_size, mb_idx,
+                        [batch["track_ids"][i] for i in mb_idx.tolist()],
+                        d_heads, e_heads, policy_loss, value_loss, entropy,
+                    )
+
                 self.optimizer.zero_grad()
                 if self.separate_value_net:
                     self.value_net_optimizer.zero_grad()
@@ -5208,6 +5874,16 @@ class PPOTrainer:
                     list(self.decision_net.parameters()) + list(self.execution_net.parameters()),
                     float("inf"),  # don't clip yet, just measure
                 )
+                # TEMPORARY diagnostic (see _dump_nan_diagnostic docstring).
+                # total_loss WAS finite (checked above) but the gradient
+                # isn't -- points at a backward-pass numerical singularity,
+                # not corrupted forward-pass data.
+                if not torch.isfinite(_gn_tensors["raw"]):
+                    self._dump_nan_diagnostic(
+                        "backward", epoch_i, start // self.minibatch_size, mb_idx,
+                        [batch["track_ids"][i] for i in mb_idx.tolist()],
+                        d_heads, e_heads, policy_loss, value_loss, entropy,
+                    )
                 # Direction-head params (move_direction/kick_direction weights +
                 # move_dir_log_kappa/kick_dir_log_kappa/kick_dir_z_log_std) are clipped in their own
                 # isolated group via direction_max_grad_norm, so a single sample's
@@ -5394,15 +6070,6 @@ class PPOTrainer:
                 all_entropy.append(_entropy_f)
                 all_kl.append(kl_after_step)
 
-                _ppo_mb_done += 1
-                _ppo_progress.update(
-                    _ppo_mb_done,
-                    postfix=(
-                        f"epoch={epoch_i + 1}/{self.n_epochs}  pol={_policy_loss_f:.4f}"
-                        f"  kl={kl_after_step:.4f}  grad={raw_grad_norm:.2f}"
-                    ),
-                )
-
                 # Early stop per-minibatch: limits drift to O(1) gradient step
                 # past the trust region boundary rather than O(n_minibatches).
                 if kl_after_step > self.target_kl:
@@ -5414,11 +6081,6 @@ class PPOTrainer:
                         )
                         if per_head_kl_mb is not None else "(head_log_probs unavailable)"
                     )
-                    if _ppo_progress.live:
-                        # Bar stopped short of its total -- terminate the
-                        # in-place \r line cleanly before logging, otherwise
-                        # the early-stop message gets glued onto its end.
-                        print(file=_ppo_progress.stream)
                     log.info(
                         f"  [early stop e{epoch_i} mb{mb_i_stop}]"
                         f"  KL={kl_after_step:.5f} > target={self.target_kl}"
@@ -5430,16 +6092,13 @@ class PPOTrainer:
 
             epoch_times.append((time.perf_counter() - epoch_start) * 1000)
             # Full-epoch means (every minibatch this epoch actually ran, not
-            # just the last 32) -- the per-minibatch [ppo update] progress
-            # line only samples ~10 single minibatches across the WHOLE
-            # update (roughly once every 2-3 epochs), so two consecutive
-            # printed pol=/kl= values are effectively independent random
-            # minibatches, not a smooth trend -- easy to misread ordinary
-            # sampling noise (e.g. pol swinging between -0.017 and +0.026,
-            # all of it close to zero) as the policy getting worse or better
-            # within the update. This line answers "does this actually
-            # degrade deeper into the update" directly, once per epoch,
-            # instead of guessing from ~10 sparse single-minibatch snapshots.
+            # a single sampled one) -- reading pol=/kl= off any one minibatch
+            # is effectively a random draw, not a trend; two consecutive
+            # single-minibatch values swinging between e.g. -0.017 and +0.026
+            # (both close to zero) is easy to misread as the policy getting
+            # worse or better within the update when it's just ordinary
+            # sampling noise. This line answers "does this actually degrade
+            # deeper into the update" directly, once per epoch.
             _epoch_pol = all_policy_loss[_epoch_slice_start:]
             _epoch_kl = all_kl[_epoch_slice_start:]
             mean_pol_epoch = float(np.mean(_epoch_pol)) if _epoch_pol else 0.0
@@ -6136,6 +6795,7 @@ class PPOTrainer:
             "pre_update_value_loss": pre_update_value_loss,
             "entropy": float(np.mean(all_entropy)),
             "entropy_breakdown": {k: float(np.mean(v)) for k, v in all_entropy_breakdown.items()},
+            "ent_coef": ent_coef,
             "approx_kl": float(np.mean(all_kl)),
             "bc_loss": float(np.mean(all_bc_loss)),
             "bc_tackle_loss": float(np.mean(all_bc_tackle_loss)) if all_bc_tackle_loss else 0.0,
@@ -6596,7 +7256,7 @@ def _merge_worker_batches(batches: list[dict]) -> dict:
     """
     merged: dict = {}
     for key in batches[0]:
-        if key in ("reward_comps_raw", "step_outcomes"):
+        if key in ("reward_comps_raw", "step_outcomes", "track_ids"):
             merged[key] = [x for b in batches for x in b[key]]
         else:
             merged[key] = torch.cat([b[key] for b in batches], dim=0)

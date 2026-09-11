@@ -369,6 +369,15 @@ class RolloutBuffer:
         result["sample_weights"] = torch.tensor(self.weights, dtype=torch.float32)
         result["reward_comps_raw"] = list(self.reward_comps)
         result["step_outcomes"] = _backfill_step_outcomes(self.step_outcomes, self.dones)
+        # Diagnostic-only, NOT consumed by the PPO loss math -- track identity
+        # is only load-bearing for compute_gae()'s per-track segmentation
+        # (already applied above, before this dict is built), so downstream
+        # code correctly treats every row as track-agnostic. Kept here purely
+        # so callers/tests/diagnostics can ask "which track was row i" without
+        # the fragile sample_weights != 1.0 proxy (breaks the moment
+        # secondary_weight is ever set to 1.0, and doesn't extend past two
+        # tracks). A plain list, not a tensor -- these are strings.
+        result["track_ids"] = list(self.track_ids)
 
         return result
 

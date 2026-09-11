@@ -1,14 +1,20 @@
-"""Opponent pool management for self-play and curriculum training.
+"""Frozen-checkpoint opponent pool -- NOT how self-play actually works today.
 
 See ai_design_doc.md section 4 (curriculum item: "opponent progression:
 immobile -> sometimes rules-based AI -> sometimes older AI generations").
 
-This module manages:
-1. Rules-based opponents (the existing orders/actions API)
-2. Frozen checkpoint opponents (old AI generations for self-play)
-
-For the MVP experiments, only rules-based opponents are used.
-Checkpoint-based self-play opponents are stubbed for future extension.
+This module was written for a checkpoint-POOL design (sample a random OLD
+frozen checkpoint as the opponent). That design is stubbed and unused --
+neither ``OpponentPool`` nor ``apply_rules_based_opponent()`` below is
+constructed/called anywhere in the real training path (rules-based
+opponents go through ``rules_ai.Phase1RulesAI`` directly instead, wired up
+in ``ui/scenarios.py``'s ``build_1v1_scenario``). Real self-play
+(``ai_config.json``'s ``phase1_opponent_neural_ratio``) works completely
+differently in any case: the secondary/opponent player shares the
+trainee's SAME LIVE weights via
+``rules_ai.NeuralPlayerAI``/``maybe_assign_neural_opponent`` (see
+``ai/env/scenario_env.py``'s ``ScenarioEnv.reset()``), not a pool of frozen
+snapshots.
 """
 from __future__ import annotations
 

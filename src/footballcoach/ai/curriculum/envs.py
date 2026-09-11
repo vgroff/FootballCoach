@@ -73,6 +73,38 @@ def bc_label_fn_for_phase_player(phase_id: int) -> Optional[Callable]:
 # Per-phase builders (private)
 # ---------------------------------------------------------------------------
 
+def opponent_type_probs(
+    rules_ratio: float, immobile_ratio: float, neural_ratio: float,
+) -> tuple[float, float]:
+    """Convert the three curriculum ratios (``ai_config.json``'s
+    ``phase1_opponent_{rules,immobile,neural}_ratio``) into the
+    ``(opponent_rules_prob, opponent_immobile_prob)`` pair
+    ``build_1v1_scenario`` actually takes -- the neural probability is
+    whatever's left over (``1 - rules_prob - immobile_prob``), matching
+    ``build_1v1_scenario``'s own roll (see its docstring: "the remainder
+    becomes neural").
+
+    Extracted from ``_build_phase1_env`` as its own pure function
+    specifically so this arithmetic -- the thing that turns e.g. a
+    ``1 : 0 : 3`` config ratio into "75% of phase-1 training is self-play"
+    -- can be unit-tested directly. Every existing self-play test
+    deliberately bypasses ``_build_phase1_env``/``load_ai_config()``
+    entirely (pytest-xdist workers share the config file, so mutating it
+    mid-run is unsafe), which meant this exact conversion had never been
+    exercised by anything. This file has already shipped one silent
+    "config value has zero effect on real training" bug before (see the
+    ``ball_max_speed_mps`` comment below) -- not a hypothetical risk.
+
+    Falls back to ``(0.0, 1.0)`` (always immobile) when all three ratios
+    sum to <= 0, matching ``phase1_opponent_immobile_ratio``'s own config
+    default of ``1.0``.
+    """
+    total = rules_ratio + immobile_ratio + neural_ratio
+    if total <= 0:
+        return 0.0, 1.0
+    return rules_ratio / total, immobile_ratio / total
+
+
 def _build_phase1_env(phase: CurriculumPhase):
     import functools
     from footballcoach.ai.env.scenario_env import ScenarioEnv
@@ -87,9 +119,7 @@ def _build_phase1_env(phase: CurriculumPhase):
     _rules_ratio = float(_curriculum_cfg.get("phase1_opponent_rules_ratio", 0.0))
     _immobile_ratio = float(_curriculum_cfg.get("phase1_opponent_immobile_ratio", 1.0))
     _neural_ratio = float(_curriculum_cfg.get("phase1_opponent_neural_ratio", 0.0))
-    _total = _rules_ratio + _immobile_ratio + _neural_ratio
-    _rules_prob = (_rules_ratio / _total) if _total > 0 else 0.0
-    _immobile_prob = (_immobile_ratio / _total) if _total > 0 else 1.0
+    _rules_prob, _immobile_prob = opponent_type_probs(_rules_ratio, _immobile_ratio, _neural_ratio)
     defn = ScenarioDefinition(
         key="phase1_1v1",
         label="Phase 1: 1v1 Get Possession",
