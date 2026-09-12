@@ -104,30 +104,30 @@ def test_no_damping_when_not_overlapping():
     assert abs(p2.velocity.x - (-10.0)) < 1e-9
 
 
-def test_inactive_player_still_gets_velocity_damped():
-    """Inactive (just-tackled) players are excluded from position push-apart
-    but MUST still have their closing velocity damped — prevents gliding at
-    full speed into an opponent after a tackle."""
+def test_damp_overlap_velocity_is_state_agnostic():
+    """`_damp_overlap_velocity` itself has no inactive-state check - it damps
+    whatever pair it's given. The inactive-pair exclusion lives one level up,
+    in `resolve_all_overlaps`'s loop (see
+    test_resolve_all_overlaps_skips_inactive_pairs_entirely below)."""
     params = _make_collision_params()
     p1 = make_player("p1", position=Vector3(0, 0, 0))
     p2 = make_player("p2", position=Vector3(0.3, 0, 0))
     p1.velocity = Vector3(1.5, 0, 0)
     p2.velocity = Vector3(-1.5, 0, 0)
-    # Mark p2 as inactive
     p2.state = PlayerState.INACTIVE_TACKLED
     p2.state_timer_s = 0.5
 
-    # Position push-apart is skipped for inactive pairs in resolve_all_overlaps,
-    # but velocity damping (_damp_overlap_velocity) should still apply.
     _damp_overlap_velocity(p1, p2, params)
 
     assert abs(p1.velocity.x - 0.75) < 1e-6  # halved
     assert abs(p2.velocity.x - (-0.75)) < 1e-6  # halved
 
 
-def test_resolve_all_overlaps_position_pushes_active_pairs_only():
-    """Position push-apart is skipped for inactive pairs, but velocity
-    damping is applied for all pairs via resolve_all_overlaps."""
+def test_resolve_all_overlaps_skips_inactive_pairs_entirely():
+    """Both position push-apart AND velocity damping are skipped for pairs
+    where either player is inactive, so an active player can push straight
+    past someone they just tackled (or who just failed to tackle them)
+    instead of getting stuck gliding against them."""
     params = _make_collision_params()
     p1 = make_player("p1", position=Vector3(0, 0, 0))
     p2 = make_player("p2", position=Vector3(0.3, 0, 0))  # overlapping
@@ -145,8 +145,8 @@ def test_resolve_all_overlaps_position_pushes_active_pairs_only():
     assert p1.position == initial_p1_pos
     assert p2.position == initial_p2_pos
 
-    # Velocity: p1's closing speed (3.0 > 0.3 floor) should be damped
-    assert p1.velocity.x < 3.0
+    # Velocity: inactive pair is NOT damped either - p1 keeps its full speed
+    assert abs(p1.velocity.x - 3.0) < 1e-9
 
 
 def test_multi_tick_compounding_self_limits():

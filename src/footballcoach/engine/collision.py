@@ -9,17 +9,15 @@ that line - this lets a faster-moving/harder-charging player "win" more of
 the push, approximating momentum without a full mass/impulse system.
 
 Inactive players (just tackled, or having just failed a tackle - see
-`Player.is_inactive`) are excluded from this push-apart logic entirely: per
-the design spec you can run straight through an inactive player rather than
-being blocked by them. They can, however, still physically block a loose
-ball that flies through their cylinder from outside it (see
-`resolve_ball_block_by_inactive_players`) - a player lying on the ground
-after a tackle can still deflect a stray shot, they just can't obstruct
-other *players*' movement.
-
-Velocity damping (applied after position push-apart) reduces the closing
-speed of colliding players, even for inactive pairs: without this, a
-just-tackled player would keep gliding at full speed into the opponent.
+`Player.is_inactive`) are excluded from both this push-apart logic AND the
+velocity damping below entirely: per the design spec you can run straight
+through an inactive player rather than being blocked by them or getting
+stuck to them - a player who just failed a tackle (or just got tackled)
+should be "pushable past", not an obstacle. They can, however, still
+physically block a loose ball that flies through their cylinder from
+outside it (see `resolve_ball_block_by_inactive_players`) - a player lying
+on the ground after a tackle can still deflect a stray shot, they just
+can't obstruct other *players*' movement.
 """
 from __future__ import annotations
 
@@ -61,9 +59,8 @@ def _damp_overlap_velocity(
     few ticks of sustained contact (see the worked example in the phase D
     design doc for the compounding analysis).
 
-    Unlike the position push-apart, this runs for ALL pairs — including
-    those where one or both players are inactive — so a just-tackled player
-    does not keep gliding at full sprint speed into the opponent.
+    Like the position push-apart, this is skipped entirely for pairs where
+    either player is inactive — see `resolve_all_overlaps`'s docstring.
 
     Note: position z is preserved; only xy closing components are damped.
     """
@@ -160,14 +157,12 @@ def resolve_all_overlaps(
     """Resolves overlaps across all player pairs. Multiple iterations help
     settle chains of overlapping players (e.g. 3+ players bunched up).
 
-    Position push-apart: pairs where either player is currently `is_inactive`
-    are skipped entirely - per the design spec, you can run straight through
-    an inactive player, rather than merely reducing the push.
-
-    Velocity damping: applied once after all push-apart iterations, for ALL
-    pairs (including those involving inactive players). This prevents a
-    just-tackled player from continuing to glide at full sprint speed into
-    the opponent, while keeping the position push-apart rule unchanged.
+    Both position push-apart and velocity damping (applied once after all
+    push-apart iterations) are skipped entirely for pairs where either
+    player is currently `is_inactive` - per the design spec, you can run
+    straight through an inactive player (or push past one you just tackled,
+    or one who just failed to tackle you) rather than being blocked by them
+    or stuck gliding against them.
     """
     params = collision_params or CollisionParams.from_config()
 
@@ -191,14 +186,17 @@ def resolve_all_overlaps(
         if not any_overlap:
             break
 
-    # Velocity damping — single pass over ALL pairs (active and inactive).
-    # This is intentionally separate from the position push-apart loop above:
-    # position push-apart is skipped for inactive pairs, but velocity damping
-    # is not (see module docstring for rationale). Compounding is self-limiting
+    # Velocity damping — single pass over all pairs, skipping inactive ones
+    # the same way the position push-apart loop above does (see this
+    # function's docstring for rationale). Compounding is self-limiting
     # because the floor threshold stops damping once closing speed drops below
     # collision_damping_min_closing_speed_mps.
     for i in range(len(players)):
+        if players[i].is_inactive:
+            continue
         for j in range(i + 1, len(players)):
+            if players[j].is_inactive:
+                continue
             _damp_overlap_velocity(players[i], players[j], params)
 
 

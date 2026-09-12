@@ -1068,6 +1068,28 @@ def _phase1_scenario_cfg() -> dict:
         return {}
 
 
+def _phase1_training_cfg() -> dict:
+    """Returns the actual values PPO training uses for decision cadence and
+    episode length -- sourced from ai_config.json's ``observation``/
+    ``curriculum`` sections (NOT ``phase1_scenario``, which only covers the
+    randomised-scenario knobs) -- so the Phase 1 UI's defaults can match
+    training instead of drifting from it via separately-hardcoded numbers.
+    Falls back to the same numbers currently in ai_config.json if it can't
+    be loaded, so a missing/broken config degrades gracefully rather than
+    crashing the scenario picker."""
+    try:
+        from footballcoach.ai.config import load_ai_config
+        cfg = load_ai_config()
+        obs = cfg.get("observation", {})
+        curriculum = cfg.get("curriculum", {})
+        return {
+            "decision_interval_s": float(obs.get("decision_interval_s", 0.2499)),
+            "max_episode_s": float(curriculum.get("phase1_max_episode_s", 18.5)),
+        }
+    except Exception:
+        return {"decision_interval_s": 0.2499, "max_episode_s": 18.5}
+
+
 def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
     """Factory returning (build_fn, None, params_list) for the Phase 1 UI scenario
     -- the second element is always None; neural players are driven by a plain
@@ -1086,8 +1108,25 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
     import logging
     log_ui = logging.getLogger("footballcoach.ui.scenarios")
 
-    DECISION_INTERVAL_MS_DEFAULT = 500.0  # 0.5 s at 30 Hz — matches old hardcoded 15-tick default
-    UI_TICK_HZ = 30.0  # UI always ticks the engine at 30Hz regardless of ai_config.json's sim_dt_s
+    _train_cfg = _phase1_training_cfg()
+    # Matches the real-world decision cadence PPO training actually uses
+    # (ai_config.json observation.decision_interval_s, currently 0.2499s) --
+    # NOT the tick count training uses (5 ticks at its own 20Hz), since the
+    # UI intentionally ticks the engine at a different rate (see UI_TICK_HZ
+    # below); matching on real seconds is what keeps the network seeing the
+    # same decision cadence it was trained on regardless of that difference.
+    # This replaced a stale hardcoded 500ms (a leftover 15-tick-at-30Hz
+    # default that was never actually training's value) -- exactly 2x too
+    # slow a decision cadence versus training.
+    DECISION_INTERVAL_MS_DEFAULT = _train_cfg["decision_interval_s"] * 1000.0
+    UI_TICK_HZ = 30.0  # UI always ticks the engine at 30Hz for smooth human playback -- deliberately NOT ai_config.json's sim_dt_s (0.05s/20Hz, see its own _comment_sim_dt_s: "UI ignores this and always uses 30Hz")
+    # Matches ai_config.json curriculum.phase1_max_episode_s -- the real
+    # episode length training uses. NeuralPlayerAI derives a "time_remaining"
+    # observation feature from this (see rules_ai.py); leaving it at the old
+    # hardcoded 1e9 effectively froze that feature at a huge constant,
+    # meaning the network never saw the time-pressure signal here that it
+    # saw throughout training.
+    PHASE1_MAX_EPISODE_S = _train_cfg["max_episode_s"]
 
     _trainer_cache: dict[str, object] = {}
 
@@ -1138,7 +1177,7 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         ScenarioBoolParam("trainee_rules", "Trainee: rules-based override", False),
         ScenarioBoolParam("trainee_immobile", "Trainee: immobile override", False),
         ScenarioGroupedChoiceParam("opponent_checkpoint", "Opponent checkpoint", ckpt_groups, ckpt_default),
-        ScenarioBoolParam("opponent_rules", "Opponent: rules-based override", True),
+        ScenarioBoolParam("opponent_rules", "Opponent: rules-based override", False),
         ScenarioBoolParam("opponent_immobile", "Opponent: immobile override", False),
         ScenarioChoiceParam("trainee_tier", "Trainee tier", ("generic", "amateur", "semi_pro", "premier_league"), str(_cfg.get("trainee_tier", "generic"))),
         ScenarioChoiceParam("opponent_tier", "Opponent tier", ("generic", "amateur", "semi_pro", "premier_league"), str(_cfg.get("opponent_tier", "generic"))),
@@ -1170,7 +1209,7 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
         trainee_rules: bool = False,
         trainee_immobile: bool = False,
         opponent_checkpoint: str = ckpt_default,
-        opponent_rules: bool = True,
+        opponent_rules: bool = False,
         opponent_immobile: bool = False,
         trainee_tier: str = str(_cfg.get("trainee_tier", "generic")),
         opponent_tier: str = str(_cfg.get("opponent_tier", "generic")),
@@ -1260,7 +1299,7 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
                 _trainee.ai = NeuralPlayerAI(
                     trainee_trainer._sample_action,
                     decision_interval_ticks=decision_interval_ticks,
-                    max_episode_s=1e9,
+                    max_episode_s=PHASE1_MAX_EPISODE_S,
                 )
             else:
                 _trainee = match.player_by_id("trainee")
@@ -1279,7 +1318,7 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
                 _opponent.ai = NeuralPlayerAI(
                     opponent_trainer._sample_action,
                     decision_interval_ticks=decision_interval_ticks,
-                    max_episode_s=1e9,
+                    max_episode_s=PHASE1_MAX_EPISODE_S,
                 )
             else:
                 _opponent = match.player_by_id("opponent")

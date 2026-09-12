@@ -129,6 +129,29 @@ def main() -> None:
                             "PPOTrainer.load_for_inference() auto-detects this from the checkpoint, so "
                             "no flag is needed when evaluating/running a checkpoint trained with this on."
                         ))
+    parser.add_argument("--share-value-grad-with-decision", action="store_true",
+                        help=(
+                            "Only meaningful with --separate-value-net. By default, self.value_net's "
+                            "critic gradient never reaches decision_net (d_heads is detached before "
+                            "feeding value_net) -- this opts back into a controlled, decision_value_coef"
+                            "-scaled version of that gradient during the main PPO update loop (does NOT "
+                            "affect pretrain_value(), Phase 1's online-BC value fallback, or the "
+                            "value-only continuation, which keep the fully-detached behaviour either "
+                            "because decision_net's forward there is already under torch.no_grad(), or "
+                            "because their optimizer/backward timing isn't safe to merge -- see "
+                            "ai_trainer_knowledge.md 'Separate value network'). execution_net's own trunk "
+                            "is never affected either way -- value_net has zero weight sharing with it "
+                            "regardless of this flag."
+                        ))
+    parser.add_argument("--decision-value-coef", type=float, default=None,
+                        help=(
+                            "Scales the slice of --share-value-grad-with-decision's leaked gradient that "
+                            "reaches decision_net specifically (default: ppo.decision_value_coef in "
+                            "ai_config.json). Deliberately separate from vf_coef, which keeps scaling "
+                            "value_loss's contribution to value_net's own trunk unchanged -- this knob "
+                            "only tunes how much of that additionally reaches decision_net. No effect "
+                            "without --share-value-grad-with-decision."
+                        ))
     parser.add_argument("--bc-dataset", type=str, default=None,
                         help=(
                             "Path to a directory of .npz demonstration files for offline BC "
@@ -329,6 +352,12 @@ def main() -> None:
         else int(bc_cfg.get("bc_online_steps", bc_cfg.get("pretrain_steps", 0)))
     )
 
+    # --decision-value-coef falls back to ppo.decision_value_coef in ai_config.json.
+    _decision_value_coef = (
+        args.decision_value_coef if args.decision_value_coef is not None
+        else float(cfg.get("ppo", {}).get("decision_value_coef", 0.5))
+    )
+
     # Build trainer (--no-bc-aux zeros out the aux coeff in config)
     if args.no_bc_aux:
         import copy
@@ -344,11 +373,15 @@ def main() -> None:
             device=device,
             checkpoint_dir=checkpoint_dir,
             separate_value_net=args.separate_value_net,
+            share_value_grad_with_decision=args.share_value_grad_with_decision,
+            decision_value_coef=_decision_value_coef,
         )
     else:
         trainer = PPOTrainer.from_config(
             device=device, checkpoint_dir=checkpoint_dir,
             separate_value_net=args.separate_value_net,
+            share_value_grad_with_decision=args.share_value_grad_with_decision,
+            decision_value_coef=_decision_value_coef,
         )
 
     # --dagger-*: override bc.dagger_* (read into trainer._dagger_* at

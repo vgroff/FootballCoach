@@ -13,7 +13,7 @@ from footballcoach.config import load_graphics_config
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.pitch import Pitch
 from footballcoach.entities.player import Player, PlayerState, Team
-from footballcoach.ui import style
+from footballcoach.ui import player_sprites, style
 from footballcoach.ui.camera import Camera
 
 from footballcoach.mathutils import Vector3
@@ -192,6 +192,8 @@ class Renderer:
         hi = gcfg.get("heading_indicator", {})
         self._heading_length_px: int = int(hi.get("length_px", 8))
         self._heading_alpha: int = int(hi.get("alpha", 255))
+        self._heading_base_half_width_px: float = float(hi.get("base_half_width_px", 6.0))
+        self._heading_base_inset_px: float = float(hi.get("base_inset_px", 3.0))
         _pn = gcfg.get("pause_notification", {})
         self.pause_notification_font = pygame.font.Font(style.FONT_NAME, _pn.get("font_size_px", 26))
 
@@ -224,6 +226,13 @@ class Renderer:
         self._ring_color_rolling: tuple = _rgb("color_rolling", style.BALL_STATE_ROLLING_OUTLINE)
         self._ring_color_bounced: tuple = _rgb("color_bounced", style.BALL_STATE_BOUNCED_OUTLINE)
 
+        # Goal net mesh
+        _gn = gcfg.get("goal_net", {})
+        self._goal_net_spacing_m: float = float(_gn.get("spacing_m", 0.35))
+        self._goal_net_alpha: int = int(_gn.get("alpha", style.GOAL_NET_ALPHA))
+        _gn_col = _gn.get("color", list(style.GOAL_NET_COLOUR))
+        self._goal_net_colour: tuple = (int(_gn_col[0]), int(_gn_col[1]), int(_gn_col[2]))
+
         # Ball trail
         _bt = gcfg.get("ball_trail", {})
         self._trail_length: int = _bt.get("length", 10)
@@ -235,6 +244,14 @@ class Renderer:
         self._trail_radius_taper: float = max(0.0, min(1.0, float(_bt.get("radius_taper", 0.35))))
         self._trail_interp_steps: int = max(1, int(_bt.get("interp_steps", 1)))
         self._ball_trail: collections.deque = collections.deque(maxlen=self._trail_length)
+
+        # Player sprites (see player_sprites.py) -- replaces the plain
+        # circle when enabled. Per-player gait phase is renderer-side state
+        # (purely cosmetic, so it doesn't belong on the engine's Player),
+        # advanced once per rendered frame via update_player_animations.
+        self._sprites_enabled: bool = bool(gcfg.get("player_sprites", {}).get("enabled", True))
+        self._sprite_params = player_sprites.PlayerSpriteParams.from_config() if self._sprites_enabled else None
+        self._player_gait_phase: dict[str, float] = {}
 
     @staticmethod
     def _make_fibonacci_sphere(n: int) -> list:
@@ -300,6 +317,18 @@ class Renderer:
             ]
             self._ball_orientation = self._mat_mul3(dR, self._ball_orientation)
 
+    def update_player_animations(self, players: list[Player], dt_s: float) -> None:
+        """Advances each player's stride-gait phase (see player_sprites.py).
+        Call once per rendered frame (only when not paused), before drawing
+        any players -- a no-op if sprites are disabled."""
+        if not self._sprites_enabled:
+            return
+        for player in players:
+            phase = self._player_gait_phase.get(player.player_id, 0.0)
+            self._player_gait_phase[player.player_id] = player_sprites.advance_gait_phase(
+                phase, player.speed_mps, dt_s, self._sprite_params
+            )
+
     def draw_pitch(self, surface: pygame.Surface, pitch: Pitch) -> None:
         surface.fill(style.PITCH_GREEN)
         cam = self.camera
@@ -342,11 +371,147 @@ class Renderer:
             spot_px = cam.world_to_screen(spot.x, spot.y)
             pygame.draw.circle(surface, style.PITCH_LINE_WHITE, spot_px, max(2, line_w // 2))
 
-        # Goal mouths, drawn as a small rectangle protruding outside the pitch.
+        # Goal mouths: post/crossbar outline, netting, and a coloured bar
+        # behind each showing which team defends that end.
         half_goal_w = pitch.goal_width_m / 2.0
         goal_depth_m = 2.0
         rect_world(-pitch.half_length - goal_depth_m, -half_goal_w, -pitch.half_length, half_goal_w)
         rect_world(pitch.half_length, -half_goal_w, pitch.half_length + goal_depth_m, half_goal_w)
+        self._draw_goal_net(surface, -pitch.half_length - goal_depth_m, -pitch.half_length, half_goal_w)
+        self._draw_goal_net(surface, pitch.half_length, pitch.half_length + goal_depth_m, half_goal_w)
+        self._draw_defending_marker(surface, -pitch.half_length - goal_depth_m, half_goal_w, style.TEAM_LEFT_COLOUR, faces_positive_x=False)
+        self._draw_defending_marker(surface, pitch.half_length + goal_depth_m, half_goal_w, style.TEAM_RIGHT_COLOUR, faces_positive_x=True)
+
+        self._draw_corner_flags(surface, pitch)
+        self._draw_sideline_benches(surface, pitch)
+
+    def _draw_goal_net(self, surface: pygame.Surface, x0: float, x1: float, half_goal_w: float) -> None:
+        """Fills the goal frame's footprint (back panel + the two side
+        panels, which in this top-down view all project onto the same
+        rectangle) with a translucent diagonal net mesh, drawn on an
+        isolated SRCALPHA surface sized to the box so the diagonal lines
+        clip cleanly at its edges without per-line clamping math."""
+        cam = self.camera
+        p0 = cam.world_to_screen(x0, -half_goal_w)
+        p1 = cam.world_to_screen(x1, half_goal_w)
+        left, top = min(p0[0], p1[0]), min(p0[1], p1[1])
+        w, h = abs(p1[0] - p0[0]), abs(p1[1] - p0[1])
+        if w < 2 or h < 2:
+            return
+        net_surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        spacing = max(2, int(self._goal_net_spacing_m * cam.pixels_per_metre))
+        colour = (*self._goal_net_colour, self._goal_net_alpha)
+        for i in range(-h, w, spacing):
+            pygame.draw.line(net_surf, colour, (i, 0), (i + h, h), 1)
+            pygame.draw.line(net_surf, colour, (i + h, 0), (i, h), 1)
+        surface.blit(net_surf, (left, top))
+
+    def _draw_defending_marker(
+        self, surface: pygame.Surface, back_x: float, half_goal_w: float,
+        colour: tuple[int, int, int], faces_positive_x: bool,
+    ) -> None:
+        """A translucent bar set back a little behind the goal net, in the
+        defending team's colour, spanning a bit wider than the goal mouth
+        so it reads at a glance from the whole penalty area."""
+        cam = self.camera
+        gap_m = 0.3
+        bar_depth_m = 1.0
+        overhang_m = 1.5
+        x0 = back_x + gap_m if faces_positive_x else back_x - gap_m
+        x1 = x0 + bar_depth_m if faces_positive_x else x0 - bar_depth_m
+        p0 = cam.world_to_screen(x0, -(half_goal_w + overhang_m))
+        p1 = cam.world_to_screen(x1, half_goal_w + overhang_m)
+        left, top = min(p0[0], p1[0]), min(p0[1], p1[1])
+        w, h = max(1, abs(p1[0] - p0[0])), max(1, abs(p1[1] - p0[1]))
+        bar_surf = pygame.Surface((w, h), pygame.SRCALPHA)
+        bar_surf.fill((*colour, style.DEFENDING_SIDE_MARKER_ALPHA))
+        surface.blit(bar_surf, (left, top))
+
+    def _draw_corner_flags(self, surface: pygame.Surface, pitch: Pitch) -> None:
+        """Small pennant + pole at each of the 4 pitch corners."""
+        cam = self.camera
+        flag_h_m, flag_w_m = 0.55, 0.4
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                cx, cy = sx * pitch.half_length, sy * pitch.half_width
+                pole = cam.world_to_screen(cx, cy)
+                pygame.draw.circle(surface, style.CORNER_FLAG_POLE_COLOUR, pole, 2)
+                # Pennant leans inward over the pitch so it's never clipped
+                # by the window edge, and its two "furled" points sit at the
+                # pole (up the pole a touch) — cloth billowing away from it.
+                tip = cam.world_to_screen(cx - sx * flag_w_m, cy - sy * flag_h_m * 0.35)
+                up = cam.world_to_screen(cx, cy - sy * flag_h_m)
+                tri = (pole, up, tip)
+                pygame.gfxdraw.filled_polygon(surface, tri, style.CORNER_FLAG_COLOUR)
+                pygame.gfxdraw.aapolygon(surface, tri, style.CORNER_FLAG_COLOUR)
+
+    # x-offsets (metres, from the halfway line) of each bench along a
+    # touchline -- spread across the middle third of the pitch, well clear
+    # of the penalty boxes and corners regardless of pitch size.
+    _BENCH_X_OFFSETS_M = (-16.0, -8.5, -1.0, 6.5, 14.0)
+
+    def _draw_sideline_benches(self, surface: pygame.Surface, pitch: Pitch) -> None:
+        """A row of simple technical-area benches just outside each
+        touchline -- pure dressing, no gameplay meaning."""
+        cam = self.camera
+        bench_len_m, bench_depth_m, gap_m = 5.0, 1.1, 0.6
+        for side in (-1, 1):  # -1 = below the pitch (screen), 1 = above
+            y0 = side * (pitch.half_width + gap_m)
+            y1 = side * (pitch.half_width + gap_m + bench_depth_m)
+            for x_centre in self._BENCH_X_OFFSETS_M:
+                p0 = cam.world_to_screen(x_centre - bench_len_m / 2.0, y0)
+                p1 = cam.world_to_screen(x_centre + bench_len_m / 2.0, y1)
+                left, top = min(p0[0], p1[0]), min(p0[1], p1[1])
+                w, h = max(1, abs(p1[0] - p0[0])), max(1, abs(p1[1] - p0[1]))
+                rect = (left, top, w, h)
+                pygame.draw.rect(surface, style.BENCH_SEAT_COLOUR, rect, border_radius=2)
+                pygame.draw.rect(surface, style.BENCH_OUTLINE_COLOUR, rect, 1, border_radius=2)
+
+    _RING_SUPERSAMPLE = 4
+    _DOT_POLY_SEGMENTS = 14  # vertices approximating each ball spin-dot's outline
+
+    @classmethod
+    def _draw_ring(
+        cls, surface: pygame.Surface, colour: tuple[int, int, int],
+        pos: tuple[int, int], outer_radius: int, width: int,
+    ) -> None:
+        """Draws a smooth circular outline (a "ring"/annulus) around a player
+        or the ball (selection/possession/control-delay/stamina-flash/
+        ball-state indicators).
+
+        This deliberately avoids drawing a single ``pygame.draw.circle(...,
+        width=N)`` at game resolution: at the small radii these rings use
+        (roughly 8-20px), pygame-ce's circle rasteriser has a real, visible
+        raggedness -- sampling actual rendered frames pixel-by-pixel found
+        genuine isolated single-pixel gaps of pure background punched
+        through an otherwise-solid stroke (a ring pixel, then one pure
+        background pixel, then a ring pixel again, at the same angle),
+        worse on the SE side of the circle and, to a lesser extent, the NW
+        side. This is what looked like players "having a chunk eaten out of
+        them" -- the ring sits close enough to the player's own fill circle
+        that the hole reads as part of the player at normal zoom. Trying to
+        patch this by building the ring from two separately-rasterised
+        filled circles (an opaque outer disc plus a transparent inner
+        "punch") does not help either -- each circle has its own staircase
+        edge and the two don't line up in phase, which turned the single
+        stray hole into a visibly dashed/toothed ring instead.
+
+        Fix: render the ring at `_RING_SUPERSAMPLE`x resolution (where a
+        multi-pixel gap in the oversized rasterisation is a sub-pixel sliver
+        once scaled back down) and downsample with ``smoothscale``, which
+        area-averages rather than picking one sample point -- any leftover
+        staircase noise gets blended into a smooth anti-aliased edge instead
+        of surviving as a hole. This is the standard way to get a clean
+        result out of primitives that don't rasterise well at small sizes.
+        """
+        scale = cls._RING_SUPERSAMPLE
+        pad = 2
+        size = (outer_radius + pad) * 2
+        big = pygame.Surface((size * scale, size * scale), pygame.SRCALPHA)
+        c = (size * scale) // 2
+        pygame.draw.circle(big, colour, (c, c), outer_radius * scale, width * scale)
+        small = pygame.transform.smoothscale(big, (size, size))
+        surface.blit(small, (pos[0] - size // 2, pos[1] - size // 2))
 
     def draw_ball(self, surface: pygame.Surface, ball: Ball) -> None:
         cam = self.camera
@@ -357,7 +522,13 @@ class Renderer:
         # positions stay physically accurate, only the drawn dot size is
         # boosted. The height effect is then exaggerated on top of that
         # minimum, and a small height label is shown, per the design spec.
-        base_radius_px = max(self.min_ball_radius_px, cam.scale_length(ball.radius_m))
+        # The floor itself scales with the camera's zoom (see
+        # `Camera.zoom_scale`'s docstring) -- otherwise the ball stops
+        # growing under the "[Z]" ball-follow zoom as soon as it hits this
+        # floor, while players (radius_m 0.3 vs the ball's 0.11) keep
+        # growing well past it, leaving the ball looking disproportionately
+        # tiny next to them once zoomed in.
+        base_radius_px = max(self.min_ball_radius_px * cam.zoom_scale, cam.scale_length(ball.radius_m))
         height_boost = 1.0 + min(ball.height_m, 5.0) * self._ball_height_boost_per_m
         radius_px = max(2, int(base_radius_px * height_boost))
 
@@ -404,8 +575,7 @@ class Renderer:
         pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px, style.BALL_COLOUR)
         if self._ball_outline and self._ball_outline_width > 0.0:
             if self._ball_outline_width >= 1.0:
-                pygame.draw.circle(surface, style.BALL_OUTLINE, pos, radius_px, int(self._ball_outline_width))
-                pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px, style.BALL_OUTLINE)
+                self._draw_ring(surface, style.BALL_OUTLINE, pos, radius_px, int(self._ball_outline_width))
             else:
                 # Sub-pixel: draw 1px outline at reduced alpha for a softer border
                 _oa = int(self._ball_outline_width * 255)
@@ -417,29 +587,60 @@ class Renderer:
         # Priority: just_bounced > flying > rolling (mutually exclusive for display).
         _ring_r = radius_px + self._ring_offset_px
         if self._ring_show_bounced and ball.just_bounced_timer_s > 0.0:
-            pygame.draw.circle(surface, self._ring_color_bounced, pos, _ring_r, self._ring_width_px)
+            self._draw_ring(surface, self._ring_color_bounced, pos, _ring_r, self._ring_width_px)
         elif self._ring_show_flying and ball.position.z > ball.radius_m + self._flying_min_height_m and ball.possessed_by is None:
-            pygame.draw.circle(surface, self._ring_color_flying, pos, _ring_r, self._ring_width_px)
+            self._draw_ring(surface, self._ring_color_flying, pos, _ring_r, self._ring_width_px)
         elif self._ring_show_rolling:
-            pygame.draw.circle(surface, self._ring_color_rolling, pos, _ring_r, self._ring_width_px)
+            self._draw_ring(surface, self._ring_color_rolling, pos, _ring_r, self._ring_width_px)
 
         # --- Dots: fixed points on the 3D ball surface, projected top-down ---
         # Always shown; rotate as the ball spins. Front hemisphere only.
         # Clipped to the ball circle so dots don't bleed outside the edge.
+        #
+        # Each dot is a small circular patch on the sphere's surface, not a
+        # flat disc floating in front of it -- so under orthographic
+        # projection it must foreshorten into an ellipse as it nears the
+        # silhouette edge (where the local surface normal is close to
+        # perpendicular to the view axis), exactly like the panels on a real
+        # football do. Rather than compute that foreshortening as an ad hoc
+        # squish-and-rotate, this projects `_DOT_POLY_SEGMENTS` points
+        # arranged in a small circle in the dot's own tangent plane (spanned
+        # by `u`/`v`, both perpendicular to the dot's centre direction)
+        # through the same rotation + orthographic projection as the centre
+        # point. The correct ellipse (or near-silhouette sliver) shape falls
+        # out automatically, with no separate foreshortening-factor math.
         orbit_r = radius_px * self._spin_orbit_frac
         dot_r = max(1, int(radius_px * self._spin_dot_radius_frac))
         pad = int(orbit_r) + dot_r + 2
         ds = pygame.Surface((pad * 2, pad * 2), pygame.SRCALPHA)
         R = self._ball_orientation
+        dot_epsilon = dot_r / orbit_r if orbit_r > 0 else 0.0
+        dot_colour = (*self._spin_dot_color, 220)
         for (lx, ly, lz) in self._ball_dot_positions:
             wx = R[0][0]*lx + R[0][1]*ly + R[0][2]*lz
             wy = R[1][0]*lx + R[1][1]*ly + R[1][2]*lz
             wz = R[2][0]*lx + R[2][1]*ly + R[2][2]*lz
-            sx = pad + int(wx * orbit_r)
-            sy = pad - int(wy * orbit_r)  # y inverted: world +y = screen up
             if wz < 0:
                 continue  # back hemisphere — hidden from top-down camera
-            pygame.draw.circle(ds, (*self._spin_dot_color, 220), (sx, sy), dot_r)
+            # Tangent basis (u, v) perpendicular to (wx, wy, wz): pick an
+            # "up" reference not nearly parallel to it, to keep the cross
+            # product well-conditioned near the poles.
+            up = (0.0, 1.0, 0.0) if abs(wz) > 0.9 else (0.0, 0.0, 1.0)
+            ux, uy, uz = wy*up[2] - wz*up[1], wz*up[0] - wx*up[2], wx*up[1] - wy*up[0]
+            ulen = math.sqrt(ux*ux + uy*uy + uz*uz) or 1.0
+            ux, uy, uz = ux/ulen, uy/ulen, uz/ulen
+            vx, vy, vz = wy*uz - wz*uy, wz*ux - wx*uz, wx*uy - wy*ux
+            poly = []
+            for k in range(self._DOT_POLY_SEGMENTS):
+                theta = 2 * math.pi * k / self._DOT_POLY_SEGMENTS
+                ct, st = math.cos(theta), math.sin(theta)
+                ex = wx + dot_epsilon * (ct*ux + st*vx)
+                ey = wy + dot_epsilon * (ct*uy + st*vy)
+                ez = wz + dot_epsilon * (ct*uz + st*vz)
+                elen = math.sqrt(ex*ex + ey*ey + ez*ez) or 1.0
+                poly.append((int(pad + (ex/elen)*orbit_r), int(pad - (ey/elen)*orbit_r)))
+            pygame.gfxdraw.filled_polygon(ds, poly, dot_colour)
+            pygame.gfxdraw.aapolygon(ds, poly, dot_colour)
         # Clip dots inside the outline so they don't bleed over the alpha border
         clip = pygame.Surface((pad * 2, pad * 2), pygame.SRCALPHA)
         clip_r = max(1, radius_px - int(max(1, self._ball_outline_width)))
@@ -450,6 +651,43 @@ class Renderer:
         if ball.height_m > 0.15:
             label = self.hud_font.render(f"{ball.height_m:.1f}m", True, style.HUD_TEXT)
             surface.blit(label, (pos[0] + radius_px + 2, pos[1] - label.get_height() // 2))
+
+    def _draw_player_sprite(
+        self, surface: pygame.Surface, player: Player, pos: tuple[int, int], radius_px: int,
+        colour: tuple[int, int, int], is_inactive: bool,
+    ) -> None:
+        """Draws the rotated/scaled top-down sprite in place of the plain
+        circle (see player_sprites.py). `colour` is the same team/goalkeeper
+        colour `draw_player` already resolved -- reused as the sprite's
+        shirt colour, so a keeper's sprite set is cached under its own
+        distinct colour exactly like the old circle was."""
+        side, level = player_sprites.pick_pose(
+            self._player_gait_phase.get(player.player_id, 0.0), player.speed_mps, self._sprite_params
+        )
+        sprite_set = player_sprites.get_sprite_set(self._sprite_params, colour)
+        base_sprite = sprite_set.get(side, level)
+
+        # Rotate to match heading: the sprite's own local art faces "down"
+        # (+y); `hx, hy` is the same screen-space facing vector the heading
+        # arrow below uses. rotozoom's angle is counter-clockwise-as-viewed
+        # (a plain image rotation, unrelated to the y-down pixel coordinate
+        # system), so the rotation needed is (angle of the sprite's local
+        # "down" reference, i.e. 90 degrees) minus (angle of the target
+        # facing vector), both measured the same way `atan2` measures them
+        # here (which -- since screen y grows downward -- reads as
+        # clockwise-as-viewed, matching how the two cancel out below).
+        hx, hy = math.cos(-player.heading_rad), math.sin(-player.heading_rad)
+        rotate_deg = 90.0 - math.degrees(math.atan2(hy, hx))
+
+        target_diameter = max(1.0, radius_px * self._sprite_params.size_scale)
+        scale = target_diameter / base_sprite.get_width()
+        rotated = pygame.transform.rotozoom(base_sprite, rotate_deg, scale)
+
+        if is_inactive:
+            rotated = rotated.copy()
+            rotated.set_alpha(self._inactive_alpha)
+        rect = rotated.get_rect(center=pos)
+        surface.blit(rotated, rect)
 
     def draw_player(
         self, surface: pygame.Surface, player: Player, selected: bool,
@@ -472,7 +710,7 @@ class Renderer:
         """
         cam = self.camera
         pos = cam.world_to_screen(player.position.x, player.position.y)
-        radius_px = max(self.min_player_radius_px, cam.scale_length(player.radius_m))
+        radius_px = int(max(self.min_player_radius_px * cam.zoom_scale, cam.scale_length(player.radius_m)))
 
         if player.is_goalkeeper:
             colour = style.GOALKEEPER_COLOUR
@@ -500,7 +738,9 @@ class Renderer:
                 ey = sy + trail_dy * self._speed_line_length_px
                 pygame.draw.aaline(surface, style.SPEED_LINE_COLOUR, (sx, sy), (ex, ey))
 
-        if is_inactive:
+        if self._sprites_enabled:
+            self._draw_player_sprite(surface, player, pos, radius_px, colour, is_inactive)
+        elif is_inactive:
             # Draw on a small per-pixel-alpha surface so the player reads as
             # translucent rather than a flat grey substitute colour.
             diameter = radius_px * 2 + 4
@@ -517,41 +757,50 @@ class Renderer:
             period_ms = 1000.0 / max(self._stamina_flash_hz, 0.1)
             flash_on = (pygame.time.get_ticks() % int(period_ms * 2)) < int(period_ms)
             if flash_on:
-                pygame.draw.circle(surface, style.STAMINA_FLASH_OUTLINE, pos, radius_px + 11, 2)
-                pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px + 11, style.STAMINA_FLASH_OUTLINE)
+                self._draw_ring(surface, style.STAMINA_FLASH_OUTLINE, pos, radius_px + 11, 2)
 
         # State outline rings: CONTROLLING_BALL (cyan) and INACTIVE_TACKLED (red).
         if player.state == PlayerState.CONTROLLING_BALL:
-            pygame.draw.circle(surface, style.CONTROL_DELAY_OUTLINE, pos, radius_px + 4, 2)
-            pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px + 4, style.CONTROL_DELAY_OUTLINE)
+            self._draw_ring(surface, style.CONTROL_DELAY_OUTLINE, pos, radius_px + 4, 2)
         elif is_inactive:
-            pygame.draw.circle(surface, style.INACTIVE_OUTLINE, pos, radius_px + 4, 2)
-            pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px + 4, style.INACTIVE_OUTLINE)
+            self._draw_ring(surface, style.INACTIVE_OUTLINE, pos, radius_px + 4, 2)
 
         if has_ball:
-            pygame.draw.circle(surface, style.POSSESSION_OUTLINE, pos, radius_px + 2, self._possession_outline_thickness)
-            pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px + 2, style.POSSESSION_OUTLINE)
+            self._draw_ring(surface, style.POSSESSION_OUTLINE, pos, radius_px + 2, self._possession_outline_thickness)
         if selected:
-            pygame.draw.circle(surface, style.SELECTED_OUTLINE, pos, radius_px + 7, 2)
-            pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px + 7, style.SELECTED_OUTLINE)
+            self._draw_ring(surface, style.SELECTED_OUTLINE, pos, radius_px + 7, 2)
 
-        # Heading indicator - a short line showing facing direction.
-        if self._heading_alpha > 0:
-            heading_len_px = radius_px + self._heading_length_px
-            tip_dx = math.cos(-player.heading_rad) * heading_len_px
-            tip_dy = math.sin(-player.heading_rad) * heading_len_px
-            # Use a small SRCALPHA surface so the alpha is respected.
+        # Heading indicator - a broad, thin "V": two lines touching the rim
+        # at points spread wide around the front of the player, meeting at
+        # a point just ahead in the facing direction. Not filled, no
+        # outline -- just the two strokes (this replaced a filled-triangle
+        # badge that read as too heavy/blocky). Skipped when sprites are
+        # enabled -- the rotated sprite itself already shows facing (head/
+        # hair asymmetry, limb pose), so the arrow would just be clutter on
+        # top of it.
+        if self._heading_alpha > 0 and not self._sprites_enabled:
+            hx, hy = math.cos(-player.heading_rad), math.sin(-player.heading_rad)
+            perp_x, perp_y = -hy, hx
+            apex_r = radius_px + self._heading_length_px
+            base_r = radius_px - self._heading_base_inset_px
+            apex = (pos[0] + hx * apex_r, pos[1] + hy * apex_r)
+            base_cx, base_cy = pos[0] + hx * base_r, pos[1] + hy * base_r
+            bw = self._heading_base_half_width_px
+            base_l = (base_cx + perp_x * bw, base_cy + perp_y * bw)
+            base_r_pt = (base_cx - perp_x * bw, base_cy - perp_y * bw)
+
+            pts = (apex, base_l, base_r_pt)
             pad = 2
-            sx = int(min(pos[0], pos[0] + tip_dx)) - pad
-            sy = int(min(pos[1], pos[1] + tip_dy)) - pad
-            sw = int(abs(tip_dx)) + pad * 2 + 2
-            sh = int(abs(tip_dy)) + pad * 2 + 2
-            h_surf = pygame.Surface((sw, sh), pygame.SRCALPHA)
-            lp0 = (pos[0] - sx, pos[1] - sy)
-            lp1 = (pos[0] + tip_dx - sx, pos[1] + tip_dy - sy)
-            r, g, b = style.PITCH_LINE_WHITE
-            pygame.draw.aaline(h_surf, (r, g, b, self._heading_alpha), lp0, lp1)
-            surface.blit(h_surf, (sx, sy))
+            minx = int(min(p[0] for p in pts)) - pad
+            miny = int(min(p[1] for p in pts)) - pad
+            maxx = int(max(p[0] for p in pts)) + pad
+            maxy = int(max(p[1] for p in pts)) + pad
+            h_surf = pygame.Surface((maxx - minx, maxy - miny), pygame.SRCALPHA)
+            loc = lambda p: (p[0] - minx, p[1] - miny)
+            colour = (*style.HEADING_INDICATOR_COLOUR, self._heading_alpha)
+            pygame.draw.aaline(h_surf, colour, loc(apex), loc(base_l))
+            pygame.draw.aaline(h_surf, colour, loc(apex), loc(base_r_pt))
+            surface.blit(h_surf, (minx, miny))
 
         label = self.hud_font.render(player.player_id, True, style.HUD_TEXT)
         surface.blit(label, (pos[0] - label.get_width() // 2, pos[1] + radius_px + 2))
@@ -1028,6 +1277,52 @@ class Renderer:
 
         pygame.draw.rect(surface, (50, 50, 65), val_rect, border_radius=6)
         val_surf = self.hud_font.render(f"{sim_speed:g}x", True, style.HUD_ACCENT)
+        surface.blit(val_surf, (
+            val_rect.centerx - val_surf.get_width() // 2,
+            val_rect.centery - val_surf.get_height() // 2,
+        ))
+
+        for rect, symbol in ((minus_rect, "-"), (plus_rect, "+")):
+            hovered = rect.collidepoint(mouse_pos)
+            bg_colour = (70, 70, 90) if hovered else (50, 50, 65)
+            pygame.draw.rect(surface, bg_colour, rect, border_radius=6)
+            sym_surf = self.hud_font.render(symbol, True, style.HUD_ACCENT)
+            surface.blit(sym_surf, (
+                rect.centerx - sym_surf.get_width() // 2,
+                rect.centery - sym_surf.get_height() // 2,
+            ))
+
+        return minus_rect, plus_rect
+
+    def draw_zoom_control(
+        self,
+        surface: pygame.Surface,
+        zoom_level: float,
+        right_x: int,
+        top_y: int = 8,
+    ) -> tuple[pygame.Rect, pygame.Rect]:
+        """Draws a compact ``[-]  <zoom>x  [+]`` control, right-aligned to
+        `right_x` (same look/layout as `draw_speed_control`; callers place
+        this immediately to that control's left so it doesn't collide with
+        the player-inspector panel that can appear just below this row).
+        The value box is highlighted in the accent colour whenever
+        `zoom_level` is actually engaged (> 1.0), so it's visible at a
+        glance whether the ball-follow zoom is currently active. Returns
+        `(minus_rect, plus_rect)` for click handling."""
+        btn_w, btn_h = 28, 32
+        val_w = 56
+        gap = 4
+        mouse_pos = pygame.mouse.get_pos()
+
+        plus_rect = pygame.Rect(right_x - btn_w, top_y, btn_w, btn_h)
+        val_rect = pygame.Rect(plus_rect.x - gap - val_w, top_y, val_w, btn_h)
+        minus_rect = pygame.Rect(val_rect.x - gap - btn_w, top_y, btn_w, btn_h)
+
+        active = zoom_level > 1.0
+        val_bg = style.HUD_ACCENT if active else (50, 50, 65)
+        val_text_colour = (10, 10, 18) if active else style.HUD_ACCENT
+        pygame.draw.rect(surface, val_bg, val_rect, border_radius=6)
+        val_surf = self.hud_font.render(f"{zoom_level:g}x", True, val_text_colour)
         surface.blit(val_surf, (
             val_rect.centerx - val_surf.get_width() // 2,
             val_rect.centery - val_surf.get_height() // 2,

@@ -16,7 +16,7 @@
     "attacker_b_running": true,
     "defender_dist_from_goal_m": 7.5,
     "defender_y_m": -5.8,
-    "pass_power_multiplier": 2.1,
+    "pass_power_multiplier": 3.4,
 
     "_comment_attrs": "Per-player attribute overrides. Each key overrides that attribute for the uniform skill drawn from *_skill_min/max. Omit a key to keep the uniform value. Attributes: top_speed, acceleration, stamina, kick_precision, kick_power, dribbling, ball_control, tackling.",
     "atk_a_attrs": {

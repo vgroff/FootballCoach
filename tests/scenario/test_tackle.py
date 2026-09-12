@@ -4,15 +4,34 @@ the outcome is deterministic based purely on attribute comparison.
 from __future__ import annotations
 
 import random
+from dataclasses import dataclass, field
+from typing import Callable
 
 from footballcoach.engine.match import Match
-from footballcoach.entities import Ball, Pitch, Team
+from footballcoach.entities import Ball, Pitch, Player, Team
 from footballcoach.mathutils import Vector3
 from footballcoach.engine.collision import are_touching
-from footballcoach.engine.movement import MovementParams, effective_top_speed
-from footballcoach.orders import ChaseTackleOrder, GetPossessionOrder
+from footballcoach.engine.movement import MovementParams, SpeedMode, effective_top_speed
+from footballcoach.orders import ChaseTackleOrder, GetPossessionOrder, OrderStatus
 from footballcoach.rules_ai import Phase1RulesAI, StopWhenIdleAI
 from tests.conftest import make_player
+
+
+@dataclass
+class _StraightSprintOrder:
+    """Minimal order: sprint in a fixed direction forever, no braking and no
+    opponent-avoidance repulsion (unlike MoveOrder, which steers around
+    other players). Used to force a genuine head-on collision in tests
+    that need one, rather than the normal AI behaviour of curving around
+    an opponent to avoid contact."""
+    direction: Vector3
+    status: OrderStatus = OrderStatus.PENDING
+    on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
+
+    def execute(self, player: Player, match: Match, dt: float) -> bool:
+        player.desired_direction = self.direction
+        player.desired_speed_mode = SpeedMode.SPRINT
+        return False
 
 
 def test_tackle_wins_ball_from_carrier():
@@ -119,3 +138,77 @@ def test_armed_tackle_fires_before_autotackle_on_sprint_into_range():
         "armed path (tackle_armed + _check_armed_tackles)"
     )
     assert ball.possessed_by == chaser.player_id, "Armed tackle fired but chaser didn't win"
+
+
+def test_elite_dribbler_pushes_past_beaten_defender_fast_and_unslowed():
+    """An elite dribbler (1.0) running full pelt, with a slight lateral
+    deviation, into a hopeless tackler (0.0) should: resolve exactly one
+    tackle attempt (win it), then push straight through the now-inactive
+    defender almost immediately and at near-unchanged speed — not get
+    stuck gliding against them.
+
+    This exercises collision.py's rule that BOTH position push-apart and
+    velocity damping are skipped for pairs where either player is inactive
+    (see resolve_all_overlaps' docstring): before that fix, damping still
+    applied to inactive pairs, so the dribbler would keep bleeding speed
+    for as long as the two remained overlapping.
+
+    No explicit tackle order is given to the defender — contact alone
+    triggers the collision-based auto-tackle path (_check_head_on_tackles).
+    """
+    pitch = Pitch.standard()
+    attacker = make_player("attacker", Team.LEFT, position=Vector3(-10.0, 0.15, 0.0), dribbling=1.0)
+    defender = make_player("defender", Team.RIGHT, position=Vector3(0.0, 0.0, 0.0), tackling=0.0)
+    defender.ai = StopWhenIdleAI()  # stationary; not under test
+
+    ball = Ball.at_rest(attacker.position)
+    ball.possessed_by = attacker.player_id
+
+    match = Match(pitch=pitch, players=[attacker, defender], ball=ball,
+                  rng_reduction=1.0, rng=random.Random(0))
+
+    # Straight sprint at the defender: MoveOrder would steer around them via
+    # repulsion (realistic AI behaviour, but it would avoid the collision
+    # this test needs to force).
+    attacker.current_order = _StraightSprintOrder(direction=Vector3(1.0, 0.0, 0.0))
+
+    tackle_results: list[bool] = []
+
+    def on_defender_auto_result(player: Player, tackler_won: bool, is_tackler: bool) -> None:
+        if is_tackler:
+            tackle_results.append(tackler_won)
+
+    defender.on_auto_tackle_result = on_defender_auto_result
+
+    min_clear_distance = attacker.radius_m + defender.radius_m
+    contact_start_s: float | None = None
+    speed_at_contact_start: float | None = None
+    clear_s: float | None = None
+
+    for _ in range(10 * 30):  # 10s of headroom at the default 30Hz tick rate
+        match.step()
+
+        if contact_start_s is None and are_touching(attacker, defender):
+            contact_start_s = match.time_s
+            speed_at_contact_start = attacker.speed_mps
+
+        if contact_start_s is not None and clear_s is None:
+            dist = attacker.position.xy().distance_to(defender.position.xy())
+            if dist >= min_clear_distance:
+                clear_s = match.time_s
+                break
+
+    assert len(tackle_results) == 1, f"expected exactly one tackle attempt, got {len(tackle_results)}"
+    assert tackle_results[0] is False, "defender (0 tackling) should lose to attacker (1.0 dribbling)"
+    assert ball.possessed_by == attacker.player_id
+
+    assert contact_start_s is not None, "attacker never made contact with the defender"
+    assert clear_s is not None, "attacker never cleared the defender within the simulated window"
+
+    time_to_clear = clear_s - contact_start_s
+    assert time_to_clear < 0.2, f"took {time_to_clear:.3f}s to get past the defender, expected < 0.2s"
+
+    speed_change = abs(attacker.speed_mps - speed_at_contact_start)
+    assert speed_change < 0.5, (
+        f"attacker's speed changed by {speed_change:.3f} m/s while passing the defender, expected < 0.5 m/s"
+    )

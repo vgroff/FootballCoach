@@ -4,11 +4,43 @@ screen used by both.
 """
 from __future__ import annotations
 
+import sys
 from dataclasses import dataclass, field
 from enum import Enum, auto
 from pathlib import Path
 
 import pygame
+
+
+def _make_process_dpi_aware() -> None:
+    """Windows only: tells the OS this process renders at its own native
+    pixel resolution, so it must not bitmap-scale our window to match a
+    non-100% display scaling factor.
+
+    Without this, on any display running e.g. 125%/150% scaling (the
+    Windows default on most laptops and many external monitors), the
+    desktop compositor resamples our whole window after the fact. That
+    resampling is what looked like players "having a chunk eaten out of
+    them" — a soft, direction-biased blur on one side of small circles
+    (confirmed by inspecting a user-supplied screenshot pixel-by-pixel: a
+    multi-pixel *gradual* red-to-green blend, not the crisp 1px edge
+    `pygame.gfxdraw.aacircle` actually draws — that gradual blend is a
+    resampling-filter signature, not anything this renderer draws). Must be
+    called before `pygame.display.set_mode()` creates the window — ideally
+    before `pygame.init()` — since DPI awareness is fixed for the process
+    once a window exists. No-op (silently) on non-Windows platforms or if
+    the API isn't available.
+    """
+    if sys.platform != "win32":
+        return
+    try:
+        import ctypes
+        try:
+            ctypes.windll.shcore.SetProcessDpiAwareness(2)  # PROCESS_PER_MONITOR_DPI_AWARE
+        except (AttributeError, OSError):
+            ctypes.windll.user32.SetProcessDPIAware()  # fallback: system DPI aware (Vista+)
+    except Exception:
+        pass  # best-effort — a blurry window beats a crashed one
 
 from footballcoach.config import load_graphics_config, load_gameplay_config
 from footballcoach.engine.match import Match
@@ -85,6 +117,7 @@ class App:
     _MIN_WINDOW_H = 480
 
     def __init__(self) -> None:
+        _make_process_dpi_aware()
         pygame.init()
         pygame.display.set_caption("Football Coach")
 
@@ -95,6 +128,10 @@ class App:
             pixels_per_metre=_cam_cfg.get("pixels_per_metre", 9.0),
             margin_px=int(_cam_cfg.get("margin_px", 40)),
         )
+        _zoom_max = float(_cam_cfg.get("max_zoom", 5.0))
+        _zoom_step = float(_cam_cfg.get("zoom_step", 0.5))
+        _n_steps = max(1, round((_zoom_max - 1.0) / _zoom_step))
+        self._ZOOM_LEVELS: tuple[float, ...] = tuple(1.0 + i * _zoom_step for i in range(_n_steps + 1))
         self._target_fps: int = int(_gcfg.get("target_fps", 60))
         _gpcfg = load_gameplay_config().get("ui", {})
         self._physics_tick_hz: float = float(_gpcfg.get("physics_tick_hz", 30))
@@ -131,6 +168,8 @@ class App:
         self.help_button_rect = pygame.Rect(0, 0, 90, 32)
         self._speed_minus_rect = pygame.Rect(0, 0, 0, 0)
         self._speed_plus_rect = pygame.Rect(0, 0, 0, 0)
+        self._zoom_minus_rect = pygame.Rect(0, 0, 0, 0)
+        self._zoom_plus_rect = pygame.Rect(0, 0, 0, 0)
 
         # Game log
         self.game_log = GameLog(max_entries=50)
@@ -157,7 +196,10 @@ class App:
         # next to the Help button. Steps/frame = round(physics_tick_hz * speed / target_fps).
         _default_sim_speed = float(load_gameplay_config().get("ui", {}).get("default_sim_speed", 2.0))
         self._sim_speed: float = _default_sim_speed
-        self._SIM_SPEED_OPTIONS: tuple[float, ...] = (0.2, 0.5, 1.0, 2.0, 4.0, 8.0)
+        # Linear 0.25 steps (0.25x-8x) rather than the old doubling sequence
+        # (0.2/0.5/1/2/4/8) -- finer control around normal speed, at the
+        # cost of more clicks/keypresses to reach the extremes.
+        self._SIM_SPEED_OPTIONS: tuple[float, ...] = tuple(round(i * 0.25, 2) for i in range(1, 33))
 
         # Training mode: neural control toggle for the trainee (see `N` hotkey
         # in _handle_keydown / _toggle_training_ai_mode). None = human control
@@ -230,6 +272,10 @@ class App:
                 self._cycle_sim_speed(-1)
             elif self.screen == Screen.MATCH and not self.show_help and event.type == pygame.MOUSEBUTTONDOWN and self._speed_plus_rect.collidepoint(event.pos):
                 self._cycle_sim_speed(1)
+            elif self.screen == Screen.MATCH and not self.show_help and event.type == pygame.MOUSEBUTTONDOWN and self._zoom_minus_rect.collidepoint(event.pos):
+                self._cycle_zoom(-1)
+            elif self.screen == Screen.MATCH and not self.show_help and event.type == pygame.MOUSEBUTTONDOWN and self._zoom_plus_rect.collidepoint(event.pos):
+                self._cycle_zoom(1)
             elif self.screen == Screen.MATCH and not self.show_help:
                 self._handle_match_mouse_event(event)
 
@@ -299,6 +345,8 @@ class App:
             self._cycle_sim_speed(1)
         elif key == pygame.K_LEFTBRACKET:
             self._cycle_sim_speed(-1)
+        elif key == pygame.K_z:
+            self._cycle_zoom(1)
 
     def _cycle_sim_speed(self, direction: int) -> None:
         """Steps `self._sim_speed` to the next (`direction=1`) or previous
@@ -309,6 +357,19 @@ class App:
         opts = self._SIM_SPEED_OPTIONS
         idx = min(range(len(opts)), key=lambda i: abs(opts[i] - self._sim_speed))
         self._sim_speed = opts[(idx + direction) % len(opts)]
+
+    def _cycle_zoom(self, direction: int) -> None:
+        """Steps the camera's zoom level to the next (`direction=1`) or
+        previous (`direction=-1`) entry in `_ZOOM_LEVELS` (1.0 = no zoom,
+        up to `graphics.json["camera"]["max_zoom"]`), snapping to the
+        nearest level first (so this is well-defined even if the zoom level
+        was set to a value not in the list). Wraps around at either end,
+        same as `_cycle_sim_speed`. Shared by the `Z` hotkey (always steps
+        forward) and the on-screen [-]/[+] control."""
+        opts = self._ZOOM_LEVELS
+        idx = min(range(len(opts)), key=lambda i: abs(opts[i] - self.camera.zoom_factor))
+        idx = (idx + direction) % len(opts)
+        self.camera.set_zoom_level(opts[idx])
 
     def _handle_match_mouse_event(self, event: pygame.event.Event) -> None:
         if self.input_controller is None:
@@ -832,12 +893,22 @@ class App:
 
     def _draw_match(self) -> None:
         assert self.match is not None and self.input_controller is not None
+        if self.camera.zoomed:
+            self.camera.follow(self.match.ball.position.x, self.match.ball.position.y)
         self.renderer.draw_pitch(self.surface, self.match.pitch)
 
         selected_id = self.input_controller.selected_player_id
         carrier_id = self.match.ball.possessed_by
-        # Draw the ball carrier last so they always render on top of every
-        # other player, per the design spec.
+        if not self.match.paused:
+            self.renderer.update_player_animations(self.match.players, 1.0 / self._target_fps)
+            self.renderer.update_ball_effects(self.match.ball, 1.0 / self._target_fps)
+        # Ball drawn before players (not after) so a player standing over it
+        # -- e.g. the carrier dribbling -- renders on top rather than the
+        # ball covering up the (now much bigger/more detailed) player sprite.
+        self.renderer.draw_ball(self.surface, self.match.ball)
+
+        # Draw the ball carrier last among players so they render on top of
+        # every other player, per the design spec.
         ordered_players = sorted(self.match.players, key=lambda p: p.player_id == carrier_id)
         now_s = pygame.time.get_ticks() / 1000.0
         for player in ordered_players:
@@ -848,9 +919,6 @@ class App:
                 has_ball=pid == carrier_id,
                 action_icon=action_icon,
             )
-        if not self.match.paused:
-            self.renderer.update_ball_effects(self.match.ball, 1.0 / self._target_fps)
-        self.renderer.draw_ball(self.surface, self.match.ball)
 
         kick_state = self.input_controller.kick_ui_state()
         if kick_state is not None:
@@ -923,6 +991,9 @@ class App:
         self._draw_help_button()
         self._speed_minus_rect, self._speed_plus_rect = self.renderer.draw_speed_control(
             self.surface, self._sim_speed, self.help_button_rect.x - 12,
+        )
+        self._zoom_minus_rect, self._zoom_plus_rect = self.renderer.draw_zoom_control(
+            self.surface, self.camera.zoom_factor, self._speed_minus_rect.x - 12,
         )
         self.renderer.draw_hotkey_bar(self.surface, self._hotkey_entries())
         panel_player = self.input_controller.panel_player()
@@ -1004,6 +1075,7 @@ class App:
             "Space                    - pause/resume the simulation",
             "] / [                    - increase / decrease simulation speed (0.2x-8x)",
             "[-]/[+] control (top right) - same simulation speed control, via mouse",
+            "Z or [-]/[+] Zoom control - step the ball-follow camera zoom (1.0x-5.0x)",
             "H or Help button         - toggle this help overlay",
             "L                        - cycle game log level (INFO / DEBUG)",
             "Esc                      - close this overlay, or return to the menu / quit",
@@ -1050,12 +1122,13 @@ class App:
             ("[S]",   "Save",   is_gk,       False),
             ("[X]",   "Stop",   is_selected, False),
             ("[RClk]", "Get Possession", is_selected, False),
+            ("[Z]",   "Zoom",   True,        self.camera.zoomed),
             ("[H]",   "Help",   True,        self.show_help),
             ("[Esc]", "Menu",   True,        False),
         ]
         if self.is_training_mode:
             is_neural = self._training_checkpoint_idx != -1
-            entries.insert(6, ("[N]", "Neural AI" if not is_neural else "Human", True, is_neural))
+            entries.insert(7, ("[N]", "Neural AI" if not is_neural else "Human", True, is_neural))
         return entries
 
 

@@ -366,14 +366,31 @@ what's best for value prediction.
 `--separate-value-net` constructs a second, **fully independent**
 `ExecutionNetwork` (`trainer.value_net`, own trunk/encoders/optimizer, zero
 weight sharing with `execution_net`) and uses it as the **sole critic for
-the entire run** — BC pre-training (`pretrain_combined()`'s Phase 0/Phase 1
-joint value-loss terms are skipped entirely when this is on — the whole
-point is a critic that never sees a BC gradient), value warm-up
-(`pretrain_value()`), and PPO (`_ppo_update()`'s value loss trains
-`value_net` via its own `value_net_optimizer`, with `d_heads` detached before
-reaching it so no gradient leaks back into `decision_net`). Meanwhile
-`execution_net.value_head`/`execution_net.value_ai_type_channel` are frozen
-and structurally unused in this mode.
+the entire run** — BC pre-training, value warm-up (`pretrain_value()`), and
+PPO. Meanwhile `execution_net.value_head`/`execution_net.value_ai_type_channel`
+are frozen and structurally unused in this mode.
+
+**Correction (this note previously said Phase 0's value term is "skipped
+entirely" under `separate_value_net` — that's stale/wrong):** only Phase 1's
+*joint* BC+value term (`_use_joint_val`) is force-disabled
+(`not self.separate_value_net` is one of its gating conditions).
+`pretrain_combined()`'s **Phase 0** (`demo_epochs`) runs regardless of
+`separate_value_net` — `decision_net`'s own warm-up optimizer (`demo_opt`)
+and `self.value_net`'s (`_value_opt`) both step off the SAME combined
+backward (`dec_bc_loss + phase0_value_coef * val_loss`), and critically,
+Phase 0 calls `self._value_heads()` for the value forward, which does
+**not** detach `d_heads` — so `decision_net` already receives
+`phase0_value_coef`-scaled gradient from `value_net`'s loss during Phase 0,
+unconditionally, in both modes. The `d_heads`-detach discussed below is
+specific to `_ppo_update()` (and Phase 1's `_use_separate_value_training`
+online-BC fallback, and `pretrain_value()`'s own rollout-fit epochs, where
+`decision_net`'s forward runs under `torch.no_grad()` regardless).
+
+In `_ppo_update()`, the value loss trains `value_net` via its own
+`value_net_optimizer`, with `d_heads` detached before reaching it by default
+so no gradient leaks back into `decision_net` there — see
+"`share_value_grad_with_decision`" below for an opt-in way to lift that,
+scoped to this one call site.
 
 This is a **permanent architecture switch**, distinct from the
 `--experiment-separate-value-net` diagnostic flag (see `pretrain_value()`'s
@@ -395,6 +412,41 @@ keeps `value_net` at its fresh random init rather than crashing.
 
 See `tests/ai_scenario/test_separate_value_net.py` for the test coverage
 (construction, value routing, gradient isolation, checkpoint round-trip).
+
+#### `--share-value-grad-with-decision` / `ppo.decision_value_coef`
+
+Opt-in, only meaningful alongside `--separate-value-net`. By default
+`value_net`'s critic gradient never reaches `decision_net` (see the
+`_ppo_update()` note above) — this flag lifts that, but **only inside
+`_ppo_update()`'s per-minibatch loop**, since that's the one live call site
+where `decision_net`'s forward isn't already gradient-dead for this purpose
+(either wrapped in `torch.no_grad()`, as in `pretrain_value()`/the
+value-only continuation, or running through a genuinely separately-timed
+optimizer/backward, as in Phase 1's `_use_separate_value_training` online-BC
+fallback — extending either safely needs more than dropping the detach, see
+`_scale_decision_heads_grad`'s docstring for why). `execution_net`'s own
+trunk is never touched either way — `value_net` has zero weight sharing
+with it regardless of this flag.
+
+Mechanism: `_scale_decision_heads_grad(d_heads, coef)` (`ppo_trainer.py`,
+next to `_detach_decision_heads`) clones each `d_heads` field and registers
+a backward hook scaling that clone's incoming gradient by `coef`, instead of
+detaching. Cloning (not hooking the original tensor) is load-bearing — the
+same `d_heads` also feeds `execution_net` to produce the policy's own
+`e_heads` in the same forward pass, so hooking the original would incorrectly
+scale the policy's own gradient too; the clone gets its own graph node, so
+the hook only touches the gradient contribution arriving from
+`self.value_net`.
+
+`decision_value_coef` (`ppo` config, CLI `--decision-value-coef`) is a
+**separate** knob from `vf_coef` — `vf_coef` keeps scaling `value_loss`'s
+contribution to `value_net`'s own trunk exactly as before regardless of this
+feature; `decision_value_coef` only scales the additional slice of that same
+gradient crossing into `decision_net`. They compose multiplicatively
+(`decision_net` sees `vf_coef * decision_value_coef * d(value_loss)`), so
+they were kept independent deliberately rather than overloading `vf_coef` —
+reusing it would have coupled two conceptually different jobs (weighting a
+loss term vs. gating a cross-network gradient leak) onto one number.
 
 ### 3.7 Parallel rollout collection (`ppo.n_parallel_envs`)
 

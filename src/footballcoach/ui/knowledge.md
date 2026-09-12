@@ -42,6 +42,32 @@ swappable/removable without touching the engine, per the project's
   machine (`MENU` / `SCENARIO_PARAMS` / `MATCH`), and wires input events to
   `MatchInputController` + `Match.step()` + `Renderer` + `GameLog`.
 
+## Windows DPI awareness (`app.py::_make_process_dpi_aware`)
+
+Called once, before `pygame.init()`, in `App.__init__`. On Windows, a
+process that hasn't declared itself DPI-aware gets its whole window
+bitmap-rescaled by the desktop compositor to match the display's scaling
+factor (125%/150% are the common non-100% defaults on laptops and many
+external monitors) — the app itself still renders at "logical" pixel
+coordinates and never sees this. That post-hoc resampling is what looked
+like players "having a chunk eaten out of them": a user-supplied screenshot
+inspected pixel-by-pixel showed a multi-pixel *gradual* colour blend across
+the edge of a player's circle, not the crisp 1-2px transition
+`pygame.gfxdraw.aacircle` actually produces — a gradual blend spanning
+several pixels is the signature of a resampling filter, not anything drawn
+by this renderer. It was worse on one side (bottom-right, matching the
+original bug report) because the resampling kernel's alignment relative to
+the source pixel grid is consistent across the whole window for a given
+scale factor, so every circle gets the same directional bias. `SetProcess
+DpiAwareness(PROCESS_PER_MONITOR_DPI_AWARE)` (falling back to the older
+`SetProcessDPIAware` on failure, and silently no-op-ing on non-Windows or
+if neither API is available) tells Windows to hand our window its own
+native pixel buffer instead of rescaling it after the fact. This can't be
+verified by rendering to an offscreen/dummy-driver surface the way the
+rest of this file's rendering bugs were — there's no compositor involved
+in that path — it has to be checked by actually running the app on a
+scaled display.
+
 ## Rendering scale gotcha
 
 Players (radius 0.3m) and the ball (radius 0.11m) are only a few pixels
@@ -54,6 +80,54 @@ visibility. Don't use the rendered circle size for any gameplay logic (e.g.
 click-to-select uses `SELECT_TOLERANCE_PX` in `input.py`, not the drawn
 radius, though in practice they're similar).
 
+Both floors are scaled by `Camera.zoom_scale` (`pixels_per_metre` as a
+multiple of the fit-to-pitch baseline — 1.0 normally, `zoom_factor` under
+the `[Z]` ball-follow zoom, see below) rather than used as flat pixel
+constants. Without this, whichever entity is smaller in world units (the
+ball, 0.11m, vs a player's 0.3m) stops growing under zoom as soon as its
+true-to-scale size overtakes its *unscaled* floor — which happens much
+sooner for the ball than for players — leaving the ball looking
+disproportionately tiny next to zoomed-in players even though it visually
+grew the least of anything on screen. Scaling both floors together keeps
+their relative sizes roughly constant across zoom levels.
+
+## Pitch dressing (`draw_pitch` — nets, defending-side markers, corner flags, benches)
+
+Purely cosmetic additions with no gameplay meaning, all drawn as part of
+`draw_pitch` (so they redraw fresh every frame along with the pitch lines,
+same as everything else in that method):
+
+- **Goal netting** (`_draw_goal_net`): fills each goal frame's rectangular
+  footprint (`goal_depth_m` × `goal_width_m`) with a translucent diagonal
+  X-hatch, drawn on an isolated SRCALPHA surface sized to the box so the
+  diagonal lines clip cleanly at its edges. Colour/density/opacity are
+  configurable via `graphics.json["goal_net"]` (`spacing_m`, `alpha`,
+  `color`) rather than flat `style.py` constants, since "barely visible" was
+  the first complaint about it — `style.GOAL_NET_COLOUR`/`GOAL_NET_ALPHA`
+  now only serve as that config's fallback defaults. In this top-down view
+  the goal's back panel and its two side panels all project onto the same
+  rectangle, so one hatch fill reads as netting on all three sides at once
+  — there's no separate "side netting" to add; before this there was no net
+  graphic at all (front, back, or side) — the goal was a bare white-line
+  outline, and the ball simply disappearing there on a goal is what read as
+  "the net working".
+- **Defending-side markers** (`_draw_defending_marker`): a translucent bar
+  in the defending team's colour, set back a little (`gap_m`) behind each
+  goal net rather than flush against it. Fixed per the engine's
+  LEFT-attacks-+x / RIGHT-attacks-−x convention (see `engine/knowledge.md`
+  and `actions.py::opponent_goal_centre`) — the left goal (x=−half_length)
+  is Team.LEFT's own goal and gets `style.TEAM_LEFT_COLOUR` (blue); the
+  right goal gets `style.TEAM_RIGHT_COLOUR` (red). If that attack-direction
+  convention is ever flipped, this needs to flip too.
+- **Corner flags** (`_draw_corner_flags`): a small pole dot + pennant
+  triangle at each of the 4 pitch corners, leaning inward over the pitch so
+  they're never clipped by the window edge at small margins.
+- **Sideline benches** (`_draw_sideline_benches`): a row of benches (`x`
+  positions in `Renderer._BENCH_X_OFFSETS_M`, spread across the middle
+  third of the pitch, clear of the boxes/corners regardless of pitch size)
+  just outside each touchline. Decorative only — no technical-area gameplay
+  concept exists.
+
 ## Ball height display
 
 Per the original design spec ("make the ball change size with height (but
@@ -61,6 +135,47 @@ maybe exaggerate the effect) and have a small number on it showing its
 height in metres"): `draw_ball` boosts the ball's radius by
 `1 + min(height, 5)*0.35` and renders a `"{height:.1f}m"` label next to it
 whenever height exceeds 0.15m.
+
+## Ring drawing (`Renderer._draw_ring`) — supersampled, not `pygame.draw.circle(..., width=N)`
+
+Every circular outline (selection, possession, control-delay/inactive,
+stamina-flash, and the ball's outline + state rings) is drawn via the shared
+`Renderer._draw_ring()` helper, **not** a direct `pygame.draw.circle(...,
+width=N)` + `gfxdraw.aacircle` pair. At the small radii these rings use
+(~8-20px), pygame-ce's stroked-circle rasteriser is visibly ragged: sampling
+real rendered frames pixel-by-pixel found genuine isolated single-pixel gaps
+of pure background punched through an otherwise-solid ring (worse on the SE
+side, lesser on NW) — this is what read as players "having a chunk eaten out
+of them" at normal zoom, since the ring sits right up against the player's
+own fill circle. Building the ring from two separately-rasterised filled
+circles (opaque outer disc + transparent inner punch) does not fix it either
+— their staircase edges don't line up in phase, turning one stray hole into
+a visibly dashed/toothed ring instead. The fix that actually works: render
+the ring at `_RING_SUPERSAMPLE` (4x) resolution and downscale with
+`pygame.transform.smoothscale`, which area-averages instead of sampling one
+point per pixel, so leftover rasteriser noise blends into a soft
+anti-aliased edge instead of surviving as a hole. Any *new* circular outline
+added to the renderer should go through this helper rather than a fresh
+`draw.circle(..., width=N)` call.
+
+## Ball spin dots (`draw_ball`'s dot-projection block)
+
+The ball's surface dots (fixed points on a Fibonacci-lattice unit sphere,
+rotated each frame by `_ball_orientation` and projected top-down) are drawn
+as **projected tangent-plane patches, not flat discs of constant size**.
+Each dot's outline is built from `_DOT_POLY_SEGMENTS` points arranged in a
+small circle in the dot's own tangent plane (`u`/`v`, both perpendicular to
+its centre direction `(wx,wy,wz)`), pushed through the *same* rotation +
+orthographic projection as the centre point, then filled/antialiased with
+`gfxdraw.filled_polygon` + `gfxdraw.aapolygon`. This is what makes dots near
+the ball's silhouette edge correctly foreshorten into ellipses (a real
+football's panels do the same under orthographic projection), while dots
+near the visible "pole" stay circular — the shape falls out of the
+projection automatically, with no separate squish-factor/rotation-angle
+math needed. Before this, dots were plain `pygame.draw.circle` calls of a
+single fixed radius with no antialiasing at all (visibly jagged, and flat
+rather than sphere-like) — if you need to touch this code again, keep both
+properties (foreshortening + AA) rather than reverting to a flat circle.
 
 ## Player visual indicators (`style.py` / `renderer.draw_player`)
 
@@ -80,6 +195,18 @@ whenever height exceeds 0.15m.
   whichever player has the ball is drawn last, i.e. on top of every other
   player - avoids the possession ring/player circle being partially
   obscured by a nearby defender drawn afterwards.
+- **Heading indicator**: a broad, thin "V" — two unfilled lines touching
+  the rim at wide-spread points and meeting at a point just ahead in the
+  facing direction (`draw_player`'s "Heading indicator" block, colour
+  `style.HEADING_INDICATOR_COLOUR`, geometry tunable via
+  `graphics.json["heading_indicator"]`: `length_px` = how far the meeting
+  point sits beyond the rim, `base_half_width_px` = how wide the two rim
+  contact points are spread (bigger = broader V), `base_inset_px` = how far
+  inside the rim those contact points sit (0 = exactly on the rim),
+  `alpha`). Went through two earlier designs: a thin line from the player's
+  *centre* out past the rim (read as a stray line poking through the fill),
+  then a filled triangle badge (read as too heavy/blocky) — this is
+  deliberately just two thin strokes, no fill, no outline.
 
 ## Ball state indicator rings (Phase G)
 
@@ -296,6 +423,72 @@ now returns `(button_rects, clamped_dropdown_scroll)` rather than just
 - `ScenarioParamsUIState.open_choice_folder` tracks which group is expanded
   for a `ScenarioGroupedChoiceParam` (`None` = showing the group list).
 
+## Phase 1 UI scenario vs. actual PPO training conditions (`_make_phase1_scenario_pair`)
+
+This scenario lets a human load a checkpoint and watch it play, so its
+defaults should put the network in conditions matching what it was
+*trained* under — otherwise you're evaluating it out-of-distribution
+without realising it. Two of its numeric defaults used to be independently
+hardcoded instead of sourced from `ai_config.json`, and had drifted from
+the real training values:
+
+- **`decision_interval_ms`** (default of the same-named `ScenarioParam`):
+  now `_phase1_training_cfg()["decision_interval_s"] * 1000` (currently
+  249.9ms) instead of a hardcoded `500.0`. Training's own decision cadence
+  comes from `ai_config.json["observation"]["decision_interval_s"]`
+  (`0.2499s`) combined with its own `sim_dt_s` (`0.05s`/20Hz) →
+  `ScenarioEnv` computes `ticks_per_decision = round(0.2499/0.05) = 5`
+  ticks, i.e. a real-world cadence of `5 * 0.05 = 0.25s`. The UI
+  deliberately ticks the engine at a fixed 30Hz regardless (`UI_TICK_HZ`,
+  for smooth human-visible playback — see `ai_config.json`'s own
+  `_comment_sim_dt_s`: "UI ignores this and always uses 30Hz"), so matching
+  training means matching the real-seconds cadence, not the tick count —
+  `decision_interval_ticks = round(ms/1000 * 30)` is computed fresh from
+  whatever `decision_interval_ms` the slider holds, so keeping the
+  **default** in real seconds correct is what matters. The old hardcoded
+  500ms was exactly 2x training's real cadence.
+- **`max_episode_s`** passed to both players' `NeuralPlayerAI`: now
+  `_phase1_training_cfg()["max_episode_s"]` (currently `18.5`, from
+  `ai_config.json["curriculum"]["phase1_max_episode_s"]`) instead of a
+  hardcoded `1e9`. `NeuralPlayerAI` derives a `time_remaining` observation
+  feature from this (`rules_ai.py`: `max(0.0, max_episode_s -
+  episode_ticks/30.0)`, clamped to 0 rather than going negative, so a UI
+  trial running longer than 18.5s just saturates at "no time left" the same
+  way a training episode nearing its cap would — no special-casing needed
+  if a trial overruns it). Leaving this at `1e9` effectively froze that
+  feature at a huge constant the whole time, so the network never saw the
+  same time-pressure signal in the UI that it saw throughout training.
+
+Both are sourced via `_phase1_training_cfg()`, which reads
+`ai_config.json`'s `observation`/`curriculum` sections directly (distinct
+from `_phase1_scenario_cfg()`, which only covers the *randomised-scenario*
+knobs — tiers, ball speed/distance, stamina range, restitution — that
+`build_1v1_scenario` already shares between the UI and
+`ai/curriculum/envs.py`'s actual training env construction, so those were
+never actually mismatched).
+
+**`opponent_rules` default is now `False`** (neural, driven by
+`opponent_checkpoint`'s dropdown default — the same latest-checkpoint
+default `trainee_checkpoint` already used) rather than `True`
+(rules-based). Training's curriculum ratios
+(`ai_config.json["curriculum"]`: `phase1_opponent_rules_ratio=1` /
+`_immobile_ratio=0` / `_neural_ratio=3`, normalized in
+`ai/curriculum/envs.py`'s `opponent_type_probs()`) put the trainee against
+a live neural self-play opponent 75% of the time during training,
+rules-based only 25%, never immobile — so neural is the closer default to
+training's dominant condition, even though no single boolean default can
+reproduce the full 75/25/0 mix. This was a deliberate choice (flagged to
+and confirmed by the user, favouring "closer to training" over "a fixed,
+interpretable benchmark opponent") — `opponent_rules`/`opponent_immobile`
+checkboxes are both still there for anyone who wants the old deterministic
+rules-based benchmark back.
+
+**Known remaining divergence, left as-is deliberately (not a bug)**:
+Physics tick rate — UI always 30Hz vs. training's 20Hz (`sim_dt_s=0.05`).
+Explicitly documented as intentional in `ai_config.json`'s own comment,
+kept for smooth human playback; confirmed with the user rather than
+changed.
+
 ## Balance scenario looping (`ScenarioLoop` in `scenarios.py`)
 
 `ScenarioLoop` wraps a `ScenarioDefinition` and replays it indefinitely
@@ -361,6 +554,39 @@ neural) only while in training mode (`App._hotkey_entries`); the help
 overlay (`H`) documents the hotkey too. `App._start_match` resets
 `_training_checkpoint_idx = -1` whenever a new training match is built, so
 every fresh training session always starts in human control.
+
+## Ball-follow zoom (`Z` hotkey / `[-]`/value/`[+]` zoom control)
+
+`Camera` supports a second mode besides the default "whole pitch always
+fits the window" fit-to-pitch view: `zoom_factor > 1.0` (`zoomed` is a
+derived bool, `zoom_factor > 1.0`) boosts `pixels_per_metre` by
+`zoom_factor` and recentres the view on a world point every frame via
+`Camera.follow()`, instead of centring on the pitch. This is a
+**continuous, steppable level, not a toggle** — `Camera.set_zoom_level(level)`
+sets it directly (`level <= 1.0` snaps back to the normal fit-to-pitch
+view). `App._ZOOM_LEVELS` is a linear sequence from 1.0 up to
+`graphics.json["camera"]["max_zoom"]` (default 5.0) in `zoom_step`
+increments (default 0.5), built once in `__init__` the same way
+`_SIM_SPEED_OPTIONS` is; `App._cycle_zoom(direction)` snaps to the nearest
+level and steps (wrapping at either end, same as `_cycle_sim_speed`),
+shared by the `Z` hotkey (always steps forward) and the on-screen
+`Renderer.draw_zoom_control`'s `[-]`/`[+]` buttons (drawn immediately to
+the *left* of the sim-speed control so neither it nor the value box
+collides with the player-inspector panel that appears just below that
+row — the value box itself highlights in the accent colour whenever
+zoom is actually engaged). `App._draw_match` calls
+`self.camera.follow(ball.x, ball.y)` once per frame whenever
+`camera.zoomed` — so the view always tracks the ball, not any particular
+player. `resize()` keeps `zoom_factor` applied consistently across
+window-size changes while zoomed (only the *offset* is left for the next
+`follow()` call to fix, since it's about to be overwritten anyway). Zoom
+state persists across matches/trials (not reset by `_start_match`/
+`_start_scenario`), same as `_sim_speed`.
+
+`_SIM_SPEED_OPTIONS` itself is linear 0.25 steps from 0.25x to 8x
+(`tuple(round(i * 0.25, 2) for i in range(1, 33))`), not the old doubling
+sequence (0.2/0.5/1/2/4/8) — finer control around normal speed, at the
+cost of more `]`/`[`/click steps to reach the extremes.
 
 ## Coordinate convention — critical pitfall
 

@@ -556,7 +556,7 @@ resolved attempt, win or lose — there is no separate shorter "failed lunge"
 duration any more; both parties get the same cooldown regardless of outcome.
 While inactive a player: can't tackle or be tackled
 (`Player.is_available_to_tackle()`), is excluded from push-apart collision
-resolution (but *not* from velocity damping — see `collision.py` below), and
+resolution *and* from velocity damping (see `collision.py` below), and
 does not regen stamina (`Match._update_state_timers` only regens `ACTIVE`
 players). There is **no ongoing speed penalty** for being inactive itself —
 `inactive_speed_penalty` doesn't exist in `physics.json` (removed at some
@@ -772,11 +772,16 @@ balance on the ground rather than bumping into them like a solid obstacle.
   closing velocity above a minimum floor, the component of each player's
   velocity directed toward the other is damped. The floor prevents
   continuous damping of gentle jostling; the retention factor and floor are
-  tunable in `physics.json["collision"]`. Damping applies even to inactive
-  pairs (unlike position push-apart) so a just-tackled player coasting at
-  full speed still slows on contact. Because overlap can persist across
-  multiple ticks, the damping compounds — this is intentional but the floor
+  tunable in `physics.json["collision"]`. Like position push-apart, damping
+  is skipped entirely for pairs where either player is inactive - a player
+  can push straight past someone they just tackled (or who just failed to
+  tackle them) instead of getting stuck gliding against them at reduced
+  speed. Because overlap can persist across multiple ticks (for active
+  pairs), the damping compounds — this is intentional but the floor
   prevents it from driving velocity to zero.
+
+**Ball-blocking by inactive players** (`resolve_ball_block_by_inactive_players`):
+  a loose, in-flight ball can still be blocked by an
   inactive player's cylinder from *outside* it - a ball already inside the
   cylinder (e.g. one that was there when the player became inactive) does
   NOT get blocked, only a ball crossing in from outside, per the explicit

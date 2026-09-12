@@ -41,14 +41,19 @@ Current notes:
         - faster rollouts - more cores?
         - consider non-separate value net
         - fix tests!
+    - sprite: 4.5 strides per second at 9m/s, interpolate down on that and the degree of extension
+    - !! do a sweep of envs/cores thing
+    - !! maybe arming kick/tackle should slow you slightly? so that it's not totally free
+        - only during arming, not if it actually triggers
+        - _could_ retrain the player encoder here
     - maybe stamina should weaken all your abilities
-    - !!! dt in the UI should be the same as real life!!
-    - failed tackles still hamper the ball carrier - I think because the opposite player is still "in the way"
-    - decision interval in the UI should copy the real one
-    - !! collision shouldn't happen on a tick with a failed auto-tackle, is that the case? then no more collisions till the next tick or smth
+    - boost tackles, but weaken tackles from the back too
+    - !!! are they kick-tackling?? that should be pensalised probably/worse precision or smth - maybe depends on tackle quality
+        - can inactive opponents interecept?
+    - !!! add previous-neural opponents (previous runs, randomly selected)
     - do label smoothing or smth similar on the physics encoders, the logits are for sure fucking it
-    - !! Seperate kick z vs. x/y log dir std and therefore entropy calculations?
     - !! Are the bernoulli heads sampled to become execution inputs? They shouldnt be!!
+        - Or maybe they should?? it's also weird if they switch rapidly, no? Maybe they stick for longer somehow?
     - Every attribute should be like dribbling = 0.1 + driblling_skill*0.9 or smth, so that no rolls are totally 0 success
     - !! new training:
         - value net pre-training (phase 0) really struggles with the invalid/timeouts, which is weird because it was doing okay on them in the debug value net. Does it definitely have that last team touched variable for example? Is the MC time-based fixed with non-uniform timesteps included? Maybe it just needs longer, val_mse was falling the whole time

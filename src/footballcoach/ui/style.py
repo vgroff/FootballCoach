@@ -8,6 +8,7 @@ BALL_OUTLINE = (40, 40, 40)
 
 TEAM_LEFT_COLOUR = (60, 110, 220)
 TEAM_RIGHT_COLOUR = (220, 70, 70)
+DEFENDING_SIDE_MARKER_ALPHA = 140  # translucency of the blue/red "defends this end" goal-line bar
 SELECTED_OUTLINE = (255, 220, 40)
 GOALKEEPER_COLOUR = (235, 140, 30)  # orange fill, overrides team colour
 POSSESSION_OUTLINE = (255, 255, 255)  # white outline on the player in possession
@@ -59,6 +60,20 @@ MIN_BALL_RADIUS_PX = 4    # fallback default only — Renderer overrides from gr
 
 # Speed lines: colour of trailing motion lines drawn behind fast-moving players.
 SPEED_LINE_COLOUR = (160, 210, 255)  # light blue
+
+# Heading indicator: a broad, thin "V" of two lines touching the front rim
+# of the player's circle and meeting at a point just ahead, pointing the
+# way they're facing (replaces an earlier thin line-through-the-centre
+# placeholder, and a filled-triangle badge before that).
+HEADING_INDICATOR_COLOUR = (255, 225, 60)  # yellow
+
+# Pitch dressing: goal netting, corner flags, sideline benches.
+GOAL_NET_COLOUR = (230, 230, 230)          # net mesh lines drawn inside the goal frame
+GOAL_NET_ALPHA = 190                       # translucency of the net mesh — see graphics.json["goal_net"] to tune
+CORNER_FLAG_POLE_COLOUR = (235, 235, 235)
+CORNER_FLAG_COLOUR = (235, 120, 30)        # orange pennant
+BENCH_SEAT_COLOUR = (90, 70, 50)           # technical-area bench
+BENCH_OUTLINE_COLOUR = (50, 38, 28)
 
 # Low-stamina flash: pulsing outline when stamina drops below the configured threshold.
 STAMINA_FLASH_OUTLINE = (255, 50, 50)  # bright red (brighter than INACTIVE_OUTLINE)

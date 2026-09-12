@@ -191,6 +191,43 @@ def _detach_decision_heads(d_heads: DecisionHeadsRaw) -> DecisionHeadsRaw:
     )
 
 
+def _scale_decision_heads_grad(d_heads: DecisionHeadsRaw, coef: float) -> DecisionHeadsRaw:
+    """Like _detach_decision_heads, but instead of cutting the graph, clone
+    each field and register a backward hook that scales ITS OWN gradient by
+    coef before continuing upstream into decision_net -- see
+    share_value_grad_with_decision/decision_value_coef (__init__) and
+    ai_trainer_knowledge.md "Separate value network" for why this needs a
+    dedicated coefficient rather than reusing vf_coef.
+
+    Cloning (not just hooking the original tensor) is load-bearing: d_heads
+    is also fed to execution_net in the same forward pass to produce the
+    policy's own e_heads, so hooking the original tensor would scale THAT
+    gradient contribution too. A clone gets its own node in the graph --
+    the hook fires only on the gradient arriving from whatever consumes the
+    clone (self.value_net here), leaving the policy's own use of d_heads
+    completely unaffected.
+
+    coef == 1.0 is a no-op (returns d_heads itself, no clone needed) --
+    callers that also need coef == 0.0 to behave identically to full
+    detach should special-case that themselves (kept simple here since the
+    grad-hook path still keeps a live, if inert, backward node in that
+    case)."""
+    if coef == 1.0:
+        return d_heads
+
+    def _hook(grad: torch.Tensor, c: float = coef) -> torch.Tensor:
+        return grad * c
+
+    fields = {}
+    for name in _DECISION_HEADS_FIELD_NAMES:
+        v = getattr(d_heads, name)
+        if v is not None and v.requires_grad:
+            v = v.clone()
+            v.register_hook(_hook)
+        fields[name] = v
+    return dataclasses.replace(d_heads, **fields)
+
+
 # Reward component short-key → display label mapping (order = display order).
 # Used by both the per-rollout log and the pre-training diagnostic in train.py.
 REWARD_COMP_LABELS: list[tuple[str, str]] = [
@@ -720,6 +757,8 @@ class PPOTrainer:
         checkpoint_dir: Optional[Path] = None,
         inference_only: bool = False,
         separate_value_net: bool = False,
+        share_value_grad_with_decision: bool = False,
+        decision_value_coef: float = 0.5,
     ):
         # Wrapped so every forward call automatically canonicalizes
         # self_feat/other_feat/ball_feat into the canonical AI frame (see
@@ -754,6 +793,34 @@ class PPOTrainer:
             self.value_net = CanonicalNetworkWrapper(ExecutionNetwork.from_config(
                 trunk_hidden_override=_value_trunk_override
             ))
+        # --- Opt-in: let separate_value_net's critic gradient reach decision_net ---
+        # Only meaningful when separate_value_net is on -- in the default
+        # (non-separate) mode decision_net already receives value_loss's
+        # gradient unconditionally via execution_net's shared trunk (nothing
+        # detaches it there), so this flag would be a no-op. Scoped to the
+        # main PPO update's per-minibatch loop ONLY (_ppo_update) -- that is
+        # the one live call site where decision_net's forward isn't already
+        # under torch.no_grad() (pretrain_value(), the value-only
+        # continuation) or running through a genuinely separate, differently
+        # -timed optimizer/backward (Phase 1's _use_separate_value_training
+        # fallback), either of which would make "just stop detaching" silently
+        # wrong rather than inert. See _scale_decision_heads_grad's docstring
+        # for the actual gradient-scaling mechanism and
+        # ai_trainer_knowledge.md "Separate value network" for the full
+        # rationale. decision_value_coef is deliberately a SEPARATE knob from
+        # vf_coef: vf_coef already scales value_loss's contribution to
+        # value_net's own trunk (and, in non-separate mode, execution_net's),
+        # and must keep doing so unchanged regardless of this feature --
+        # decision_value_coef only scales the additional slice of that
+        # gradient crossing into decision_net specifically.
+        self.share_value_grad_with_decision = bool(share_value_grad_with_decision) and self.separate_value_net
+        if share_value_grad_with_decision and not self.separate_value_net:
+            log.warning(
+                "share_value_grad_with_decision has no effect without separate_value_net=True "
+                "(non-separate mode already lets value_loss's gradient reach decision_net via "
+                "the shared trunk) -- ignoring."
+            )
+        self.decision_value_coef = float(decision_value_coef)
         self.checkpoint_dir = checkpoint_dir
 
         ppo_cfg = cfg["ppo"]
@@ -1683,6 +1750,7 @@ class PPOTrainer:
         ) if outcome_parts else ""
         mv_ls = metrics.get('move_log_std', [])
         kk_ls = metrics.get('kick_log_std', [])
+        kz_ls = metrics.get('kick_z_log_std', [])
         mv_ls_grad = metrics.get('mv_ls_grad', 0.0)
         # These are actually log_kappa now (von Mises concentration), not
         # log_std -- see ai_trainer_knowledge.md "Direction heads: von Mises".
@@ -1702,10 +1770,21 @@ class PPOTrainer:
             kappa = [math.exp(v) for v in ls_pair]
             deg = [math.degrees(math.sqrt(1.0 / k)) if k > 0 else float("inf") for k in kappa]
             return kappa, deg
+        # kick_dir_z_log_std is a PLAIN Gaussian log_std (elevation component,
+        # not a von Mises kappa) -- larger = wider, same convention the old
+        # log_std parameters used, so sigma=exp(log_std) directly (no
+        # kappa->degrees inversion needed here). See ai_trainer_knowledge.md
+        # "Direction heads: von Mises".
+        def _sigma(ls_pair):
+            if not ls_pair:
+                return None
+            return [math.exp(v) for v in ls_pair]
         _mv_sig = _kappa_deg(mv_ls)
         _kk_sig = _kappa_deg(kk_ls)
+        _kz_sig = _sigma(kz_ls)
         _prev_mv_ls = self._prev_move_log_std if hasattr(self, "_prev_move_log_std") else None
         _prev_kk_ls = self._prev_kick_log_std if hasattr(self, "_prev_kick_log_std") else None
+        _prev_kz_ls = self._prev_kick_z_log_std if hasattr(self, "_prev_kick_z_log_std") else None
         _mv_delta_str = ""
         if mv_ls and _prev_mv_ls:
             _d = [b - a for a, b in zip(_prev_mv_ls, mv_ls)]
@@ -1729,8 +1808,23 @@ class PPOTrainer:
                 f"  d_kick=[{','.join(f'{v:+.4f}' for v in _d)}]"
                 f" (Δ(ang std)≈{','.join(f'{v:.3f}°' for v in _kk_dstd_deg)})"
             )
+        _kz_delta_str = ""
+        if kz_ls and _prev_kz_ls:
+            _d = [b - a for a, b in zip(_prev_kz_ls, kz_ls)]
+            # Same small-angle sigma->degrees approximation as the non-delta
+            # kz_ls line above (accurate near-horizontal, z_mean~=0) -- kept
+            # analogous to d_move/d_kick's Δ(ang std) rather than a raw Δσ.
+            _kz_dstd_deg = [
+                abs(math.degrees(math.exp(b)) - math.degrees(math.exp(a)))
+                for a, b in zip(_prev_kz_ls, kz_ls)
+            ]
+            _kz_delta_str = (
+                f"  d_kickz=[{','.join(f'{v:+.4f}' for v in _d)}]"
+                f" (Δ(ang std)≈{','.join(f'{v:.3f}°' for v in _kz_dstd_deg)})"
+            )
         self._prev_move_log_std = list(mv_ls) if mv_ls else None
         self._prev_kick_log_std = list(kk_ls) if kk_ls else None
+        self._prev_kick_z_log_std = list(kz_ls) if kz_ls else None
         mv_ls_str = ""
         if mv_ls:
             mv_ls_str = f"  mv_ls=[{','.join(f'{v:.4f}' for v in mv_ls)}]"
@@ -1744,6 +1838,24 @@ class PPOTrainer:
                 _kap, _deg = _kk_sig
                 mv_ls_str += f" (\u03ba\u2248{','.join(f'{k:.2f}' for k in _kap)}, ang std\u2248{','.join(f'{d:.0f}\u00b0' for d in _deg)})"
             mv_ls_str += _kk_delta_str
+        if kz_ls:
+            mv_ls_str += f"\n  kz_ls=[{','.join(f'{v:.4f}' for v in kz_ls)}]"
+            if _kz_sig:
+                # kick_dir_z_log_std's sigma is a std on the raw z-COMPONENT of
+                # the kick direction unit vector, not an angle -- elevation
+                # angle = arcsin(z), and d(arcsin)/dz = 1/sqrt(1-z^2) = 1 at
+                # z=0, so treating sigma directly as a small-angle radian
+                # estimate is only accurate for near-horizontal kicks (mean
+                # elevation near 0); it under-reports the true angular spread
+                # for kicks with a large mean elevation (|z| closer to 1),
+                # same caveat the move/kick_dir kappa->degrees conversion
+                # already carries for its own small-angle approximation.
+                _kz_deg = [math.degrees(s) for s in _kz_sig]
+                mv_ls_str += (
+                    f" (\u03c3\u2248{','.join(f'{s:.4f}' for s in _kz_sig)}"
+                    f", ang std\u2248{','.join(f'{d:.0f}\u00b0' for d in _kz_deg)})"
+                )
+            mv_ls_str += _kz_delta_str
         ha = metrics.get("head_act", {})
         _ta_p = ha.get('ta_p', float('nan'))
         _kk_p = ha.get('kk_p', float('nan'))
@@ -5627,12 +5739,21 @@ class PPOTrainer:
 
                 # Value estimate — single value head (execution_net only), OR the
                 # dedicated self.value_net when separate_value_net is enabled. In
-                # the latter case d_heads is detached before feeding value_net so
-                # its (separately-optimised) value loss never contributes gradient
-                # into decision_net -- the whole point of separate_value_net is a
-                # critic trunk fully independent of the (BC-primed) policy trunk.
+                # the latter case d_heads is normally detached before feeding
+                # value_net so its (separately-optimised) value loss never
+                # contributes gradient into decision_net -- the whole point of
+                # separate_value_net is a critic trunk fully independent of the
+                # (BC-primed) policy trunk. share_value_grad_with_decision opts
+                # back into a controlled version of that leak (decision_net only,
+                # never execution_net's trunk -- value_net has zero weight
+                # sharing with execution_net either way), scaled by
+                # decision_value_coef instead of full-strength -- see that flag's
+                # __init__ comment and _scale_decision_heads_grad's docstring.
                 if self.separate_value_net:
-                    d_heads_for_value = _detach_decision_heads(d_heads)
+                    if self.share_value_grad_with_decision:
+                        d_heads_for_value = _scale_decision_heads_grad(d_heads, self.decision_value_coef)
+                    else:
+                        d_heads_for_value = _detach_decision_heads(d_heads)
                     _value = self.value_net(sf, of, em, bf, gf, d_heads_for_value, sat, oat, value_only=True)
                     new_values = _value.squeeze(-1)
                 else:
@@ -5842,9 +5963,16 @@ class PPOTrainer:
                 if self.separate_value_net:
                     self.value_net_optimizer.zero_grad()
                 total_loss.backward()
-                # d_heads_for_value was detached above, so value_loss's gradient
-                # (folded into total_loss) only reaches self.value_net's params
-                # here -- decision_net/execution_net's policy heads never see it.
+                # d_heads_for_value was detached above (unless
+                # share_value_grad_with_decision), so value_loss's gradient
+                # (folded into total_loss) normally only reaches self.value_net's
+                # params here -- decision_net/execution_net's policy heads never
+                # see it. When share_value_grad_with_decision is on, a
+                # decision_value_coef-scaled slice of it also lands on
+                # decision_net's own .grad by this point (accumulated alongside
+                # policy_loss's contribution from the same backward) -- picked up
+                # normally by self.optimizer's step()/grad-clipping below, same as
+                # any other decision_net gradient this minibatch.
                 if self.separate_value_net:
                     nn.utils.clip_grad_norm_(self.value_net.parameters(), self.max_grad_norm)
                     self.value_net_optimizer.step()
@@ -6101,10 +6229,13 @@ class PPOTrainer:
             # deeper into the update" directly, once per epoch.
             _epoch_pol = all_policy_loss[_epoch_slice_start:]
             _epoch_kl = all_kl[_epoch_slice_start:]
+            _epoch_val = all_value_loss[_epoch_slice_start:]
             mean_pol_epoch = float(np.mean(_epoch_pol)) if _epoch_pol else 0.0
             mean_kl_epoch = float(np.mean(_epoch_kl)) if _epoch_kl else 0.0
+            mean_val_epoch = float(np.mean(_epoch_val)) if _epoch_val else 0.0
             log.info(
                 f"  [epoch {epoch_i + 1}/{self.n_epochs}] pol_mean={mean_pol_epoch:.4f}  "
+                f"val_mean={mean_val_epoch:.4f}(x{self.vf_coef})={self.vf_coef * mean_val_epoch:.4f}  "
                 f"kl_mean={mean_kl_epoch:.4f}  (n={len(_epoch_kl)} minibatch(es), {epoch_times[-1]:.0f}ms)"
             )
             if _early_stopped:
@@ -6305,9 +6436,25 @@ class PPOTrainer:
         median_kl = float(np.median(all_kl)) if all_kl else 0.0
         move_log_std = self.execution_net.move_dir_log_kappa.data.tolist()
         kick_log_std = self.execution_net.kick_dir_log_kappa.data.tolist()
+        kick_z_log_std = self.execution_net.kick_dir_z_log_std.data.tolist()
         mean_mv_ls_grad = float(np.mean(all_mv_log_std_grad)) if all_mv_log_std_grad else 0.0
         if mean_kl > KL_DIAG_THRESHOLD and all_ratios:
             ratios_t = torch.cat(all_ratios)
+            ratios_max = ratios_t.max()  # true max, before any subsampling below
+            # torch.quantile() hard-errors ("input tensor is too large") past
+            # 16,777,216 elements -- with enough epochs/minibatches (e.g. a
+            # KL-triggered run with n_epochs in the hundreds) all_ratios'
+            # concatenation can exceed that easily. This is a diagnostic
+            # printout, not a training-affecting computation, so an unbiased
+            # random subsample is just as informative for p5/p25/p50/p75/p95
+            # -- max above is already taken from the full tensor so we don't
+            # lose the one statistic a subsample could plausibly miss.
+            _MAX_QUANTILE_ELEMENTS = 8_000_000
+            if ratios_t.numel() > _MAX_QUANTILE_ELEMENTS:
+                _idx = torch.randint(
+                    0, ratios_t.numel(), (_MAX_QUANTILE_ELEMENTS,), device=ratios_t.device,
+                )
+                ratios_t = ratios_t.flatten()[_idx]
             log.info(
                 f"  [KL mean={mean_kl:.4f} median={median_kl:.4f} > {KL_DIAG_THRESHOLD}] ratio percentiles:"
                 f"  p5={ratios_t.quantile(0.05):.3f}"
@@ -6315,7 +6462,7 @@ class PPOTrainer:
                 f"  p50={ratios_t.quantile(0.50):.3f}"
                 f"  p75={ratios_t.quantile(0.75):.3f}"
                 f"  p95={ratios_t.quantile(0.95):.3f}"
-                f"  max={ratios_t.max():.3f}\n"
+                f"  max={ratios_max:.3f}\n"
                 f"  move_dir_log_kappa={move_log_std}  kick_dir_log_kappa={kick_log_std}"
             )
             # Per-head new log_prob means on stored actions (first 256 transitions)
@@ -6805,6 +6952,7 @@ class PPOTrainer:
             "epoch_time_ms": float(np.mean(epoch_times)) if epoch_times else 0.0,
             "move_log_std": move_log_std,
             "kick_log_std": kick_log_std,
+            "kick_z_log_std": kick_z_log_std,
             "mv_ls_grad": mean_mv_ls_grad,
             "head_act": head_act,
             "grad_clip_pct_main": grad_clip_pct_main,

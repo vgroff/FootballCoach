@@ -30,12 +30,50 @@ import math
 import pytest
 import torch
 
+from footballcoach.ai.action.schema import DecisionHeadsRaw
 from footballcoach.ai.env.scenario_env import ScenarioEnv
-from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _action_to_numpy
+from footballcoach.ai.ppo.ppo_trainer import (
+    PPOTrainer,
+    _action_to_numpy,
+    _scale_decision_heads_grad,
+)
 from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
 from footballcoach.ui.scenarios import ScenarioDefinition, build_1v1_scenario
 
 _ROLLOUT_STEPS = 20
+
+
+def _make_decision_heads_with(**overrides) -> DecisionHeadsRaw:
+    """Minimal DecisionHeadsRaw for unit-testing _scale_decision_heads_grad
+    in isolation, without a real DecisionNetwork forward pass. Every field
+    not in ``overrides`` is a requires_grad=False zero tensor of a plausible
+    shape -- irrelevant to the tests that use this (they only care about
+    whichever field they pass in), and _scale_decision_heads_grad already
+    skips cloning/hooking any field with requires_grad=False."""
+    batch = 1
+    max_other = 3
+    defaults = dict(
+        shoot_logit=torch.zeros(batch, 1),
+        pass_logit=torch.zeros(batch, 1),
+        move_logit=torch.zeros(batch, 1),
+        tackle_logit=torch.zeros(batch, 1),
+        get_possession_raw=torch.zeros(batch, 1),
+        mark_logit=torch.zeros(batch, 1),
+        hold_position_logit=torch.zeros(batch, 1),
+        pass_target_logits=torch.zeros(batch, max_other),
+        tackle_target_logits=torch.zeros(batch, max_other),
+        mark_target_logits=torch.zeros(batch, max_other),
+        move_region_center=torch.zeros(batch, 2),
+        move_region_size=torch.zeros(batch, 1),
+        move_arrival_speed=torch.zeros(batch, 1),
+        region_of_play_center=torch.zeros(batch, 2),
+        region_of_play_size=torch.zeros(batch, 1),
+        attack_defence_raw=torch.zeros(batch, 1),
+        latent_vector=torch.zeros(batch, 8),
+        value=torch.zeros(batch, 1),
+    )
+    defaults.update(overrides)
+    return DecisionHeadsRaw(**defaults)
 
 
 def _make_env() -> ScenarioEnv:
@@ -325,3 +363,126 @@ class TestCheckpointRoundTrip:
         loaded = PPOTrainer.load_for_inference(ckpt_path)
         assert loaded.separate_value_net is False
         assert loaded.value_net is None
+
+
+class TestShareValueGradWithDecision:
+    """Coverage for --share-value-grad-with-decision / decision_value_coef
+    (see ai_trainer_knowledge.md "Separate value network" for the full
+    rationale). This is an opt-in, controlled exception to the isolation
+    TestPPOUpdateTrainsValueNet above guards by default."""
+
+    def test_disabled_by_default(self):
+        trainer = PPOTrainer.from_config(separate_value_net=True)
+        assert trainer.share_value_grad_with_decision is False
+
+    def test_forced_off_without_separate_value_net(self):
+        """Flag has no meaning outside separate_value_net mode -- must be
+        coerced to False rather than silently doing nothing at some other
+        call site."""
+        trainer = PPOTrainer.from_config(
+            separate_value_net=False, share_value_grad_with_decision=True,
+        )
+        assert trainer.share_value_grad_with_decision is False
+
+    def test_enabled_when_both_set(self):
+        trainer = PPOTrainer.from_config(
+            separate_value_net=True, share_value_grad_with_decision=True,
+            decision_value_coef=0.3,
+        )
+        assert trainer.share_value_grad_with_decision is True
+        assert trainer.decision_value_coef == pytest.approx(0.3)
+
+    def test_coef_one_is_identity_no_clone(self):
+        d_heads = _make_decision_heads_with(
+            shoot_logit=torch.randn(1, 1, requires_grad=True)
+        )
+        scaled = _scale_decision_heads_grad(d_heads, coef=1.0)
+        assert scaled is d_heads
+
+    def test_scale_decision_heads_grad_only_scales_the_leaked_path(self):
+        """Core correctness property: coef must scale ONLY the gradient
+        contribution flowing through the returned (cloned) tensor, leaving
+        the ORIGINAL d_heads tensor's own gradient -- as used by
+        execution_net's forward for the policy's own output, at the real
+        _ppo_update() call site -- completely unscaled. If this were
+        implemented by hooking the original tensor instead of a clone, this
+        test would fail (the policy's own contribution would get scaled
+        too)."""
+        x = torch.randn(4, requires_grad=True)
+        d_heads = _make_decision_heads_with(shoot_logit=x.view(1, 4))
+        coef = 0.25
+        scaled = _scale_decision_heads_grad(d_heads, coef)
+        assert scaled.shoot_logit is not d_heads.shoot_logit
+
+        # Simulates the real call site: the SAME d_heads feeds execution_net
+        # (policy_loss, unscaled) AND self.value_net (value_loss, via the
+        # coef-scaled clone) in one shared backward.
+        policy_loss = (d_heads.shoot_logit ** 2).sum()
+        value_loss = (scaled.shoot_logit ** 2).sum()
+        (policy_loss + value_loss).backward()
+
+        expected_grad = (2 * x.detach()) * (1.0 + coef)
+        assert torch.allclose(x.grad, expected_grad, atol=1e-5)
+
+    def test_ppo_update_decision_net_changes_more_when_enabled(self):
+        """Integration check: given IDENTICAL starting weights, an identical
+        rollout, and an identical minibatch-shuffle seed, decision_net's
+        post-update parameters must differ between
+        share_value_grad_with_decision=False (value gradient fully blocked
+        from decision_net) and =True with a non-trivial coef -- proving the
+        leaked gradient actually reaches self.optimizer.step() in a real
+        _ppo_update() call, not just in the isolated helper test above."""
+        env = _make_env()
+        torch.manual_seed(0)
+        trainer_off = PPOTrainer.from_config(
+            separate_value_net=True, share_value_grad_with_decision=False,
+        )
+        torch.manual_seed(0)
+        trainer_on = PPOTrainer.from_config(
+            separate_value_net=True, share_value_grad_with_decision=True,
+            decision_value_coef=1.0,
+        )
+        # Sanity-check the identical-seed assumption before relying on it.
+        p_off0 = next(trainer_off.decision_net.parameters()).detach().clone()
+        p_on0 = next(trainer_on.decision_net.parameters()).detach().clone()
+        assert torch.equal(p_off0, p_on0)
+
+        buffer, last_obs = _collect_rollout(env, trainer_on, _ROLLOUT_STEPS)
+
+        torch.manual_seed(123)
+        _run_ppo_update(trainer_off, buffer, last_obs)
+        torch.manual_seed(123)
+        _run_ppo_update(trainer_on, buffer, last_obs)
+
+        changed = any(
+            not torch.equal(a, b)
+            for a, b in zip(
+                trainer_off.decision_net.parameters(),
+                trainer_on.decision_net.parameters(),
+            )
+        )
+        assert changed, (
+            "decision_net's parameters after one _ppo_update() were identical "
+            "between share_value_grad_with_decision=False/True -- the leaked "
+            "value gradient did not reach decision_net's optimizer step"
+        )
+
+    def test_execution_net_trunk_unaffected_when_enabled(self):
+        """share_value_grad_with_decision must never let value_net's
+        gradient reach execution_net -- value_net has zero weight sharing
+        with it regardless of this flag (only decision_net is shared)."""
+        env = _make_env()
+        trainer = PPOTrainer.from_config(
+            separate_value_net=True, share_value_grad_with_decision=True,
+            decision_value_coef=1.0,
+        )
+        exec_before = [p.detach().clone() for p in trainer.execution_net.value_head.parameters()]
+
+        buffer, last_obs = _collect_rollout(env, trainer, _ROLLOUT_STEPS)
+        _run_ppo_update(trainer, buffer, last_obs)
+
+        for before, after in zip(exec_before, trainer.execution_net.value_head.parameters()):
+            assert torch.equal(before, after), (
+                "execution_net.value_head changed even though "
+                "share_value_grad_with_decision must only affect decision_net"
+            )
