@@ -381,6 +381,61 @@ def build_goal_to_goal_sprint_scenario(
     return match
 
 
+def build_sprint_shuttle_scenario(
+    rng_reduction: float = 0.3,
+    *,
+    distance_m: float = 20.0,
+    player_attr: float = 0.7,
+    lane_gap_m: float = 10.0,
+) -> Match:
+    """Two identical runners (same attributes, same MoveOrders) sprint
+    `distance_m` straight ahead side by side, then sprint straight back to
+    the start -- one plain, one dribbling the ball -- for eyeballing
+    acceleration/turning/braking physics (see engine/knowledge.md's
+    movement.py section) and how much carrying the ball costs on top of
+    that (ball_carry_speed_multiplier / lateral_accel_ball_penalty_max).
+    `player_attr` sets all 8 attributes to the same single value
+    (`PlayerAttributes.average`) -- one knob for "how good is this player"
+    rather than separately tuning top_speed/acceleration/etc, since this
+    scenario is about the movement physics, not attribute interactions.
+    `lane_gap_m` defaults to 10m (> orders.json["repulsion"]["radius_m"]'s
+    7m) so the two runners' player-repulsion steering never engages and
+    perturbs either one off its straight line -- keep it above 7m if you
+    change it, or the comparison stops being a clean one.
+    The turn-around at the far end is a full 180 degree heading reversal,
+    which triggers the order-layer's brake-to-turn heuristic (decelerate to
+    a stop before pivoting) rather than carving a wide arc. Uses the default
+    arrive-at-jog-pace braking curve, so some overshoot past each end before
+    turning around is expected/normal, not a bug."""
+    pitch = Pitch.standard()
+    attrs = PlayerAttributes.average(player_attr)
+    half_gap = lane_gap_m / 2.0
+    start_no_ball = Vector3(0.0, half_gap, 0.0)
+    ahead_no_ball = Vector3(distance_m, half_gap, 0.0)
+    start_with_ball = Vector3(0.0, -half_gap, 0.0)
+    ahead_with_ball = Vector3(distance_m, -half_gap, 0.0)
+
+    runner = Player.create("runner", Team.LEFT, attrs, position=start_no_ball)
+    dribbler = Player.create("runner_with_ball", Team.LEFT, attrs, position=start_with_ball)
+
+    ball = Ball.at_rest(start_with_ball)
+    ball.set_initial_possession(dribbler.player_id)
+    ui_cfg = load_gameplay_config().get("ui", {})
+    match = Match(
+        pitch=pitch, players=[runner, dribbler], ball=ball,
+        rng_reduction=rng_reduction, rng=random.Random(),
+        goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
+    )
+    runner.current_order = MoveOrder(target_position=ahead_no_ball, sprint=True)
+    dribbler.current_order = MoveOrder(target_position=ahead_with_ball, sprint=True)
+    # SprintWaypointAI issues the return-leg MoveOrder once the first
+    # completes, then falls back to StopOrder once both are done (see its
+    # own docstring in rules_ai.py) -- no separate StopWhenIdleAI needed.
+    runner.ai = SprintWaypointAI([ahead_no_ball, start_no_ball], start_idx=1)
+    dribbler.ai = SprintWaypointAI([ahead_with_ball, start_with_ball], start_idx=1)
+    return match
+
+
 def build_close_range_save_scenario(
     rng_reduction: float = 0.3,
     *,
@@ -2123,6 +2178,23 @@ SCENARIOS: list[ScenarioDefinition] = [
         ],
     ),
     ScenarioDefinition(
+        key="sprint_shuttle",
+        label="Sprint: out-and-back shuttle (with/without ball)",
+        description=(
+            "Two identical runners sprint a fixed distance straight ahead side by side, then "
+            "sprint straight back to the start -- one plain, one dribbling the ball. Good for "
+            "watching acceleration/braking/turn-around physics in isolation (the turn-around is "
+            "a full 180 degree heading reversal, which triggers brake-to-turn) and how much "
+            "carrying the ball costs on top of that."
+        ),
+        build=build_sprint_shuttle_scenario,
+        params=[
+            ScenarioParam("distance_m", "Distance out (m)", 2.0, 50.0, 1.0, 20.0),
+            ScenarioParam("player_attr", "Player attributes (all 8)", 0.0, 1.0, 0.05, 0.7),
+            ScenarioParam("lane_gap_m", "Lane separation (m)", 7.5, 20.0, 0.5, 10.0),
+        ],
+    ),
+    ScenarioDefinition(
         key="sprint",
         label="Sprint: random 5-waypoint course",
         description="A runner follows a random 5-leg course across the pitch.",
@@ -2358,17 +2430,34 @@ class ScenarioLoop:
     def complete(self) -> bool:
         return self.max_trials > 0 and self._trial_count >= self.max_trials
 
-    def step(self) -> bool:
+    def _step_match(self, *, skip_state_timers: bool) -> None:
+        """Calls ``self._match.step()``, only passing ``skip_state_timers``
+        when it's actually ``True`` -- several tests monkeypatch
+        ``match.step`` with a plain zero-arg callable (e.g. ``lambda:
+        None``) for isolation, which would break if this unconditionally
+        passed a kwarg those replacements don't accept. Real ``Match``
+        instances accept the kwarg either way; this just avoids forcing
+        every existing monkeypatch of ``.step`` to also accept it."""
+        if skip_state_timers:
+            self._match.step(skip_state_timers=True)
+        else:
+            self._match.step()
+
+    def step(self, *, skip_state_timers: bool = False) -> bool:
         """Advance the current trial by one physics tick.
 
         Returns ``True`` the tick a trial ends (after the linger period), at
         which point the loop has already rebuilt a fresh match for the next
         trial (or set ``complete`` if max_trials reached).
+
+        ``skip_state_timers``: forwarded to ``Match.step()`` -- see its own
+        docstring (``BatchedEnvGroup``'s batched-decision timer-ordering
+        fix). Default ``False``, unchanged for every caller but that one.
         """
         if self._pending_outcome is not None:
             if self.definition.on_tick is not None:
                 self.definition.on_tick(self._match, self._trial_tick)
-            self._match.step()
+            self._step_match(skip_state_timers=skip_state_timers)
             self._trial_tick += 1
             self._linger_remaining_s -= self._match.dt_s
             if self._linger_remaining_s <= 0.0:
@@ -2382,7 +2471,7 @@ class ScenarioLoop:
 
         if self.definition.on_tick is not None:
             self.definition.on_tick(self._match, self._trial_tick)
-        self._match.step()
+        self._step_match(skip_state_timers=skip_state_timers)
         self._trial_tick += 1
         # Call on_tick again after the step so that controllers can reissue
         # orders in the same tick they were cleared by match.step(). Without

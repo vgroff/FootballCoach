@@ -63,13 +63,69 @@ Mechanism, per round:
      ``_collect()`` line for line, just once per env per round instead of
      once per worker process.
 
-Secondary neural players (e.g. a self-play opponent) are OUT OF SCOPE for
-batching in this first pass -- they still decide via their own
-``NeuralPlayerAI.act()`` synchronously, one at a time, exactly as today.
-Only the trainee's decision is batched. Worth revisiting if a curriculum
-phase leans on neural self-play heavily; phase 1's default opponent is
-immobile/rules-based, so this is a reasonable scope for now, not a silently
-swept-under-the-rug limitation.
+Secondary neural players (e.g. a self-play opponent) are batched too, but
+only opt-in via ``ppo.batch_secondary_players`` (default ``False``) --
+``_batched_worker_main`` passes ``secondary_trainer=trainer`` (the SAME
+trainer as the primary, i.e. true self-play with identical weights) to
+``BatchedEnvGroup`` when set, which batches every due secondary player's
+decision into its own extra ``_sample_action_batch()`` call per round (see
+``BatchedEnvGroup``'s own docstring and ``_batch_due_decisions()``). Default
+``False`` preserves the original behavior exactly: secondary players decide
+unbatched, one at a time, via their own ``env.sample_action_fn`` fallback
+inside ``env.step()``. Worth turning on whenever a curriculum phase leans on
+neural self-play heavily (e.g. phase 1's default
+``phase1_opponent_neural_ratio``, often the majority of episodes).
+
+Episode-seed replay (opt-in, ``ppo.episode_replay_enabled``): every
+mid-collection episode reset is now given an EXPLICIT seed (drawn via
+``random.randint`` when not replaying -- statistically equivalent to the
+prior bare ``env.reset()``, see ``ScenarioEnv.reset()``'s own docstring on
+explicit-seed vs OS-entropy being the same underlying RNG) and recorded on
+``stats[i]["episode_seeds"]`` in exact 1:1 order with
+``stats[i]["episode_rewards"]``. ``collect(..., replay_seeds=[...])`` lets a
+caller (``PPOTrainer._train_batched_parallel``, see its own docstring for
+the "highest mean |advantage| episode" selection this feeds) force specific
+seeds onto the next available episode slots instead of drawing fresh ones --
+one shared FCFS queue for the whole call, consumed by whichever env resets
+first; once exhausted, resets fall back to fresh random seeds exactly as
+before this feature existed. The FIRST episode per env slot (from
+``__init__``'s own initial reset) is deliberately left unseeded/unrecorded
+(``None`` in ``episode_seeds``) -- one episode per slot, ever, not worth the
+churn.
+
+Chunked streaming (opt-in, ``ppo.batched_rollout_chunk_steps``): fixes a
+real production crash -- ``_batched_worker_main`` used to run ``collect()``
+to full completion (accumulating ALL ``steps_per_worker`` transitions, e.g.
+21,000 rows across ``envs_per_process`` envs) before pickling the entire
+result list into ONE ``conn.send()`` call. With many worker processes all
+finishing around the same time, that many simultaneous huge pickle
+allocations spiked system RAM past what was available (``MemoryError``
+inside ``_ForkingPickler.dumps``). ``collect(chunk_steps=K,
+on_chunk=callback)`` periodically flushes (every ``K`` steps collected,
+checked once per round) instead of only at the very end: each flush calls
+``on_chunk`` with a small per-env result list (same shape as the final
+return value), then clears just those envs' buffers/stats (NOT their
+mid-episode accumulators -- ``episode_reward_accum``,
+``_current_episode_seed``, etc. survive a flush unchanged, so an episode
+that straddles a chunk boundary still gets its full reward/seed correctly
+attributed when it eventually completes). ``chunk_steps=None`` (default)
+is a complete no-op -- ``on_chunk`` is never called, ``collect()`` returns
+the full list exactly as before this feature existed.
+
+The one real (accepted) trade-off: GAE for an episode that's mid-flight at
+a flush boundary gets bootstrap-truncated right there, instead of seeing
+its full trajectory in one buffer -- exactly the same kind of truncation
+that ALREADY happens once per rollout today for whatever episode is
+in-progress when ``steps_per_worker`` is reached (``RolloutBuffer.compute_gae()``
+already resets its backward recursion at every ``dones==1`` row regardless
+of chunk boundaries, so only the in-flight episode at each boundary is
+affected). Picking ``chunk_steps`` comfortably larger than
+``envs_per_process x typical_episode_length`` keeps the fraction of split
+episodes small. Episode-seed replay's per-episode mean(|advantage|) is
+correspondingly a little less accurate for a straddling episode (computed
+from only whichever half of its rows share a buffer with its terminal row)
+-- its seed/reward bookkeeping stays exactly correct either way, only the
+replay-ranking signal for that one episode is slightly noisier.
 
 Two non-obvious things discovered (the hard way, via a failing test) while
 building this:
@@ -109,9 +165,75 @@ def _stack_obs_dicts(obs_dicts: list) -> dict:
     return {k: torch.stack([o[k] for o in obs_dicts]) for k in keys}
 
 
+def _secondary_neural_candidates(env) -> list[tuple]:
+    """(player, ai, match) triples for every one of this env's
+    secondary_player_ids currently driven by a NeuralPlayerAI --
+    rules-based/immobile/None secondaries (duck-typed: anything without
+    an is_due_for_decision() method) are excluded, exactly as they
+    already are from the unbatched path (they never had a
+    _precomputed_result hook to consume in the first place). Module-level
+    (not a BatchedEnvGroup method) so ai/eval/seeded_eval.py's batched eval
+    consumer can reuse the exact same logic without needing a full
+    BatchedEnvGroup instance."""
+    out = []
+    for pid in env.secondary_player_ids:
+        try:
+            sec_player = env.match.player_by_id(pid)
+        except KeyError:
+            continue
+        sec_ai = sec_player.ai
+        if not hasattr(sec_ai, "is_due_for_decision"):
+            continue
+        out.append((sec_player, sec_ai, env.match))
+    return out
+
+
+def _batch_due_decisions(
+    candidates: list[tuple], trainer,
+    deterministic: bool, deterministic_decision: bool, deterministic_direction: bool,
+) -> None:
+    """Shared by BatchedEnvGroup's trainee/secondary collection phases AND
+    ai/eval/seeded_eval.py's batched eval consumer: given (player, ai, match)
+    candidate triples, check which are actually due this round, prepare()
+    each due one's observation, run ONE batched
+    ``trainer._sample_action_batch()`` call over all of them together, and
+    stash the result on each ai as ``_precomputed_result`` -- consumed the
+    next time ``Match._process_orders()`` calls that ai's ``act()`` (see
+    ``NeuralPlayerAI.act()``'s own docstring for the hook). No-op if nothing
+    in `candidates` is due this round. Module-level (not a method) so it has
+    exactly one implementation shared by both consumers."""
+    obs_dicts = []
+    due_ais = []
+    for player, ai, match in candidates:
+        if not ai.is_due_for_decision():
+            continue
+        obs_dict = ai.prepare(player, match, 0)
+        assert obs_dict is not None, (
+            "is_due_for_decision() said this player was due, but "
+            "prepare() returned None anyway -- the two are now out "
+            "of sync (see is_due_for_decision()'s docstring for the "
+            "exact condition it checks)."
+        )
+        obs_dicts.append(obs_dict)
+        due_ais.append(ai)
+
+    if not obs_dicts:
+        return
+    obs_batch = _stack_obs_dicts(obs_dicts)
+    results = trainer._sample_action_batch(
+        obs_batch,
+        deterministic=deterministic,
+        deterministic_decision=deterministic_decision,
+        deterministic_direction=deterministic_direction,
+    )
+    for ai, result in zip(due_ais, results):
+        ai._precomputed_result = result
+
+
 def _new_episode_stats() -> dict:
     return {
         "episode_rewards": [],
+        "episode_seeds": [],
         "episode_outcome_labels": [],
         "secondary_episode_rewards": [],
         "episode_outcomes_vs_rules": [],
@@ -128,14 +250,37 @@ class BatchedEnvGroup:
     across all of them. Single-process, directly testable without any
     multiprocessing involved -- see ``_batched_worker_main`` below for the
     Process+Pipe wrapper real parallel collection uses.
+
+    ``secondary_trainer`` (default ``None``): when given, ALSO batches every
+    secondary/opponent player's decision (across every env's
+    ``secondary_player_ids``) into one extra ``secondary_trainer.
+    _sample_action_batch()`` call per round, via the exact same
+    ``prepare()``/``_precomputed_result`` hook used for the trainee (see
+    ``NeuralPlayerAI.act()``'s own docstring -- that hook is already
+    per-AI-instance and player-agnostic, so no changes to ``NeuralPlayerAI``
+    or ``ScenarioEnv`` are needed for this). ``None`` (default) preserves
+    the exact prior behavior: secondary players decide unbatched, one at a
+    time, via their own ``env.sample_action_fn`` fallback inside
+    ``env.step()``'s internal tick loop -- see this module's own top
+    docstring ("OUT OF SCOPE for batching in this first pass"). Pass the
+    SAME trainer as the primary one for real self-play (identical weights,
+    just batched for speed); pass a DIFFERENT trainer for e.g. neural-vs-
+    neural eval (a frozen snapshot on the opponent side). Only ONE shared
+    secondary_trainer for the whole group -- every env's secondary
+    player(s) must be driven by the same network for a given
+    ``collect()``/``collect_eval_episodes()`` call.
     """
 
-    def __init__(self, envs: list, trainer, seeds: Optional[list] = None) -> None:
+    def __init__(
+        self, envs: list, trainer, seeds: Optional[list] = None,
+        secondary_trainer=None,
+    ) -> None:
         assert len(envs) > 0, "BatchedEnvGroup needs at least one env"
         if seeds is not None:
             assert len(seeds) == len(envs), "seeds must have exactly one entry per env"
         self.envs = envs
         self.trainer = trainer
+        self.secondary_trainer = secondary_trainer
         from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
         self._buffers = [RolloutBuffer() for _ in envs]
         # Always resets every env exactly once here, regardless of whether
@@ -147,16 +292,35 @@ class BatchedEnvGroup:
             self._last_obs = [env.reset(seed=s) for env, s in zip(envs, seeds)]
         else:
             self._last_obs = [env.reset() for env in envs]
+        # Seed of each env's CURRENTLY IN-PROGRESS episode, for episode-seed
+        # replay (see collect()'s replay_seeds kwarg and this module's own
+        # top docstring). This first episode per slot is deliberately left
+        # unseeded/unrecorded (None) -- every LATER reset, inside collect(),
+        # is given an explicit seed and recorded here before being
+        # overwritten for the next episode.
+        self._current_episode_seed: list[Optional[int]] = [None] * len(envs)
 
     def _trainee_player_and_ai(self, env):
         player = env.match.player_by_id(env.trainee_player_id)
         return player, player.ai
+
+    def _secondary_neural_candidates(self, env) -> list[tuple]:
+        return _secondary_neural_candidates(env)
+
+    def _batch_due_decisions(
+        self, candidates: list[tuple], trainer,
+        deterministic: bool, deterministic_decision: bool, deterministic_direction: bool,
+    ) -> None:
+        _batch_due_decisions(candidates, trainer, deterministic, deterministic_decision, deterministic_direction)
 
     def collect(
         self, n_steps: int,
         deterministic: bool = False,
         deterministic_decision: bool = False,
         deterministic_direction: bool = False,
+        replay_seeds: Optional[list[int]] = None,
+        chunk_steps: Optional[int] = None,
+        on_chunk=None,
     ) -> list[dict]:
         """Collect until at least ``n_steps`` total trainee+secondary steps
         have been recorded across the whole group (mirrors
@@ -205,7 +369,43 @@ class BatchedEnvGroup:
         re-apply cached gating) -- identical to what the unbatched
         rollout_worker.py path already does for that same tick, so this
         adds no behavior change, just tolerance for an env not being due.
+
+        ``replay_seeds``: optional list of seeds to force onto the next
+        available episode slots in THIS call, instead of drawing fresh
+        random ones -- see this module's top docstring ("Episode-seed
+        replay") and ``PPOTrainer._train_batched_parallel``'s
+        highest-mean-|advantage| seed selection. One shared queue for the
+        whole call, consumed FCFS by whichever env resets first; once
+        exhausted (or if ``None``/empty), every later reset this call draws
+        a fresh random seed exactly as if this parameter didn't exist.
+        Every episode's seed (replayed or fresh) is recorded on
+        ``stats[i]["episode_seeds"]``, one entry per completed episode in
+        exact 1:1 order with ``stats[i]["episode_rewards"]``.
+
+        ``chunk_steps``/``on_chunk``: see this module's top docstring
+        ("Chunked streaming") -- when ``chunk_steps`` is set, every time
+        that many steps have been collected since the last flush (checked
+        once per round, never mid-round), ``on_chunk`` is called with a
+        small per-env result list (same shape as this method's own return
+        value) and those envs' buffers/stats are cleared immediately after
+        (mid-episode accumulators are NOT touched, so a straddling episode's
+        reward/seed bookkeeping stays correct). A final flush happens after
+        the collection loop ends for whatever wasn't already flushed. In
+        this mode the method itself returns ``[]`` -- everything was already
+        delivered via ``on_chunk``. ``chunk_steps=None`` (default) disables
+        this entirely: ``on_chunk`` is never called and the full result list
+        is returned normally, exactly as before this parameter existed.
+
+        IMPORTANT for ``on_chunk`` implementers: each dict's ``"buffer"`` is
+        ``self._buffers[i]`` itself, not a copy -- it gets ``.clear()``-ed
+        (mutated in place) as soon as the NEXT flush happens, so ``on_chunk``
+        MUST fully consume/copy/serialize the data before returning (exactly
+        what pickling for a ``conn.send()`` already does -- see
+        ``_batched_worker_main``'s usage). Holding onto the dict past that
+        point and reading it later will see it silently emptied.
         """
+        import random as _random
+
         from footballcoach.ai.ppo.ppo_trainer import _action_to_numpy
 
         n = len(self.envs)
@@ -213,47 +413,78 @@ class BatchedEnvGroup:
         episode_reward_accum = [0.0] * n
         secondary_episode_reward_accum = [0.0] * n
         episode_comp_accum = [dict() for _ in range(n)]
+        _replay_queue: list[int] = list(replay_seeds) if replay_seeds else []
+
+        def _next_episode_seed() -> int:
+            return _replay_queue.pop(0) if _replay_queue else _random.randint(0, 2**31 - 1)
 
         collected = 0
+        _last_flush_at = 0  # only meaningful when chunk_steps is set
         while collected < n_steps:
-            # --- 1. Prepare each DUE env's trainee decision for this round.
-            # --- (see docstring above for why not every env is guaranteed
-            # to be due, and why is_due_for_decision() is checked first
-            # rather than just calling prepare() and branching on None).
-            obs_dicts = []
-            players_and_ais = []
-            for env in self.envs:
-                player, ai = self._trainee_player_and_ai(env)
-                if not ai.is_due_for_decision():
-                    continue
-                obs_dict = ai.prepare(player, env.match, 0)
-                assert obs_dict is not None, (
-                    "is_due_for_decision() said this env was due, but "
-                    "prepare() returned None anyway -- the two are now out "
-                    "of sync (see is_due_for_decision()'s docstring for the "
-                    "exact condition it checks)."
-                )
-                obs_dicts.append(obs_dict)
-                players_and_ais.append((player, ai))
+            # --- 0. Figure out, per env, whether ANYTHING is due this round
+            # (trainee or, when secondary batching is on, any secondary
+            # player) -- a pure peek, same is_due_for_decision() check
+            # _batch_due_decisions does internally, just done once upfront
+            # here. For every such env, advance its match's state timers
+            # (stamina drain/regen, inactive-tackled/controlling-ball
+            # countdowns) RIGHT NOW, before prepare() encodes any
+            # observation below -- Match.step() normally does this itself,
+            # BEFORE processing orders/decisions, but a batched decision is
+            # encoded externally, before env.step() (hence before its
+            # internal Match.step() call) even runs. Without this, every
+            # batched decision would see one tick's worth of stale timer
+            # state relative to the identical unbatched path -- confirmed as
+            # a real (if small) source of divergence between BatchedEnvGroup
+            # and plain unbatched stepping. See Match.step()'s own
+            # docstring for the full rationale. ---
+            env_has_due_decision = [False] * n
+            for i, env in enumerate(self.envs):
+                _player, _ai = self._trainee_player_and_ai(env)
+                if _ai.is_due_for_decision():
+                    env_has_due_decision[i] = True
+                elif self.secondary_trainer is not None:
+                    for _p, sec_ai, _m in self._secondary_neural_candidates(env):
+                        if sec_ai.is_due_for_decision():
+                            env_has_due_decision[i] = True
+                            break
+            for i, env in enumerate(self.envs):
+                if env_has_due_decision[i]:
+                    env.match.advance_state_timers()
 
-            # --- 2 & 3. ONE batched network call over the due envs only,
-            # then stash results (not-due envs' _precomputed_result stays
-            # None -- see docstring above). ---
-            if obs_dicts:
-                obs_batch = _stack_obs_dicts(obs_dicts)
-                results = self.trainer._sample_action_batch(
-                    obs_batch,
-                    deterministic=deterministic,
-                    deterministic_decision=deterministic_decision,
-                    deterministic_direction=deterministic_direction,
+            # --- 1, 2 & 3. Prepare each DUE env's trainee decision for this
+            # round (see docstring above for why not every env is
+            # guaranteed to be due, and why is_due_for_decision() is checked
+            # first rather than just calling prepare() and branching on
+            # None), then ONE batched network call over the due envs only
+            # (not-due envs' _precomputed_result stays None -- see docstring
+            # above). ---
+            trainee_candidates = [
+                (*self._trainee_player_and_ai(env), env.match) for env in self.envs
+            ]
+            self._batch_due_decisions(
+                trainee_candidates, self.trainer,
+                deterministic, deterministic_decision, deterministic_direction,
+            )
+
+            # --- Same thing, for secondary/opponent players, only when the
+            # caller opted in via secondary_trainer (see class docstring) --
+            # None (default) leaves every secondary player fully unbatched,
+            # exactly as before this was added. ---
+            if self.secondary_trainer is not None:
+                secondary_candidates = [
+                    triple
+                    for env in self.envs
+                    for triple in self._secondary_neural_candidates(env)
+                ]
+                self._batch_due_decisions(
+                    secondary_candidates, self.secondary_trainer,
+                    deterministic, deterministic_decision, deterministic_direction,
                 )
-                for (player, ai), result in zip(players_and_ais, results):
-                    ai._precomputed_result = result
 
             # --- 4 & 5. Step every env; per-env bookkeeping (mirrors
             # rollout_worker.py._collect() exactly, once per env). ---
             for i, env in enumerate(self.envs):
-                next_obs, reward, done, info = env.step()
+                next_obs, reward, done, info = env.step(timers_already_advanced=env_has_due_decision[i])
                 tr = env.last_trainee_transition
                 if tr is None:
                     # Structurally shouldn't happen given the precomputed
@@ -263,11 +494,14 @@ class BatchedEnvGroup:
                     # than assuming it can truly never fire.
                     if done:
                         stats[i]["episode_rewards"].append(episode_reward_accum[i])
+                        stats[i]["episode_seeds"].append(self._current_episode_seed[i])
                         episode_reward_accum[i] = 0.0
                         stats[i]["episode_outcome_labels"].append(
                             info.trial_outcome if (info is not None and info.trial_outcome is not None) else "unknown"
                         )
-                        self._last_obs[i] = env.reset()
+                        _seed = _next_episode_seed()
+                        self._current_episode_seed[i] = _seed
+                        self._last_obs[i] = env.reset(seed=_seed)
                     else:
                         self._last_obs[i] = next_obs
                     continue
@@ -311,6 +545,7 @@ class BatchedEnvGroup:
 
                 if done:
                     stats[i]["episode_rewards"].append(episode_reward_accum[i])
+                    stats[i]["episode_seeds"].append(self._current_episode_seed[i])
                     episode_reward_accum[i] = 0.0
                     stats[i]["episode_outcome_labels"].append(
                         info.trial_outcome if (info is not None and info.trial_outcome is not None) else "unknown"
@@ -327,15 +562,53 @@ class BatchedEnvGroup:
                             stats[i]["episode_outcomes_vs_neural"].append(info.trial_outcome)
                     if info is not None:
                         stats[i]["episode_durations_s"].append(info.ticks_elapsed * env._dt_s)
-                    self._last_obs[i] = env.reset()
+                    _seed = _next_episode_seed()
+                    self._current_episode_seed[i] = _seed
+                    self._last_obs[i] = env.reset(seed=_seed)
                 else:
                     self._last_obs[i] = next_obs
+
+            # --- Periodic flush (chunked streaming, opt-in) -- checked once
+            # per round, never mid-round, so a flush always lands on a clean
+            # "every env has stepped once" boundary. See this module's top
+            # docstring ("Chunked streaming") for the full rationale. ---
+            if chunk_steps and (collected - _last_flush_at) >= chunk_steps:
+                chunk = self._build_results(range(n), stats)
+                if chunk:
+                    on_chunk(chunk)  # synchronous -- fully sent before we clear anything below
+                for i in range(n):
+                    self._buffers[i].clear()
+                    stats[i] = _new_episode_stats()
+                _last_flush_at = collected
 
         # Bootstrap value per env (never concatenate raw transitions across
         # envs before this -- see _train_parallel()'s identical per-worker
         # discipline).
+        if chunk_steps:
+            # Final flush of whatever's left since the last periodic one --
+            # everything has already been (or is about to be) delivered via
+            # on_chunk, so there's nothing left to return.
+            chunk = self._build_results(range(n), stats)
+            if chunk:
+                on_chunk(chunk)
+            return []
+        return self._build_results(range(n), stats)
+
+    def _build_results(self, indices, stats: list[dict]) -> list[dict]:
+        """Build the ``{"buffer", "last_value", "stats"}`` result dict for
+        each given env index -- shared by ``collect()``'s final return AND
+        its periodic ``chunk_steps`` flush. ``stats`` is that call's own
+        per-env stats list (indexed the same way as ``self.envs``). Skips
+        any index whose buffer is currently empty (nothing collected for
+        that env since the last flush/start) -- an empty buffer would crash
+        ``RolloutBuffer.as_tensors()``'s ``self.obs[0]`` indexing, and can
+        legitimately happen at a flush boundary if an env's episode just
+        ended right before its next decision was due."""
         out = []
-        for i, env in enumerate(self.envs):
+        for i in indices:
+            if len(self._buffers[i]) == 0:
+                continue
+            env = self.envs[i]
             last_value = self.trainer._bootstrap_last_values(env, self._last_obs[i], self._buffers[i])
             out.append({"buffer": self._buffers[i], "last_value": last_value, "stats": stats[i]})
         return out
@@ -348,6 +621,7 @@ class BatchedEnvGroup:
 def _batched_worker_main(
     conn, phase_id: int, base_seed: int, worker_idx: int, envs_per_process: int,
     separate_value_net: bool = False, worker_torch_threads: int = 1,
+    batch_secondary_players: bool = False, chunk_steps: Optional[int] = None,
 ) -> None:
     """Entry point run inside each persistent batched-worker process. Must
     stay picklable/top-level (mirrors rollout_worker.py's ``_worker_main``,
@@ -387,7 +661,10 @@ def _batched_worker_main(
         env.bc_label_fn = bc_label_fn
         envs.append(env)
 
-    group = BatchedEnvGroup(envs, trainer)
+    group = BatchedEnvGroup(
+        envs, trainer,
+        secondary_trainer=trainer if batch_secondary_players else None,
+    )
 
     while True:
         try:
@@ -396,9 +673,23 @@ def _batched_worker_main(
             break
         cmd = msg.get("cmd")
         if cmd == "collect":
-            results = group.collect(msg["n_steps"])
-            conn.send(results)
-            group.clear_buffers()  # after send: results[i]["buffer"] IS this same object
+            # Uniform protocol regardless of chunking: zero-or-more
+            # {"chunk": [...]} messages, always followed by exactly one
+            # {"done": True} -- see this module's top docstring ("Chunked
+            # streaming") for why (fixes a real MemoryError from pickling
+            # one giant end-of-rollout result all at once).
+            if chunk_steps:
+                group.collect(
+                    msg["n_steps"], replay_seeds=msg.get("replay_seeds"),
+                    chunk_steps=chunk_steps,
+                    on_chunk=lambda chunk: conn.send({"chunk": chunk}),
+                )
+            else:
+                results = group.collect(msg["n_steps"], replay_seeds=msg.get("replay_seeds"))
+                if results:
+                    conn.send({"chunk": results})
+            conn.send({"done": True})
+            group.clear_buffers()  # harmless no-op if chunking already cleared everything
         elif cmd == "set_weights":
             _load_state_dict_tolerant(trainer.decision_net, msg["decision_net"], "decision_net")
             _load_state_dict_tolerant(trainer.execution_net, msg["execution_net"], "execution_net")
@@ -420,8 +711,8 @@ class BatchedRolloutWorkerHandle:
     conn: "mp.connection.Connection"
     worker_idx: int
 
-    def collect(self, n_steps: int) -> None:
-        self.conn.send({"cmd": "collect", "n_steps": n_steps})
+    def collect(self, n_steps: int, replay_seeds: Optional[list[int]] = None) -> None:
+        self.conn.send({"cmd": "collect", "n_steps": n_steps, "replay_seeds": replay_seeds})
 
     def recv_result(self) -> list:
         return self.conn.recv()
@@ -448,6 +739,7 @@ class BatchedRolloutWorkerHandle:
 def spawn_batched_workers(
     phase_id: int, n_processes: int, envs_per_process: int, base_seed: int,
     separate_value_net: bool = False, worker_torch_threads: int = 1,
+    batch_secondary_players: bool = False, chunk_steps: Optional[int] = None,
 ) -> list[BatchedRolloutWorkerHandle]:
     """Spawn ``n_processes`` batched-worker processes, each internally
     owning ``envs_per_process`` environments (total envs =
@@ -455,7 +747,9 @@ def spawn_batched_workers(
     exactly today's ``rollout_worker.py`` topology (for empirical A/B
     comparison, at the same ``n_processes``); ``n_processes=1`` is the
     "everything in one process" extreme this module was built to test;
-    anything in between is a tunable hybrid.
+    anything in between is a tunable hybrid. ``chunk_steps``: see
+    ``_batched_worker_main``/``BatchedEnvGroup.collect()``'s "Chunked
+    streaming" docstring -- fixed for the life of this worker.
     """
     ctx = mp.get_context("spawn")
     handles: list[BatchedRolloutWorkerHandle] = []
@@ -465,7 +759,7 @@ def spawn_batched_workers(
             target=_batched_worker_main,
             args=(
                 child_conn, phase_id, base_seed + i * envs_per_process, i, envs_per_process,
-                separate_value_net, worker_torch_threads,
+                separate_value_net, worker_torch_threads, batch_secondary_players, chunk_steps,
             ),
             daemon=True,
         )

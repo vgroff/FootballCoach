@@ -38,7 +38,7 @@ def _eval_worker_main(conn, separate_value_net: bool, worker_torch_threads: int 
 
     import torch
 
-    from footballcoach.ai.eval.seeded_eval import run_seeded_evaluation
+    from footballcoach.ai.eval.seeded_eval import run_seeded_evaluation, run_seeded_evaluation_batched
     from footballcoach.ai.ppo.ppo_trainer import _build_eval_env_factory, rebuild_inference_trainer
 
     torch.set_num_threads(max(1, worker_torch_threads))
@@ -57,10 +57,23 @@ def _eval_worker_main(conn, separate_value_net: bool, worker_torch_threads: int 
         elif cmd == "eval":
             assert trainer is not None, "eval requested before any set_weights"
             env_factory = _build_eval_env_factory(msg["use_rules_ai"], msg["max_episode_s"])
-            result = run_seeded_evaluation(
-                env_factory, trainer._sample_action, msg["seeds"], msg["repeats_per_seed"],
-                msg.get("win_outcome", "box_possession"),
-            )
+            if msg.get("batched", False):
+                # Rules/immobile opponents only here -- no neural decision to
+                # batch on the opponent side (see
+                # _secondary_neural_candidates' duck-typed skip), so
+                # secondary_trainer stays unset.
+                result = run_seeded_evaluation_batched(
+                    env_factory, trainer, msg["seeds"], msg["repeats_per_seed"],
+                    msg.get("win_outcome", "box_possession"),
+                    swap_sides=msg.get("swap_sides", False),
+                    envs_per_process=msg.get("envs_per_process", 8),
+                )
+            else:
+                result = run_seeded_evaluation(
+                    env_factory, trainer._sample_action, msg["seeds"], msg["repeats_per_seed"],
+                    msg.get("win_outcome", "box_possession"),
+                    swap_sides=msg.get("swap_sides", False),
+                )
             conn.send(result)
         else:
             raise ValueError(f"unknown eval worker command: {cmd!r}")
@@ -82,10 +95,15 @@ class EvalWorkerHandle:
         self.conn.recv()  # block until applied, keeps weight sync deterministic
 
     def eval(self, seed_chunk: list[int], repeats_per_seed: int, use_rules_ai: bool,
-             max_episode_s: float, win_outcome: str = "box_possession") -> None:
+             max_episode_s: float, win_outcome: str = "box_possession",
+             swap_sides: bool = False, batched: bool = False, envs_per_process: int = 8) -> None:
         """Fire-and-forget: dispatch the eval, collect the result separately
         via recv_result() once ALL workers have been dispatched (lets
-        workers run in parallel instead of one at a time)."""
+        workers run in parallel instead of one at a time). ``batched``/
+        ``envs_per_process``: see ai_config.json eval.batched_eval --
+        routes this worker's episodes through
+        seeded_eval.run_seeded_evaluation_batched instead of
+        run_seeded_evaluation."""
         self.conn.send({
             "cmd": "eval",
             "seeds": seed_chunk,
@@ -93,6 +111,9 @@ class EvalWorkerHandle:
             "use_rules_ai": use_rules_ai,
             "max_episode_s": max_episode_s,
             "win_outcome": win_outcome,
+            "swap_sides": swap_sides,
+            "batched": batched,
+            "envs_per_process": envs_per_process,
         })
 
     def recv_result(self):

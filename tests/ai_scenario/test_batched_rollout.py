@@ -21,7 +21,7 @@ import torch
 
 import functools
 
-from footballcoach.ai.curriculum.envs import build_env, bc_label_fn_for_phase_player
+from footballcoach.ai.curriculum.envs import bc_label_fn_for_phase_player
 from footballcoach.ai.curriculum.phases import PHASES_BY_ID
 from footballcoach.ai.env.scenario_env import ScenarioEnv
 from footballcoach.ai.ppo.batched_rollout_worker import BatchedEnvGroup
@@ -221,13 +221,28 @@ class TestMatchesSingleEnvStepping:
         # (and including) whichever path's first `done` comes first.
         N = 30
 
+        # _make_envs (module-level, see its own docstring) forces a
+        # non-neural opponent -- deliberately NOT build_env(_PHASE), which
+        # reads ai_config.json's LIVE phase1_opponent_neural_ratio at call
+        # time (mostly self-play as of this session). If that rolled a
+        # neural opponent, BatchedEnvGroup's buffer would pick up
+        # interleaved trainee+secondary rows (via last_secondary_results)
+        # that this test's manual stepping loop below never reads --
+        # comparing the two buffers index-for-index would then silently
+        # compare MISALIGNED rows (trainee vs. secondary), which looks like
+        # "flaky float noise" but is actually a structural mismatch that
+        # only surfaces when the ambient config happens to roll self-play.
+        # Forcing a non-neural opponent makes this test fully independent
+        # of that ambient config, matching what it's actually meant to
+        # isolate (BatchedEnvGroup's own K=1 orchestration).
+
         # Path A: through BatchedEnvGroup with K=1. env.sample_action_fn
         # must still be set -- ScenarioEnv.reset() itself checks it to
         # decide whether/how to wire a NeuralPlayerAI onto the trainee at
         # all -- but note collect()'s own deterministic=True is what
         # actually controls sampling behavior; once wired, the assigned
         # NeuralPlayerAI's .sample_action_fn is never called by the group.
-        env_a = build_env(_PHASE)
+        env_a = _make_envs(trainer, 1)[0]
         env_a.sample_action_fn = det_sample_fn
         group = BatchedEnvGroup([env_a], trainer, seeds=[42])
         # Reseed the trainee's observation-noise RNG for a fully controlled comparison.
@@ -237,7 +252,7 @@ class TestMatchesSingleEnvStepping:
 
         # Path B: manual stepping, mirroring rollout_worker.py's own loop,
         # with the exact same seed/RNG setup.
-        env_b = build_env(_PHASE)
+        env_b = _make_envs(trainer, 1)[0]
         env_b.sample_action_fn = det_sample_fn
         env_b.reset(seed=42)
         env_b.match.player_by_id(env_b.trainee_player_id).ai._rng = random.Random(777)
@@ -274,6 +289,15 @@ class TestMatchesSingleEnvStepping:
         cutoff = min(_first_done_index(buf_a), _first_done_index(buf_b)) + 1
         assert cutoff >= 1, "first episode ended with zero recorded steps -- widen N or pick a different seed"
 
+        # NOTE: K=1 here means BatchedEnvGroup's own _sample_action_batch
+        # call is ALSO batch-of-1 (only one env in the group) -- and
+        # trainer._sample_action(deterministic=True) (env_b's path)
+        # literally calls _sample_action_batch(batch=1) internally too (see
+        # test_sample_action_batch.py's docstring). Both paths are the
+        # SAME batch shape, so unlike a real K>1-vs-K=1 comparison there's
+        # no floating-point non-associativity excuse available here --
+        # these should be bit-identical (tight tolerance only for float
+        # repr slop, not batching-shape differences).
         np.testing.assert_allclose(buf_a.rewards[:cutoff], buf_b.rewards[:cutoff], atol=1e-5)
         np.testing.assert_allclose(buf_a.log_probs[:cutoff], buf_b.log_probs[:cutoff], atol=1e-5)
         np.testing.assert_allclose(buf_a.values[:cutoff], buf_b.values[:cutoff], atol=1e-5)
@@ -406,7 +430,6 @@ class TestNotDueEnvHandledGracefully:
         import functools
         import random
 
-        from footballcoach.ai.curriculum.envs import build_env, bc_label_fn_for_phase_player
         from footballcoach.ai.ppo.ppo_trainer import _action_to_numpy
         from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
 
@@ -414,15 +437,21 @@ class TestNotDueEnvHandledGracefully:
         FORCED_TICKS_SINCE_DECISION = 3
         det_fn = functools.partial(trainer._sample_action, deterministic=True)
 
+        # _make_envs forces a non-neural opponent -- deliberately NOT
+        # build_env(_PHASE) (reads ai_config.json's LIVE
+        # phase1_opponent_neural_ratio at call time; see
+        # test_k1_group_matches_manual_stepping's identical note above for
+        # why a neural-opponent roll would silently misalign these two
+        # buffers via interleaved secondary rows).
+
         # Path A: through the group. seeds=[9000] resets it; _rng is seeded
         # BEFORE the priming decision so that decision (which consumes
         # encode_observation's sensor-noise RNG) is fully reproducible
         # against path B below. _force_not_due then runs ONE real decision
         # (populating _last_gating exactly like production) before winding
         # _ticks_since_decision back down to simulate the early-exit.
-        env_a = build_env(_PHASE)
+        env_a = _make_envs(trainer, 1)[0]
         env_a.sample_action_fn = det_fn
-        env_a.bc_label_fn = bc_label_fn_for_phase_player(1)
         group = BatchedEnvGroup([env_a], trainer, seeds=[9000])
         env_a.match.player_by_id(env_a.trainee_player_id).ai._rng = random.Random(555)
         self._force_not_due(trainer, env_a, FORCED_TICKS_SINCE_DECISION)
@@ -431,9 +460,8 @@ class TestNotDueEnvHandledGracefully:
 
         # Path B: manual, unbatched stepping -- identical seed/_rng/priming
         # recipe, same ordering, so it reaches the IDENTICAL forced state.
-        env_b = build_env(_PHASE)
+        env_b = _make_envs(trainer, 1)[0]
         env_b.sample_action_fn = det_fn
-        env_b.bc_label_fn = bc_label_fn_for_phase_player(1)
         env_b.reset(seed=9000)
         env_b.match.player_by_id(env_b.trainee_player_id).ai._rng = random.Random(555)
         self._force_not_due(trainer, env_b, FORCED_TICKS_SINCE_DECISION)
@@ -468,7 +496,123 @@ class TestNotDueEnvHandledGracefully:
         cutoff = min(_first_done_index(buf_a), _first_done_index(buf_b)) + 1
         assert cutoff >= 1, "first episode ended with zero recorded steps -- widen N or pick a different seed"
 
+        # NOTE: K=1 here means BatchedEnvGroup's own _sample_action_batch
+        # call is ALSO batch-of-1 (only one env in the group) -- and
+        # trainer._sample_action(deterministic=True) (env_b's path)
+        # literally calls _sample_action_batch(batch=1) internally too (see
+        # test_sample_action_batch.py's docstring). Both paths are the
+        # SAME batch shape, so unlike a real K>1-vs-K=1 comparison there's
+        # no floating-point non-associativity excuse available here --
+        # these should be bit-identical (tight tolerance only for float
+        # repr slop, not batching-shape differences).
         np.testing.assert_allclose(buf_a.rewards[:cutoff], buf_b.rewards[:cutoff], atol=1e-5)
         np.testing.assert_allclose(buf_a.log_probs[:cutoff], buf_b.log_probs[:cutoff], atol=1e-5)
         np.testing.assert_allclose(buf_a.values[:cutoff], buf_b.values[:cutoff], atol=1e-5)
         np.testing.assert_allclose(buf_a.dones[:cutoff], buf_b.dones[:cutoff], atol=1e-6)
+
+
+class TestChunkedStreaming:
+    """Coverage for collect(chunk_steps=..., on_chunk=...) -- fixes a real
+    production MemoryError (ai/ppo/batched_rollout_worker.py's "Chunked
+    streaming" docstring section): instead of one giant end-of-rollout
+    pickle+send, results are periodically flushed in smaller pieces. The
+    default (chunk_steps=None) path is exercised by every other test in
+    this file already; these specifically guard the NEW opt-in behavior.
+    """
+
+    def test_on_chunk_called_multiple_times(self, trainer):
+        # NOTE: on_chunk's dicts hold self._buffers[i] BY REFERENCE, not a
+        # copy -- a later flush .clear()s the same object in place (see
+        # collect()'s own docstring warning). A real consumer pickles
+        # (conn.send) immediately; this test must extract the row COUNT
+        # immediately too, rather than holding onto the dicts themselves.
+        envs = _make_envs(trainer, 3)
+        group = BatchedEnvGroup(envs, trainer, seeds=[9000, 9001, 9002])
+        chunk_row_counts: list[int] = []
+        result = group.collect(
+            n_steps=300, chunk_steps=50,
+            on_chunk=lambda chunk: chunk_row_counts.append(sum(len(r["buffer"]) for r in chunk)),
+        )
+
+        assert result == [], "chunked mode should return [] -- everything already delivered via on_chunk"
+        assert len(chunk_row_counts) >= 2, "expected multiple flushes for n_steps=300, chunk_steps=50"
+        assert sum(chunk_row_counts) >= 300
+
+    def test_aggregate_stats_close_to_unchunked(self, trainer):
+        """Same seeds, same total step budget, deterministic sampling --
+        chunking must not change episode count/outcome/reward totals (only
+        individual advantage values for episodes straddling a flush
+        boundary are expected to differ, see the module docstring).
+
+        Every episode AFTER the first draws its own fresh seed via
+        collect()'s _next_episode_seed() (Python's GLOBAL random module,
+        since replay_seeds isn't used here) -- the two collect() calls
+        below must each start from the SAME global random state or their
+        episodes beyond the first would legitimately diverge for reasons
+        having nothing to do with chunking.
+        """
+        import random
+        seeds = [9100, 9101, 9102]
+
+        envs_unchunked = _make_envs(trainer, 3)
+        group_unchunked = BatchedEnvGroup(envs_unchunked, trainer, seeds=seeds)
+        random.seed(424242)
+        result_unchunked = group_unchunked.collect(
+            n_steps=400, deterministic=True, deterministic_decision=True, deterministic_direction=True,
+        )
+
+        envs_chunked = _make_envs(trainer, 3)
+        group_chunked = BatchedEnvGroup(envs_chunked, trainer, seeds=seeds)
+        random.seed(424242)
+        # Extract episode_rewards immediately in the callback -- see the
+        # note in test_on_chunk_called_multiple_times above (r["stats"] is
+        # a freshly-reassigned dict per flush so it's actually safe to hold
+        # onto here, but r["buffer"] is not; extracting immediately either
+        # way is the correct pattern any real on_chunk consumer must follow).
+        rewards_chunked: list[float] = []
+        group_chunked.collect(
+            n_steps=400, deterministic=True, deterministic_decision=True, deterministic_direction=True,
+            chunk_steps=60,
+            on_chunk=lambda chunk: rewards_chunked.extend(
+                rew for r in chunk for rew in r["stats"]["episode_rewards"]
+            ),
+        )
+
+        rewards_unchunked = sorted(
+            rew for r in result_unchunked for rew in r["stats"]["episode_rewards"]
+        )
+        rewards_chunked = sorted(rewards_chunked)
+        assert len(rewards_unchunked) > 0 and len(rewards_chunked) > 0
+        # Not exact equality -- see module docstring on chunk-boundary GAE
+        # truncation for straddling episodes; reward totals themselves are
+        # computed independently of chunk boundaries (episode_reward_accum
+        # persists across flushes) so should match very closely regardless.
+        assert abs(sum(rewards_unchunked) - sum(rewards_chunked)) < 1e-6
+
+    def test_chunk_steps_none_is_unchanged(self, trainer):
+        """Regression guard: omitting chunk_steps must behave exactly as
+        before this feature existed (on_chunk never called, full list
+        returned)."""
+        envs = _make_envs(trainer, 2)
+        group = BatchedEnvGroup(envs, trainer, seeds=[9200, 9201])
+        called = []
+        result = group.collect(n_steps=100, on_chunk=called.append)
+        assert called == [], "on_chunk must never be invoked when chunk_steps is None"
+        assert len(result) == 2
+        assert all(len(r["buffer"]) > 0 for r in result)
+
+    def test_build_results_skips_empty_buffers(self, trainer):
+        """Direct unit test of the empty-buffer guard: an env with zero
+        rows collected since the last flush must be silently skipped, not
+        crash RolloutBuffer.as_tensors()'s self.obs[0] indexing."""
+        envs = _make_envs(trainer, 3)
+        group = BatchedEnvGroup(envs, trainer, seeds=[9300, 9301, 9302])
+        group.collect(n_steps=60)  # populate real data into all 3 buffers
+        group._buffers[1].clear()  # simulate "nothing new for env 1 this flush"
+
+        stats = [{"episode_rewards": []} for _ in range(3)]
+        results = group._build_results(range(3), stats)
+
+        result_buffer_ids = {id(r["buffer"]) for r in results}
+        assert len(results) == 2, "the empty-buffer env must be skipped, not included"
+        assert id(group._buffers[1]) not in result_buffer_ids

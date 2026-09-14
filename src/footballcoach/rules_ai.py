@@ -847,6 +847,15 @@ class NeuralPlayerAI(PlayerAI):
         # BEFORE this tick's act() runs -- see act()'s own docstring for the
         # exact mechanism and why this is the only hook batching needs.
         self._precomputed_result = None
+        # Set by plan() when it samples a fresh decision (see plan()/commit()
+        # below) -- Match._process_orders' own two-pass tick split
+        # (PlayerAI's class docstring) means the ACTUAL apply() (which can
+        # mutate shared state, e.g. an immediate kick when already
+        # possessing the ball) must wait until every player has planned
+        # this tick, not happen inline inside act()/plan(). None on a
+        # non-decision tick (nothing to apply) or once commit() has
+        # consumed it.
+        self._pending_result = None
         # Optional Callable[[Player, Match], BCLabel] (e.g.
         # footballcoach.ai.ppo.bc.phase1_labels_for_player), called from
         # WITHIN act() -- see its call site below for why: it must run at
@@ -869,6 +878,7 @@ class NeuralPlayerAI(PlayerAI):
         self._pending_obs_dict = None
         self._pending_bc_label = None
         self._precomputed_result = None
+        self._pending_result = None
 
     def is_due_for_decision(self) -> bool:
         """True if the NEXT ``act()``/``prepare()`` call on this instance
@@ -1041,6 +1051,47 @@ class NeuralPlayerAI(PlayerAI):
         result = self.sample_action_fn(obs_dict)
         self.apply(player, match, result)
 
+    def plan(self, player: "Player", match: "Match", trial_tick: int) -> None:
+        """First pass of Match._process_orders' two-pass tick (see
+        PlayerAI's own class docstring in entities/player.py): compute --
+        but do NOT yet apply -- this tick's decision. apply() can mutate
+        shared/other-player-visible state immediately (e.g. kicking the
+        ball right now when this player already possesses it --
+        apply_action_to_player()'s synchronous kick_with_direction() call),
+        so it must wait for commit() (every player's SECOND pass), not run
+        here where a later-processed player's OWN plan() this same tick
+        could still observe it. If an external batching caller (ai/ppo/
+        batched_rollout_worker.py) already set _precomputed_result, there's
+        nothing to compute here -- commit() consumes that directly, same as
+        it always has."""
+        if self._precomputed_result is not None:
+            return
+        obs_dict = self.prepare(player, match, trial_tick)
+        if obs_dict is None:
+            self._pending_result = None
+            return
+        self._pending_result = self.sample_action_fn(obs_dict)
+
+    def commit(self, player: "Player", match: "Match", trial_tick: int) -> None:
+        """Second pass: apply whatever plan() (or an external batching
+        caller, via _precomputed_result) computed this tick. No-op on a
+        non-decision tick -- plan()'s own prepare() call already re-applied
+        cached movement gating in that case (see prepare()'s "ticks_since_
+        decision < decision_interval_ticks" branch), which only ever
+        touches movement intent (desired_direction/desired_speed_mode),
+        already safe/deferred to Match._apply_movement -- nothing further
+        to commit here."""
+        if self._precomputed_result is not None:
+            result = self._precomputed_result
+            self._precomputed_result = None
+            self.apply(player, match, result)
+            return
+        if self._pending_result is None:
+            return
+        result = self._pending_result
+        self._pending_result = None
+        self.apply(player, match, result)
+
 
 def maybe_assign_neural_opponent(
     match, player_id: str, sample_action_fn, *,
@@ -1203,6 +1254,16 @@ class HybridPlayerAI(NeuralPlayerAI):
     # -- act() ----------------------------------------------------------------
 
     def act(self, player: "Player", match: "Match", trial_tick: int) -> None:
+        # NOTE: unlike NeuralPlayerAI, this class does not override
+        # plan()/commit() -- PlayerAI's default plan() -> act() means
+        # channel 2's immediate apply_action_to_player() call below runs
+        # during Match._process_orders' FIRST (plan) pass, not deferred to
+        # commit() (see PlayerAI's class docstring in entities/player.py).
+        # Left as-is deliberately: HybridPlayerAI is UI/human-interactive-
+        # override only (issue_order/set_decision_override), never used in
+        # PPO training rollouts or eval self-play, so it doesn't need the
+        # same-tick isolation fix that motivated plan()/commit() -- revisit
+        # if that ever changes.
         # Channel 1 takes priority: while an order override is active, skip
         # the neural network entirely (no sampling, no last_transition) and
         # let the engine's normal order-execution machinery run it.

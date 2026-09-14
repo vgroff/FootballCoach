@@ -113,8 +113,9 @@ def test_no_velocity_snap_during_move_order():
     )
 
     params = MovementParams.from_config()
-    # a_max for attr=0.5: 2.5 + 5*0.5 = 5.0 m/s²; standstill gets 1.5× boost
-    a_max_base = 2.5 + 5.0 * 0.5
+    # a_max for attr=0.5, derived from the live config rather than hardcoded
+    # literals so this doesn't drift out of sync with physics.json again.
+    a_max_base = params.accel_base_mps2 + params.accel_scale_mps2 * 0.5
     max_allowed_delta = a_max_base * params.standstill_decel_multiplier * (1.0 / 30.0) * 1.1  # 10% headroom
 
     prev_speed = 0.0
@@ -142,7 +143,9 @@ def test_stop_order_no_snap():
     player.current_order = StopOrder()
 
     params = MovementParams.from_config()
-    a_max_base = 2.5 + 5.0 * 0.5
+    # Derived from the live config rather than hardcoded literals so this
+    # doesn't drift out of sync with physics.json again.
+    a_max_base = params.accel_base_mps2 + params.accel_scale_mps2 * 0.5
     max_allowed_delta = a_max_base * params.standstill_decel_multiplier * (1.0 / 30.0) * 1.1
 
     prev_speed = player.speed_mps

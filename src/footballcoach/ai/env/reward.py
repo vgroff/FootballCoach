@@ -109,6 +109,40 @@ breaks the total down by source key:
           decision interval's real duration in seconds (not a flat
           per-step cost) so the total per-second cost of sprinting stays
           the same regardless of decision_interval_s tuning.
+  tack  — tackle-armed cost. tackle_armed_penalty_per_second * decision_interval_s
+          whenever tackle_armed was set this step, 0 otherwise -- same
+          per-second/decision-interval convention as "sprint" above (read at
+          the decision boundary, not integrated tick-by-tick within the
+          interval). Further multiplied by
+          tackle_armed_while_possessing_multiplier when the player was ALSO
+          in possession of the ball while arming it (multiplies rather than
+          adds so retuning the base rate scales the possession case
+          proportionally). Deliberately independent of "ill"
+          (illegal_action_attempted) -- a dedicated knob rather than folded
+          into the illegal-action penalty, which already covers several
+          unrelated invalid-action cases (see apply_nn_action.py's
+          tackle_no_carrier/tackle_while_inactive) and would make either
+          number harder to reason about on its own.
+  tatt  — tackle-attempted bonus. Same shape as "tack" but positive: when
+          tackle_attempted_this_step is true this decision step,
+          abs(tackle_armed_penalty_per_second) * decision_interval_s *
+          tackle_attempt_bonus_multiplier. Deliberately reuses "tack"'s OWN
+          per-second rate as its base (flipped positive) rather than an
+          independent coefficient, so retuning the armed-cost rate keeps
+          the two proportionally coupled unless tackle_attempt_bonus_multiplier
+          is also retuned -- that multiplier is the one exposed knob for
+          sizing the bonus relative to the cost it's meant to offset.
+          Fires on a real, INTENTIONAL tackle resolving contact (engine's
+          on_tackle callback, set only from the armed path in
+          Match._check_armed_tackles / _attempt_tackle_contact), regardless
+          of win or lose -- deliberately NOT scaled by outcome, since a win
+          already earns "poss" separately and this term exists purely to
+          offset "tack"'s ongoing per-tick cost for a genuine, uncertain
+          chase that might still fail, not to re-reward winning. Does NOT
+          fire for the collision-based auto-tackle fallback
+          (Match._check_head_on_tackles, on_auto_tackle_result) -- that path
+          never touches tackle_armed and isn't an intentional action this
+          reward is trying to shape.
 """
 from __future__ import annotations
 
@@ -189,6 +223,8 @@ def phase1_reward(
     player_speed_mps: float = 0.0,
     stamina_used: float = 0.0,
     is_sprinting: bool = False,
+    tackle_armed: bool = False,
+    tackle_attempted_this_step: bool | int = False,
     decision_interval_s: float = 0.0,
     episode_done: bool = False,
     prog_reward_clamp: float | None = None,
@@ -367,6 +403,31 @@ def phase1_reward(
     sprint_r = -_sprint_coef * decision_interval_s if (is_sprinting and _sprint_coef > 0.0) else 0.0
     r += sprint_r
     comps["sprint"] = sprint_r
+
+    # Tackle-armed cost -- see "tack" in the module docstring for the full
+    # rationale (independent of "ill"/illegal_action_attempted by design).
+    _tack_coef = float(cfg.get("tackle_armed_penalty_per_second", 0.0))
+    tack_r = 0.0
+    if tackle_armed and _tack_coef != 0.0:
+        tack_r = _tack_coef * decision_interval_s
+        if has_possession_now:
+            tack_r *= float(cfg.get("tackle_armed_while_possessing_multiplier", 1.0))
+    r += tack_r
+    comps["tack"] = tack_r
+
+    # Tackle-attempted bonus -- see "tatt" in the module docstring. Same
+    # shape as "tack" above but positive: reuses tackle_armed_penalty_per_second's
+    # own magnitude as its base rate (flipped positive) rather than an
+    # independent coefficient, scaled by the exposed
+    # tackle_attempt_bonus_multiplier. Deliberately NOT outcome-scaled -- a
+    # win already earns "poss" separately.
+    _tatt_base = abs(float(cfg.get("tackle_armed_penalty_per_second", 0.0)))
+    tatt_r = 0.0
+    if tackle_attempted_this_step and _tatt_base != 0.0:
+        _tatt_mult = float(cfg.get("tackle_attempt_bonus_multiplier", 1.0))
+        tatt_r = _tatt_base * decision_interval_s * _tatt_mult
+    r += tatt_r
+    comps["tatt"] = tatt_r
 
     return r, comps, cumulative_state_after
 

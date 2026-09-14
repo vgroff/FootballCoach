@@ -38,16 +38,25 @@ Current notes:
 - " [task] : read knowledge.md, ai/knowledge.md and ai_trainer_knowledge.md entirely. Please do not skip any of them. "
 - train blockers:
     - Next run:
-        - faster rollouts - more cores?
-        - consider non-separate value net
-        - fix tests!
-    - sprite: 4.5 strides per second at 9m/s, interpolate down on that and the degree of extension
+        - !! fix tests!
+        - !! large rollouts and smallish epochs at first? high entropy and reset log stds and kick power std and bernoullis
+    - !! on checkpointing
+        - way higher LR? with reset optimixer
+        - [] Plan to train against old checkpoints
+            - write a plan to include a 4th type of opponent - previous neural checkpoints
+                - add a phase1_opponent_previous_neural_ratio
+                - randomly select a previous checkpoint from this run and from any in a "previous_checkpoint_folders": ["phase1_run32", "phase1_run43"] type variable
+                - make sure we don't train on these, obviously
+        - !! at some point, using more envs with the GPU has to win out over fewer envs on the CPU for the rollouts, right?
+    - control needs fixing big time
+    - autotackle should slow the tackler down more, as a form of penalty
+    - having the decision latent space be added to the final layer of the player one (like an actual .add()) is genius because it allows player personalties but also manager influence and overriding etc... we can have the action layer that comes off it just be a generic decoder shared by everyone, that way everyone also has to agree on the shape on the latent space somewhat
+        - only issue - will it cause problems with teh "order" heads?
     - !! do a sweep of envs/cores thing
     - !! maybe arming kick/tackle should slow you slightly? so that it's not totally free
         - only during arming, not if it actually triggers
         - _could_ retrain the player encoder here
     - maybe stamina should weaken all your abilities
-    - boost tackles, but weaken tackles from the back too
     - !!! are they kick-tackling?? that should be pensalised probably/worse precision or smth - maybe depends on tackle quality
         - can inactive opponents interecept?
     - !!! add previous-neural opponents (previous runs, randomly selected)
@@ -241,7 +250,7 @@ NB Immediate Immediate:
 - kicking direction needs working - can’t kick at 90 degrees upward, even less with the same power
 - Allow pausing and going back in time (up to 30s)
 - Tackling - should be harder to tackle when you and/or target is moving fast (especially you). with dribbling its a little harder if you're moving fast
-- Control - should set the ball to ground level, snap for now but improve it later? Also how long are the control delays vs real life? Also implement failed control - rebounds or pass-throughs (depending if it hits the cylinder and random chance). I guess if they fail the control check the ball just keeps flying and it can hit them and/or tunnel through them maybe? easier tunneling if they failed a control/tackle already. Control difficulty should depend on speed/angle to heading. What happens during control, does a player have ball possession and can he be tackled while controlling? Shouldn’t be possible until ball on floor. Can he kick during control? I think no, either volley/head it first time or finish controlling it - but can arm a kick? Doess ball control skill even do much atm? Should be able to arm a control/let a ball run through (unless it "really" contacts). Speed penalty during ball control is flat atm, it should depend on control skill. Turning with the ball should be slower than without. A lot of this will require player physics encoder re-training but that's not an issue
+- Control - should set the ball to ground level, snap for now but improve it later? Also how long are the control delays vs real life? Also implement failed control - rebounds or pass-throughs (depending if it hits the cylinder and random chance). I guess if they fail the control check the ball just keeps flying and it can hit them and/or tunnel through them maybe? easier tunneling if they failed a control/tackle already. Control difficulty should depend on speed/angle to heading. What happens during control, does a player have ball possession and can he be tackled while controlling? Shouldn’t be possible until ball on floor. Can he kick during control? I think no, either volley/head it first time or finish controlling it - but can arm a kick? Doess ball control skill even do much atm? Should be able to arm a control/let a ball run through (unless it "really" contacts). Speed penalty during ball control is flat atm, it should depend on control skill. Turning with the ball should be slower than without. Turning speed should be affected by ball control if in possession, high ball can turn almost immediately. A lot of this will require player physics encoder re-training but that's not an issue
 - Heading - should reduce shot power (and precision) 
 - Give the ball some dots and make them spin during spinning
 - Possible later optimisation - the execution network could have only decisions+latent space as input, with none of the other current inputs present? Or way fewer at least? Would make it run faster, it can be smaller, the larger decision network can run less often

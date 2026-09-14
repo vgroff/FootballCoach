@@ -64,6 +64,10 @@ def main() -> None:
     parser.add_argument("--deterministic-direction", action="store_true",
                         help="Only the move_direction/kick_direction heads use their mean; discrete "
                              "decision/execution heads still sample stochastically.")
+    parser.add_argument("--no-swap-sides", action="store_true",
+                        help="Disable field-side-swap fairness passes (see ai/eval/seeded_eval.py's "
+                             "swap_player_states; ai_config.json eval.swap_sides defaults true) -- "
+                             "halves total eval episode count.")
     args = parser.parse_args()
 
     if not args.baseline_only and args.checkpoint is None:
@@ -86,7 +90,10 @@ def main() -> None:
     # Baseline-only mode: no checkpoint needed
     if args.baseline_only:
         log.info(f"Running rules-vs-{args.baseline_opponent} baseline ({args.baseline_trials} episodes, phase={args.phase})...")
-        baseline_stats = _run_baseline_evaluation(None, args.baseline_trials, args.repeats_per_seed, args.n_parallel_workers, args.baseline_opponent)
+        baseline_stats = _run_baseline_evaluation(
+            None, args.baseline_trials, args.repeats_per_seed, args.n_parallel_workers,
+            args.baseline_opponent, swap_sides=not args.no_swap_sides,
+        )
         combined = {
             "checkpoint": None,
             "checkpoint_step": 0,
@@ -121,6 +128,7 @@ def main() -> None:
         deterministic=args.deterministic,
         deterministic_decision=args.deterministic_decision,
         deterministic_direction=args.deterministic_direction,
+        swap_sides=not args.no_swap_sides,
     )
     log.info(f"  Neural net eval done: {neural_stats['n_trials']} episodes, "
              f"win={neural_stats['win_rate_pct']:.1f}%")
@@ -129,7 +137,10 @@ def main() -> None:
     baseline_stats: dict | None = None
     if not args.no_baseline and args.phase == 1:
         log.info(f"Running rules-vs-{args.baseline_opponent} baseline ({args.baseline_trials} episodes)...")
-        baseline_stats = _run_baseline_evaluation(env, args.baseline_trials, args.repeats_per_seed, args.n_parallel_workers, args.baseline_opponent)
+        baseline_stats = _run_baseline_evaluation(
+            env, args.baseline_trials, args.repeats_per_seed, args.n_parallel_workers,
+            args.baseline_opponent, swap_sides=not args.no_swap_sides,
+        )
         log.info(f"  Baseline eval done: win={baseline_stats['win_rate_pct']:.1f}%")
 
     # Combine results
@@ -164,15 +175,28 @@ def _checkpoint_eval_env_factory(
     -- each subprocess reloads the checkpoint fresh from disk (live
     nn.Module/optimizer objects aren't picklable across the process
     boundary), mirroring ai/ppo/rollout_worker.py's pattern."""
+    import dataclasses
     import functools
     import torch
     from footballcoach.ai.env.scenario_env import ScenarioEnv
     from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+    from footballcoach.ai.eval.seeded_eval import swap_player_states
 
     trainer = PPOTrainer.load_for_inference(checkpoint_path)
+    _trainee_pid = definition_kwargs.get("trainee_player_id", "trainee")
 
-    def _env_factory(seed: int) -> ScenarioEnv:
-        return ScenarioEnv(**definition_kwargs, seed=seed)
+    def _env_factory(seed: int, swap: bool = False) -> ScenarioEnv:
+        _kwargs = dict(definition_kwargs)
+        if swap:
+            _orig_build = _kwargs["definition"].build
+
+            def _swapped_build(*_a, **_kw):
+                _m = _orig_build(*_a, **_kw)
+                swap_player_states(_m, _trainee_pid, "opponent")
+                return _m
+
+            _kwargs["definition"] = dataclasses.replace(_kwargs["definition"], build=_swapped_build)
+        return ScenarioEnv(**_kwargs, seed=seed)
 
     sample_fn = trainer._sample_action
     if deterministic or deterministic_decision or deterministic_direction:
@@ -191,6 +215,7 @@ def _run_evaluation(
     deterministic: bool = False,
     deterministic_decision: bool = False,
     deterministic_direction: bool = False,
+    swap_sides: Optional[bool] = None,
 ) -> dict:
     """Run the shared seeded evaluation (ai/eval/seeded_eval.py) against the
     checkpoint's own env/definition, reusing the SAME fixed seed list as
@@ -201,11 +226,13 @@ def _run_evaluation(
     the checkpoint itself -- see _checkpoint_eval_env_factory). deterministic=True
     runs the policy's mode/mean instead of sampling; deterministic_decision/
     deterministic_direction narrow this to just the discrete or just the
-    direction heads respectively (see PPOTrainer._sample_action)."""
+    direction heads respectively (see PPOTrainer._sample_action). swap_sides
+    (None = fall back to ai_config.json eval.swap_sides): see
+    ai/eval/seeded_eval.py's swap_player_states."""
     from footballcoach.ai.config import load_ai_config
     from footballcoach.ai.env.scenario_env import ScenarioEnv
     from footballcoach.ai.eval.seeded_eval import (
-        default_eval_seeds, run_seeded_evaluation, run_seeded_evaluation_parallel,
+        default_eval_seeds, run_seeded_evaluation, run_seeded_evaluation_parallel, swap_player_states,
     )
 
     cfg = load_ai_config()
@@ -220,6 +247,8 @@ def _run_evaluation(
     n_workers = n_parallel_workers if n_parallel_workers is not None else int(
         cfg.get("eval", {}).get("eval_n_parallel_workers", 1)
     )
+    if swap_sides is None:
+        swap_sides = bool(cfg.get("eval", {}).get("swap_sides", True))
 
     if n_workers > 1 and checkpoint_path is not None:
         import functools
@@ -234,11 +263,23 @@ def _run_evaluation(
             _checkpoint_eval_env_factory, checkpoint_path, "cpu", _def_kwargs,
             deterministic, deterministic_decision, deterministic_direction,
         )
-        result = run_seeded_evaluation_parallel(worker_factory, seeds, repeats, n_workers=n_workers)
+        result = run_seeded_evaluation_parallel(worker_factory, seeds, repeats, n_workers=n_workers, swap_sides=swap_sides)
     else:
-        def _env_factory(seed: int) -> ScenarioEnv:
+        import dataclasses
+
+        def _env_factory(seed: int, swap: bool = False) -> ScenarioEnv:
+            _definition = env.definition
+            if swap:
+                _orig_build = _definition.build
+
+                def _swapped_build(*_a, **_kw):
+                    _m = _orig_build(*_a, **_kw)
+                    swap_player_states(_m, env.trainee_player_id, "opponent")
+                    return _m
+
+                _definition = dataclasses.replace(_definition, build=_swapped_build)
             return ScenarioEnv(
-                definition=env.definition,
+                definition=_definition,
                 trainee_player_id=env.trainee_player_id,
                 phase=env.phase,
                 secondary_player_ids=env.secondary_player_ids,
@@ -255,7 +296,7 @@ def _run_evaluation(
                 deterministic_decision=deterministic_decision,
                 deterministic_direction=deterministic_direction,
             )
-        result = run_seeded_evaluation(_env_factory, sample_fn, seeds, repeats)
+        result = run_seeded_evaluation(_env_factory, sample_fn, seeds, repeats, swap_sides=swap_sides)
 
     d = result.as_dict()
     d["min_reward"] = float(min(result.rewards)) if result.rewards else float("nan")
@@ -300,11 +341,14 @@ def _baseline_env_worker_factory(opponent: str = "rules") -> tuple:
     from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
     from footballcoach.rules_ai import Phase1RulesAI
     from footballcoach.ai.env.scenario_env import ScenarioEnv
+    from footballcoach.ai.eval.seeded_eval import swap_player_states
 
     _pids = ("trainee", "opponent") if opponent == "rules" else ("trainee",)
 
-    def _baseline_build(*args, **kwargs):
+    def _baseline_build(*args, swap: bool = False, **kwargs):
         match = build_1v1_scenario(*args, **kwargs)
+        if swap:
+            swap_player_states(match, "trainee", "opponent")
         match.rng = random.Random()  # fresh entropy -- see docstring above
         for pid in _pids:
             try:
@@ -313,7 +357,7 @@ def _baseline_env_worker_factory(opponent: str = "rules") -> tuple:
                 pass
         return match
 
-    def _env_factory(seed: int) -> ScenarioEnv:
+    def _env_factory(seed: int, swap: bool = False) -> ScenarioEnv:
         def _build(*_a, **_kw):
             # ball_max_speed_mps deliberately NOT passed (was hardcoded to
             # 4.0 until 2026-09-03) -- omitting it matches build_1v1_scenario's
@@ -322,7 +366,7 @@ def _baseline_env_worker_factory(opponent: str = "rules") -> tuple:
             # actually uses too (see curriculum/envs.py's matching fix) --
             # this baseline was previously measuring a materially different,
             # unrelated ball-speed regime from what it's meant to baseline.
-            return _baseline_build(*_a, seed=seed, **_kw)
+            return _baseline_build(*_a, seed=seed, swap=swap, **_kw)
 
         defn = ScenarioDefinition(
             key="baseline_1v1",
@@ -338,13 +382,15 @@ def _baseline_env_worker_factory(opponent: str = "rules") -> tuple:
 
 def _run_baseline_evaluation(
     env, n_trials: int, repeats_per_seed: Optional[int] = None, n_parallel_workers: Optional[int] = None,
-    opponent: str = "rules",
+    opponent: str = "rules", swap_sides: Optional[bool] = None,
 ) -> dict:  # env unused, kept for API compat
     """Run the shared seeded evaluation with rules-based AI on the trainee
     side and `opponent` ("rules" or "immobile") on the other.
 
     build_1v1_scenario assigns Phase1RulesAI to both trainee and opponent via
-    player.ai; Match.step() fires them automatically.
+    player.ai; Match.step() fires them automatically. swap_sides (None =
+    fall back to ai_config.json eval.swap_sides): see
+    ai/eval/seeded_eval.py's swap_player_states.
     """
     from footballcoach.ai.config import load_ai_config
     from footballcoach.ai.eval.seeded_eval import run_seeded_evaluation, run_seeded_evaluation_parallel
@@ -357,15 +403,18 @@ def _run_baseline_evaluation(
     n_workers = n_parallel_workers if n_parallel_workers is not None else int(
         cfg.get("eval", {}).get("eval_n_parallel_workers", 1)
     )
+    if swap_sides is None:
+        swap_sides = bool(cfg.get("eval", {}).get("swap_sides", True))
 
     if n_workers > 1:
         import functools
         result = run_seeded_evaluation_parallel(
             functools.partial(_baseline_env_worker_factory, opponent), seeds, repeats, n_workers=n_workers,
+            swap_sides=swap_sides,
         )
     else:
         env_factory, sample_action_fn = _baseline_env_worker_factory(opponent)
-        result = run_seeded_evaluation(env_factory, sample_action_fn, seeds, repeats)
+        result = run_seeded_evaluation(env_factory, sample_action_fn, seeds, repeats, swap_sides=swap_sides)
 
     d = result.as_dict()
     del d["mean_value_pred"]  # no neural player in this scenario
@@ -379,6 +428,8 @@ def _run_baseline_evaluation(
 
 
 def _print_combined_stats(combined: dict) -> None:
+    from footballcoach.ai.ppo.ppo_trainer import format_outcomes_with_pct as _fmt_oc
+
     log.info("=" * 60)
     log.info("EVALUATION RESULTS")
     log.info("=" * 60)
@@ -388,11 +439,11 @@ def _print_combined_stats(combined: dict) -> None:
     nn = combined["neural_net"]
     log.info(f"  Neural net:  win={nn['win_rate_pct']:.1f}%  "
              f"reward={nn['mean_reward']:.2f}±{nn['std_reward']:.2f} (sem={nn['sem_reward']:.2f})  "
-             f"outcomes={nn['outcomes']}  (win/loss/tout/miss: {nn['outcome_breakdown']})")
+             f"outcomes={_fmt_oc(nn['outcomes'])}  (win/loss/tout/miss: {nn['outcome_breakdown']})")
 
     bl = combined.get("baseline_rules_vs_rules")
     if bl:
-        log.info(f"  Rules base:  win={bl['win_rate_pct']:.1f}%  outcomes={bl['outcomes']}"
+        log.info(f"  Rules base:  win={bl['win_rate_pct']:.1f}%  outcomes={_fmt_oc(bl['outcomes'])}"
                  f"  (win/loss/tout/miss: {bl['outcome_breakdown']})")
         diff = nn["win_rate_pct"] - bl["win_rate_pct"]
         log.info(f"  Delta vs baseline: {diff:+.1f}pp")

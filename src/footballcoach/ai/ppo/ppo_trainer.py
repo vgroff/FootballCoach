@@ -65,9 +65,12 @@ from footballcoach.ai.action.gating import select_action
 from footballcoach.ai.action.schema import DecisionAction, DecisionHeadsRaw, ExecutionAction
 from footballcoach.ai.config import load_ai_config
 from footballcoach.ai.eval.seeded_eval import (
+    _capped_thread_env_for_pool_spawn,
     default_eval_seeds,
     run_seeded_evaluation,
+    run_seeded_evaluation_batched,
     run_seeded_evaluation_parallel,
+    run_seeded_evaluation_parallel_batched,
 )
 from footballcoach.ai.models.decision_network import DecisionNetwork, derive_get_possession_prob
 from footballcoach.ai.models.execution_network import ExecutionNetwork, flatten_decision_heads
@@ -248,6 +251,8 @@ REWARD_COMP_LABELS: list[tuple[str, str]] = [
     ("step",  "step_penalty"),
     ("stam",  "stamina_penalty"),
     ("sprint", "sprint_penalty"),
+    ("tack",  "tackle_armed_penalty"),
+    ("tatt",  "tackle_attempted_bonus"),
 ]
 
 # Execution-network head name -> nn.Module attribute name, used for the
@@ -540,12 +545,15 @@ def _build_eval_env_factory(use_rules_ai: bool, max_episode_s: float):
     from footballcoach.rules_ai import Phase1RulesAI
     from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
     from footballcoach.ai.env.scenario_env import ScenarioEnv
+    from footballcoach.ai.eval.seeded_eval import swap_player_states
 
     _label = "rules" if use_rules_ai else "immobile"
 
-    def _eval_env_factory(seed: int) -> ScenarioEnv:
+    def _eval_env_factory(seed: int, swap: bool = False) -> ScenarioEnv:
         def _eval_build(*_a, **_kw):
             _m = build_1v1_scenario(*_a, seed=seed, **_kw)
+            if swap:
+                swap_player_states(_m, "trainee", "opponent")
             if use_rules_ai:
                 _m.player_by_id("opponent").ai = Phase1RulesAI()
             _m._opponent_use_rules_ai = use_rules_ai
@@ -573,6 +581,148 @@ def _eval_worker_factory(
     ai/ppo/rollout_worker.py."""
     trainer = rebuild_inference_trainer(decision_state, execution_state, separate_value_net, value_state)
     return _build_eval_env_factory(use_rules_ai, max_episode_s), trainer._sample_action
+
+
+def _eval_worker_factory_batched(
+    decision_state: dict, execution_state: dict, separate_value_net: bool,
+    value_state: Optional[dict], use_rules_ai: bool, max_episode_s: float,
+) -> tuple:
+    """Batched-eval counterpart to ``_eval_worker_factory``: returns
+    ``(env_factory, trainer, secondary_trainer)`` -- the trainer OBJECT
+    (not just its bound ``sample_action_fn``), since
+    ``run_seeded_evaluation_batched`` needs ``_sample_action_batch()``.
+    ``secondary_trainer`` is always ``None`` here: rules/immobile opponents
+    have no neural decision to batch (see ``_secondary_neural_candidates``'s
+    duck-typed skip of anything without ``is_due_for_decision()``)."""
+    trainer = rebuild_inference_trainer(decision_state, execution_state, separate_value_net, value_state)
+    return _build_eval_env_factory(use_rules_ai, max_episode_s), trainer, None
+
+
+def _build_neural_vs_neural_env_factory(max_episode_s: float, opponent_sample_action_fn):
+    """Builds a ``(seed, swap) -> ScenarioEnv`` factory for neural-vs-neural
+    snapshot eval (see ``PPOTrainer._eval_vs_neural_snapshot``): the trainee
+    uses whatever ``sample_action_fn`` the caller assigns onto the returned
+    env (same convention as ``_build_eval_env_factory``), while the
+    'opponent' secondary player is pinned to a DIFFERENT, fixed
+    ``opponent_sample_action_fn`` (a frozen snapshot) via a small
+    ``ScenarioEnv`` subclass -- ``reset()``'s normal
+    ``maybe_assign_neural_opponent()`` (``ai/env/scenario_env.py``) always
+    mirrors the trainee's OWN live weights onto secondary players (real
+    self-play), so this overrides the opponent's ``.ai`` right after
+    ``super().reset()`` assigns it, with an otherwise-identical
+    ``NeuralPlayerAI`` just pointed at the snapshot instead."""
+    from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
+    from footballcoach.ai.env.scenario_env import ScenarioEnv
+    from footballcoach.ai.eval.seeded_eval import swap_player_states
+
+    class _NeuralOpponentEnv(ScenarioEnv):
+        def reset(self, *, seed: Optional[int] = None):
+            obs = super().reset(seed=seed)
+            from footballcoach.rules_ai import NeuralPlayerAI
+            match = self._loop.match
+            try:
+                opponent = match.player_by_id("opponent")
+            except KeyError:
+                return obs
+            opponent.ai = NeuralPlayerAI(
+                opponent_sample_action_fn,
+                decision_interval_ticks=self._ticks_per_decision,
+                max_episode_s=self.max_episode_s,
+                ema_smoothed=self._sec_ema["opponent"].smoothed,
+                rng=self.rng,
+            )
+            return obs
+
+    def _eval_env_factory(seed: int, swap: bool = False) -> ScenarioEnv:
+        def _eval_build(*_a, **_kw):
+            # opponent_rules_prob/opponent_immobile_prob=0.0: force
+            # build_1v1_scenario's OWN internal opponent-type roll to land on
+            # its "neural" branch (ai=None, no order touched at all) instead
+            # of its default opponent_immobile_prob=1.0, which would assign a
+            # JogOrder that re-asserts a fixed direction every tick
+            # regardless of what player.ai does (see that function's own
+            # opponent-roll comment, and ui/scenarios.py's
+            # build_checkpoint_vs_checkpoint-style scenario for the exact
+            # same fix already applied once before for the identical reason).
+            # Without this, the opponent.ai reassignment below is completely
+            # neutralized by the engine re-applying the leftover JogOrder on
+            # top of it every tick -- confirmed via a real self-play sanity
+            # check (checkpoint vs itself came back ~90% "trainee" win rate
+            # instead of ~50%, i.e. the opponent was just jogging in a
+            # straight line, never actually running any network).
+            _m = build_1v1_scenario(
+                *_a, seed=seed, opponent_rules_prob=0.0, opponent_immobile_prob=0.0, **_kw,
+            )
+            if swap:
+                swap_player_states(_m, "trainee", "opponent")
+            return _m
+
+        return _NeuralOpponentEnv(
+            ScenarioDefinition(key="_eval_neural_snapshot", label="eval_neural_snapshot",
+                               description="neural-vs-neural snapshot eval", build=_eval_build),
+            trainee_player_id="trainee",
+            secondary_player_ids=["opponent"],
+            max_episode_s=max_episode_s,
+        )
+
+    return _eval_env_factory
+
+
+def _eval_worker_factory_neural_snapshot(
+    trainee_decision_state: dict, trainee_execution_state: dict, trainee_value_state: Optional[dict],
+    opponent_decision_state: dict, opponent_execution_state: dict, opponent_value_state: Optional[dict],
+    separate_value_net: bool, max_episode_s: float,
+) -> tuple:
+    """Module-level (picklable) factory for parallel neural-vs-neural
+    snapshot eval (``PPOTrainer._eval_vs_neural_snapshot``) -- mirrors
+    ``_eval_worker_factory``, but rebuilds TWO inference-only PPOTrainers
+    (the trainee's current live weights, and a frozen snapshot for the
+    opponent) instead of one."""
+    trainee_trainer = rebuild_inference_trainer(
+        trainee_decision_state, trainee_execution_state, separate_value_net, trainee_value_state)
+    opponent_trainer = rebuild_inference_trainer(
+        opponent_decision_state, opponent_execution_state, separate_value_net, opponent_value_state)
+    env_factory = _build_neural_vs_neural_env_factory(max_episode_s, opponent_trainer._sample_action)
+    return env_factory, trainee_trainer._sample_action
+
+
+def _eval_worker_factory_neural_snapshot_batched(
+    trainee_decision_state: dict, trainee_execution_state: dict, trainee_value_state: Optional[dict],
+    opponent_decision_state: dict, opponent_execution_state: dict, opponent_value_state: Optional[dict],
+    separate_value_net: bool, max_episode_s: float,
+) -> tuple:
+    """Batched-eval counterpart to ``_eval_worker_factory_neural_snapshot``:
+    returns ``(env_factory, trainee_trainer, opponent_trainer)`` instead of
+    ``(env_factory, trainee_sample_action_fn)`` -- ``run_seeded_evaluation_batched``
+    batches the opponent's decisions too (secondary_trainer=opponent_trainer)
+    the same way ``BatchedEnvGroup.secondary_trainer`` does for training
+    self-play, since neural-vs-neural eval's 'opponent' is exactly that kind
+    of secondary neural player (see ``_build_neural_vs_neural_env_factory``'s
+    ``_NeuralOpponentEnv``)."""
+    trainee_trainer = rebuild_inference_trainer(
+        trainee_decision_state, trainee_execution_state, separate_value_net, trainee_value_state)
+    opponent_trainer = rebuild_inference_trainer(
+        opponent_decision_state, opponent_execution_state, separate_value_net, opponent_value_state)
+    env_factory = _build_neural_vs_neural_env_factory(max_episode_s, opponent_trainer._sample_action)
+    return env_factory, trainee_trainer, opponent_trainer
+
+
+def _trimmed_mean_p1_p99(x: torch.Tensor) -> float:
+    """Mean of ``x`` after dropping the bottom/top 1% (i.e. keeping only
+    values in [p1, p99]) -- a robust companion to a plain mean, so a
+    handful of extreme outliers (e.g. a rare mis-valued state producing a
+    huge squared-error term) don't single-handedly dominate the reported
+    number the way they can dominate ``value_loss``'s straight mean. Same
+    motivation as the policy_loss percentile lines elsewhere in this file,
+    just collapsed to one robust scalar instead of a full percentile
+    spread. Returns ``nan`` for an empty input."""
+    if x.numel() == 0:
+        return float("nan")
+    lo = x.quantile(0.01)
+    hi = x.quantile(0.99)
+    mask = (x >= lo) & (x <= hi)
+    trimmed = x[mask]
+    return float(trimmed.mean()) if trimmed.numel() > 0 else float(x.mean())
 
 
 def _ai_types(obs_dict: dict) -> tuple:
@@ -623,6 +773,49 @@ def outcome_breakdown(outcomes: list[str]) -> str:
     return "/".join(parts)
 
 
+def format_outcomes_with_pct(outcomes: dict) -> str:
+    """Format an outcome-count dict as ``{'key': N (P%), ...}`` so relative
+    shares are visible in logs alongside the raw counts, without requiring
+    mental division while reading them.
+    """
+    total = sum(outcomes.values())
+    if total == 0:
+        return "{}"
+    parts = [f"'{k}': {v} ({v / total * 100:.1f}%)" for k, v in outcomes.items()]
+    return "{" + ", ".join(parts) + "}"
+
+
+def _trainee_episode_abs_adv_means(
+    track_ids: list, dones, advantages,
+) -> list[float]:
+    """Per-trainee-episode mean(|advantage|), for episode-seed replay (see
+    ``PPOTrainer._train_batched_parallel``'s highest-mean-|advantage| seed
+    selection). Filters to ``track_ids == "trainee"`` rows FIRST, then
+    segments those (in their own relative order) on ``dones > 0.5`` --
+    unlike the ``[advantage |.| by episode]`` diagnostic log line elsewhere
+    in this file, which segments the flat (possibly track-interleaved)
+    ``dones`` directly and is therefore only a reasonable approximation when
+    a secondary/opponent track is present. A trailing incomplete episode
+    (no terminal ``done=1`` row yet) is silently dropped, matching
+    ``stats["episode_rewards"]``'s own behavior (only appended on
+    ``done=True``) so the two line up 1:1 in order.
+
+    ``dones``/``advantages`` accept plain lists OR anything indexable with
+    ``[int] -> float`` (e.g. a ``RolloutBuffer.dones`` list alongside a
+    freshly computed ``compute_gae()`` advantages list) -- both are always
+    the SAME length as ``track_ids`` (one entry per buffer row).
+    """
+    idxs = [i for i, t in enumerate(track_ids) if t == "trainee"]
+    means: list[float] = []
+    start = 0
+    for pos, i in enumerate(idxs):
+        if dones[i] > 0.5:
+            seg = idxs[start:pos + 1]
+            means.append(sum(abs(advantages[j]) for j in seg) / len(seg))
+            start = pos + 1
+    return means
+
+
 # Slash-joined short labels matching outcome_breakdown()'s column order, for
 # a one-time "vs[...]:" legend prefix on log lines instead of repeating the
 # key names on every vs_rules/vs_immobile/vs_neural segment.
@@ -631,26 +824,44 @@ _PHASE1_OUTCOME_LEGEND = "/".join(label for _, label in _PHASE1_OUTCOME_KEYS)
 
 def value_mse_by_outcome(
     pred: torch.Tensor, target: torch.Tensor, outcomes: list[str],
-) -> dict[str, tuple[float, int]]:
-    """Per-outcome (raw MSE, n_rows) breakdown of a value-prediction batch,
-    shared by every value-fitting call site (Phase 0 demo warm-up, PPO
-    rollout value pre-training, and the PPO value loss itself) so "is the
-    critic doing worse on losses/timeouts than wins" can be answered the
-    same way everywhere instead of duplicating the group-by logic per
-    caller. ``outcomes`` must be the same length as ``pred``/``target``
-    (e.g. a dataset's ``row_outcomes()`` for demo rows, or a rollout
-    batch's ``step_outcomes`` list, with "" -> "unknown"). Empty/missing
-    outcome strings are grouped under "unknown".
+) -> dict[str, tuple[float, int, float, float]]:
+    """Per-outcome (raw MSE, n_rows, target_mean, target_mean_sq) breakdown
+    of a value-prediction batch, shared by every value-fitting call site
+    (Phase 0 demo warm-up, PPO rollout value pre-training, and the PPO value
+    loss itself) so "is the critic doing worse on losses/timeouts than wins"
+    can be answered the same way everywhere instead of duplicating the
+    group-by logic per caller. ``outcomes`` must be the same length as
+    ``pred``/``target`` (e.g. a dataset's ``row_outcomes()`` for demo rows,
+    or a rollout batch's ``step_outcomes`` list, with "" -> "unknown").
+    Empty/missing outcome strings are grouped under "unknown".
+
+    ``target_mean``/``target_mean_sq`` (mean of target, mean of target**2 --
+    NOT variance/std directly) are the ground-truth return's own first two
+    raw moments for this group, in the same "per-call mean, multiply by n to
+    re-accumulate a sum across chunks" convention ``mse`` already uses --
+    callers accumulating this across multiple calls (e.g.
+    ``_accum_value_by_outcome`` below) should do the same
+    ``value * n``-then-divide-by-total-n dance for these two fields that
+    they already do for ``mse``, then derive
+    ``std = sqrt(max(target_mean_sq - target_mean**2, 0))`` once at the
+    final, fully-accumulated point -- NOT per chunk (mean/mean_sq combine
+    linearly across chunks via weighted averaging, std does not).
     """
     if len(outcomes) == 0:
         return {}
+    target_np = target.detach().float().cpu().numpy()
     sq_err = (pred.detach() - target).float().cpu().numpy() ** 2
-    out: dict[str, tuple[float, int]] = {}
+    out: dict[str, tuple[float, int, float, float]] = {}
     labels = np.array([o if o else "unknown" for o in outcomes], dtype=object)
     for name in np.unique(labels):
         mask = labels == name
         n = int(mask.sum())
-        out[str(name)] = (float(sq_err[mask].sum() / max(n, 1)), n)
+        out[str(name)] = (
+            float(sq_err[mask].sum() / max(n, 1)),
+            n,
+            float(target_np[mask].mean()),
+            float((target_np[mask] ** 2).mean()),
+        )
     return out
 
 
@@ -678,21 +889,34 @@ def log_episode_reward_stats_by_outcome(
         )
 
 
-def format_outcome_rmse_breakdown(by_outcome: dict[str, tuple[float, int]]) -> str:
-    """One-line ``outcome=rmse(n)`` summary of ``value_mse_by_outcome()``'s
-    output, for appending to an existing log line without a full extra
-    multi-line block -- callers that want the fuller multi-line form (see
-    debug_value_network.py) can iterate the dict themselves instead.
+def format_outcome_rmse_breakdown(by_outcome: dict[str, tuple[float, int, float, float]]) -> str:
+    """One-line ``outcome=rmse(gt=mean±std, n)`` summary of
+    ``value_mse_by_outcome()``'s output, for appending to an existing log
+    line without a full extra multi-line block -- callers that want the
+    fuller multi-line form (see debug_value_network.py) can iterate the
+    dict themselves instead.
 
     Takes the sqrt of each outcome's mean squared error before formatting,
-    so the displayed number is in the same units as the value/return itself
+    so the displayed RMSE is in the same units as the value/return itself
     (reward-scale) rather than squared units -- easier to eyeball against
-    the return std printed elsewhere on the same log line.
+    the return std printed elsewhere on the same log line. The ground-truth
+    ``gt=mean±std`` alongside it is what the critic is actually being
+    scored against for that outcome group -- an RMSE of e.g. 0.66 reads very
+    differently against a gt std of 0.45 (worse than just predicting the
+    mean) than against a gt std of 2.0 (a solid fit).
+
+    ``by_outcome`` values are ``(mse, n, target_mean, target_mean_sq)`` --
+    the LAST two are target_mean_sq, not variance/std; std is derived here
+    as ``sqrt(max(target_mean_sq - target_mean**2, 0))``, matching
+    ``value_mse_by_outcome()``'s own docstring on why that derivation must
+    happen only once, at the final fully-accumulated point.
     """
     if not by_outcome:
         return ""
     return "  ".join(
-        f"{name}={math.sqrt(max(mse, 0.0)):.3f}(n={n})" for name, (mse, n) in sorted(by_outcome.items())
+        f"{name}={math.sqrt(max(mse, 0.0)):.3f}"
+        f"(gt={gt_mean:+.2f}±{math.sqrt(max(gt_mean_sq - gt_mean ** 2, 0.0)):.2f}, n={n})"
+        for name, (mse, n, gt_mean, gt_mean_sq) in sorted(by_outcome.items())
     )
 
 
@@ -887,6 +1111,29 @@ class PPOTrainer:
         )
         self.minibatch_size = int(ppo_cfg.get("minibatch_size", 64))
         self.target_kl = float(ppo_cfg.get("target_kl", 0.02))
+        # Dual-clip PPO (Ye et al. 2020, "Mastering Complex Control in MOBA
+        # Games with Deep Reinforcement Learning" -- the OpenAI Five/Tencent
+        # lineage): vanilla PPO's clip only bounds the surrogate objective
+        # for POSITIVE advantage -- for NEGATIVE advantage, if ratio blows
+        # up (the network drastically increases the probability of an
+        # action its OWN advantage estimate says was bad), the unclipped
+        # side (ratio*adv) keeps decreasing without bound as ratio grows,
+        # and min() picks it the moment ratio exceeds (1+clip_range) --
+        # giving an UNBOUNDED positive policy_loss contribution from that
+        # one row. Confirmed live in this codebase: recurring "[ratio
+        # spike]" log entries with negative adv imply per-sample policy_loss
+        # in the hundreds to (rarely) tens of thousands. This adds a SECOND
+        # floor, ONLY for adv<0: max(min(surr1,surr2), dual_clip_c*adv) --
+        # bounds that row's worst case at dual_clip_c*|adv| without
+        # touching the already-fine positive-advantage path at all. 0
+        # (default, falsy) disables entirely -- byte-identical to vanilla
+        # PPO. When enabled, dual_clip_c should be > 1 (paper/typical
+        # practice: 2-3) so the floor sits below (more negative than, since
+        # adv<0) the standard clip's own (1+clip_range)*adv bound -- picking
+        # dual_clip_c <= 1+clip_range would instead tighten the ALREADY-
+        # clipped region too, which is not the intent. See
+        # _apply_dual_clip().
+        self.dual_clip_c = float(ppo_cfg.get("dual_clip_c", 0.0) or 0.0)
         self.rollout_steps = int(ppo_cfg.get("rollout_steps", 2048))
         self.dir_l2_coef = float(ppo_cfg.get("dir_l2_coef", 0.01))
         self.move_dir_log_kappa_min = float(ppo_cfg.get("move_dir_log_kappa_min", ppo_cfg.get("dir_log_kappa_min", -2.0)))
@@ -915,6 +1162,26 @@ class PPOTrainer:
         self._eval_seeds = default_eval_seeds(cfg)
         self._eval_repeats_per_seed = int(eval_cfg.get("eval_repeats_per_seed", 2))
         self._eval_n_parallel_workers = int(eval_cfg.get("eval_n_parallel_workers", 1))
+        # Field-side fairness (see ai/eval/seeded_eval.py's swap_player_states):
+        # deliberately a separate bool, NOT folded into eval_repeats_per_seed
+        # -- repeats_per_seed always means "episodes per seed [per side]",
+        # this just controls whether each seed also gets a second pass with
+        # trainee/opponent roles swapped. Applies to every seeded eval in
+        # this file (vs-rules, vs-immobile, rules-vs-rules baseline, and the
+        # neural-snapshot comparisons below).
+        self._eval_swap_sides = bool(eval_cfg.get("swap_sides", True))
+        # Opt-in batched eval (see ai/eval/seeded_eval.py's
+        # run_seeded_evaluation_batched): when True, every seeded eval in
+        # this file (vs-rules, vs-immobile, rules-vs-rules baseline, and the
+        # neural-snapshot comparisons) batches its episodes'
+        # decision-network calls across eval_envs_per_process envs at a
+        # time (per worker process), the same speedup
+        # ppo.batched_rollout/batch_secondary_players gives real rollout
+        # collection -- see that module's docstring. False (default) =
+        # unchanged: each worker runs its episodes one at a time
+        # (batch-of-1 network calls).
+        self._eval_batched = bool(eval_cfg.get("batched_eval", False))
+        self._eval_envs_per_process = int(eval_cfg.get("eval_envs_per_process", 8))
         # Set only by _train_parallel() (see ai/eval/eval_worker.py) for the
         # duration of that call -- a persistent eval worker pool that
         # _eval_vs_opponent_type() reuses instead of spinning up a fresh
@@ -934,6 +1201,18 @@ class PPOTrainer:
         # _compute_rules_vs_rules_baseline), since it never changes: same
         # seeds, same deterministic-ish rules-AI opponent logic.
         self._rules_vs_rules_baseline = None
+        # --- Neural-snapshot self-eval (see _maybe_run_neural_snapshot_eval)
+        # -- every_n<=0 disables the whole feature (default). No separate
+        # in-memory snapshot ring: _save_checkpoint() already writes
+        # checkpoint{N}.pt to disk every rollout regardless of this feature,
+        # so "K rollouts back" is just checkpoint{current_count - K}.pt in
+        # the same checkpoint_dir -- read fresh each time, nothing extra to
+        # keep in memory. 'original' is always checkpoint1.pt.
+        self._neural_snapshot_every_n = int(eval_cfg.get("neural_snapshot_eval_every_n_rollouts", 0))
+        self._neural_snapshot_lookbacks: list[int] = [
+            int(k) for k in eval_cfg.get("neural_snapshot_lookbacks", [1, 5, 20])
+        ]
+        self._nn_snapshot_rollout_count = 0
         self.n_processes = int(ppo_cfg.get("n_processes", 1))
         self.worker_torch_threads = int(ppo_cfg.get("worker_torch_threads", 1))
         # Opt-in batched-rollout mode (see ai/ppo/batched_rollout_worker.py):
@@ -947,6 +1226,63 @@ class PPOTrainer:
         # 1, so n_processes alone is both the process count and total envs).
         self.batched_rollout = bool(ppo_cfg.get("batched_rollout", False))
         self.envs_per_process = int(ppo_cfg.get("envs_per_process", 1))
+        # Opt-in, only meaningful alongside batched_rollout=True: also
+        # batches every secondary/opponent neural player's decision (e.g.
+        # phase 1's self-play "neural remainder" opponent -- see
+        # curriculum.phase1_opponent_neural_ratio, often the majority of
+        # episodes) into its own one-call-per-round
+        # BatchedEnvGroup.secondary_trainer batch, instead of each opponent
+        # deciding unbatched one at a time. Passes the SAME trainer as the
+        # primary (true self-play, identical weights, just batched for
+        # speed) -- see BatchedEnvGroup's own docstring. False (default) =
+        # unchanged: secondary players decide unbatched via their own
+        # sample_action_fn fallback inside env.step().
+        self.batch_secondary_players = bool(ppo_cfg.get("batch_secondary_players", False))
+        # Batched-rollout only: bounds each worker's peak memory by having
+        # it flush/send its results in chunks of roughly this many steps
+        # instead of accumulating its full steps_per_worker budget (often
+        # tens of thousands of rows) before one giant end-of-rollout
+        # pickle+send -- see ai/ppo/batched_rollout_worker.py's "Chunked
+        # streaming" docstring section. Fixes a real MemoryError observed in
+        # production (many workers finishing near-simultaneously, each
+        # trying to pickle its entire buffer at once). 0/falsy disables --
+        # restores the old monolithic single-send-per-rollout behavior.
+        self.batched_rollout_chunk_steps = int(ppo_cfg.get("batched_rollout_chunk_steps", 3000))
+        # Episode-seed replay (batched-rollout only, see
+        # ai/ppo/batched_rollout_worker.py's "Episode-seed replay" docstring
+        # section and _train_batched_parallel()'s selection logic): when
+        # enabled, the top episode_replay_top_fraction of each rollout's
+        # episodes by mean(|advantage|) have their seeds re-queued for the
+        # VERY NEXT rollout only (one-shot, not a persistent buffer) --
+        # PLR-style re-exposure to whatever the policy found most
+        # surprising/informative, plus a before/after mean-reward log line.
+        self._episode_replay_enabled = bool(ppo_cfg.get("episode_replay_enabled", False))
+        self._episode_replay_top_fraction = float(ppo_cfg.get("episode_replay_top_fraction", 0.05))
+        # {seed: {"reward": float, "abs_adv": float}} for seeds queued at the
+        # END of the previous rollout cycle -- the "before" side of the
+        # before/after report, consumed (and replaced) once per cycle in
+        # _train_batched_parallel().
+        self._pending_replay_before: dict[int, dict] = {}
+        # Held-out validation episodes (diagnostic only -- see
+        # _split_train_val_episodes()/_eval_val_episode_losses() and
+        # _ppo_update()'s per-epoch val_episode_policy_loss/
+        # val_episode_value_loss log line). A random val_episode_fraction of
+        # each rollout's COMPLETE episodes (split per track_id, so a
+        # secondary neural opponent's interleaved rows can never straddle
+        # the train/val boundary -- see RolloutBuffer.compute_gae's own
+        # per-track segmentation note) are excluded from every minibatch
+        # update this call, then re-evaluated (forward pass only, no
+        # backward/optimizer step) under the CURRENT weights at the end of
+        # every epoch. Purely informational -- unlike bc pretrain's/value
+        # pretrain's val splits, nothing here ever early-stops or otherwise
+        # changes what gets trained. 0.0 (default) disables entirely: no
+        # split, no held-out rows, _ppo_update behaves exactly as before.
+        self.val_episode_fraction = float(ppo_cfg.get("val_episode_fraction", 0.0))
+        # Dedicated RNG for choosing which episodes are held out each
+        # update -- deliberately separate from self._aug_rng (batch
+        # augmentation) so enabling/disabling one never shifts the other's
+        # draw sequence.
+        self._val_split_rng = random.Random()
         # Separate, deliberately DECOUPLED from n_processes above:
         # _collect_value_pretrain_rollout() (pretrain_value()'s own rollout
         # collection, also used by pretrain_combined()'s Phase 2/3 warm-up)
@@ -1679,6 +2015,7 @@ class PPOTrainer:
                 # Quick periodic eval vs rules-based AI (always, regardless of training opponent)
                 if self.rollout_eval_trials > 0:
                     self._eval_vs_rules(env.max_episode_s)
+                self._maybe_run_neural_snapshot_eval(env.max_episode_s)
 
         # Always save a final checkpoint so the result of the run is not lost
         # even if total_steps is not an exact multiple of rollout_steps.
@@ -1751,6 +2088,7 @@ class PPOTrainer:
         mv_ls = metrics.get('move_log_std', [])
         kk_ls = metrics.get('kick_log_std', [])
         kz_ls = metrics.get('kick_z_log_std', [])
+        kp_ls = metrics.get('kick_power_log_std', [])
         mv_ls_grad = metrics.get('mv_ls_grad', 0.0)
         # These are actually log_kappa now (von Mises concentration), not
         # log_std -- see ai_trainer_knowledge.md "Direction heads: von Mises".
@@ -1782,9 +2120,11 @@ class PPOTrainer:
         _mv_sig = _kappa_deg(mv_ls)
         _kk_sig = _kappa_deg(kk_ls)
         _kz_sig = _sigma(kz_ls)
+        _kp_sig = _sigma(kp_ls)
         _prev_mv_ls = self._prev_move_log_std if hasattr(self, "_prev_move_log_std") else None
         _prev_kk_ls = self._prev_kick_log_std if hasattr(self, "_prev_kick_log_std") else None
         _prev_kz_ls = self._prev_kick_z_log_std if hasattr(self, "_prev_kick_z_log_std") else None
+        _prev_kp_ls = self._prev_kick_power_log_std if hasattr(self, "_prev_kick_power_log_std") else None
         _mv_delta_str = ""
         if mv_ls and _prev_mv_ls:
             _d = [b - a for a, b in zip(_prev_mv_ls, mv_ls)]
@@ -1822,9 +2162,22 @@ class PPOTrainer:
                 f"  d_kickz=[{','.join(f'{v:+.4f}' for v in _d)}]"
                 f" (Δ(ang std)≈{','.join(f'{v:.3f}°' for v in _kz_dstd_deg)})"
             )
+        _kp_delta_str = ""
+        if kp_ls and _prev_kp_ls:
+            _d = [b - a for a, b in zip(_prev_kp_ls, kp_ls)]
+            # kick_power isn't an angle (it's a sigmoid-squashed [0,1] power
+            # fraction) -- no ang-std-style geometric conversion applies here,
+            # unlike kz_ls's z-component-of-a-direction-vector case. Report
+            # the raw sigma delta directly.
+            _kp_dsig = [abs(math.exp(b) - math.exp(a)) for a, b in zip(_prev_kp_ls, kp_ls)]
+            _kp_delta_str = (
+                f"  d_kickpower=[{','.join(f'{v:+.4f}' for v in _d)}]"
+                f" (Δσ≈{','.join(f'{v:.4f}' for v in _kp_dsig)})"
+            )
         self._prev_move_log_std = list(mv_ls) if mv_ls else None
         self._prev_kick_log_std = list(kk_ls) if kk_ls else None
         self._prev_kick_z_log_std = list(kz_ls) if kz_ls else None
+        self._prev_kick_power_log_std = list(kp_ls) if kp_ls else None
         mv_ls_str = ""
         if mv_ls:
             mv_ls_str = f"  mv_ls=[{','.join(f'{v:.4f}' for v in mv_ls)}]"
@@ -1856,6 +2209,17 @@ class PPOTrainer:
                     f", ang std\u2248{','.join(f'{d:.0f}\u00b0' for d in _kz_deg)})"
                 )
             mv_ls_str += _kz_delta_str
+        if kp_ls:
+            mv_ls_str += f"\n  kp_ls=[{','.join(f'{v:.4f}' for v in kp_ls)}]"
+            if _kp_sig:
+                # kick_power is a plain Gaussian log_std (same convention as
+                # kz_ls -- larger = wider), but unlike kz_ls it's not any
+                # kind of direction/angle component (SquashedNormalHead
+                # sigmoid-squashes it to a [0,1] power fraction) -- no
+                # geometric ang-std interpretation applies, so just report
+                # sigma directly.
+                mv_ls_str += f" (σ≈{','.join(f'{s:.4f}' for s in _kp_sig)})"
+            mv_ls_str += _kp_delta_str
         ha = metrics.get("head_act", {})
         _ta_p = ha.get('ta_p', float('nan'))
         _kk_p = ha.get('kk_p', float('nan'))
@@ -2182,6 +2546,7 @@ class PPOTrainer:
 
                 if self.rollout_eval_trials > 0:
                     self._eval_vs_rules(max_episode_s)
+                self._maybe_run_neural_snapshot_eval(max_episode_s)
         finally:
             close_workers(workers)
             if eval_workers is not None:
@@ -2193,6 +2558,63 @@ class PPOTrainer:
             self._save_checkpoint(self._total_steps)
             log.info("Final checkpoint saved.")
         log.info(f"Training complete. Total steps: {self._total_steps:,}")
+
+    def _update_episode_replay(
+        self, all_episode_seed_reward_adv: list[tuple[int, float, float]],
+    ) -> list[int]:
+        """One rollout cycle's worth of episode-seed-replay bookkeeping --
+        see ``_episode_replay_enabled``'s __init__ comment and
+        ai/ppo/batched_rollout_worker.py's "Episode-seed replay" docstring
+        section. Called once per cycle from ``_train_batched_parallel()``,
+        right after this rollout's per-episode ``(seed, reward,
+        mean_abs_advantage)`` triples are assembled.
+
+        1. Before/after report: any seed in THIS rollout that was queued at
+           the end of the PREVIOUS cycle (``self._pending_replay_before``)
+           just gave us its "after" reward -- log the before-vs-after
+           comparison, then clear it (one-shot: a seed not seen this
+           rollout, because no env happened to reset while it was queued,
+           is simply dropped, not carried forward another cycle).
+        2. New selection: rank ALL of this rollout's episodes (fresh-drawn
+           and any replays alike) by mean(|advantage|) descending, take the
+           top ``episode_replay_top_fraction``, and stash them as the new
+           "before" baseline for next cycle's report.
+
+        Returns the list of seeds to request next cycle (empty if this
+        rollout had no eligible episodes at all).
+        """
+        if self._pending_replay_before:
+            _matched = [
+                (seed, info["reward"], reward)
+                for seed, reward, _adv in all_episode_seed_reward_adv
+                if (info := self._pending_replay_before.get(seed)) is not None
+            ]
+            if _matched:
+                _before_mean = float(np.mean([b for _s, b, _a in _matched]))
+                _after_mean = float(np.mean([a for _s, _b, a in _matched]))
+                log.info(
+                    f"  [episode replay] matched={len(_matched)}/{len(self._pending_replay_before)}  "
+                    f"before_mean_rew={_before_mean:.3f}  after_mean_rew={_after_mean:.3f}  "
+                    f"delta={_after_mean - _before_mean:+.3f}"
+                )
+            else:
+                log.info(
+                    f"  [episode replay] 0/{len(self._pending_replay_before)} queued seeds were "
+                    f"replayed this rollout (not enough episode resets to reach them)"
+                )
+            self._pending_replay_before = {}
+
+        if not all_episode_seed_reward_adv:
+            return []
+
+        n_top = max(1, math.ceil(self._episode_replay_top_fraction * len(all_episode_seed_reward_adv)))
+        top_k = sorted(all_episode_seed_reward_adv, key=lambda t: t[2], reverse=True)[:n_top]
+        self._pending_replay_before = {seed: {"reward": rew, "abs_adv": adv} for seed, rew, adv in top_k}
+        log.info(
+            f"  [episode replay] queued {len(top_k)} seed(s) for next rollout "
+            f"(top {self._episode_replay_top_fraction * 100:.1f}% of {len(all_episode_seed_reward_adv)} episodes by |adv|)"
+        )
+        return list(self._pending_replay_before.keys())
 
     def _train_batched_parallel(self, total_steps: int, phase_id: int, max_episode_s: float) -> None:
         """Batched multi-environment rollout collection path
@@ -2247,6 +2669,8 @@ class PPOTrainer:
         workers = spawn_batched_workers(
             phase_id, n_processes, envs_per_process, base_seed,
             self.separate_value_net, self.worker_torch_threads,
+            batch_secondary_players=self.batch_secondary_players,
+            chunk_steps=self.batched_rollout_chunk_steps or None,
         )
         # Persistent eval worker pool -- identical rationale/pattern to
         # _train_parallel()'s own (see that method's comment).
@@ -2260,6 +2684,11 @@ class PPOTrainer:
         try:
             _steps_at_call_start = self._total_steps
             target_steps = _steps_at_call_start + total_steps
+            # Episode-seed replay (see __init__'s _episode_replay_enabled
+            # comment): seeds selected at the END of one cycle are consumed
+            # at the START of the NEXT -- one-shot, not carried further if a
+            # cycle doesn't happen to reset enough envs to use them all.
+            replay_seeds_for_next_cycle: list[int] = []
 
             while self._total_steps < target_steps:
                 progress = (self._total_steps - _steps_at_call_start) / total_steps
@@ -2275,26 +2704,14 @@ class PPOTrainer:
                 for w in workers:
                     w.set_weights(dec_state, exec_state, val_state)
 
-                for w in workers:
-                    w.collect(steps_per_worker)
-                _pending = {w.conn: w for w in workers}
-                _agg_progress = ProgressReporter(
-                    n_processes, prefix=f"  [batched rollout] ({total_envs} envs, {n_processes} proc): ", live=True,
-                )
-                _n_done = 0
-                while _pending:
-                    ready = multiprocessing.connection.wait(list(_pending.keys()), timeout=0.2)
-                    for conn in ready:
-                        _pending.pop(conn, None)
-                        _n_done += 1
-                    _agg_progress.update(_n_done)
-                # Each worker process returns a list of per-env result dicts
-                # (one process may own several envs) -- flatten into ONE
-                # flat list, so everything below is byte-for-byte identical
-                # to _train_parallel()'s per-worker loop (which already
-                # receives a flat list, one entry per worker there).
-                worker_results = [w.recv_result() for w in workers]
-                results = [env_result for proc_results in worker_results for env_result in proc_results]
+                if replay_seeds_for_next_cycle:
+                    _replay_chunks = [
+                        c for c in (replay_seeds_for_next_cycle[i::len(workers)] for i in range(len(workers))) if c
+                    ]
+                else:
+                    _replay_chunks = []
+                for _wi, w in enumerate(workers):
+                    w.collect(steps_per_worker, replay_seeds=(_replay_chunks[_wi] if _wi < len(_replay_chunks) else None))
 
                 worker_batches = []
                 episode_rewards: list[float] = []
@@ -2305,7 +2722,16 @@ class PPOTrainer:
                 episode_comp_list: list[dict[str, float]] = []
                 episode_durations_s: list[float] = []
                 rollout_components: dict[str, float] = {}
-                for r in results:
+                # (seed, reward, mean_abs_advantage) for every completed
+                # trainee episode this rollout with a recorded seed -- only
+                # populated when episode_replay is enabled (see
+                # _trainee_episode_abs_adv_means's docstring for why this is
+                # computed per-r, using each buffer's OWN track_ids/dones,
+                # rather than after _merge_worker_batches concatenates
+                # everything together).
+                all_episode_seed_reward_adv: list[tuple[int, float, float]] = []
+
+                def _consume_result(r: dict) -> None:
                     advantages, returns = r["buffer"].compute_gae(self.gamma, self.lam, r["last_value"])
                     worker_batches.append(r["buffer"].as_tensors(advantages, returns))
                     stats = r["stats"]
@@ -2319,9 +2745,49 @@ class PPOTrainer:
                     for ep in stats["episode_comp_list"]:
                         for _k, _v in ep.items():
                             rollout_components[_k] = rollout_components.get(_k, 0.0) + _v
+                    if self._episode_replay_enabled:
+                        _abs_adv_means = _trainee_episode_abs_adv_means(
+                            r["buffer"].track_ids, r["buffer"].dones, advantages,
+                        )
+                        for _seed, _rew, _adv in zip(
+                            stats.get("episode_seeds", []), stats["episode_rewards"], _abs_adv_means,
+                        ):
+                            if _seed is not None:
+                                all_episode_seed_reward_adv.append((_seed, _rew, _adv))
+
+                # Interleaved receive: each worker sends zero-or-more
+                # {"chunk": [...]} messages (see ai/ppo/batched_rollout_worker.py's
+                # "Chunked streaming" docstring -- this is what bounds each
+                # worker's peak memory instead of one giant end-of-rollout
+                # pickle) followed by exactly one {"done": True}. A worker
+                # still counts as "done" (for progress reporting) exactly
+                # once, when its sentinel arrives, regardless of how many
+                # chunks preceded it -- unchanged semantics from before
+                # chunking existed. wait() reports a connection ready again
+                # immediately if it still has buffered messages, so a
+                # connection with several queued messages just costs a few
+                # extra (cheap) polling iterations, never a lost message.
+                _pending = {w.conn for w in workers}
+                _agg_progress = ProgressReporter(
+                    n_processes, prefix=f"  [batched rollout] ({total_envs} envs, {n_processes} proc): ", live=True,
+                )
+                _n_done = 0
+                while _pending:
+                    ready = multiprocessing.connection.wait(list(_pending), timeout=0.2)
+                    for conn in ready:
+                        msg = conn.recv()
+                        for r in msg.get("chunk", []):
+                            _consume_result(r)
+                        if msg.get("done"):
+                            _pending.discard(conn)
+                            _n_done += 1
+                            _agg_progress.update(_n_done)
 
                 batch = _merge_worker_batches(worker_batches)
                 n_collected = int(batch["rewards"].shape[0])
+
+                if self._episode_replay_enabled:
+                    replay_seeds_for_next_cycle = self._update_episode_replay(all_episode_seed_reward_adv)
                 self._total_steps += n_collected
                 rollout_time = time.perf_counter() - rollout_start
                 steps_per_sec = n_collected / max(rollout_time, 1e-6)
@@ -2372,6 +2838,7 @@ class PPOTrainer:
 
                 if self.rollout_eval_trials > 0:
                     self._eval_vs_rules(max_episode_s)
+                self._maybe_run_neural_snapshot_eval(max_episode_s)
         finally:
             close_batched_workers(workers)
             if eval_workers is not None:
@@ -2423,10 +2890,13 @@ class PPOTrainer:
         from footballcoach.rules_ai import Phase1RulesAI
         from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
         from footballcoach.ai.env.scenario_env import ScenarioEnv
+        from footballcoach.ai.eval.seeded_eval import swap_player_states
 
-        def _baseline_env_factory(seed: int) -> ScenarioEnv:
+        def _baseline_env_factory(seed: int, swap: bool = False) -> ScenarioEnv:
             def _build(*_a, **_kw):
                 _m = build_1v1_scenario(*_a, seed=seed, **_kw)
+                if swap:
+                    swap_player_states(_m, "trainee", "opponent")
                 for p in _m.players:
                     p.ai = Phase1RulesAI()
                 _m._opponent_use_rules_ai = True
@@ -2447,6 +2917,7 @@ class PPOTrainer:
             # gate) -- both players stay pure rules-AI.
             self._rules_vs_rules_baseline = run_seeded_evaluation(
                 _baseline_env_factory, None, self._eval_seeds, self._eval_repeats_per_seed,
+                swap_sides=self._eval_swap_sides,
             )
         except Exception as _e:
             log.warning(f"  [eval baseline rules-vs-rules] failed: {_e}")
@@ -2480,13 +2951,17 @@ class PPOTrainer:
     def _run_persistent_eval(
         self, workers, decision_state: dict, execution_state: dict, value_state: Optional[dict],
         seeds: list[int], repeats_per_seed: int, use_rules_ai: bool, max_episode_s: float,
-        win_outcome: str = "box_possession",
+        win_outcome: str = "box_possession", swap_sides: bool = False,
+        batched: bool = False, envs_per_process: int = 8,
     ):
         """Dispatch one seeded eval across an already-running persistent
         eval worker pool (see ai/eval/eval_worker.py), mirroring
         run_seeded_evaluation_parallel()'s seed-chunking/merge but without
         spawning a fresh Pool -- the workers were spawned once by
-        _train_parallel() and are reused every call."""
+        _train_parallel() and are reused every call. ``batched``/
+        ``envs_per_process``: see eval.batched_eval -- threaded straight
+        into each worker's "eval" IPC message (ai/eval/eval_worker.py's
+        _eval_worker_main picks the batched vs unbatched path there)."""
         from footballcoach.ai.eval.seeded_eval import merge_eval_results
 
         for w in workers:
@@ -2494,7 +2969,8 @@ class PPOTrainer:
         chunks = [c for c in (seeds[i::len(workers)] for i in range(len(workers))) if c]
         active = workers[:len(chunks)]
         for w, chunk in zip(active, chunks):
-            w.eval(chunk, repeats_per_seed, use_rules_ai, max_episode_s, win_outcome)
+            w.eval(chunk, repeats_per_seed, use_rules_ai, max_episode_s, win_outcome, swap_sides,
+                   batched=batched, envs_per_process=envs_per_process)
         results = [w.recv_result() for w in active]
         return merge_eval_results(results, repeats_per_seed)
 
@@ -2521,6 +2997,8 @@ class PPOTrainer:
                 result = self._run_persistent_eval(
                     _persistent_workers, _decision_state, _execution_state, _value_state,
                     _seeds, _repeats, use_rules_ai, max_episode_s,
+                    swap_sides=self._eval_swap_sides,
+                    batched=self._eval_batched, envs_per_process=self._eval_envs_per_process,
                 )
             elif self._eval_n_parallel_workers > 1:
                 # Fallback parallel path (no persistent pool available --
@@ -2531,39 +3009,44 @@ class PPOTrainer:
                 # live nn.Modules aren't picklable.
                 import functools
                 _decision_state, _execution_state, _value_state = self._cpu_state_dicts()
-                worker_factory = functools.partial(
-                    _eval_worker_factory, _decision_state, _execution_state,
-                    self.separate_value_net, _value_state, use_rules_ai, max_episode_s,
-                )
-                result = run_seeded_evaluation_parallel(
-                    worker_factory, _seeds, _repeats,
-                    n_workers=self._eval_n_parallel_workers,
-                )
-            else:
-                from footballcoach.rules_ai import Phase1RulesAI
-                from footballcoach.ui.scenarios import build_1v1_scenario, ScenarioDefinition
-                from footballcoach.ai.env.scenario_env import ScenarioEnv
-
-                def _eval_env_factory(seed: int) -> ScenarioEnv:
-                    def _eval_build(*_a, **_kw):
-                        _m = build_1v1_scenario(*_a, seed=seed, **_kw)
-                        if use_rules_ai:
-                            _m.player_by_id("opponent").ai = Phase1RulesAI()
-                        _m._opponent_use_rules_ai = use_rules_ai
-                        _m._opponent_is_immobile = not use_rules_ai
-                        return _m
-
-                    return ScenarioEnv(
-                        ScenarioDefinition(key=f"_eval_{_label}", label=f"eval_{_label}",
-                                           description=f"periodic {_label} eval", build=_eval_build),
-                        trainee_player_id="trainee",
-                        max_episode_s=max_episode_s,
+                if self._eval_batched:
+                    worker_factory = functools.partial(
+                        _eval_worker_factory_batched, _decision_state, _execution_state,
+                        self.separate_value_net, _value_state, use_rules_ai, max_episode_s,
                     )
-
-                result = run_seeded_evaluation(
-                    _eval_env_factory, self._sample_action,
-                    _seeds, _repeats,
-                )
+                    result = run_seeded_evaluation_parallel_batched(
+                        worker_factory, _seeds, _repeats,
+                        n_workers=self._eval_n_parallel_workers,
+                        swap_sides=self._eval_swap_sides,
+                        envs_per_process=self._eval_envs_per_process,
+                    )
+                else:
+                    worker_factory = functools.partial(
+                        _eval_worker_factory, _decision_state, _execution_state,
+                        self.separate_value_net, _value_state, use_rules_ai, max_episode_s,
+                    )
+                    result = run_seeded_evaluation_parallel(
+                        worker_factory, _seeds, _repeats,
+                        n_workers=self._eval_n_parallel_workers,
+                        swap_sides=self._eval_swap_sides,
+                    )
+            else:
+                # Reuse the exact same factory the persistent-pool/fallback-
+                # parallel branches above use (_build_eval_env_factory) rather
+                # than duplicating the build logic a third time -- keeps
+                # swap_sides handling (swap_player_states) in one place.
+                _eval_env_factory = _build_eval_env_factory(use_rules_ai, max_episode_s)
+                if self._eval_batched:
+                    result = run_seeded_evaluation_batched(
+                        _eval_env_factory, self,
+                        _seeds, _repeats, swap_sides=self._eval_swap_sides,
+                        envs_per_process=self._eval_envs_per_process,
+                    )
+                else:
+                    result = run_seeded_evaluation(
+                        _eval_env_factory, self._sample_action,
+                        _seeds, _repeats, swap_sides=self._eval_swap_sides,
+                    )
             log.info(
                 f"  [eval vs {_label}] step={self._total_steps:,}  "
                 f"seeds={len(_seeds)}x{_repeats}  "
@@ -2571,7 +3054,7 @@ class PPOTrainer:
                 f"mean_rew={result.mean_reward:.3f}±{result.std_reward:.3f} "
                 f"(sem={result.sem_reward:.3f})  "
                 f"V={result.mean_value_pred:.3f}  gap={result.mean_value_pred - result.mean_reward:+.3f}  "
-                f"outcomes={result.outcomes}"
+                f"outcomes={format_outcomes_with_pct(result.outcomes)}"
             )
             if use_rules_ai:
                 _baseline = self._compute_rules_vs_rules_baseline(max_episode_s)
@@ -2581,10 +3064,177 @@ class PPOTrainer:
                         f"win={_baseline.win_rate_pct:.0f}%  "
                         f"mean_rew={_baseline.mean_reward:.3f}±{_baseline.std_reward:.3f} "
                         f"(sem={_baseline.sem_reward:.3f})  "
-                        f"outcomes={_baseline.outcomes}"
+                        f"outcomes={format_outcomes_with_pct(_baseline.outcomes)}"
                     )
         except Exception as _e:
             log.warning(f"  [eval vs {_label}] failed: {_e}")
+
+    def _load_snapshot_dict_from_checkpoint(self, path: Path) -> dict:
+        """Load a checkpoint FILE (as already written by _save_checkpoint())
+        into the same {"step", "decision", "execution", "value"} shape
+        _eval_vs_neural_snapshot() expects as its opponent_snapshot -- the
+        single source of truth for "what did the network look like at
+        checkpoint N" is the checkpoint file itself, not a separate
+        in-memory copy."""
+        ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        return {
+            "step": ckpt.get("step", 0),
+            "decision": ckpt["decision_net"],
+            "execution": ckpt["execution_net"],
+            "value": ckpt.get("value_net") if self.separate_value_net else None,
+        }
+
+    def _eval_vs_neural_snapshot(
+        self, max_episode_s: float, label: str, opponent_snapshot: dict, pool=None,
+    ) -> None:
+        """One neural-vs-neural comparison: current live weights (trainee
+        side) vs a frozen snapshot (opponent side), on the SAME fixed eval
+        seed set as _eval_vs_rules() (self._eval_seeds/_eval_repeats_per_seed
+        -- 'use the same number of episodes as the existing evals'), with the
+        same eval.swap_sides fairness treatment. Unlike _eval_vs_opponent_type,
+        this doesn't use the persistent eval worker pool (that pool's IPC
+        protocol only supports ONE trainer's weights per call, see
+        ai/eval/eval_worker.py) -- it uses a throwaway parallel pool via
+        run_seeded_evaluation_parallel[_batched], sized by
+        eval.eval_n_parallel_workers. Pass ``pool`` (see
+        _maybe_run_neural_snapshot_eval, which spawns ONE pool per rollout
+        cycle and reuses it across every lookback comparison) rather than
+        letting each call spawn its own -- with
+        eval.neural_snapshot_lookbacks holding several entries,
+        respawning eval_n_parallel_workers fresh PROCESSES per lookback
+        (on top of the already-running persistent rollout+eval pools) is
+        real, confirmed oversubscription that can stall a live training run
+        for many minutes with every process fighting for the same cores.
+        Failure is caught and logged, never raised, matching
+        _eval_vs_opponent_type -- a broken comparison here must not take
+        down the training run."""
+        try:
+            import functools
+            _decision_state, _execution_state, _value_state = self._cpu_state_dicts()
+            if self._eval_batched:
+                worker_factory = functools.partial(
+                    _eval_worker_factory_neural_snapshot_batched,
+                    _decision_state, _execution_state, _value_state,
+                    opponent_snapshot["decision"], opponent_snapshot["execution"], opponent_snapshot["value"],
+                    self.separate_value_net, max_episode_s,
+                )
+                result = run_seeded_evaluation_parallel_batched(
+                    worker_factory, self._eval_seeds, self._eval_repeats_per_seed,
+                    n_workers=self._eval_n_parallel_workers,
+                    swap_sides=self._eval_swap_sides,
+                    envs_per_process=self._eval_envs_per_process,
+                    pool=pool,
+                )
+            else:
+                worker_factory = functools.partial(
+                    _eval_worker_factory_neural_snapshot,
+                    _decision_state, _execution_state, _value_state,
+                    opponent_snapshot["decision"], opponent_snapshot["execution"], opponent_snapshot["value"],
+                    self.separate_value_net, max_episode_s,
+                )
+                result = run_seeded_evaluation_parallel(
+                    worker_factory, self._eval_seeds, self._eval_repeats_per_seed,
+                    n_workers=self._eval_n_parallel_workers,
+                    swap_sides=self._eval_swap_sides,
+                    pool=pool,
+                )
+            log.info(
+                f"  [eval vs neural:{label}] step={self._total_steps:,}  "
+                f"opp_step={opponent_snapshot['step']:,}  "
+                f"seeds={len(self._eval_seeds)}x{self._eval_repeats_per_seed}  "
+                f"win={result.win_rate_pct:.0f}%  "
+                f"mean_rew={result.mean_reward:.3f}±{result.std_reward:.3f} "
+                f"(sem={result.sem_reward:.3f})  "
+                f"outcomes={format_outcomes_with_pct(result.outcomes)}"
+            )
+        except Exception as _e:
+            log.warning(f"  [eval vs neural:{label}] failed: {_e}")
+
+    def _maybe_run_neural_snapshot_eval(self, max_episode_s: float) -> None:
+        """Every eval.neural_snapshot_eval_every_n_rollouts rollouts: compare
+        the CURRENT live policy against the checkpoint saved
+        eval.neural_snapshot_lookbacks[i] rollouts ago, for every entry in
+        that list, plus 'original' (this run's checkpoint1.pt) -- using the
+        checkpoint FILES _save_checkpoint() already writes every rollout
+        regardless of this feature, rather than keeping a separate in-memory
+        snapshot ring. Requires self.checkpoint_dir (no-op without one,
+        since there's nothing on disk to compare against). Lookbacks with
+        not-yet-enough history (checkpoint count - k < 1) are silently
+        skipped, not logged as failures -- this is expected early in a run
+        and self-resolves as more checkpoints accumulate.
+
+        All comparisons this cycle share ONE throwaway worker pool (spawned
+        once here, closed at the end) instead of each
+        _eval_vs_neural_snapshot() call spawning its own -- with several
+        lookbacks configured, respawning eval_n_parallel_workers fresh
+        processes per comparison stacks on top of the already-running
+        persistent rollout+eval pools and can genuinely stall a live run for
+        minutes (confirmed live: processes starved of CPU before they could
+        even finish importing). Reusing one pool cuts that spawn/teardown
+        cost from N times per cycle to once.
+        """
+        if self._neural_snapshot_every_n <= 0 or self.checkpoint_dir is None:
+            return
+        self._nn_snapshot_rollout_count += 1
+        if self._nn_snapshot_rollout_count % self._neural_snapshot_every_n != 0:
+            return
+
+        current_count = self._checkpoint_count  # _save_checkpoint() already ran this rollout
+        comparisons: list[tuple[str, dict]] = []
+        for k in self._neural_snapshot_lookbacks:
+            target_count = current_count - k
+            if target_count < 1:
+                continue
+            ckpt_path = self.checkpoint_dir / f"checkpoint{target_count}.pt"
+            if not ckpt_path.exists():
+                continue
+            try:
+                snapshot = self._load_snapshot_dict_from_checkpoint(ckpt_path)
+            except Exception as _e:
+                log.warning(f"  [eval vs neural:{k}_back] failed to load {ckpt_path}: {_e}")
+                continue
+            comparisons.append((f"{k}_back", snapshot))
+
+        # checkpoint1.pt always exists by this point (current_count >= 1 is
+        # guaranteed -- _save_checkpoint() already ran this rollout, see the
+        # comment above) -- always attempt "original", even on rollout 1
+        # itself, where current_count == 1 means this IS checkpoint1.pt: a
+        # degenerate but still useful self-play comparison (current live
+        # weights vs an identical copy of themselves), since both sides
+        # still sample stochastically -- a ~50% win rate here is the same
+        # "eval pipeline isn't systematically biased" sanity check as this
+        # session's earlier manual self-play probes, now free every run.
+        original_path = self.checkpoint_dir / "checkpoint1.pt"
+        if original_path.exists():
+            try:
+                comparisons.append(("original", self._load_snapshot_dict_from_checkpoint(original_path)))
+            except Exception as _e:
+                log.warning(f"  [eval vs neural:original] failed to load {original_path}: {_e}")
+
+        if not comparisons:
+            return
+
+        pool = None
+        if self._eval_n_parallel_workers > 1:
+            import multiprocessing as mp
+            # See _capped_thread_env_for_pool_spawn's own docstring: without
+            # this, each of these eval_n_parallel_workers fresh processes
+            # defaults to one BLAS thread per logical core, on top of the
+            # already-running persistent rollout+eval worker pools -- real,
+            # confirmed to crash a live run outright with
+            # "OMP: Error #111: Memory allocation failed.", not just slow it
+            # down. The other throwaway seeded-eval pools (seeded_eval.py's
+            # own run_seeded_evaluation_parallel[_batched] fallback path)
+            # are capped the same way at their own Pool(...) construction.
+            with _capped_thread_env_for_pool_spawn("1"):
+                pool = mp.get_context("spawn").Pool(processes=self._eval_n_parallel_workers)
+        try:
+            for label, snapshot in comparisons:
+                self._eval_vs_neural_snapshot(max_episode_s, label, snapshot, pool=pool)
+        finally:
+            if pool is not None:
+                pool.close()
+                pool.join()
     # -----------------------------------------------------------------------
     # Value pre-training
     # -----------------------------------------------------------------------
@@ -2772,11 +3422,12 @@ class PPOTrainer:
                             "Phase 0 val-loss-by-outcome breakdown will be skipped.")
                 _p0_outcome_by_row = np.full(len(dataset), "n/a", dtype=object)
 
-            def _eval_p0_val_loss() -> tuple[float, float, float, dict[str, tuple[float, int]]]:
+            def _eval_p0_val_loss() -> tuple[float, float, float, dict[str, tuple[float, int, float, float]]]:
                 """Combined dec_bc + value MSE on the held-out val rows (no grad).
                 Returns (combined, bc_adj, val_mse, val_mse_by_outcome) where
                 bc_adj = bc - floor and val_mse_by_outcome is the per-outcome
-                (raw value MSE, n_rows) breakdown (see value_mse_by_outcome())."""
+                (raw value MSE, n_rows, gt_mean, gt_std) breakdown (see
+                value_mse_by_outcome())."""
                 self.decision_net.eval()
                 _v_losses: list[float] = []
                 _v_bc_losses: list[float] = []
@@ -2784,6 +3435,8 @@ class PPOTrainer:
                 _v_floors: list[float] = []
                 _outc_sq_err: dict[str, float] = {}
                 _outc_n: dict[str, int] = {}
+                _outc_gt_sum: dict[str, float] = {}
+                _outc_gt_sqsum: dict[str, float] = {}
                 _pos = 0
                 with torch.no_grad():
                     for _obs_v, _lbl_v, _ret_v in dataset.iterate_minibatches(
@@ -2829,18 +3482,25 @@ class PPOTrainer:
                         _v_bc_losses.append(_bc_v.item())
                         _v_mse_losses.append(_mse_v.item())
                         _v_floors.append(_floor_v)
-                        for _name, (_mse, _n) in value_mse_by_outcome(
+                        for _name, (_mse, _n, _gt_mean, _gt_mean_sq) in value_mse_by_outcome(
                             _pred_v, _ret_v, list(_p0_outcome_by_row[_chunk])
                         ).items():
                             _outc_sq_err[_name] = _outc_sq_err.get(_name, 0.0) + _mse * _n
                             _outc_n[_name] = _outc_n.get(_name, 0) + _n
+                            _outc_gt_sum[_name] = _outc_gt_sum.get(_name, 0.0) + _gt_mean * _n
+                            _outc_gt_sqsum[_name] = _outc_gt_sqsum.get(_name, 0.0) + _gt_mean_sq * _n
                 self.decision_net.train()
                 _combined = float(np.mean(_v_losses)) if _v_losses else float("nan")
                 _bc_mean = float(np.mean(_v_bc_losses)) if _v_bc_losses else float("nan")
                 _floor_mean = float(np.mean(_v_floors)) if _v_floors else 0.0
                 _mse_mean = float(np.mean(_v_mse_losses)) if _v_mse_losses else float("nan")
                 _by_outcome = {
-                    name: (_outc_sq_err[name] / max(_outc_n[name], 1), _outc_n[name])
+                    name: (
+                        _outc_sq_err[name] / max(_outc_n[name], 1),
+                        _outc_n[name],
+                        _outc_gt_sum[name] / max(_outc_n[name], 1),
+                        _outc_gt_sqsum[name] / max(_outc_n[name], 1),
+                    )
                     for name in _outc_sq_err
                 }
                 return _combined, _bc_mean - _floor_mean, _mse_mean, _by_outcome
@@ -5450,6 +6110,204 @@ class PPOTrainer:
         raise PPOTrainer._NaNReproFound(out_path)
 
     # -----------------------------------------------------------------------
+    # Held-out validation episodes (diagnostic only, see __init__'s
+    # val_episode_fraction comment)
+    # -----------------------------------------------------------------------
+
+    def _split_train_val_episodes(self, batch: dict) -> tuple[dict, Optional[dict]]:
+        """Randomly hold out ``val_episode_fraction`` of complete episodes.
+
+        Segmented per ``track_ids`` (same reasoning as
+        ``RolloutBuffer.compute_gae``'s own per-track pass): a flat
+        ``dones > 0.5`` scan over the concatenated batch would misidentify
+        episode boundaries whenever a secondary neural opponent's rows are
+        interleaved with the trainee's own (see ``track_ids``'s docstring in
+        rollout_buffer.py) -- segmenting per track first guarantees every
+        held-out "episode" is a real, single-track episode. Note a held-out
+        episode's rows are NOT necessarily a contiguous flat-index range --
+        two tracks interleave row-by-row (see track_ids's docstring), so an
+        episode's own rows can have other tracks' rows sitting in between
+        them; the exact index LIST for each episode is tracked and masked
+        explicitly below rather than via a ``[start:end+1]`` slice, which
+        would wrongly sweep in whatever other track's rows happen to fall
+        inside that span.
+
+        Returns ``(train_batch, val_batch)`` -- ``val_batch`` is ``None``
+        when there are fewer than 2 complete episodes in this rollout (val
+        split skipped, everything trains, matching every other
+        opt-in-with-a-minimum-episode-count split in this file).
+        """
+        track_ids = batch.get("track_ids") or ["trainee"] * len(batch["dones"])
+        dones_np = batch["dones"].numpy()
+        n_total = len(dones_np)
+
+        groups: dict[str, list[int]] = {}
+        for i, t in enumerate(track_ids):
+            groups.setdefault(t, []).append(i)
+
+        episodes: list[list[int]] = []  # each entry: that episode's own flat indices
+        for _track, idxs in groups.items():
+            ep_start_pos = 0
+            for pos, flat_i in enumerate(idxs):
+                if dones_np[flat_i] > 0.5:
+                    episodes.append(idxs[ep_start_pos:pos + 1])
+                    ep_start_pos = pos + 1
+            # Trailing partial episode (no terminal done yet) dropped --
+            # same convention as every other episode-boundary scan here.
+
+        n_complete = len(episodes)
+        n_val_eps = max(1, round(self.val_episode_fraction * n_complete)) if n_complete >= 2 else 0
+        if n_val_eps == 0:
+            return batch, None
+
+        val_episodes = self._val_split_rng.sample(episodes, n_val_eps)
+        val_mask = np.zeros(n_total, dtype=bool)
+        for ep_idxs in val_episodes:
+            val_mask[ep_idxs] = True
+        train_mask = ~val_mask
+
+        _LIST_KEYS = {"reward_comps_raw", "step_outcomes", "track_ids"}
+
+        def _sel(mask: np.ndarray) -> dict:
+            idx = np.where(mask)[0]
+            idx_list = idx.tolist()
+            idx_t = torch.from_numpy(idx).long()
+            return {
+                k: ([v[i] for i in idx_list] if k in _LIST_KEYS else v[idx_t])
+                for k, v in batch.items()
+            }
+
+        train_batch = _sel(train_mask)
+        val_batch = _sel(val_mask)
+        log.info(
+            f"  [val split] {n_complete - n_val_eps} train episodes ({int(train_mask.sum())} steps)"
+            f"  |  {n_val_eps} val episodes ({int(val_mask.sum())} steps, held out from training)"
+        )
+        return train_batch, val_batch
+
+    def _apply_dual_clip(self, min_surr: torch.Tensor, adv: torch.Tensor) -> torch.Tensor:
+        """Dual-clip PPO's negative-advantage floor (see __init__'s
+        dual_clip_c comment for the full rationale): ``max(min_surr,
+        dual_clip_c * adv)`` wherever ``adv < 0``, unchanged everywhere
+        else. ``self.dual_clip_c <= 0`` (default) is a true no-op -- returns
+        ``min_surr`` completely unmodified, so every call site can call this
+        unconditionally without its own gating and stays byte-identical to
+        vanilla PPO when the feature is off.
+
+        ``adv`` may be a lower-rank/broadcastable view of ``min_surr``
+        (e.g. the per-head breakdown's ``(batch, 1)`` advantage against a
+        ``(batch, 15)`` min_surr) -- ``torch.where``/multiplication both
+        broadcast normally.
+        """
+        if self.dual_clip_c <= 0:
+            return min_surr
+        floor = self.dual_clip_c * adv
+        return torch.where(adv < 0, torch.max(min_surr, floor), min_surr)
+
+    def _eval_val_episode_losses(
+        self, val_batch: dict, clip: float,
+    ) -> tuple[float, float, float, torch.Tensor, float, float]:
+        """No-grad policy/value loss + approx KL on held-out episodes, under
+        CURRENT weights.
+
+        Same PPO-clipped-surrogate, normalised-MSE, and approximate-KL
+        (``mean(old_log_prob - new_log_prob)``, same "k1" estimator and
+        same ``clamp(min=-1e6)`` floor as ``approx_kl``/``kl_after_step`` in
+        the main training minibatch loop, see ``_ppo_update``) formulas as
+        training itself, just under ``torch.no_grad()`` and never followed
+        by an optimizer step -- called once per epoch so the reported
+        numbers track how the *policy being trained this call* moves on
+        episodes it never saw, epoch by epoch. Advantages are normalised
+        using THIS val batch's own mean/std (val rows never participate in
+        the train batch's normalisation stats).
+
+        Returns ``(policy_loss, value_loss, kl, per_sample_policy_loss,
+        value_loss_p1_p99, policy_loss_p1_p99)``. ``per_sample_policy_loss``
+        is every row's own (pre-mean) clipped-surrogate value, concatenated
+        across minibatches in val_batch's own row order -- lets a caller
+        look at the DISTRIBUTION (percentiles, outliers), not just the
+        mean, the same way _ppo_update's per-epoch percentile line does.
+        ``value_loss_p1_p99``/``policy_loss_p1_p99`` are ``value_loss``/
+        ``policy_loss`` recomputed as a TRIMMED mean (see
+        ``_trimmed_mean_p1_p99``) over per-sample terms, dropping the most
+        extreme 1% on each end -- a robust companion to the plain mean,
+        which a single outlier row can otherwise dominate. See __init__'s
+        val_episode_fraction comment / _ppo_update's log line for why
+        ``policy_loss``/``kl`` here are NOT meaningful generalization
+        diagnostics the way ``value_loss`` is: both collapse toward 0 for
+        ANY row that received zero gradient steps (ratio~1), regardless of
+        train/val identity -- ``policy_loss_p1_p99`` inherits that same
+        caveat (it's a robust version of a not-very-meaningful number, not
+        a robust generalization diagnostic on its own).
+        """
+        n_val = len(val_batch["log_probs"])
+        val_adv = val_batch["advantages"]
+        val_adv = (val_adv - val_adv.mean()) / (val_adv.std() + 1e-8)
+        val_old_lp = val_batch["log_probs"]
+        val_returns = val_batch["returns"]
+        val_ret_var = val_returns.var().clamp(min=1.0)
+
+        total_policy_loss = 0.0
+        total_value_loss = 0.0
+        total_kl = 0.0
+        total_n = 0
+        _per_sample_chunks: list[torch.Tensor] = []
+        _per_sample_value_chunks: list[torch.Tensor] = []
+        with torch.no_grad():
+            for start in range(0, n_val, self.minibatch_size):
+                idx = torch.arange(start, min(start + self.minibatch_size, n_val))
+                mb_obs = {k.replace("obs/", ""): val_batch[k][idx].to(self.device)
+                          for k in val_batch if k.startswith("obs/")}
+                sf, of, em = mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"]
+                bf, gf = mb_obs["ball_feat"], mb_obs["global_feat"]
+                sat, oat = _ai_types(mb_obs)
+
+                d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
+                e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
+                if self.separate_value_net:
+                    d_heads_for_value = _detach_decision_heads(d_heads)
+                    new_values = self.value_net(
+                        sf, of, em, bf, gf, d_heads_for_value, sat, oat, value_only=True
+                    ).squeeze(-1)
+                else:
+                    new_values = e_heads.value.squeeze(-1)
+
+                mb_actions = {k.replace("action/", ""): val_batch[k][idx].to(self.device)
+                              for k in val_batch if k.startswith("action/")}
+                new_log_probs = self._recompute_log_prob(d_heads, e_heads, mb_actions, em)
+
+                mb_adv = val_adv[idx].to(self.device)
+                mb_ret = val_returns[idx].to(self.device)
+                mb_old_lp = val_old_lp[idx].to(self.device)
+                ratio = torch.exp(new_log_probs - mb_old_lp)
+                surr1 = ratio * mb_adv
+                surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * mb_adv
+                _mb_min_surr = self._apply_dual_clip(torch.min(surr1, surr2), mb_adv)
+                _mb_per_sample_policy_loss = -_mb_min_surr
+                mb_policy_loss = _mb_per_sample_policy_loss.mean()
+                _mb_per_sample_value_loss = (new_values - mb_ret).pow(2) / val_ret_var
+                mb_value_loss = _mb_per_sample_value_loss.mean()
+                mb_kl = (mb_old_lp - new_log_probs.clamp(min=-1e6)).mean()
+                _per_sample_chunks.append(_mb_per_sample_policy_loss.cpu())
+                _per_sample_value_chunks.append(_mb_per_sample_value_loss.cpu())
+
+                bs = len(idx)
+                total_policy_loss += float(mb_policy_loss) * bs
+                total_value_loss += float(mb_value_loss) * bs
+                total_kl += float(mb_kl) * bs
+                total_n += bs
+
+        _per_sample_pol_cat = torch.cat(_per_sample_chunks) if _per_sample_chunks else torch.zeros(0)
+        return (
+            total_policy_loss / max(total_n, 1),
+            total_value_loss / max(total_n, 1),
+            total_kl / max(total_n, 1),
+            _per_sample_pol_cat,
+            _trimmed_mean_p1_p99(torch.cat(_per_sample_value_chunks)) if _per_sample_value_chunks else float("nan"),
+            _trimmed_mean_p1_p99(_per_sample_pol_cat) if _per_sample_chunks else float("nan"),
+        )
+
+    # -----------------------------------------------------------------------
     # PPO update
     # -----------------------------------------------------------------------
 
@@ -5459,6 +6317,16 @@ class PPOTrainer:
         Returns dict of mean loss metrics for logging.
         """
         from footballcoach.ai.ppo.bc import bc_loss_from_tensor, direction_magnitude_reg
+
+        # Hold out a random subset of complete episodes from training (see
+        # __init__'s val_episode_fraction comment) BEFORE augmentation, so
+        # held-out rows are never expanded/flipped and never enter any
+        # minibatch below -- `batch` is reassigned to the train-only portion
+        # for the rest of this function; `val_batch` (None when disabled or
+        # too few episodes) is only touched by the per-epoch eval below.
+        val_batch: Optional[dict] = None
+        if self.val_episode_fraction > 0.0:
+            batch, val_batch = self._split_train_val_episodes(batch)
 
         # Augment batch with geometric flips + slot permutations before any
         # gradient computation.  This expands the batch by 4 × n_slot_shuffles.
@@ -5536,6 +6404,27 @@ class PPOTrainer:
 
         all_policy_loss = []
         all_value_loss = []
+        # Per-SAMPLE (not per-minibatch-mean) policy_loss, reset and
+        # reported every epoch -- lets us look at the actual distribution's
+        # shape (skew, outliers) rather than just pol_mean, which can hide
+        # e.g. a small number of huge-magnitude samples dragging the mean
+        # away from 0. Like pol_mean itself, this is a PROGRESSIVE pool
+        # across that epoch's minibatches -- rows collected early in the
+        # epoch reflect staler, less-trained weights than rows collected
+        # near its end (the network is being updated minibatch-by-minibatch
+        # throughout), so treat each epoch's percentiles as an average-ish
+        # summary over that epoch's trajectory, not a single clean
+        # snapshot -- unlike the val-side percentiles (_eval_val_episode_losses),
+        # which really are one clean snapshot since val rows never train.
+        _epoch_sample_policy_loss: list[torch.Tensor] = []
+        # Same progressive-pool caveat as _epoch_sample_policy_loss above,
+        # but for the value HEAD's per-sample squared-error terms -- reports
+        # as val_mean_p1_p99 (a trimmed companion to val_mean, this
+        # function's TRAIN-side value-head loss; not to be confused with
+        # val_episode_value_loss_p1_p99, the HELD-OUT set's own trimmed
+        # value loss -- "val" is unfortunately overloaded in this file
+        # between "value head" and "held-out validation set").
+        _epoch_sample_value_loss: list[torch.Tensor] = []
         all_entropy = []
         all_entropy_breakdown: dict[str, list[float]] = {}
         all_kl = []
@@ -5545,15 +6434,19 @@ class PPOTrainer:
         # below), for a single end-of-update breakdown log line.
         _outc_sq_err_sum: dict[str, float] = {}
         _outc_n_sum: dict[str, int] = {}
+        _outc_gt_sum: dict[str, float] = {}
+        _outc_gt_sqsum: dict[str, float] = {}
         _step_outcomes = batch.get("step_outcomes", [])
 
         def _accum_value_by_outcome(pred: torch.Tensor, target: torch.Tensor, idx: torch.Tensor) -> None:
             if not _step_outcomes:
                 return
             outcomes_mb = [_step_outcomes[i] for i in idx.tolist()]
-            for _name, (_mse, _n) in value_mse_by_outcome(pred, target, outcomes_mb).items():
+            for _name, (_mse, _n, _gt_mean, _gt_mean_sq) in value_mse_by_outcome(pred, target, outcomes_mb).items():
                 _outc_sq_err_sum[_name] = _outc_sq_err_sum.get(_name, 0.0) + _mse * _n
                 _outc_n_sum[_name] = _outc_n_sum.get(_name, 0) + _n
+                _outc_gt_sum[_name] = _outc_gt_sum.get(_name, 0.0) + _gt_mean * _n
+                _outc_gt_sqsum[_name] = _outc_gt_sqsum.get(_name, 0.0) + _gt_mean_sq * _n
         all_bc_loss = []
         all_bc_tackle_loss: list[float] = []   # BCE on tackle_attempt head only
         all_tackle_prob: list[float] = []       # mean sigmoid(tackle_attempt_logit) per mb
@@ -5579,6 +6472,19 @@ class PPOTrainer:
         all_ratio_clipped_frac: list[float] = []
         all_head_grad_norm: dict[str, list[float]] = {name: [] for name, _ in EXEC_HEAD_MODULES}
         all_head_kl: list[torch.Tensor] = []  # per-mb (13,) per-head KL, after step
+        # Per-head COUNTERFACTUAL policy_loss: "if only this ONE head's
+        # probability had shifted from the rollout-collection policy (every
+        # other head held at ratio=1), what would the clipped surrogate
+        # loss be" -- computed pre-step (matching the real, reported
+        # `policy_loss` scalar, unlike all_head_kl above which is measured
+        # AFTER the optimizer step). Since the real per-sample ratio is the
+        # PRODUCT of every head's own ratio (log-probs sum -> ratio =
+        # exp(sum) = product of exp(per-head delta)), this is NOT a strict
+        # decomposition of the scalar policy_loss (sum of these 15 numbers
+        # != actual policy_loss) -- it's a per-head counterfactual, useful
+        # for comparing which heads are driving the objective in which
+        # direction, not for reconstructing the total.
+        all_head_policy_loss: list[torch.Tensor] = []
         all_continuous_mean_shift: dict[str, list[float]] = {"move_direction": [], "kick_direction": []}
         all_continuous_log_std_shift: dict[str, list[float]] = {"move_direction": [], "kick_direction": []}
         # kick_dir_z_log_std (elevation, plain Gaussian) has no per-head KL/
@@ -5689,6 +6595,8 @@ class PPOTrainer:
         for epoch_i in range(self.n_epochs):
             epoch_start = time.perf_counter()
             _epoch_slice_start = len(all_policy_loss)
+            _epoch_sample_policy_loss.clear()
+            _epoch_sample_value_loss.clear()
             indices = torch.randperm(n)
             for start in range(0, n, self.minibatch_size):
                 mb_idx = indices[start:start + self.minibatch_size]
@@ -5843,13 +6751,45 @@ class PPOTrainer:
                 ratio_clipped_frac_t = ((ratio < 1.0 - clip) | (ratio > 1.0 + clip)).float().mean()
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * mb_adv
-                policy_loss = -(torch.min(surr1, surr2) * mb_w).mean()
+                _min_surr = self._apply_dual_clip(torch.min(surr1, surr2), mb_adv)
+                _per_sample_policy_loss = -(_min_surr * mb_w)
+                policy_loss = _per_sample_policy_loss.mean()
+                _epoch_sample_policy_loss.append(_per_sample_policy_loss.detach().cpu())
+
+                # Per-head counterfactual policy_loss breakdown -- see
+                # all_head_policy_loss's own comment above for why this is a
+                # counterfactual (each head's ratio in isolation, others
+                # held at 1) rather than a strict decomposition of the
+                # scalar above. No extra network forward pass: d_heads/
+                # e_heads are already computed; this just re-slices their
+                # existing logits/distributions per head (same cost as the
+                # ratio-spike diagnostic's per-head call a few lines up).
+                # Dual-clip (if enabled) is applied here too, for the same
+                # reason it's applied to the val-side diagnostic -- keeps
+                # this breakdown consistent with whatever the real,
+                # backpropagated policy_loss formula actually is.
+                if "head_log_probs" in batch:
+                    with torch.no_grad():
+                        _mb_old_head_lp = batch["head_log_probs"][mb_idx].to(self.device)
+                        _mb_new_head_lp = self._per_head_new_log_probs(d_heads, e_heads, mb_actions, em)
+                        _head_ratio = torch.exp(_mb_new_head_lp - _mb_old_head_lp)  # (batch, 15)
+                        _head_adv = mb_adv.unsqueeze(-1)
+                        _head_w = mb_w.unsqueeze(-1)
+                        _head_surr1 = _head_ratio * _head_adv
+                        _head_surr2 = torch.clamp(_head_ratio, 1.0 - clip, 1.0 + clip) * _head_adv
+                        _head_min_surr = self._apply_dual_clip(
+                            torch.min(_head_surr1, _head_surr2), _head_adv
+                        )
+                        _head_policy_loss = -(_head_min_surr * _head_w).mean(dim=0)
+                    all_head_policy_loss.append(_head_policy_loss.cpu())
 
                 # Value loss — normalise by return variance so it stays ~O(1)
                 # regardless of how large/negative the returns are. This keeps
                 # the value gradient from overwhelming the policy gradient.
                 ret_var = returns.var().clamp(min=1.0)
-                value_loss = F.mse_loss(new_values, mb_ret) / ret_var
+                _per_sample_value_loss = (new_values - mb_ret).pow(2) / ret_var
+                value_loss = _per_sample_value_loss.mean()
+                _epoch_sample_value_loss.append(_per_sample_value_loss.detach().cpu())
                 _accum_value_by_outcome(new_values, mb_ret, mb_idx)
 
                 # Entropy bonus
@@ -6233,11 +7173,93 @@ class PPOTrainer:
             mean_pol_epoch = float(np.mean(_epoch_pol)) if _epoch_pol else 0.0
             mean_kl_epoch = float(np.mean(_epoch_kl)) if _epoch_kl else 0.0
             mean_val_epoch = float(np.mean(_epoch_val)) if _epoch_val else 0.0
+            # Trimmed (p1-p99) companions to pol_mean/val_mean -- pol_mean's
+            # uses the SAME _epoch_sample_policy_loss pool the percentile
+            # line below already builds (no extra work); val_mean's is this
+            # function's TRAIN-side value-HEAD loss (as opposed to
+            # val_episode_value_loss_p1_p99, the HELD-OUT set's own trimmed
+            # value loss; see _epoch_sample_value_loss's own comment for the
+            # "val" = value-head vs val = held-out-set naming clash).
+            mean_pol_epoch_trimmed = (
+                _trimmed_mean_p1_p99(torch.cat(_epoch_sample_policy_loss))
+                if _epoch_sample_policy_loss else float("nan")
+            )
+            mean_val_epoch_trimmed = (
+                _trimmed_mean_p1_p99(torch.cat(_epoch_sample_value_loss))
+                if _epoch_sample_value_loss else float("nan")
+            )
             log.info(
                 f"  [epoch {epoch_i + 1}/{self.n_epochs}] pol_mean={mean_pol_epoch:.4f}  "
+                f"pol_mean_p1_p99={mean_pol_epoch_trimmed:.4f}  "
                 f"val_mean={mean_val_epoch:.4f}(x{self.vf_coef})={self.vf_coef * mean_val_epoch:.4f}  "
+                f"val_mean_p1_p99={mean_val_epoch_trimmed:.4f}(x{self.vf_coef})="
+                f"{self.vf_coef * mean_val_epoch_trimmed:.4f}  "
                 f"kl_mean={mean_kl_epoch:.4f}  (n={len(_epoch_kl)} minibatch(es), {epoch_times[-1]:.0f}ms)"
             )
+            if _epoch_sample_policy_loss:
+                # Distribution shape, not just pol_mean -- e.g. a few
+                # huge-magnitude samples can drag the mean positive even
+                # while the bulk of samples sit right around/below 0. Same
+                # percentile list/style as the existing "[advantage |.| by
+                # episode]" line above, and as the val-side
+                # val_episode_policy_loss percentiles below -- but see
+                # _epoch_sample_policy_loss's own comment (declared near the
+                # top of this function) for why this one is a progressive
+                # pool across the epoch's minibatches (rows shaped by
+                # different, progressively-more-trained weights), not one
+                # clean snapshot the way the val-side numbers are.
+                _epoch_pol_t = torch.cat(_epoch_sample_policy_loss)
+                _pcts = [0, 1, 10, 50, 90, 99, 100]
+                _epoch_pct_str = "  ".join(
+                    f"p{p}={float(_epoch_pol_t.quantile(p / 100.0)):.4f}" for p in _pcts
+                )
+                log.info(
+                    f"  [epoch {epoch_i + 1}/{self.n_epochs} policy_loss percentiles, "
+                    f"n={len(_epoch_pol_t):,}]  {_epoch_pct_str}"
+                )
+            if val_batch is not None:
+                # val_episode_policy_loss is NOT a generalization diagnostic
+                # -- at ratio=1 (i.e. for any row that received zero
+                # gradient steps this call), the clipped surrogate collapses
+                # to -mean(adv_normalized), which is exactly 0 by
+                # construction (advantages are normalized to zero mean) --
+                # confirmed empirically: a same-size sample of about-to-be-
+                # trained TRAIN rows reads 0.000000 too, measured before any
+                # epoch runs. So it reads near-zero for ANY untouched rows
+                # regardless of split quality or true generalization, and
+                # says nothing that pol_mean above doesn't. Only
+                # val_episode_value_loss (real regression MSE, no
+                # ratio/zero-mean-advantage artifact) is a meaningful
+                # apples-to-apples train/val comparison here.
+                (
+                    _val_pol_loss, _val_val_loss, _val_kl, _val_per_sample_pol,
+                    _val_val_loss_trimmed, _val_pol_loss_trimmed,
+                ) = self._eval_val_episode_losses(val_batch, clip)
+                log.info(
+                    f"  [epoch {epoch_i + 1}/{self.n_epochs}] "
+                    f"val_episode_policy_loss={_val_pol_loss:.4f}  "
+                    f"val_episode_policy_loss_p1_p99={_val_pol_loss_trimmed:.4f}  "
+                    f"val_episode_value_loss={_val_val_loss:.4f}(x{self.vf_coef})="
+                    f"{self.vf_coef * _val_val_loss:.4f}  "
+                    f"val_episode_value_loss_p1_p99={_val_val_loss_trimmed:.4f}(x{self.vf_coef})="
+                    f"{self.vf_coef * _val_val_loss_trimmed:.4f}  "
+                    f"val_episode_kl={_val_kl:.4f}  "
+                    f"(n={len(val_batch['log_probs'])} held-out steps, never trained on)"
+                )
+                # Same distribution-shape percentiles as the epoch-0
+                # train-side line above, but for the held-out set, every
+                # epoch (cheap: val_batch is fixed, this is the same
+                # no-grad pass _eval_val_episode_losses already runs to get
+                # the mean above -- no extra forward pass).
+                if len(_val_per_sample_pol) > 0:
+                    _pcts = [0, 1, 10, 50, 90, 99, 100]
+                    _val_pct_str = "  ".join(
+                        f"p{p}={float(_val_per_sample_pol.quantile(p / 100.0)):.4f}" for p in _pcts
+                    )
+                    log.info(
+                        f"  [epoch {epoch_i + 1}/{self.n_epochs} val_episode_policy_loss "
+                        f"percentiles, n={len(_val_per_sample_pol):,}]  {_val_pct_str}"
+                    )
             if _early_stopped:
                 break
 
@@ -6437,6 +7459,7 @@ class PPOTrainer:
         move_log_std = self.execution_net.move_dir_log_kappa.data.tolist()
         kick_log_std = self.execution_net.kick_dir_log_kappa.data.tolist()
         kick_z_log_std = self.execution_net.kick_dir_z_log_std.data.tolist()
+        kick_power_log_std = self.execution_net.kick_power_log_std.data.tolist()
         mean_mv_ls_grad = float(np.mean(all_mv_log_std_grad)) if all_mv_log_std_grad else 0.0
         if mean_kl > KL_DIAG_THRESHOLD and all_ratios:
             ratios_t = torch.cat(all_ratios)
@@ -6756,6 +7779,40 @@ class PPOTrainer:
                 f"  min={float(np.min(all_adv_min)):.3f}"
                 f"  max={float(np.max(all_adv_max)):.3f}"
             )
+        # --- Per-episode |advantage| percentiles: unlike the [advantage] line
+        # above (normalised advantage, pooled across every row from every
+        # minibatch/epoch this rollout), this uses the RAW (pre-normalisation)
+        # per-step advantages in batch["advantages"] -- untouched by the
+        # `adv = (adv - adv.mean()) / (adv.std() + 1e-8)` reassignment above,
+        # which rebinds the local name `adv` to a new tensor rather than
+        # mutating batch["advantages"] in place -- segmented into episodes via
+        # batch["dones"] (same convention as the value-pretrain 85/15 episode
+        # split above: an episode is [prev_done_idx+1, this_done_idx]; any
+        # trailing partial episode after the last done is dropped). For each
+        # complete episode we take mean(|advantage|) across its rows, then
+        # report percentiles of THAT per-episode number across all episodes in
+        # the rollout -- i.e. "how big are advantage swings, episode by
+        # episode", distinct from the pooled per-row view above which can't
+        # tell a rollout with uniformly-moderate advantages apart from one
+        # with a few huge-swing episodes among many quiet ones.
+        if "dones" in batch:
+            _raw_adv_np = batch["advantages"].detach().cpu().numpy()
+            _dones_np = batch["dones"].detach().cpu().numpy()
+            _ep_end_idxs = np.where(_dones_np > 0.5)[0]
+            if len(_ep_end_idxs) > 0:
+                _ep_starts = np.concatenate([[0], _ep_end_idxs[:-1] + 1])
+                _ep_abs_adv_means = np.array([
+                    np.abs(_raw_adv_np[s:e + 1]).mean()
+                    for s, e in zip(_ep_starts, _ep_end_idxs)
+                ])
+                _ep_abs_adv_t = torch.from_numpy(_ep_abs_adv_means)
+                _pcts = [0, 1, 10, 50, 90, 99, 100]
+                _pct_str = "  ".join(
+                    f"p{p}={float(_ep_abs_adv_t.quantile(p / 100.0)):.3f}" for p in _pcts
+                )
+                log.info(
+                    f"  [advantage |.| by episode, n_episodes={len(_ep_abs_adv_means)}]  {_pct_str}"
+                )
         if all_ratios:
             _ratios_all = torch.cat(all_ratios)
             _ratio_clip_frac = float(np.mean(all_ratio_clipped_frac)) if all_ratio_clipped_frac else 0.0
@@ -6868,6 +7925,23 @@ class PPOTrainer:
                 f"{k}={v:+.4f}" for k, v in zip(HEAD_LP_KEYS, _mean_head_kl.tolist())
             )
             log.info(f"  [per-head KL] {_head_kl_str}")
+        if all_head_policy_loss:
+            # See all_head_policy_loss's own comment (declared near the top
+            # of this function) -- a per-head COUNTERFACTUAL (this head's
+            # ratio alone, others held at 1), not a strict decomposition:
+            # these 15 numbers do NOT sum to the scalar policy_loss= above.
+            # Sorted by |value| (biggest driver first) rather than
+            # HEAD_LP_KEYS order, since the whole point is spotting which
+            # head(s) are pulling the objective away from 0.
+            _mean_head_pol = torch.stack(all_head_policy_loss).mean(dim=0)
+            _head_pol_pairs = sorted(
+                zip(HEAD_LP_KEYS, _mean_head_pol.tolist()), key=lambda kv: -abs(kv[1])
+            )
+            _head_pol_str = "  ".join(f"{k}={v:+.4f}" for k, v in _head_pol_pairs)
+            log.info(
+                f"  [per-head policy_loss (counterfactual, ratio-in-isolation, "
+                f"sorted by |.|)] {_head_pol_str}"
+            )
 
         # Per-head mean activation rates from the buffer (0–100%). Zero-cost: just
         # averages the stored 0/1 action arrays — no extra forward pass needed.
@@ -6931,7 +8005,12 @@ class PPOTrainer:
 
         if _outc_n_sum:
             _value_by_outcome = {
-                name: (_outc_sq_err_sum[name] / max(_outc_n_sum[name], 1), _outc_n_sum[name])
+                name: (
+                    _outc_sq_err_sum[name] / max(_outc_n_sum[name], 1),
+                    _outc_n_sum[name],
+                    _outc_gt_sum[name] / max(_outc_n_sum[name], 1),
+                    _outc_gt_sqsum[name] / max(_outc_n_sum[name], 1),
+                )
                 for name in _outc_sq_err_sum
             }
             log.info(f"  [value RMSE by outcome] {format_outcome_rmse_breakdown(_value_by_outcome)}")
@@ -6953,6 +8032,7 @@ class PPOTrainer:
             "move_log_std": move_log_std,
             "kick_log_std": kick_log_std,
             "kick_z_log_std": kick_z_log_std,
+            "kick_power_log_std": kick_power_log_std,
             "mv_ls_grad": mean_mv_ls_grad,
             "head_act": head_act,
             "grad_clip_pct_main": grad_clip_pct_main,

@@ -56,6 +56,7 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from footballcoach.ai.physics_pretrain.event_head_smoothing import expected_bce_floor, smooth_target
 from footballcoach.ai.physics_pretrain.player_dataset import GROUPS, PlayerDynamicsDataset
 from footballcoach.ai.progress import ProgressReporter
 from footballcoach.ai.physics_pretrain.player_dynamics_net import N_IDENTITY_SHORTCUT_FIELDS, PlayerDynamicsAutoencoder
@@ -113,7 +114,7 @@ def _heading_angular_dist(pred_sincos: torch.Tensor, target_sincos: torch.Tensor
 
 def _goal_bce_masked(
     goal_logit: torch.Tensor, goal_target: torch.Tensor, possession_mask: torch.Tensor,
-    pos_weight: torch.Tensor | None, reduction: str = "mean",
+    pos_weight: torch.Tensor | None, reduction: str = "mean", label_smoothing: float = 0.0,
 ) -> torch.Tensor:
     """``goal_scored`` BCE, restricted to ``has_possession=1`` rows -- see
     the module docstring. ``possession_mask`` is the batch's own input
@@ -122,8 +123,18 @@ def _goal_bce_masked(
     to contain zero possessing rows contributes nothing, rather than NaN
     from a 0/0 division) -- negligible in practice at any real batch size
     given ``possession_start_frac``'s default, and never silently drops
-    gradient information a possessing row would have provided."""
-    per_row = F.binary_cross_entropy_with_logits(goal_logit, goal_target, pos_weight=pos_weight, reduction="none")
+    gradient information a possessing row would have provided.
+
+    ``label_smoothing`` (default 0.0, no behaviour change): smooths
+    ``goal_target`` before the BCE -- see ``event_head_smoothing.py``. The
+    analytic floor for this term is subtracted by callers via
+    ``event_head_smoothing.expected_bce_floor`` at their own aggregation
+    point, same convention as ``train_ball_dynamics.py`` -- not computed
+    in here.
+    """
+    per_row = F.binary_cross_entropy_with_logits(
+        goal_logit, smooth_target(goal_target, label_smoothing), pos_weight=pos_weight, reduction="none",
+    )
     if reduction == "none":
         return per_row * possession_mask
     denom = possession_mask.sum().clamp(min=1.0)
@@ -133,6 +144,7 @@ def _goal_bce_masked(
 def compute_loss(
     pred_heads: list[torch.Tensor], target: torch.Tensor, input_x: torch.Tensor,
     pos_weight: torch.Tensor, bce_weight: float = 1.0, heading_weight: float = 1.0, stamina_weight: float = 1.0,
+    label_smoothing: float = 0.0,
 ) -> tuple[torch.Tensor, LossBreakdown]:
     """Sum over horizons of (continuous MSE + event BCE), directly mirroring
     ``train_ball_dynamics.compute_loss`` -- see its docstring. ``pos_weight``:
@@ -159,8 +171,10 @@ def compute_loss(
         heading_mse = F.mse_loss(head_out[:, 4:6], target_h[:, 4:6])
         heading_dist = _heading_angular_dist(head_out[:, 4:6], target_h[:, 4:6])
         stamina_mse = F.mse_loss(head_out[:, 6], target_h[:, 6])
-        oob_bce = F.binary_cross_entropy_with_logits(head_out[:, 7], target_h[:, 7], pos_weight=pos_weight[h, 0])
-        goal_bce = _goal_bce_masked(head_out[:, 8], target_h[:, 8], possession_mask, pos_weight[h, 1])
+        oob_bce = F.binary_cross_entropy_with_logits(
+            head_out[:, 7], smooth_target(target_h[:, 7], label_smoothing), pos_weight=pos_weight[h, 0],
+        )
+        goal_bce = _goal_bce_masked(head_out[:, 8], target_h[:, 8], possession_mask, pos_weight[h, 1], label_smoothing=label_smoothing)
         total = (
             total + pos_mse + vel_mse + heading_weight * heading_mse + stamina_weight * stamina_mse
             + bce_weight * (oob_bce + goal_bce)
@@ -180,6 +194,7 @@ def compute_loss(
 def compute_per_episode_loss(
     pred_heads: list[torch.Tensor], target: torch.Tensor, input_x: torch.Tensor,
     pos_weight: torch.Tensor, bce_weight: float = 1.0, heading_weight: float = 1.0, stamina_weight: float = 1.0,
+    label_smoothing: float = 0.0,
 ) -> torch.Tensor:
     """Same components as ``compute_loss``'s ``total``, NOT reduced across
     the batch -- see ``train_ball_dynamics.compute_per_episode_loss``."""
@@ -194,9 +209,11 @@ def compute_per_episode_loss(
         heading_sq = (head_out[:, 4:6] - target_h[:, 4:6]).pow(2).mean(dim=1)
         stamina_sq = (head_out[:, 6] - target_h[:, 6]).pow(2)
         oob_bce = F.binary_cross_entropy_with_logits(
-            head_out[:, 7], target_h[:, 7], pos_weight=pos_weight[h, 0], reduction="none",
+            head_out[:, 7], smooth_target(target_h[:, 7], label_smoothing), pos_weight=pos_weight[h, 0], reduction="none",
         )
-        goal_bce = _goal_bce_masked(head_out[:, 8], target_h[:, 8], possession_mask, pos_weight[h, 1], reduction="none")
+        goal_bce = _goal_bce_masked(
+            head_out[:, 8], target_h[:, 8], possession_mask, pos_weight[h, 1], reduction="none", label_smoothing=label_smoothing,
+        )
         total = (
             total + pos_sq + vel_sq + heading_weight * heading_sq + stamina_weight * stamina_sq
             + bce_weight * (oob_bce + goal_bce)
@@ -235,7 +252,7 @@ def compute_confusion_counts(
 def _single_target_loss_with_breakdown(
     pred: torch.Tensor, target: torch.Tensor, input_x: torch.Tensor,
     pos_weight_row: torch.Tensor | None = None, bce_weight: float = 1.0,
-    heading_weight: float = 1.0, stamina_weight: float = 1.0,
+    heading_weight: float = 1.0, stamina_weight: float = 1.0, label_smoothing: float = 0.0,
 ) -> tuple[torch.Tensor, dict[str, float]]:
     """Same components as one horizon's worth of ``compute_loss``, for a
     single ``(pred, target)`` pair -- shared by the adjacent-pair and
@@ -252,8 +269,8 @@ def _single_target_loss_with_breakdown(
     stamina_mse = F.mse_loss(pred[:, 6], target[:, 6])
     oob_w = pos_weight_row[0] if pos_weight_row is not None else None
     goal_w = pos_weight_row[1] if pos_weight_row is not None else None
-    oob_bce = F.binary_cross_entropy_with_logits(pred[:, 7], target[:, 7], pos_weight=oob_w)
-    goal_bce = _goal_bce_masked(pred[:, 8], target[:, 8], possession_mask, goal_w)
+    oob_bce = F.binary_cross_entropy_with_logits(pred[:, 7], smooth_target(target[:, 7], label_smoothing), pos_weight=oob_w)
+    goal_bce = _goal_bce_masked(pred[:, 8], target[:, 8], possession_mask, goal_w, label_smoothing=label_smoothing)
     total = (
         pos_mse + vel_mse + heading_weight * heading_mse + stamina_weight * stamina_mse
         + bce_weight * (oob_bce + goal_bce)
@@ -271,7 +288,7 @@ def _single_target_loss_with_breakdown(
 def _single_target_per_episode_loss(
     pred: torch.Tensor, target: torch.Tensor, input_x: torch.Tensor,
     pos_weight_row: torch.Tensor | None = None, bce_weight: float = 1.0,
-    heading_weight: float = 1.0, stamina_weight: float = 1.0,
+    heading_weight: float = 1.0, stamina_weight: float = 1.0, label_smoothing: float = 0.0,
 ) -> torch.Tensor:
     possession_mask = input_x[:, HAS_POSSESSION_INPUT_IDX]
     pos_sq = (pred[:, 0:2] - target[:, 0:2]).pow(2).mean(dim=1)
@@ -280,8 +297,8 @@ def _single_target_per_episode_loss(
     stamina_sq = (pred[:, 6] - target[:, 6]).pow(2)
     oob_w = pos_weight_row[0] if pos_weight_row is not None else None
     goal_w = pos_weight_row[1] if pos_weight_row is not None else None
-    oob_bce = F.binary_cross_entropy_with_logits(pred[:, 7], target[:, 7], pos_weight=oob_w, reduction="none")
-    goal_bce = _goal_bce_masked(pred[:, 8], target[:, 8], possession_mask, goal_w, reduction="none")
+    oob_bce = F.binary_cross_entropy_with_logits(pred[:, 7], smooth_target(target[:, 7], label_smoothing), pos_weight=oob_w, reduction="none")
+    goal_bce = _goal_bce_masked(pred[:, 8], target[:, 8], possession_mask, goal_w, reduction="none", label_smoothing=label_smoothing)
     return (
         pos_sq + vel_sq + heading_weight * heading_sq + stamina_weight * stamina_sq
         + bce_weight * (oob_bce + goal_bce)
@@ -388,7 +405,7 @@ def _crossing_head_loss(
     model: PlayerDynamicsAutoencoder, latent: torch.Tensor, pos_all: np.ndarray, dt_all: np.ndarray,
     mask_all: np.ndarray, row_idx: np.ndarray, device: str,
     pos_loss_weight: float = 1.0, crosses_loss_weight: float = 1.0, dt_loss_weight: float = 1.0,
-    dt_norm_s: float = 1.0, trust_negatives: bool = True,
+    dt_norm_s: float = 1.0, trust_negatives: bool = True, label_smoothing: float = 0.0,
 ) -> tuple[torch.Tensor, float, float, float, float, float, float]:
     """``model.crossing_head``'s loss for one batch -- THREE separate terms:
 
@@ -493,6 +510,15 @@ def _crossing_head_loss(
     ensure ``pos_all``/``dt_all``/``mask_all`` and ``row_idx`` share the
     same indexing convention; this function doesn't care which one it is.
 
+    ``label_smoothing`` (default 0.0, no behaviour change): smooths
+    ``crosses_target`` before the ``crosses_logit`` BCE (both branches) --
+    see ``event_head_smoothing.py``. Does not affect ``crosses_acc`` (still
+    computed against the hard target). Callers that report an aggregated
+    ``crosses_loss`` mean subtract
+    ``crosses_loss_weight * event_head_smoothing.expected_bce_floor(label_smoothing)``
+    (no ``pos_weight`` for this head) at the point of aggregation -- see
+    ``train_ball_dynamics._crossing_head_loss``'s identical convention.
+
     Returns ``(loss, pos_dist_mean, dt_mae_mean, pos_loss_val,
     crosses_loss_val, dt_loss_val, crosses_acc)`` -- ``pos_dist_mean``/
     ``dt_mae_mean``/``crosses_acc`` are plain floats (not backpropagated)
@@ -517,9 +543,10 @@ def _crossing_head_loss(
     pos_loss = (pos_err.pow(2).sum(dim=-1) * mask_f).sum() / denom
 
     crosses_target = (c_dt_raw != -1.0).float()
+    crosses_target_smoothed = smooth_target(crosses_target, label_smoothing)
     crosses_logit = crossing_pred[:, 2]
     if trust_negatives:
-        crosses_loss = F.binary_cross_entropy_with_logits(crosses_logit, crosses_target)
+        crosses_loss = F.binary_cross_entropy_with_logits(crosses_logit, crosses_target_smoothed)
     else:
         # See this function's own trust_negatives docstring -- a negative
         # label here is right-censored, not verified, so it's excluded
@@ -527,7 +554,7 @@ def _crossing_head_loss(
         # rows (crosses_target == 1) are untouched.
         crosses_denom = crosses_target.sum().clamp_min(1.0)
         crosses_loss = (
-            F.binary_cross_entropy_with_logits(crosses_logit, crosses_target, reduction="none") * crosses_target
+            F.binary_cross_entropy_with_logits(crosses_logit, crosses_target_smoothed, reduction="none") * crosses_target
         ).sum() / crosses_denom
 
     dt_mask_f = crosses_target
@@ -711,11 +738,31 @@ class _AuxAccumulator:
         self._values["short_horizon_rmse_0_2s"].append(rmse_0_2s)
         self._values["short_horizon_rmse_1_0s"].append(rmse_1_0s)
 
-    def summary(self) -> dict[str, float]:
-        return {
+    def summary(self, crossing_crosses_loss_floor: float = 0.0) -> dict[str, float]:
+        """``crossing_crosses_loss_floor`` (default 0.0, no behaviour
+        change): the analytic label-smoothing floor for ``crossing_head``'s
+        ``crosses_logit`` term (see ``train()``'s
+        ``_crossing_crosses_loss_floor`` -- a closed-form constant, no
+        batch data needed), subtracted (clamped at 0) from BOTH the
+        ``crossing_crosses_loss`` entry (the standalone sub-term) AND
+        ``crossing_loss`` (the aggregate pos+crosses+dt weighted sum crosses
+        is folded into) -- keeping them consistent is what lets a caller use
+        ``crossing_loss`` as a percentage-split denominator against the
+        already-adjusted ``crossing_crosses_loss``/``crossing_pos_loss``/
+        ``crossing_dt_loss`` numerators (see the "pos/crosses/dt split" log
+        line in ``train()``) without the split silently overshooting 100%.
+        Every OTHER consumer of ``crossing_loss`` (the "crossing_head: train
+        loss=" display, ``backprop_contrib``'s "crossing" entry, the
+        "train_crossing_loss" history key) shares this same adjusted value
+        too -- see ``train_ball_dynamics.py``'s identical convention.
+        """
+        result = {
             k: (float(np.mean(v)) if v else float("nan"))
             for k, v in self._values.items()
         }
+        result["crossing_crosses_loss"] = float(np.maximum(0.0, result["crossing_crosses_loss"] - crossing_crosses_loss_floor))
+        result["crossing_loss"] = float(np.maximum(0.0, result["crossing_loss"] - crossing_crosses_loss_floor))
+        return result
 
 
 def _summary_stats(values: list[float]) -> dict[str, float]:
@@ -1205,13 +1252,24 @@ def train(
             log.info(f"    {prefix} {c:12s} by horizon: {np.array2string(values, precision=4)}, mean: {values.mean():.4f}")
 
     def _mean_breakdown_by_horizon(breakdowns_by_h: list[list[dict]]) -> dict[str, np.ndarray]:
-        return {
+        """... ``oob_bce``/``goal_bce`` have the analytic label-smoothing
+        floor subtracted (clamped at 0) before being returned -- see the
+        ``_oob_bce_floor_by_h``/``_goal_bce_floor_by_h`` comment near where
+        ``label_smoothing`` is read from config. Every caller in this file
+        (both the ``LossBreakdown``-based ``compute_loss`` path, converted
+        to per-horizon dicts at the call site, and the dict-shaped
+        ``_single_target_loss_with_breakdown`` path) funnels through this
+        one function, so this is the single choke point for both."""
+        result = {
             c: np.array([
                 np.mean([b[c] for b in breakdowns_by_h[h]]) if breakdowns_by_h[h] else np.nan
                 for h in range(n_horizons)
             ])
             for c in _COMPONENTS
         }
+        result["oob_bce"] = np.maximum(0.0, result["oob_bce"] - _oob_bce_floor_by_h)
+        result["goal_bce"] = np.maximum(0.0, result["goal_bce"] - _goal_bce_floor_by_h)
+        return result
 
     target_var = ds.compute_group_variance(n_horizons, indices=train_idx)
     persistence_mse = ds.compute_persistence_baseline_mse(n_horizons, indices=train_idx)
@@ -1311,6 +1369,38 @@ def train(
     # same way -- 1.0 (default) is unchanged behaviour.
     main_loss_weight = float(cfg.get("main_loss_weight", 1.0))
     bce_weight = float(cfg.get("bce_loss_weight", 1.0))
+    # Label smoothing applied to every BCE event-head target (oob/goal per
+    # horizon, crossing_head's crosses_logit) before its loss -- see
+    # event_head_smoothing.py and physics_pretrain.player.label_smoothing.
+    # 0.0 (default) = no behaviour change. Reported oob_bce/goal_bce/
+    # crossing_crosses_loss are floor-adjusted wherever they're aggregated
+    # for logging/history -- see train_ball_dynamics.py's identical
+    # convention (this pipeline directly mirrors it).
+    label_smoothing = float(cfg.get("label_smoothing", 0.0))
+    # Per-horizon analytic label-smoothing floor for oob_bce/goal_bce -- a
+    # closed-form function of (label_smoothing, pos_weight) alone, no batch
+    # data needed (see event_head_smoothing.expected_bce_floor's
+    # docstring). All-zero when label_smoothing<=0.0. Applied inside
+    # `_mean_breakdown`/`_mean_breakdown_by_horizon` below, the single
+    # aggregation choke point every phase's train/val oob_bce/goal_bce mean
+    # flows through on its way to both the per-epoch log line and
+    # `.history.npz`/the report.
+    _oob_bce_floor_by_h = np.array([expected_bce_floor(label_smoothing, float(pos_weight_np[h, 0])) for h in range(n_horizons)])
+    _goal_bce_floor_by_h = np.array([expected_bce_floor(label_smoothing, float(pos_weight_np[h, 1])) for h in range(n_horizons)])
+    # crossing_head's crosses_logit has no pos_weight (see
+    # _crossing_head_loss), so its floor is a true CONSTANT -- pre-scaled by
+    # crossing_crosses_weight to match how crosses_loss_val already has
+    # that weight baked in.
+    _crossing_crosses_loss_floor = crossing_crosses_weight * expected_bce_floor(label_smoothing)
+    # "main" head's own floor (bce_weight-scaled oob/goal floor, summed
+    # across horizons, ALSO scaled by main_loss_weight since that's applied
+    # on top -- see "main": main_loss_weight * float(np.mean(losses)) in
+    # backprop_contrib below) -- used ONLY to floor-adjust the "backprop_
+    # loss contribution by head" diagnostic (and its percentage-denominator
+    # total), same rationale as train_ball_dynamics.py's identical
+    # _main_head_floor. Never touches the real backpropagated tensors or
+    # train_loss/val_loss themselves -- display-only.
+    _main_head_floor = main_loss_weight * bce_weight * float(np.sum(_oob_bce_floor_by_h) + np.sum(_goal_bce_floor_by_h))
     # PlayerDynamicsLinearDecoder only predicts pos+vel (see its docstring)
     # -- heading/stamina come back as constant zero, no gradient source, so
     # weighting them into the trained objective would just bake a
@@ -1777,7 +1867,7 @@ def train(
                     for x, y in _iterate_numpy_minibatches(ae_inputs, ae_targets, batch_size, device):
                         latent = model.encoder(x)
                         pred = model.decoder.forward_at(latent, 0.0)
-                        loss, breakdown = _single_target_loss_with_breakdown(pred, y, x, pos_weight[h_idx], bce_weight, heading_weight, stamina_weight)
+                        loss, breakdown = _single_target_loss_with_breakdown(pred, y, x, pos_weight[h_idx], bce_weight, heading_weight, stamina_weight, label_smoothing)
                         losses.append(float(loss.item()))
                         breakdowns_by_h[h_idx].append(breakdown)
             mean_loss = float(np.mean(losses)) if losses else float("nan")
@@ -1797,7 +1887,7 @@ def train(
                 y = torch.from_numpy(ae_targets[row_idx].astype(np.float32, copy=False)).to(device)
                 latent = model.encoder(x)
                 pred = model.decoder.forward_at(latent, 0.0)
-                loss, breakdown = _single_target_loss_with_breakdown(pred, y, x, pos_weight[h_idx], bce_weight, heading_weight, stamina_weight)
+                loss, breakdown = _single_target_loss_with_breakdown(pred, y, x, pos_weight[h_idx], bce_weight, heading_weight, stamina_weight, label_smoothing)
                 autoencode_optimizer.zero_grad()
                 loss.backward()
                 autoencode_optimizer.step()
@@ -1934,7 +2024,7 @@ def train(
             x = torch.from_numpy(ds.inputs[row_idx].astype(np.float32, copy=False)).to(device)
             y = torch.from_numpy(ds.targets[row_idx].astype(np.float32, copy=False)).to(device)
             latent, pred_heads = model(x)
-            loss, breakdown = compute_loss(pred_heads, y, x, pos_weight, bce_weight, heading_weight, stamina_weight)
+            loss, breakdown = compute_loss(pred_heads, y, x, pos_weight, bce_weight, heading_weight, stamina_weight, label_smoothing)
             # `backprop_loss` folds in every auxiliary latent head's term
             # (crossing/goal-dist-delta/short-horizon-probe), same as
             # before pairing existed. `losses` below keeps reporting the
@@ -1951,6 +2041,7 @@ def train(
                     model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, row_idx, device,
                     pos_loss_weight=crossing_pos_weight, crosses_loss_weight=crossing_crosses_weight,
                     dt_loss_weight=crossing_dt_weight, dt_norm_s=crossing_dt_norm_s,
+                    label_smoothing=label_smoothing,
                 )
                 backprop_loss = backprop_loss + crossing_loss
                 aux.add_crossing(crossing_loss, c_pos_dist, c_dt_mae, c_pos_loss, c_crosses_loss, c_dt_loss, c_crosses_acc)
@@ -1992,7 +2083,7 @@ def train(
                     y_h = torch.from_numpy(ae_targets[h_row_idx].astype(np.float32, copy=False)).to(device)
                     pred = model.decoder.forward_at(latent_h, 0.0)
                     t0_loss, t0_breakdown = _single_target_loss_with_breakdown(
-                        pred, y_h, x_h, pos_weight[h_idx], bce_weight, heading_weight, stamina_weight,
+                        pred, y_h, x_h, pos_weight[h_idx], bce_weight, heading_weight, stamina_weight, label_smoothing,
                     )
                     # main_loss_weight here too (see isolate_crossing) --
                     # t0/pair are the horizon-pass's OWN version of the main
@@ -2015,6 +2106,7 @@ def train(
                         pred_pair = model.decoder.forward_at(latent_h, gap)
                         per_ex_loss = _single_target_per_episode_loss(
                             pred_pair, y_pair, x_h, pos_weight[h_idx + skip], bce_weight, heading_weight, stamina_weight,
+                            label_smoothing,
                         )
                         pair_loss = pair_loss + (per_ex_loss * mask_f).sum() / denom
                     horizon_loss = horizon_loss + main_loss_weight * pair_loss
@@ -2031,6 +2123,7 @@ def train(
                         horizon_bundle_train["crossing_valid"][h_idx], h_row_idx, device,
                         pos_loss_weight=crossing_pos_weight, crosses_loss_weight=crossing_crosses_weight,
                         dt_loss_weight=crossing_dt_weight, dt_norm_s=crossing_dt_norm_s, trust_negatives=False,
+                        label_smoothing=label_smoothing,
                     )
                     horizon_loss = horizon_loss + crossing_loss_h
                     aux.add_crossing(crossing_loss_h, c_pos_dist_h, c_dt_mae_h, c_pos_loss_h, c_crosses_loss_h, c_dt_loss_h, c_crosses_acc_h)
@@ -2069,7 +2162,7 @@ def train(
             running_loss = float(np.mean(backprop_losses))
             progress.update(_step_i + 1, postfix=f"loss={running_loss:.5f}")
 
-        aux_summary = aux.summary()
+        aux_summary = aux.summary(crossing_crosses_loss_floor=_crossing_crosses_loss_floor)
         return {
             "aux": aux_summary,
             "mean_loss": float(np.mean(losses)) if losses else float("nan"),
@@ -2090,8 +2183,13 @@ def train(
             # main_loss_weight was overridden -- see isolate_crossing);
             # crossing is aux_summary's own crossing_loss (already weighted
             # -- see _crossing_head_loss).
+            # "main"'s label-smoothing floor is subtracted here (clamped at
+            # 0) -- see train_ball_dynamics.py's identical backprop_contrib
+            # treatment. "crossing" (aux_summary["crossing_loss"]) is
+            # already floor-adjusted by _AuxAccumulator.summary() above;
+            # goal_dist_delta/short_horizon_probe have no BCE, no floor.
             "backprop_contrib": {
-                "main": main_loss_weight * float(np.mean(losses)) if losses else float("nan"),
+                "main": float(np.maximum(0.0, (main_loss_weight * float(np.mean(losses)) if losses else float("nan")) - _main_head_floor)),
                 "crossing": aux_summary["crossing_loss"],
                 "goal_dist_delta": float(np.mean(train_goal_dist_contrib)) if train_goal_dist_contrib else float("nan"),
                 "short_horizon_probe": float(np.mean(train_probe_contrib)) if train_probe_contrib else float("nan"),
@@ -2119,13 +2217,14 @@ def train(
                 x = torch.from_numpy(ds.inputs[batch_idx].astype(np.float32, copy=False)).to(device)
                 y = torch.from_numpy(ds.targets[batch_idx].astype(np.float32, copy=False)).to(device)
                 latent, pred_heads = model(x)
-                loss, breakdown = compute_loss(pred_heads, y, x, pos_weight, bce_weight, heading_weight, stamina_weight)
+                loss, breakdown = compute_loss(pred_heads, y, x, pos_weight, bce_weight, heading_weight, stamina_weight, label_smoothing)
                 losses.append(float(loss.item()))
                 if has_crossing_data:
                     aux.add_crossing(*_crossing_head_loss(
                         model, latent, ds.crossing_pos, ds.crossing_dt, ds.crossing_mask, batch_idx, device,
                         pos_loss_weight=crossing_pos_weight, crosses_loss_weight=crossing_crosses_weight,
                         dt_loss_weight=crossing_dt_weight, dt_norm_s=crossing_dt_norm_s,
+                        label_smoothing=label_smoothing,
                     ))
                 if goal_dist_delta_targets is not None:
                     aux.add_goal_dist(*_goal_dist_delta_head_loss(
@@ -2168,7 +2267,7 @@ def train(
                         if autoencode_during_main_loop_enabled:
                             y = torch.from_numpy(ae_targets[row_idx].astype(np.float32, copy=False)).to(device)
                             pred = model.decoder.forward_at(latent, 0.0)
-                            t0_loss = _single_target_loss_with_breakdown(pred, y, x, pos_weight[h_idx], bce_weight, heading_weight, stamina_weight)[0]
+                            t0_loss = _single_target_loss_with_breakdown(pred, y, x, pos_weight[h_idx], bce_weight, heading_weight, stamina_weight, label_smoothing)[0]
                             t0_losses.append(float(t0_loss.item()))
 
                         pair_targets_h = horizon_bundle_val["pair_targets"][h_idx] if adjacent_pair_enabled else []
@@ -2182,6 +2281,7 @@ def train(
                                 pred_pair = model.decoder.forward_at(latent, gap)
                                 per_ex_loss = _single_target_per_episode_loss(
                                     pred_pair, y_pair, x, pos_weight[h_idx + skip], bce_weight, heading_weight, stamina_weight,
+                                    label_smoothing,
                                 )
                                 pair_loss = pair_loss + (per_ex_loss * mask_f).sum() / denom
                             pair_losses.append(float(pair_loss.item()))
@@ -2192,10 +2292,11 @@ def train(
                                 horizon_bundle_val["crossing_valid"][h_idx], row_idx, device,
                                 pos_loss_weight=crossing_pos_weight, crosses_loss_weight=crossing_crosses_weight,
                         dt_loss_weight=crossing_dt_weight, dt_norm_s=crossing_dt_norm_s, trust_negatives=False,
+                                label_smoothing=label_smoothing,
                             ))
 
         return {
-            "aux": aux.summary(),
+            "aux": aux.summary(crossing_crosses_loss_floor=_crossing_crosses_loss_floor),
             "mean_loss": float(np.mean(losses)) if losses else float("nan"),
             "breakdowns": _mean_breakdown_by_horizon(breakdowns_by_h),
             "oob_counts": oob_counts, "goal_counts": goal_counts,
@@ -2514,8 +2615,13 @@ def train(
             # applied here the same way _run_interleaved_train_epoch does
             # for the train side. See train_ball_dynamics.py's identical
             # val_backprop_loss_delta diagnostic.
+            # "main"'s floor is subtracted here (clamped at 0, _main_head_
+            # floor already includes the main_loss_weight scaling) without
+            # ever touching `val_loss` itself -- see train_ball_dynamics.py's
+            # identical val-side pattern. "crossing" (val_aux["crossing_
+            # loss"]) is already floor-adjusted by _AuxAccumulator.summary().
             val_backprop_contrib = {
-                "main": main_loss_weight * val_loss,
+                "main": float(np.maximum(0.0, main_loss_weight * val_loss - _main_head_floor)),
                 "crossing": val_aux["crossing_loss"],
                 "goal_dist_delta": goal_dist_delta_weight * val_aux["goal_dist_delta_loss"],
                 "short_horizon_probe": short_horizon_probe_weight * val_aux["short_horizon_probe_loss"],

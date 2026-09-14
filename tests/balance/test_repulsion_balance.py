@@ -277,9 +277,25 @@ def test_ball_carrier_avoidance_and_slowdown(balance_recorder):
         confirmed the hard way when this test started failing on a config
         that WAS applying the ball-carrier penalty correctly, just via a
         different, faster-clearing trajectory shape."""
+    import dataclasses
+
     from footballcoach.engine.movement import SpeedMode
     N_STEPS = 45
     sum_radii = 0.6
+
+    # Pinned locally rather than read from orders.json: the live
+    # ball_carrier_speed_penalty_max (0.1) caps speed_mult at >= 0.9, and
+    # speed_penalty_scale (0.03) keeps it well above that anyway at the
+    # net_rep magnitudes this scenario reaches -- so speed_mult never gets
+    # anywhere near the orders.py SPRINT->JOG downgrade threshold (0.75)
+    # regardless of how close the carrier gets. That's a real, currently-live
+    # gameplay tuning choice (not something this test should second-guess),
+    # so instead of depending on it, this test uses its own values chosen to
+    # comfortably trigger the mechanism, to verify the WIRING (does a strong
+    # enough penalty actually flip SPRINT to JOG) rather than today's tuning.
+    _test_repulsion_params = dataclasses.replace(
+        RepulsionParams.from_config(), ball_carrier_speed_penalty_max=0.5, speed_penalty_scale=0.5,
+    )
 
     def _run_carrier(carrier_has_ball: bool) -> tuple[float, bool]:
         """Returns (min_separation, sprint_downgraded_to_jog_during_close_approach)."""
@@ -305,9 +321,16 @@ def test_ball_carrier_avoidance_and_slowdown(balance_recorder):
             ball.possessed_by = carrier.player_id
         else:
             ball.possessed_by = None
-            ball.position = Vector3(100.0, 0.0, 0.0)
+            # In-bounds but far from the action -- (100, 0, 0) is outside
+            # the pitch, and a loose out-of-bounds ball gets reset to
+            # kickoff/centre-field by the engine on the very first step,
+            # putting it directly in the sprinting carrier's path and
+            # getting picked up a few ticks in. That silently turned this
+            # "no ball" control run into a real ball-carrier run partway
+            # through, which is what made non_carrier_downgraded fire.
+            ball.position = Vector3(-40.0, 25.0, 0.0)
 
-        match = _make_match([carrier, obstacle], ball)
+        match = _make_match([carrier, obstacle], ball, repulsion_params=_test_repulsion_params)
         separations = []
         jog_downgrade_fired = False
 
@@ -317,7 +340,12 @@ def test_ball_carrier_avoidance_and_slowdown(balance_recorder):
             obs = match.players[1]  # obstacle
             sep = p.position.xy().distance_to(obs.position.xy())
             separations.append(sep)
-            if sep < 4.0 and p.desired_speed_mode == SpeedMode.JOG:  # within repulsion radius
+            # last_desired_speed_mode, NOT desired_speed_mode -- Match._apply_movement
+            # resets the latter to None every tick right after consuming it (see
+            # ai/knowledge.md's "Orders vs execution-network labels boundary"
+            # section), so reading it back here always sees None regardless of
+            # what mode actually ran.
+            if sep < 4.0 and p.last_desired_speed_mode == SpeedMode.JOG:  # within repulsion radius
                 jog_downgrade_fired = True
 
         return min(separations), jog_downgrade_fired

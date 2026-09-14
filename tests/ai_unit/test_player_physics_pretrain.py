@@ -401,6 +401,77 @@ def test_compute_loss_hand_computed():
     assert total.item() > 0.0
 
 
+def test_compute_loss_label_smoothing_zero_is_noop():
+    from footballcoach.ai.physics_pretrain.train_player_dynamics import compute_loss
+
+    pred = torch.zeros(2, N_TARGET_FIELDS_PER_HORIZON)
+    target = torch.zeros(2, N_TARGET_FIELDS_PER_HORIZON)
+    target[:, 0] = 1.0
+    input_x = torch.zeros(2, N_INPUT_FIELDS)
+    input_x[:, 11] = 1.0
+    pos_weight = torch.ones(1, 2)
+
+    total_base, breakdown_base = compute_loss([pred], target, input_x, pos_weight)
+    total_smoothed, breakdown_smoothed = compute_loss([pred], target, input_x, pos_weight, label_smoothing=0.0)
+    assert float(total_smoothed.item()) == pytest.approx(float(total_base.item()), abs=1e-8)
+    assert breakdown_smoothed.oob_bce[0] == pytest.approx(breakdown_base.oob_bce[0], abs=1e-8)
+    assert breakdown_smoothed.goal_bce[0] == pytest.approx(breakdown_base.goal_bce[0], abs=1e-8)
+
+
+def test_compute_loss_label_smoothing_hand_computed():
+    from footballcoach.ai.physics_pretrain.event_head_smoothing import expected_bce_floor
+    from footballcoach.ai.physics_pretrain.train_player_dynamics import compute_loss
+
+    pred = torch.zeros(2, N_TARGET_FIELDS_PER_HORIZON)  # logit=0 -> p=0.5
+    target = torch.zeros(2, N_TARGET_FIELDS_PER_HORIZON)
+    target[:, 7] = 1.0  # positive out_of_bounds
+    target[:, 8] = 0.0  # negative goal_scored
+    input_x = torch.zeros(2, N_INPUT_FIELDS)
+    input_x[:, 11] = 1.0  # has_possession=1 so goal_bce is actually computed
+    pos_weight = torch.ones(1, 2)
+    smoothing = 0.2
+
+    _, breakdown = compute_loss([pred], target, input_x, pos_weight, label_smoothing=smoothing)
+
+    # At logit=0 (p=0.5), BCE against either smoothed-target value is still
+    # ln(2) (see the ball test's identical reasoning) -- only the FLOOR
+    # (the achievable minimum) moves, not the raw value at this particular
+    # prediction.
+    expected_bce = math.log(2)
+    assert breakdown.oob_bce[0] == pytest.approx(expected_bce, abs=1e-4)
+    assert breakdown.goal_bce[0] == pytest.approx(expected_bce, abs=1e-4)
+
+    floor = expected_bce_floor(smoothing)
+    assert floor > 0.0
+    assert expected_bce - floor < expected_bce
+
+
+def test_crossing_head_loss_label_smoothing_does_not_affect_accuracy():
+    from footballcoach.ai.physics_pretrain.event_head_smoothing import expected_bce_floor
+    from footballcoach.ai.physics_pretrain.train_player_dynamics import _crossing_head_loss
+
+    torch.manual_seed(0)
+    latent_dim = 24
+    model = PlayerDynamicsAutoencoder(latent_dim=latent_dim)
+    latent = torch.randn(4, latent_dim)
+    pos_all = np.zeros((4, 2), dtype=np.float32)
+    dt_all = np.array([-1.0, -1.0, 1.0, 1.0], dtype=np.float32)
+    mask_all = np.array([False, False, True, True])
+    row_idx = np.arange(4)
+    smoothing = 0.1
+
+    loss_base, _, _, _, _, _, acc_base = _crossing_head_loss(
+        model, latent, pos_all, dt_all, mask_all, row_idx, "cpu",
+        crosses_loss_weight=1.0, label_smoothing=0.0,
+    )
+    loss_smoothed, _, _, _, crosses_loss_val, _, acc_smoothed = _crossing_head_loss(
+        model, latent, pos_all, dt_all, mask_all, row_idx, "cpu",
+        crosses_loss_weight=1.0, label_smoothing=smoothing,
+    )
+    assert acc_smoothed == pytest.approx(acc_base, abs=1e-8)
+    assert expected_bce_floor(smoothing) > 0.0
+
+
 def test_goal_bce_possession_gating():
     """goal_scored BCE must be computed ONLY over has_possession=1 rows --
     a batch of entirely has_possession=0 rows should report goal_bce=0 and
@@ -1093,6 +1164,47 @@ def test_train_smoke_with_all_auxiliary_heads(tmp_path, monkeypatch, caplog):
     state = torch.load(output_path.with_suffix(".after_training.pt"), map_location="cpu")["model_state_dict"]
     for head in ("crossing_head", "goal_dist_delta_head", "short_horizon_head_0_2s", "short_horizon_head_1_0s"):
         assert f"{head}.weight" in state and f"{head}.bias" in state
+
+
+def test_train_smoke_with_label_smoothing(tmp_path, monkeypatch, caplog):
+    """End-to-end: label_smoothing > 0.0 runs without error, and the
+    resulting history's oob_bce/goal_bce/crossing_crosses_loss values stay
+    finite and non-negative -- i.e. the floor-adjustment is actually
+    reflected in what's reported, not just present in the code."""
+    from footballcoach.ai.physics_pretrain.train_player_dynamics import train
+    import footballcoach.ai.config as ai_config_mod
+
+    orig_load_ai_config = ai_config_mod.load_ai_config
+
+    def _patched():
+        cfg = orig_load_ai_config()
+        pp = cfg["physics_pretrain"]["player"]
+        pp["label_smoothing"] = 0.1
+        pp["bce_loss_weight"] = 1.0
+        pp["crossing_pos_loss_weight"] = 0.005
+        pp["crossing_crosses_loss_weight"] = 1.0
+        pp["crossing_dt_loss_weight"] = 0.005
+        return cfg
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _patched)
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=80, output_dir=dataset_dir, seed=5, shard_size=80, n_workers=1)
+    output_path = tmp_path / "player_encoder.pt"
+    with caplog.at_level("INFO", logger="footballcoach.ai.physics_pretrain.train_player_dynamics"):
+        artifact = train(
+            dataset_dir=str(dataset_dir), output_path=str(output_path),
+            epochs=1, batch_size=16, lr=1e-3, val_frac=0.2, seed=0,
+        )
+    for record in artifact["history"]:
+        for k in ("train_oob_bce", "val_oob_bce", "train_goal_bce", "val_goal_bce"):
+            v = np.asarray(record[k])
+            assert np.all(np.isfinite(v)), f"{k} is not finite: {v}"
+            assert np.all(v >= 0.0), f"{k} is negative: {v}"
+        for k in ("train_crossing_crosses_loss", "val_crossing_crosses_loss"):
+            v = float(record[k])
+            assert math.isfinite(v), f"{k} is not finite: {v}"
+            assert v >= 0.0, f"{k} is negative: {v}"
 
 
 def test_train_resumes_from_checkpoint_predating_the_aux_heads(tmp_path, monkeypatch, caplog):

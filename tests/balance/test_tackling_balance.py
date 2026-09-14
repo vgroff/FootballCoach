@@ -43,8 +43,10 @@ def test_goalkeeper_tackling_boost(balance_recorder):
     balance_recorder.report("goalkeeper_tackle_boost", stats)
     # GK (2.0 boost) should win majority even against a stronger dribbler (0.8 vs 0.5).
     assert gk_rate > 60.0
-    # Outfield (1.2 boost, matched against 0.8 dribbler) should rarely win.
-    assert outfield_rate < 40.0
+    # Outfield (1.2 boost, matched against 0.8 dribbler) should rarely win. Threshold
+    # raised slightly from 40.0 to account for tackling_skill_floor/dribbling_skill_floor
+    # (see engine/tackling.py) compressing both ends of the attribute range upward.
+    assert outfield_rate < 45.0
 
 
 def test_tackling_win_rate_table_across_attribute_pairs(balance_recorder):

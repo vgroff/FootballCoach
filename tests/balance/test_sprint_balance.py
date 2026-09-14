@@ -62,9 +62,26 @@ def test_top_attribute_player_100m_sprint_time(balance_recorder):
 
 
 def test_bottom_attribute_player_100m_sprint_time(balance_recorder):
+    """Bounds derived from the live top-speed formula rather than hardcoded
+    seconds: this test originally assumed a 5.0 m/s bottom-tier top speed
+    (see module docstring) and asserted 18.0 < t < 35.0 accordingly, but
+    physics.json's top_speed_base_mps has since moved for design reasons
+    ("League Three should still be competent" -- see engine/knowledge.md),
+    making a bottom-tier player faster and the old lower bound stale. Uses
+    the idealised constant-cruising-speed time (distance / top speed) as a
+    reference point and allows a wide band around it for acceleration
+    ramp-up, so this tracks future top_speed retuning instead of drifting
+    out of sync with it again."""
+    from footballcoach.engine.movement import MovementParams
+    params = MovementParams.from_config()
+    ideal_time_s = SPRINT_DISTANCE_M / params.top_speed_base_mps  # attr=0.0
+
     t = _time_to_run(top_speed_attr=0.0, acceleration_attr=0.0, has_ball=False)
     balance_recorder.report("sprint_100m_bottom_attrs_no_ball_seconds", {"time_s": round(t, 2)})
-    assert 18.0 < t < 35.0
+    assert ideal_time_s * 0.9 < t < ideal_time_s * 1.5, (
+        f"expected roughly {ideal_time_s:.2f}s (100m / top_speed_base_mps) with slack "
+        f"for acceleration ramp-up, got {t:.2f}s"
+    )
 
 
 def test_top_attribute_player_is_faster_than_bottom(balance_recorder):

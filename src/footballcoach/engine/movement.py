@@ -61,6 +61,10 @@ class MovementParams:
     standstill_decel_multiplier: float  # accel boost when decelerating to STANDSTILL
     turn_speed_penalty_max: float  # max fractional speed-cap reduction mid-turn (0.7 = up to 70%)
     control_speed_multiplier: float  # fraction of speed kept on first-touch contact (0.6 = 40% reduction)
+    accel_taper_strength: float  # how much accel falls off approaching top speed (0 = flat/no taper)
+    accel_taper_exponent: float  # 1.0 = linear falloff; >1 stays explosive longer then drops harder
+    accel_taper_min_fraction: float  # floor multiplier so accel never tapers all the way to zero
+    accel_taper_peak_boost: float  # multiplies accel_base/scale up to get the at-rest ("explosive") peak
 
     @staticmethod
     def from_config() -> "MovementParams":
@@ -88,6 +92,10 @@ class MovementParams:
             standstill_decel_multiplier=d.get("standstill_decel_multiplier", 1.5),
             turn_speed_penalty_max=d.get("turn_speed_penalty_max", 0.7),
             control_speed_multiplier=d.get("control_speed_multiplier", 0.6),
+            accel_taper_strength=d.get("accel_taper_strength", 0.0),
+            accel_taper_exponent=d.get("accel_taper_exponent", 1.0),
+            accel_taper_min_fraction=d.get("accel_taper_min_fraction", 1.0),
+            accel_taper_peak_boost=d.get("accel_taper_peak_boost", 1.0),
         )
 
 
@@ -140,7 +148,43 @@ def effective_acceleration(
     acceleration_attr: float,
     stamina_fraction: float,
     is_goalkeeper: bool = False,
+    has_ball: bool = False,
+    ball_control_attr: float = 0.0,
 ) -> float:
+    """The player's flat/constant acceleration capability (attribute +
+    stamina + goalkeeper + ball-carry), NOT current-speed-dependent, and
+    deliberately UNCHANGED by the accel_taper_* shaping described below.
+
+    This is what every ETA/decision-estimator call site uses (sprint_eta,
+    rules_ai's race-to-the-ball comparisons, orders.py's braking-distance
+    calc, shot_selection's GK dive estimate) -- they all model straight-line
+    acceleration as flat/constant, so they intentionally get this value, not
+    the taper-shaped one. It's also exactly what BRAKING uses (mode
+    STANDSTILL, or any tick where the player is decelerating toward a lower
+    target speed) inside `step_player_towards`: braking isn't force-velocity
+    limited the way producing forward propulsive force is, so it deliberately
+    keeps using this flat value (times `standstill_decel_multiplier` where
+    applicable), never the taper or its peak_boost.
+
+    `has_ball`/`ball_control_attr` apply the SAME `ball_carry_speed_
+    multiplier` used by `effective_top_speed`, so a ball carrier's
+    acceleration ramp is capped by the same fraction as their top speed --
+    the ball-carry penalty acts equally on both rather than only capping the
+    ceiling. Defaults to `has_ball=False` (no-op) so every ETA/decision-
+    estimator call site above keeps its existing ball-unaware flat behavior
+    unless it's deliberately updated to pass it -- only `step_player_towards`
+    does, since it's the actual movement simulation, not a heuristic.
+
+    Only the ACCELERATING branch of `step_player_towards` (`speed_diff > 0`)
+    applies anything on top of this: first `accel_taper_peak_boost` (a flat
+    multiplier -- the true at-rest "explosive first step" is higher than
+    this flat value), then `accel_taper_multiplier` (which tapers that
+    boosted peak down as speed climbs toward top speed). This is a known,
+    accepted approximation: reworking the ETA estimators above to be
+    taper-aware (the taper has a closed-form exponential solution, so it's
+    not fundamentally hard) is a good future follow-up, not done here since
+    none of them are the actual movement simulation, just heuristics for
+    decisions like "do I sprint now?"."""
     accel = max_acceleration_mps2(params, acceleration_attr) * stamina_multiplier(params, stamina_fraction)
     if is_goalkeeper:
         # Simulates diving reach: goalkeepers get a flat acceleration boost
@@ -149,7 +193,30 @@ def effective_acceleration(
         # diving"). Applies to all goalkeeper movement, not just Save
         # orders, since a keeper's explosive first step matters generally.
         accel *= params.goalkeeper_accel_multiplier
+    if has_ball:
+        accel *= ball_carry_speed_multiplier(params, ball_control_attr)
     return accel
+
+
+def accel_taper_multiplier(params: MovementParams, current_speed_mps: float, top_speed_mps: float) -> float:
+    """Multiplier applied to `effective_acceleration`'s peak value ONLY while
+    speeding up (never while braking -- braking isn't muscle-force-velocity
+    limited the same way real sprinting is, and already gets its own
+    `standstill_decel_multiplier` boost).
+
+    Models the classic force-velocity taper of real sprinting: near-full
+    acceleration at rest, tapering down as current speed approaches the
+    player's own effective top speed (a simple, standard drag-equilibrium
+    approximation -- with `accel_taper_exponent=1.0` this is exactly the
+    textbook "terminal velocity" ODE dv/dt = a*(1 - v/v_top), whose solution
+    is the classic exponential approach curve v(t) = v_top*(1 - e^(-a*t/v_top))).
+    Floored at `accel_taper_min_fraction` so it never asymptotes all the way
+    to a crawl right near top speed.
+    """
+    v_top = max(top_speed_mps, 1e-6)
+    speed_frac = max(0.0, min(1.0, current_speed_mps / v_top))
+    taper = 1.0 - params.accel_taper_strength * (speed_frac ** params.accel_taper_exponent)
+    return max(taper, params.accel_taper_min_fraction)
 
 
 def sprint_eta(dist_m: float, v0_mps: float, v_top_mps: float, accel_mps2: float) -> float:
@@ -188,12 +255,19 @@ def lateral_accel_capability(
     has_ball: bool,
     ball_control_attr: float = 0.0,
     is_goalkeeper: bool = False,
+    dribbling_attr: float = 0.0,
 ) -> float:
     """Max lateral (turning) acceleration available, in m/s^2.
 
     This governs turn rate: omega_max = a_lat / max(speed, eps). Carrying the
-    ball reduces this unless ball_control is high (at ball_control=1.0 there
-    is no penalty, per the design spec).
+    ball reduces this unless the player's close-control skill is high (at
+    close_control=1.0 there is no penalty, per the design spec). close_control
+    is `max(ball_control_attr, dribbling_attr)`, not ball_control alone --
+    either a good first-touch player or a good dribbler can plausibly cut
+    sharply with the ball at their feet, so a player shouldn't be penalized
+    here just for being weaker in whichever of the two they rely on less.
+    `dribbling_attr` defaults to 0.0 (matching ball_control_attr's default)
+    so omitting it reproduces the old ball_control-only behavior.
 
     Goalkeepers get the same `goalkeeper_accel_multiplier` boost applied
     here as `effective_acceleration` - without it, a keeper with boosted
@@ -205,7 +279,8 @@ def lateral_accel_capability(
     """
     a_lat = params.lateral_accel_base_mps2 + params.lateral_accel_scale_mps2 * acceleration_attr
     if has_ball:
-        a_lat *= 1.0 - params.lateral_accel_ball_penalty_max * (1.0 - ball_control_attr)
+        close_control = max(ball_control_attr, dribbling_attr)
+        a_lat *= 1.0 - params.lateral_accel_ball_penalty_max * (1.0 - close_control)
     if is_goalkeeper:
         a_lat *= params.goalkeeper_accel_multiplier
     return a_lat
@@ -218,11 +293,25 @@ def max_turn_rate_rad_s(
     has_ball: bool,
     ball_control_attr: float = 0.0,
     is_goalkeeper: bool = False,
+    dribbling_attr: float = 0.0,
 ) -> float:
     """omega_max = a_lat / max(speed, min_speed) -- turning is "free" (fast) at
     low speed and increasingly constrained at high speed, matching real
-    running biomechanics (tight turns cost more the faster you're moving)."""
-    a_lat = lateral_accel_capability(params, acceleration_attr, has_ball, ball_control_attr, is_goalkeeper)
+    running biomechanics (tight turns cost more the faster you're moving).
+
+    This v-in-the-denominator effect is one of TWO reasons turning gets
+    easier at low speed. The other lives in `step_player_towards`'s traction
+    circle: `lateral_accel_capability` (the a_lat used here) is deliberately
+    left un-tapered by speed -- it's the same number whether the player is
+    at 1 m/s or top speed -- because the taper effect belongs to *shared use*
+    of one budget, not to lateral capability shrinking on its own. See the
+    docstring there for why (an earlier version tapered a_lat directly here
+    too, and it broke `test_small_heading_change_does_not_decelerate`: it
+    compounded with the pre-existing turn-arc speed penalty and made a plain
+    45 degree turn at sprint speed brake far harder than intended)."""
+    a_lat = lateral_accel_capability(
+        params, acceleration_attr, has_ball, ball_control_attr, is_goalkeeper, dribbling_attr
+    )
     denom = max(speed_mps, params.min_speed_for_turn_mps)
     return a_lat / denom
 
@@ -284,7 +373,9 @@ def step_player_towards(
     attrs = player.attributes
 
     v_top = effective_top_speed(params, attrs.top_speed, player.stamina, has_ball, attrs.ball_control, player.is_goalkeeper)
-    a_max = effective_acceleration(params, attrs.acceleration, player.stamina, player.is_goalkeeper)
+    a_max = effective_acceleration(
+        params, attrs.acceleration, player.stamina, player.is_goalkeeper, has_ball, attrs.ball_control
+    )
 
     current_speed = player.velocity.length_xy()
     desired_dir = target_direction.xy().normalized()
@@ -305,18 +396,27 @@ def step_player_towards(
         desired_speed = 0.0
 
     # Turn rate limits how fast heading can rotate towards the desired direction.
+    # lateral_peak (== lateral_accel_capability, un-tapered by speed -- see
+    # max_turn_rate_rad_s's docstring for why) feeds omega_max exactly as
+    # before. The NEW part is the traction-circle clamp further below: once
+    # heading is resolved, whatever share of lateral_peak this tick's actual
+    # turn used isn't also available for forward acceleration -- they draw
+    # from one shared force budget, not two independent ones.
     current_heading = player.heading_rad
     desired_heading = desired_dir.angle_xy() if desired_dir.length() > 1e-9 else current_heading
-    omega_max = max_turn_rate_rad_s(
-        params, attrs.acceleration, max(current_speed, 0.5), has_ball, attrs.ball_control, player.is_goalkeeper
+    lateral_peak = lateral_accel_capability(
+        params, attrs.acceleration, has_ball, attrs.ball_control, player.is_goalkeeper, attrs.dribbling
     )
+    omega_max = lateral_peak / max(current_speed, 0.5)
 
     heading_diff = angle_diff(current_heading, desired_heading)
     max_turn_this_tick = omega_max * dt_s
     if abs(heading_diff) <= max_turn_this_tick:
         new_heading = desired_heading
+        omega_actual = heading_diff / dt_s if dt_s > 1e-9 else 0.0
     else:
         new_heading = current_heading + math.copysign(max_turn_this_tick, heading_diff)
+        omega_actual = math.copysign(omega_max, heading_diff)
 
     # Speed change is limited by acceleration, and further reduced the more
     # the player is turning (large heading changes cost more speed), per the
@@ -326,6 +426,35 @@ def step_player_towards(
     target_speed = desired_speed * turn_speed_penalty
 
     speed_diff = target_speed - current_speed
+    if speed_diff > 0.0:
+        # Only while actually speeding up: boost a_max up to its true at-rest
+        # ("explosive") peak, then taper that peak down as speed climbs
+        # toward top speed. Braking (speed_diff <= 0) keeps the flat a_max
+        # from effective_acceleration() unchanged (already boosted separately
+        # for STANDSTILL above), since decelerating isn't force-velocity
+        # limited the way producing forward propulsive force is -- see
+        # effective_acceleration's and accel_taper_multiplier's docstrings.
+        a_max *= params.accel_taper_peak_boost * accel_taper_multiplier(params, current_speed, v_top)
+
+        # Traction-circle clamp: whatever share of lateral_peak this tick's
+        # realized turn (omega_actual) is already using isn't available for
+        # forward acceleration too. a_lat = v*omega is the same centripetal
+        # identity max_turn_rate_rad_s is built on, so a_lat_used is always
+        # <= lateral_peak by construction (omega_actual <= omega_max). This
+        # is a friction-ELLIPSE (not a true circle) since the two peaks are
+        # independently attribute-scaled: remaining forward-accel headroom
+        # is sqrt(1 - (used/peak)^2) of its own peak, so a dead-straight
+        # tick (a_lat_used=0) is completely unaffected. Floored at
+        # accel_taper_min_fraction (same floor the speed taper uses) rather
+        # than let a max-rate cut zero it out entirely -- a real sprinter
+        # mid-cut still has *some* forward drive left, and an un-floored
+        # ellipse turned out to compound badly with orders.json's boundary
+        # steering (a continuously-curving path kept the multiplier pinned
+        # near zero tick after tick, see test_boundary_carry_steering.py).
+        if lateral_peak > 1e-9:
+            lat_fraction = min(abs(current_speed * omega_actual) / lateral_peak, 1.0)
+            ellipse_mult = math.sqrt(max(0.0, 1.0 - lat_fraction * lat_fraction))
+            a_max *= max(ellipse_mult, params.accel_taper_min_fraction)
     max_delta = a_max * dt_s
     if abs(speed_diff) <= max_delta:
         new_speed = target_speed

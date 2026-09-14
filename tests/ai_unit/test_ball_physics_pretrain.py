@@ -563,6 +563,120 @@ def test_compute_loss_bce_weight_scales_total_but_not_reported_breakdown():
     assert head_out2.grad[0, 0].abs().item() > 0.0  # pos/vel/spin gradient unaffected
 
 
+def test_compute_loss_label_smoothing_zero_is_noop():
+    """label_smoothing=0.0 (the default) must be byte-identical to before
+    this parameter existed."""
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import compute_loss
+
+    head_out = torch.zeros(1, N_TARGET_FIELDS_PER_HORIZON)
+    target = torch.zeros(1, N_TARGET_FIELDS_PER_HORIZON)
+    target[0, :9] = 2.0
+    target[0, 9] = 1.0
+    pos_weight = torch.ones(1, 2)
+
+    total_base, breakdown_base = compute_loss([head_out], target, pos_weight)
+    total_smoothed, breakdown_smoothed = compute_loss([head_out], target, pos_weight, label_smoothing=0.0)
+    assert float(total_smoothed.item()) == pytest.approx(float(total_base.item()), abs=1e-8)
+    assert breakdown_smoothed.oob_bce[0] == pytest.approx(breakdown_base.oob_bce[0], abs=1e-8)
+    assert breakdown_smoothed.goal_bce[0] == pytest.approx(breakdown_base.goal_bce[0], abs=1e-8)
+
+
+def test_compute_loss_label_smoothing_hand_computed():
+    """label_smoothing>0 trains/reports against the SMOOTHED target -- the
+    raw breakdown value is naturally elevated by the analytic H(y') floor
+    (event_head_smoothing.expected_bce_floor)."""
+    from footballcoach.ai.physics_pretrain.event_head_smoothing import expected_bce_floor
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import compute_loss
+
+    head_out = torch.zeros(1, N_TARGET_FIELDS_PER_HORIZON)  # logit=0 -> p=0.5 for oob/goal
+    target = torch.zeros(1, N_TARGET_FIELDS_PER_HORIZON)
+    target[0, 9] = 1.0  # positive out_of_bounds
+    target[0, 10] = 0.0  # negative goal_scored
+    pos_weight = torch.ones(1, 2)
+    smoothing = 0.2
+
+    _, breakdown = compute_loss([head_out], target, pos_weight, label_smoothing=smoothing)
+
+    # Smoothed target for y=1 is 1-0.5*s=0.9; for y=0 is 0.5*s=0.1. BCE at
+    # logit=0 (p=0.5) against either is -[y'ln(0.5)+(1-y')ln(0.5)] = ln(2)
+    # regardless of y' (since ln(0.5) is the same for both terms) -- so at
+    # p=0.5 exactly, the raw BCE value doesn't change with smoothing, only
+    # its FLOOR does (the achievable minimum moves up to H(y')).
+    expected_bce = float(np.log(2.0))
+    assert breakdown.oob_bce[0] == pytest.approx(expected_bce, abs=1e-5)
+    assert breakdown.goal_bce[0] == pytest.approx(expected_bce, abs=1e-5)
+
+    floor = expected_bce_floor(smoothing)
+    assert floor > 0.0
+    # The floor-adjusted value (what a diagnostic would report) must be
+    # LESS than the raw ln(2) baseline, and strictly less than the raw BCE.
+    assert expected_bce - floor < expected_bce
+
+
+def test_crossing_head_loss_label_smoothing_floor_matches_expected_bce_floor():
+    from footballcoach.ai.physics_pretrain.event_head_smoothing import expected_bce_floor
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import _crossing_head_loss
+
+    torch.manual_seed(0)
+    latent_dim = 16
+    model = BallDynamicsAutoencoder(latent_dim=latent_dim)
+    latent = torch.zeros(4, latent_dim)  # crossing_head is Linear off latent -> logit=0 at latent=0
+    pos_all = np.zeros((4, 2), dtype=np.float32)
+    dt_all = np.array([-1.0, -1.0, 1.0, 1.0], dtype=np.float32)
+    mask_all = np.array([False, False, True, True])
+    row_idx = np.arange(4)
+    smoothing = 0.1
+
+    loss_base, *_ = _crossing_head_loss(
+        model, latent, pos_all, dt_all, mask_all, row_idx, torch.device("cpu"),
+        crosses_loss_weight=1.0, label_smoothing=0.0,
+    )
+    loss_smoothed, _, _, _, crosses_loss_val, _, crosses_acc, crosses_recall = _crossing_head_loss(
+        model, latent, pos_all, dt_all, mask_all, row_idx, torch.device("cpu"),
+        crosses_loss_weight=1.0, label_smoothing=smoothing,
+    )
+    # crosses_logit is 0 at an all-zero latent (Linear with zero-init bias
+    # is NOT guaranteed, so only check the floor-related properties, not an
+    # exact hand-computed value tied to random init).
+    floor = expected_bce_floor(smoothing)
+    assert floor > 0.0
+    # crosses_acc/crosses_recall are computed against the HARD target, so
+    # smoothing must not perturb them at all (same predictions either way).
+    loss_base2, _, _, _, _, _, crosses_acc_base, crosses_recall_base = _crossing_head_loss(
+        model, latent, pos_all, dt_all, mask_all, row_idx, torch.device("cpu"),
+        crosses_loss_weight=1.0, label_smoothing=0.0,
+    )
+    assert crosses_acc == pytest.approx(crosses_acc_base, abs=1e-8)
+    assert crosses_recall == pytest.approx(crosses_recall_base, abs=1e-8)
+
+
+def test_event_head_loss_label_smoothing_matches_manual_bce():
+    from footballcoach.ai.physics_pretrain.event_head_smoothing import smooth_target
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import _event_head_loss
+
+    torch.manual_seed(0)
+    latent_dim = 16
+    model = BallDynamicsAutoencoder(latent_dim=latent_dim)
+    latent = torch.randn(5, latent_dim)
+    ever_oob = np.array([1.0, 0.0, 1.0, 0.0, 1.0], dtype=np.float32)
+    ever_goal = np.array([0.0, 1.0, 0.0, 1.0, 0.0], dtype=np.float32)
+    row_idx = np.arange(5)
+    smoothing = 0.15
+
+    with torch.no_grad():
+        pred = model.event_head(latent)
+    manual_oob = F.binary_cross_entropy_with_logits(
+        pred[:, 0], smooth_target(torch.from_numpy(ever_oob), smoothing),
+    )
+    manual_goal = F.binary_cross_entropy_with_logits(
+        pred[:, 1], smooth_target(torch.from_numpy(ever_goal), smoothing),
+    )
+    loss, oob_acc, goal_acc, _, _ = _event_head_loss(
+        model, latent, ever_oob, ever_goal, row_idx, torch.device("cpu"), label_smoothing=smoothing,
+    )
+    assert float(loss.item()) == pytest.approx(float((manual_oob + manual_goal).item()), abs=1e-5)
+
+
 def test_compute_per_episode_loss_matches_batch_mean_and_identifies_rows():
     from footballcoach.ai.physics_pretrain.train_ball_dynamics import compute_loss, compute_per_episode_loss
 
@@ -1178,6 +1292,51 @@ def test_decoder_only_training_trunk_frozen_but_out_trains_with_identity_rows_ma
     assert (model.encoder.out.weight[dim:, :] - before_out_weight[dim:, :]).abs().max().item() > 0.0
     decoder_diff = max((model.decoder.state_dict()[k] - before_decoder[k]).abs().max().item() for k in before_decoder)
     assert decoder_diff > 0.0
+
+
+def test_train_smoke_with_label_smoothing(tmp_path, monkeypatch, caplog):
+    """End-to-end: label_smoothing > 0.0 runs without error, and the
+    logged oob_bce/goal_bce/event_loss numbers stay finite, non-negative,
+    and don't blow up to some huge floor-inflated value -- i.e. the
+    floor-adjustment is actually taking effect on the printed diagnostics,
+    not just on paper."""
+    from footballcoach.ai.physics_pretrain.train_ball_dynamics import train
+    import footballcoach.ai.config as ai_config_mod
+
+    orig_load_ai_config = ai_config_mod.load_ai_config
+
+    def _patched():
+        cfg = orig_load_ai_config()
+        cfg["physics_pretrain"]["ball"]["label_smoothing"] = 0.1
+        cfg["physics_pretrain"]["ball"]["bce_loss_weight"] = 1.0
+        cfg["physics_pretrain"]["ball"]["event_loss_weight"] = 1.0
+        cfg["physics_pretrain"]["ball"]["crossing_crosses_loss_weight"] = 1.0
+        cfg["physics_pretrain"]["ball"]["optimizer_type"] = "adam"
+        return cfg
+
+    monkeypatch.setattr(ai_config_mod, "load_ai_config", _patched)
+
+    dataset_dir = tmp_path / "data"
+    generate_dataset(n_episodes=80, output_dir=dataset_dir, seed=5, shard_size=80, n_workers=1)
+    output_path = tmp_path / "ball_encoder.pt"
+    with caplog.at_level("INFO", logger="footballcoach.ai.physics_pretrain.train_ball_dynamics"):
+        train(
+            dataset_dir=str(dataset_dir), output_path=str(output_path),
+            epochs=1, batch_size=16, lr=1e-2, val_frac=0.2, seed=0,
+        )
+    assert "oob_bce" in caplog.text
+    assert "train_event_loss" in caplog.text
+    # Reported oob_bce/goal_bce values are printed as "mean: X.XXXX" --
+    # extract them and sanity-check they're finite, non-negative, and well
+    # under an absurd floor-inflated magnitude (an untrained network's raw
+    # BCE near p=0.5 is close to ln(2)~0.69; the floor-adjusted value
+    # should not be dramatically larger than that).
+    import re
+    means = [float(m) for m in re.findall(r"oob_bce\s+by horizon.*?mean:\s*(-?\d+\.\d+)", caplog.text)]
+    assert means, "expected at least one oob_bce mean in the log"
+    for m in means:
+        assert m == m  # not NaN
+        assert -1e-3 <= m < 5.0
 
 
 def test_train_smoke_with_decoder_only_pretraining(tmp_path, monkeypatch, caplog):

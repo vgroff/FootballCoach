@@ -34,6 +34,8 @@ class TacklingParams:
     angle_modifier_behind: float
     dribble_beaten_speed_threshold: float
     dribble_beaten_max_penalty: float
+    tackling_skill_floor: float
+    dribbling_skill_floor: float
 
     @staticmethod
     def from_config() -> "TacklingParams":
@@ -55,6 +57,8 @@ class TacklingParams:
             angle_modifier_behind=d["angle_modifier_behind"],
             dribble_beaten_speed_threshold=d["dribble_beaten_speed_threshold"],
             dribble_beaten_max_penalty=d["dribble_beaten_max_penalty"],
+            tackling_skill_floor=d.get("tackling_skill_floor", 0.1),
+            dribbling_skill_floor=d.get("dribbling_skill_floor", 0.1),
         )
 
 
@@ -160,8 +164,15 @@ def attempt_tackle(
     """Returns a TackleResult describing who won and how badly the dribbler
     was affected if they managed to keep the ball.
 
-    tackler_roll = (rng_reduction + (1-rng_reduction)*U) * effective_boost * tackling_attr
-    dribbler_roll = (rng_reduction + (1-rng_reduction)*U) * dribbling_attr
+    tackler_roll = (rng_reduction + (1-rng_reduction)*U) * effective_boost * effective_tackling_attr
+    dribbler_roll = (rng_reduction + (1-rng_reduction)*U) * effective_dribbling_attr
+
+    ``effective_tackling_attr = tackling_skill_floor + (1 - tackling_skill_floor) * tackling_attr``
+    and likewise for ``effective_dribbling_attr`` / ``dribbling_skill_floor``: a
+    professional footballer is never a *true* 0 at either skill, so raw
+    attribute 0.0 still maps to a real skill floor (config-tunable, default
+    0.1) rather than a guaranteed loss of the check. Attribute 1.0 still maps
+    to 1.0 either way (the floor only compresses the low end upward).
 
     The base boost is ``tackler_boost`` (1.25, +25%) for outfield players, or
     ``goalkeeper_tackle_boost`` (2.0, +100%) for goalkeepers.
@@ -193,8 +204,10 @@ def attempt_tackle(
     if is_goalkeeper_tackle and gk_outside_box:
         boost *= (1.0 - params.goalkeeper_outside_box_tackle_penalty)
     effective_boost = boost * (1.0 + angle_modifier)
-    t_roll = skill_roll(tackling_attr * effective_boost, rng_reduction, r)
-    d_roll = skill_roll(dribbling_attr, rng_reduction, r)
+    effective_tackling_attr = params.tackling_skill_floor + (1.0 - params.tackling_skill_floor) * tackling_attr
+    effective_dribbling_attr = params.dribbling_skill_floor + (1.0 - params.dribbling_skill_floor) * dribbling_attr
+    t_roll = skill_roll(effective_tackling_attr * effective_boost, rng_reduction, r)
+    d_roll = skill_roll(effective_dribbling_attr, rng_reduction, r)
 
     # Base contact speed reductions applied to both players always.
     base_tackler = params.tackle_attempt_tackler_speed_mult

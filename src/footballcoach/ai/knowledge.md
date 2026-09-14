@@ -238,6 +238,82 @@ to each other directly; use the floor-adjusted log line, or call
 `compute_bc_loss_floor_components()` directly against a raw breakdown dict
 from `bc_loss_from_tensor(..., return_breakdown=True)`.
 
+**Same mechanism ported to `ai/physics_pretrain`'s event heads (2026-09)**:
+the ball/player dynamics encoders' own sigmoid BCE "event" heads (the
+shared decoder's per-horizon `out_of_bounds`/`goal_scored` logits,
+`crossing_head`'s `crosses_logit`, and — ball only — `event_head`'s
+ever-out-of-bounds/ever-goal logits) were observed to interfere with the
+regression heads sharing the same encoder; label smoothing was added as a
+complement to the pre-existing down-weighting mitigation
+(`bce_loss_weight`/`crossing_crosses_loss_weight`/`event_loss_weight`, all
+tuned low). `ai/physics_pretrain/event_head_smoothing.py` is a small shared
+module (used by both `train_ball_dynamics.py`/`train_player_dynamics.py`)
+providing `smooth_target()` (identical formula to `bc.py`'s `_bce()`) and
+two floor helpers: `bce_label_smoothing_floor()` (the exact per-row `H(y')`
+tensor, mirroring `compute_bc_loss_floor_components`'s `_floor_bce`) and
+`expected_bce_floor(smoothing, pos_weight=1.0)` — a **closed-form scalar**
+version used for the actual floor-subtraction in both training scripts,
+since `crosses_logit`/`event_head` have no `pos_weight` at all (making
+their floor a true smoothing-only constant) and the per-horizon
+`out_of_bounds`/`goal_scored` heads' `pos_weight` is itself already a
+dataset-level inverse-class-frequency constant (`n_neg/n_pos`, computed
+once before training) — so `frac_pos = 1/(1+pos_weight)` recovers the same
+dataset-level balance without needing to re-derive it from a live batch
+tensor, avoiding per-batch sampling noise in what's meant to be a stable
+diagnostic number.
+
+Config: `physics_pretrain.ball.label_smoothing`/`physics_pretrain.player.
+label_smoothing`, one independently-tunable value per network (matching
+every other knob in that config section — NOT split by head like bc.py's
+dec/exec smoothing), default `0.0` = no behaviour change. Both training
+scripts subtract the appropriate floor at the single aggregation choke
+point each metric already funnels through on its way to both the per-epoch
+log line and `.history.npz`/the HTML report — `_mean_breakdown`/
+`_mean_breakdown_by_horizon` for `oob_bce`/`goal_bce` (per-horizon,
+`np.maximum(0.0, raw - floor_by_h)`), and a handful of named scalar sites
+for `crossing_crosses_loss`/`event_loss` (player routes this through
+`_AuxAccumulator.summary()`'s `crossing_crosses_loss_floor` param). The RAW
+(floor-inflated) value is always what's actually backpropagated and what
+`compute_loss`/`_crossing_head_loss`/`_event_head_loss` return — only the
+reported/logged/saved numbers are adjusted, same "diagnostics only, never
+the optimized loss" convention as the BC pipeline. See
+`tests/ai_unit/test_event_head_smoothing.py` for the shared helper's own
+coverage, and the `test_*_label_smoothing_*` tests in
+`test_ball_physics_pretrain.py`/`test_player_physics_pretrain.py`.
+
+**Extended (2026-09) to the "backprop_loss contribution by head" diagnostic
+and the crossing_head sub-term splits, not just the standalone oob_bce/
+goal_bce/crossing_crosses_loss/event_loss numbers.** Rationale: those
+per-head percentage breakdowns (`main=... crossing=... event=...` and, for
+crossing_head, `pos=... crosses=... dt=...`) exist specifically to judge
+which head is dominating the shared encoder's gradient budget -- left raw,
+a head whose entire reported contribution is mostly its own constant
+smoothing floor looks artificially significant, exactly the comparison
+this diagnostic is for. `_main_head_floor` (bce_weight-, and for player
+also main_loss_weight-, scaled sum of `_oob_bce_floor_by_h`/
+`_goal_bce_floor_by_h` across horizons) and the existing `_crossing_
+crosses_loss_floor`/`_event_loss_floor` (ball only) are subtracted from
+EVERY per-head `backprop_contrib` entry, from the percentage-denominator
+total (`mean_backprop_loss` -- an independent per-step accumulator on
+ball's train side, so adjusted directly there; a value DERIVED from
+`backprop_contrib`'s own already-adjusted entries everywhere else, so
+automatically consistent for free), and from `aux_summary`/`_AuxAccumulator.
+summary()`'s `crossing_loss` (player) / `mean_crossing_loss` (ball) --
+the aggregate pos+crosses+dt crossing_head total, which is ALSO what the
+crossing pos/(crosses/)dt split uses as its percentage denominator, so
+adjusting it keeps that split's own numerator sum matching its denominator
+(this was a real latent bug on the player side until this pass: the split's
+`crosses` numerator was already floor-adjusted from the original pass but
+its `crossing_loss` denominator wasn't, silently breaking the percentages'
+100% sum). **Still never touches `train_loss`/`val_loss` themselves**
+(the plain main-task loss, mixing continuous regression with BCE) **or
+anything used for a real decision** (`best_val_loss` comparisons, early
+stopping, LR scheduling) -- those stay exactly as before; only display-only
+derived values (dict entries, locally-computed adjusted variables like
+`main_val_contrib`) are touched, verified by re-reading each raw variable's
+every other use site before mutating it in place vs. computing a fresh
+adjusted copy.
+
 ### BC class balancing (pos_weight + trivial-row downsampling)
 
 `DemonstrationDataset.compute_pos_weights()` computes inverse-frequency

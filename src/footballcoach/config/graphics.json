@@ -94,7 +94,7 @@
   "player_sprites": {
     "_comment": "Top-down player sprite (head/shoulders/torso/limbs) drawn instead of a plain circle. Set enabled=false to fall back to the old circle rendering. size_scale: sprite's on-screen diameter as a multiple of the old circle's radius_px (bigger = larger sprite relative to the pitch). Colours are RGB triples: skin/hair/shorts/shoe/lace/stud (team shirt colour itself is TEAM_LEFT_COLOUR/TEAM_RIGHT_COLOUR in ui/style.py, not here). hair_coverage_deg: how much of the head (in degrees, out of 360) the hair patch covers, centred on the back of the head — 0 = bald, 360 = fully covered. Finer body-shape proportions (torso/limb/shoulder sizing) are intentionally not exposed here — they were tuned as an interdependent set; see ui/player_sprites.py to go further. Animation: top_speed_for_stride_mps is the pace (m/s) at which a player hits max_stride_hz (full strides/second) and full stride extension; below that, both stride rate and how far the stride extends scale down (so jogging shows a shorter, slower stride, not just a slower one) — extension_speed_exponent > 1 makes that extension drop-off steeper at low-to-mid speed (only nearing full extension close to top speed), 1.0 = linear, < 1 reaches full extension sooner.",
     "enabled": true,
-    "size_scale": 3.8,
+    "size_scale": 3.5,
     "skin_color": [222, 178, 140],
     "hair_color": [92, 58, 32],
     "shorts_color": [245, 245, 245],
@@ -103,7 +103,7 @@
     "stud_color": [210, 210, 216],
     "hair_coverage_deg": 220,
     "top_speed_for_stride_mps": 8.5,
-    "max_stride_hz": 3.7,
+    "max_stride_hz": 3.3,
     "extension_speed_exponent": 1.0
   }
 }

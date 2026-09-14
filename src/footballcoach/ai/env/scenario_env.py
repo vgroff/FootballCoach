@@ -273,9 +273,19 @@ class ScenarioEnv:
         # Record stamina at episode start for end-of-episode stamina penalty.
         # Also recorded per-secondary-player below (same treatment — see
         # _compute_phase1_reward_for_player()).
+        # Per-decision-step tackle-attempt counter (see "tatt" in reward.py's
+        # module docstring) -- Match.on_tackle fires synchronously inside
+        # Match.step() (called from self._loop.step() in the tick loop
+        # below), so this must be a persistent instance attribute the
+        # callback can mutate, not a local var -- reset at the top of step()
+        # itself (mirrors trainee_kicks_this_step's per-step reset, just as
+        # an instance attribute since that one polls player.kicked_this_tick
+        # directly instead of needing a callback).
+        self._trainee_tackle_attempt_count = 0
         try:
             _trainee = self._loop.match.player_by_id(self.trainee_player_id)
             self._trainee_start_stamina = _trainee.stamina
+            _trainee.on_tackle = self._on_trainee_tackle
         except KeyError:
             self._trainee_start_stamina = 1.0
         # Running UNCLAMPED cumulative-term state for this episode (see
@@ -317,6 +327,7 @@ class ScenarioEnv:
                 )
 
         # Initialise per-secondary-player state
+        self._sec_tackle_attempt_count: dict[str, int] = {pid: 0 for pid in self.secondary_player_ids}
         for pid in self.secondary_player_ids:
             if pid not in self._sec_ema:
                 self._sec_ema[pid] = EMAFilter.from_config()
@@ -326,7 +337,9 @@ class ScenarioEnv:
             # treatment as the trainee above — see
             # _compute_phase1_reward_for_player().
             try:
-                self._sec_start_stamina[pid] = self._loop.match.player_by_id(pid).stamina
+                _sec_player = self._loop.match.player_by_id(pid)
+                self._sec_start_stamina[pid] = _sec_player.stamina
+                _sec_player.on_tackle = self._make_on_sec_tackle(pid)
             except KeyError:
                 self._sec_start_stamina[pid] = 1.0
             # Running UNCLAMPED cumulative-term state for this secondary
@@ -339,12 +352,27 @@ class ScenarioEnv:
         self._match_logger.record_start(self._loop.match)
         return self._get_obs()
 
-    def step(self) -> tuple[ObservationBatch, float, bool, StepInfo]:
+    def step(self, *, timers_already_advanced: bool = False) -> tuple[ObservationBatch, float, bool, StepInfo]:
         """Advance one decision interval (DECISION_INTERVAL_S sim-seconds).
 
         All player AI (neural and rules-based) fires automatically inside
         Match.step() via player.ai.act().  This method just ticks the sim,
         computes reward, and collects transition data from player.ai.
+
+        ``timers_already_advanced``: pass ``True`` only when the caller
+        already called ``match.advance_state_timers()`` for this env's
+        upcoming tick before calling ``step()`` -- see
+        ``Match.step(skip_state_timers=...)``'s own docstring. This env's
+        FIRST internal tick then skips its own (would-be-duplicate)
+        state-timer update; every later tick this call runs is unaffected
+        (``Match.step()`` runs its own timer update normally for those).
+        Only ``BatchedEnvGroup`` (ai/ppo/batched_rollout_worker.py) sets
+        this -- it must encode a due decision's observation BEFORE calling
+        ``step()``, which would otherwise make that decision from
+        one-tick-stale timer state (e.g. stamina) relative to the identical
+        unbatched path, where a decision is only ever made from INSIDE
+        ``Match.step()``, after timers have already advanced for that tick.
+        Default ``False``: unchanged behavior for every other caller.
 
         Returns:
             (observation, reward, done, info)
@@ -394,6 +422,14 @@ class ScenarioEnv:
         # comment for why a single post-loop read would silently miss kicks
         # that land on any tick but the last one of this decision interval.
         trainee_kicks_this_step = 0
+        # Reset the tackle-attempt counters THIS on_tackle callback(s)
+        # mutate synchronously inside the tick loop below (see
+        # _on_trainee_tackle/_make_on_sec_tackle) -- instance attributes, not
+        # locals, since the callback runs inside Match.step() with no direct
+        # access to this method's stack.
+        self._trainee_tackle_attempt_count = 0
+        for pid in sec_pre:
+            self._sec_tackle_attempt_count[pid] = 0
         _sec_poss_prev = {pid: self._sec_had_possession_last_step.get(pid, False) for pid in sec_pre}
         _sec_pending_loss = {pid: self._sec_pending_loss.get(pid, False) for pid in sec_pre}
         sec_gained_count = {pid: 0 for pid in sec_pre}
@@ -411,12 +447,18 @@ class ScenarioEnv:
         _sec_box_dist_prev = {pid: pre["prev_box_dist"] for pid, pre in sec_pre.items()}
         sec_prog_accum = {pid: 0.0 for pid in sec_pre}
 
-        for _ in range(self._ticks_per_decision):
+        for _tick_idx in range(self._ticks_per_decision):
             # Track shot events (KickOrder completing toward goal)
             if self._detect_shot_this_tick(match, player):
                 shot_taken = True
 
-            tick_done = self._loop.step()
+            # Only the FIRST tick of this call is ever the one a caller
+            # could have pre-advanced timers for (that's the only tick a
+            # precomputed decision is waiting on) -- every later tick here
+            # runs Match.step()'s own state-timer update normally.
+            tick_done = self._loop.step(
+                skip_state_timers=(timers_already_advanced and _tick_idx == 0)
+            )
             self._episode_ticks += 1
             if player.kicked_this_tick:
                 trainee_kicks_this_step += 1
@@ -580,6 +622,7 @@ class ScenarioEnv:
                 ball_progress_toward_goal_m=ball_progress,
                 ball_went_out_after_touch=ball_went_out,
                 illegal_action_attempted=info.illegal_action,
+                tackle_attempted_this_step=self._trainee_tackle_attempt_count > 0,
                 reached_opponent_box_with_possession=box_terminal,
                 opponent_reached_trainee_box=opponent_box_terminal,
                 timed_out=timeout and not box_terminal and not opponent_box_terminal,
@@ -711,6 +754,7 @@ class ScenarioEnv:
                         sec_player.ai.last_transition.get("illegal_action", False)
                         if _sec_has_transition else False
                     ),
+                    tackle_attempted_this_step=self._sec_tackle_attempt_count.get(pid, 0) > 0,
                     reached_opponent_box_with_possession=sec_box_terminal,
                     opponent_reached_trainee_box=box_terminal,  # from sec's POV, trainee winning = sec losing
                     timed_out=timeout and not sec_box_terminal and not box_terminal,
@@ -889,6 +933,7 @@ class ScenarioEnv:
         ball_progress_toward_goal_m: float,
         ball_went_out_after_touch: bool,
         illegal_action_attempted: bool,
+        tackle_attempted_this_step: bool = False,
         reached_opponent_box_with_possession: bool,
         opponent_reached_trainee_box: bool,
         timed_out: bool,
@@ -923,6 +968,13 @@ class ScenarioEnv:
         # signal used elsewhere for the same reason -- see ai/obs/encoder.py's
         # identical convention for the live desired-speed-mode observation feature.
         _is_sprinting = player_obj.last_desired_speed_mode is SpeedMode.SPRINT
+        # Reset every raw engine tick in Match._process_orders() and only
+        # re-set the same tick the network (or rules AI) actually attempts a
+        # tackle -- reading it here at the decision boundary is the same
+        # "state at decision boundary represents the whole interval"
+        # simplification _is_sprinting above already relies on, not a new
+        # approximation.
+        _tackle_armed = player_obj.tackle_armed
         return phase1_reward(
             prev_ball_dist=prev_ball_dist,
             curr_ball_dist=curr_ball_dist,
@@ -932,6 +984,7 @@ class ScenarioEnv:
             ball_progress_toward_goal_m=ball_progress_toward_goal_m,
             ball_went_out_after_touch=ball_went_out_after_touch,
             illegal_action_attempted=illegal_action_attempted,
+            tackle_attempted_this_step=tackle_attempted_this_step,
             reached_opponent_box_with_possession=reached_opponent_box_with_possession,
             cfg=self._reward_cfg["phase1"],
             time_fraction_remaining=1.0 - self._episode_ticks / self._max_episode_ticks,
@@ -947,6 +1000,7 @@ class ScenarioEnv:
             player_speed_mps=_speed,
             stamina_used=_stamina_used,
             is_sprinting=_is_sprinting,
+            tackle_armed=_tackle_armed,
             decision_interval_s=self._decision_interval_s,
             prog_reward_clamp=self._reward_cfg["phase1"].get("ball_progress_reward_clamp"),
             appr_sq_approach_reward_clamp=self._reward_cfg["phase1"].get("ball_approach_speed_reward_clamp"),
@@ -1063,6 +1117,24 @@ class ScenarioEnv:
 
     def _find_trainee(self, match: Match):
         return match.player_by_id(self.trainee_player_id)
+
+    def _on_trainee_tackle(self, player) -> None:  # noqa: ANN001
+        """Player.on_tackle callback -- fires synchronously inside
+        Match.step() the instant an INTENTIONAL (armed) tackle resolves
+        contact, before the win/lose result is known (see
+        Match._attempt_tackle_contact). Never fires for the collision-based
+        auto-tackle fallback (Match._check_head_on_tackles uses
+        on_auto_tackle_result instead) -- see reward.py's "tatt" docstring."""
+        self._trainee_tackle_attempt_count += 1
+
+    def _make_on_sec_tackle(self, pid: str):
+        """Same as _on_trainee_tackle, for a secondary player -- a closure
+        per pid since Player.on_tackle takes no player_id argument of its
+        own (the callback IS bound to one specific Player object already,
+        but this env tracks counts per pid in a shared dict)."""
+        def _cb(player) -> None:  # noqa: ANN001
+            self._sec_tackle_attempt_count[pid] = self._sec_tackle_attempt_count.get(pid, 0) + 1
+        return _cb
 
     def _latest_outcome(self) -> Optional[str]:
         if self._loop is None:

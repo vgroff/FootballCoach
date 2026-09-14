@@ -137,10 +137,48 @@ treat `physics.json` as authoritative over this prose if they disagree again.**
   covering overshoot, tunneling, and drift.
 
 - **Top speed / acceleration**: linear in the attribute,
-  `v_max = 5.4 + 4.7*top_speed` m/s (5.4-10.1 m/s), `a_max = 3.3 + 2.4*accel`
-  m/s² (3.3-5.7 m/s²). ~10 m/s is a very fast but real football sprint
-  speed; 5.4 m/s is a brisk jog, deliberately never "slow" per Idea.md's
-  "League Three should still be competent" requirement.
+  `v_max = 6.1 + 4.6*top_speed` m/s (6.1-10.7 m/s), `a_max = 3.3 + 2.4*accel`
+  m/s² (3.3-5.7 m/s²) -- **this flat value is what braking and every ETA/
+  decision-estimator uses** (see the taper bullet immediately below for the
+  separate, higher, speed-shaped value used while actually accelerating).
+  ~10 m/s is a very fast but real football sprint speed; 6.1 m/s is a brisk
+  jog, deliberately never "slow" per Idea.md's "League Three should still be
+  competent" requirement.
+- **Acceleration taper** (`accel_taper_multiplier` + `accel_taper_peak_boost`,
+  added when this was flat-only): while a player is actually speeding up
+  (`speed_diff > 0` in `step_player_towards`, never while braking), `a_max`
+  first gets multiplied by `accel_taper_peak_boost` (**1.48**) to reach its
+  true at-rest "explosive first step" peak (4.9-8.45 m/s², not the flat
+  3.3-5.7 above), then tapered back down by
+  `1 - accel_taper_strength * (current_speed / v_top)^accel_taper_exponent`
+  (floored at `accel_taper_min_fraction`, **0.35**) as speed climbs toward
+  the player's own top speed -- modelling the real force-velocity taper of
+  sprinting (explosive off the mark, less punch as you approach top speed).
+  With the default `accel_taper_exponent=1.0` this is exactly the textbook
+  "terminal velocity" ODE (`dv/dt = a*(1-v/v_top)`), i.e. the classic
+  exponential approach to top speed. `peak_boost=1.48` was chosen
+  empirically so the *average* accelerating rate over a full 0-to-top-speed
+  ramp works out close to the old flat 3.3+2.4*accel -- time-to-top-speed is
+  barely changed, only the shape is.
+  **Braking and the flat value are completely unaffected by this** -- neither
+  `peak_boost` nor the taper apply when `speed_diff <= 0` (braking keeps
+  using the plain flat `a_max`, further boosted by `standstill_decel_
+  multiplier` as before), and every ETA/decision-estimator call site
+  (`sprint_eta`, rules_ai's race-to-the-ball comparisons, orders.py's
+  braking-distance calc, shot_selection's GK dive estimate) reads
+  `effective_acceleration()` directly, which also never sees peak_boost or
+  the taper. This was a deliberate fix during development: an earlier version
+  of this taper baked `peak_boost` straight into `accel_base_mps2`/
+  `accel_scale_mps2` in physics.json, which inflated braking and every ETA
+  estimator right along with accelerating -- breaking multiple tests that
+  measure braking distance/snap behaviour and one sprint-time balance test.
+  **Known limitation, accepted deliberately rather than fixed here**: those
+  ETA/decision estimators still model straight-line acceleration as flat/
+  constant even during the accelerating phase, so they're all somewhat
+  optimistic relative to how the real (tapered) movement actually plays out
+  while still ramping up to speed. Making them taper-aware is a reasonable
+  follow-up (the taper has a closed-form exponential solution, so it's not
+  fundamentally hard), just out of scope for the change that introduced it.
 - **Stamina multiplier**: `1 - stamina_speed_penalty_max*(1 - stamina_fraction)`,
   `stamina_speed_penalty_max = 0.63`, i.e. roughly the "reduces speed/
   acceleration by up to 65%" from Idea.md. At full stamina the multiplier is
@@ -152,19 +190,79 @@ treat `physics.json` as authoritative over this prose if they disagree again.**
   once more at the very *start* of a first touch — see `control_speed_
   multiplier` in the `possession.py` section below, a separate, one-time
   cut applied on top of (not instead of) this ongoing multiplier.
+  Applied equally to acceleration, not just the top-speed ceiling:
+  `effective_acceleration` takes the same optional `has_ball`/
+  `ball_control_attr` pair as `effective_top_speed` and multiplies by the
+  same `ball_carry_speed_multiplier` when given -- `step_player_towards` is
+  the only caller that passes them (a carrier's acceleration ramp and top
+  speed are throttled by the identical fraction), every ETA/decision-
+  estimator call site keeps the old ball-unaware flat value by leaving
+  `has_ball` at its default `False`.
 - **Turning**: modelled via a max *lateral acceleration* budget
   `a_lat = 4.0 + 4.0*accel_attr` m/s², from which a max turn rate is derived
   as `omega_max = a_lat / max(speed, min_speed)`. This is the key modelling
   choice: turn rate is *inversely proportional to current speed*, matching
   the real-world fact that sharp turns are much more costly at high speed
   than when jogging or standing still (a stationary player can pivot almost
-  freely). Carrying the ball scales `a_lat` down further unless
-  `ball_control` is high (`a_lat *= 1 - 0.6*(1-ball_control)`, so at
-  `ball_control=1.0` there's no turning penalty at all, matching the same
-  "at 1.0 it's the same as without the ball" rule Idea.md states for the
-  speed penalty). A large heading change also caps the *target* speed for
+  freely). Carrying the ball scales `a_lat` down further unless the
+  player's close-control skill is high (`a_lat *= 1 - 0.6*(1-close_control)`,
+  `close_control = max(ball_control, dribbling)` -- not `ball_control`
+  alone, so a strong dribbler with mediocre ball_control (or vice versa)
+  isn't penalized as if weak in both -- so at `close_control=1.0` there's no
+  turning penalty at all, matching the same "at 1.0 it's the same as
+  without the ball" rule Idea.md states for the speed penalty; `dribbling`
+  is irrelevant while NOT carrying the ball, only ever entering via this
+  `max(...)`). A large heading change also caps the *target* speed for
   that tick (`turn_speed_penalty`), so you can't "moonwalk" instantly from
-  full speed forward to full speed sideways.
+  full speed forward to full speed sideways. `lateral_accel_capability`
+  (`a_lat` above) is deliberately **not** tapered by current speed the way
+  straight-line acceleration is -- see the traction circle bullet below for
+  why turning still ends up coupled to speed/acceleration despite that.
+- **Traction circle** (the ellipse clamp in `step_player_towards`'s
+  accelerating branch): lateral (turning) and forward-accelerating capability
+  draw on one shared force budget, not two fully independent ones. Each tick,
+  after heading is resolved, `lat_fraction = |current_speed * omega_actual| /
+  lateral_peak` measures what share of the turn-rate budget (`omega_max =
+  a_lat / speed`, the pre-existing mechanism above) this tick's *actual*
+  turn just used (`omega_actual` is the realized rate: capped at `omega_max`
+  when turn-rate-limited, or whatever smaller rate fully closes the heading
+  gap otherwise). Forward-accel headroom for that same tick is then
+  `sqrt(1 - lat_fraction^2)` of what it would otherwise be (a friction
+  *ellipse*, not a true circle, since the lateral and longitudinal peaks are
+  independently attribute-scaled) -- floored at `accel_taper_min_fraction`
+  (the same floor the speed taper uses) rather than let a maxed-out turn
+  zero out forward acceleration entirely. A dead-straight tick
+  (`lat_fraction=0`) is completely unaffected; this only bites once a player
+  is both carrying speed *and* turning close to their max rate while also
+  trying to speed up. Braking is untouched (the clamp lives in the
+  `speed_diff > 0` branch only, same as `accel_taper_peak_boost`), and so is
+  turning at low/zero speed (`a_lat_used = current_speed * omega`, so it's
+  ~0 regardless of how sharp the turn is when `current_speed` is small) --
+  an explosive first step is never turn-penalized.
+  This directly answers a question that came up designing the speed taper
+  above: turning is *already* easier at low speed via the pre-existing
+  `omega_max = a_lat/speed` geometry, independent of any of this -- but the
+  traction circle adds a second, genuine coupling on top: simultaneously
+  turning hard *and* accelerating hard competes for the same budget, the way
+  a real sprinter's ground-force output is finite whether it's spent
+  redirecting or speeding up. Tapering `lateral_accel_capability` itself by
+  speed (making the *turn-rate* budget shrink at high speed, on top of the
+  1/speed geometry it already has) was tried and reverted: it compounded
+  with the pre-existing `turn_speed_penalty` and broke
+  `test_small_heading_change_does_not_decelerate` (a plain 45 degree turn at
+  sprint speed braked far harder than intended). The ellipse clamp here is
+  the more surgical piece that survived -- it only costs you when turning
+  and accelerating are actually competing for the same tick, not for
+  merely being at high speed.
+  **Retune note**: landing this reduced the safety margin on
+  `test_boundary_carry_steering.py`'s carrier-steered-away-from-the-line
+  scenario (turning while sprinting toward a target now costs a bit of
+  forward-accel headroom, which changed the timing of that curving path
+  just enough to graze the line). Fixed by bumping orders.json's
+  `boundary_strength_base` 1.2 -> 1.6 (that value was already flagged in its
+  own config comment as "not yet empirically tuned", so this was a
+  reasonable place to absorb the change) rather than softening the traction
+  circle further.
 - **Stamina drain/regen**: `drain_rate = base * lerp(stamina_drain_attr_lo
   (1.6), stamina_drain_attr_hi (1.1), stamina_attr)` = `base * (1.6 -
   0.5*stamina_attr)`, `regen_rate = base * lerp(stamina_regen_attr_lo (0.7),
@@ -499,11 +597,25 @@ as authoritative over any other doc/comment that disagrees.**
 
 ```
 effective_boost = base_boost * (1 + angle_modifier)
-tackler_roll  = skill_roll(tackling_attr * effective_boost, rng_reduction)
+effective_tackling_attr  = tackling_skill_floor  + (1 - tackling_skill_floor)  * tackling_attr
+effective_dribbling_attr = dribbling_skill_floor + (1 - dribbling_skill_floor) * effective_dribbling_attr(target)
+tackler_roll  = skill_roll(effective_tackling_attr * effective_boost, rng_reduction)
 dribbler_roll = skill_roll(effective_dribbling_attr, rng_reduction)
 tackler wins iff tackler_roll >= dribbler_roll
 ```
 
+- **Skill floors** (`tackling_skill_floor` / `dribbling_skill_floor`, both **0.1**
+  by default, `physics.json["tackling"]`): a professional footballer is never
+  a true 0 at either skill, so a raw attribute of 0.0 still maps to a real
+  floor rather than a guaranteed loss of the check; raw 1.0 still maps to
+  1.0 (the floor only compresses the low end upward, it's not a rescale of
+  the whole range). Applied inside `attempt_tackle()` itself to both
+  `tackling_attr` and whatever `dribbling_attr` the caller passed in (i.e.
+  *after* the CONTROLLING_BALL penalty below, since that's the actual skill
+  value being rolled) — this is the single chokepoint both call sites
+  (`_attempt_tackle_contact`'s chase-tackle path and `_check_head_on_tackles`'s
+  collision-based path) funnel through, so the floor applies uniformly
+  regardless of which path resolved the attempt.
 - `base_boost` is `tackler_boost` (**1.25**, +25%) for an outfield tackler,
   or `goalkeeper_tackle_boost` (**2.0**, +100%) if the tackler is a
   goalkeeper — a keeper coming to punch/collect is a much stronger

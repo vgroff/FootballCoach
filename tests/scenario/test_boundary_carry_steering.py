@@ -58,7 +58,9 @@ def _run_carry_toward_out_of_bounds_target(*, boundary_radius_m: float) -> Match
     # every other repulsion knob stays at its real configured value.
     match.repulsion_params = match.repulsion_params.__class__(
         **{**match.repulsion_params.__dict__, "boundary_radius_m": boundary_radius_m,
-           "boundary_strength_base": 1.2 if boundary_radius_m > 0.0 else 0.0},
+           # 1.6 matches orders.json's real boundary_strength_base (bumped from
+           # 1.2 alongside the traction circle -- see that config's comment).
+           "boundary_strength_base": 1.6 if boundary_radius_m > 0.0 else 0.0},
     )
 
     for _ in range(30 * 3):

@@ -47,6 +47,28 @@ class PlayerAI:
     every player that has an AI assigned. The default implementation (no
     subclass override at all) is a no-op (stationary / order-driven
     player).
+
+    Separately, ``Match._process_orders`` splits each tick into two full
+    per-player passes -- ``plan()`` for everyone, THEN ``commit()`` for
+    everyone -- so no player's decision can observe another player's
+    same-tick action results (see ``engine/knowledge.md`` "decisions use
+    tick-start state" and the incident this fixed: a player who currently
+    possesses the ball had its kick resolved immediately inside ``act()``,
+    visible to a later-processed player's observation on the SAME tick).
+    This is an ORTHOGONAL axis to ``act()``/``decide()`` above (which is
+    about decision-cadence throttling within one player's own turn, not
+    about ordering across players): ``plan()`` defaults to calling
+    ``self.act(player, match, trial_tick)`` (today's full per-tick
+    behavior) and ``commit()`` defaults to a no-op -- exactly preserving
+    current behavior for any AI that doesn't override them. An AI whose
+    ``act()``/``decide()`` only ever sets ``player.current_order`` (every
+    rules-based AI in this codebase) needs no override at all: its actual
+    execution already happens via the separate, already-deferred
+    ``order.execute()`` call ``_process_orders`` makes in its own second
+    pass. Only an AI that mutates shared/other-player-visible state
+    directly inside ``act()`` (``NeuralPlayerAI``, via ``apply_action_to_
+    player()``'s immediate kick-while-possessing path) needs to override
+    ``plan()``/``commit()`` to split that mutation out of the first pass.
     """
 
     def __init__(self, decision_interval_ticks: int = 1) -> None:
@@ -61,6 +83,22 @@ class PlayerAI:
         self.decide(player, match, trial_tick)
 
     def decide(self, player: "Player", match: "Match", trial_tick: int) -> None:  # noqa: ARG002
+        pass
+
+    def plan(self, player: "Player", match: "Match", trial_tick: int) -> None:
+        """First pass of Match._process_orders' two-pass tick (see class
+        docstring): default just calls act() -- safe for any AI whose
+        act()/decide() only ever sets player.current_order, since that's
+        pure decision with no immediate side effect. Override alongside
+        commit() only if act() also mutates shared/cross-player-visible
+        state directly."""
+        self.act(player, match, trial_tick)
+
+    def commit(self, player: "Player", match: "Match", trial_tick: int) -> None:  # noqa: ARG002
+        """Second pass of Match._process_orders' two-pass tick (see class
+        docstring): no-op by default. order.execute() (Match._process_
+        orders' own job, not this method) is the actual second-pass
+        resolution step for any Order-driven AI."""
         pass
 
 

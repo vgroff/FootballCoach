@@ -170,7 +170,7 @@ class TestPhase1Reward:
         assert set(comps.keys()) == {
             "appr", "retr", "appr_sq", "hdg", "poss", "prog", "out", "ill",
             "box", "spd", "lpos", "lterm", "tout", "prox", "stam", "step",
-            "sprint",
+            "sprint", "tack", "tatt",
         }
 
     def test_total_always_equals_sum_of_components(self):
@@ -503,6 +503,188 @@ class TestPhase1Reward:
         assert isinstance(cum_after, dict)
         assert "prog" in cum_after
         assert "appr_sq" in cum_after
+
+
+class TestTackleArmedPenalty:
+    """'tack' -- tackle_armed_penalty_per_second * decision_interval_s
+    whenever tackle_armed is set this step, further multiplied by
+    tackle_armed_while_possessing_multiplier when also in possession. Uses
+    its own explicit cfg overrides (not the live ai_config.json values)
+    since this is testing the arithmetic, not the currently-tuned magnitude."""
+
+    _BASE_KWARGS = dict(
+        prev_ball_dist=5.0, curr_ball_dist=5.0,
+        gained_possession_this_step=False,
+        ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+        illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+    )
+
+    def _call(self, *, tackle_armed, has_possession_now, decision_interval_s, cfg_overrides):
+        cfg = {**_CFG1, "step_penalty": 0.0, **cfg_overrides}
+        total, comps, _ = phase1_reward(
+            **self._BASE_KWARGS,
+            has_possession_now=has_possession_now,
+            tackle_armed=tackle_armed,
+            decision_interval_s=decision_interval_s,
+            cfg=cfg,
+        )
+        return total, comps
+
+    def test_zero_when_not_armed_regardless_of_coef(self):
+        _, comps = self._call(
+            tackle_armed=False, has_possession_now=False, decision_interval_s=1.0,
+            cfg_overrides={"tackle_armed_penalty_per_second": -0.1},
+        )
+        assert comps["tack"] == pytest.approx(0.0)
+
+    def test_zero_when_coef_disabled(self):
+        _, comps = self._call(
+            tackle_armed=True, has_possession_now=False, decision_interval_s=1.0,
+            cfg_overrides={"tackle_armed_penalty_per_second": 0.0},
+        )
+        assert comps["tack"] == pytest.approx(0.0)
+
+    def test_per_second_cost_scales_with_decision_interval(self):
+        _, comps = self._call(
+            tackle_armed=True, has_possession_now=False, decision_interval_s=0.2,
+            cfg_overrides={"tackle_armed_penalty_per_second": -0.1},
+        )
+        assert comps["tack"] == pytest.approx(-0.1 * 0.2)
+
+    def test_multiplier_applied_only_when_possessing(self):
+        cfg_overrides = {
+            "tackle_armed_penalty_per_second": -0.1,
+            "tackle_armed_while_possessing_multiplier": 3.0,
+        }
+        _, comps_not_possessing = self._call(
+            tackle_armed=True, has_possession_now=False, decision_interval_s=1.0,
+            cfg_overrides=cfg_overrides,
+        )
+        _, comps_possessing = self._call(
+            tackle_armed=True, has_possession_now=True, decision_interval_s=1.0,
+            cfg_overrides=cfg_overrides,
+        )
+        assert comps_not_possessing["tack"] == pytest.approx(-0.1)
+        assert comps_possessing["tack"] == pytest.approx(-0.1 * 3.0)
+
+    def test_multiplier_defaults_to_one_when_unset(self):
+        # Deliberately NOT spreading _CFG1 (the live config already sets
+        # tackle_armed_while_possessing_multiplier) -- this checks the
+        # function's OWN fallback when the key is absent from cfg entirely.
+        cfg = {**_CFG1, "step_penalty": 0.0, "tackle_armed_penalty_per_second": -0.1}
+        del cfg["tackle_armed_while_possessing_multiplier"]
+        total, comps, _ = phase1_reward(
+            **self._BASE_KWARGS,
+            has_possession_now=True,
+            tackle_armed=True,
+            decision_interval_s=1.0,
+            cfg=cfg,
+        )
+        assert comps["tack"] == pytest.approx(-0.1)
+
+    def test_tatt_zero_when_not_attempted(self):
+        """Sanity check that this class's own tests (which never pass
+        tackle_attempted_this_step) don't accidentally leak a nonzero 'tatt'
+        into 'tack' assertions -- see TestTackleAttemptedBonus for 'tatt'
+        itself."""
+        _, comps = self._call(
+            tackle_armed=True, has_possession_now=False, decision_interval_s=1.0,
+            cfg_overrides={"tackle_armed_penalty_per_second": -0.1},
+        )
+        assert comps["tatt"] == pytest.approx(0.0)
+
+    def test_tack_included_in_total(self):
+        total, comps = self._call(
+            tackle_armed=True, has_possession_now=False, decision_interval_s=1.0,
+            cfg_overrides={"tackle_armed_penalty_per_second": -0.1},
+        )
+        assert total == pytest.approx(comps["tack"])
+
+
+class TestTackleAttemptedBonus:
+    """'tatt' -- same shape as 'tack' but positive: when
+    tackle_attempted_this_step is true, abs(tackle_armed_penalty_per_second)
+    * decision_interval_s * tackle_attempt_bonus_multiplier. Deliberately
+    reuses tackle_armed_penalty_per_second's OWN magnitude rather than an
+    independent coefficient -- see reward.py's 'tatt' docstring."""
+
+    _BASE_KWARGS = dict(
+        prev_ball_dist=5.0, curr_ball_dist=5.0,
+        gained_possession_this_step=False,
+        ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+        illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+        has_possession_now=False,
+    )
+
+    def _call(self, *, tackle_attempted_this_step, decision_interval_s, cfg_overrides):
+        cfg = {**_CFG1, "step_penalty": 0.0, **cfg_overrides}
+        total, comps, _ = phase1_reward(
+            **self._BASE_KWARGS,
+            tackle_attempted_this_step=tackle_attempted_this_step,
+            decision_interval_s=decision_interval_s,
+            cfg=cfg,
+        )
+        return total, comps
+
+    def test_zero_when_not_attempted_regardless_of_coef(self):
+        _, comps = self._call(
+            tackle_attempted_this_step=False, decision_interval_s=1.0,
+            cfg_overrides={"tackle_armed_penalty_per_second": -0.1, "tackle_attempt_bonus_multiplier": 2.0},
+        )
+        assert comps["tatt"] == pytest.approx(0.0)
+
+    def test_zero_when_base_rate_disabled(self):
+        """Base rate is tackle_armed_penalty_per_second itself (shared with
+        'tack') -- disabling that disables 'tatt' too, not a separate knob."""
+        _, comps = self._call(
+            tackle_attempted_this_step=True, decision_interval_s=1.0,
+            cfg_overrides={"tackle_armed_penalty_per_second": 0.0, "tackle_attempt_bonus_multiplier": 2.0},
+        )
+        assert comps["tatt"] == pytest.approx(0.0)
+
+    def test_reuses_armed_penalty_magnitude_flipped_positive(self):
+        _, comps = self._call(
+            tackle_attempted_this_step=True, decision_interval_s=1.0,
+            cfg_overrides={"tackle_armed_penalty_per_second": -0.1, "tackle_attempt_bonus_multiplier": 1.0},
+        )
+        assert comps["tatt"] == pytest.approx(0.1)
+
+    def test_scales_with_decision_interval_and_multiplier(self):
+        _, comps = self._call(
+            tackle_attempted_this_step=True, decision_interval_s=0.5,
+            cfg_overrides={"tackle_armed_penalty_per_second": -0.1, "tackle_attempt_bonus_multiplier": 4.0},
+        )
+        assert comps["tatt"] == pytest.approx(0.1 * 0.5 * 4.0)
+
+    def test_multiplier_defaults_to_one_when_unset(self):
+        cfg = {**_CFG1, "step_penalty": 0.0, "tackle_armed_penalty_per_second": -0.1}
+        cfg.pop("tackle_attempt_bonus_multiplier", None)
+        total, comps, _ = phase1_reward(
+            **self._BASE_KWARGS,
+            tackle_attempted_this_step=True,
+            decision_interval_s=1.0,
+            cfg=cfg,
+        )
+        assert comps["tatt"] == pytest.approx(0.1)
+
+    def test_disabled_by_zero_multiplier(self):
+        _, comps = self._call(
+            tackle_attempted_this_step=True, decision_interval_s=1.0,
+            cfg_overrides={"tackle_armed_penalty_per_second": -0.1, "tackle_attempt_bonus_multiplier": 0.0},
+        )
+        assert comps["tatt"] == pytest.approx(0.0)
+
+    def test_tack_zero_when_only_attempted_not_armed(self):
+        """tackle_armed and tackle_attempted_this_step are independent flags
+        in this function's signature -- an attempt resolving doesn't imply
+        tackle_armed is still true (the arming already happened on a
+        previous tick of the chase); 'tack' must not fire off of 'tatt'
+        alone."""
+        _, comps = self._call(
+            tackle_attempted_this_step=True, decision_interval_s=1.0,
+            cfg_overrides={"tackle_armed_penalty_per_second": -0.1},
+        )
+        assert comps["tack"] == pytest.approx(0.0)
 
 
 # ---------------------------------------------------------------------------

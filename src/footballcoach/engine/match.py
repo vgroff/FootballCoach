@@ -242,7 +242,37 @@ class Match:
             return None
         return self.player_by_id(self.ball.possessed_by)
 
-    def step(self) -> None:
+    def advance_state_timers(self) -> None:
+        """Public entry point for a caller that needs to run THIS tick's
+        state-timer update (stamina drain/regen, inactive-tackled/
+        controlling-ball countdowns, etc.) before ``step()`` itself runs --
+        see ``step(skip_state_timers=...)``'s own docstring for why this
+        exists: an external batching caller (``ai/ppo/batched_rollout_worker.py``'s
+        ``BatchedEnvGroup``) needs decisions to see the SAME up-to-date
+        timer state a normal ``step()`` call would give them, even though it
+        must encode the observation (hence make the decision) BEFORE calling
+        ``step()`` for this tick."""
+        self._update_state_timers(self.dt_s)
+
+    def step(self, *, skip_state_timers: bool = False) -> None:
+        """Advance the match by one physics tick.
+
+        ``skip_state_timers``: pass ``True`` only when the caller already
+        called ``advance_state_timers()`` for this exact tick before calling
+        ``step()`` -- see that method's docstring. Needed because
+        ``BatchedEnvGroup`` (ai/ppo/batched_rollout_worker.py) encodes a
+        batched decision's observation BEFORE calling ``env.step()`` for
+        that round, i.e. before this method's own state-timer update would
+        normally run (below, ahead of ``_process_orders``) -- without this,
+        every batched decision would see one tick's worth of STALE timer
+        state (e.g. stamina) relative to what the identical unbatched
+        ``env.step()`` path sees, since there a decision is only ever made
+        from INSIDE this method, after timers have already advanced for
+        that tick. Confirmed as the root cause of a real (if tiny -- one
+        tick's stamina delta, ~1e-4 scale) discrepancy between
+        BatchedEnvGroup's K=1 case and plain unbatched stepping. Default
+        ``False`` (unchanged behavior) for every other caller.
+        """
         if self.paused:
             return
         dt = self.dt_s
@@ -256,7 +286,8 @@ class Match:
         # has a valid pre-tick position on record.
         pre_tick_player_positions = {p.player_id: p.position for p in self.players}
 
-        self._update_state_timers(dt)
+        if not skip_state_timers:
+            self._update_state_timers(dt)
         self._process_orders(dt)
         self._apply_movement(dt)
         self._sync_possessed_ball()
@@ -402,8 +433,20 @@ class Match:
                 player.state_timer_s = 0.0
 
     def _process_orders(self, dt: float) -> None:
+        # Pass 1 (plan): every player decides using ONLY tick-start state.
+        # See PlayerAI.plan()'s own docstring (entities/player.py) for the
+        # full rationale -- in short, an AI whose act()/decide() also
+        # mutates shared/other-player-visible state immediately (e.g.
+        # NeuralPlayerAI's apply(), which can kick the ball right now if
+        # this player already possesses it) must defer that mutation to
+        # commit() below, or a LATER-PROCESSED player's plan() this SAME
+        # tick would see the earlier player's already-resolved action
+        # (confirmed a real bug this way: two players' observations of
+        # each other differed on the same tick when they should not have).
+        # Flag resets happen here, before this tick's own plan() call,
+        # exactly as before this split.
         for player in self.players:
-            # Reset before this tick's AI/order execution so kick_direct()
+            # Reset before this tick's AI/order resolution so kick_direct()
             # (called from ANY order type, or directly by the neural net) can
             # set it fresh — see Player.kicked_this_tick docstring.
             player.kicked_this_tick = False
@@ -414,7 +457,18 @@ class Match:
             player.last_kick_power_fraction = None
             player.last_kick_spin = None
             if player.ai is not None:
-                player.ai.act(player, self, 0)
+                player.ai.plan(player, self, 0)
+
+        # Pass 2 (commit/resolve): every player's decision takes effect, now
+        # that everyone has planned -- no player's plan() above could have
+        # observed another's resolution, since none had happened yet this
+        # tick. order.execute() is the resolution step for any Order-driven
+        # (rules-based) AI; commit() is the equivalent hook for an AI that
+        # applies its own effects directly (see PlayerAI.commit()'s
+        # docstring).
+        for player in self.players:
+            if player.ai is not None:
+                player.ai.commit(player, self, 0)
             order = player.current_order
             if order is None:
                 # Neural players kick directly (no Order), so log here before skipping.

@@ -203,10 +203,11 @@ def main() -> None:
                             "this lets you re-pretrain an existing policy with new config or demos."
                         ))
     parser.add_argument("--pre-ppo-eval-trials", type=int, default=None,
-                        help="Number of distinct eval seeds to evaluate vs rules-based AI after "
-                             "pre-training, before PPO starts (default: ai_config.json "
+                        help="Number of distinct eval seeds for ALL pre-PPO evals run after "
+                             "pre-training, before PPO starts -- vs rules-based AI, vs immobile, "
+                             "self-play, and the rules-vs-rules baseline (default: ai_config.json "
                              "eval.eval_n_seeds; each seed is repeated eval.eval_repeats_per_seed "
-                             "times). Set to 0 to skip.")
+                             "times). Set to 0 to skip all four entirely.")
     parser.add_argument("--no-head-freeze", action="store_true",
                         help="Skip frozen_heads from the curriculum phase definition — all "
                              "decision-network heads are trained during PPO. Default: the "
@@ -237,6 +238,31 @@ def main() -> None:
                              "supervises the mean), so it sits at whatever it was initialised/left "
                              "at, producing real per-kick power sampling noise BC's own loss/metrics "
                              "can't see.")
+    parser.add_argument("--reset-bernoullis", action="store_true",
+                        help="Scale the weight AND bias of each of ExecutionNetwork's 4 Bernoulli "
+                             "action heads (exec_move_logit, sprint_logit, kick_logit, "
+                             "tackle_attempt_logit) after loading any checkpoint (same "
+                             "checkpoint-loading call sites/timing as --reset-dir-log-std). Analogous "
+                             "to --reset-dir-log-std/--reset-kick-power-log-std for the Gaussian/"
+                             "von-Mises heads, but those reset a dedicated log_std/log_kappa scalar "
+                             "-- a Bernoulli head has no such parameter (the logit magnitude itself is "
+                             "the confidence), so this instead scales the Linear layer's own "
+                             "weight+bias, which scales every logit it outputs by the same factor "
+                             "(input-dependent structure is kept either way) -- a 'temperature'-like "
+                             "reset. scale<1 flattens toward p=0.5/max-entropy; scale>1 sharpens "
+                             "(pushes existing confidence further from 0.5); scale=1.0 is a no-op. "
+                             "Per-head scale via --bernoulli-scale-{exec-move,sprint,kick,tackle} "
+                             "(each falls back to ppo.bernoulli_reset_scale_<head> in ai_config.json, "
+                             "default 0.3). Useful when a head (e.g. tackle_attempt) is stuck "
+                             "saturated near p=0.5 and dominating per-head KL.")
+    parser.add_argument("--bernoulli-scale-exec-move", type=float, default=None, metavar="SCALE",
+                        help="Override ppo.bernoulli_reset_scale_exec_move for --reset-bernoullis.")
+    parser.add_argument("--bernoulli-scale-sprint", type=float, default=None, metavar="SCALE",
+                        help="Override ppo.bernoulli_reset_scale_sprint for --reset-bernoullis.")
+    parser.add_argument("--bernoulli-scale-kick", type=float, default=None, metavar="SCALE",
+                        help="Override ppo.bernoulli_reset_scale_kick for --reset-bernoullis.")
+    parser.add_argument("--bernoulli-scale-tackle", type=float, default=None, metavar="SCALE",
+                        help="Override ppo.bernoulli_reset_scale_tackle for --reset-bernoullis.")
     parser.add_argument("--reset-optimizer", action="store_true",
                         help="Skip restoring Adam's optimizer state (per-param running "
                              "m/v moment estimates + step count) when loading any checkpoint "
@@ -470,6 +496,26 @@ def main() -> None:
             trainer.execution_net.kick_power_log_std.fill_(kp_init)
         log.info(f"--reset-kick-power-log-std: kick_power_log_std={kp_init}")
 
+    def _reset_bernoullis() -> None:
+        ppo_cfg_r = cfg.get("ppo", {})
+        _heads = {
+            "exec_move": (trainer.execution_net.exec_move_logit, args.bernoulli_scale_exec_move),
+            "sprint": (trainer.execution_net.sprint_logit, args.bernoulli_scale_sprint),
+            "kick": (trainer.execution_net.kick_logit, args.bernoulli_scale_kick),
+            "tackle": (trainer.execution_net.tackle_attempt_logit, args.bernoulli_scale_tackle),
+        }
+        _applied = {}
+        with torch.no_grad():
+            for _name, (_layer, _cli_scale) in _heads.items():
+                _scale = (
+                    _cli_scale if _cli_scale is not None
+                    else float(ppo_cfg_r.get(f"bernoulli_reset_scale_{_name}", 0.3))
+                )
+                _layer.weight.mul_(_scale)
+                _layer.bias.mul_(_scale)
+                _applied[_name] = _scale
+        log.info(f"--reset-bernoullis: scales={_applied}")
+
     # Optionally resume from checkpoint
     if args.checkpoint:
         trainer.load_checkpoint(Path(args.checkpoint), reset_optimizer=args.reset_optimizer)
@@ -477,6 +523,8 @@ def main() -> None:
             _reset_dir_log_std()
         if args.reset_kick_power_log_std:
             _reset_kick_power_log_std()
+        if args.reset_bernoullis:
+            _reset_bernoullis()
 
     # --pretrain-from-checkpoint: load weights but still run pretraining
     if args.pretrain_from_checkpoint:
@@ -491,6 +539,8 @@ def main() -> None:
             _reset_dir_log_std()
         if args.reset_kick_power_log_std:
             _reset_kick_power_log_std()
+        if args.reset_bernoullis:
+            _reset_bernoullis()
         if not args.bc_dataset:
             log.warning(
                 "--pretrain-from-checkpoint used without --bc-dataset: "
@@ -516,6 +566,8 @@ def main() -> None:
             _reset_dir_log_std()
         if args.reset_kick_power_log_std:
             _reset_kick_power_log_std()
+        if args.reset_bernoullis:
+            _reset_bernoullis()
         log.info(f"Loaded pre-trained checkpoint: {pretrained_path} — skipping BC/value pre-training")
 
     # Pre-training phase: BC + value jointly when a dataset is available,
@@ -683,7 +735,16 @@ def main() -> None:
         _fp = Path(args.from_pretrained)
         _eval_ckpt_path = str(_fp / "checkpoint_pretrained.pt" if _fp.is_dir() else _fp)
 
-    if args.pre_ppo_eval_trials != 0:
+    # --pre-ppo-eval-trials, when explicitly passed, always wins (0 = skip,
+    # N>0 = run with N seeds, regardless of the config default below).
+    # Left at its default (None), fall back to ai_config.json's
+    # eval.pre_ppo_eval_enabled so this can be turned off persistently
+    # without having to remember the CLI flag every run.
+    _run_pre_ppo_eval = (
+        args.pre_ppo_eval_trials != 0 if args.pre_ppo_eval_trials is not None
+        else bool(cfg.get("eval", {}).get("pre_ppo_eval_enabled", True))
+    )
+    if _run_pre_ppo_eval:
         _pre_ppo_n_seeds = args.pre_ppo_eval_trials  # None = fall back to ai_config.json eval.eval_n_seeds
         from footballcoach.ai.scripts.evaluate import _run_evaluation
         from footballcoach.ui.scenarios import ScenarioDefinition
@@ -697,6 +758,7 @@ def main() -> None:
         )
         rules_stats = _run_evaluation(trainer, rules_env, _pre_ppo_n_seeds, checkpoint_path=_eval_ckpt_path)
         from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS as _CL
+        from footballcoach.ai.ppo.ppo_trainer import format_outcomes_with_pct
         _cl_map = dict(_CL)
         _comp_str = "  ".join(
             f"{_cl_map.get(k, k)}={v:+.2f}" for k, v in sorted(
@@ -708,7 +770,7 @@ def main() -> None:
             f"mean_rew={rules_stats['mean_reward']:.3f}  "
             f"V={rules_stats['mean_step_v']:.3f}  R={rules_stats['mean_step_r']:.3f}  "
             f"gap={rules_stats['mean_step_v'] - rules_stats['mean_step_r']:+.3f}  "
-            f"outcomes={rules_stats['outcomes']}"
+            f"outcomes={format_outcomes_with_pct(rules_stats['outcomes'])}"
         )
         if _comp_str:
             log.info(f"  rew breakdown (rules, per ep): {_comp_str}")
@@ -730,7 +792,7 @@ def main() -> None:
             f"mean_rew={immobile_stats['mean_reward']:.3f}  "
             f"V={immobile_stats['mean_step_v']:.3f}  R={immobile_stats['mean_step_r']:.3f}  "
             f"gap={immobile_stats['mean_step_v'] - immobile_stats['mean_step_r']:+.3f}  "
-            f"outcomes={immobile_stats['outcomes']}"
+            f"outcomes={format_outcomes_with_pct(immobile_stats['outcomes'])}"
         )
         if _imm_comp_str:
             log.info(f"  rew breakdown (immobile, per ep): {_imm_comp_str}")
@@ -759,21 +821,32 @@ def main() -> None:
             f"mean_rew={neural_stats['mean_reward']:.3f}  "
             f"V={neural_stats['mean_step_v']:.3f}  R={neural_stats['mean_step_r']:.3f}  "
             f"gap={neural_stats['mean_step_v'] - neural_stats['mean_step_r']:+.3f}  "
-            f"outcomes={neural_stats['outcomes']}"
+            f"outcomes={format_outcomes_with_pct(neural_stats['outcomes'])}"
         )
         if _nn_comp_str:
             log.info(f"  rew breakdown (self-play, per ep): {_nn_comp_str}")
 
-    # Rules vs rules baseline (always runs, 12 trials)
-    try:
-        from footballcoach.ai.scripts.evaluate import _run_baseline_evaluation
-        baseline_stats = _run_baseline_evaluation(env, n_trials=12)
-        log.info(
-            f"Baseline (rules vs rules, 12 trials): trainee_win={baseline_stats['win_rate_pct']:.1f}%  "
-            f"outcomes={baseline_stats['outcomes']}"
-        )
-    except Exception as _e:
-        log.warning(f"Baseline eval failed: {_e}")
+        # Rules vs rules baseline (12 trials) -- doesn't touch the trainee
+        # policy at all (rules AI on both sides), purely an informational
+        # reference point logged alongside the three evals above. Gated by
+        # the SAME --pre-ppo-eval-trials flag as those (rather than always
+        # running unconditionally) since it's just as much a "before
+        # anything even starts" eval as they are, and has zero effect on
+        # anything downstream: unlike PPOTrainer._compute_rules_vs_rules_baseline
+        # (a separate, lazily-cached computation used later during training
+        # for the "[eval baseline rules-vs-rules]"/gap= numbers), this calls
+        # the free-standing _run_baseline_evaluation() purely for this one
+        # log line -- skipping it changes nothing else.
+        try:
+            from footballcoach.ai.scripts.evaluate import _run_baseline_evaluation
+            from footballcoach.ai.ppo.ppo_trainer import format_outcomes_with_pct as _fmt_oc
+            baseline_stats = _run_baseline_evaluation(env, n_trials=12)
+            log.info(
+                f"Baseline (rules vs rules, 12 trials): trainee_win={baseline_stats['win_rate_pct']:.1f}%  "
+                f"outcomes={_fmt_oc(baseline_stats['outcomes'])}"
+            )
+        except Exception as _e:
+            log.warning(f"Baseline eval failed: {_e}")
 
     # Apply curriculum head freezing (after pre-training, before PPO)
     if not args.no_head_freeze and phase.frozen_heads:
