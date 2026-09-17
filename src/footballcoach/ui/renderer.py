@@ -1142,7 +1142,16 @@ class Renderer:
 
         if show_linger:
             outcome_str = getattr(game_log, "linger_outcome", None) or "resetting"
-            label = self.hud_font.render(f"⏳ {outcome_str}", True, style.HUD_TEXT)
+            # Terminal-only reward approximation (see ScenarioLoop.
+            # _compute_terminal_rewards / phase1_terminal_reward_only) --
+            # appended to the existing outcome line rather than given its
+            # own row, so this costs zero extra vertical space in an
+            # already-crowded panel.
+            rewards = getattr(game_log, "linger_rewards", None)
+            reward_str = ""
+            if rewards:
+                reward_str = "  " + "  ".join(f"{pid} {val:+.2f}" for pid, val in rewards.items())
+            label = self.hud_font.render(f"⏳ {outcome_str}{reward_str}", True, style.HUD_TEXT)
             label_y = box_y + box_h - linger_h
             surface.blit(label, (box_x + 8, label_y))
 

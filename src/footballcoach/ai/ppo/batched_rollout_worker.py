@@ -530,8 +530,21 @@ class BatchedEnvGroup:
                         reward=sec["reward"],
                         done=sec["done"],
                         bc_label=None,
+                        # See ppo_trainer.py's single-process rollout loop's
+                        # matching secondary buffer.add() call for why this
+                        # is real data (from NeuralPlayerAI.last_transition,
+                        # same for trainee and secondary players), not a
+                        # placeholder -- omitting it silently corrupted every
+                        # per-head KL/policy_loss diagnostic for every
+                        # secondary/opponent row via RolloutBuffer.add()'s
+                        # all-zero default.
+                        head_log_probs=sec.get("head_log_probs"),
                         weight=self.trainer._secondary_weight,
                         track_id=sec["player_id"],
+                        # Shared env-level episode outcome -- see
+                        # scenario_env.py's last_secondary_results["step_outcome"]
+                        # and ai/knowledge.md "unknown outcome bucket".
+                        step_outcome=sec.get("step_outcome", ""),
                     )
                     secondary_episode_reward_accum[i] += sec["reward"]
                     if sec["done"]:

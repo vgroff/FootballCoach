@@ -422,6 +422,17 @@ class ScenarioEnv:
         # comment for why a single post-loop read would silently miss kicks
         # that land on any tick but the last one of this decision interval.
         trainee_kicks_this_step = 0
+        # Of those, how many fired via the ARMED path (Player.kick_armed was
+        # still True the instant kick_with_direction/kicked_this_tick fired
+        # -- see Player._finish_kick, which never touches kick_armed itself,
+        # so it still reflects whichever branch of apply_nn_action.py's
+        # if/else set it this exact tick: the armed branch leaves it True,
+        # the instant-in-possession branch never touches it, so it's already
+        # False from that tick's own reset). Gates "katt" (see reward.py's
+        # own docstring) so an ordinary in-possession kick -- which never
+        # paid any "karm" cost in the first place -- doesn't also collect
+        # the bonus meant to offset that cost for a genuine, uncertain chase.
+        trainee_armed_kicks_this_step = 0
         # Reset the tackle-attempt counters THIS on_tackle callback(s)
         # mutate synchronously inside the tick loop below (see
         # _on_trainee_tackle/_make_on_sec_tackle) -- instance attributes, not
@@ -434,6 +445,21 @@ class ScenarioEnv:
         _sec_pending_loss = {pid: self._sec_pending_loss.get(pid, False) for pid in sec_pre}
         sec_gained_count = {pid: 0 for pid in sec_pre}
         sec_lost_count = {pid: 0 for pid in sec_pre}
+        # Secondary-player kick scan -- same rationale/shape as the
+        # trainee's own trainee_kicks_this_step/trainee_armed_kicks_this_step
+        # above, just per-pid. Player objects fetched once here (not inside
+        # the tick loop) to avoid a repeated match.player_by_id() lookup
+        # every physics tick; a pid whose player has since left the match
+        # (shouldn't happen mid-episode, but mirrors every other secondary
+        # lookup's defensive try/except in this file) is simply skipped.
+        sec_players: dict = {}
+        for pid in sec_pre:
+            try:
+                sec_players[pid] = match.player_by_id(pid)
+            except KeyError:
+                pass
+        sec_kicks_this_step = {pid: 0 for pid in sec_pre}
+        sec_armed_kicks_this_step = {pid: 0 for pid in sec_pre}
 
         # Per-tick box-distance progress accumulators. Must be gated on
         # possession at the SAME tick the box-distance moved, not possession
@@ -462,6 +488,13 @@ class ScenarioEnv:
             self._episode_ticks += 1
             if player.kicked_this_tick:
                 trainee_kicks_this_step += 1
+                if player.kick_armed:
+                    trainee_armed_kicks_this_step += 1
+            for _pid, _sec_p in sec_players.items():
+                if _sec_p.kicked_this_tick:
+                    sec_kicks_this_step[_pid] += 1
+                    if _sec_p.kick_armed:
+                        sec_armed_kicks_this_step[_pid] += 1
 
             if tick_done:
                 # Break BEFORE reading any match state. When linger_s=0
@@ -515,6 +548,46 @@ class ScenarioEnv:
                 if _sec_poss_prev[pid]:
                     sec_prog_accum[pid] += _sec_box_dist_prev[pid] - _curr_sec_box_dist
                 _sec_box_dist_prev[pid] = _curr_sec_box_dist
+
+            # An armed-kick auto-fire (Match._update_loose_ball_pickup)
+            # grants possession then immediately kicks it away again WITHIN
+            # this same tick (see Player.kick_armed_direction's docstring) --
+            # a real, if momentary, possession event that the single
+            # end-of-tick possessed_by sample below can never observe on its
+            # own (it reads None both before and after this tick). Detected
+            # via the same kicked_this_tick+kick_armed combination
+            # trainee_armed_kicks_this_step already checks above:
+            # _finish_kick never touches kick_armed, so it still reads True
+            # here iff THIS tick's kick came from the armed path (never true
+            # for an already-possessing instant kick, since
+            # apply_nn_action.py's kick branch is exclusive -- that case
+            # needs no special handling, since poss_prev was already True
+            # from an earlier tick and the real end-of-tick sample below
+            # correctly sees the release). Feeds a synthetic
+            # "possessed_by=this player" sample through
+            # _possession_transition_step FIRST (registering the gain),
+            # before the real end-of-tick sample below (registering the
+            # subsequent loss/pending-loss) -- reuses the state machine
+            # completely unchanged, just calls it one extra time for the
+            # tick a touch happened that the final poll would otherwise miss.
+            if player.kicked_this_tick and player.kick_armed:
+                (
+                    _trainee_poss_prev, _trainee_pending_loss,
+                    trainee_gained_count, trainee_lost_count,
+                ) = self._possession_transition_step(
+                    self.trainee_player_id, self.trainee_player_id, _trainee_poss_prev,
+                    _trainee_pending_loss, trainee_gained_count, trainee_lost_count,
+                )
+            for pid in sec_pre:
+                _sec_p = sec_players.get(pid)
+                if _sec_p is not None and _sec_p.kicked_this_tick and _sec_p.kick_armed:
+                    (
+                        _sec_poss_prev[pid], _sec_pending_loss[pid],
+                        sec_gained_count[pid], sec_lost_count[pid],
+                    ) = self._possession_transition_step(
+                        pid, pid, _sec_poss_prev[pid],
+                        _sec_pending_loss[pid], sec_gained_count[pid], sec_lost_count[pid],
+                    )
 
             # Update possession transitions AFTER progress, so gain-tick
             # motion counts on the NEXT tick, not the tick possession is taken.
@@ -623,6 +696,8 @@ class ScenarioEnv:
                 ball_went_out_after_touch=ball_went_out,
                 illegal_action_attempted=info.illegal_action,
                 tackle_attempted_this_step=self._trainee_tackle_attempt_count > 0,
+                kick_attempted_this_step=trainee_kicks_this_step > 0,
+                kick_attempt_was_armed_this_step=trainee_armed_kicks_this_step > 0,
                 reached_opponent_box_with_possession=box_terminal,
                 opponent_reached_trainee_box=opponent_box_terminal,
                 timed_out=timeout and not box_terminal and not opponent_box_terminal,
@@ -755,6 +830,8 @@ class ScenarioEnv:
                         if _sec_has_transition else False
                     ),
                     tackle_attempted_this_step=self._sec_tackle_attempt_count.get(pid, 0) > 0,
+                    kick_attempted_this_step=sec_kicks_this_step.get(pid, 0) > 0,
+                    kick_attempt_was_armed_this_step=sec_armed_kicks_this_step.get(pid, 0) > 0,
                     reached_opponent_box_with_possession=sec_box_terminal,
                     opponent_reached_trainee_box=box_terminal,  # from sec's POV, trainee winning = sec losing
                     timed_out=timeout and not sec_box_terminal and not box_terminal,
@@ -771,6 +848,22 @@ class ScenarioEnv:
                 "player_id": pid,
                 "reward": sec_reward,
                 "done": 1.0 if done else 0.0,
+                # The episode-ending outcome is a single shared, env-level
+                # fact (one trial ends the same way for every player on the
+                # pitch at once) -- NOT player-specific, so this is just
+                # info.trial_outcome (already computed above, "" when this
+                # tick isn't terminal). Without this, every secondary row's
+                # step_outcome silently defaulted to "" via
+                # RolloutBuffer.add()'s default (only the trainee's own
+                # buffer.add() call threaded step_outcome through), and
+                # _backfill_step_outcomes -- which operates on the flat,
+                # track-unaware dones/step_outcomes lists -- can never
+                # recover a done=1 row whose OWN outcome slot is empty. Every
+                # secondary player's terminal-tick row therefore fell into
+                # value_mse_by_outcome()'s "unknown" bucket forever, despite
+                # the backfill correctly covering every earlier row of the
+                # same episode. See ai/knowledge.md "unknown outcome bucket".
+                "step_outcome": info.trial_outcome or "",
                 # This player's OWN component breakdown -- kept separate
                 # from self.last_reward_components (the trainee's own),
                 # NOT merged into it. Merging used to make e.g. a "win"
@@ -934,6 +1027,8 @@ class ScenarioEnv:
         ball_went_out_after_touch: bool,
         illegal_action_attempted: bool,
         tackle_attempted_this_step: bool = False,
+        kick_attempted_this_step: bool = False,
+        kick_attempt_was_armed_this_step: bool = False,
         reached_opponent_box_with_possession: bool,
         opponent_reached_trainee_box: bool,
         timed_out: bool,
@@ -975,6 +1070,10 @@ class ScenarioEnv:
         # simplification _is_sprinting above already relies on, not a new
         # approximation.
         _tackle_armed = player_obj.tackle_armed
+        # Same "state at decision boundary represents the whole interval"
+        # convention as _tackle_armed above -- see reward.py's "karm"
+        # docstring entry.
+        _kick_armed = player_obj.kick_armed
         return phase1_reward(
             prev_ball_dist=prev_ball_dist,
             curr_ball_dist=curr_ball_dist,
@@ -985,6 +1084,8 @@ class ScenarioEnv:
             ball_went_out_after_touch=ball_went_out_after_touch,
             illegal_action_attempted=illegal_action_attempted,
             tackle_attempted_this_step=tackle_attempted_this_step,
+            kick_attempted_this_step=kick_attempted_this_step,
+            kick_attempt_was_armed_this_step=kick_attempt_was_armed_this_step,
             reached_opponent_box_with_possession=reached_opponent_box_with_possession,
             cfg=self._reward_cfg["phase1"],
             time_fraction_remaining=1.0 - self._episode_ticks / self._max_episode_ticks,
@@ -1001,6 +1102,7 @@ class ScenarioEnv:
             stamina_used=_stamina_used,
             is_sprinting=_is_sprinting,
             tackle_armed=_tackle_armed,
+            kick_armed=_kick_armed,
             decision_interval_s=self._decision_interval_s,
             prog_reward_clamp=self._reward_cfg["phase1"].get("ball_progress_reward_clamp"),
             appr_sq_approach_reward_clamp=self._reward_cfg["phase1"].get("ball_approach_speed_reward_clamp"),

@@ -41,13 +41,19 @@ Current notes:
         - !! fix tests!
         - !! large rollouts and smallish epochs at first? high entropy and reset log stds and kick power std and bernoullis
     - !! on checkpointing
-        - way higher LR? with reset optimixer
+        - !!!! in the phase 1 UI, have the value network print value prediction and also give the results
+        - is the augmentation done right with PPO stuff?
+        - !! print KLs and losses in order
+        - !! are the kick params sampled/trained only if a kick actually fired (legally? e.g. while in possession?)
+            - same with tackling? and kick boolean?
+                - would need to remove the penalties?
         - [] Plan to train against old checkpoints
             - write a plan to include a 4th type of opponent - previous neural checkpoints
                 - add a phase1_opponent_previous_neural_ratio
                 - randomly select a previous checkpoint from this run and from any in a "previous_checkpoint_folders": ["phase1_run32", "phase1_run43"] type variable
                 - make sure we don't train on these, obviously
         - !! at some point, using more envs with the GPU has to win out over fewer envs on the CPU for the rollouts, right?
+        - !! be more ram efficient
     - control needs fixing big time
     - autotackle should slow the tackler down more, as a form of penalty
     - having the decision latent space be added to the final layer of the player one (like an actual .add()) is genius because it allows player personalties but also manager influence and overriding etc... we can have the action layer that comes off it just be a generic decoder shared by everyone, that way everyone also has to agree on the shape on the latent space somewhat

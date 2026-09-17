@@ -12,6 +12,7 @@ from footballcoach.ai.env.reward import (
     EMAFilter,
     cumulative_clamped_delta,
     phase1_reward,
+    phase1_terminal_reward_only,
     phase2_reward,
     symmetric_clamp,
 )
@@ -170,8 +171,27 @@ class TestPhase1Reward:
         assert set(comps.keys()) == {
             "appr", "retr", "appr_sq", "hdg", "poss", "prog", "out", "ill",
             "box", "spd", "lpos", "lterm", "tout", "prox", "stam", "step",
-            "sprint", "tack", "tatt",
+            "sprint", "tack", "tatt", "karm", "katt",
         }
+
+    def test_every_component_key_has_a_display_label(self):
+        """Regression guard: PPOTrainer.REWARD_COMP_LABELS (used by both the
+        per-episode 'component mean/std/min/max' table and the per-step
+        'rew/step' table in _log_rollout_summary) is a SEPARATE, hand-
+        maintained list from phase1_reward's own comps dict -- adding a new
+        component here (as 'karm'/'katt' were) without also adding it to
+        REWARD_COMP_LABELS means it silently never appears in either
+        diagnostic table, with no error anywhere. This failed for exactly
+        that reason before REWARD_COMP_LABELS was updated."""
+        from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS
+        _, comps = self._call()
+        labeled_keys = {k for k, _ in REWARD_COMP_LABELS}
+        missing = set(comps.keys()) - labeled_keys
+        assert not missing, (
+            f"phase1_reward returns component(s) {missing} with no entry in "
+            "REWARD_COMP_LABELS -- they will never show up in the rollout "
+            "summary tables. Add them to REWARD_COMP_LABELS in ppo_trainer.py."
+        )
 
     def test_total_always_equals_sum_of_components(self):
         """Invariant: total == sum(comps.values()) for any input."""
@@ -687,6 +707,176 @@ class TestTackleAttemptedBonus:
         assert comps["tack"] == pytest.approx(0.0)
 
 
+class TestKickArmedPenalty:
+    """'karm' -- kick_armed_penalty_per_second * decision_interval_s
+    whenever kick_armed is set this step. Same shape as 'tack', but no
+    possessing-multiplier: kick_armed can never be true while ALSO
+    possessing (apply_nn_action.py's if/else is exclusive -- see reward.py's
+    'karm' docstring), so that extra-bad case tackle guards against doesn't
+    apply here. Uses explicit cfg overrides, not the live ai_config.json
+    value (which defaults to 0.0/disabled)."""
+
+    _BASE_KWARGS = dict(
+        prev_ball_dist=5.0, curr_ball_dist=5.0,
+        gained_possession_this_step=False,
+        ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+        illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+        has_possession_now=False,
+    )
+
+    def _call(self, *, kick_armed, decision_interval_s, cfg_overrides):
+        cfg = {**_CFG1, "step_penalty": 0.0, **cfg_overrides}
+        total, comps, _ = phase1_reward(
+            **self._BASE_KWARGS,
+            kick_armed=kick_armed,
+            decision_interval_s=decision_interval_s,
+            cfg=cfg,
+        )
+        return total, comps
+
+    def test_zero_when_not_armed_regardless_of_coef(self):
+        _, comps = self._call(
+            kick_armed=False, decision_interval_s=1.0,
+            cfg_overrides={"kick_armed_penalty_per_second": -0.1},
+        )
+        assert comps["karm"] == pytest.approx(0.0)
+
+    def test_zero_when_coef_disabled(self):
+        _, comps = self._call(
+            kick_armed=True, decision_interval_s=1.0,
+            cfg_overrides={"kick_armed_penalty_per_second": 0.0},
+        )
+        assert comps["karm"] == pytest.approx(0.0)
+
+    def test_per_second_cost_scales_with_decision_interval(self):
+        _, comps = self._call(
+            kick_armed=True, decision_interval_s=0.2,
+            cfg_overrides={"kick_armed_penalty_per_second": -0.1},
+        )
+        assert comps["karm"] == pytest.approx(-0.1 * 0.2)
+
+    def test_katt_zero_when_not_attempted(self):
+        """Sanity check that this class's own tests (which never pass
+        kick_attempted_this_step) don't accidentally leak a nonzero 'katt'
+        into 'karm' assertions -- see TestKickAttemptedBonus for 'katt'
+        itself."""
+        _, comps = self._call(
+            kick_armed=True, decision_interval_s=1.0,
+            cfg_overrides={"kick_armed_penalty_per_second": -0.1},
+        )
+        assert comps["katt"] == pytest.approx(0.0)
+
+    def test_karm_included_in_total(self):
+        total, comps = self._call(
+            kick_armed=True, decision_interval_s=1.0,
+            cfg_overrides={"kick_armed_penalty_per_second": -0.1},
+        )
+        assert total == pytest.approx(comps["karm"])
+
+
+class TestKickAttemptedBonus:
+    """'katt' -- same flat shape as 'tatt': when kick_attempted_this_step is
+    true, abs(kick_armed_penalty_per_second) * decision_interval_s *
+    kick_attempt_bonus_multiplier, NOT scaled by how long (if at all) it was
+    armed for first. UNLIKE 'tatt', also gated on
+    kick_attempt_was_armed_this_step -- an ordinary kick while already
+    possessing never paid any 'karm' cost, so it must not also collect
+    'katt' (see reward.py's 'katt' docstring for why this diverges from the
+    tackle analogy)."""
+
+    _BASE_KWARGS = dict(
+        prev_ball_dist=5.0, curr_ball_dist=5.0,
+        gained_possession_this_step=False,
+        ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
+        illegal_action_attempted=False, reached_opponent_box_with_possession=False,
+        has_possession_now=False,
+    )
+
+    def _call(self, *, kick_attempted_this_step, kick_attempt_was_armed_this_step, decision_interval_s, cfg_overrides):
+        cfg = {**_CFG1, "step_penalty": 0.0, **cfg_overrides}
+        total, comps, _ = phase1_reward(
+            **self._BASE_KWARGS,
+            kick_attempted_this_step=kick_attempted_this_step,
+            kick_attempt_was_armed_this_step=kick_attempt_was_armed_this_step,
+            decision_interval_s=decision_interval_s,
+            cfg=cfg,
+        )
+        return total, comps
+
+    def test_zero_when_not_attempted_regardless_of_coef(self):
+        _, comps = self._call(
+            kick_attempted_this_step=False, kick_attempt_was_armed_this_step=False, decision_interval_s=1.0,
+            cfg_overrides={"kick_armed_penalty_per_second": -0.1, "kick_attempt_bonus_multiplier": 2.0},
+        )
+        assert comps["katt"] == pytest.approx(0.0)
+
+    def test_zero_when_attempted_but_not_armed(self):
+        """The core behavior this feature was built for: an ordinary kick
+        while already in possession (kick_attempted_this_step=True,
+        kick_attempt_was_armed_this_step=False, since kick_armed is never
+        set on that path) must NOT collect 'katt' -- it never paid any
+        'karm' cost to offset."""
+        _, comps = self._call(
+            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=False, decision_interval_s=1.0,
+            cfg_overrides={"kick_armed_penalty_per_second": -0.1, "kick_attempt_bonus_multiplier": 2.0},
+        )
+        assert comps["katt"] == pytest.approx(0.0)
+
+    def test_nonzero_when_attempted_and_armed(self):
+        _, comps = self._call(
+            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True, decision_interval_s=1.0,
+            cfg_overrides={"kick_armed_penalty_per_second": -0.1, "kick_attempt_bonus_multiplier": 1.0},
+        )
+        assert comps["katt"] == pytest.approx(0.1)
+
+    def test_zero_when_base_rate_disabled(self):
+        _, comps = self._call(
+            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True, decision_interval_s=1.0,
+            cfg_overrides={"kick_armed_penalty_per_second": 0.0, "kick_attempt_bonus_multiplier": 2.0},
+        )
+        assert comps["katt"] == pytest.approx(0.0)
+
+    def test_scales_with_decision_interval_and_multiplier_not_arm_duration(self):
+        """Flat payout regardless of decision_interval_s/multiplier combo --
+        there is no 'how long was it armed' input to this formula at all,
+        by design (matching 'tatt' paying the same for an instant vs. long
+        tackle chase)."""
+        _, comps = self._call(
+            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True, decision_interval_s=0.5,
+            cfg_overrides={"kick_armed_penalty_per_second": -0.1, "kick_attempt_bonus_multiplier": 4.0},
+        )
+        assert comps["katt"] == pytest.approx(0.1 * 0.5 * 4.0)
+
+    def test_multiplier_defaults_to_one_when_unset(self):
+        cfg = {**_CFG1, "step_penalty": 0.0, "kick_armed_penalty_per_second": -0.1}
+        cfg.pop("kick_attempt_bonus_multiplier", None)
+        total, comps, _ = phase1_reward(
+            **self._BASE_KWARGS,
+            kick_attempted_this_step=True,
+            kick_attempt_was_armed_this_step=True,
+            decision_interval_s=1.0,
+            cfg=cfg,
+        )
+        assert comps["katt"] == pytest.approx(0.1)
+
+    def test_disabled_by_zero_multiplier(self):
+        _, comps = self._call(
+            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True, decision_interval_s=1.0,
+            cfg_overrides={"kick_armed_penalty_per_second": -0.1, "kick_attempt_bonus_multiplier": 0.0},
+        )
+        assert comps["katt"] == pytest.approx(0.0)
+
+    def test_karm_zero_when_only_attempted_not_armed(self):
+        """kick_armed and kick_attempted_this_step are independent flags in
+        this function's signature -- 'karm' must not fire off of
+        kick_attempted_this_step/kick_attempt_was_armed_this_step alone."""
+        _, comps = self._call(
+            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True, decision_interval_s=1.0,
+            cfg_overrides={"kick_armed_penalty_per_second": -0.1},
+        )
+        assert comps["karm"] == pytest.approx(0.0)
+
+
 # ---------------------------------------------------------------------------
 # phase2_reward
 # ---------------------------------------------------------------------------
@@ -878,4 +1068,77 @@ class TestEMAFilter:
         ema = EMAFilter.from_config()
         assert 0.0 <= ema.smoothed <= 1.0
         assert ema.alpha_normal > 0.9  # should be slow (close to 1)
+
+
+class TestPhase1TerminalRewardOnly:
+    """phase1_terminal_reward_only() -- the UI's live-scenario terminal-only
+    reward approximation (see ScenarioLoop._compute_terminal_rewards). Must
+    agree EXACTLY with phase1_reward() itself for the terminal components
+    (it's a thin wrapper, not a reimplementation), and must always zero out
+    every per-tick shaping term regardless of what the terminal flags are."""
+
+    _NEUTRAL = dict(
+        reached_opponent_box_with_possession=False,
+        opponent_reached_trainee_box=False,
+        timed_out=False,
+        ball_went_out_after_touch=False,
+        illegal_action_attempted=False,
+        cfg=_CFG1,
+    )
+
+    def test_agrees_with_phase1_reward_for_box_possession(self):
+        total_only, comps_only = phase1_terminal_reward_only(
+            **{**self._NEUTRAL, "reached_opponent_box_with_possession": True},
+            time_fraction_remaining=0.4,
+        )
+        total_full, comps_full, _ = phase1_reward(
+            prev_ball_dist=0.0, curr_ball_dist=0.0, has_possession_now=False,
+            gained_possession_this_step=0, ball_progress_toward_goal_m=0.0,
+            ball_went_out_after_touch=False, illegal_action_attempted=False,
+            reached_opponent_box_with_possession=True, cfg=_CFG1,
+            time_fraction_remaining=0.4, episode_done=True,
+        )
+        assert total_only == pytest.approx(total_full)
+        assert comps_only["box"] == pytest.approx(comps_full["box"])
+        assert comps_only["spd"] == pytest.approx(comps_full["spd"])
+
+    def test_no_terminal_flags_leaves_only_step_and_stam(self):
+        total, comps = phase1_terminal_reward_only(**self._NEUTRAL, stamina_used=0.3)
+        for key in ("appr", "retr", "appr_sq", "hdg", "poss", "prog", "out", "ill",
+                    "box", "spd", "lpos", "lterm", "tout", "prox", "sprint",
+                    "tack", "tatt", "karm", "katt"):
+            assert comps[key] == pytest.approx(0.0), key
+        # step/stam are the only always-on components.
+        assert total == pytest.approx(comps["step"] + comps["stam"])
+
+    def test_loss_terminal_fires_on_opponent_reached_trainee_box(self):
+        cfg = {**_CFG1, "loss_terminal": -1.0, "step_penalty": 0.0}
+        _total, comps = phase1_terminal_reward_only(
+            **{**self._NEUTRAL, "cfg": cfg, "opponent_reached_trainee_box": True},
+        )
+        assert comps["lterm"] == pytest.approx(-1.0)
+        assert comps["box"] == pytest.approx(0.0)
+
+    def test_timeout_and_proximity_use_given_box_distance(self):
+        cfg = {**_CFG1, "timeout_penalty": -0.5, "proximity_bonus_scale": 1.0, "step_penalty": 0.0}
+        _total, comps = phase1_terminal_reward_only(
+            **{**self._NEUTRAL, "cfg": cfg, "timed_out": True},
+            ball_dist_to_opponent_box_m=20.0,
+        )
+        assert comps["tout"] == pytest.approx(-0.5)
+        assert comps["prox"] == pytest.approx(1.0 * (1.0 - 20.0 / 40.0))
+
+    def test_ball_out_fires_independently_of_other_flags(self):
+        cfg = {**_CFG1, "ball_out_penalty": -0.2, "step_penalty": 0.0}
+        _total, comps = phase1_terminal_reward_only(
+            **{**self._NEUTRAL, "cfg": cfg, "ball_went_out_after_touch": True},
+        )
+        assert comps["out"] == pytest.approx(-0.2)
+
+    def test_stamina_used_only_matters_via_configured_coefficient(self):
+        cfg = {**_CFG1, "stamina_sprint_penalty": 0.4, "step_penalty": 0.0}
+        _total, comps = phase1_terminal_reward_only(
+            **{**self._NEUTRAL, "cfg": cfg}, stamina_used=0.25,
+        )
+        assert comps["stam"] == pytest.approx(-0.4 * 0.25)
         assert ema.alpha_post_goal < ema.alpha_normal  # faster after goal

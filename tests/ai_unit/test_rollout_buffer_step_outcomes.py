@@ -148,3 +148,80 @@ class TestAsTensorsAppliesBackfill:
         assert set(by_outcome) == {"box_possession", "timeout"}
         assert by_outcome["box_possession"][1] == 10
         assert by_outcome["timeout"][1] == 5
+
+
+class TestMultiTrackSecondaryStepOutcome:
+    """_backfill_step_outcomes() operates on the flat, track_id-unaware
+    dones/step_outcomes lists (unlike compute_gae(), which explicitly
+    segments by track). This means a secondary player's OWN terminal-tick
+    row -- appended right after the trainee's terminal row in the same tick
+    (see RolloutBuffer.track_ids docstring: trainee row added before that
+    tick's secondary row(s)) -- can never be rescued by the backfill if its
+    own step_outcome slot is empty: the backfill only propagates a done=1
+    row's PRECEDING span, and only `if outcome:` at that row's own slot.
+
+    This is exactly what happened before scenario_env.py started forwarding
+    the shared env-level outcome into last_secondary_results["step_outcome"]
+    (see ai/knowledge.md "unknown outcome bucket") -- every secondary
+    buffer.add() call omitted step_outcome, silently defaulting to "" even
+    on the secondary's own done=1 row, forever excluded from any backfill.
+    """
+
+    def _build_interleaved(self, secondary_step_outcome: str) -> RolloutBuffer:
+        """One 3-tick episode, trainee + one secondary player interleaved
+        exactly as real rollout collection appends them (trainee row for a
+        tick, then that tick's secondary row) -- both share done=1 on the
+        final tick, mirroring one shared env-level episode ending."""
+        buf = RolloutBuffer()
+        dummy_obs = {"x": np.zeros(1, dtype=np.float32)}
+        dummy_act = {"a": np.zeros(1, dtype=np.float32)}
+        for tick in range(3):
+            done = tick == 2
+            buf.add(obs=dummy_obs, action=dummy_act, log_prob=0.0, value=0.0,
+                    reward=0.0, done=1.0 if done else 0.0, track_id="trainee",
+                    step_outcome="box_possession" if done else "")
+            buf.add(obs=dummy_obs, action=dummy_act, log_prob=0.0, value=0.0,
+                    reward=0.0, done=1.0 if done else 0.0, track_id="opponent",
+                    step_outcome=(secondary_step_outcome if done else ""))
+        return buf
+
+    def test_secondary_terminal_row_leaks_to_unknown_without_the_fix(self):
+        """Documents the bug mechanism: if the secondary's own terminal row
+        never receives step_outcome (the pre-fix behavior), it stays ""
+        even after backfill -- everything else in the episode (both
+        tracks' earlier rows, plus the trainee's own terminal row) recovers
+        correctly since they're all in the flat span BEFORE the trainee's
+        terminal row."""
+        buf = self._build_interleaved(secondary_step_outcome="")
+        advantages, returns = buf.compute_gae(gamma=0.99, lam=0.95, last_value=0.0)
+        batch = buf.as_tensors(advantages, returns)
+        # trainee_0, opponent_0, trainee_1, opponent_1, trainee_2(done), opponent_2(done)
+        assert batch["step_outcomes"] == [
+            "box_possession", "box_possession",
+            "box_possession", "box_possession",
+            "box_possession", "",
+        ]
+
+    def test_secondary_terminal_row_resolves_correctly_with_the_fix(self):
+        """With the fix (secondary buffer.add() forwarding the shared
+        outcome, see scenario_env.py), every row -- including the
+        secondary's own terminal row -- gets the real outcome directly, with
+        nothing left for the backfill to even need to do for that row."""
+        buf = self._build_interleaved(secondary_step_outcome="box_possession")
+        advantages, returns = buf.compute_gae(gamma=0.99, lam=0.95, last_value=0.0)
+        batch = buf.as_tensors(advantages, returns)
+        assert batch["step_outcomes"] == ["box_possession"] * 6
+
+    def test_value_mse_by_outcome_has_no_unknown_bucket_with_the_fix(self):
+        import torch
+
+        from footballcoach.ai.ppo.ppo_trainer import value_mse_by_outcome
+
+        buf = self._build_interleaved(secondary_step_outcome="box_possession")
+        advantages, returns = buf.compute_gae(gamma=0.99, lam=0.95, last_value=0.0)
+        batch = buf.as_tensors(advantages, returns)
+        pred = torch.zeros(len(batch["step_outcomes"]))
+        target = torch.zeros(len(batch["step_outcomes"]))
+        by_outcome = value_mse_by_outcome(pred, target, batch["step_outcomes"])
+        assert "unknown" not in by_outcome
+        assert by_outcome["box_possession"][1] == 6

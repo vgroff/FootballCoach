@@ -97,7 +97,15 @@ def _run_ppo_update(trainer: PPOTrainer, buffer: RolloutBuffer, last_obs):
 
 
 class TestPerHeadPolicyLossBreakdown:
-    def test_log_line_lists_every_head_with_finite_values(self, caplog):
+    def test_log_line_lists_every_active_head_with_finite_values(self, caplog):
+        """Masked/frozen/inactive heads (PPOTrainer._inactive_head_lp_keys --
+        curriculum-frozen decision heads plus kick_spin, which is
+        permanently frozen regardless of curriculum phase) are dropped from
+        this line entirely rather than shown as a content-free residual
+        (ratio=1 collapses the counterfactual policy_loss to
+        -mean(this update's advantages), identical across every masked
+        head, not a real per-head signal -- see _inactive_head_lp_keys'
+        own docstring)."""
         trainer = PPOTrainer.from_config()
         env = _make_env()
         buffer, last_obs = _collect_rollout(env, trainer, _ROLLOUT_STEPS)
@@ -112,23 +120,30 @@ class TestPerHeadPolicyLossBreakdown:
         assert len(lines) == 1, f"expected exactly one summary line, got {len(lines)}"
         line = lines[0]
 
-        for key in HEAD_LP_KEYS:
-            assert f"{key}=" in line, f"head {key!r} missing from breakdown line: {line}"
+        inactive = trainer._inactive_head_lp_keys()
+        assert inactive, (
+            "expected at least kick_spin to be permanently frozen -- if this "
+            "changed, _kick_spin_frozen's default changed too, update this test"
+        )
+        active_keys = [k for k in HEAD_LP_KEYS if k not in inactive]
 
         # Parse "key=+0.0123" pairs (values are signed, fixed 4dp) and check
         # every one is finite -- a NaN/Inf here would print as literal
         # "nan"/"inf" text, which float() will happily parse, so also guard
         # against that explicitly.
         body = line.split("]", 1)[1].strip()
-        n_parsed = 0
+        parsed_keys = []
         for token in body.split("  "):
             if not token:
                 continue
             _key, _val_str = token.split("=")
             val = float(_val_str)
             assert math.isfinite(val), f"{_key}={_val_str} is not finite"
-            n_parsed += 1
-        assert n_parsed == len(HEAD_LP_KEYS)
+            parsed_keys.append(_key)
+        assert sorted(parsed_keys) == sorted(active_keys), (
+            f"expected exactly the active heads, no masked/frozen ones -- "
+            f"got={sorted(parsed_keys)} expected={sorted(active_keys)}"
+        )
 
     def test_frozen_head_shows_ratio_of_exactly_one(self, caplog):
         """A frozen head's stored old_log_prob AND freshly-recomputed
@@ -189,15 +204,15 @@ class TestPerHeadPolicyLossBreakdown:
 
 
 class TestEpochPolicyLossPercentiles:
-    """The "[epoch N/M policy_loss percentiles, n=...]" line -- per-SAMPLE
-    (not per-minibatch-mean) TRAIN policy_loss distribution, reported every
-    epoch (like the val-side percentiles), requested to check whether
-    pol_mean's positive value is a broad shift or a few outliers dragging
-    the mean. Unlike the val-side numbers, this is a progressive pool
-    across that epoch's minibatches (rows reflect whatever weights existed
-    when each minibatch ran, not one clean end-of-epoch snapshot) -- an
-    approximation, not an exact per-epoch distribution, but still useful
-    for spotting skew/outliers."""
+    """The "[policy percentiles, n=...]" line -- per-SAMPLE (not
+    per-minibatch-mean) TRAIN policy_loss distribution, reported every
+    epoch (like the held-out percentiles), requested to check whether the
+    [policy] mean's positive value is a broad shift or a few outliers
+    dragging the mean. Unlike the held-out numbers, this is a progressive
+    pool across that epoch's minibatches (rows reflect whatever weights
+    existed when each minibatch ran, not one clean end-of-epoch snapshot)
+    -- an approximation, not an exact per-epoch distribution, but still
+    useful for spotting skew/outliers."""
 
     def test_percentiles_logged_every_epoch_monotonic_and_finite(self, caplog):
         trainer = PPOTrainer.from_config()
@@ -207,16 +222,20 @@ class TestEpochPolicyLossPercentiles:
         with caplog.at_level("INFO"):
             _run_ppo_update(trainer, buffer, last_obs)
 
+        # startswith (not a plain substring check) so this doesn't also
+        # pick up "[held-out policy percentiles, ...]" -- not relevant in
+        # this file's fixture (val_episode_fraction stays at its 0.0
+        # default here) but kept precise regardless.
         lines = [
             r.message for r in caplog.records
-            if "policy_loss percentiles" in r.message
+            if r.message.strip().startswith("[policy percentiles")
         ]
         n_epoch_lines = sum(
-            1 for r in caplog.records if r.message.startswith("  [epoch ") and "pol_mean=" in r.message
+            1 for r in caplog.records if r.message.startswith("  == epoch ")
         )
         assert n_epoch_lines >= 1, "no epoch ran -- test is vacuous"
         # <= n_epoch_lines since KL early-stop can cut the epoch loop short
-        # partway through a minibatch, same caveat as the val-side test.
+        # partway through a minibatch, same caveat as the held-out test.
         assert len(lines) == n_epoch_lines, (
             f"expected one percentile line per epoch that actually ran "
             f"({n_epoch_lines}), got {len(lines)}"
@@ -241,3 +260,137 @@ class TestEpochPolicyLossPercentiles:
                 values.append(val)
             assert len(values) == len(pcts)
             assert values == sorted(values), f"percentiles are not monotonically non-decreasing: {values}"
+
+
+class TestEpochPolicyLossPerHeadBreakdown:
+    """The "[policy heads] shoot=... move_dir=..." line -- per-epoch
+    counterfactual per-head policy_loss breakdown, requested to answer
+    "which heads are contributing to [policy] mean at each epoch" directly,
+    rather than only at the very end of the whole update (the pre-existing
+    "[per-head policy_loss (counterfactual, ...)]" line). Same formula/
+    semantics as that end-of-run line (see this file's own module
+    docstring) -- just sliced to one epoch's minibatches via the same
+    _epoch_slice_start window [policy]/[policy percentiles] already use,
+    instead of averaged over the whole update."""
+
+    def test_logged_every_epoch_with_every_active_head_finite(self, caplog):
+        """Masked/frozen/inactive heads are dropped from this line too (see
+        TestPerHeadPolicyLossBreakdown.test_log_line_lists_every_active_head_with_finite_values's
+        own docstring for why -- same PPOTrainer._inactive_head_lp_keys
+        filter, same rationale)."""
+        trainer = PPOTrainer.from_config()
+        env = _make_env()
+        buffer, last_obs = _collect_rollout(env, trainer, _ROLLOUT_STEPS)
+        inactive = trainer._inactive_head_lp_keys()
+        active_keys = [k for k in HEAD_LP_KEYS if k not in inactive]
+
+        with caplog.at_level("INFO"):
+            _run_ppo_update(trainer, buffer, last_obs)
+
+        n_epoch_lines = sum(
+            1 for r in caplog.records if r.message.startswith("  == epoch ")
+        )
+        assert n_epoch_lines >= 1, "no epoch ran -- test is vacuous"
+        lines = [
+            r.message for r in caplog.records
+            if r.message.strip().startswith("[policy heads]")
+        ]
+        # <= n_epoch_lines since KL early-stop can cut the epoch loop short
+        # partway through a minibatch, same caveat as the percentile line.
+        assert len(lines) == n_epoch_lines, (
+            f"expected one per-head line per epoch that actually ran "
+            f"({n_epoch_lines}), got {len(lines)}"
+        )
+
+        for line in lines:
+            body = line.split("]", 1)[1].strip()
+            parsed_keys = []
+            for token in body.split("  "):
+                if not token:
+                    continue
+                key, val_str = token.split("=")
+                assert key in HEAD_LP_KEYS, f"unexpected head {key!r} in: {line}"
+                assert math.isfinite(float(val_str)), f"{key}={val_str} is not finite"
+                parsed_keys.append(key)
+            assert sorted(parsed_keys) == sorted(active_keys), (
+                f"expected exactly the active heads, no masked/frozen ones -- "
+                f"got={sorted(parsed_keys)} expected={sorted(active_keys)}"
+            )
+
+
+class TestRolloutSummaryEntropyDropsInactiveHeads:
+    """The "[PPO] ... entropy  shoot=... move_dir=..." breakdown line inside
+    _log_rollout_summary's multi-line rollout summary -- same
+    PPOTrainer._inactive_head_lp_keys filter as the per-head KL/policy_loss
+    lines above, applied to metrics['entropy_breakdown'] before building
+    the display string. Unlike KL/policy_loss (which are only ever
+    approximately or artifactually zero for a masked head), entropy for a
+    masked head is an intentional, exact 0.0 set inside _compute_entropy
+    itself (see that method's own docstring) -- still dropped rather than
+    shown, since a guaranteed-0.0 entry for an untrained head is exactly as
+    uninformative as the KL/policy_loss cases.
+
+    Calls _log_rollout_summary directly with a REAL metrics dict (from an
+    actual _ppo_update() call, so entropy_breakdown is real data, not
+    hand-built) and empty/trivial values for the other rollout-bookkeeping
+    params -- the same empty initial forms train()'s own loop uses before
+    any episode has completed this rollout (episode_rewards=[], etc.), so
+    this exercises an already-load-bearing code path, not a synthetic edge
+    case."""
+
+    def test_entropy_breakdown_state_omits_inactive_heads(self, caplog):
+        """Asserts on trainer._prev_entropy_breakdown (the ALREADY-FILTERED
+        dict _log_rollout_summary stores right after building the display
+        string -- see that method's own "_prev_entropy_breakdown = dict(
+        _ent_bkdn)" line) rather than parsing the rendered multi-line log
+        text: the "heads" section a few lines below entropy in the same
+        rollout summary reuses several of the SAME short names (move=,
+        exec_move=, sprint=) for a completely different metric (action-
+        taken proportions), so scanning the combined message's raw text for
+        "key=value" tokens can't reliably tell the two sections apart.
+        Asserting on the dict that's the direct input to string-building
+        tests the actual filtering behavior without that ambiguity."""
+        trainer = PPOTrainer.from_config()
+        env = _make_env()
+        buffer, last_obs = _collect_rollout(env, trainer, _ROLLOUT_STEPS)
+        inactive = trainer._inactive_head_lp_keys()
+        assert inactive, (
+            "expected at least kick_spin to be permanently frozen -- if this "
+            "changed, _kick_spin_frozen's default changed too, update this test"
+        )
+
+        metrics = _run_ppo_update(trainer, buffer, last_obs)
+        assert metrics.get("entropy_breakdown"), "fixture produced no entropy_breakdown -- test is vacuous"
+        active_keys = [k for k in HEAD_LP_KEYS if k not in inactive]
+
+        with caplog.at_level("INFO"):
+            trainer._log_rollout_summary(
+                metrics=metrics, steps_per_sec=1.0,
+                episode_rewards=[], secondary_episode_rewards=[],
+                episode_outcomes_vs_rules=[], episode_outcomes_vs_immobile=[],
+                episode_outcomes_vs_neural=[], rollout_components={},
+                episode_comp_list=[], episode_durations_s=[],
+                comp_step_stats={}, n_reward_comp_steps=0,
+            )
+
+        assert trainer._prev_entropy_breakdown is not None, (
+            "_log_rollout_summary should have set _prev_entropy_breakdown "
+            "from a non-empty entropy_breakdown"
+        )
+        assert sorted(trainer._prev_entropy_breakdown.keys()) == sorted(active_keys), (
+            f"expected exactly the active heads, no masked/frozen ones -- "
+            f"got={sorted(trainer._prev_entropy_breakdown.keys())} expected={sorted(active_keys)}"
+        )
+        for k in inactive:
+            assert k not in trainer._prev_entropy_breakdown
+
+        # Sanity check the rendered log text too (loosely): at least one
+        # active head's own entropy value should appear literally, and the
+        # combined message should exist -- doesn't try to delineate exact
+        # line boundaries (see docstring above), just confirms something
+        # was actually logged.
+        _lines = [r.message for r in caplog.records if "[PPO] step=" in r.message]
+        assert len(_lines) == 1
+        _sample_key = active_keys[0]
+        _sample_val = f"{trainer._prev_entropy_breakdown[_sample_key]:.4f}"
+        assert f"{_sample_key}={_sample_val}" in _lines[0]

@@ -633,6 +633,75 @@ State (`_trainee_pending_loss` / `_sec_pending_loss` dicts) persists across
 `step()` calls, not just within one, mirroring `_trainee_had_possession_last_step`
 / `_sec_had_possession_last_step`.
 
+**Armed-kick auto-fire possession touch (fixed -- was previously invisible)**:
+`Match._update_loose_ball_pickup`'s armed-kick branch grants possession
+(`self._set_possession(player.player_id)`) then immediately fires the kick,
+whose `_release_kick` sets `ball.possessed_by = None` again -- BOTH within
+the same physics tick. `ScenarioEnv.step()`'s possession-transition scan
+only sampled `match.ball.possessed_by` once per tick (after the tick fully
+resolved), so this real, if momentary, touch was completely invisible --
+not "cancelled via pending_loss" like a genuine same-tick regrab, just
+never observed at all (`possessed_by` read `None` both before and after
+that tick). Fixed by detecting the armed auto-fire via the SAME
+`kicked_this_tick and kick_armed` combination `trainee_armed_kicks_this_step`/
+`sec_armed_kicks_this_step` already check (`kick_armed` is never touched by
+`_finish_kick`, so it still reads True at this point iff this tick's kick
+came from the armed path -- never true for an already-possessing instant
+kick, since `apply_nn_action.py`'s kick branch is exclusive) and feeding a
+synthetic `possessed_by=this player` sample through
+`_possession_transition_step` FIRST (registering the gain) before the real
+end-of-tick sample (registering the subsequent loss/pending-loss) --
+`_possession_transition_step` itself is unchanged, this just calls it one
+extra time for the tick a touch happened. See
+`tests/ai_unit/test_possession_transition_step.py`'s
+`TestArmedKickAutoFireWithinOneTick`.
+
+**Augmentation log_prob approximation (fixed -- was a real, uncontrolled
+noise source)**: `ai/obs/augment.py`'s `augment_batch()` tiles `log_probs`/
+`head_log_probs` from the original (s, a) pair onto every augmented copy,
+unchanged. Exact for slot-permutation copies (permutation invariance means
+`log π(perm(a)|perm(s)) == log π(a|s)` identically), but only an
+APPROXIMATION for flip_y copies: the tiled value equals the true
+`π_old(flip(a)|flip(s))` only once the network has already learned exact
+flip-equivariance, and is off by a real, uncontrolled ratio-scaling factor
+otherwise -- confirmed via the epoch-0 baseline diagnostic
+(`log_epoch_zero_baseline`): the augmented TRAIN batch's own
+`[policy percentiles]` line read p100 in the 20s at ratio=1 (no gradient
+step yet this update), while a same-rollout, never-augmented held-out
+batch read single digits.
+
+Initially defended (in this file and in `augment.py`'s own docstring) as a
+deliberate "provides a gradient signal toward equivariance" mechanism --
+on closer, more rigorous derivation this doesn't hold up. The gradient
+DIRECTION an augmented row contributes is `d(new_log_prob)/dtheta`, which
+depends only on the current weights and the (already-correctly-flipped)
+input `(s', a')` -- NOT on which `old_log_prob` constant is subtracted
+from it in the ratio's exponent (that constant doesn't depend on theta
+either way). Only the MAGNITUDE differs between the tiled (borrowed) value
+and the true one. Whatever teaches the network the y-flip symmetry comes
+from training on the correctly-flipped `(s', a', A)` sample at all, with
+its own correctly-signed advantage -- both the tiled and the proper
+version do this identically; the tiled version just also multiplies the
+update by an uncontrolled, non-equivariance-dependent factor on top,
+which is noise, not signal.
+
+Fixed via `PPOTrainer._recompute_old_log_probs_for_augmented_batch()`,
+called from `_ppo_update()` immediately after `augment_batch()` (and after
+the physics-encoder full-feature precompute, which it depends on) --
+safe specifically because the network is still exactly theta_old at that
+point in the call, before any gradient step. Reuses the SAME
+`_recompute_log_prob`/`_per_head_new_log_probs` helpers the real
+per-minibatch training loop and `_eval_val_episode_losses` already use, so
+no new masking/formula logic was introduced -- confirmed consistent with
+the ORIGINAL rollout-time log_prob via the held-out epoch-0 baseline
+already reading an exact 0.0000 (proving `_recompute_log_prob`'s formula
+already matches however the original scalar was stored, for the
+never-augmented held-out rows). Only meaningful when
+`augment_n_slot_shuffles > 0`; recomputes ALL rows (identity copies
+included) rather than special-casing just the flip_y half, since the
+identity copies' recomputed value is provably identical to what they
+already had.
+
 ### Player event callbacks
 
 `Player` has two optional callbacks set on the instance:
@@ -852,6 +921,38 @@ segmentation defensively even though it's never actually fed a multi-track
 buffer today (value-pretrain rollout collection never records secondary
 transitions) — kept consistent so it doesn't become the same landmine if
 that changes later.
+
+**"unknown" outcome bucket (`value_mse_by_outcome()`, PPO side)**: same root
+cause SHAPE as the per-track bugs above (a kwarg threaded through the
+trainee's `buffer.add()` call but silently omitted from the secondary-player
+one), different field. `RolloutBuffer.add()`'s `step_outcome` param was only
+ever passed at the trainee's own call site in `ppo_trainer.py`/
+`rollout_worker.py`/`batched_rollout_worker.py` — every secondary-player
+`buffer.add()` call silently took the `""` default, and
+`env.last_secondary_results` never even carried an outcome field to source
+it from.
+
+`_backfill_step_outcomes()` (propagates a done=1 row's real outcome onto
+every earlier row of that same episode) could not rescue these: it scans
+the flat, `track_id`-unaware `dones`/`step_outcomes` lists, and only
+backfills a done=1 row's OWN preceding span `if outcome:` at THAT row's own
+slot. On a terminal tick, the trainee's row (added first, correctly
+labeled) triggers a backfill that correctly recovers every earlier row of
+the episode (both tracks, since they're interleaved before it) — but each
+secondary player's OWN terminal-tick row, appended immediately after in the
+same tick, independently also has `done=1.0` with an empty `step_outcome`
+slot, so the backfill finds nothing to propagate and skips it. Every
+secondary player's terminal-tick row therefore permanently leaked into
+`value_mse_by_outcome()`'s fabricated `"unknown"` bucket — exactly the
+"no legitimate unknown, all are bugs to fix at the source" case
+`DemonstrationDataset.row_outcomes()` already documents for the BC side
+(`ai/bc/dataset.py`), just not enforced here.
+
+Fixed by threading the shared, env-level `info.trial_outcome` (one trial
+ends the same way for every player on the pitch at once — never
+player-specific) into `last_secondary_results["step_outcome"]`
+(`scenario_env.py`), then passing `step_outcome=sec.get("step_outcome", "")`
+at all 3 secondary `buffer.add()` call sites, mirroring the trainee's own.
 
 ## Critical design rules
 

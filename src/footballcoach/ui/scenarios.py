@@ -2359,6 +2359,11 @@ class ScenarioLoop:
     )
     _pending_outcome: str | None = field(default=None, init=False, repr=False)
     _linger_remaining_s: float = field(default=0.0, init=False, repr=False)
+    # {player_id: terminal-only reward approximation}, snapshotted the
+    # instant _pending_outcome is set (see _compute_terminal_rewards) --
+    # None for non-phase-1 scenarios. Read by the UI during linger; see
+    # ai/env/reward.py's phase1_terminal_reward_only().
+    _pending_terminal_rewards: dict[str, float] | None = field(default=None, init=False, repr=False)
 
     def __post_init__(self) -> None:
         # Pre-seed every raw outcome key at 0 so consumers (app.py's HUD
@@ -2382,6 +2387,7 @@ class ScenarioLoop:
         self._ball_released = False
         self._pending_outcome = None
         self._linger_remaining_s = 0.0
+        self._pending_terminal_rewards = None
 
     def _apply_remap(self, outcome: str) -> str:
         if self.definition.outcome_remap is not None:
@@ -2389,6 +2395,78 @@ class ScenarioLoop:
                 self._match, outcome, self._match.ball.last_touched_by_player_id,
             )
         return outcome
+
+    def _ball_dist_to_box(self, player_id: str) -> float:
+        """2D shortest distance from the ball to *player_id*'s ATTACKING
+        box -- mirrors ScenarioEnv._ball_dist_to_opponent_box()'s formula
+        exactly (same rx_min/rx_max/half_box_w rectangle-distance calc), for
+        the "prox" term in phase1_terminal_reward_only(). Not cached (unlike
+        that method) since this only ever runs once per trial, at the
+        instant its outcome is detected."""
+        try:
+            player = self._match.player_by_id(player_id)
+            ball = self._match.ball.position
+            pitch = self._match.pitch
+            half_box_w = pitch.box_width_m / 2.0
+            if player.team == Team.LEFT:
+                rx_min, rx_max = pitch.half_length - pitch.box_length_m, pitch.half_length
+            else:
+                rx_min, rx_max = -pitch.half_length, -pitch.half_length + pitch.box_length_m
+            dx = max(rx_min - ball.x, 0.0, ball.x - rx_max)
+            dy = max(-half_box_w - ball.y, 0.0, ball.y - half_box_w)
+            return float(math.hypot(dx, dy))
+        except (KeyError, AttributeError):
+            return 9999.0
+
+    def _compute_terminal_rewards(self, outcome: str) -> dict[str, float] | None:
+        """Terminal-only reward approximation for both named phase-1 roles
+        ("trainee" and "opponent" -- see phase1_terminal_reward_only()),
+        computed from the CURRENT self._match/self._trial_tick state (the
+        true final tick -- caller must call this before linger starts
+        stepping the match further). None for non-phase-1 scenarios.
+
+        Known limitation: if this scenario's outcome_remap() maps
+        box_possession/opponent_box_possession/timeout to something else,
+        this can't recognise it and silently falls through to "no terminal
+        component fires" (step/stam/ill only) for that trial -- a safe
+        degradation, not a crash, but see phase1_terminal_reward_only()'s
+        own docstring for why this is an approximation regardless.
+        """
+        trainee_id = self.definition.phase1_trainee_player_id
+        if trainee_id is None:
+            return None
+        from footballcoach.ai.config import load_ai_config
+        from footballcoach.ai.env.reward import phase1_terminal_reward_only
+        cfg = load_ai_config()["reward"]["phase1"]
+        match = self._match
+        toucher_id = match.ball.last_touched_by_player_id
+        timed_out = self._trial_tick >= self.timeout_ticks
+        time_frac = max(0.0, 1.0 - (self._trial_tick / max(self.timeout_ticks, 1)))
+        out: dict[str, float] = {}
+        for role_id in (trainee_id, "opponent"):
+            try:
+                player = match.player_by_id(role_id)
+            except KeyError:
+                continue
+            is_trainee = role_id == trainee_id
+            reached_box = outcome == ("box_possession" if is_trainee else "opponent_box_possession")
+            opp_reached_box = outcome == ("opponent_box_possession" if is_trainee else "box_possession")
+            ball_out = outcome in ("miss", "goal") and toucher_id == role_id
+            last_transition = getattr(player.ai, "last_transition", None)
+            illegal = bool(last_transition and last_transition.get("illegal_action", False))
+            total, _comps = phase1_terminal_reward_only(
+                reached_opponent_box_with_possession=reached_box,
+                opponent_reached_trainee_box=opp_reached_box,
+                timed_out=timed_out,
+                ball_went_out_after_touch=ball_out,
+                illegal_action_attempted=illegal,
+                cfg=cfg,
+                time_fraction_remaining=time_frac,
+                ball_dist_to_opponent_box_m=self._ball_dist_to_box(role_id),
+                stamina_used=1.0 - player.stamina,
+            )
+            out[role_id] = total
+        return out
 
     @property
     def last_completed_trial_toucher_id(self) -> str | None:
@@ -2493,6 +2571,10 @@ class ScenarioLoop:
             outcome = None
         if outcome is not None:
             outcome = self._apply_remap(outcome)
+            # Snapshot the terminal reward HERE, at the true final tick --
+            # not after linger, which keeps stepping self._match forward
+            # (ball settling/rolling) and would measure the wrong instant.
+            self._pending_terminal_rewards = self._compute_terminal_rewards(outcome)
             if linger > 0.0:
                 self._pending_outcome = outcome
                 self._linger_remaining_s = linger

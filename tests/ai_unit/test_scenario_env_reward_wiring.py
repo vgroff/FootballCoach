@@ -194,6 +194,81 @@ class TestPhase1RewardWiring:
         player.on_tackle(player)
         assert env._trainee_tackle_attempt_count == 2
 
+    def test_kick_armed_forwarded_into_karm_component(self):
+        """player_obj.kick_armed must be forwarded into phase1_reward()'s
+        'karm' component -- same class of wiring bug as tackle_armed/tack
+        above, see reward.py's 'karm' docstring."""
+        env = _make_env()
+        env._reward_cfg["phase1"] = {
+            **env._reward_cfg["phase1"],
+            "kick_armed_penalty_per_second": -0.2,
+        }
+        env.reset()
+        match = env._loop.match
+        player = match.player_by_id("trainee")
+        player.kick_armed = True
+
+        _, comps, _ = env._compute_phase1_reward_for_player(
+            player_id="trainee", player_obj=player, ball_pos=match.ball.position,
+            start_stamina=env._trainee_start_stamina,
+            prev_ball_dist=1.0, curr_ball_dist=1.0,
+            has_possession_now=False, gained_possession_this_step=False,
+            lost_possession_this_step=False, ball_progress_toward_goal_m=0.0,
+            ball_went_out_after_touch=False, illegal_action_attempted=False,
+            reached_opponent_box_with_possession=False,
+            opponent_reached_trainee_box=False, timed_out=False, episode_done=False,
+        )
+        assert comps["karm"] < 0.0, (
+            f"'karm' component is {comps['karm']} -- expected a nonzero penalty "
+            "with player_obj.kick_armed=True. If this is 0.0, kick_armed is "
+            "not being forwarded from _compute_phase1_reward_for_player() into "
+            "phase1_reward()."
+        )
+
+    def test_kick_attempted_and_armed_forwarded_into_katt_component(self):
+        """kick_attempted_this_step AND kick_attempt_was_armed_this_step
+        must both be forwarded into phase1_reward()'s 'katt' component --
+        and 'katt' must stay zero when attempted is true but armed is
+        false (the ordinary in-possession-kick case this gate exists for,
+        see reward.py's 'katt' docstring)."""
+        env = _make_env()
+        env._reward_cfg["phase1"] = {
+            **env._reward_cfg["phase1"],
+            "kick_armed_penalty_per_second": -0.2,
+            "kick_attempt_bonus_multiplier": 1.0,
+        }
+        env.reset()
+        match = env._loop.match
+        player = match.player_by_id("trainee")
+
+        _base_kwargs = dict(
+            player_id="trainee", player_obj=player, ball_pos=match.ball.position,
+            start_stamina=env._trainee_start_stamina,
+            prev_ball_dist=1.0, curr_ball_dist=1.0,
+            has_possession_now=False, gained_possession_this_step=False,
+            lost_possession_this_step=False, ball_progress_toward_goal_m=0.0,
+            ball_went_out_after_touch=False, illegal_action_attempted=False,
+            reached_opponent_box_with_possession=False,
+            opponent_reached_trainee_box=False, timed_out=False, episode_done=False,
+        )
+        _, comps_armed, _ = env._compute_phase1_reward_for_player(
+            **_base_kwargs, kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True,
+        )
+        assert comps_armed["katt"] > 0.0, (
+            f"'katt' component is {comps_armed['katt']} -- expected a nonzero bonus "
+            "with kick_attempted_this_step=True and kick_attempt_was_armed_this_step=True. "
+            "If this is 0.0, those flags are not being forwarded from "
+            "_compute_phase1_reward_for_player() into phase1_reward()."
+        )
+        _, comps_unarmed, _ = env._compute_phase1_reward_for_player(
+            **_base_kwargs, kick_attempted_this_step=True, kick_attempt_was_armed_this_step=False,
+        )
+        assert comps_unarmed["katt"] == 0.0, (
+            f"'katt' component is {comps_unarmed['katt']} -- expected exactly 0.0 for an "
+            "ordinary (unarmed) kick attempt. If this is nonzero, "
+            "kick_attempt_was_armed_this_step is not gating 'katt'."
+        )
+
     def test_stamina_penalty_nonzero_on_episode_done_when_stamina_used(self):
         """'stam' must reflect actual stamina drop on episode_done=True --
         prior to the fix, stamina_used was never forwarded so 'stam' was

@@ -891,6 +891,24 @@ class App:
         hint = self.renderer.hud_font.render("Esc to quit", True, style.HUD_TEXT)
         self.surface.blit(hint, (60, self.camera.screen_height - 40))
 
+    def _value_prediction_line(self) -> str | None:
+        """One HUD line with every NeuralPlayerAI-controlled player's latest
+        value-head prediction -- e.g. "Value: trainee +0.42  opponent -0.10".
+
+        ``last_transition["value"]`` is already computed every real decision
+        by NeuralPlayerAI.apply() (rules_ai.py) for both live-play display
+        and PPO rollout collection alike -- this just reads it, no extra
+        forward pass. None (no line added) when no player has a neural
+        controller yet, or no decision has happened yet this trial.
+        """
+        from footballcoach.rules_ai import NeuralPlayerAI
+        parts = []
+        for player in self.match.players:
+            ai = getattr(player, "ai", None)
+            if isinstance(ai, NeuralPlayerAI) and ai.last_transition is not None:
+                parts.append(f"{player.player_id} {ai.last_transition['value']:+.2f}")
+        return "Value: " + "  ".join(parts) if parts else None
+
     def _draw_match(self) -> None:
         assert self.match is not None and self.input_controller is not None
         if self.camera.zoomed:
@@ -987,6 +1005,9 @@ class App:
                 hud_lines.append(f"Selected: {selected_id}  [{mode.name} mode - Esc cancels]")
             else:
                 hud_lines.append(f"Selected: {selected_id}")
+        value_line = self._value_prediction_line()
+        if value_line is not None:
+            hud_lines.append(value_line)
         self.renderer.draw_hud_text(self.surface, hud_lines)
         self._draw_help_button()
         self._speed_minus_rect, self._speed_plus_rect = self.renderer.draw_speed_control(
@@ -1007,9 +1028,11 @@ class App:
             total = loop.linger_s * 0.5 if loop._pending_outcome == "miss" else loop.linger_s
             self.game_log.linger_frac = loop._linger_remaining_s / max(total, 0.001)
             self.game_log.linger_outcome = loop._pending_outcome
+            self.game_log.linger_rewards = loop._pending_terminal_rewards
         else:
             self.game_log.linger_frac = 0.0
             self.game_log.linger_outcome = None
+            self.game_log.linger_rewards = None
         self.renderer.draw_game_log(self.surface, self.game_log, self.log_min_level, mouse_pos=pygame.mouse.get_pos())
         if self._pause_notification:
             self.renderer.draw_pause_notification(self.surface, self._pause_notification)

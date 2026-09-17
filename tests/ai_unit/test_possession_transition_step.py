@@ -126,6 +126,59 @@ class TestPossessionTransitionStep:
         assert pending_loss is False
 
 
+class TestArmedKickAutoFireWithinOneTick:
+    """ScenarioEnv.step()'s NEW calling pattern for an armed-kick auto-fire
+    (Match._update_loose_ball_pickup grants possession then Player.
+    kick_with_direction's _release_kick immediately releases it again,
+    BOTH within the same physics tick): a synthetic "possessed_by=this
+    player" sample is fed through FIRST (registering the momentary gain),
+    then the real end-of-tick sample (None, since it was just kicked away)
+    -- two calls representing what happened within one tick, since a
+    single end-of-tick poll would see None before and after and miss the
+    touch entirely. The state machine itself doesn't know about tick
+    boundaries, so this is the same math test_loss_to_loose_ball_defers_counting
+    already proves correct for a gain-then-loose sequence across two real
+    ticks -- this class just documents/locks in the SAME-TICK usage."""
+
+    def test_synthetic_touch_then_release_registers_gain_and_pending_loss(self):
+        poss_prev, pending_loss, gained, lost = False, False, 0, 0
+        # Synthetic touch (the momentary grant _update_loose_ball_pickup
+        # made, invisible to a real possessed_by poll).
+        poss_prev, pending_loss, gained, lost = _step(
+            "p1", "p1", poss_prev, pending_loss, gained, lost,
+        )
+        assert gained == 1
+        # Real end-of-tick sample: kicked away, ball now loose.
+        poss_prev, pending_loss, gained, lost = _step(
+            "p1", None, poss_prev, pending_loss, gained, lost,
+        )
+        assert poss_prev is False
+        assert pending_loss is True
+        assert gained == 1
+        assert lost == 0, "not yet a confirmed loss -- p1 (or anyone) might still resolve it"
+
+    def test_same_player_recollecting_after_own_micro_kick_nets_to_zero(self):
+        """The common case in practice: a near-zero-power armed kick barely
+        moves the ball, so the SAME player recollects it almost immediately
+        -- net effect across the whole sequence must be a complete no-op
+        (matches test_loose_ball_regained_by_same_player_cancels_silently's
+        existing invariant), not a spurious gained+lost pair."""
+        poss_prev, pending_loss, gained, lost = False, False, 0, 0
+        poss_prev, pending_loss, gained, lost = _step(  # synthetic touch
+            "p1", "p1", poss_prev, pending_loss, gained, lost,
+        )
+        poss_prev, pending_loss, gained, lost = _step(  # real release
+            "p1", None, poss_prev, pending_loss, gained, lost,
+        )
+        poss_prev, pending_loss, gained, lost = _step(  # next tick: p1 recollects
+            "p1", "p1", poss_prev, pending_loss, gained, lost,
+        )
+        assert poss_prev is True
+        assert pending_loss is False
+        assert gained == 1, "one real gain (the initial touch), not two"
+        assert lost == 0
+
+
 class TestSymmetricTwoPlayerSequence:
     """Mirrors scenario_env.py's REAL calling pattern: _possession_transition_step
     is called ONCE PER PLAYER PER TICK (independently, own counters), all

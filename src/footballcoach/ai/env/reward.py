@@ -143,6 +143,38 @@ breaks the total down by source key:
           (Match._check_head_on_tackles, on_auto_tackle_result) -- that path
           never touches tackle_armed and isn't an intentional action this
           reward is trying to shape.
+  karm  — kick-armed cost. Same shape as "tack": kick_armed_penalty_per_second
+          * decision_interval_s whenever kick_armed was set this step, 0
+          otherwise. kick_armed (Player, entities/player.py) is set while
+          chasing a loose ball with a committed kick direction/power
+          (apply_nn_action.py's kick-handling branch, only reached when the
+          player does NOT yet have the ball) -- structurally identical
+          "commit now, resolve on contact" pattern as tackle_armed, engine
+          auto-fires on first touch (Match._update_loose_ball_pickup). No
+          possessing-multiplier equivalent to tackle's own: kick_armed can
+          never be true while ALSO possessing (apply_nn_action.py's
+          if/else is exclusive -- already possessing takes the immediate-
+          kick branch instead, which never touches kick_armed), so that
+          extra-bad case tackle guards against doesn't apply here.
+  katt  — kick-attempted bonus. Same flat shape as "tatt":
+          abs(kick_armed_penalty_per_second) * decision_interval_s *
+          kick_attempt_bonus_multiplier when kick_attempted_this_step is
+          true this decision step, same regardless of how long (if at all)
+          it was armed for first -- not scaled by chase length, exactly
+          matching "tatt" paying the same whether a tackle resolved
+          instantly or after a long chase. UNLIKE "tatt", this is gated on
+          kick_attempt_was_armed_this_step (0 unless the SPECIFIC kick that
+          fired this step came from the armed path, i.e. Player.kick_armed
+          was still true the instant it fired -- see
+          ScenarioEnv._compute_phase1_reward_for_player's kick-scan
+          comment) -- an ordinary kick while already in possession never
+          paid any "karm" cost in the first place, so paying "katt" for it
+          too would be a pure, uncommitted freebie rather than offsetting a
+          genuine risky chase the way "tatt" offsets "tack" for tackle.
+          Deliberately keeps this asymmetry from tackle rather than trying
+          to force a 1:1 analogy: kicking has a real zero-cost, zero-
+          commitment path (already possessing) that tackling structurally
+          does not.
 """
 from __future__ import annotations
 
@@ -225,6 +257,9 @@ def phase1_reward(
     is_sprinting: bool = False,
     tackle_armed: bool = False,
     tackle_attempted_this_step: bool | int = False,
+    kick_armed: bool = False,
+    kick_attempted_this_step: bool | int = False,
+    kick_attempt_was_armed_this_step: bool | int = False,
     decision_interval_s: float = 0.0,
     episode_done: bool = False,
     prog_reward_clamp: float | None = None,
@@ -429,7 +464,86 @@ def phase1_reward(
     r += tatt_r
     comps["tatt"] = tatt_r
 
+    # Kick-armed cost -- see "karm" in the module docstring. Same shape as
+    # "tack" above, no possessing-multiplier equivalent (kick_armed can
+    # never be true while possessing -- see that docstring entry).
+    _karm_coef = float(cfg.get("kick_armed_penalty_per_second", 0.0))
+    karm_r = 0.0
+    if kick_armed and _karm_coef != 0.0:
+        karm_r = _karm_coef * decision_interval_s
+    r += karm_r
+    comps["karm"] = karm_r
+
+    # Kick-attempted bonus -- see "katt" in the module docstring. Same flat
+    # shape as "tatt" (reuses kick_armed_penalty_per_second's own magnitude
+    # as its base rate, flipped positive, scaled by
+    # kick_attempt_bonus_multiplier), but ALSO gated on
+    # kick_attempt_was_armed_this_step -- unlike tackle, kicking has a
+    # zero-cost/zero-commitment path (already possessing) that never paid
+    # any "karm" cost, so it must not also collect "katt".
+    _katt_base = abs(float(cfg.get("kick_armed_penalty_per_second", 0.0)))
+    katt_r = 0.0
+    if kick_attempted_this_step and kick_attempt_was_armed_this_step and _katt_base != 0.0:
+        _katt_mult = float(cfg.get("kick_attempt_bonus_multiplier", 1.0))
+        katt_r = _katt_base * decision_interval_s * _katt_mult
+    r += katt_r
+    comps["katt"] = katt_r
+
     return r, comps, cumulative_state_after
+
+
+def phase1_terminal_reward_only(
+    *,
+    reached_opponent_box_with_possession: bool,
+    opponent_reached_trainee_box: bool,
+    timed_out: bool,
+    ball_went_out_after_touch: bool,
+    illegal_action_attempted: bool,
+    cfg: dict,
+    time_fraction_remaining: float = 0.0,
+    ball_dist_to_opponent_box_m: float = 9999.0,
+    stamina_used: float = 0.0,
+) -> tuple[float, dict[str, float]]:
+    """Approximate a phase-1 episode's reward using ONLY phase1_reward()'s
+    TERMINAL-gated components (box/spd, lterm, tout/prox, out) plus the
+    always-on step/stam/ill point-reads -- for callers that only have the
+    final-tick state and none of the continuous per-tick running state
+    (prev_ball_dist deltas, cumulative_state, possession-transition counts,
+    kick/tackle-armed flags, ...) the OTHER components need. Every per-tick
+    shaping term (appr/retr/appr_sq/hdg/poss/prog/sprint/tack/tatt/karm/katt)
+    is fed a neutral input below so it always contributes exactly 0 --
+    NOT computed and subtracted out, simply never triggered.
+
+    Intended for the UI's live scenario view (``ScenarioLoop``, which never
+    routes through ``ScenarioEnv`` and so never tracks that per-tick state --
+    see ``ai/knowledge.md``), to show a rough "what did this episode's
+    ending actually pay out" number during the post-trial linger. This is
+    NOT the real per-episode training reward (the sum of every per-tick
+    shaping term across the whole episode) -- just this one terminal
+    snapshot's contribution, useful for sanity-checking the terminal/outcome
+    coefficients by eye, not for comparing against training logs.
+    """
+    total, comps, _ = phase1_reward(
+        prev_ball_dist=0.0, curr_ball_dist=0.0,
+        has_possession_now=False, gained_possession_this_step=0,
+        ball_progress_toward_goal_m=0.0,
+        ball_went_out_after_touch=ball_went_out_after_touch,
+        illegal_action_attempted=illegal_action_attempted,
+        reached_opponent_box_with_possession=reached_opponent_box_with_possession,
+        cfg=cfg,
+        time_fraction_remaining=time_fraction_remaining,
+        opponent_reached_trainee_box=opponent_reached_trainee_box,
+        lost_possession_this_step=0,
+        timed_out=timed_out,
+        ball_dist_to_opponent_box_m=ball_dist_to_opponent_box_m,
+        heading_cos_sim=1.0, player_speed_mps=0.0,
+        stamina_used=stamina_used, is_sprinting=False,
+        tackle_armed=False, tackle_attempted_this_step=False,
+        kick_armed=False, kick_attempted_this_step=False,
+        kick_attempt_was_armed_this_step=False,
+        decision_interval_s=0.0, episode_done=True,
+    )
+    return total, comps
 
 
 def phase2_reward(

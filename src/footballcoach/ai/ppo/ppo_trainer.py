@@ -253,6 +253,8 @@ REWARD_COMP_LABELS: list[tuple[str, str]] = [
     ("sprint", "sprint_penalty"),
     ("tack",  "tackle_armed_penalty"),
     ("tatt",  "tackle_attempted_bonus"),
+    ("karm",  "kick_armed_penalty"),
+    ("katt",  "kick_attempted_bonus"),
 ]
 
 # Execution-network head name -> nn.Module attribute name, used for the
@@ -479,6 +481,17 @@ _LP_HEAD_NAMES: tuple[str, ...] = (
     "shoot_logit", "pass_logit", "move_logit", "tackle_logit",
     "get_possession_raw", "mark_logit", "hold_position_logit",
 )
+
+# _LP_HEAD_NAMES (decision_net attribute names, as returned by
+# PPOTrainer._ppo_lp_masked_heads) -> their short HEAD_LP_KEYS-style name
+# (rollout_buffer.py) -- the per-head diagnostic lines (entropy breakdown,
+# [per-head KL], [per-head policy_loss (counterfactual...)], [policy heads])
+# all key on the short form, so masked-head filtering needs this mapping.
+_LP_HEAD_NAME_TO_SHORT: dict[str, str] = {
+    "shoot_logit": "shoot", "pass_logit": "pass_", "move_logit": "move",
+    "tackle_logit": "tackle", "get_possession_raw": "gp_extra",
+    "mark_logit": "mark", "hold_position_logit": "hold",
+}
 
 
 def _slice_dataclass_row(obj, i: int):
@@ -707,22 +720,41 @@ def _eval_worker_factory_neural_snapshot_batched(
     return env_factory, trainee_trainer, opponent_trainer
 
 
-def _trimmed_mean_p1_p99(x: torch.Tensor) -> float:
-    """Mean of ``x`` after dropping the bottom/top 1% (i.e. keeping only
-    values in [p1, p99]) -- a robust companion to a plain mean, so a
-    handful of extreme outliers (e.g. a rare mis-valued state producing a
-    huge squared-error term) don't single-handedly dominate the reported
-    number the way they can dominate ``value_loss``'s straight mean. Same
-    motivation as the policy_loss percentile lines elsewhere in this file,
-    just collapsed to one robust scalar instead of a full percentile
-    spread. Returns ``nan`` for an empty input."""
+def _trimmed_mean(x: torch.Tensor, lo_q: float, hi_q: float) -> float:
+    """Mean of ``x`` after dropping values outside ``[quantile(lo_q),
+    quantile(hi_q)]`` -- a robust companion to a plain mean, so a handful of
+    extreme outliers (e.g. a rare mis-valued state producing a huge
+    squared-error term, or a ratio-spike row) don't single-handedly
+    dominate the reported number. Returns ``nan`` for an empty input.
+    Shared core for ``_trimmed_mean_p10_p90``/``_trimmed_mean_p10_p75``
+    below -- see those for the specific cuts actually logged."""
     if x.numel() == 0:
         return float("nan")
-    lo = x.quantile(0.01)
-    hi = x.quantile(0.99)
+    lo = x.quantile(lo_q)
+    hi = x.quantile(hi_q)
     mask = (x >= lo) & (x <= hi)
     trimmed = x[mask]
     return float(trimmed.mean()) if trimmed.numel() > 0 else float(x.mean())
+
+
+def _trimmed_mean_p10_p90(x: torch.Tensor) -> float:
+    """Mean of ``x`` after dropping the bottom/top 10% (i.e. keeping only
+    values in [p10, p90]) -- same motivation as the policy_loss percentile
+    lines elsewhere in this file, just collapsed to one robust scalar
+    instead of a full percentile spread."""
+    return _trimmed_mean(x, 0.10, 0.90)
+
+
+def _trimmed_mean_p25_p75(x: torch.Tensor) -> float:
+    """Mean of ``x`` after dropping the bottom AND top 25% (i.e. the
+    interquartile mean, keeping only values in [p25, p75]) -- a much more
+    aggressive, but symmetric/centered, cut than p10_p90's. Logged alongside
+    p10_p90 (not instead of it) as a second, more heavily-trimmed data
+    point: comparing the two shows whether a metric's mean is dominated by
+    its tails generally (p25_p75 reads much smaller/flatter than p10_p90)
+    or is fairly stable regardless of how aggressively both tails are cut
+    (the two read close together)."""
+    return _trimmed_mean(x, 0.25, 0.75)
 
 
 def _ai_types(obs_dict: dict) -> tuple:
@@ -1278,6 +1310,15 @@ class PPOTrainer:
         # changes what gets trained. 0.0 (default) disables entirely: no
         # split, no held-out rows, _ppo_update behaves exactly as before.
         self.val_episode_fraction = float(ppo_cfg.get("val_episode_fraction", 0.0))
+        # Opt-in (default off -- costs one extra full no-grad pass over the
+        # whole batch, and a second over val_batch when enabled): logs an
+        # "epoch 0" block, in the EXACT same format as every real per-epoch
+        # block below, evaluated under CURRENT weights before epoch 1's
+        # first gradient step touches anything -- a clean ratio=1-exactly
+        # baseline (policy_loss/KL/surrogate trivially ~0 by construction,
+        # but value/entropy/percentiles are real and useful) to diff epoch
+        # 1+ against. See _ppo_update's own comment at the call site.
+        self.log_epoch_zero_baseline = bool(ppo_cfg.get("log_epoch_zero_baseline", False))
         # Dedicated RNG for choosing which episodes are held out each
         # update -- deliberately separate from self._aug_rng (batch
         # augmentation) so enabling/disabling one never shifts the other's
@@ -1720,6 +1761,25 @@ class PPOTrainer:
             and all(not p.requires_grad for p in module.parameters())
         )
 
+    def _inactive_head_lp_keys(self) -> frozenset[str]:
+        """HEAD_LP_KEYS-style short names (rollout_buffer.py) of every head
+        that's currently forced to ratio=1 / zero entropy everywhere --
+        curriculum-frozen decision heads (_ppo_lp_masked_heads, translated
+        via _LP_HEAD_NAME_TO_SHORT) plus kick_spin when permanently frozen
+        (_kick_spin_frozen, a separate flag from the curriculum mask).
+        These heads' per-head diagnostic values are either an exact 0.0000
+        (entropy, KL -- both literally zero when old==new==0) or a
+        content-free "-mean(this slice's advantages)" residual (the
+        counterfactual policy_loss breakdown, since ratio=1 collapses the
+        clipped surrogate to -adv regardless of the head) -- never a real
+        gradient/training signal either way, so every per-head diagnostic
+        line drops these entirely rather than clutter the output with
+        guaranteed-uninformative entries."""
+        keys = {_LP_HEAD_NAME_TO_SHORT[name] for name in self._ppo_lp_masked_heads}
+        if self._kick_spin_frozen:
+            keys.add("kick_spin")
+        return frozenset(keys)
+
     def _bc_heads_for_loss(self, d_heads: DecisionHeadsRaw) -> DecisionHeadsRaw:
         """Decision heads to hand to bc_loss_from_tensor() for the BC
         auxiliary loss computed during PPO's own update loop.
@@ -1900,8 +1960,28 @@ class PPOTrainer:
                     reward=sec["reward"],
                     done=sec["done"],
                     bc_label=None,
+                    # Secondary players use the same NeuralPlayerAI as the
+                    # trainee (see rules_ai.py's last_transition, which sets
+                    # "head_log_probs" unconditionally), so this is real
+                    # data, not a placeholder -- omitting it here (as this
+                    # call did until now) silently fell back to
+                    # RolloutBuffer.add()'s all-zero default for every
+                    # secondary/opponent row, corrupting every per-head KL/
+                    # policy_loss diagnostic (which reads batch["head_log_probs"]
+                    # as the "old" baseline) for the majority of rows in any
+                    # curriculum phase with a nonzero phase1_opponent_neural_ratio
+                    # -- the scalar total policy_loss/KL was never affected
+                    # (it reads log_prob, which WAS always passed correctly
+                    # above), only the per-head breakdown lines.
+                    head_log_probs=sec.get("head_log_probs"),
                     weight=self._secondary_weight,
                     track_id=sec["player_id"],
+                    # Shared env-level episode outcome (same for every
+                    # player on the pitch that tick) -- see
+                    # scenario_env.py's last_secondary_results["step_outcome"]
+                    # and ai/knowledge.md "unknown outcome bucket" for why
+                    # omitting this silently corrupted value_mse_by_outcome().
+                    step_outcome=sec.get("step_outcome", ""),
                 )
                 secondary_episode_reward_accum += sec["reward"]
                 if sec["done"]:
@@ -2262,6 +2342,20 @@ class PPOTrainer:
                     if not _vals:
                         continue
                     _arr = np.array(_vals)
+                    # Same "never fired / always exactly zero this rollout"
+                    # skip as the "rew/step" table's own "_cs['mean'] == 0.0
+                    # and _cs['std'] == 0.0" check -- mean==0 and std==0
+                    # together mean every episode's value for this
+                    # component was exactly 0.0, so there's nothing to show.
+                    # Component identity/whether it's config-disabled can
+                    # change between rollouts (a coefficient retuned in
+                    # ai_config.json, a curriculum phase change), so this is
+                    # a per-rollout runtime check, not a permanent removal
+                    # from REWARD_COMP_LABELS -- a component that starts
+                    # firing again just reappears on its own next rollout,
+                    # nothing to keep in sync by hand.
+                    if _arr.mean() == 0.0 and _arr.std() == 0.0:
+                        continue
                     _lbl = _lbl_map.get(_k, _k)
                     _rew_stats_lines.append(
                         f"  {_lbl:<{_col_w}}  {_arr.mean():>+8.3f}  {_arr.std():>7.3f}"
@@ -2285,7 +2379,16 @@ class PPOTrainer:
         # shrink, entropy's constant pull increasingly wins by default with
         # nothing here to anneal it back down. See ai_trainer_knowledge.md
         # "Reading the training log" / entropy-runaway discussion.
-        _ent_bkdn = metrics.get("entropy_breakdown", {})
+        # Masked/frozen/inactive heads (see _inactive_head_lp_keys) are
+        # explicitly zeroed inside _compute_entropy -- a real, exact 0.0000,
+        # not a residual -- but showing a wall of guaranteed-zero entries
+        # here just buries the heads that are actually live. Dropped
+        # entirely rather than displayed as 0.0000.
+        _inactive_heads = self._inactive_head_lp_keys()
+        _ent_bkdn = {
+            k: v for k, v in metrics.get("entropy_breakdown", {}).items()
+            if k not in _inactive_heads
+        }
         if _ent_bkdn:
             _prev = self._prev_entropy_breakdown or {}
             _ent_parts = [
@@ -4746,6 +4849,20 @@ class PPOTrainer:
                     if not _vals:
                         continue
                     _arr = np.array(_vals)
+                    # Same "never fired / always exactly zero this rollout"
+                    # skip as the "rew/step" table's own "_cs['mean'] == 0.0
+                    # and _cs['std'] == 0.0" check -- mean==0 and std==0
+                    # together mean every episode's value for this
+                    # component was exactly 0.0, so there's nothing to show.
+                    # Component identity/whether it's config-disabled can
+                    # change between rollouts (a coefficient retuned in
+                    # ai_config.json, a curriculum phase change), so this is
+                    # a per-rollout runtime check, not a permanent removal
+                    # from REWARD_COMP_LABELS -- a component that starts
+                    # firing again just reappears on its own next rollout,
+                    # nothing to keep in sync by hand.
+                    if _arr.mean() == 0.0 and _arr.std() == 0.0:
+                        continue
                     _lbl = _lbl_map.get(_k, _k)
                     _rew_stats_lines.append(
                         f"  {_lbl:<{_col_w}}  {_arr.mean():>+8.3f}  {_arr.std():>7.3f}"
@@ -6206,7 +6323,7 @@ class PPOTrainer:
 
     def _eval_val_episode_losses(
         self, val_batch: dict, clip: float,
-    ) -> tuple[float, float, float, torch.Tensor, float, float]:
+    ) -> tuple[float, float, float, torch.Tensor, float, float, float, float, float, float, float, Optional[torch.Tensor]]:
         """No-grad policy/value loss + approx KL on held-out episodes, under
         CURRENT weights.
 
@@ -6222,23 +6339,52 @@ class PPOTrainer:
         the train batch's normalisation stats).
 
         Returns ``(policy_loss, value_loss, kl, per_sample_policy_loss,
-        value_loss_p1_p99, policy_loss_p1_p99)``. ``per_sample_policy_loss``
-        is every row's own (pre-mean) clipped-surrogate value, concatenated
-        across minibatches in val_batch's own row order -- lets a caller
-        look at the DISTRIBUTION (percentiles, outliers), not just the
-        mean, the same way _ppo_update's per-epoch percentile line does.
-        ``value_loss_p1_p99``/``policy_loss_p1_p99`` are ``value_loss``/
-        ``policy_loss`` recomputed as a TRIMMED mean (see
-        ``_trimmed_mean_p1_p99``) over per-sample terms, dropping the most
-        extreme 1% on each end -- a robust companion to the plain mean,
-        which a single outlier row can otherwise dominate. See __init__'s
+        value_loss_p10_p90, value_loss_p25_p75, policy_loss_p10_p90,
+        policy_loss_p25_p75, surrogate_mean, surrogate_p10_p90,
+        surrogate_p25_p75, per_head_policy_loss)``.
+        ``per_sample_policy_loss`` is every row's own (pre-mean) clipped-
+        surrogate value, concatenated across minibatches in val_batch's own
+        row order -- lets a caller look at the DISTRIBUTION (percentiles,
+        outliers), not just the mean, the same way _ppo_update's per-epoch
+        percentile line does. ``value_loss_p10_p90``/``policy_loss_p10_p90``
+        (and their ``_p25_p75`` companions) are ``value_loss``/``policy_loss``
+        recomputed as a TRIMMED mean (see ``_trimmed_mean_p10_p90``/
+        ``_trimmed_mean_p25_p75``) over per-sample terms -- p10_p90 drops the
+        most extreme 10% on each end, p25_p75 is the more aggressive,
+        symmetric interquartile mean (drops 25% each end) -- logged
+        alongside each other so a caller can see whether a mean is being
+        dragged by its tails generally (the two read far apart) or is
+        fairly stable regardless of trim aggressiveness (they read close
+        together). Both are robust companions to the plain mean, which a
+        single outlier row can otherwise dominate. See __init__'s
         val_episode_fraction comment / _ppo_update's log line for why
         ``policy_loss``/``kl`` here are NOT meaningful generalization
         diagnostics the way ``value_loss`` is: both collapse toward 0 for
         ANY row that received zero gradient steps (ratio~1), regardless of
-        train/val identity -- ``policy_loss_p1_p99`` inherits that same
-        caveat (it's a robust version of a not-very-meaningful number, not
-        a robust generalization diagnostic on its own).
+        train/val identity -- ``policy_loss_p10_p90``/``policy_loss_p25_p75``
+        inherit that same caveat (robust versions of a not-very-meaningful
+        number, not a robust generalization diagnostic on their own).
+
+        ``surrogate_mean``/``surrogate_p10_p90``/``surrogate_p25_p75`` are
+        the mean/trimmed-means of the UNCLIPPED, no-dual-clip linearised
+        surrogate ``(ratio - 1) * A`` per row -- mathematically
+        ``policy_loss == -surrogate_mean`` exactly whenever the clip and
+        dual-clip floor are both inactive for a row (``mean(A)~=0`` by
+        normalisation), so this is NOT a different signal in the common
+        case -- it's the same quantity with the clip/dual-clip machinery
+        stripped out, so a row whose ratio actually drifted far enough to
+        hit the clip band shows its true magnitude here instead of being
+        floored. See "[held-out policy surrogate]"'s log-line comment in
+        _ppo_update for the fuller rationale.
+
+        ``per_head_policy_loss`` (shape ``(15,)``, ``HEAD_LP_KEYS`` order,
+        ``None`` when ``val_batch`` lacks ``head_log_probs``) is the SAME
+        per-head COUNTERFACTUAL breakdown as the train-side "[per-head
+        policy_loss (counterfactual, ...)]" line (each head's own ratio in
+        isolation, others held at ratio=1, through the same clipped-
+        surrogate + dual-clip formula) -- a counterfactual, not a strict
+        decomposition (sum of the 15 values != policy_loss above, since the
+        real ratio is the PRODUCT of every head's own ratio).
         """
         n_val = len(val_batch["log_probs"])
         val_adv = val_batch["advantages"]
@@ -6253,6 +6399,12 @@ class PPOTrainer:
         total_n = 0
         _per_sample_chunks: list[torch.Tensor] = []
         _per_sample_value_chunks: list[torch.Tensor] = []
+        # Unclipped, no-dual-clip linearised surrogate (r-1)*A for each row --
+        # see "[held-out policy surrogate]"'s own log-line comment below for
+        # why this is a deliberately clip-invariant companion to
+        # val_policy_loss, not a replacement for it.
+        _per_sample_surrogate_chunks: list[torch.Tensor] = []
+        _head_policy_loss_sum: Optional[torch.Tensor] = None  # running (bs-weighted) sum, (15,)
         with torch.no_grad():
             for start in range(0, n_val, self.minibatch_size):
                 idx = torch.arange(start, min(start + self.minibatch_size, n_val))
@@ -6285,6 +6437,9 @@ class PPOTrainer:
                 _mb_min_surr = self._apply_dual_clip(torch.min(surr1, surr2), mb_adv)
                 _mb_per_sample_policy_loss = -_mb_min_surr
                 mb_policy_loss = _mb_per_sample_policy_loss.mean()
+                # (r-1)*A == surr1 - mb_adv -- reuses surr1 rather than
+                # recomputing ratio*mb_adv, cheap either way.
+                _per_sample_surrogate_chunks.append((surr1 - mb_adv).cpu())
                 _mb_per_sample_value_loss = (new_values - mb_ret).pow(2) / val_ret_var
                 mb_value_loss = _mb_per_sample_value_loss.mean()
                 mb_kl = (mb_old_lp - new_log_probs.clamp(min=-1e6)).mean()
@@ -6297,19 +6452,126 @@ class PPOTrainer:
                 total_kl += float(mb_kl) * bs
                 total_n += bs
 
+                # Per-head counterfactual policy_loss breakdown -- same
+                # formula/masking as the train-side all_head_policy_loss
+                # computation (see its own comment in the main minibatch
+                # loop below), just evaluated here under no_grad on the
+                # held-out set instead.
+                if "head_log_probs" in val_batch:
+                    mb_old_head_lp = val_batch["head_log_probs"][idx].to(self.device)
+                    mb_new_head_lp = self._per_head_new_log_probs(d_heads, e_heads, mb_actions, em)
+                    head_ratio = torch.exp(mb_new_head_lp - mb_old_head_lp)
+                    head_adv = mb_adv.unsqueeze(-1)
+                    head_surr1 = head_ratio * head_adv
+                    head_surr2 = torch.clamp(head_ratio, 1.0 - clip, 1.0 + clip) * head_adv
+                    head_min_surr = self._apply_dual_clip(torch.min(head_surr1, head_surr2), head_adv)
+                    head_policy_loss_mb = -head_min_surr.mean(dim=0).cpu()  # (15,)
+                    _head_policy_loss_sum = (
+                        head_policy_loss_mb * bs if _head_policy_loss_sum is None
+                        else _head_policy_loss_sum + head_policy_loss_mb * bs
+                    )
+
         _per_sample_pol_cat = torch.cat(_per_sample_chunks) if _per_sample_chunks else torch.zeros(0)
+        _per_sample_value_cat = (
+            torch.cat(_per_sample_value_chunks) if _per_sample_value_chunks else torch.zeros(0)
+        )
+        _surrogate_cat = (
+            torch.cat(_per_sample_surrogate_chunks) if _per_sample_surrogate_chunks else torch.zeros(0)
+        )
         return (
             total_policy_loss / max(total_n, 1),
             total_value_loss / max(total_n, 1),
             total_kl / max(total_n, 1),
             _per_sample_pol_cat,
-            _trimmed_mean_p1_p99(torch.cat(_per_sample_value_chunks)) if _per_sample_value_chunks else float("nan"),
-            _trimmed_mean_p1_p99(_per_sample_pol_cat) if _per_sample_chunks else float("nan"),
+            _trimmed_mean_p10_p90(_per_sample_value_cat) if _per_sample_value_chunks else float("nan"),
+            _trimmed_mean_p25_p75(_per_sample_value_cat) if _per_sample_value_chunks else float("nan"),
+            _trimmed_mean_p10_p90(_per_sample_pol_cat) if _per_sample_chunks else float("nan"),
+            _trimmed_mean_p25_p75(_per_sample_pol_cat) if _per_sample_chunks else float("nan"),
+            float(_surrogate_cat.mean()) if _per_sample_surrogate_chunks else float("nan"),
+            _trimmed_mean_p10_p90(_surrogate_cat) if _per_sample_surrogate_chunks else float("nan"),
+            _trimmed_mean_p25_p75(_surrogate_cat) if _per_sample_surrogate_chunks else float("nan"),
+            _head_policy_loss_sum / max(total_n, 1) if _head_policy_loss_sum is not None else None,
         )
 
     # -----------------------------------------------------------------------
     # PPO update
     # -----------------------------------------------------------------------
+
+    def _recompute_old_log_probs_for_augmented_batch(
+        self, batch: dict,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """Properly recompute old_log_prob (+ per-head old_log_prob) for
+        EVERY row of an augmented batch, replacing ``augment_batch()``'s
+        cheap "tile the original row's log_prob onto every augmented copy"
+        shortcut.
+
+        Only valid to call here, BEFORE this update's first gradient step:
+        the current weights are still exactly the rollout-collection policy
+        (theta_old), so a forward pass right now gives the TRUE
+        ``log pi_old(action | obs)`` for every row -- flip_y-augmented
+        copies included, not just the identity copies (which already had
+        this correct by construction, since nothing about them changed).
+
+        Why this replaces the tiling instead of leaving it: the borrowed/
+        tiled log_prob for a flip_y copy is generically WRONG unless the
+        network already happens to be exactly flip-equivariant at that
+        specific (obs, action) pair, and the resulting ratio-scaling error
+        is a real, uncontrolled source of gradient-MAGNITUDE noise -- e.g.
+        confirmed via the epoch-0 baseline's own "[policy percentiles]"
+        line reading p100 in the 20s on the augmented train batch vs a
+        same-rollout, never-augmented held-out batch's single digits, both
+        measured at ratio=1 (no gradient step yet). NOT a deliberate "push
+        toward equivariance" mechanism: the gradient DIRECTION contributed
+        by an augmented row is ``d(new_log_prob)/dtheta``, identical
+        regardless of which old_log_prob constant is subtracted from it
+        (that constant doesn't depend on theta either way) -- only the
+        magnitude (via the ratio it's exponentiated into) differs. Whatever
+        genuinely teaches the network the y-flip symmetry comes from
+        training on the correctly-flipped (obs, action, advantage) sample
+        at all, with its own correctly-signed advantage -- not from which
+        log_prob happens to sit in the ratio's denominator. See
+        ai/knowledge.md "Augmentation log_prob approximation" for the full
+        writeup.
+
+        Chunked by minibatch_size under torch.no_grad(), mirroring
+        pre_update_value_loss's own pass in _ppo_update (including passing
+        through the physics-encoder full features, if present, the same
+        way) -- call this AFTER that block populates
+        obs/ball_physics_full etc. on ``batch``, not before.
+
+        Returns ``(log_probs, head_log_probs)`` -- ``head_log_probs`` is
+        ``None`` when ``"head_log_probs"`` isn't present in ``batch``
+        (matches ``RolloutBuffer.add()``'s own optionality for that field).
+        """
+        n = len(batch["log_probs"])
+        has_head_lp = "head_log_probs" in batch
+        lp_parts: list[torch.Tensor] = []
+        head_lp_parts: list[torch.Tensor] = []
+        with torch.no_grad():
+            for start in range(0, n, self.minibatch_size):
+                idx = torch.arange(start, min(start + self.minibatch_size, n))
+                mb_obs = {k.replace("obs/", ""): batch[k][idx].to(self.device)
+                          for k in batch if k.startswith("obs/")}
+                sf, of, em = mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"]
+                bf, gf = mb_obs["ball_feat"], mb_obs["global_feat"]
+                sat, oat = _ai_types(mb_obs)
+                d_heads = self.decision_net(
+                    sf, of, em, bf, gf, sat, oat,
+                    ball_physics_full=mb_obs.get("ball_physics_full"),
+                    self_physics_full=mb_obs.get("self_physics_full"),
+                    other_physics_full=mb_obs.get("other_physics_full"),
+                )
+                e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
+                mb_actions = {k.replace("action/", ""): batch[k][idx].to(self.device)
+                              for k in batch if k.startswith("action/")}
+                lp_parts.append(self._recompute_log_prob(d_heads, e_heads, mb_actions, em).cpu())
+                if has_head_lp:
+                    head_lp_parts.append(
+                        self._per_head_new_log_probs(d_heads, e_heads, mb_actions, em).cpu()
+                    )
+        log_probs = torch.cat(lp_parts, dim=0)
+        head_log_probs = torch.cat(head_lp_parts, dim=0) if has_head_lp else None
+        return log_probs, head_log_probs
 
     def _ppo_update(self, batch: dict, progress: float) -> dict:
         """Run N epochs of minibatch PPO updates over the collected rollout.
@@ -6329,7 +6591,10 @@ class PPOTrainer:
             batch, val_batch = self._split_train_val_episodes(batch)
 
         # Augment batch with geometric flips + slot permutations before any
-        # gradient computation.  This expands the batch by 4 × n_slot_shuffles.
+        # gradient computation.  This expands the batch by 2 × n_slot_shuffles
+        # (N_FLIP_VARIANTS=2: identity, flip_y -- see augment.py's module
+        # docstring; flip_x is a fixed canonical-frame transform, not a
+        # random augmentation choice here).
         if self.augment_n_slot_shuffles > 0:
             batch = augment_batch(batch, self.augment_n_slot_shuffles, self._aug_rng)
 
@@ -6383,6 +6648,19 @@ class PPOTrainer:
                 batch["obs/self_physics_full"] = torch.cat(_phys_self_parts, dim=0)
                 batch["obs/other_physics_full"] = torch.cat(_phys_other_parts, dim=0)
 
+        # Replace augment_batch()'s cheap tiled old_log_prob (correct only
+        # for the identity-flip copies) with the TRUE log pi_old(action|obs)
+        # for every row, flip_y-augmented copies included -- see
+        # _recompute_old_log_probs_for_augmented_batch's own docstring for
+        # the full rationale. Must run AFTER the physics-full precompute
+        # just above (consumes those obs/*_physics_full fields) and is only
+        # meaningful when augmentation actually ran -- an unaugmented batch's
+        # log_probs are already exact.
+        if self.augment_n_slot_shuffles > 0:
+            batch["log_probs"], _recomputed_head_lp = self._recompute_old_log_probs_for_augmented_batch(batch)
+            if _recomputed_head_lp is not None:
+                batch["head_log_probs"] = _recomputed_head_lp
+
         clip = self.schedules.clip(progress)
         lr = self.schedules.lr(progress)
         value_lr = self.schedules.value_lr(progress)
@@ -6419,12 +6697,16 @@ class PPOTrainer:
         _epoch_sample_policy_loss: list[torch.Tensor] = []
         # Same progressive-pool caveat as _epoch_sample_policy_loss above,
         # but for the value HEAD's per-sample squared-error terms -- reports
-        # as val_mean_p1_p99 (a trimmed companion to val_mean, this
+        # as val_mean_p10_p90 (a trimmed companion to val_mean, this
         # function's TRAIN-side value-head loss; not to be confused with
-        # val_episode_value_loss_p1_p99, the HELD-OUT set's own trimmed
+        # val_episode_value_loss_p10_p90, the HELD-OUT set's own trimmed
         # value loss -- "val" is unfortunately overloaded in this file
         # between "value head" and "held-out validation set").
         _epoch_sample_value_loss: list[torch.Tensor] = []
+        # Unclipped, no-dual-clip linearised surrogate (r-1)*A per row -- see
+        # "[policy surrogate]"'s own log-line comment below for the
+        # rationale (a clip-invariant companion to pol_mean/policy_loss).
+        _epoch_sample_surrogate: list[torch.Tensor] = []
         all_entropy = []
         all_entropy_breakdown: dict[str, list[float]] = {}
         all_kl = []
@@ -6591,12 +6873,70 @@ class PPOTrainer:
                 _pre_n += len(_idx)
             pre_update_value_loss = (_pre_sq_err_sum / max(_pre_n, 1)) / float(_ret_var_full)
 
+        if self.log_epoch_zero_baseline:
+            # Reuses _eval_val_episode_losses() for BOTH populations (it
+            # takes an arbitrary batch dict, not hardcoded to "the held-out
+            # set") -- gives byte-identical formulas to the real per-epoch
+            # lines below with no duplicated math, at the cost of the same
+            # physics-encoder gap that function already has for the REAL
+            # held-out lines (no ball_physics_full/self_physics_full/
+            # other_physics_full passthrough) -- an existing limitation,
+            # not a new one introduced here; irrelevant when physics
+            # encoders are disabled. old_log_prob==new_log_prob EXACTLY for
+            # every row here (epoch 1's first gradient step hasn't happened
+            # yet), so policy_loss/KL/surrogate are trivially ~0 by
+            # construction -- expected, not a bug -- while value/entropy-
+            # adjacent percentiles/per-head numbers are real and useful as
+            # a before/after-epoch-1 comparison point.
+            def _log_baseline_block(tag: str, n_rows_label: str, eval_result: tuple) -> None:
+                (
+                    _b_pol, _b_val, _b_kl, _b_per_sample_pol,
+                    _b_val_p90, _b_val_p75, _b_pol_p90, _b_pol_p75,
+                    _b_surr_mean, _b_surr_p90, _b_surr_p75, _b_head_pol,
+                ) = eval_result
+                log.info(
+                    f"  [{tag}policy] mean={_b_pol:.4f}  p10_p90={_b_pol_p90:.4f}  "
+                    f"p25_p75={_b_pol_p75:.4f}  kl={_b_kl:.4f}  ({n_rows_label})"
+                )
+                log.info(
+                    f"  [{tag}policy surrogate] mean={_b_surr_mean:.4f}  "
+                    f"p10_p90={_b_surr_p90:.4f}  p25_p75={_b_surr_p75:.4f}  "
+                    f"(n={len(_b_per_sample_pol):,})"
+                )
+                if len(_b_per_sample_pol) > 0:
+                    _pcts = [0, 1, 10, 50, 90, 99, 100]
+                    _pct_str = "  ".join(
+                        f"p{p}={float(_b_per_sample_pol.quantile(p / 100.0)):.4f}" for p in _pcts
+                    )
+                    log.info(f"  [{tag}policy percentiles, n={len(_b_per_sample_pol):,}]  {_pct_str}")
+                if _b_head_pol is not None:
+                    _inactive_heads = self._inactive_head_lp_keys()
+                    _head_str = "  ".join(
+                        f"{k}={v:+.4f}" for k, v in zip(HEAD_LP_KEYS, _b_head_pol.tolist())
+                        if k not in _inactive_heads
+                    )
+                    log.info(f"  [{tag}policy heads] {_head_str}")
+                log.info(
+                    f"  [{tag}value] mean={_b_val:.4f}(x{self.vf_coef})={self.vf_coef * _b_val:.4f}  "
+                    f"p10_p90={_b_val_p90:.4f}(x{self.vf_coef})={self.vf_coef * _b_val_p90:.4f}  "
+                    f"p25_p75={_b_val_p75:.4f}(x{self.vf_coef})={self.vf_coef * _b_val_p75:.4f}"
+                )
+
+            log.info(f"  == epoch 0 (pre-training baseline, ratio=1 exactly) " + "=" * 32)
+            _log_baseline_block("", f"n={n} rows, pre-training", self._eval_val_episode_losses(batch, clip))
+            if val_batch is not None:
+                _log_baseline_block(
+                    "held-out ", f"n={len(val_batch['log_probs'])} held-out steps, pre-training",
+                    self._eval_val_episode_losses(val_batch, clip),
+                )
+            log.info("  [grad clip] N/A -- no gradient step taken yet")
 
         for epoch_i in range(self.n_epochs):
             epoch_start = time.perf_counter()
             _epoch_slice_start = len(all_policy_loss)
             _epoch_sample_policy_loss.clear()
             _epoch_sample_value_loss.clear()
+            _epoch_sample_surrogate.clear()
             indices = torch.randperm(n)
             for start in range(0, n, self.minibatch_size):
                 mb_idx = indices[start:start + self.minibatch_size]
@@ -6755,6 +7095,10 @@ class PPOTrainer:
                 _per_sample_policy_loss = -(_min_surr * mb_w)
                 policy_loss = _per_sample_policy_loss.mean()
                 _epoch_sample_policy_loss.append(_per_sample_policy_loss.detach().cpu())
+                # (r-1)*A, weighted the same way as _per_sample_policy_loss
+                # (mb_w) for direct comparability -- see "[policy surrogate]"
+                # below for why this is logged unclipped/no-dual-clip.
+                _epoch_sample_surrogate.append(((surr1 - mb_adv) * mb_w).detach().cpu())
 
                 # Per-head counterfactual policy_loss breakdown -- see
                 # all_head_policy_loss's own comment above for why this is a
@@ -7173,93 +7517,219 @@ class PPOTrainer:
             mean_pol_epoch = float(np.mean(_epoch_pol)) if _epoch_pol else 0.0
             mean_kl_epoch = float(np.mean(_epoch_kl)) if _epoch_kl else 0.0
             mean_val_epoch = float(np.mean(_epoch_val)) if _epoch_val else 0.0
-            # Trimmed (p1-p99) companions to pol_mean/val_mean -- pol_mean's
+            # Trimmed (p10-p90) companions to pol_mean/val_mean -- pol_mean's
             # uses the SAME _epoch_sample_policy_loss pool the percentile
             # line below already builds (no extra work); val_mean's is this
             # function's TRAIN-side value-HEAD loss (as opposed to
-            # val_episode_value_loss_p1_p99, the HELD-OUT set's own trimmed
+            # val_episode_value_loss_p10_p90, the HELD-OUT set's own trimmed
             # value loss; see _epoch_sample_value_loss's own comment for the
             # "val" = value-head vs val = held-out-set naming clash).
+            _epoch_pol_cat_for_trim = (
+                torch.cat(_epoch_sample_policy_loss) if _epoch_sample_policy_loss else torch.zeros(0)
+            )
+            _epoch_val_cat_for_trim = (
+                torch.cat(_epoch_sample_value_loss) if _epoch_sample_value_loss else torch.zeros(0)
+            )
             mean_pol_epoch_trimmed = (
-                _trimmed_mean_p1_p99(torch.cat(_epoch_sample_policy_loss))
-                if _epoch_sample_policy_loss else float("nan")
+                _trimmed_mean_p10_p90(_epoch_pol_cat_for_trim) if _epoch_sample_policy_loss else float("nan")
+            )
+            mean_pol_epoch_trimmed2 = (
+                _trimmed_mean_p25_p75(_epoch_pol_cat_for_trim) if _epoch_sample_policy_loss else float("nan")
             )
             mean_val_epoch_trimmed = (
-                _trimmed_mean_p1_p99(torch.cat(_epoch_sample_value_loss))
-                if _epoch_sample_value_loss else float("nan")
+                _trimmed_mean_p10_p90(_epoch_val_cat_for_trim) if _epoch_sample_value_loss else float("nan")
             )
+            mean_val_epoch_trimmed2 = (
+                _trimmed_mean_p25_p75(_epoch_val_cat_for_trim) if _epoch_sample_value_loss else float("nan")
+            )
+            # E[(r-1)*A], unclipped/no-dual-clip -- see "[policy surrogate]"
+            # log line below for the rationale. Same progressive-pool
+            # caveat as _epoch_sample_policy_loss above (this epoch's pool
+            # mixes rows shaped by progressively-more-trained weights).
+            _epoch_surrogate_cat = (
+                torch.cat(_epoch_sample_surrogate) if _epoch_sample_surrogate else torch.zeros(0)
+            )
+            mean_surrogate_epoch = float(_epoch_surrogate_cat.mean()) if _epoch_sample_surrogate else float("nan")
+            mean_surrogate_epoch_trimmed = (
+                _trimmed_mean_p10_p90(_epoch_surrogate_cat) if _epoch_sample_surrogate else float("nan")
+            )
+            mean_surrogate_epoch_trimmed2 = (
+                _trimmed_mean_p25_p75(_epoch_surrogate_cat) if _epoch_sample_surrogate else float("nan")
+            )
+            # --- Per-epoch summary, one topic per line (train side, then
+            # held-out side if val_episode_fraction is enabled) -- replaces
+            # the old single mega-line-per-topic format. "[policy]"/"[value]"
+            # are this function's TRAIN-side numbers; "[held-out policy]"/
+            # "[held-out value]" are the HELD-OUT SET's (see
+            # _epoch_sample_value_loss's own comment for the "val" = value-
+            # head vs val = held-out-set naming clash this deliberately
+            # avoids by not using "val" as a line tag at all). ---
+            log.info(f"  == epoch {epoch_i + 1}/{self.n_epochs} " + "=" * 32)
             log.info(
-                f"  [epoch {epoch_i + 1}/{self.n_epochs}] pol_mean={mean_pol_epoch:.4f}  "
-                f"pol_mean_p1_p99={mean_pol_epoch_trimmed:.4f}  "
-                f"val_mean={mean_val_epoch:.4f}(x{self.vf_coef})={self.vf_coef * mean_val_epoch:.4f}  "
-                f"val_mean_p1_p99={mean_val_epoch_trimmed:.4f}(x{self.vf_coef})="
-                f"{self.vf_coef * mean_val_epoch_trimmed:.4f}  "
-                f"kl_mean={mean_kl_epoch:.4f}  (n={len(_epoch_kl)} minibatch(es), {epoch_times[-1]:.0f}ms)"
+                f"  [policy] mean={mean_pol_epoch:.4f}  p10_p90={mean_pol_epoch_trimmed:.4f}  "
+                f"p25_p75={mean_pol_epoch_trimmed2:.4f}  "
+                f"kl={mean_kl_epoch:.4f}  (n={len(_epoch_kl)} minibatch(es), {epoch_times[-1]:.0f}ms)"
             )
+            if _epoch_sample_surrogate:
+                # E[(r-1)*A] -- the UNCLIPPED, no-dual-clip linearised
+                # surrogate. Mathematically, [policy]'s mean above ==
+                # -mean_surrogate_epoch exactly whenever the clip/dual-clip
+                # floor are inactive for a row (mean(A)~=0 by
+                # normalisation) -- so on a stable step this line will read
+                # close to the negative of [policy]'s mean, NOT a
+                # different number. Its value is in the rows where clipping
+                # DOES engage (far more common here, mid-optimization, than
+                # on the held-out side): [policy] intentionally floors those
+                # to protect the actual gradient step, which also hides how
+                # far ratios really moved -- this line shows the true
+                # unclipped magnitude, trimmed the same way as every other
+                # per-sample line here since a single ratio-spike row is
+                # just as capable of dominating an unclipped mean.
+                log.info(
+                    f"  [policy surrogate] mean={mean_surrogate_epoch:.4f}  "
+                    f"p10_p90={mean_surrogate_epoch_trimmed:.4f}  "
+                    f"p25_p75={mean_surrogate_epoch_trimmed2:.4f}  "
+                    f"(n={len(_epoch_surrogate_cat):,})"
+                )
             if _epoch_sample_policy_loss:
-                # Distribution shape, not just pol_mean -- e.g. a few
+                # Distribution shape, not just the mean -- e.g. a few
                 # huge-magnitude samples can drag the mean positive even
                 # while the bulk of samples sit right around/below 0. Same
                 # percentile list/style as the existing "[advantage |.| by
-                # episode]" line above, and as the val-side
-                # val_episode_policy_loss percentiles below -- but see
-                # _epoch_sample_policy_loss's own comment (declared near the
-                # top of this function) for why this one is a progressive
-                # pool across the epoch's minibatches (rows shaped by
-                # different, progressively-more-trained weights), not one
-                # clean snapshot the way the val-side numbers are.
-                _epoch_pol_t = torch.cat(_epoch_sample_policy_loss)
+                # episode]" line above, and as "[held-out policy percentiles]"
+                # below -- but see _epoch_sample_policy_loss's own comment
+                # (declared near the top of this function) for why this one
+                # is a progressive pool across the epoch's minibatches (rows
+                # shaped by different, progressively-more-trained weights),
+                # not one clean snapshot the way the held-out numbers are.
+                _epoch_pol_t = _epoch_pol_cat_for_trim
                 _pcts = [0, 1, 10, 50, 90, 99, 100]
                 _epoch_pct_str = "  ".join(
                     f"p{p}={float(_epoch_pol_t.quantile(p / 100.0)):.4f}" for p in _pcts
                 )
-                log.info(
-                    f"  [epoch {epoch_i + 1}/{self.n_epochs} policy_loss percentiles, "
-                    f"n={len(_epoch_pol_t):,}]  {_epoch_pct_str}"
+                log.info(f"  [policy percentiles, n={len(_epoch_pol_t):,}]  {_epoch_pct_str}")
+            # Which heads are actually driving [policy] mean above -- the
+            # SAME per-head COUNTERFACTUAL breakdown as the end-of-run
+            # "[per-head policy_loss (counterfactual, ...)]" line (each
+            # head's own ratio in isolation, others held at ratio=1), just
+            # sliced to THIS epoch's minibatches only (same _epoch_slice_start
+            # window as _epoch_pol/_epoch_kl above) instead of the whole
+            # update. NOT a strict decomposition -- see all_head_policy_loss's
+            # own comment for why the 15 values don't sum to mean_pol_epoch.
+            _epoch_head_pol = all_head_policy_loss[_epoch_slice_start:]
+            if _epoch_head_pol:
+                _mean_epoch_head_pol = torch.stack(_epoch_head_pol).mean(dim=0)
+                _inactive_heads = self._inactive_head_lp_keys()
+                _epoch_head_pol_str = "  ".join(
+                    f"{k}={v:+.4f}" for k, v in zip(HEAD_LP_KEYS, _mean_epoch_head_pol.tolist())
+                    if k not in _inactive_heads
                 )
+                log.info(f"  [policy heads] {_epoch_head_pol_str}")
+            log.info(
+                f"  [value] mean={mean_val_epoch:.4f}(x{self.vf_coef})={self.vf_coef * mean_val_epoch:.4f}  "
+                f"p10_p90={mean_val_epoch_trimmed:.4f}(x{self.vf_coef})="
+                f"{self.vf_coef * mean_val_epoch_trimmed:.4f}  "
+                f"p25_p75={mean_val_epoch_trimmed2:.4f}(x{self.vf_coef})="
+                f"{self.vf_coef * mean_val_epoch_trimmed2:.4f}"
+            )
             if val_batch is not None:
-                # val_episode_policy_loss is NOT a generalization diagnostic
-                # -- at ratio=1 (i.e. for any row that received zero
-                # gradient steps this call), the clipped surrogate collapses
-                # to -mean(adv_normalized), which is exactly 0 by
-                # construction (advantages are normalized to zero mean) --
-                # confirmed empirically: a same-size sample of about-to-be-
-                # trained TRAIN rows reads 0.000000 too, measured before any
-                # epoch runs. So it reads near-zero for ANY untouched rows
+                # held-out policy loss is NOT a generalization diagnostic --
+                # at ratio=1 (i.e. for any row that received zero gradient
+                # steps this call), the clipped surrogate collapses to
+                # -mean(adv_normalized), which is exactly 0 by construction
+                # (advantages are normalized to zero mean) -- confirmed
+                # empirically: a same-size sample of about-to-be-trained
+                # TRAIN rows reads 0.000000 too, measured before any epoch
+                # runs. So it reads near-zero for ANY untouched rows
                 # regardless of split quality or true generalization, and
-                # says nothing that pol_mean above doesn't. Only
-                # val_episode_value_loss (real regression MSE, no
-                # ratio/zero-mean-advantage artifact) is a meaningful
-                # apples-to-apples train/val comparison here.
+                # says nothing that [policy] above doesn't. Only [held-out
+                # value] (real regression MSE, no ratio/zero-mean-advantage
+                # artifact) is a meaningful apples-to-apples comparison.
                 (
                     _val_pol_loss, _val_val_loss, _val_kl, _val_per_sample_pol,
-                    _val_val_loss_trimmed, _val_pol_loss_trimmed,
+                    _val_val_loss_trimmed, _val_val_loss_trimmed2,
+                    _val_pol_loss_trimmed, _val_pol_loss_trimmed2,
+                    _val_surrogate_mean, _val_surrogate_trimmed, _val_surrogate_trimmed2,
+                    _val_head_pol,
                 ) = self._eval_val_episode_losses(val_batch, clip)
                 log.info(
-                    f"  [epoch {epoch_i + 1}/{self.n_epochs}] "
-                    f"val_episode_policy_loss={_val_pol_loss:.4f}  "
-                    f"val_episode_policy_loss_p1_p99={_val_pol_loss_trimmed:.4f}  "
-                    f"val_episode_value_loss={_val_val_loss:.4f}(x{self.vf_coef})="
-                    f"{self.vf_coef * _val_val_loss:.4f}  "
-                    f"val_episode_value_loss_p1_p99={_val_val_loss_trimmed:.4f}(x{self.vf_coef})="
-                    f"{self.vf_coef * _val_val_loss_trimmed:.4f}  "
-                    f"val_episode_kl={_val_kl:.4f}  "
+                    f"  [held-out policy] mean={_val_pol_loss:.4f}  "
+                    f"p10_p90={_val_pol_loss_trimmed:.4f}  p25_p75={_val_pol_loss_trimmed2:.4f}  "
+                    f"kl={_val_kl:.4f}  "
                     f"(n={len(val_batch['log_probs'])} held-out steps, never trained on)"
                 )
-                # Same distribution-shape percentiles as the epoch-0
-                # train-side line above, but for the held-out set, every
-                # epoch (cheap: val_batch is fixed, this is the same
-                # no-grad pass _eval_val_episode_losses already runs to get
-                # the mean above -- no extra forward pass).
+                # E[(r-1)*A] -- the UNCLIPPED, no-dual-clip linearised
+                # surrogate, mathematically == -[held-out policy]'s own mean
+                # whenever the clip/dual-clip floor are inactive for a row
+                # (see _eval_val_episode_losses' docstring). NOT a different
+                # signal in the common case -- held-out rows rarely drift far
+                # from ratio=1 since nothing here ever gets a direct
+                # gradient, so this and [held-out policy] will usually track
+                # each other closely. Its value is narrower than that:
+                # it's a tripwire for the rare held-out row whose ratio DID
+                # drift past the clip band purely from the shared network
+                # being trained on OTHER (train-side) rows -- exactly the
+                # kind of real cross-row generalisation drift [held-out
+                # policy] silently floors away. Trimmed the same way as
+                # every other per-sample line here since it's unclipped and
+                # therefore just as exposed to a single ratio-spike row.
+                log.info(
+                    f"  [held-out policy surrogate] mean={_val_surrogate_mean:.4f}  "
+                    f"p10_p90={_val_surrogate_trimmed:.4f}  p25_p75={_val_surrogate_trimmed2:.4f}  "
+                    f"(n={len(_val_per_sample_pol)} held-out steps)"
+                )
+                # Same distribution-shape percentiles as [policy percentiles]
+                # above, but for the held-out set, every epoch (cheap:
+                # val_batch is fixed, this is the same no-grad pass
+                # _eval_val_episode_losses already runs to get the mean
+                # above -- no extra forward pass).
                 if len(_val_per_sample_pol) > 0:
                     _pcts = [0, 1, 10, 50, 90, 99, 100]
                     _val_pct_str = "  ".join(
                         f"p{p}={float(_val_per_sample_pol.quantile(p / 100.0)):.4f}" for p in _pcts
                     )
                     log.info(
-                        f"  [epoch {epoch_i + 1}/{self.n_epochs} val_episode_policy_loss "
-                        f"percentiles, n={len(_val_per_sample_pol):,}]  {_val_pct_str}"
+                        f"  [held-out policy percentiles, n={len(_val_per_sample_pol):,}]  {_val_pct_str}"
                     )
+                if _val_head_pol is not None:
+                    _inactive_heads = self._inactive_head_lp_keys()
+                    _val_head_pol_str = "  ".join(
+                        f"{k}={v:+.4f}" for k, v in zip(HEAD_LP_KEYS, _val_head_pol.tolist())
+                        if k not in _inactive_heads
+                    )
+                    log.info(f"  [held-out policy heads] {_val_head_pol_str}")
+                log.info(
+                    f"  [held-out value] mean={_val_val_loss:.4f}(x{self.vf_coef})="
+                    f"{self.vf_coef * _val_val_loss:.4f}  "
+                    f"p10_p90={_val_val_loss_trimmed:.4f}(x{self.vf_coef})="
+                    f"{self.vf_coef * _val_val_loss_trimmed:.4f}  "
+                    f"p25_p75={_val_val_loss_trimmed2:.4f}(x{self.vf_coef})="
+                    f"{self.vf_coef * _val_val_loss_trimmed2:.4f}"
+                )
+            # Final line of the per-epoch block: pre-clip grad-norm spread for
+            # this epoch's minibatches only (sliced the same way as
+            # _epoch_pol/_epoch_kl/_epoch_val above, off the SAME
+            # all_grad_norm_main/all_grad_norm_dir lists the end-of-call
+            # "[grad clip]" summary uses over the whole rollout -- see that
+            # line's own comment for why "main"/"direction" are reported as
+            # separate isolated clip groups). mean/max alone (as in that
+            # end-of-call line) hide whether a high mean is a broad shift or
+            # one or two spikes -- std/min complete the picture per epoch.
+            _epoch_gn_main = all_grad_norm_main[_epoch_slice_start:]
+            _epoch_gn_dir = all_grad_norm_dir[_epoch_slice_start:] if all_grad_norm_dir else []
+            if _epoch_gn_main:
+                _gn_main_arr = np.array(_epoch_gn_main)
+                _gn_line = (
+                    f"  [grad norm] main: mean={_gn_main_arr.mean():.3f} std={_gn_main_arr.std():.3f} "
+                    f"min={_gn_main_arr.min():.3f} max={_gn_main_arr.max():.3f} (n={len(_epoch_gn_main)})"
+                )
+                if _epoch_gn_dir:
+                    _gn_dir_arr = np.array(_epoch_gn_dir)
+                    _gn_line += (
+                        f"\n              direction: mean={_gn_dir_arr.mean():.3f} "
+                        f"std={_gn_dir_arr.std():.3f} min={_gn_dir_arr.min():.3f} max={_gn_dir_arr.max():.3f}"
+                    )
+                log.info(_gn_line)
             if _early_stopped:
                 break
 
@@ -7919,10 +8389,18 @@ class PPOTrainer:
         )
         if _disc_shift_str:
             log.info(f"  [exec discrete \u0394logit per opt step] {_disc_shift_str}")
+        # Masked/frozen/inactive heads (see _inactive_head_lp_keys) are
+        # dropped from both lines below -- ratio=1 forces KL to an exact,
+        # content-free 0.0000 and the counterfactual policy_loss to a
+        # meaningless -mean(this update's advantages) residual for these
+        # heads, never a real training signal, so listing them just buries
+        # the heads that actually moved.
+        _inactive_heads = self._inactive_head_lp_keys()
         if all_head_kl:
             _mean_head_kl = torch.stack(all_head_kl).mean(dim=0)
             _head_kl_str = "  ".join(
                 f"{k}={v:+.4f}" for k, v in zip(HEAD_LP_KEYS, _mean_head_kl.tolist())
+                if k not in _inactive_heads
             )
             log.info(f"  [per-head KL] {_head_kl_str}")
         if all_head_policy_loss:
@@ -7935,7 +8413,8 @@ class PPOTrainer:
             # head(s) are pulling the objective away from 0.
             _mean_head_pol = torch.stack(all_head_policy_loss).mean(dim=0)
             _head_pol_pairs = sorted(
-                zip(HEAD_LP_KEYS, _mean_head_pol.tolist()), key=lambda kv: -abs(kv[1])
+                (kv for kv in zip(HEAD_LP_KEYS, _mean_head_pol.tolist()) if kv[0] not in _inactive_heads),
+                key=lambda kv: -abs(kv[1]),
             )
             _head_pol_str = "  ".join(f"{k}={v:+.4f}" for k, v in _head_pol_pairs)
             log.info(

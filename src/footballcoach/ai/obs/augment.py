@@ -46,16 +46,31 @@ ai/obs/canonical.py, instead of a random augmentation).
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 CORRECTNESS OF REUSING old_log_probs
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-PPO requires π_old(a|s) to compute the importance-sampling ratio.  For
-augmented samples we reuse the log_prob from the original (s, a) pair.
+PPO requires π_old(a|s) to compute the importance-sampling ratio. THIS
+function always tiles log_probs (and head_log_probs) from the original
+(s, a) pair onto every augmented copy, unchanged -- cheap, and exactly
+correct for one of the two augmentation types:
 
   • Slot permutations:  exact — permutation invariance means
     log π(perm(a)|perm(s)) = log π(a|s) for any permutation.
 
-  • Geometric flips:  approximate early in training, exact once the
-    network has learned equivariance.  The mismatch provides a gradient
-    signal toward equivariance and the approximation error shrinks as
-    training progresses.  Empirically this is stable and beneficial.
+  • Geometric flips:  the tiled value is only an APPROXIMATION of the true
+    π_old(flip(a)|flip(s)) -- exact only once the network has already
+    learned exact flip-equivariance, otherwise off by a real, uncontrolled
+    ratio-scaling factor that depends on how non-equivariant the network
+    currently is (NOT a deliberate "push toward equivariance" signal --
+    the gradient DIRECTION an augmented row contributes doesn't depend on
+    which old_log_prob constant is subtracted, only its magnitude does;
+    see ai/knowledge.md "Augmentation log_prob approximation" for the full
+    analysis). PPOTrainer._ppo_update() corrects this immediately after
+    calling this function -- it recomputes log_probs (and head_log_probs)
+    PROPERLY for the whole returned batch via
+    _recompute_old_log_probs_for_augmented_batch(), since the network is
+    still exactly θ_old at that point in the call (no gradient step yet).
+    This function's own tiled value is only ever the FINAL word for a
+    caller that does NOT do that correction (e.g. BC pretraining's
+    augment_obs_bc()/augment_bc_batch() below, which has no PPO
+    ratio/old_log_prob concept at all and is unaffected).
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 FIELD INDICES
