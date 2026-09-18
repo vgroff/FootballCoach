@@ -60,6 +60,7 @@ from footballcoach.ai.action.distributions import (
     MaskedCategorical,
     SquashedNormalHead,
     VonMisesDirectionHead,
+    _von_mises_kl,
 )
 from footballcoach.ai.action.gating import select_action
 from footballcoach.ai.action.schema import DecisionAction, DecisionHeadsRaw, ExecutionAction
@@ -757,6 +758,31 @@ def _trimmed_mean_p25_p75(x: torch.Tensor) -> float:
     return _trimmed_mean(x, 0.25, 0.75)
 
 
+def _trimmed_rmse(sq_err: torch.Tensor, trim_frac: float) -> float:
+    """RMSE (in the same units as the errors, i.e. sqrt of a mean of squared
+    errors) after dropping the ``trim_frac`` fraction of rows with the LARGEST
+    squared error -- e.g. ``0.10`` = "RMSE excluding the worst 10%". A robust
+    companion to plain RMSE for the value refit's train/val lines: a small
+    tail of badly-mis-valued states (e.g. rare high-variance outcomes)
+    dominates a plain RMSE and can hide whether the bulk of predictions is
+    improving. One-sided (unlike ``_trimmed_mean``, which cuts both tails),
+    since a squared error has no meaningful "too good" tail to drop.
+
+    Implemented with a sort rather than ``torch.quantile`` on purpose: the
+    latter raises on inputs past ~16M elements, and an augmented train batch
+    can get large. ``trim_frac <= 0`` (or a keep-count reaching every row)
+    degenerates to the plain RMSE; empty input returns ``nan``.
+    """
+    n = sq_err.numel()
+    if n == 0:
+        return float("nan")
+    keep = n if trim_frac <= 0.0 else max(1, int(math.ceil(n * (1.0 - trim_frac))))
+    if keep >= n:
+        return math.sqrt(float(sq_err.mean()))
+    kept = torch.sort(sq_err.reshape(-1)).values[:keep]
+    return math.sqrt(float(kept.mean()))
+
+
 def _ai_types(obs_dict: dict) -> tuple:
     """Extract (self_ai_type, other_ai_type) tensors from an obs dict, or
     (None, None) if absent — DecisionNetwork/ExecutionNetwork.forward()
@@ -817,34 +843,78 @@ def format_outcomes_with_pct(outcomes: dict) -> str:
     return "{" + ", ".join(parts) + "}"
 
 
-def _trainee_episode_abs_adv_means(
+def _episode_abs_adv_means(
     track_ids: list, dones, advantages,
 ) -> list[float]:
-    """Per-trainee-episode mean(|advantage|), for episode-seed replay (see
-    ``PPOTrainer._train_batched_parallel``'s highest-mean-|advantage| seed
-    selection). Filters to ``track_ids == "trainee"`` rows FIRST, then
-    segments those (in their own relative order) on ``dones > 0.5`` --
-    unlike the ``[advantage |.| by episode]`` diagnostic log line elsewhere
-    in this file, which segments the flat (possibly track-interleaved)
-    ``dones`` directly and is therefore only a reasonable approximation when
-    a secondary/opponent track is present. A trailing incomplete episode
-    (no terminal ``done=1`` row yet) is silently dropped, matching
-    ``stats["episode_rewards"]``'s own behavior (only appended on
-    ``done=True``) so the two line up 1:1 in order.
+    """Per-episode mean(|advantage|), for episode-seed replay (see
+    ``PPOTrainer._update_episode_replay``'s highest-mean-|advantage| seed
+    selection). Segments on the TRAINEE's own ``done > 0.5`` events (one
+    entry per completed trainee episode, in order) so the result lines up
+    1:1 with ``stats["episode_rewards"]``/``stats["episode_seeds"]`` --
+    those are populated the same way, only ever appended when the
+    trainee's own ``done`` fires. A trailing incomplete episode (no
+    terminal trainee ``done=1`` row yet) is silently dropped, matching
+    those two stats lists' own behavior.
+
+    Unlike the previous (``_trainee_episode_abs_adv_means``) version of
+    this function, each episode's mean is now taken over EVERY row in that
+    episode's span -- the trainee's own rows AND any interleaved
+    secondary-track rows -- not just the trainee's. This is deliberate,
+    not an oversight: whenever a secondary/opponent row exists in the
+    buffer at all, it is -- today -- ALWAYS the current, live network
+    playing itself. See ai/ppo/batched_rollout_worker.py's "Secondary
+    neural players" docstring section: ``_batched_worker_main`` passes
+    ``secondary_trainer=trainer``, the exact same weights as the trainee's
+    own network, and ``_secondary_neural_candidates()`` excludes
+    rules-based/immobile secondaries entirely (they never had a
+    ``NeuralPlayerAI``/``last_transition`` to add to the buffer in the
+    first place) -- so a rules/immobile-opponent episode simply never puts
+    a non-"trainee" row in the buffer, and this function reduces to
+    trainee-only for those episodes automatically, with no explicit
+    filtering needed. A secondary row's own ``done`` is always set to the
+    SAME shared, env-level ``done`` as the trainee's for that tick (see
+    scenario_env.py's ``last_secondary_results`` construction -- one trial
+    ends the same way for every player on the pitch at once), so every
+    secondary row for an episode arrives strictly between that episode's
+    previous trainee-``done`` row and its own trainee-``done`` row (the
+    trainee row for a given tick is always added to the buffer BEFORE that
+    tick's secondary rows -- see ``_batched_worker_main``/single-process
+    ``_collect()``'s ``buffer.add()`` ordering) -- segmenting on trainee
+    ``done`` events alone still captures every secondary row exactly once,
+    in the right episode, with no separate secondary-side bookkeeping
+    needed. Closing a segment is deliberately deferred until the NEXT
+    trainee row is seen (not done immediately at the trainee ``done=1``
+    row) specifically so that tick's own trailing secondary rows -- which
+    arrive right after it, still done=1, before the next episode's first
+    trainee row -- are pulled into the segment being closed, not the next
+    one.
+
+    CAUTION: if a frozen/older-checkpoint opponent is ever added (this has
+    been discussed as a real future possibility), the "any secondary row
+    implies current network" invariant this function leans on breaks --
+    at that point this needs an explicit per-row "is this the live
+    network" signal (not currently threaded through the buffer) before it
+    can keep including secondary rows unconditionally. Don't assume this
+    still holds without checking when that lands.
 
     ``dones``/``advantages`` accept plain lists OR anything indexable with
     ``[int] -> float`` (e.g. a ``RolloutBuffer.dones`` list alongside a
     freshly computed ``compute_gae()`` advantages list) -- both are always
     the SAME length as ``track_ids`` (one entry per buffer row).
     """
-    idxs = [i for i, t in enumerate(track_ids) if t == "trainee"]
     means: list[float] = []
-    start = 0
-    for pos, i in enumerate(idxs):
-        if dones[i] > 0.5:
-            seg = idxs[start:pos + 1]
+    seg: list[int] = []
+    pending_close = False
+    for i, t in enumerate(track_ids):
+        if t == "trainee" and pending_close:
             means.append(sum(abs(advantages[j]) for j in seg) / len(seg))
-            start = pos + 1
+            seg = []
+            pending_close = False
+        seg.append(i)
+        if t == "trainee" and dones[i] > 0.5:
+            pending_close = True
+    if pending_close:
+        means.append(sum(abs(advantages[j]) for j in seg) / len(seg))
     return means
 
 
@@ -1340,6 +1410,25 @@ class PPOTrainer:
         self.value_pretrain_n_processes = int(
             ppo_cfg.get("value_pretrain_n_processes", 9)
         )
+        # Opt-in (default off, this repo's convention): use the batched
+        # rollout workers (ai/ppo/batched_rollout_worker.py) for the value-
+        # pretrain rollout instead of plain one-env-per-process
+        # rollout_worker.py workers -- see _spawn_value_pretrain_workers().
+        # Total envs = value_pretrain_n_processes * value_pretrain_envs_per_process.
+        self.value_pretrain_batched_rollout = bool(
+            ppo_cfg.get("value_pretrain_batched_rollout", False)
+        )
+        self.value_pretrain_envs_per_process = int(
+            ppo_cfg.get("value_pretrain_envs_per_process", 12)
+        )
+        # Whole-episode chunk streaming for the batched value-pretrain workers
+        # (rows collected between flushes; 0 = one big send at the end, the
+        # old memory profile). Safe to leave on: flushes only ever send
+        # COMPLETED episodes -- see batched_rollout_worker.py's "Chunked
+        # streaming" docstring.
+        self.value_pretrain_chunk_steps = int(
+            ppo_cfg.get("value_pretrain_chunk_steps", 3000)
+        )
         self._aug_rng = random.Random()
         self._bc_cfg = bc_cfg
         self._bc_dir_loss_w = float(bc_cfg.get("direction_loss_weight", 3.0))
@@ -1404,6 +1493,22 @@ class PPOTrainer:
         # Phase 0's demo-return value warm-up in pretrain_combined() -- both
         # previously fell back silently to self.minibatch_size.
         self._value_pretrain_batch_size = int(bc_cfg.get("value_pretrain_batch_size", 512))
+        # PPG-style KL-anchored value refit (see ppg_value_refit()'s own
+        # docstring and ai/knowledge.md "PPG-style value refit"). A standalone
+        # phase, not part of the ppo.* rollout-cycle loop -- keyed under "bc"
+        # like every other pretrain-adjacent knob (value_pretrain_* above),
+        # not "ppo".
+        self._ppg_enabled = bool(bc_cfg.get("ppg_enabled", False))
+        self._ppg_rollout_steps = int(bc_cfg.get("ppg_rollout_steps", 110000))
+        self._ppg_epochs = int(bc_cfg.get("ppg_epochs", 6))
+        self._ppg_lr = float(bc_cfg.get("ppg_lr", 1e-4))
+        self._ppg_kl_coef = float(bc_cfg.get("ppg_kl_coef", 1.0))
+        self._ppg_num_rollouts = int(bc_cfg.get("ppg_num_rollouts", 1))
+        # Log-only: fraction of largest-squared-error rows excluded from the
+        # extra "rmse_exNN" train/val figures in ppg_value_refit's lines (see
+        # _trimmed_rmse). 0 disables the trimmed figure's trimming (== plain
+        # rmse); never affects training or early stopping.
+        self._ppg_rmse_trim_frac = min(max(float(bc_cfg.get("ppg_rmse_trim_frac", 0.10)), 0.0), 0.99)
         self._bc_pretrain_early_stop_patience = int(bc_cfg.get("bc_pretrain_early_stop_patience", 0))
         self._bc_pretrain_early_stop_min_delta = float(bc_cfg.get("bc_pretrain_early_stop_min_delta", 1e-4))
         self._p0_early_stop_patience = int(bc_cfg.get("demo_pretrain_early_stop_patience", 0))
@@ -2748,7 +2853,7 @@ class PPOTrainer:
         import multiprocessing
         import multiprocessing.connection
 
-        from footballcoach.ai.ppo.batched_rollout_worker import spawn_batched_workers, close_batched_workers
+        from footballcoach.ai.ppo.batched_rollout_worker import close_batched_workers, spawn_batched_workers
 
         envs_per_process = max(1, self.envs_per_process)
         n_processes = self.n_processes
@@ -2813,8 +2918,18 @@ class PPOTrainer:
                     ]
                 else:
                     _replay_chunks = []
+                # Workers finalize their own results (GAE with THIS process's
+                # gamma/lam -- passed explicitly so a worker's separately-read
+                # ai_config.json can never drift from ours -- plus as_tensors)
+                # and ship compact numpy arrays instead of per-row buffers:
+                # see batched_rollout_worker.py's "Worker-side finalization".
+                _returns_spec = {"mode": "gae", "gamma": self.gamma, "lam": self.lam}
                 for _wi, w in enumerate(workers):
-                    w.collect(steps_per_worker, replay_seeds=(_replay_chunks[_wi] if _wi < len(_replay_chunks) else None))
+                    w.collect(
+                        steps_per_worker,
+                        replay_seeds=(_replay_chunks[_wi] if _wi < len(_replay_chunks) else None),
+                        returns=_returns_spec,
+                    )
 
                 worker_batches = []
                 episode_rewards: list[float] = []
@@ -2828,15 +2943,17 @@ class PPOTrainer:
                 # (seed, reward, mean_abs_advantage) for every completed
                 # trainee episode this rollout with a recorded seed -- only
                 # populated when episode_replay is enabled (see
-                # _trainee_episode_abs_adv_means's docstring for why this is
+                # _episode_abs_adv_means's docstring for why this is
                 # computed per-r, using each buffer's OWN track_ids/dones,
                 # rather than after _merge_worker_batches concatenates
                 # everything together).
                 all_episode_seed_reward_adv: list[tuple[int, float, float]] = []
 
                 def _consume_result(r: dict) -> None:
-                    advantages, returns = r["buffer"].compute_gae(self.gamma, self.lam, r["last_value"])
-                    worker_batches.append(r["buffer"].as_tensors(advantages, returns))
+                    _tensors, advantages, _r_track_ids, _r_dones = _decode_rollout_result(
+                        r, self.gamma, self.lam, self._episode_replay_enabled,
+                    )
+                    worker_batches.append(_tensors)
                     stats = r["stats"]
                     episode_rewards.extend(stats["episode_rewards"])
                     secondary_episode_rewards.extend(stats["secondary_episode_rewards"])
@@ -2849,8 +2966,8 @@ class PPOTrainer:
                         for _k, _v in ep.items():
                             rollout_components[_k] = rollout_components.get(_k, 0.0) + _v
                     if self._episode_replay_enabled:
-                        _abs_adv_means = _trainee_episode_abs_adv_means(
-                            r["buffer"].track_ids, r["buffer"].dones, advantages,
+                        _abs_adv_means = _episode_abs_adv_means(
+                            _r_track_ids, _r_dones, advantages,
                         )
                         for _seed, _rew, _adv in zip(
                             stats.get("episode_seeds", []), stats["episode_rewards"], _abs_adv_means,
@@ -2886,7 +3003,11 @@ class PPOTrainer:
                             _n_done += 1
                             _agg_progress.update(_n_done)
 
-                batch = _merge_worker_batches(worker_batches)
+                # release_inputs: drop each key from the per-chunk dicts as it's
+                # concatenated (peak ~1x the rollout instead of ~2x -- the
+                # rollout-end RAM spike). worker_batches is unused afterwards.
+                batch = _merge_worker_batches(worker_batches, release_inputs=True)
+                worker_batches.clear()
                 n_collected = int(batch["rewards"].shape[0])
 
                 if self._episode_replay_enabled:
@@ -4636,7 +4757,77 @@ class PPOTrainer:
 
         log.info("Combined pre-training complete.")
 
-    def _collect_value_pretrain_rollout(self, env, n_steps: int, phase_id: Optional[int]) -> tuple[dict, dict]:
+    def _spawn_value_pretrain_workers(self, phase_id: Optional[int]) -> Optional["_ValuePretrainWorkers"]:
+        """Spawn the parallel rollout workers for the value-pretrain
+        rollout, or return None when parallel collection doesn't apply
+        (``ppo.value_pretrain_n_processes <= 1`` or no ``phase_id`` -- the
+        single-process branch of ``_collect_value_pretrain_rollout`` then
+        steps ``env`` directly).
+
+        ``ppo.value_pretrain_batched_rollout`` (default off) selects the
+        worker kind: True = ``batched_rollout_worker.py`` workers, each
+        owning ``ppo.value_pretrain_envs_per_process`` envs and batching all
+        of their decisions into one network call per round (the same
+        mechanism the main PPO loop uses; ``batch_secondary_players`` is
+        reused from the main loop's setting so self-play opponents get
+        batched too); False = today's plain one-env-per-process
+        ``rollout_worker.py`` workers. Both share one ``ctx.Value`` step
+        counter for a single aggregate progress bar. Batched workers stream
+        WHOLE-EPISODE chunks every ``ppo.value_pretrain_chunk_steps`` rows
+        (0 = one send at the end): a flush only ever sends completed
+        episodes and keeps each env's unfinished tail, so MC returns stay
+        exact and the train/val episode split stays clean while per-process
+        memory stays bounded to one chunk -- see ai/knowledge.md "PPG-style
+        value refit" and batched_rollout_worker.py's "Chunked streaming".
+
+        Callers own the lifecycle: pair with ``_close_value_pretrain_workers``.
+        """
+        if not (self.value_pretrain_n_processes > 1 and phase_id is not None):
+            return None
+        import multiprocessing
+
+        n_workers = self.value_pretrain_n_processes
+        base_seed = random.randint(0, 2**31 - 1)
+        # Must be created with the SAME "spawn" context the spawn functions
+        # use, and passed at process-creation time (a raw ctx.Value can't be
+        # sent to an already-running worker afterwards).
+        ctx = multiprocessing.get_context("spawn")
+        progress_value = ctx.Value("l", 0)
+        if self.value_pretrain_batched_rollout:
+            from footballcoach.ai.ppo.batched_rollout_worker import spawn_batched_workers
+
+            envs_per_process = max(1, self.value_pretrain_envs_per_process)
+            handles = spawn_batched_workers(
+                phase_id, n_workers, envs_per_process, base_seed,
+                self.separate_value_net, self.worker_torch_threads,
+                batch_secondary_players=self.batch_secondary_players,
+                chunk_steps=self.value_pretrain_chunk_steps or None, progress_value=progress_value,
+            )
+            return _ValuePretrainWorkers(handles, True, progress_value, n_workers, envs_per_process)
+        from footballcoach.ai.ppo.rollout_worker import spawn_workers
+
+        handles = spawn_workers(
+            phase_id, n_workers, base_seed, self.separate_value_net, self.worker_torch_threads,
+            progress_value=progress_value,
+        )
+        return _ValuePretrainWorkers(handles, False, progress_value, n_workers, 1)
+
+    def _close_value_pretrain_workers(self, pool: Optional["_ValuePretrainWorkers"]) -> None:
+        if pool is None:
+            return
+        if pool.batched:
+            from footballcoach.ai.ppo.batched_rollout_worker import close_batched_workers
+
+            close_batched_workers(pool.handles)
+        else:
+            from footballcoach.ai.ppo.rollout_worker import close_workers
+
+            close_workers(pool.handles)
+
+    def _collect_value_pretrain_rollout(
+        self, env, n_steps: int, phase_id: Optional[int], use_gae: bool = False,
+        pool: Optional["_ValuePretrainWorkers"] = None,
+    ) -> tuple[dict, dict]:
         """Collect ``n_steps`` of on-policy experience for value warm-up.
 
         Returns ``(batch, stats)`` -- ``batch`` is the GAE-processed dict (same
@@ -4657,65 +4848,78 @@ class PPOTrainer:
         computed independently before merging, for the same reason as
         ``_train_parallel()`` (concatenating raw transitions across worker
         boundaries before GAE would corrupt advantage estimates).
+
+        Args:
+            use_gae: False (default, ``pretrain_value``'s behaviour, UNCHANGED)
+                uses pure Monte Carlo discounted returns
+                (``compute_mc_returns``) -- correct for a BC-fresh/untrained
+                value net, where bootstrapping off its own (effectively
+                random) predictions would fit targets that circularly depend
+                on the very net being warm-started. True (``ppg_value_refit``)
+                uses ``compute_gae`` instead: for an ALREADY-reasonably-
+                trained value net (ppg_value_refit's actual use case -- a
+                decent checkpoint, not a cold start), bootstrapping off its
+                own predictions is just ordinary TD learning, exactly what
+                real PPO training already does on every rollout -- and
+                matters here because real PPO's OWN value loss targets GAE
+                returns, not MC returns, so fitting the same quantity during
+                a refit means the value head needs no further readjustment
+                once real training resumes (the actual point of PPG's
+                auxiliary phase: converge toward the SAME target, not a
+                different-but-correlated one). Bootstrap handling lives in
+                ``_finalize_value_pretrain_result``: parallel workers (both
+                kinds) return a real ``last_value``, used as-is with NO
+                truncation so a trailing partial episode's data is kept;
+                the single-process branch has no ``last_value`` and falls
+                back to truncate-then-GAE with a literal ``0.0`` bootstrap,
+                which is provably never used (truncation leaves the buffer
+                ending on a ``done=1`` row and GAE's recursion resets there).
+            pool: an already-spawned worker pool (from
+                ``_spawn_value_pretrain_workers``) to REUSE for this call
+                instead of spawning a fresh one -- the worker main loops
+                (both kinds) already serve repeated "collect" commands (only
+                "close"/the pipe closing ends them), so nothing on the
+                worker side needs to change. When given, this call does NOT
+                spawn or close any process; the CALLER owns that lifecycle
+                (``ppg_value_refit`` does this for ``num_rollouts`` > 1, so
+                a fresh process pool isn't paid for every cycle). Weights
+                are re-synced to the workers at the start of EVERY call
+                regardless, which is what makes reuse correct while the
+                policy keeps moving. ``None`` (default) = spawn a pool for
+                this call alone and close it before returning -- exactly
+                the original per-call behaviour (``pretrain_value``,
+                ``pretrain_combined``).
         """
-        if self.value_pretrain_n_processes > 1 and phase_id is not None:
+        _owns_pool = pool is None
+        if _owns_pool:
+            pool = self._spawn_value_pretrain_workers(phase_id)
+        if pool is not None:
             import multiprocessing
             import multiprocessing.connection
 
-            from footballcoach.ai.ppo.rollout_worker import spawn_workers, close_workers
-
-            n_workers = self.value_pretrain_n_processes
+            n_workers = pool.n_processes
             steps_per_worker = max(1, n_steps // n_workers)
-            base_seed = random.randint(0, 2**31 - 1)
+            _kind = (
+                f"batched: {n_workers} proc x {pool.envs_per_process} envs = "
+                f"{n_workers * pool.envs_per_process} envs"
+                if pool.batched else f"{n_workers} worker(s), 1 env each"
+            )
             log.info(
-                f"  [value pretrain rollout] parallel collection: {n_workers} worker(s), "
-                f"~{steps_per_worker} steps/worker"
+                f"  [value pretrain rollout] parallel collection ({_kind}), "
+                f"~{steps_per_worker} steps/process"
+                + ("" if _owns_pool else " (reusing already-spawned workers)")
             )
             _wall_start = time.perf_counter()
-            _ctx = multiprocessing.get_context("spawn")
-            # Shared aggregate step counter across all workers (see
-            # spawn_workers()'s progress_value docstring) -- lets this call
-            # render ONE live bar instead of each worker printing its own
-            # ticking milestone lines onto a terminal they all share. Must be
-            # created with the SAME "spawn" context used by spawn_workers()
-            # and passed at process-creation time (raw ctx.Value can't be
-            # sent to an already-running worker afterwards).
-            _progress_value = _ctx.Value("l", 0)
-            workers = spawn_workers(
-                phase_id, n_workers, base_seed, self.separate_value_net, self.worker_torch_threads,
-                progress_value=_progress_value,
-            )
-            try:
-                dec_state = self.decision_net.state_dict()
-                exec_state = self.execution_net.state_dict()
-                val_state = self.value_net.state_dict() if self.value_net is not None else None
-                for w in workers:
-                    w.set_weights(dec_state, exec_state, val_state)
-                for w in workers:
-                    w.collect(steps_per_worker, progress=0.0)
-                _agg_progress = ProgressReporter(
-                    steps_per_worker * n_workers,
-                    prefix=f"  [value pretrain rollout] ({n_workers} workers): ", live=True,
-                )
-                _pending = {w.conn: w for w in workers}
-                while _pending:
-                    ready = multiprocessing.connection.wait(list(_pending.keys()), timeout=0.2)
-                    _agg_progress.update(int(_progress_value.value))
-                    for conn in ready:
-                        _pending.pop(conn, None)
-                results = [w.recv_result() for w in workers]
-            finally:
-                close_workers(workers)
-            _wall_elapsed = time.perf_counter() - _wall_start
-            _n_steps_total = sum(len(r["buffer"].rewards) for r in results)
-            log.info(
-                f"  [value pretrain rollout] parallel total: {_wall_elapsed:.1f}s wall  "
-                f"({1000.0 * _wall_elapsed / max(_n_steps_total, 1):.2f} ms/step aggregate, "
-                f"{_n_steps_total / max(_wall_elapsed, 1e-9):.1f} steps/s aggregate across "
-                f"{n_workers} worker(s), includes process spawn)"
-            )
 
-            worker_batches = []
+            # Results are INGESTED AS THEY ARRIVE (each one is finalized,
+            # its stats folded in, and the raw result dropped) rather than
+            # collected into a list first -- the old "gather everything, then
+            # convert everything, then merge" shape kept the raw results, the
+            # converted per-worker tensors and the merged batch alive
+            # together (the rollout-end RAM spike). Batched workers now also
+            # finalize in the worker and stream whole-episode chunks, so what
+            # arrives here is already compact and bounded per message.
+            worker_batches: list[dict] = []
             episode_returns: list[float] = []
             episode_outcome_labels: list[str] = []
             outcomes_vs_rules: list[str] = []
@@ -4724,16 +4928,25 @@ class PPOTrainer:
             episode_comp_list: list[dict[str, float]] = []
             episode_durations_s: list[float] = []
             n_dropped_total = 0
-            for r in results:
-                buf = r["buffer"]
-                n_dropped_total += buf.truncate_to_last_episode_end()
-                # MC returns, not GAE: the value net is untrained/stale here, so
-                # bootstrapping off it (GAE) would fit targets that circularly
-                # depend on the very net being warm-started (see
-                # ai_trainer_knowledge.md "value pretrain MC vs GAE returns").
-                advantages = [0.0] * len(buf.rewards)
-                returns = buf.compute_mc_returns(self.gamma)
-                worker_batches.append(buf.as_tensors(advantages, returns))
+            _n_rows_total = 0
+
+            def _ingest(r: dict) -> None:
+                nonlocal n_dropped_total, _n_rows_total
+                if "batch" in r:
+                    # Worker-finalized (batched workers): numpy arrays on the wire
+                    # (None = MC mode had no completed episode in this result).
+                    from footballcoach.ai.ppo.batched_rollout_worker import batch_from_wire
+
+                    tensors = batch_from_wire(r["batch"]) if r["batch"] is not None else None
+                    n_dropped = r["n_dropped"]
+                else:
+                    # Legacy shape ({"buffer", ...}): plain workers, or a batched
+                    # worker spoken to without a returns spec.
+                    tensors, n_dropped = _finalize_value_pretrain_result(r, self.gamma, self.lam, use_gae)
+                n_dropped_total += n_dropped
+                _n_rows_total += (int(tensors["returns"].shape[0]) if tensors is not None else 0) + n_dropped
+                if tensors is not None:
+                    worker_batches.append(tensors)
                 stats = r["stats"]
                 episode_returns.extend(stats["episode_rewards"])
                 episode_outcome_labels.extend(stats["episode_outcome_labels"])
@@ -4742,12 +4955,71 @@ class PPOTrainer:
                 outcomes_vs_neural.extend(stats["episode_outcomes_vs_neural"])
                 episode_comp_list.extend(stats["episode_comp_list"])
                 episode_durations_s.extend(stats["episode_durations_s"])
+
+            try:
+                dec_state = self.decision_net.state_dict()
+                exec_state = self.execution_net.state_dict()
+                val_state = self.value_net.state_dict() if self.value_net is not None else None
+                for w in pool.handles:
+                    w.set_weights(dec_state, exec_state, val_state)
+                # The PARENT resets the shared counter (workers never do --
+                # a worker-side reset would race between workers sharing it).
+                with pool.progress_value.get_lock():
+                    pool.progress_value.value = 0
+                # Batched workers finalize their own results with OUR gamma/lam
+                # (explicit, so a worker's separately-read config can't drift).
+                _returns_spec = {
+                    "mode": "gae" if use_gae else "mc", "gamma": self.gamma, "lam": self.lam,
+                }
+                for w in pool.handles:
+                    if pool.batched:
+                        w.collect(steps_per_worker, returns=_returns_spec)
+                    else:
+                        w.collect(steps_per_worker, progress=0.0)
+                _agg_progress = ProgressReporter(
+                    steps_per_worker * n_workers,
+                    prefix=f"  [value pretrain rollout] ({n_workers} workers): ", live=True,
+                )
+                _pending = {w.conn: w for w in pool.handles}
+                while _pending:
+                    ready = multiprocessing.connection.wait(list(_pending.keys()), timeout=0.2)
+                    _agg_progress.update(int(pool.progress_value.value))
+                    for conn in ready:
+                        if pool.batched:
+                            # Uniform batched protocol: zero-or-more
+                            # {"chunk": [per-env results]} then {"done": True}.
+                            msg = conn.recv()
+                            for r in msg.get("chunk", []):
+                                _ingest(r)
+                            if msg.get("done"):
+                                _pending.pop(conn, None)
+                        else:
+                            _ingest(_pending.pop(conn).recv_result())
+            finally:
+                if _owns_pool:
+                    self._close_value_pretrain_workers(pool)
+            _wall_elapsed = time.perf_counter() - _wall_start
+            log.info(
+                f"  [value pretrain rollout] parallel total: {_wall_elapsed:.1f}s wall  "
+                f"({1000.0 * _wall_elapsed / max(_n_rows_total, 1):.2f} ms/step aggregate, "
+                f"{_n_rows_total / max(_wall_elapsed, 1e-9):.1f} steps/s aggregate across "
+                f"{n_workers} process(es)"
+                + (", includes process spawn)" if _owns_pool else ")")
+            )
             if n_dropped_total:
                 log.info(
                     f"  [value pretrain rollout] dropped {n_dropped_total} trailing "
-                    f"(incomplete-episode) step(s) across workers before MC-return fit"
+                    f"(incomplete-episode) step(s) across workers before "
+                    f"{'GAE' if use_gae else 'MC'}-return fit"
                 )
-            batch = _merge_worker_batches(worker_batches)
+            if not worker_batches:
+                raise RuntimeError(
+                    "value-pretrain rollout produced no usable rows (no episode completed in "
+                    f"{n_steps} steps across {n_workers} process(es)); raise n_steps or shorten episodes"
+                )
+            # release_inputs: peak ~1x the rollout during the merge, not ~2x.
+            batch = _merge_worker_batches(worker_batches, release_inputs=True)
+            worker_batches.clear()
         else:
             env.sample_action_fn = self._sample_action
             env.reset()
@@ -4803,16 +5075,16 @@ class PPOTrainer:
                     obs = next_obs
             progress.finish(n_steps, n_episodes=len(episode_outcome_labels))
 
-            n_dropped = buffer.truncate_to_last_episode_end()
+            # No "last_value" in this bare result dict -> the helper takes its
+            # truncate-then-(MC | zero-bootstrap GAE) path, same as before.
+            batch, n_dropped = _finalize_value_pretrain_result(
+                {"buffer": buffer}, self.gamma, self.lam, use_gae,
+            )
             if n_dropped:
                 log.info(
                     f"  [value pretrain rollout] dropped {n_dropped} trailing "
-                    f"(incomplete-episode) step(s) before MC-return fit"
+                    f"(incomplete-episode) step(s) before {'GAE' if use_gae else 'MC'}-return fit"
                 )
-            # MC returns, not GAE: see parallel-path comment above.
-            advantages = [0.0] * len(buffer.rewards)
-            returns = buffer.compute_mc_returns(self.gamma)
-            batch = buffer.as_tensors(advantages, returns)
 
         log.info(
             f"  [value pretrain rollout] mean_return={np.mean(episode_returns) if episode_returns else float('nan'):.2f} "
@@ -4993,18 +5265,15 @@ class PPOTrainer:
                 val_mask[ep_starts[_i]:episode_end_idxs[_i] + 1] = True
         train_mask = ~val_mask
 
-        _LIST_KEYS = {"reward_comps_raw", "step_outcomes", "track_ids"}
+        # ret_std from all returns for consistent normalisation scale --
+        # taken BEFORE the split below empties ``batch`` key by key.
+        all_returns_t = batch["returns"].to(self.device)
 
-        def _sel(b: dict, mask: np.ndarray) -> dict:
-            idx = torch.from_numpy(np.where(mask)[0]).long()
-            idx_list = idx.tolist()
-            return {
-                k: ([v[i] for i in idx_list] if k in _LIST_KEYS else v[idx])
-                for k, v in b.items()
-            }
-
-        train_batch_raw = _sel(batch, train_mask)
-        val_batch_raw = _sel(batch, val_mask) if n_val_eps > 0 else None
+        # Split WITHOUT keeping the full batch alive next to its two slices
+        # (see _split_batch_releasing): peak ~1x the rollout, not ~2x.
+        train_batch_raw, val_batch_raw = _split_batch_releasing(
+            batch, train_mask, val_mask if n_val_eps > 0 else None,
+        )
 
         log.info(
             f"  Value pretrain split: {n_train_eps} train eps ({int(train_mask.sum())} steps)"
@@ -5014,11 +5283,10 @@ class PPOTrainer:
         # Augment only the train portion (geometric flips + slot permutations).
         if self.augment_n_slot_shuffles > 0:
             train_batch = augment_batch(train_batch_raw, self.augment_n_slot_shuffles, self._aug_rng)
+            del train_batch_raw  # the un-augmented copy is dead weight from here on
         else:
             train_batch = train_batch_raw
 
-        # ret_std from all returns for consistent normalisation scale.
-        all_returns_t = batch["returns"].to(self.device)
         ret_std = all_returns_t.std().clamp(min=1.0)
         log.debug(f"  [value pretrain] returns: mean={all_returns_t.mean():.2f}  std={ret_std:.2f}"
                   f"  min={all_returns_t.min():.2f}  max={all_returns_t.max():.2f}")
@@ -5279,6 +5547,566 @@ class PPOTrainer:
 
         return _rollout_stats
 
+    def ppg_value_refit(
+        self,
+        env,
+        n_steps: int,
+        phase_id: Optional[int] = None,
+        epochs: Optional[int] = None,
+        lr: Optional[float] = None,
+        kl_coef: Optional[float] = None,
+        batch_size: Optional[int] = None,
+        num_rollouts: Optional[int] = None,
+    ) -> dict:
+        """Re-fit the (shared-trunk) value function with FULL, unfrozen
+        gradient flow through decision_net/execution_net's trunk, while an
+        analytic per-head KL penalty (``_ppg_kl_penalty``) anchors the
+        policy's output distributions to a snapshot taken right before this
+        call, so the value function can track a reward/curriculum change (or
+        simply be given more capacity to fit returns) without the value
+        gradient damaging an already-decent policy.
+
+        This is the middle ground ``pretrain_value()`` cannot offer in the
+        shared-trunk case: ``value_pretrain_frozen_layers=-1`` (default)
+        freezes the trunk so only ``execution_net.value_head`` can adapt (a
+        weak fit); ``=0`` unfreezes everything with no protection at all
+        (the value gradient reshapes the exact trunk features the policy
+        heads read from). Inspired by the auxiliary phase of OpenAI's
+        Phasic Policy Gradient (PPG) paper -- see ai/knowledge.md "PPG-style
+        value refit" for the full design writeup -- but scoped here as a
+        standalone/occasional refit (called once after pretraining, or
+        on-demand against an existing checkpoint), NOT an automatic
+        alternating cadence inside the main PPO rollout loop.
+
+        Only meaningful when ``self.separate_value_net`` is False -- the
+        separate-net critic already has its own unfrozen trunk with zero
+        risk to the policy (no-ops with a warning otherwise, matching
+        ``pretrain_value``'s identical branching rationale).
+
+        Structurally mirrors ``pretrain_value()`` (rollout collection via
+        the same ``_collect_value_pretrain_rollout``, 85/15 train/val episode
+        split, per-epoch minibatch loop, early stop + best-val restore) with
+        four real differences: no trunk freezing, a fresh dedicated
+        optimizer over EVERY decision_net+execution_net param (never
+        ``self.optimizer`` -- matches ``pretrain_value``'s own throwaway-
+        optimizer convention rather than mixing this objective's gradient
+        statistics into the live PPO Adam state), the added KL-anchor term,
+        and GAE-bootstrapped returns instead of ``pretrain_value``'s pure
+        Monte Carlo returns -- see ``_collect_value_pretrain_rollout``'s
+        ``use_gae`` docstring paragraph for why: real PPO's own value loss
+        targets GAE returns, and the actual point of this refit (matching
+        PPG's own auxiliary phase) is to converge the value head toward the
+        SAME quantity real training already uses, not a different-but-
+        correlated one that still needs readjusting once training resumes.
+
+        ``num_rollouts`` > 1 repeats the whole "collect a fresh rollout ->
+        take a new anchor snapshot off the CURRENT (by-then already-shifted)
+        weights -> fit epochs -> restore best-val" cycle that many times in
+        one call, each cycle fully independent (own rollout, own train/val
+        split, own anchor, own early-stop/best-val tracking) except for the
+        optimizer: ``ppg_opt`` (and its Adam momentum) is built ONCE and
+        reused across every cycle in this call, deliberately -- resetting
+        Adam's moving averages every cycle would be pure waste, since
+        cycles within one call are meant to behave like one continuous
+        refit session, just periodically re-grounded against fresh on-
+        policy data and a fresh anchor. This is intentionally NOT the same
+        thing as the "automatic alternating cadence inside the main PPO
+        loop" this method's docstring says is out of scope -- it never
+        touches ``_train_batched_parallel``/the main rollout loop at all,
+        it's purely an internal repeat-N-times knob on one standalone call.
+
+        If ``self.checkpoint_dir`` is set (true for any trainer built the
+        normal way, via ``train.py``), a checkpoint is saved to
+        ``checkpoint_dir/checkpoint_pretrained.pt`` after EVERY cycle, not
+        just once at the end -- a multi-rollout call can run a long time,
+        so this bounds how much work an interrupt/crash partway through
+        loses. No-op (no save) when ``checkpoint_dir`` is None.
+
+        Args:
+            env: forwarded to ``_collect_value_pretrain_rollout`` -- ignored
+                when ``ppo.value_pretrain_n_processes > 1`` and ``phase_id``
+                is given (same convention as ``pretrain_value``).
+            n_steps: rollout steps to collect PER rollout cycle.
+            phase_id: curriculum phase id, for parallel rollout collection.
+            epochs/lr/kl_coef/batch_size: override the ``bc.ppg_*``/
+                ``bc.value_pretrain_batch_size`` config defaults for a
+                single call.
+            num_rollouts: override ``bc.ppg_num_rollouts`` (default 1) --
+                how many collect+fit+restore cycles to run in this call.
+
+        Returns:
+            The rollout-stats dict from the LAST cycle's
+            ``_collect_value_pretrain_rollout`` call (episode returns/
+            outcomes), for parity with ``pretrain_value``'s return value --
+            not an aggregate across all ``num_rollouts`` cycles.
+        """
+        if self.separate_value_net:
+            log.warning(
+                "ppg_value_refit is a no-op with separate_value_net=True "
+                "(the critic already has its own unfrozen trunk -- nothing to protect)."
+            )
+            return {}
+
+        epochs = epochs if epochs is not None else self._ppg_epochs
+        lr = lr if lr is not None else self._ppg_lr
+        kl_coef = kl_coef if kl_coef is not None else self._ppg_kl_coef
+        _batch_size = batch_size if batch_size is not None else self._value_pretrain_batch_size
+        num_rollouts = num_rollouts if num_rollouts is not None else self._ppg_num_rollouts
+        log.info(
+            f"PPG value refit: {num_rollouts} rollout(s), {n_steps} steps/rollout, "
+            f"{epochs} epochs, lr={lr}, kl_coef={kl_coef}, batch_size={_batch_size}"
+        )
+
+        # Optimizer (+ its grad-clip param groups) built ONCE and reused
+        # across every rollout cycle below -- see docstring's num_rollouts
+        # paragraph for why Adam's momentum deliberately persists across
+        # cycles within this one call, unlike the rollout/anchor/best-val
+        # state, which is fully independent per cycle.
+        ppg_params_all = list(self.decision_net.parameters()) + list(self.execution_net.parameters())
+        ppg_opt = torch.optim.Adam(ppg_params_all, lr=lr, eps=1e-5)
+        _non_direction_params = [p for p in ppg_params_all if id(p) not in self.direction_param_ids]
+        _direction_params = [p for p in ppg_params_all if id(p) in self.direction_param_ids]
+
+        # Parallel rollout workers (plain or batched, per
+        # ppo.value_pretrain_batched_rollout), if applicable, are ALSO
+        # spawned ONCE and reused across every cycle below -- see
+        # _collect_value_pretrain_rollout's ``pool`` docstring paragraph.
+        # Respawning num_rollouts times would pay full process-spawn overhead
+        # on every cycle for no reason (weights still get re-synced each
+        # cycle regardless, since the policy keeps moving). None when
+        # parallel collection doesn't apply (single-process branch).
+        _pool = self._spawn_value_pretrain_workers(phase_id)
+        if _pool is not None and num_rollouts > 1:
+            log.info(
+                f"  [ppg value refit] spawned {_pool.n_processes} rollout process(es) "
+                f"({'batched' if _pool.batched else 'plain'}), reused across all {num_rollouts} cycles"
+            )
+
+        try:
+            _rollout_stats: dict = {}
+            for _rollout_i in range(num_rollouts):
+                if num_rollouts > 1:
+                    log.info(f"=== PPG value refit: rollout {_rollout_i + 1}/{num_rollouts} ===")
+                # _collect_value_pretrain_rollout() is shared with pretrain_value()
+                # (same rollout-collection code either way, so its own progress/
+                # summary lines below are still labeled "[value pretrain rollout]"
+                # -- this line exists purely so that doesn't read as "oh, it's
+                # running pretrain_value again" when it's actually the PPG
+                # refit's own collection step) -- but use_gae=True here, UNLIKE
+                # pretrain_value's own call: see _collect_value_pretrain_rollout's
+                # use_gae docstring paragraph for why GAE (matching what real PPO
+                # training itself targets) is the right choice specifically for
+                # refitting an already-decent value function, as opposed to
+                # pretrain_value's cold-start-from-BC scenario where MC returns
+                # avoid a real circularity problem GAE would have there.
+                log.info("Doing PPG value refit rollout collection now (reuses pretrain_value()'s rollout collector, hence the '[value pretrain rollout]' label below)...")
+                batch, _rollout_stats = self._collect_value_pretrain_rollout(
+                    env, n_steps, phase_id, use_gae=True, pool=_pool,
+                )
+
+                # --- Episode-level 85/15 train/val split (overfit detection) ---
+                # Identical to pretrain_value()'s own split -- see its comments.
+                dones_arr = batch["dones"].numpy()
+                episode_end_idxs = np.where(dones_arr > 0.5)[0]
+                n_complete_eps = len(episode_end_idxs)
+                n_val_eps = max(1, round(0.15 * n_complete_eps)) if n_complete_eps >= 2 else 0
+                n_train_eps = n_complete_eps - n_val_eps
+                n_total = len(dones_arr)
+                val_mask = np.zeros(n_total, dtype=bool)
+                if n_val_eps > 0:
+                    ep_starts = np.concatenate([[0], episode_end_idxs[:-1] + 1])
+                    for _i in range(n_train_eps, n_complete_eps):
+                        val_mask[ep_starts[_i]:episode_end_idxs[_i] + 1] = True
+                train_mask = ~val_mask
+
+                # ret_std source (all returns) -- taken BEFORE the split below
+                # empties ``batch`` key by key.
+                all_returns_t = batch["returns"].to(self.device)
+
+                # Split WITHOUT keeping the full batch alive next to its two
+                # slices (see _split_batch_releasing): peak ~1x, not ~2x.
+                train_batch_raw, val_batch_raw = _split_batch_releasing(
+                    batch, train_mask, val_mask if n_val_eps > 0 else None,
+                )
+
+                log.info(
+                    f"  PPG refit split: {n_train_eps} train eps ({int(train_mask.sum())} steps)"
+                    + (f"  |  {n_val_eps} val eps ({int(val_mask.sum())} steps)" if n_val_eps > 0 else "")
+                )
+
+                # Augment only the train portion, same as pretrain_value(). Unlike
+                # PPO's own ratio-based objective, neither the value loss nor the
+                # KL-anchor term here depend on any precomputed "old" log_prob --
+                # the anchor is snapshotted AFTER augmentation (below), over the
+                # exact same (possibly-augmented, larger) row set being trained on
+                # -- so augment_batch()'s known old_log_prob approximation for
+                # flip_y copies (see augment.py) simply never comes into play here.
+                if self.augment_n_slot_shuffles > 0:
+                    train_batch = augment_batch(train_batch_raw, self.augment_n_slot_shuffles, self._aug_rng)
+                    del train_batch_raw  # the un-augmented copy is dead weight from here on
+                else:
+                    train_batch = train_batch_raw
+
+                # Frozen physics-encoder outputs depend only on the (now fixed)
+                # input features, so compute them ONCE per row here instead of
+                # re-running the encoders inside every anchor/baseline/epoch/val
+                # forward pass (~2x epochs + 4 extra passes over the data per
+                # cycle) -- the same trick _ppo_update uses across its n_epochs.
+                # Rides along as ordinary obs/* entries -> picked up by the
+                # generic obs slicing below; decision_net calls pass it through.
+                train_batch.update(self._precompute_physics_full(train_batch, _batch_size))
+                if val_batch_raw is not None:
+                    val_batch_raw.update(self._precompute_physics_full(val_batch_raw, _batch_size))
+
+                ret_std = all_returns_t.std().clamp(min=1.0)
+                returns_t = train_batch["returns"].to(self.device)
+
+                val_returns_t = None
+                val_obs_dict = None
+                val_actions_dict = None
+                if val_batch_raw is not None:
+                    val_returns_t = val_batch_raw["returns"].to(self.device)
+                    # obs stays on CPU (moved per chunk) -- see _train_obs_full below.
+                    val_obs_dict = {k.replace("obs/", ""): val_batch_raw[k]
+                                    for k in val_batch_raw if k.startswith("obs/")}
+                    val_actions_dict = {k.replace("action/", ""): val_batch_raw[k].to(self.device)
+                                         for k in val_batch_raw if k.startswith("action/")}
+
+                n = len(returns_t)
+
+                # --- Anchor snapshot(s): ONE no_grad pass each over the whole
+                # (post-augmentation) train batch AND the held-out val batch, under
+                # the CURRENT weights, before any gradient step -- see
+                # _ppg_snapshot_anchor's docstring. Everything from here on is
+                # pulled back toward these snapshots by the KL term (train) or
+                # measured against them (val, diagnostic only -- val is never
+                # trained on). anchor_globals is shared by both: it's just the
+                # handful of GLOBAL spread nn.Parameters at refit-start, not
+                # per-row, so there's nothing train/val-specific about it.
+                # Deliberately CPU-resident: the whole augmented train obs is
+                # several GB (other_feat + the precomputed other_physics_full
+                # alone are ~2.4k floats/row), and parking it on the GPU next
+                # to the anchors + training activations can overflow VRAM into
+                # (very slow) shared system memory. Every consumer moves one
+                # chunk at a time, exactly like PPO's per-minibatch .to().
+                _train_obs_full = {
+                    k.replace("obs/", ""): v
+                    for k, v in train_batch.items() if k.startswith("obs/")
+                }
+                anchor = self._ppg_snapshot_anchor(
+                    _train_obs_full, _batch_size,
+                    progress=ProgressReporter(
+                        len(_train_obs_full["self_feat"]), prefix="  [ppg] anchor snapshot (train): ", live=True,
+                    ),
+                )
+                val_anchor = (
+                    self._ppg_snapshot_anchor(
+                        val_obs_dict, _batch_size,
+                        progress=ProgressReporter(
+                            len(val_obs_dict["self_feat"]), prefix="  [ppg] anchor snapshot (val):   ", live=True,
+                        ),
+                    )
+                    if val_obs_dict is not None else None
+                )
+                anchor_globals = {
+                    "move_dir_log_kappa": self.execution_net.move_dir_log_kappa.detach().clone(),
+                    "kick_dir_log_kappa": self.execution_net.kick_dir_log_kappa.detach().clone(),
+                    "kick_dir_z_log_std": self.execution_net.kick_dir_z_log_std.detach().clone(),
+                    "kick_power_log_std": self.execution_net.kick_power_log_std.detach().clone(),
+                }
+                if not self._kick_spin_frozen:
+                    anchor_globals["kick_spin_log_std"] = self.execution_net.kick_spin_log_std.detach().clone()
+
+                # NOTE: ppg_opt/_non_direction_params/_direction_params are built
+                # ONCE, before the rollout loop (see above) -- deliberately NOT
+                # rebuilt per cycle, so Adam's momentum persists across
+                # num_rollouts cycles within this one call.
+
+                def _eval_value_loss(
+                    obs_source: dict, ret_source: torch.Tensor, progress_prefix: str = "",
+                ) -> tuple[float, float, float]:
+                    """Returns (normalized_mse, rmse, rmse excluding the worst
+                    ``ppg_rmse_trim_frac`` rows -- see ``_trimmed_rmse``).
+                    ``progress_prefix`` (optional) shows a per-chunk progress bar."""
+                    total_sq = 0.0
+                    n_rows = 0
+                    sq_chunks: list[torch.Tensor] = []
+                    _bar = ProgressReporter(len(ret_source), prefix=progress_prefix, live=True) if progress_prefix else None
+                    with torch.no_grad():
+                        for start in range(0, len(ret_source), _batch_size):
+                            mb_ret = ret_source[start:start + _batch_size]
+                            mb_obs = {k: v[start:start + _batch_size].to(self.device) for k, v in obs_source.items()}
+                            sat, oat = _ai_types(mb_obs)
+                            d_heads = self.decision_net(
+                                mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"],
+                                mb_obs["ball_feat"], mb_obs["global_feat"], sat, oat,
+                                ball_physics_full=mb_obs.get("ball_physics_full"),
+                                self_physics_full=mb_obs.get("self_physics_full"),
+                                other_physics_full=mb_obs.get("other_physics_full"),
+                            )
+                            _value = self.execution_net(
+                                mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"],
+                                mb_obs["ball_feat"], mb_obs["global_feat"], d_heads, sat, oat,
+                                value_only=True,
+                            )
+                            preds = _value.squeeze(-1)
+                            _sq = (preds - mb_ret) ** 2
+                            sq_chunks.append(_sq)
+                            total_sq += float(_sq.sum())
+                            n_rows += len(mb_ret)
+                            if _bar is not None:
+                                _bar.update(min(start + _batch_size, len(ret_source)))
+                    mse = total_sq / max(n_rows, 1)
+                    norm_mse = mse / float(ret_std ** 2)
+                    _trim_rmse = _trimmed_rmse(torch.cat(sq_chunks) if sq_chunks else torch.empty(0), self._ppg_rmse_trim_frac)
+                    return norm_mse, float(ret_std) * math.sqrt(norm_mse), _trim_rmse
+
+                def _eval_value_and_kl(
+                    obs_source: dict, actions_source: dict, ret_source: torch.Tensor, anchor_source: dict,
+                    progress_prefix: str = "",
+                ) -> tuple[float, float, float, float, dict[str, float]]:
+                    """Same value-loss computation as _eval_value_loss, PLUS the KL
+                    penalty against anchor_source -- used for the held-out val set
+                    each epoch (never trained on; purely diagnostic) so the log can
+                    show kl_val alongside kl_train instead of only measuring drift
+                    on the data actually being optimized. Returns
+                    (normalized_mse, rmse, trimmed_rmse, mean_kl, per_head_kl).
+                    ``progress_prefix`` (optional) shows a per-chunk progress bar."""
+                    total_sq = 0.0
+                    n_rows = 0
+                    sq_chunks: list[torch.Tensor] = []
+                    kl_sum = 0.0
+                    per_head_sum: dict[str, float] = {}
+                    _bar = ProgressReporter(len(ret_source), prefix=progress_prefix, live=True) if progress_prefix else None
+                    with torch.no_grad():
+                        for start in range(0, len(ret_source), _batch_size):
+                            mb_ret = ret_source[start:start + _batch_size]
+                            mb_obs = {k: v[start:start + _batch_size].to(self.device) for k, v in obs_source.items()}
+                            mb_actions = {k: v[start:start + _batch_size] for k, v in actions_source.items()}
+                            mb_anchor = {k: v[start:start + _batch_size] for k, v in anchor_source.items()}
+                            sat, oat = _ai_types(mb_obs)
+                            d_heads = self.decision_net(
+                                mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"],
+                                mb_obs["ball_feat"], mb_obs["global_feat"], sat, oat,
+                                ball_physics_full=mb_obs.get("ball_physics_full"),
+                                self_physics_full=mb_obs.get("self_physics_full"),
+                                other_physics_full=mb_obs.get("other_physics_full"),
+                            )
+                            e_heads = self.execution_net(
+                                mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"],
+                                mb_obs["ball_feat"], mb_obs["global_feat"], d_heads, sat, oat,
+                            )
+                            preds = e_heads.value.squeeze(-1)
+                            bsz = len(mb_ret)
+                            _sq = (preds - mb_ret) ** 2
+                            sq_chunks.append(_sq)
+                            total_sq += float(_sq.sum())
+                            n_rows += bsz
+                            total_kl, per_head_kl = self._ppg_kl_penalty(
+                                d_heads, e_heads, mb_anchor, anchor_globals, mb_actions, mb_obs["exists_mask"],
+                            )
+                            kl_sum += float(total_kl) * bsz
+                            for k, v in per_head_kl.items():
+                                per_head_sum[k] = per_head_sum.get(k, 0.0) + float(v) * bsz
+                            if _bar is not None:
+                                _bar.update(min(start + _batch_size, len(ret_source)))
+                    mse = total_sq / max(n_rows, 1)
+                    norm_mse = mse / float(ret_std ** 2)
+                    rmse = float(ret_std) * math.sqrt(norm_mse)
+                    _trim_rmse = _trimmed_rmse(torch.cat(sq_chunks) if sq_chunks else torch.empty(0), self._ppg_rmse_trim_frac)
+                    mean_kl = kl_sum / max(n_rows, 1)
+                    per_head_mean = {k: v / max(n_rows, 1) for k, v in per_head_sum.items()}
+                    return norm_mse, rmse, _trim_rmse, mean_kl, per_head_mean
+
+                _trim_tag = f"ex{int(round(self._ppg_rmse_trim_frac * 100))}"
+                _baseline_train_loss, _baseline_train_rmse, _baseline_train_trim = _eval_value_loss(
+                    _train_obs_full, returns_t, progress_prefix="  [ppg] baseline eval (train): ",
+                )
+                if val_obs_dict is not None and val_returns_t is not None:
+                    _baseline_val_loss, _baseline_val_rmse, _baseline_val_trim = _eval_value_loss(
+                        val_obs_dict, val_returns_t, progress_prefix="  [ppg] baseline eval (val):   ",
+                    )
+                    log.info(
+                        f"  PPG refit epoch   0/{epochs} (baseline): "
+                        f"train={_baseline_train_loss:.4f} rmse={_baseline_train_rmse:.2f} rmse_{_trim_tag}={_baseline_train_trim:.2f}  "
+                        f"val={_baseline_val_loss:.4f} val_rmse={_baseline_val_rmse:.2f} val_rmse_{_trim_tag}={_baseline_val_trim:.2f} "
+                        f"(std={float(ret_std):.1f})"
+                    )
+                else:
+                    log.info(
+                        f"  PPG refit epoch   0/{epochs} (baseline): "
+                        f"train_loss={_baseline_train_loss:.4f}  rmse={_baseline_train_rmse:.2f} rmse_{_trim_tag}={_baseline_train_trim:.2f} "
+                        f"(returns std={float(ret_std):.1f})"
+                    )
+
+                _best_val_loss = float("inf")
+                _best_decision_state: Optional[dict] = None
+                _best_execution_state: Optional[dict] = None
+                _patience = 0
+                _EARLY_STOP_PATIENCE = self._value_pretrain_early_stop_patience
+                _EARLY_STOP_MIN_DELTA = self._value_pretrain_early_stop_min_delta
+                mean_loss = float(_baseline_train_loss)
+                epochs_done = 0
+
+                for ep in range(epochs):
+                    indices = torch.randperm(n)
+                    ep_value_losses = []
+                    ep_sq_errs: list[torch.Tensor] = []
+                    ep_kl_totals = []
+                    ep_head_kl_accum: dict[str, list[float]] = {}
+                    # Live per-epoch training bar (rows/s; falls back to 10%
+                    # milestone lines when stderr isn't a terminal). Its final
+                    # update at start+batch >= n prints the closing newline, so
+                    # the epoch's log line below never lands on the bar's row.
+                    _ep_bar = ProgressReporter(n, prefix=f"  [ppg] epoch {ep + 1}/{epochs} train: ", live=True)
+                    for start in range(0, n, _batch_size):
+                        mb_idx = indices[start:start + _batch_size]
+                        mb_obs = {k.replace("obs/", ""): train_batch[k][mb_idx].to(self.device)
+                                  for k in train_batch if k.startswith("obs/")}
+                        mb_actions = {k.replace("action/", ""): train_batch[k][mb_idx].to(self.device)
+                                      for k in train_batch if k.startswith("action/")}
+                        mb_ret = returns_t[mb_idx]
+                        # anchor's tensors live on self.device (built by
+                        # _ppg_snapshot_anchor's forward passes); mb_idx itself is a
+                        # plain CPU torch.randperm() slice (matching train_batch's
+                        # own CPU-tensor indexing above) -- move it once for the
+                        # anchor lookup so this works whether self.device is "cpu"
+                        # (index device == tensor device already, a no-op move) or
+                        # a real accelerator (where indexing a device tensor with a
+                        # CPU index tensor would otherwise raise).
+                        mb_idx_dev = mb_idx.to(self.device)
+                        mb_anchor = {k: v[mb_idx_dev] for k, v in anchor.items()}
+
+                        sf, of, em = mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"]
+                        bf, gf = mb_obs["ball_feat"], mb_obs["global_feat"]
+                        sat, oat = _ai_types(mb_obs)
+
+                        d_heads = self.decision_net(
+                            sf, of, em, bf, gf, sat, oat,
+                            ball_physics_full=mb_obs.get("ball_physics_full"),
+                            self_physics_full=mb_obs.get("self_physics_full"),
+                            other_physics_full=mb_obs.get("other_physics_full"),
+                        )
+                        e_heads = self.execution_net(sf, of, em, bf, gf, d_heads, sat, oat)
+                        new_values = e_heads.value.squeeze(-1)
+                        value_loss = F.mse_loss(new_values, mb_ret) / (ret_std ** 2)
+
+                        total_kl, per_head_kl = self._ppg_kl_penalty(
+                            d_heads, e_heads, mb_anchor, anchor_globals, mb_actions, em,
+                        )
+                        loss = value_loss + kl_coef * total_kl
+
+                        ppg_opt.zero_grad()
+                        loss.backward()
+                        nn.utils.clip_grad_norm_(_non_direction_params, self.max_grad_norm)
+                        if _direction_params:
+                            nn.utils.clip_grad_norm_(_direction_params, self.direction_max_grad_norm)
+                        ppg_opt.step()
+
+                        ep_value_losses.append(value_loss.item())
+                        # Pre-step training-forward errors (same convention as the
+                        # plain train rmse from ep_value_losses above), kept per row
+                        # so the trimmed rmse below can drop the worst tail.
+                        ep_sq_errs.append(((new_values.detach() - mb_ret) ** 2))
+                        ep_kl_totals.append(total_kl.item())
+                        for k, v in per_head_kl.items():
+                            ep_head_kl_accum.setdefault(k, []).append(v.item())
+                        _ep_bar.update(
+                            min(start + _batch_size, n),
+                            postfix=f"value_loss={np.mean(ep_value_losses):.4f} kl={np.mean(ep_kl_totals):.4f}",
+                        )
+
+                    mean_loss = float(np.mean(ep_value_losses))
+                    mean_kl_train = float(np.mean(ep_kl_totals))
+                    epochs_done = ep + 1
+                    _train_rmse = float(ret_std) * math.sqrt(mean_loss)
+                    _train_trim_rmse = _trimmed_rmse(torch.cat(ep_sq_errs), self._ppg_rmse_trim_frac)
+                    _inactive = self._inactive_head_lp_keys()
+                    _head_kl_train_str = "  ".join(
+                        f"{k}={np.mean(v):+.4f}" for k, v in ep_head_kl_accum.items() if k not in _inactive
+                    )
+
+                    if val_obs_dict is not None and val_returns_t is not None and val_anchor is not None:
+                        _vl, _val_rmse, _val_trim_rmse, mean_kl_val, _val_head_kl = _eval_value_and_kl(
+                            val_obs_dict, val_actions_dict, val_returns_t, val_anchor,
+                            progress_prefix=f"  [ppg] epoch {epochs_done}/{epochs} val:   ",
+                        )
+                        log.info(
+                            f"  PPG refit epoch {epochs_done}/{epochs}: "
+                            f"train={mean_loss:.4f} rmse={_train_rmse:.2f} rmse_{_trim_tag}={_train_trim_rmse:.2f}  "
+                            f"val={_vl:.4f} val_rmse={_val_rmse:.2f} val_rmse_{_trim_tag}={_val_trim_rmse:.2f} "
+                            f"(std={float(ret_std):.1f})  "
+                            f"kl_train={mean_kl_train:.4f} kl_val={mean_kl_val:.4f}"
+                        )
+                        log.info(f"    [ppg aux KL by head] (train) {_head_kl_train_str}")
+                        _head_kl_val_str = "  ".join(
+                            f"{k}={v:+.4f}" for k, v in _val_head_kl.items() if k not in _inactive
+                        )
+                        log.info(f"    [ppg aux KL by head] (val)   {_head_kl_val_str}")
+                        if _vl < _best_val_loss - _EARLY_STOP_MIN_DELTA:
+                            _best_val_loss = _vl
+                            _patience = 0
+                            _best_decision_state = copy.deepcopy(self.decision_net.state_dict())
+                            _best_execution_state = copy.deepcopy(self.execution_net.state_dict())
+                        else:
+                            _patience += 1
+                            if _patience >= _EARLY_STOP_PATIENCE:
+                                log.info(
+                                    f"  [ppg value refit] early stop at epoch {epochs_done} "
+                                    f"(val stagnant for {_EARLY_STOP_PATIENCE} epochs, best={_best_val_loss:.4f})"
+                                )
+                                break
+                    else:
+                        log.info(
+                            f"  PPG refit epoch {epochs_done}/{epochs}: "
+                            f"train_loss={mean_loss:.4f}  rmse={_train_rmse:.2f} rmse_{_trim_tag}={_train_trim_rmse:.2f} "
+                            f"(returns std={float(ret_std):.1f})  kl_train={mean_kl_train:.4f}"
+                        )
+                        log.info(f"    [ppg aux KL by head] (train) {_head_kl_train_str}")
+
+                if _best_decision_state is not None:
+                    # NOT a plain strict load_state_dict -- decision_net can carry
+                    # optional submodules (e.g. the frozen physics-dynamics encoders)
+                    # that may or may not be part of every checkpoint/config
+                    # combination; _load_state_dict_tolerant is the same forgiving
+                    # loader every other best-state restoration in this file already
+                    # uses for exactly this reason (see pretrain_combined's Phase 0
+                    # best-state handling).
+                    _load_state_dict_tolerant(self.decision_net, _best_decision_state, "ppg_value_refit decision_net restore")
+                    _load_state_dict_tolerant(self.execution_net, _best_execution_state, "ppg_value_refit execution_net restore")
+                    log.info(f"  [ppg value refit] restored best-val weights (val_loss={_best_val_loss:.4f})")
+                _cycle_label = f" (rollout {_rollout_i + 1}/{num_rollouts})" if num_rollouts > 1 else ""
+                log.info(f"PPG value refit{_cycle_label} done ({epochs_done} epoch(s), final train_loss={mean_loss:.4f})")
+
+                # Checkpoint after EVERY cycle, not just once at the end -- a
+                # multi-rollout call can run a long time (each rollout alone can
+                # take a while at real ppg_rollout_steps sizes), so this bounds
+                # how much work a crash/interrupt partway through actually loses.
+                # Same filename train.py itself saves to after this method
+                # returns, so that final save is just a harmless idempotent
+                # re-save of whatever the last cycle already wrote here.
+                if self.checkpoint_dir is not None:
+                    _ckpt_path = self.checkpoint_dir / "checkpoint_pretrained.pt"
+                    self._save_checkpoint_to(_ckpt_path)
+                    log.info(f"  [ppg value refit] checkpoint saved to {_ckpt_path}")
+
+                # Drop this cycle's big tensors NOW. Names bound inside a loop
+                # body live until they're reassigned, so without this the whole
+                # previous cycle (raw + augmented train batch, obs/anchor
+                # snapshots, val copies -- easily several GB) would stay
+                # resident throughout the NEXT rollout's collection, on top of
+                # that rollout's own linear growth. Assigning None (rather
+                # than ``del``) is safe whether or not a name was already
+                # deleted/unset on this path.
+                batch = train_batch = train_batch_raw = val_batch_raw = None
+                returns_t = val_returns_t = all_returns_t = None
+                _train_obs_full = val_obs_dict = val_actions_dict = None
+                anchor = val_anchor = None
+        finally:
+            self._close_value_pretrain_workers(_pool)
+
+        return _rollout_stats
+
     # -----------------------------------------------------------------------
     # Policy sampling
     # -----------------------------------------------------------------------
@@ -5393,6 +6221,300 @@ class PPOTrainer:
             lp_kick_power,
             lp_kick_spin,
         ], dim=-1)
+
+    @torch.no_grad()
+    def _precompute_physics_full(self, batch: dict, chunk_size: int) -> dict[str, torch.Tensor]:
+        """Run the FROZEN physics encoders once over every row of ``batch``
+        (a dict with ``obs/self_feat``, ``obs/other_feat``, ``obs/ball_feat``,
+        ``obs/global_feat`` CPU tensors) and return their RAW canonical-frame
+        outputs as CPU tensors keyed ``obs/{ball,self,other}_physics_full`` --
+        ready to merge into the same batch so the generic ``obs/*`` slicing
+        picks them up and every ``decision_net(...)`` call site can pass them
+        through instead of re-running the encoders on identical rows every
+        pass. Empty dict when neither encoder exists. Shared by
+        ``_ppo_update`` and ``ppg_value_refit``."""
+        dn = self.decision_net
+        if dn.ball_physics_encoder is None and dn.player_physics_encoder is None:
+            return {}
+        n = len(batch["obs/self_feat"])
+        ball_parts: list[torch.Tensor] = []
+        self_parts: list[torch.Tensor] = []
+        other_parts: list[torch.Tensor] = []
+        for start in range(0, n, chunk_size):
+            idx = torch.arange(start, min(start + chunk_size, n))
+            sf_c, of_c, bf_c, _ = canonicalize_obs(
+                batch["obs/self_feat"][idx].to(self.device),
+                batch["obs/other_feat"][idx].to(self.device),
+                batch["obs/ball_feat"][idx].to(self.device),
+            )
+            gf_c = batch["obs/global_feat"][idx].to(self.device)
+            if dn.ball_physics_encoder is not None:
+                ball_parts.append(dn.ball_physics_encoder(bf_c, gf_c).cpu())
+            if dn.player_physics_encoder is not None:
+                self_parts.append(dn.player_physics_encoder(sf_c, gf_c).cpu())
+                other_parts.append(dn.player_physics_encoder(of_c, gf_c).cpu())
+        out: dict[str, torch.Tensor] = {}
+        if ball_parts:
+            out["obs/ball_physics_full"] = torch.cat(ball_parts, dim=0)
+        if self_parts:
+            out["obs/self_physics_full"] = torch.cat(self_parts, dim=0)
+            out["obs/other_physics_full"] = torch.cat(other_parts, dim=0)
+        return out
+
+    @torch.no_grad()
+    def _ppg_snapshot_anchor(
+        self, obs: dict, batch_size: int, progress: Optional["ProgressReporter"] = None,
+    ) -> dict[str, torch.Tensor]:
+        """Snapshot the state-dependent policy outputs needed to compute a
+        per-head KL penalty later, for ``ppg_value_refit()``. Called ONCE,
+        under the CURRENT (about-to-be-refit) weights, before that method's
+        epoch loop begins -- this is the "anchor" the policy gets pulled
+        back toward for the rest of the refit.
+
+        Only captures per-row, STATE-DEPENDENT outputs (Bernoulli/Categorical
+        logits, and the raw mean vector for the continuous heads) -- the
+        continuous heads' spread parameters (``move_dir_log_kappa`` etc.) are
+        global ``nn.Parameter``s, not state-dependent, so ``ppg_value_refit``
+        snapshots those separately as a handful of scalars, not per-row.
+
+        Runs in minibatch-sized chunks (not one giant forward pass) to bound
+        memory, mirroring every other full-batch pass in this file (e.g.
+        ``pretrain_value``'s own baseline-loss eval).
+
+        Args:
+            obs: dict of ``obs/*``-stripped observation tensors (kept on CPU
+                on purpose -- only one chunk at a time is moved to
+                ``self.device``, see ``ppg_value_refit``), e.g.
+                ``{"self_feat": ..., "other_feat": ...}``.
+            batch_size: chunk size for the forward passes.
+            progress: optional ``ProgressReporter`` (total = number of rows),
+                updated after every chunk -- purely cosmetic, so the caller
+                can show a bar for what is otherwise a silent, slow pass.
+
+        Returns:
+            dict of per-row tensors, same row order as ``obs``, keyed by the
+            network's own attribute names (``shoot_logit``, ``pass_logit``,
+            ..., ``pass_target_logits``, ..., ``move_direction``,
+            ``kick_direction``, ``kick_power``, and ``kick_spin`` only when
+            ``self._kick_spin_frozen`` is False).
+        """
+        n = len(obs["self_feat"])
+        chunks: dict[str, list[torch.Tensor]] = {}
+        for start in range(0, n, batch_size):
+            mb_obs = {k: v[start:start + batch_size].to(self.device) for k, v in obs.items()}
+            sat, oat = _ai_types(mb_obs)
+            d_heads = self.decision_net(
+                mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"],
+                mb_obs["ball_feat"], mb_obs["global_feat"], sat, oat,
+                ball_physics_full=mb_obs.get("ball_physics_full"),
+                self_physics_full=mb_obs.get("self_physics_full"),
+                other_physics_full=mb_obs.get("other_physics_full"),
+            )
+            e_heads = self.execution_net(
+                mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"],
+                mb_obs["ball_feat"], mb_obs["global_feat"], d_heads, sat, oat,
+            )
+            row: dict[str, torch.Tensor] = {
+                "shoot_logit": d_heads.shoot_logit,
+                "pass_logit": d_heads.pass_logit,
+                "move_logit": d_heads.move_logit,
+                "tackle_logit": d_heads.tackle_logit,
+                "get_possession_raw": d_heads.get_possession_raw,
+                "mark_logit": d_heads.mark_logit,
+                "hold_position_logit": d_heads.hold_position_logit,
+                "pass_target_logits": d_heads.pass_target_logits,
+                "tackle_target_logits": d_heads.tackle_target_logits,
+                "mark_target_logits": d_heads.mark_target_logits,
+                "exec_move_logit": e_heads.exec_move_logit,
+                "sprint_logit": e_heads.sprint_logit,
+                "kick_logit": e_heads.kick_logit,
+                "tackle_attempt_logit": e_heads.tackle_attempt_logit,
+                "move_direction": e_heads.move_direction,
+                "kick_direction": e_heads.kick_direction,
+                "kick_power": e_heads.kick_power,
+            }
+            if not self._kick_spin_frozen:
+                row["kick_spin"] = e_heads.kick_spin
+            for k, v in row.items():
+                chunks.setdefault(k, []).append(v.detach())
+            if progress is not None:
+                progress.update(min(start + batch_size, n))
+        return {k: torch.cat(v, dim=0) for k, v in chunks.items()}
+
+    def _ppg_kl_penalty(
+        self, d_heads, e_heads, anchor: dict[str, torch.Tensor],
+        anchor_globals: dict[str, torch.Tensor], mb_actions: dict, exists_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Analytic per-head KL(current policy || anchor snapshot), for
+        ``ppg_value_refit()``'s KL-anchor loss term.
+
+        Mirrors ``_recompute_log_prob``'s gating exactly (hard boolean mask
+        for the target-categorical heads keyed on the parent's actually-
+        sampled action; float exec_move/kick masks for their respective
+        sub-heads) so the SAME rows/heads that would carry real log_prob
+        signal during ordinary PPO training are the ones being KL-anchored
+        here -- and heads currently in ``_inactive_head_lp_keys()``
+        (curriculum-frozen decision heads, or permanently-frozen kick_spin)
+        are skipped entirely, exactly like the ``[per-head KL]`` diagnostic
+        already does.
+
+        Every head except move_dir/kick_dir's azimuthal component has a
+        ``torch.distributions.kl_divergence``-registered closed form
+        (Bernoulli/Categorical/Normal) -- reusing the SAME
+        ``_move_dir_head``/``_kick_dir_head``/``_kick_power_head``/
+        ``_kick_spin_dist`` constructors already used for log_prob/entropy
+        for BOTH the current and anchor distributions guarantees identical
+        clamping/construction on both sides. move_dir/kick_dir's azimuthal
+        part uses the hand-derived ``_von_mises_kl`` (torch has none
+        registered for VonMises).
+
+        Returns:
+            (total_kl, per_head_kl): ``total_kl`` is the batch-mean summed-
+            across-heads KL (for the loss). ``per_head_kl`` is a dict keyed
+            by ``HEAD_LP_KEYS`` (the same 15 short names the ``[per-head
+            KL]``/entropy diagnostics use) of that head's batch-mean KL, for
+            a ``[ppg aux KL by head]`` log line -- target-categorical KL is
+            folded into its parent's entry (``pass_target`` -> ``pass_``
+            etc.), matching how ``_recompute_log_prob`` never surfaces the
+            target categoricals as a separate scalar either.
+        """
+        device = self.device
+        bsz = exists_mask.shape[0]
+        zero = torch.zeros(bsz, device=device)
+        inactive = self._inactive_head_lp_keys()
+
+        # A logit past ~+-16.7 makes torch.sigmoid(logit) round to EXACTLY
+        # 0.0/1.0 in float32 (1 - 2**-24 is indistinguishable from 1.0 at
+        # that precision). torch's own Bernoulli-Bernoulli KL formula
+        # deliberately returns +inf when the ANCHOR side has hit that exact
+        # boundary while the current side hasn't (a real property of KL --
+        # q assigning literally zero probability to something p doesn't is
+        # genuinely infinite divergence) -- correct in isolation, but fatal
+        # here: exec_move_mask/kick_mask then multiply that +inf by 0.0 on
+        # non-firing rows (IEEE 0*inf = nan), poisoning this row's per-head
+        # sum and then the whole minibatch's .mean(). A mature, confident
+        # checkpoint (any head that's near-always/near-never true, e.g.
+        # move/tackle_attempt after enough PPO training) hits this easily.
+        # Clamped well inside the float32 saturation boundary on both sides
+        # before computing KL -- this only affects the KL PENALTY term, not
+        # the actual sampled action/log_prob/entropy used anywhere else.
+        _BERNOULLI_LOGIT_CLAMP = 12.0
+
+        def _bern_kl(new_logit, anchor_logit):
+            new_c = new_logit.clamp(-_BERNOULLI_LOGIT_CLAMP, _BERNOULLI_LOGIT_CLAMP)
+            anchor_c = anchor_logit.clamp(-_BERNOULLI_LOGIT_CLAMP, _BERNOULLI_LOGIT_CLAMP)
+            return torch.distributions.kl_divergence(
+                torch.distributions.Bernoulli(logits=new_c),
+                torch.distributions.Bernoulli(logits=anchor_c),
+            ).squeeze(-1)
+
+        def _cat_kl(new_logits, anchor_logits):
+            return torch.distributions.kl_divergence(
+                MaskedCategorical(new_logits, exists_mask).dist,
+                MaskedCategorical(anchor_logits, exists_mask).dist,
+            )
+
+        kl_shoot = zero if "shoot" in inactive else _bern_kl(d_heads.shoot_logit, anchor["shoot_logit"])
+        kl_move = zero if "move" in inactive else _bern_kl(d_heads.move_logit, anchor["move_logit"])
+        kl_gp = zero if "gp_extra" in inactive else _bern_kl(d_heads.get_possession_raw, anchor["get_possession_raw"])
+        kl_hold = zero if "hold" in inactive else _bern_kl(d_heads.hold_position_logit, anchor["hold_position_logit"])
+
+        # Parent Bernoulli KL + (gated) target-categorical KL folded into one
+        # entry, exactly mirroring _recompute_log_prob's pass_mask/tackle_mask/
+        # mark_mask boolean-row-subset convention for the categorical target
+        # heads -- pass_/tackle/mark each have one, shoot/move/gp_extra/hold
+        # don't (see the plain _bern_kl-only heads above).
+        def _parent_plus_target_kl(short_key, parent_logit, anchor_parent_logit,
+                                    action_key, target_logits, anchor_target_logits):
+            if short_key in inactive:
+                return zero
+            kl = _bern_kl(parent_logit, anchor_parent_logit)
+            mask = mb_actions[action_key].squeeze(-1) > 0.5
+            if mask.any():
+                cat_kl = _cat_kl(target_logits, anchor_target_logits)
+                kl = kl.clone()
+                kl[mask] = kl[mask] + cat_kl[mask]
+            return kl
+
+        kl_pass = _parent_plus_target_kl(
+            "pass_", d_heads.pass_logit, anchor["pass_logit"], "pass_",
+            d_heads.pass_target_logits, anchor["pass_target_logits"],
+        )
+        kl_tackle = _parent_plus_target_kl(
+            "tackle", d_heads.tackle_logit, anchor["tackle_logit"], "tackle",
+            d_heads.tackle_target_logits, anchor["tackle_target_logits"],
+        )
+        kl_mark = _parent_plus_target_kl(
+            "mark", d_heads.mark_logit, anchor["mark_logit"], "mark",
+            d_heads.mark_target_logits, anchor["mark_target_logits"],
+        )
+
+        exec_move_mask = (mb_actions["exec_move"].squeeze(-1) > 0.5).float()
+        kick_mask = (mb_actions["kick"].squeeze(-1) > 0.5).float()
+
+        kl_exec_move = zero if "exec_move" in inactive else _bern_kl(e_heads.exec_move_logit, anchor["exec_move_logit"])
+        kl_sprint = zero if "sprint" in inactive else exec_move_mask * _bern_kl(e_heads.sprint_logit, anchor["sprint_logit"])
+        kl_kick = zero if "kick" in inactive else _bern_kl(e_heads.kick_logit, anchor["kick_logit"])
+        kl_tackle_attempt = (
+            zero if "tackle_attempt" in inactive
+            else _bern_kl(e_heads.tackle_attempt_logit, anchor["tackle_attempt_logit"])
+        )
+
+        log_kappa_move = self.execution_net.move_dir_log_kappa.to(device)
+        log_kappa_kick = self.execution_net.kick_dir_log_kappa.to(device)
+        log_std_z_kick = self.execution_net.kick_dir_z_log_std.to(device)
+        log_std_power = self.execution_net.kick_power_log_std.to(device)
+
+        if "move_dir" in inactive:
+            kl_move_dir = zero
+        else:
+            cur_move = self._move_dir_head(e_heads.move_direction, log_kappa_move)
+            anc_move = self._move_dir_head(anchor["move_direction"], anchor_globals["move_dir_log_kappa"])
+            kl_move_dir = exec_move_mask * _von_mises_kl(
+                cur_move.mean_angle, cur_move.kappa, anc_move.mean_angle, anc_move.kappa,
+            )
+
+        if "kick_dir" in inactive:
+            kl_kick_dir = zero
+        else:
+            cur_kick = self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick)
+            anc_kick = self._kick_dir_head(
+                anchor["kick_direction"], anchor_globals["kick_dir_log_kappa"], anchor_globals["kick_dir_z_log_std"],
+            )
+            kl_kick_dir_azimuth = _von_mises_kl(cur_kick.theta_mean, cur_kick.kappa, anc_kick.theta_mean, anc_kick.kappa)
+            kl_kick_dir_z = torch.distributions.kl_divergence(
+                torch.distributions.Normal(cur_kick.mean_z, cur_kick.std_z),
+                torch.distributions.Normal(anc_kick.mean_z, anc_kick.std_z),
+            )
+            kl_kick_dir = kick_mask * (kl_kick_dir_azimuth + kl_kick_dir_z)
+
+        if "kick_power" in inactive:
+            kl_kick_power = zero
+        else:
+            cur_power = self._kick_power_head(e_heads.kick_power, log_std_power)
+            anc_power = self._kick_power_head(anchor["kick_power"], anchor_globals["kick_power_log_std"])
+            kl_kick_power = kick_mask * torch.distributions.kl_divergence(cur_power.dist, anc_power.dist).sum(dim=-1)
+
+        # _inactive_head_lp_keys() already folds in _kick_spin_frozen (see its
+        # own docstring), so checking "kick_spin" in inactive alone suffices.
+        if "kick_spin" in inactive:
+            kl_kick_spin = zero
+        else:
+            log_std_spin = self.execution_net.kick_spin_log_std.to(device)
+            cur_spin = self._kick_spin_dist(e_heads.kick_spin, log_std_spin)
+            anc_spin = self._kick_spin_dist(anchor["kick_spin"], anchor_globals["kick_spin_log_std"])
+            kl_kick_spin = kick_mask * torch.distributions.kl_divergence(cur_spin, anc_spin).sum(dim=-1)
+
+        per_head = {
+            "shoot": kl_shoot, "pass_": kl_pass, "move": kl_move, "tackle": kl_tackle,
+            "gp_extra": kl_gp, "mark": kl_mark, "hold": kl_hold,
+            "exec_move": kl_exec_move, "sprint": kl_sprint, "kick": kl_kick,
+            "tackle_attempt": kl_tackle_attempt, "move_dir": kl_move_dir,
+            "kick_dir": kl_kick_dir, "kick_power": kl_kick_power, "kick_spin": kl_kick_spin,
+        }
+        total_per_row = sum(per_head.values())
+        per_head_mean = {k: v.mean() for k, v in per_head.items()}
+        return total_per_row.mean(), per_head_mean
 
     @torch.no_grad()
     def _sample_action_networks(self, obs_dict_batch: dict) -> tuple:
@@ -6624,29 +7746,7 @@ class PPOTrainer:
         # free; only the self.decision_net(...) call sites themselves need
         # to pass them through via the ball_physics_full/self_physics_full/
         # other_physics_full kwargs (see DecisionNetwork.forward()). ---
-        if self.decision_net.ball_physics_encoder is not None or self.decision_net.player_physics_encoder is not None:
-            _phys_ball_parts: list[torch.Tensor] = []
-            _phys_self_parts: list[torch.Tensor] = []
-            _phys_other_parts: list[torch.Tensor] = []
-            with torch.no_grad():
-                for _pstart in range(0, n, self.minibatch_size):
-                    _pidx = torch.arange(_pstart, min(_pstart + self.minibatch_size, n))
-                    _psf_c, _pof_c, _pbf_c, _ = canonicalize_obs(
-                        batch["obs/self_feat"][_pidx].to(self.device),
-                        batch["obs/other_feat"][_pidx].to(self.device),
-                        batch["obs/ball_feat"][_pidx].to(self.device),
-                    )
-                    _pgf_c = batch["obs/global_feat"][_pidx].to(self.device)
-                    if self.decision_net.ball_physics_encoder is not None:
-                        _phys_ball_parts.append(self.decision_net.ball_physics_encoder(_pbf_c, _pgf_c).cpu())
-                    if self.decision_net.player_physics_encoder is not None:
-                        _phys_self_parts.append(self.decision_net.player_physics_encoder(_psf_c, _pgf_c).cpu())
-                        _phys_other_parts.append(self.decision_net.player_physics_encoder(_pof_c, _pgf_c).cpu())
-            if _phys_ball_parts:
-                batch["obs/ball_physics_full"] = torch.cat(_phys_ball_parts, dim=0)
-            if _phys_self_parts:
-                batch["obs/self_physics_full"] = torch.cat(_phys_self_parts, dim=0)
-                batch["obs/other_physics_full"] = torch.cat(_phys_other_parts, dim=0)
+        batch.update(self._precompute_physics_full(batch, self.minibatch_size))
 
         # Replace augment_batch()'s cheap tiled old_log_prob (correct only
         # for the identity-flip copies) with the TRUE log pi_old(action|obs)
@@ -8952,7 +10052,7 @@ def _action_to_numpy(action: DecisionAction, exec_samples: dict) -> dict[str, np
     }
 
 
-def _merge_worker_batches(batches: list[dict]) -> dict:
+def _merge_worker_batches(batches: list[dict], release_inputs: bool = False) -> dict:
     """Concatenate per-worker ``RolloutBuffer.as_tensors()`` dicts along dim 0.
 
     Each worker's batch must already have GAE applied independently (its
@@ -8960,11 +10060,154 @@ def _merge_worker_batches(batches: list[dict]) -> dict:
     bootstrap value) -- concatenating raw transitions across worker
     boundaries BEFORE computing GAE would corrupt advantage estimates by
     treating unrelated episodes/workers as one continuous trajectory.
+
+    ``release_inputs=True`` deletes each key from every input dict as soon as
+    that key has been concatenated, so peak memory is ONE full copy of the
+    data plus a single key's worth of extra, instead of the inputs AND the
+    merged result alive together (~2x) -- the rollout-end RAM spike this
+    exists to flatten. The input dicts are left EMPTY afterwards, so only
+    pass it when the caller is done with them (the streaming rollout
+    consumers are). Default False = inputs untouched, as before.
     """
     merged: dict = {}
-    for key in batches[0]:
+    for key in list(batches[0].keys()):
         if key in ("reward_comps_raw", "step_outcomes", "track_ids"):
             merged[key] = [x for b in batches for x in b[key]]
         else:
             merged[key] = torch.cat([b[key] for b in batches], dim=0)
+        if release_inputs:
+            for b in batches:
+                del b[key]
     return merged
+
+
+def _decode_rollout_result(
+    r: dict, gamma: float, lam: float, want_replay_inputs: bool,
+) -> tuple[dict, Optional[list], list, Optional[list]]:
+    """Decode ONE per-env rollout result from a batched worker into
+    ``(tensors, advantages, track_ids, dones)`` for ``_train_batched_parallel``.
+
+    - Worker-finalized result (``"batch"`` key -- what the main loop asks for
+      via ``collect(returns=...)``): GAE/returns were already computed in the
+      worker with THIS process's gamma/lam; the numpy wire batch is turned
+      back into torch tensors (zero-copy).
+    - Legacy result (``"buffer"``): GAE is computed here with
+      ``r["last_value"]``, exactly the pre-worker-finalization behaviour.
+
+    Both paths must produce identical numbers -- that equivalence is the
+    correctness claim of worker-side finalization (see the tests).
+    ``advantages``/``dones`` (Python lists) are only built when
+    ``want_replay_inputs`` (episode-seed replay needs them for
+    ``_episode_abs_adv_means``); otherwise they're None so the main loop
+    doesn't pay for a conversion nobody reads. ``track_ids`` is always
+    returned (cheap: already a list).
+    """
+    if "batch" in r:
+        from footballcoach.ai.ppo.batched_rollout_worker import batch_from_wire
+
+        tensors = batch_from_wire(r["batch"])
+        advantages = tensors["advantages"].tolist() if want_replay_inputs else None
+        dones = tensors["dones"].tolist() if want_replay_inputs else None
+        return tensors, advantages, tensors["track_ids"], dones
+    buf = r["buffer"]
+    advantages, returns = buf.compute_gae(gamma, lam, r["last_value"])
+    return buf.as_tensors(advantages, returns), advantages, buf.track_ids, buf.dones
+
+
+def _split_batch_releasing(
+    batch: dict, train_mask: np.ndarray, val_mask: Optional[np.ndarray],
+) -> tuple[dict, Optional[dict]]:
+    """Split a merged rollout batch into ``(train, val)`` row subsets (boolean
+    masks over rows; ``val_mask=None`` -> ``val`` is None) while EMPTYING
+    ``batch`` key by key as each key is sliced, so the full batch and its two
+    slices are never all alive together (peak ~1 full copy plus one key,
+    instead of ~2 full copies). ``batch`` is left empty afterwards -- the
+    caller must have read anything it still needs from it first (e.g.
+    ``batch["returns"]`` for a normalisation std) and must not use it again.
+    The list-valued keys (``reward_comps_raw``/``step_outcomes``/
+    ``track_ids``) are sliced as Python lists, exactly like the tensors."""
+    list_keys = ("reward_comps_raw", "step_outcomes", "track_ids")
+    train_idx = torch.from_numpy(np.where(train_mask)[0]).long()
+    train_list = train_idx.tolist()
+    val_idx = torch.from_numpy(np.where(val_mask)[0]).long() if val_mask is not None else None
+    val_list = val_idx.tolist() if val_idx is not None else None
+    train: dict = {}
+    val: Optional[dict] = {} if val_idx is not None else None
+    for key in list(batch.keys()):
+        v = batch.pop(key)
+        if key in list_keys:
+            train[key] = [v[i] for i in train_list]
+            if val is not None:
+                val[key] = [v[i] for i in val_list]
+        else:
+            train[key] = v[train_idx]
+            if val is not None:
+                val[key] = v[val_idx]
+        del v
+    return train, val
+
+
+@dataclass
+class _ValuePretrainWorkers:
+    """A live pool of value-pretrain rollout worker processes -- either
+    plain one-env-per-process ``rollout_worker.py`` workers, or (when
+    ``ppo.value_pretrain_batched_rollout`` is on) ``batched_rollout_worker.py``
+    workers each owning ``envs_per_process`` envs. Built by
+    ``PPOTrainer._spawn_value_pretrain_workers``; ``progress_value`` is the
+    shared ``ctx.Value`` step counter the workers add to (always present).
+    """
+    handles: list
+    batched: bool
+    progress_value: object
+    n_processes: int
+    envs_per_process: int
+
+
+def _finalize_value_pretrain_result(
+    r: dict, gamma: float, lam: float, use_gae: bool, allow_empty: bool = False,
+) -> tuple[Optional[dict], int]:
+    """Turn ONE worker/env result dict (``{"buffer", "last_value"?, "stats"}``)
+    from the value-pretrain rollout into an ``as_tensors()`` batch dict with
+    its ``returns`` filled in. Returns ``(batch_dict, n_rows_dropped)``.
+
+    ``allow_empty`` (MC mode only): when the buffer holds NO completed
+    episode at all -- with per-env whole-episode chunking that is common (an
+    env's final flush is often just its unfinished tail) -- MC returns for
+    those rows would be truncated garbage and ``truncate_to_last_episode_end``
+    (which never empties a buffer) would leave them in place. With
+    ``allow_empty=True`` the whole buffer is dropped instead and
+    ``(None, n_rows)`` is returned; callers must skip a None batch. Default
+    False keeps the old keep-everything behaviour for the callers that can't
+    tolerate an empty result (single-process collection, plain workers whose
+    single per-worker buffer always spans many episodes).
+
+    Never concatenate raw transitions across result boundaries before this
+    (same per-worker discipline as ``_merge_worker_batches``'s docstring).
+
+    - ``use_gae=False`` (``pretrain_value``): drop any trailing incomplete
+      episode (``truncate_to_last_episode_end``), then pure Monte Carlo
+      discounted returns -- unchanged from the original behaviour.
+    - ``use_gae=True`` AND the result carries a ``"last_value"`` (both worker
+      kinds compute one via ``PPOTrainer._bootstrap_last_values``): GAE with
+      that REAL bootstrap value and NO truncation, so a trailing partial
+      episode's data is kept (correctly bootstrapped) instead of thrown away.
+    - ``use_gae=True`` but no ``"last_value"`` (the single-process
+      collection branch, which builds a bare buffer): truncate, then GAE with
+      a literal 0.0 bootstrap -- provably never used, since truncation leaves
+      the buffer ending on a ``done=1`` row and GAE's backward recursion
+      resets at every ``done=1``.
+    """
+    buf = r["buffer"]
+    if use_gae and r.get("last_value") is not None:
+        advantages, returns = buf.compute_gae(gamma, lam, r["last_value"])
+        n_dropped = 0
+    else:
+        if allow_empty and not use_gae and buf.last_complete_episode_end() < 0:
+            return None, len(buf)
+        n_dropped = buf.truncate_to_last_episode_end()
+        if use_gae:
+            advantages, returns = buf.compute_gae(gamma, lam, 0.0)
+        else:
+            advantages = [0.0] * len(buf.rewards)
+            returns = buf.compute_mc_returns(gamma)
+    return buf.as_tensors(advantages, returns), n_dropped

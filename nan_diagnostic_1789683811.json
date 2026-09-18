@@ -1,0 +1,243 @@
+{
+  "stage": "backward",
+  "epoch_i": 3,
+  "mb_i": 40,
+  "n_rows_total": 12000,
+  "n_rows_secondary": 5194,
+  "secondary_fraction": 0.43283333333333335,
+  "unique_track_ids_in_minibatch": [
+    "opponent",
+    "trainee"
+  ],
+  "policy_loss_finite": true,
+  "value_loss_finite": true,
+  "entropy_finite": true,
+  "d_heads": {
+    "shoot_logit": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -8.939382553100586,
+      "max": -3.5379412174224854
+    },
+    "pass_logit": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -8.724952697753906,
+      "max": -3.8230745792388916
+    },
+    "move_logit": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -16.996706008911133,
+      "max": 14.799870491027832
+    },
+    "tackle_logit": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -8.802749633789062,
+      "max": -3.8804636001586914
+    },
+    "get_possession_raw": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -16.329936981201172,
+      "max": 16.131013870239258
+    },
+    "mark_logit": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -9.416658401489258,
+      "max": -3.449625015258789
+    },
+    "hold_position_logit": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -9.0137300491333,
+      "max": -3.663630962371826
+    },
+    "pass_target_logits": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -36.22983169555664,
+      "max": 32.27305603027344
+    },
+    "tackle_target_logits": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -33.050392150878906,
+      "max": 35.54872131347656
+    },
+    "mark_target_logits": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -26.88947105407715,
+      "max": 29.682231903076172
+    },
+    "move_region_center": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -13.965445518493652,
+      "max": 20.87399673461914
+    },
+    "move_region_size": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -20.770578384399414,
+      "max": 18.985334396362305
+    },
+    "move_arrival_speed": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -18.987071990966797,
+      "max": 18.649789810180664
+    },
+    "region_of_play_center": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -41.80044937133789,
+      "max": 20.190265655517578
+    },
+    "region_of_play_size": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -10.706255912780762,
+      "max": 22.489225387573242
+    },
+    "attack_defence_raw": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -25.077627182006836,
+      "max": 37.526405334472656
+    },
+    "latent_vector": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -49.15181350708008,
+      "max": 69.7084732055664
+    },
+    "value": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -1.4895602464675903,
+      "max": 1.061368465423584
+    },
+    "ball_physics_full": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -3.332045555114746,
+      "max": 3.00711727142334
+    },
+    "self_physics_full": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -2.2389309406280518,
+      "max": 2.262359619140625
+    },
+    "other_physics_full": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -2.2362616062164307,
+      "max": 2.2643585205078125
+    }
+  },
+  "e_heads": {
+    "move_direction": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -1.0,
+      "max": 0.9999999403953552
+    },
+    "move_direction_unnormalized": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -54.46589660644531,
+      "max": 57.24378204345703
+    },
+    "exec_move_logit": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -20.32763671875,
+      "max": 39.63456344604492
+    },
+    "sprint_logit": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -14.600889205932617,
+      "max": 25.511722564697266
+    },
+    "kick_logit": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -66.31831359863281,
+      "max": 27.763248443603516
+    },
+    "kick_direction": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -0.9999949932098389,
+      "max": 0.9999982714653015
+    },
+    "kick_direction_unnormalized": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -76.55244445800781,
+      "max": 590.7052001953125
+    },
+    "kick_power": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -21.41019630432129,
+      "max": 11.364604949951172
+    },
+    "kick_spin": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -25.76009750366211,
+      "max": 19.296581268310547
+    },
+    "tackle_attempt_logit": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -15.034481048583984,
+      "max": 7.001824378967285
+    },
+    "value": {
+      "all_finite": true,
+      "n_nonfinite": 0,
+      "n_nonfinite_secondary": 0,
+      "min": -5.892546653747559,
+      "max": 4.3811187744140625
+    }
+  }
+}

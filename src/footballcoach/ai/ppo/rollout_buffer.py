@@ -13,6 +13,7 @@ IMPORTANT: GAE correctness depends on correct `dones` alignment:
 """
 from __future__ import annotations
 
+import dataclasses
 from dataclasses import dataclass, field
 from typing import Optional  # noqa: F401 - used in add() signature
 
@@ -290,6 +291,43 @@ class RolloutBuffer:
             if self.dones[t] > 0.5:
                 return t
         return -1
+
+    def pop_complete_episodes(self) -> "Optional[RolloutBuffer]":
+        """Split off everything up to and including the last ``done=1`` row
+        into a NEW ``RolloutBuffer`` (returned), leaving only the trailing
+        incomplete-episode rows behind in ``self``. Returns ``None`` (and
+        leaves ``self`` untouched) when no episode has completed yet.
+
+        The returned buffer therefore holds WHOLE episodes only -- it ends
+        exactly on a terminal row, so ``compute_gae`` needs no bootstrap value
+        for it and ``compute_mc_returns`` is exact -- while the unfinished
+        tail stays in ``self`` and keeps growing until its episode completes,
+        at which point a later pop hands it over intact. This is how
+        ``BatchedEnvGroup``'s chunked streaming avoids cutting an episode in
+        half at a flush boundary (see its module docstring).
+
+        Multi-track safe: all rows of a terminal tick (the trainee row plus
+        its secondary rows) carry ``done=1`` and are appended consecutively
+        before the next tick, so the last ``done=1`` index always lands on
+        the last row of a complete tick -- never between a tick's rows.
+
+        Generic over the dataclass fields (every field is a per-row list) so a
+        future per-row field can't be silently left out of the split. The
+        returned buffer's lists are new list objects (shallow slices -- the
+        per-row arrays themselves aren't copied), so, unlike the buffer
+        ``BatchedEnvGroup`` used to hand to ``on_chunk`` by reference, it
+        stays valid after later flushes.
+        """
+        cut = self.last_complete_episode_end()
+        if cut < 0:
+            return None
+        k = cut + 1
+        head = RolloutBuffer()
+        for f in dataclasses.fields(self):
+            lst = getattr(self, f.name)
+            setattr(head, f.name, lst[:k])
+            setattr(self, f.name, lst[k:])
+        return head
 
     def truncate_to_last_episode_end(self) -> int:
         """Drop any trailing steps after the last completed episode in-place.

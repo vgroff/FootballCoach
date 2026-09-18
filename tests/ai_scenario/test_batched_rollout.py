@@ -39,8 +39,13 @@ def trainer():
     return t
 
 
-def _make_envs(trainer, n: int):
-    """Deliberately does NOT use curriculum.envs.build_env(_PHASE) -- that
+def _make_envs(trainer, n: int, max_episode_s: float | None = None):
+    """``max_episode_s`` (optional) overrides the phase's episode cap -- the
+    whole-episode chunk tests use a short one so several episodes actually
+    COMPLETE within a few hundred steps (a whole-episode flush only fires once
+    some env has finished an episode).
+
+    Deliberately does NOT use curriculum.envs.build_env(_PHASE) -- that
     reads ai_config.json's CURRENT phase1_opponent_*_ratio at call time, and
     this file's tests need to stay stable regardless of what those ratios
     happen to be live (they were 0 neural when these tests were first
@@ -56,6 +61,9 @@ def _make_envs(trainer, n: int):
     opponent regimes without either depending on the live config file.
     """
     envs = []
+    env_kwargs = dict(_PHASE.env_kwargs)
+    if max_episode_s is not None:
+        env_kwargs["max_episode_s"] = max_episode_s
     for _ in range(n):
         defn = ScenarioDefinition(
             key="phase1_1v1_test", label="Phase 1: 1v1 (test, rules-based opponent)",
@@ -67,7 +75,7 @@ def _make_envs(trainer, n: int):
         )
         env = ScenarioEnv(
             definition=defn, trainee_player_id="trainee", phase=1,
-            secondary_player_ids=["opponent"], **_PHASE.env_kwargs,
+            secondary_player_ids=["opponent"], **env_kwargs,
         )
         # NOTE: BatchedEnvGroup never actually calls env.sample_action_fn for
         # the TRAINEE -- every trainee decision is always precomputed (via
@@ -515,18 +523,21 @@ class TestChunkedStreaming:
     """Coverage for collect(chunk_steps=..., on_chunk=...) -- fixes a real
     production MemoryError (ai/ppo/batched_rollout_worker.py's "Chunked
     streaming" docstring section): instead of one giant end-of-rollout
-    pickle+send, results are periodically flushed in smaller pieces. The
-    default (chunk_steps=None) path is exercised by every other test in
-    this file already; these specifically guard the NEW opt-in behavior.
+    pickle+send, results are periodically flushed in smaller pieces.
+
+    Flushes are WHOLE-EPISODE ONLY: a mid-collection flush sends each env's
+    completed episodes and keeps its unfinished tail, so an episode is never
+    cut in half at a chunk boundary. The default (chunk_steps=None) path is
+    exercised by every other test in this file already.
     """
 
+    @staticmethod
+    def _trainee_done_rows(buffer) -> int:
+        return sum(1 for t, d in zip(buffer.track_ids, buffer.dones) if t == "trainee" and d > 0.5)
+
     def test_on_chunk_called_multiple_times(self, trainer):
-        # NOTE: on_chunk's dicts hold self._buffers[i] BY REFERENCE, not a
-        # copy -- a later flush .clear()s the same object in place (see
-        # collect()'s own docstring warning). A real consumer pickles
-        # (conn.send) immediately; this test must extract the row COUNT
-        # immediately too, rather than holding onto the dicts themselves.
-        envs = _make_envs(trainer, 3)
+        # Short episodes so whole-episode flushes actually fire mid-collection.
+        envs = _make_envs(trainer, 3, max_episode_s=2.0)
         group = BatchedEnvGroup(envs, trainer, seeds=[9000, 9001, 9002])
         chunk_row_counts: list[int] = []
         result = group.collect(
@@ -538,11 +549,112 @@ class TestChunkedStreaming:
         assert len(chunk_row_counts) >= 2, "expected multiple flushes for n_steps=300, chunk_steps=50"
         assert sum(chunk_row_counts) >= 300
 
+    def test_mid_collection_chunks_contain_whole_episodes_only(self, trainer):
+        """The core guarantee: every chunk except the FINAL one ends on a
+        terminal row for every env in it (nothing cut mid-episode), needs no
+        bootstrap (last_value == 0.0), and its stats describe exactly the
+        episodes whose rows it holds. Even the final chunk's stats match its
+        completed-episode rows (its tail is simply an unfinished episode)."""
+        envs = _make_envs(trainer, 3, max_episode_s=2.0)
+        group = BatchedEnvGroup(envs, trainer, seeds=[9010, 9011, 9012])
+        calls: list[list[dict]] = []
+
+        def _record(chunk):
+            calls.append([
+                {
+                    "n": len(r["buffer"]),
+                    "last_done": float(r["buffer"].dones[-1]),
+                    "trainee_dones": self._trainee_done_rows(r["buffer"]),
+                    "n_rewards": len(r["stats"]["episode_rewards"]),
+                    "last_value": r["last_value"],
+                }
+                for r in chunk
+            ])
+
+        group.collect(n_steps=400, chunk_steps=40, on_chunk=_record)
+
+        assert len(calls) >= 2
+        for i, chunk in enumerate(calls):
+            is_final = i == len(calls) - 1
+            for r in chunk:
+                assert r["trainee_dones"] == r["n_rewards"], "stats must describe exactly this chunk's episodes"
+                if not is_final:
+                    assert r["last_done"] == 1.0, "a mid-collection chunk must end on a terminal row"
+                    assert r["last_value"] == 0.0, "a whole-episode chunk needs no bootstrap value"
+
+    def test_chunks_partition_exactly_the_unchunked_rows(self, trainer):
+        """Same seeds + deterministic sampling: chunked collection must
+        deliver the SAME multiset of rows as unchunked -- nothing lost or
+        duplicated by carrying tails across flushes."""
+        import random
+        seeds = [9020, 9021, 9022]
+        kwargs = dict(deterministic=True, deterministic_decision=True, deterministic_direction=True)
+
+        group_a = BatchedEnvGroup(_make_envs(trainer, 3, max_episode_s=2.0), trainer, seeds=seeds)
+        random.seed(31337)
+        unchunked = group_a.collect(n_steps=300, **kwargs)
+        rewards_unchunked = sorted(x for r in unchunked for x in r["buffer"].rewards)
+        n_unchunked = sum(len(r["buffer"]) for r in unchunked)
+
+        group_b = BatchedEnvGroup(_make_envs(trainer, 3, max_episode_s=2.0), trainer, seeds=seeds)
+        random.seed(31337)
+        rewards_chunked: list[float] = []
+        n_chunked = [0]
+
+        def _grab(chunk):
+            for r in chunk:
+                rewards_chunked.extend(r["buffer"].rewards)
+                n_chunked[0] += len(r["buffer"])
+
+        group_b.collect(n_steps=300, chunk_steps=40, on_chunk=_grab, **kwargs)
+
+        assert n_chunked[0] == n_unchunked
+        assert sorted(rewards_chunked) == pytest.approx(rewards_unchunked)
+
+    def test_mid_collection_chunk_buffers_are_safe_to_hold(self, trainer):
+        """Unlike the old flush (which handed over the LIVE per-env buffers
+        and then .clear()ed them), popped buffers are new objects -- holding
+        them across later flushes must still see their original rows."""
+        envs = _make_envs(trainer, 2, max_episode_s=2.0)
+        group = BatchedEnvGroup(envs, trainer, seeds=[9030, 9031])
+        held: list[tuple[object, int]] = []
+
+        def _hold(chunk):
+            for r in chunk:
+                held.append((r["buffer"], len(r["buffer"])))
+
+        group.collect(n_steps=300, chunk_steps=40, on_chunk=_hold)
+
+        # every chunk except the last is a popped (independent) buffer; the
+        # final flush hands over the live buffers, so skip the trailing entries
+        # belonging to the last on_chunk call by checking only rows-per-buffer
+        # consistency for buffers that are demonstrably not the live ones.
+        live_ids = {id(b) for b in group._buffers}
+        checked = 0
+        for buf, n_at_flush in held:
+            if id(buf) in live_ids:
+                continue
+            assert len(buf) == n_at_flush
+            checked += 1
+        assert checked > 0, "expected at least one mid-collection (popped) chunk"
+
+    def test_flush_retries_until_an_episode_completes_then_final_flush_sends_the_rest(self, trainer):
+        # Default (long) episodes: nothing completes in 60 steps, so the due
+        # mid-collection flushes have nothing whole to send -- only the final
+        # flush fires, carrying every row (as a trailing in-progress tail).
+        envs = _make_envs(trainer, 2)
+        group = BatchedEnvGroup(envs, trainer, seeds=[9040, 9041])
+        calls: list[int] = []
+        group.collect(
+            n_steps=60, chunk_steps=20,
+            on_chunk=lambda chunk: calls.append(sum(len(r["buffer"]) for r in chunk)),
+        )
+        assert len(calls) == 1, "no completed episode -> no mid-collection flush, just the final one"
+        assert calls[0] >= 60
+
     def test_aggregate_stats_close_to_unchunked(self, trainer):
         """Same seeds, same total step budget, deterministic sampling --
-        chunking must not change episode count/outcome/reward totals (only
-        individual advantage values for episodes straddling a flush
-        boundary are expected to differ, see the module docstring).
+        chunking must not change episode count/outcome/reward totals.
 
         Every episode AFTER the first draws its own fresh seed via
         collect()'s _next_episode_seed() (Python's GLOBAL random module,
@@ -554,21 +666,16 @@ class TestChunkedStreaming:
         import random
         seeds = [9100, 9101, 9102]
 
-        envs_unchunked = _make_envs(trainer, 3)
+        envs_unchunked = _make_envs(trainer, 3, max_episode_s=2.0)
         group_unchunked = BatchedEnvGroup(envs_unchunked, trainer, seeds=seeds)
         random.seed(424242)
         result_unchunked = group_unchunked.collect(
             n_steps=400, deterministic=True, deterministic_decision=True, deterministic_direction=True,
         )
 
-        envs_chunked = _make_envs(trainer, 3)
+        envs_chunked = _make_envs(trainer, 3, max_episode_s=2.0)
         group_chunked = BatchedEnvGroup(envs_chunked, trainer, seeds=seeds)
         random.seed(424242)
-        # Extract episode_rewards immediately in the callback -- see the
-        # note in test_on_chunk_called_multiple_times above (r["stats"] is
-        # a freshly-reassigned dict per flush so it's actually safe to hold
-        # onto here, but r["buffer"] is not; extracting immediately either
-        # way is the correct pattern any real on_chunk consumer must follow).
         rewards_chunked: list[float] = []
         group_chunked.collect(
             n_steps=400, deterministic=True, deterministic_decision=True, deterministic_direction=True,
@@ -583,10 +690,7 @@ class TestChunkedStreaming:
         )
         rewards_chunked = sorted(rewards_chunked)
         assert len(rewards_unchunked) > 0 and len(rewards_chunked) > 0
-        # Not exact equality -- see module docstring on chunk-boundary GAE
-        # truncation for straddling episodes; reward totals themselves are
-        # computed independently of chunk boundaries (episode_reward_accum
-        # persists across flushes) so should match very closely regardless.
+        assert len(rewards_unchunked) == len(rewards_chunked)
         assert abs(sum(rewards_unchunked) - sum(rewards_chunked)) < 1e-6
 
     def test_chunk_steps_none_is_unchanged(self, trainer):

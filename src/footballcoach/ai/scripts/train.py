@@ -202,6 +202,17 @@ def main() -> None:
                             "pre-training loop. Unlike --checkpoint (which skips pre-training), "
                             "this lets you re-pretrain an existing policy with new config or demos."
                         ))
+    parser.add_argument("--ppg-refit-only", action="store_true",
+                        help=(
+                            "After all normal checkpoint loading/pre-training above, run "
+                            "PPOTrainer.ppg_value_refit() once (see ai_config.json's bc.ppg_* "
+                            "comments) and save checkpoint_pretrained.pt, then exit WITHOUT "
+                            "running the full PPO training loop. Use this to re-fit the value "
+                            "function against an existing 'decent' checkpoint (e.g. --checkpoint/"
+                            "--from-pretrained/--latest) with full trunk gradient flow, protected "
+                            "by a KL-anchor penalty, without risking policy damage. A no-op (with "
+                            "a warning) if --separate-value-net is set."
+                        ))
     parser.add_argument("--pre-ppo-eval-trials", type=int, default=None,
                         help="Number of distinct eval seeds for ALL pre-PPO evals run after "
                              "pre-training, before PPO starts -- vs rules-based AI, vs immobile, "
@@ -721,6 +732,18 @@ def main() -> None:
                     phase_id=args.phase,
                 )
 
+        # PPG-style KL-anchored value refit (bc.ppg_enabled, default False --
+        # see ai_config.json's bc.ppg_* comments and ppg_value_refit()'s own
+        # docstring). Runs once, right after whatever pretraining path above
+        # just ran, using the SAME env/phase -- before checkpoint_pretrained.pt
+        # is saved below, so the refit is baked into that checkpoint.
+        if bool(bc_cfg.get("ppg_enabled", False)):
+            trainer.ppg_value_refit(
+                env,
+                n_steps=int(bc_cfg.get("ppg_rollout_steps", 110000)),
+                phase_id=args.phase,
+            )
+
     # Save pre-trained checkpoint NOW so parallel pre-PPO eval workers can reload it from disk.
     # (parallel eval requires a file path — live nn.Modules aren't picklable across subprocesses)
     _eval_ckpt_path: str | None = None
@@ -851,6 +874,20 @@ def main() -> None:
     # Apply curriculum head freezing (after pre-training, before PPO)
     if not args.no_head_freeze and phase.frozen_heads:
         trainer.set_frozen_heads(phase.frozen_heads)
+
+    if args.ppg_refit_only:
+        # Ad-hoc "starting from a decent checkpoint" use case -- reuses every
+        # bit of setup above (env, checkpoint loading, curriculum freezing)
+        # and just replaces the full PPO training loop with one refit call.
+        trainer.ppg_value_refit(
+            env,
+            n_steps=int(bc_cfg.get("ppg_rollout_steps", 110000)),
+            phase_id=args.phase,
+        )
+        _refit_ckpt_path = checkpoint_dir / "checkpoint_pretrained.pt"
+        trainer._save_checkpoint_to(_refit_ckpt_path)
+        log.info(f"--ppg-refit-only: refit complete, checkpoint saved to {_refit_ckpt_path}, exiting.")
+        return
 
     # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0).
     # NOTE: PPOTrainer.train()'s bc_label_fn needs the (player, match) ->

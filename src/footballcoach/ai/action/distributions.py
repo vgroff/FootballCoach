@@ -187,6 +187,36 @@ def _von_mises_entropy(kappa: torch.Tensor) -> torch.Tensor:
     return log_two_pi + torch.log(i0e) + kappa - kappa * (i1e / i0e)
 
 
+def _von_mises_kl(
+    mu1: torch.Tensor, kappa1: torch.Tensor, mu2: torch.Tensor, kappa2: torch.Tensor,
+) -> torch.Tensor:
+    """Closed-form KL(vM(mu1, kappa1) || vM(mu2, kappa2)):
+
+        KL = log(I0(kappa2)) - log(I0(kappa1))
+             + (kappa1 - kappa2*cos(mu1-mu2)) * I1(kappa1)/I0(kappa1)
+
+    ``torch.distributions`` has no ``kl_divergence`` registered for
+    ``VonMises`` (confirmed: raises ``NotImplementedError``). Computed via
+    the same numerically-stable exponentially-scaled Bessel functions
+    (``i0e``/``i1e`` = ``I0``/``I1`` * exp(-kappa)) as ``_von_mises_entropy``,
+    so it stays well-conditioned for large kappa where raw ``I0``/``I1``
+    would overflow: ``log(I0(k)) = log(i0e(k)) + k`` (the ``exp(-k)`` factor
+    cancels exactly in the log), and ``I1(k)/I0(k) = i1e(k)/i0e(k)`` (the
+    ``exp(-k)`` factor cancels in the ratio directly). Always >= 0 for valid
+    kappa > 0 (a real KL divergence between two proper distributions); == 0
+    exactly when ``mu1 == mu2`` and ``kappa1 == kappa2``. Broadcasts
+    normally, so a global (scalar-shaped) kappa alongside a per-row
+    (batch-shaped) mu works without any special-casing.
+    """
+    i0e_1 = torch.special.i0e(kappa1)
+    i1e_1 = torch.special.i1e(kappa1)
+    i0e_2 = torch.special.i0e(kappa2)
+    log_i0_1 = torch.log(i0e_1) + kappa1
+    log_i0_2 = torch.log(i0e_2) + kappa2
+    mean_resultant_1 = i1e_1 / i0e_1  # I1(kappa1)/I0(kappa1)
+    return (log_i0_2 - log_i0_1) + (kappa1 - kappa2 * torch.cos(mu1 - mu2)) * mean_resultant_1
+
+
 class VonMisesDirectionHead:
     """2D unit-vector output with a true von Mises (circular) PPO log_prob.
 
@@ -236,6 +266,20 @@ class VonMisesDirectionHead:
 
     def entropy(self) -> torch.Tensor:
         return _von_mises_entropy(self._kappa)
+
+    @property
+    def mean_angle(self) -> torch.Tensor:
+        """The mean angle (radians) this head's von Mises is centered on --
+        for building a KL divergence against another head's distribution
+        (e.g. a frozen snapshot) without reaching into the underscore-
+        prefixed internals directly."""
+        return self._theta_mean
+
+    @property
+    def kappa(self) -> torch.Tensor:
+        """The (already-clamped, exponentiated) concentration parameter --
+        see ``mean_angle``'s docstring for why this is exposed publicly."""
+        return self._kappa
 
 
 class KickDirectionHead:
@@ -311,6 +355,29 @@ class KickDirectionHead:
 
     def entropy(self) -> torch.Tensor:
         return _von_mises_entropy(self._kappa) + self.dist_z.entropy()
+
+    @property
+    def theta_mean(self) -> torch.Tensor:
+        """Mean azimuthal angle (radians) -- see ``VonMisesDirectionHead
+        .mean_angle``'s docstring for why this is exposed publicly."""
+        return self._theta_mean
+
+    @property
+    def kappa(self) -> torch.Tensor:
+        """Azimuthal concentration parameter -- see ``theta_mean``'s
+        docstring."""
+        return self._kappa
+
+    @property
+    def mean_z(self) -> torch.Tensor:
+        """Mean of the elevation (z) Normal component."""
+        return self._mean_z
+
+    @property
+    def std_z(self) -> torch.Tensor:
+        """Std of the elevation (z) Normal component (already exponentiated
+        and clamped)."""
+        return self._std_z
 
 
 class DirectionHead:

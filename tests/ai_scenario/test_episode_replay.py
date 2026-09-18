@@ -1,6 +1,6 @@
 """Coverage for episode-seed replay (ai/ppo/batched_rollout_worker.py's
 "Episode-seed replay" docstring section, and
-PPOTrainer._update_episode_replay/_trainee_episode_abs_adv_means in
+PPOTrainer._update_episode_replay/_episode_abs_adv_means in
 ppo_trainer.py) -- the Prioritized-Level-Replay-style feature that re-queues
 the seeds of the highest-mean-|advantage| episodes for the very next
 rollout.
@@ -10,10 +10,14 @@ Two independent pieces are tested here:
    get consumed by the next episode reset, and is every episode's seed
    correctly recorded in stats["episode_seeds"] (1:1 with
    stats["episode_rewards"])?
-2. _trainee_episode_abs_adv_means -- the pure per-episode advantage
-   segmentation helper, including that it correctly IGNORES an interleaved
-   secondary/opponent track (unlike the track-naive '[advantage |.| by
-   episode]' diagnostic log line elsewhere in ppo_trainer.py).
+2. _episode_abs_adv_means -- the pure per-episode advantage segmentation
+   helper. Segments strictly on the TRAINEE's own done events (so it lines
+   up 1:1 with stats["episode_seeds"]/stats["episode_rewards"]), but each
+   episode's mean now INCLUDES any interleaved secondary/opponent-track
+   rows for that same episode -- see the function's own docstring for why
+   that's safe today (a non-"trainee" row only ever exists when the
+   secondary player is the current live network playing itself; rules/
+   immobile opponents never produce a buffer row at all).
 
 Mirrors test_batched_rollout.py's fixture pattern (_make_envs: explicit
 opponent_rules_prob/opponent_immobile_prob, not ai_config.json's live
@@ -30,7 +34,7 @@ import torch
 from footballcoach.ai.curriculum.phases import PHASES_BY_ID
 from footballcoach.ai.env.scenario_env import ScenarioEnv
 from footballcoach.ai.ppo.batched_rollout_worker import BatchedEnvGroup
-from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _trainee_episode_abs_adv_means
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _episode_abs_adv_means
 from footballcoach.ui.scenarios import ScenarioDefinition, build_1v1_scenario, phase1_training_on_tick
 
 _PHASE = PHASES_BY_ID[1]
@@ -107,34 +111,68 @@ class TestReplaySeedConsumption:
             assert r["buffer"] is not None
 
 
-class TestTraineeEpisodeAbsAdvMeans:
+class TestEpisodeAbsAdvMeans:
     def test_simple_single_track(self):
         track_ids = ["trainee"] * 6
         dones = [0.0, 0.0, 1.0, 0.0, 0.0, 1.0]
         advantages = [1.0, -2.0, 3.0, 0.0, 0.0, 0.0]
         # episode 1: rows 0-2 -> mean(|1|,|-2|,|3|) = 2.0
         # episode 2: rows 3-5 -> mean(0,0,0) = 0.0
-        means = _trainee_episode_abs_adv_means(track_ids, dones, advantages)
+        means = _episode_abs_adv_means(track_ids, dones, advantages)
         assert means == pytest.approx([2.0, 0.0])
 
-    def test_ignores_interleaved_secondary_track(self):
-        # trainee_t0, secondary_t0, trainee_t1(done), secondary_t1(done), trainee_t2, trainee_t3(done)
+    def test_includes_secondary_row_at_the_terminal_tick(self):
+        # Real buffer.add() ordering: the trainee's row for a tick is always
+        # added BEFORE that same tick's secondary row(s) -- so the terminal
+        # tick of episode 1 looks like [trainee(done=1), opponent(done=1)],
+        # with the opponent row arriving AFTER the trainee done=1 row but
+        # still belonging to episode 1, not episode 2.
         track_ids = ["trainee", "opponent", "trainee", "opponent", "trainee", "trainee"]
         dones = [0.0, 0.0, 1.0, 1.0, 0.0, 1.0]
-        advantages = [10.0, 999.0, 2.0, 999.0, 4.0, 6.0]
-        # trainee-only rows (indices 0, 2, 4, 5): values [10.0, 2.0, 4.0, 6.0], dones [0, 1, 0, 1]
-        # episode 1: rows (0, 2) -> mean(10, 2) = 6.0
-        # episode 2: rows (4, 5) -> mean(4, 6) = 5.0
-        means = _trainee_episode_abs_adv_means(track_ids, dones, advantages)
-        assert means == pytest.approx([6.0, 5.0])
+        advantages = [10.0, 20.0, 2.0, 40.0, 4.0, 6.0]
+        # episode 1: rows (0, 1, 2, 3) -> mean(10, 20, 2, 40) = 18.0
+        # episode 2: rows (4, 5) -> mean(4, 6) = 5.0 (no secondary this time)
+        means = _episode_abs_adv_means(track_ids, dones, advantages)
+        assert means == pytest.approx([18.0, 5.0])
+
+    def test_includes_secondary_rows_spread_through_the_whole_episode(self):
+        # Secondary rows interleaved at every tick of a 3-tick episode, not
+        # just the terminal one -- all of them should count.
+        track_ids = ["trainee", "opponent", "trainee", "opponent", "trainee", "opponent"]
+        dones = [0.0, 0.0, 0.0, 0.0, 1.0, 1.0]
+        advantages = [1.0, 2.0, 3.0, 4.0, 5.0, 6.0]
+        means = _episode_abs_adv_means(track_ids, dones, advantages)
+        assert means == pytest.approx([(1 + 2 + 3 + 4 + 5 + 6) / 6])
+
+    def test_mixed_rollout_some_episodes_with_secondary_some_without(self):
+        # episode 1: vs a rules/immobile opponent -- no secondary rows at
+        # all (they never reach the buffer), trainee-only mean.
+        # episode 2: self-play -- secondary rows present, included.
+        track_ids = ["trainee", "trainee", "trainee", "opponent", "trainee"]
+        dones = [0.0, 1.0, 0.0, 1.0, 1.0]
+        advantages = [1.0, 3.0, 10.0, 20.0, 30.0]
+        # episode 1: rows (0, 1) -> mean(1, 3) = 2.0
+        # episode 2: rows (2, 3, 4) -> mean(10, 20, 30) = 20.0
+        means = _episode_abs_adv_means(track_ids, dones, advantages)
+        assert means == pytest.approx([2.0, 20.0])
 
     def test_trailing_incomplete_episode_dropped(self):
         track_ids = ["trainee"] * 4
         dones = [1.0, 0.0, 0.0, 0.0]  # only the first row completes an episode
         advantages = [5.0, 100.0, 100.0, 100.0]
-        means = _trainee_episode_abs_adv_means(track_ids, dones, advantages)
+        means = _episode_abs_adv_means(track_ids, dones, advantages)
+        assert means == pytest.approx([5.0])
+
+    def test_trailing_incomplete_episode_with_secondary_rows_dropped(self):
+        # Same as above, but the dangling trailing episode also has
+        # secondary rows mixed in -- still fully dropped, not partially
+        # counted.
+        track_ids = ["trainee", "trainee", "opponent", "trainee", "opponent"]
+        dones = [1.0, 0.0, 0.0, 0.0, 0.0]
+        advantages = [5.0, 100.0, 100.0, 100.0, 100.0]
+        means = _episode_abs_adv_means(track_ids, dones, advantages)
         assert means == pytest.approx([5.0])
 
     def test_no_complete_episodes_returns_empty(self):
-        means = _trainee_episode_abs_adv_means(["trainee", "trainee"], [0.0, 0.0], [1.0, 2.0])
+        means = _episode_abs_adv_means(["trainee", "trainee"], [0.0, 0.0], [1.0, 2.0])
         assert means == []

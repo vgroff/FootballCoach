@@ -42,11 +42,13 @@ Current notes:
         - !! large rollouts and smallish epochs at first? high entropy and reset log stds and kick power std and bernoullis
     - !! on checkpointing
         - !!!! in the phase 1 UI, have the value network print value prediction and also give the results
-        - is the augmentation done right with PPO stuff?
-        - !! print KLs and losses in order
+        - !!!!!! feed sigmas into the value function so that it suffers less from changes
+        - !! Can we have it so that the sigmas from previous move dir affect the next one?
         - !! are the kick params sampled/trained only if a kick actually fired (legally? e.g. while in possession?)
             - same with tackling? and kick boolean?
-                - would need to remove the penalties?
+                - would need to remove the penalties?       
+        - !!! forgetting kicking? Add some BC aux loss to re-teach push-kicks
+        - !! print KLs and losses in order
         - [] Plan to train against old checkpoints
             - write a plan to include a 4th type of opponent - previous neural checkpoints
                 - add a phase1_opponent_previous_neural_ratio

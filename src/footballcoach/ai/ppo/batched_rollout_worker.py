@@ -102,30 +102,46 @@ finishing around the same time, that many simultaneous huge pickle
 allocations spiked system RAM past what was available (``MemoryError``
 inside ``_ForkingPickler.dumps``). ``collect(chunk_steps=K,
 on_chunk=callback)`` periodically flushes (every ``K`` steps collected,
-checked once per round) instead of only at the very end: each flush calls
-``on_chunk`` with a small per-env result list (same shape as the final
-return value), then clears just those envs' buffers/stats (NOT their
-mid-episode accumulators -- ``episode_reward_accum``,
-``_current_episode_seed``, etc. survive a flush unchanged, so an episode
-that straddles a chunk boundary still gets its full reward/seed correctly
-attributed when it eventually completes). ``chunk_steps=None`` (default)
-is a complete no-op -- ``on_chunk`` is never called, ``collect()`` returns
-the full list exactly as before this feature existed.
+checked once per round) instead of only at the very end.
 
-The one real (accepted) trade-off: GAE for an episode that's mid-flight at
-a flush boundary gets bootstrap-truncated right there, instead of seeing
-its full trajectory in one buffer -- exactly the same kind of truncation
-that ALREADY happens once per rollout today for whatever episode is
-in-progress when ``steps_per_worker`` is reached (``RolloutBuffer.compute_gae()``
-already resets its backward recursion at every ``dones==1`` row regardless
-of chunk boundaries, so only the in-flight episode at each boundary is
-affected). Picking ``chunk_steps`` comfortably larger than
-``envs_per_process x typical_episode_length`` keeps the fraction of split
-episodes small. Episode-seed replay's per-episode mean(|advantage|) is
-correspondingly a little less accurate for a straddling episode (computed
-from only whichever half of its rows share a buffer with its terminal row)
--- its seed/reward bookkeeping stays exactly correct either way, only the
-replay-ranking signal for that one episode is slightly noisier.
+**Flushes are WHOLE-EPISODE ONLY.** Each mid-collection flush sends, per
+env, exactly the rows up to and including that env's last completed episode
+(``RolloutBuffer.pop_complete_episodes()``) and KEEPS the unfinished tail in
+the worker's buffer until its episode completes -- an episode is never cut in
+half at a flush boundary. (An earlier version flushed everything regardless
+and just accepted the cut; that bootstrap-truncated GAE for the rows next to
+every boundary, made episode-seed-replay's per-episode mean(|advantage|) use
+only half an episode's rows, and let one episode's halves land on both sides
+of a train/val split -- all avoidable, so it's gone.) Consequences: a
+mid-collection chunk always ends on a ``done=1`` row, so its GAE needs no
+bootstrap value (``last_value`` is a literal 0.0 and the per-flush value-net
+bootstrap forward pass is skipped entirely) and its MC returns are exact; a
+chunk's ``stats`` describe exactly the episodes whose rows it contains
+(each episode's stats travel with its rows); the buffers handed to
+``on_chunk`` are NEW objects (not the live per-env buffers), so a consumer
+may hold them. If a flush is due but no env has completed an episode yet,
+nothing is sent and the next round tries again (buffers just keep growing
+until an episode ends -- episodes always end, at worst by timeout).
+Per-episode mid-episode accumulators (``episode_reward_accum``,
+``_current_episode_seed``, ...) are untouched by flushes, as before.
+
+The final flush at the end of ``collect()`` still sends everything left --
+the last complete episodes AND each env's trailing in-progress episode, with
+a real bootstrap ``last_value`` -- so, as always, exactly one partial
+episode per env per rollout is bootstrap-truncated (unavoidable: the env
+carries on into the next rollout). ``chunk_steps=None`` (default) is a
+complete no-op -- ``on_chunk`` is never called, ``collect()`` returns the
+full list exactly as before this feature existed.
+
+Worker-side finalization (opt-in per ``collect`` command, ``returns`` spec):
+building the ``as_tensors`` batch and the GAE/MC returns is done INSIDE the
+worker (``finalize_result_for_wire``), and only the finished flat arrays go
+over the pipe (as numpy, not torch tensors -- no torch shared-memory
+reductions involved) instead of a pickled per-row ``RolloutBuffer`` (millions
+of tiny dicts/arrays -- heavy to pickle, unpickle and then re-stack in the
+main process). Peak memory on both sides is then bounded by one chunk. With
+no ``returns`` spec the wire format is exactly the legacy
+``{"buffer", "last_value", "stats"}``.
 
 Two non-obvious things discovered (the hard way, via a failing test) while
 building this:
@@ -321,6 +337,7 @@ class BatchedEnvGroup:
         replay_seeds: Optional[list[int]] = None,
         chunk_steps: Optional[int] = None,
         on_chunk=None,
+        progress_value=None,
     ) -> list[dict]:
         """Collect until at least ``n_steps`` total trainee+secondary steps
         have been recorded across the whole group (mirrors
@@ -383,26 +400,40 @@ class BatchedEnvGroup:
         exact 1:1 order with ``stats[i]["episode_rewards"]``.
 
         ``chunk_steps``/``on_chunk``: see this module's top docstring
-        ("Chunked streaming") -- when ``chunk_steps`` is set, every time
-        that many steps have been collected since the last flush (checked
-        once per round, never mid-round), ``on_chunk`` is called with a
-        small per-env result list (same shape as this method's own return
-        value) and those envs' buffers/stats are cleared immediately after
-        (mid-episode accumulators are NOT touched, so a straddling episode's
-        reward/seed bookkeeping stays correct). A final flush happens after
-        the collection loop ends for whatever wasn't already flushed. In
-        this mode the method itself returns ``[]`` -- everything was already
-        delivered via ``on_chunk``. ``chunk_steps=None`` (default) disables
-        this entirely: ``on_chunk`` is never called and the full result list
-        is returned normally, exactly as before this parameter existed.
+        ("Chunked streaming", WHOLE-EPISODE flushes) -- when ``chunk_steps``
+        is set, every time that many steps have been collected since the
+        last flush (checked once per round, never mid-round), ``on_chunk``
+        is called with a per-env result list (same shape as this method's own
+        return value) holding each env's COMPLETED episodes only (rows +
+        the stats of exactly those episodes); the unfinished tail of each
+        env's buffer stays put. If no env has a completed episode yet,
+        nothing is sent and the flush is retried next round. A final flush
+        happens after the collection loop ends for whatever wasn't already
+        flushed (including each env's trailing in-progress episode, with a
+        real bootstrap ``last_value``). In this mode the method itself
+        returns ``[]`` -- everything was already delivered via ``on_chunk``.
+        ``chunk_steps=None`` (default) disables this entirely: ``on_chunk``
+        is never called and the full result list is returned normally,
+        exactly as before this parameter existed.
 
-        IMPORTANT for ``on_chunk`` implementers: each dict's ``"buffer"`` is
-        ``self._buffers[i]`` itself, not a copy -- it gets ``.clear()``-ed
-        (mutated in place) as soon as the NEXT flush happens, so ``on_chunk``
-        MUST fully consume/copy/serialize the data before returning (exactly
-        what pickling for a ``conn.send()`` already does -- see
-        ``_batched_worker_main``'s usage). Holding onto the dict past that
-        point and reading it later will see it silently emptied.
+        ``progress_value``: optional shared ``ctx.Value("l", 0)`` (same
+        pattern as ``rollout_worker.py``'s own ``progress_value``); after
+        every round, the rows collected that round are ADDED to it under
+        its lock, so a caller in another process can poll one aggregate
+        counter and render a live progress bar across all workers. This
+        method never resets it -- the caller owns that (resetting here
+        would race between workers all sharing one counter). ``None``
+        (default) = no effect.
+
+        NOTE for ``on_chunk`` implementers: the ``"buffer"`` in every
+        mid-collection chunk is a NEW ``RolloutBuffer`` (from
+        ``pop_complete_episodes``), safe to keep. Only the FINAL flush's
+        buffers are the live ``self._buffers[i]`` objects (nothing mutates
+        them after that flush; ``clear_buffers()`` -- called by the worker
+        right after sending -- empties them), so a consumer that outlives
+        ``collect()`` should still serialize/copy the final chunk before
+        clearing (exactly what pickling for a ``conn.send()`` already does --
+        see ``_batched_worker_main``'s usage).
         """
         import random as _random
 
@@ -420,6 +451,7 @@ class BatchedEnvGroup:
 
         collected = 0
         _last_flush_at = 0  # only meaningful when chunk_steps is set
+        _last_progress_at = 0  # only meaningful when progress_value is set
         while collected < n_steps:
             # --- 0. Figure out, per env, whether ANYTHING is due this round
             # (trainee or, when secondary batching is on, any secondary
@@ -581,18 +613,22 @@ class BatchedEnvGroup:
                 else:
                     self._last_obs[i] = next_obs
 
+            if progress_value is not None:
+                with progress_value.get_lock():
+                    progress_value.value += collected - _last_progress_at
+                _last_progress_at = collected
+
             # --- Periodic flush (chunked streaming, opt-in) -- checked once
             # per round, never mid-round, so a flush always lands on a clean
-            # "every env has stepped once" boundary. See this module's top
-            # docstring ("Chunked streaming") for the full rationale. ---
+            # "every env has stepped once" boundary. WHOLE EPISODES ONLY: see
+            # this module's top docstring ("Chunked streaming"). If nothing
+            # is sendable yet, _last_flush_at is left alone so the very next
+            # round retries. ---
             if chunk_steps and (collected - _last_flush_at) >= chunk_steps:
-                chunk = self._build_results(range(n), stats)
+                chunk = self._pop_complete_episode_results(range(n), stats)
                 if chunk:
-                    on_chunk(chunk)  # synchronous -- fully sent before we clear anything below
-                for i in range(n):
-                    self._buffers[i].clear()
-                    stats[i] = _new_episode_stats()
-                _last_flush_at = collected
+                    on_chunk(chunk)
+                    _last_flush_at = collected
 
         # Bootstrap value per env (never concatenate raw transitions across
         # envs before this -- see _train_parallel()'s identical per-worker
@@ -606,6 +642,26 @@ class BatchedEnvGroup:
                 on_chunk(chunk)
             return []
         return self._build_results(range(n), stats)
+
+    def _pop_complete_episode_results(self, indices, stats: list[dict]) -> list[dict]:
+        """Whole-episode counterpart of ``_build_results`` for a MID-collection
+        flush: for each given env, split off its completed episodes into a new
+        buffer (``RolloutBuffer.pop_complete_episodes``), leave the unfinished
+        tail in place, and hand over that env's stats (resetting ``stats[i]``
+        to a fresh dict so the sent one is never mutated again). Envs with no
+        completed episode yet are skipped and keep both their rows and their
+        stats. ``last_value`` is a literal 0.0 -- the popped buffer ends on a
+        ``done=1`` row, so ``compute_gae`` never reads it -- which also means
+        no value-net bootstrap forward pass per flush (unlike
+        ``_build_results``)."""
+        out = []
+        for i in indices:
+            popped = self._buffers[i].pop_complete_episodes()
+            if popped is None:
+                continue
+            out.append({"buffer": popped, "last_value": 0.0, "stats": stats[i]})
+            stats[i] = _new_episode_stats()
+        return out
 
     def _build_results(self, indices, stats: list[dict]) -> list[dict]:
         """Build the ``{"buffer", "last_value", "stats"}`` result dict for
@@ -631,10 +687,54 @@ class BatchedEnvGroup:
             b.clear()
 
 
+def _batch_to_wire(batch: dict) -> dict:
+    """``as_tensors()`` dict -> same dict with torch tensors replaced by numpy
+    views (zero-copy). Numpy arrays pickle by value through the pipe, so no
+    torch shared-memory reductions (``ForkingPickler`` registers those for
+    ``torch.Tensor``) are involved; the lists (``reward_comps_raw``,
+    ``step_outcomes``, ``track_ids``) pass through unchanged."""
+    return {k: (v.numpy() if isinstance(v, torch.Tensor) else v) for k, v in batch.items()}
+
+
+def batch_from_wire(d: dict) -> dict:
+    """Inverse of ``_batch_to_wire`` (numpy -> torch via ``from_numpy``,
+    zero-copy). Call in the RECEIVING process on a finalized result's
+    ``"batch"``."""
+    import numpy as _np
+
+    return {k: (torch.from_numpy(v) if isinstance(v, _np.ndarray) else v) for k, v in d.items()}
+
+
+def finalize_result_for_wire(r: dict, returns_spec: dict) -> dict:
+    """Finalize ONE per-env result inside the worker: compute its returns
+    (``returns_spec["mode"]``: ``"gae"`` = GAE with the result's own
+    ``last_value``, no truncation; ``"mc"`` = truncate the trailing partial
+    episode then pure MC -- exactly ``_finalize_value_pretrain_result``'s
+    contract) using the CALLER's ``gamma``/``lam``, pack it with
+    ``as_tensors``, and convert to numpy for the pipe. Returns
+    ``{"batch", "stats", "n_dropped"}``; the receiver applies
+    ``batch_from_wire`` to ``"batch"``. ``"batch"`` is ``None`` when MC mode
+    had nothing usable in this result (a buffer with no completed episode --
+    e.g. an env's final flush that is only its unfinished tail): its rows are
+    all counted in ``n_dropped`` and the receiver must skip the batch (its
+    ``stats`` are still valid and must still be folded in)."""
+    from footballcoach.ai.ppo.ppo_trainer import _finalize_value_pretrain_result
+
+    tensors, n_dropped = _finalize_value_pretrain_result(
+        r, float(returns_spec["gamma"]), float(returns_spec["lam"]), returns_spec["mode"] == "gae",
+        allow_empty=True,
+    )
+    return {
+        "batch": _batch_to_wire(tensors) if tensors is not None else None,
+        "stats": r["stats"], "n_dropped": n_dropped,
+    }
+
+
 def _batched_worker_main(
     conn, phase_id: int, base_seed: int, worker_idx: int, envs_per_process: int,
     separate_value_net: bool = False, worker_torch_threads: int = 1,
     batch_secondary_players: bool = False, chunk_steps: Optional[int] = None,
+    progress_value=None,
 ) -> None:
     """Entry point run inside each persistent batched-worker process. Must
     stay picklable/top-level (mirrors rollout_worker.py's ``_worker_main``,
@@ -691,16 +791,30 @@ def _batched_worker_main(
             # {"done": True} -- see this module's top docstring ("Chunked
             # streaming") for why (fixes a real MemoryError from pickling
             # one giant end-of-rollout result all at once).
+            returns_spec = msg.get("returns")
+
+            def _emit(chunk: list, _spec=returns_spec) -> None:
+                # Opt-in worker-side finalization (see this module's
+                # "Worker-side finalization" docstring paragraph): only the
+                # finished flat arrays cross the pipe, not the per-row buffer.
+                if _spec is not None:
+                    chunk = [finalize_result_for_wire(r, _spec) for r in chunk]
+                conn.send({"chunk": chunk})
+
             if chunk_steps:
                 group.collect(
                     msg["n_steps"], replay_seeds=msg.get("replay_seeds"),
                     chunk_steps=chunk_steps,
-                    on_chunk=lambda chunk: conn.send({"chunk": chunk}),
+                    on_chunk=_emit,
+                    progress_value=progress_value,
                 )
             else:
-                results = group.collect(msg["n_steps"], replay_seeds=msg.get("replay_seeds"))
+                results = group.collect(
+                    msg["n_steps"], replay_seeds=msg.get("replay_seeds"),
+                    progress_value=progress_value,
+                )
                 if results:
-                    conn.send({"chunk": results})
+                    _emit(results)
             conn.send({"done": True})
             group.clear_buffers()  # harmless no-op if chunking already cleared everything
         elif cmd == "set_weights":
@@ -724,8 +838,22 @@ class BatchedRolloutWorkerHandle:
     conn: "mp.connection.Connection"
     worker_idx: int
 
-    def collect(self, n_steps: int, replay_seeds: Optional[list[int]] = None) -> None:
-        self.conn.send({"cmd": "collect", "n_steps": n_steps, "replay_seeds": replay_seeds})
+    def collect(
+        self, n_steps: int, replay_seeds: Optional[list[int]] = None,
+        returns: Optional[dict] = None,
+    ) -> None:
+        """``returns`` (optional): ``{"mode": "gae" | "mc", "gamma": float,
+        "lam": float}`` -- ask the worker to finalize each result (GAE/MC
+        returns + ``as_tensors``) itself and send compact flat arrays
+        instead of per-row buffers; see ``finalize_result_for_wire`` /
+        ``batch_from_wire``. ``gamma``/``lam`` are passed explicitly (the
+        caller's values are the source of truth -- a worker reads its own
+        ai_config.json at spawn time, which can drift from the main process's
+        if the file is edited mid-run). None (default) = legacy wire format
+        (``{"buffer", "last_value", "stats"}``)."""
+        self.conn.send({
+            "cmd": "collect", "n_steps": n_steps, "replay_seeds": replay_seeds, "returns": returns,
+        })
 
     def recv_result(self) -> list:
         return self.conn.recv()
@@ -753,6 +881,7 @@ def spawn_batched_workers(
     phase_id: int, n_processes: int, envs_per_process: int, base_seed: int,
     separate_value_net: bool = False, worker_torch_threads: int = 1,
     batch_secondary_players: bool = False, chunk_steps: Optional[int] = None,
+    progress_value=None,
 ) -> list[BatchedRolloutWorkerHandle]:
     """Spawn ``n_processes`` batched-worker processes, each internally
     owning ``envs_per_process`` environments (total envs =
@@ -763,6 +892,14 @@ def spawn_batched_workers(
     anything in between is a tunable hybrid. ``chunk_steps``: see
     ``_batched_worker_main``/``BatchedEnvGroup.collect()``'s "Chunked
     streaming" docstring -- fixed for the life of this worker.
+
+    ``progress_value``: optional shared ``ctx.Value("l", 0)`` that every
+    worker adds its collected rows to (see ``BatchedEnvGroup.collect()``'s
+    ``progress_value`` docstring). Must be created from the SAME
+    ``mp.get_context("spawn")`` used here and passed at process-creation
+    time -- a raw ``Synchronized`` value can't be sent to an already-running
+    worker afterwards. The caller resets it to 0 before each collect.
+    ``None`` (default) = no effect (the main PPO loop never passes it).
     """
     ctx = mp.get_context("spawn")
     handles: list[BatchedRolloutWorkerHandle] = []
@@ -773,6 +910,7 @@ def spawn_batched_workers(
             args=(
                 child_conn, phase_id, base_seed + i * envs_per_process, i, envs_per_process,
                 separate_value_net, worker_torch_threads, batch_secondary_players, chunk_steps,
+                progress_value,
             ),
             daemon=True,
         )

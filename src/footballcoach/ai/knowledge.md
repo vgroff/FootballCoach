@@ -1394,3 +1394,277 @@ separate, larger workstream, not yet planned in detail.
 Both use existing `ui/scenarios.py` scenario builders - no separate
 training-only scenario code.  Add new training scenarios directly to
 `ui/scenarios.py` so they're also available in the UI for visual inspection.
+
+## Episode-seed replay's advantage ranking now includes self-play secondary rows
+
+`_episode_abs_adv_means()` (`ai/ppo/ppo_trainer.py`, formerly
+`_trainee_episode_abs_adv_means`) computes the per-episode mean(|advantage|)
+used to pick which episode seeds get re-queued for the next rollout
+(`episode_replay_enabled`, PLR-style). It used to filter to
+`track_ids == "trainee"` rows only. Extended to include interleaved
+secondary-track rows too, because a non-"trainee" row in the buffer is —
+today — *always* the current, live network playing itself:
+`_batched_worker_main` passes `secondary_trainer=trainer` (identical
+weights), and `_secondary_neural_candidates()` excludes rules-based/immobile
+opponents entirely (they never produce a buffer row at all). So a
+rules/immobile episode still reduces to trainee-only automatically; a
+self-play episode's secondary rows are real signal from the same network
+being trained and were previously being silently dropped from the ranking.
+
+The tricky part: a secondary row's own `done` mirrors the trainee's shared,
+env-level `done` for that tick exactly, and the trainee row for a tick is
+always added to the buffer *before* that tick's secondary row(s)
+(`buffer.add()` ordering in both `_batched_worker_main` and the
+single-process `_collect()`). That means the terminal tick of an episode
+looks like `[trainee(done=1), secondary(done=1), ...]` — segmenting by
+"close the segment the instant a trainee `done=1` row is seen" would wrongly
+push that tick's own secondary rows into the *next* episode. Fixed by
+deferring the close until the *next* trainee row is seen instead, so a
+terminal tick's trailing secondary rows get pulled into the segment being
+closed. See the function's docstring for the full trace-through and the
+explicit caution: if a frozen/older-checkpoint opponent is ever added, the
+"any secondary row implies current network" invariant this leans on breaks,
+and an explicit per-row "is this the live network" signal would be needed
+before secondary rows can keep being included unconditionally.
+
+## PPG-style value refit (`PPOTrainer.ppg_value_refit`)
+
+`pretrain_value()`'s shared-trunk mode (`separate_value_net=False`) only
+offered two extremes: `value_pretrain_frozen_layers=-1` (default) freezes
+encoders + full trunk, leaving only `execution_net.value_head` trainable (a
+weak fit — the head can't reshape any upstream feature for value
+prediction); `=0` unfreezes everything, so the value gradient reshapes the
+exact trunk/encoder weights the policy heads read from, damaging the
+policy. `ppg_value_refit()` (`ai/ppo/ppo_trainer.py`) is the middle ground:
+full, unfrozen gradient flow through the trunk for the value loss, while an
+analytic per-head KL-divergence penalty anchors every policy head's output
+distribution to a snapshot taken right before the refit starts. Inspired by
+the auxiliary phase of OpenAI's Phasic Policy Gradient (PPG) paper, but
+scoped as a standalone/occasional refit — opt-in via `bc.ppg_enabled` (runs
+once, automatically, right after whatever pretraining path `train.py` took,
+before `checkpoint_pretrained.pt` is saved) or on-demand via `train.py
+--ppg-refit-only` against any existing checkpoint — NOT an automatic
+alternating cadence inside the main PPO rollout loop (that's a documented,
+deliberately out-of-scope future extension, not built here).
+
+Key implementation points, in case any of this needs revisiting:
+
+- **The anchor is a snapshot of raw distribution PARAMETERS, not a cloned
+  network.** One `torch.no_grad()` forward pass (`_ppg_snapshot_anchor`,
+  minibatch-chunked to bound memory) over the whole (post-augmentation)
+  refit batch, under the CURRENT weights, right before the epoch loop
+  starts — captures only the state-dependent outputs each head's
+  distribution needs (Bernoulli/Categorical logits, and the raw mean vector
+  for move_dir/kick_dir/kick_power/kick_spin). This is much cheaper than
+  keeping a second live copy of `decision_net`/`execution_net` around.
+- **The continuous heads' spread parameters (`move_dir_log_kappa`,
+  `kick_dir_log_kappa`, `kick_dir_z_log_std`, `kick_power_log_std`,
+  `kick_spin_log_std`) are GLOBAL `nn.Parameter`s, not state-dependent**
+  (confirmed directly in `execution_network.py`: each is
+  `nn.Parameter(torch.full((1,), ...))`, or `(3,)` for kick_spin) — so the
+  anchor only needs a one-time `.detach().clone()` of each, not a per-row
+  tensor. This mirrors what `[exec continuous log_kappa]`-style log lines
+  have shown all along (always a single-element list).
+- **`kick_power`'s KL is computed via the raw (pre-squash) `Normal`, reusing
+  `_kick_power_head(...).dist` for both current and anchor.** KL divergence
+  is invariant under any invertible transform applied identically to both
+  sides, so this is *exact* for the true squashed distributions — and it
+  completely sidesteps the sigmoid-Jacobian log-density term responsible
+  for an earlier session's `[ratio spike]` blow-up (see the checkpoint-
+  surgery/exploding-surrogate incident earlier in this file's history). A
+  genuine free correctness win from reusing the existing head constructors
+  instead of hand-deriving anything for this head.
+- **`torch.distributions` has no `kl_divergence` registered for
+  `VonMises`** (confirmed: raises `NotImplementedError`) — move_dir/kick_dir
+  needed a hand-derived closed form, `_von_mises_kl()`
+  (`ai/action/distributions.py`, next to `_von_mises_entropy`), using the
+  same numerically-stable `i0e`/`i1e` (`torch.special`) trick to stay
+  well-conditioned at large kappa. `VonMisesDirectionHead`/`KickDirectionHead`
+  gained small public `mean_angle`/`kappa`/`theta_mean`/`mean_z`/`std_z`
+  properties so this (and any future caller) doesn't need to reach into
+  underscore-prefixed internals.
+- **Gating mirrors `_recompute_log_prob` exactly**, not `_compute_entropy`'s
+  soft `E[parent]` weighting: hard boolean row-subset for the
+  pass_target/tackle_target/mark_target categorical KL (folded into their
+  parent Bernoulli's breakdown entry, matching how `_recompute_log_prob`
+  never surfaces them as a separate scalar either), float exec_move/kick
+  masks for their respective sub-heads. Heads in `_inactive_head_lp_keys()`
+  (curriculum-frozen decision heads, or permanently-frozen kick_spin) are
+  skipped entirely, exactly like the `[per-head KL]` diagnostic.
+- **Fresh, throwaway Adam optimizer, not `self.optimizer`** — matches
+  `pretrain_value`'s own convention (its shared-trunk branch also builds a
+  fresh Adam) rather than mixing this objective's gradient statistics into
+  the live PPO Adam state. Grad-norm clipping still splits direction-head
+  params into their own `clip_grad_norm_` call via the existing
+  `self.direction_param_ids` (computed once in `__init__`) — these heads get
+  REAL gradient here (unlike `pretrain_value`'s frozen-trunk case), so
+  without the split a single large direction-head KL gradient could force a
+  proportional shrink of the value gradient in the same step, the exact
+  failure mode `direction_max_grad_norm` already exists to prevent in
+  `_ppo_update`.
+- Best-val restoration must snapshot/restore the *full* `decision_net`+
+  `execution_net` state dicts (not just `value_head`, since the whole
+  network is trainable here) — a larger restore scope than
+  `pretrain_value`'s own. It must also use `_load_state_dict_tolerant`, NOT
+  a plain `load_state_dict` — `DecisionNetwork.state_dict()` is itself
+  overridden to deliberately EXCLUDE `ball_physics_encoder.*`/
+  `player_physics_encoder.*` (an external, versioned artifact, never part
+  of the main checkpoint's training state — see that override's own
+  docstring, which literally names the tolerant loader as the fix), so a
+  strict load of a snapshot taken via that same `state_dict()` raises
+  "missing keys" for those params. First hit as a real crash mid-run.
+- **GAE returns, not MC** — `_collect_value_pretrain_rollout` gained an
+  opt-in `use_gae` param (default False, `pretrain_value`'s exact prior
+  behavior unchanged) that `ppg_value_refit` passes `True`. This was a real
+  design correction, not the original plan: MC returns were initially
+  copied straight from `pretrain_value`'s own reasoning ("bootstrapping off
+  an untrained value net is circular"), but that reasoning is specific to
+  `pretrain_value`'s cold-start-from-BC scenario, where the value head has
+  genuinely never seen a return. `ppg_value_refit`'s actual target scenario
+  — refitting an ALREADY-reasonably-trained value function — isn't cold
+  start at all; bootstrapping off an imperfect-but-real value estimate is
+  just ordinary TD learning, exactly what real PPO does every rollout. And
+  it matters concretely: real PPO's own value loss targets GAE returns, not
+  MC returns, so the actual point of a PPG-style refit (converging the
+  value head toward the SAME quantity real training already uses, so
+  resuming training needs no further readjustment) requires GAE, not MC.
+  Mechanically cheap to add: `compute_gae`'s `last_value` bootstrap
+  argument is passed as a literal `0.0` and is PROVABLY never used, since
+  `truncate_to_last_episode_end()` (already called on both collection
+  branches) always leaves the buffer ending exactly on a `done=1` row, and
+  `compute_gae`'s backward recursion resets to 0 at every `done=1` — no
+  extra "final value" forward pass needed.
+- **`num_rollouts`** (default 1): repeats the whole collect→anchor→fit→
+  restore cycle that many times in ONE `ppg_value_refit()` call, each cycle
+  fully independent (own rollout, split, anchor, early-stop/best-val
+  tracking) except the Adam optimizer, which is built ONCE before the loop
+  and deliberately persists its momentum across cycles within one call —
+  resetting it every cycle would be pure waste, since cycles within a call
+  are meant to behave like one continuous session, just periodically
+  re-grounded against fresh on-policy data and a fresh anchor. Still not
+  the same thing as an automatic in-loop cadence — never touches the main
+  `ppo.*` training loop. A checkpoint is saved to
+  `checkpoint_dir/checkpoint_pretrained.pt` after EVERY cycle (not just at
+  the end) when `self.checkpoint_dir` is set, since a multi-rollout call at
+  real `ppg_rollout_steps` sizes can run a long time — bounds how much work
+  a crash/interrupt partway through loses.
+- **Bernoulli logit clamp (`±12.0`, inside `_ppg_kl_penalty`'s `_bern_kl`)**
+  — `torch.distributions.kl_divergence` for two `Bernoulli`s is genuinely
+  `+inf` (not a bug) whenever the ANCHOR side's probability has rounded to
+  exactly 0.0/1.0 in float32 (any logit past ~±16.7) while the current side
+  hasn't — very plausible on a mature, confident checkpoint (e.g. `move`/
+  `tackle_attempt` after 500k+ PPO steps). Observed for real: `move`/
+  `gp_extra`/`exec_move`/`tackle_attempt` all showed `+inf`, and `sprint`
+  showed `nan` specifically because `exec_move_mask=0.0` on non-firing rows
+  multiplies that `+inf` (IEEE `0*inf=nan`), poisoning the whole minibatch
+  `.mean()`. Fixed the same way this file already handles analogous
+  boundary cases for other heads (`SquashedNormalHead`/`VonMisesDirectionHead`
+  already clamp `log_std`/`log_kappa` for the same class of reason) — only
+  affects this KL penalty term, not the real sampled action/log_prob/
+  entropy used anywhere else. The Categorical target heads
+  (pass_target/tackle_target/mark_target) share the same architectural risk
+  in principle but are UNVERIFIED — not currently protected, and not yet
+  observed failing only because they're curriculum-frozen (hence excluded
+  via `_inactive_head_lp_keys()`) in the phase this was debugged under.
+- **`kl_train`/`kl_val` reported separately** — a second (no-grad,
+  diagnostic-only; val is never trained on) forward pass over the held-out
+  val set each epoch, against its own `val_anchor` snapshot taken at the
+  same time as the train anchor, via `_eval_value_and_kl`.
+- **Batched value-pretrain rollout (`ppo.value_pretrain_batched_rollout`,
+  default off).** `_collect_value_pretrain_rollout` (shared by
+  `pretrain_value`, `pretrain_combined`'s Phase 2/3 and `ppg_value_refit`)
+  used to always spawn plain one-env-per-process `rollout_worker.py`
+  workers (batch-of-1 network calls, e.g. 20 envs total) while the main PPO
+  loop ran 17x12 batched envs — the reason this path felt "crazy slow" at
+  `ppg_rollout_steps=580000`. With the flag on it spawns
+  `batched_rollout_worker.py` workers instead
+  (`value_pretrain_n_processes` x `value_pretrain_envs_per_process` envs;
+  `batch_secondary_players` reused from the main loop). Pieces:
+  `_spawn_value_pretrain_workers`/`_close_value_pretrain_workers` (one
+  worker-lifecycle code path, replacing the spawn logic that had been
+  duplicated inside `ppg_value_refit`; the collector takes an optional
+  `pool` — None = spawn+close per call exactly as before, given = caller
+  owns it, which is how `num_rollouts` > 1 reuses one pool; weights are
+  re-synced every call regardless), `_finalize_value_pretrain_result` (pure
+  per-result MC/GAE finalizer shared by every branch, unit-tested without
+  processes), and an optional shared `progress_value` counter on
+  `BatchedEnvGroup.collect`/`_batched_worker_main`/`spawn_batched_workers`
+  (parent resets it, workers only add — a worker-side reset races between
+  workers; default None = the main loop is untouched).
+  **Chunk-streamed, WHOLE EPISODES ONLY** (`ppo.value_pretrain_chunk_steps`,
+  default 3000, 0 = one send at the end). An earlier revision of this
+  section said value pretrain could NOT be chunked because a flush cuts
+  episodes (~20% straddling at ~50-step episodes, wrong MC heads, an episode
+  split across train/val). That was the wrong conclusion — the cut itself
+  was the bug. See the next bullet: flushes now only ever send completed
+  episodes, so chunking is safe here and everywhere.
+  **GAE bootstrap change riding along:** with `use_gae=True` both worker
+  kinds return a real `last_value`, which is now used as-is with NO
+  truncation (a trailing partial episode is kept, correctly bootstrapped)
+  instead of the earlier truncate-then-`last_value=0.0`; only the bare
+  single-process branch (no `last_value`) still truncates + zero-bootstraps.
+  MC mode (`pretrain_value`) is unchanged: truncate, then pure MC returns.
+- **Refit obs stays on CPU; physics features are precomputed once.** Per row,
+  `other_feat` is 21x39 floats but the frozen player-physics encoder's
+  `other_physics_full` is 21x74 -- caching it (as `_ppo_update` does, via the
+  shared `_precompute_physics_full`) makes the obs ~3x bigger (~17 GB for a
+  1.6M-row train set). So `ppg_value_refit` keeps train/val obs on CPU and
+  moves ONE chunk at a time to the device in the anchor/eval/epoch loops
+  (like PPO's per-minibatch `.to()`); only returns, actions and the per-row
+  anchors live on the GPU. History: the original version put the whole
+  (uncached-physics) train obs on the GPU; measured no-grad forward incl.
+  encoders was ~200k rows/s but the training epoch only ~2.3k rows/s, so
+  the encoders were NOT the bottleneck -- suspected VRAM overflow into
+  shared memory (12 GB card). Unconfirmed until the CPU-resident version's
+  epoch speed is measured.
+
+## Batched rollouts: whole-episode chunks, worker-side finalization, RAM
+
+**Whole-episode flushes (applies to the MAIN PPO loop too, not just value
+pretrain).** `BatchedEnvGroup.collect(chunk_steps=...)` used to flush every
+env's whole buffer at a step-count boundary regardless of where its episode
+was, and this file called that an "accepted trade-off". It wasn't necessary
+and it cost real correctness at every boundary: (1) GAE for the rows next to
+the cut was bootstrap-truncated off a value estimate, biasing those
+advantages; (2) episode-seed replay's per-episode mean(|advantage|) was
+computed from only the half of a straddling episode that shared a chunk with
+its terminal row, corrupting the replay ranking; (3) a straddling episode's
+halves could land on both sides of a train/val split; (4) per-episode
+diagnostics ([advantage |.| by episode], step-outcome backfill) saw half
+episodes. Now a mid-collection flush pops each env's COMPLETED episodes
+(`RolloutBuffer.pop_complete_episodes()`) and leaves the unfinished tail in
+the worker until its episode ends, so a chunk always ends on `done=1`: GAE
+needs no bootstrap (`last_value` is 0.0 and the per-flush bootstrap forward
+pass is skipped), MC returns are exact, and a chunk's stats describe exactly
+the episodes whose rows it holds. The only remaining cut is the unavoidable
+one — each env's trailing in-progress episode at the END of a rollout (the
+env carries on into the next), bootstrapped with a real `last_value`, one per
+env per rollout, exactly as before chunking existed. If a flush is due but
+no env has finished an episode yet it retries next round.
+
+**Worker-side finalization + compact wire format.** `collect(returns=
+{"mode": "gae"|"mc", "gamma", "lam"})` makes the worker compute returns and
+`as_tensors` itself and send flat numpy arrays (`finalize_result_for_wire`;
+numpy on purpose, so torch's ForkingPickler shared-memory reductions aren't
+involved) instead of a pickled per-row `RolloutBuffer` — millions of tiny
+dicts/arrays that were expensive to pickle, unpickle and re-stack in the main
+process. `gamma`/`lam` travel in the command (the main process is the source
+of truth; a worker's own ai_config.json read can drift if the file is edited
+mid-run). No `returns` spec = the legacy `{"buffer","last_value","stats"}`
+wire format, unchanged (tests and any other consumer). Both `_train_batched_
+parallel` and the batched value-pretrain path request it.
+
+**RAM at the end of a rollout.** The spike was several full copies alive at
+once: worker buffer + its pickle, received bytes + unpickled per-row buffers,
+the stacked tensors, the `torch.cat` merge, the train/val split copies, the
+augmented train set (x2 at `augment_n_slot_shuffles=1`) — with the raw
+results/per-worker lists/merged batch/raw split all still referenced.
+Fixes: streaming whole-episode chunks (per-message memory bounded), results
+ingested as they arrive, `_merge_worker_batches(release_inputs=True)` (delete
+each key from the inputs as it's concatenated: ~1x + one key, not ~2x),
+`_split_batch_releasing` (slice the merged batch key-by-key while emptying it),
+dropping the un-augmented copy after augmentation, and clearing every big
+per-cycle name at the end of each `ppg_value_refit` cycle so the previous
+cycle isn't resident during the next rollout. NOT changed: `_ppo_update`'s own
+`_split_train_val_episodes`/`augment_batch` copies (a separate, delicate
+phase).
