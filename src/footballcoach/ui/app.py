@@ -50,6 +50,7 @@ from footballcoach.ui.gamelog import GameLog, LogLevel
 from footballcoach.ui.input import MatchInputController, OrderMode
 from footballcoach.ui.renderer import Renderer
 from footballcoach.ui.scenarios import ScenarioBoolParam, ScenarioChoiceParam, ScenarioGroupedChoiceParam, ScenarioParam
+from footballcoach.ui.sim_clock import SimTimeDelta
 
 
 class Screen(Enum):
@@ -263,6 +264,8 @@ class App:
         # next to the Help button. Steps/frame = round(physics_tick_hz * speed / target_fps).
         _default_sim_speed = float(load_gameplay_config().get("ui", {}).get("default_sim_speed", 2.0))
         self._sim_speed: float = _default_sim_speed
+        # Sim time between rendered frames, for the cosmetic animations (see sim_clock.py).
+        self._animation_clock = SimTimeDelta()
         # Linear 0.25 steps (0.25x-8x) rather than the old doubling sequence
         # (0.2/0.5/1/2/4/8) -- finer control around normal speed, at the
         # cost of more clicks/keypresses to reach the extremes.
@@ -984,14 +987,18 @@ class App:
         selected_id = self.input_controller.selected_player_id
         carrier_id = self.match.ball.possessed_by
         if not self.match.paused:
-            self.renderer.update_player_animations(self.match.players, 1.0 / self._target_fps)
-            self.renderer.update_ball_effects(self.match.ball, 1.0 / self._target_fps)
+            # Stride and ball spin advance by the SIM time since the last frame, not 1/fps: the sim
+            # runs `_sim_speed` match-seconds per real second, so a fixed per-frame step made them
+            # play at 1/sim_speed of their true rate (see ui/sim_clock.py).
+            sim_dt = self._animation_clock.delta(self.match, self.match.time_s)
+            self.renderer.update_player_animations(self.match.players, sim_dt)
+            self.renderer.update_ball_effects(self.match.ball, sim_dt)
         # Pitch, then ball, with the goal's crossbar/net drawn over a ball that
         # is inside the goal and under one that is above it. Ball drawn before
         # players (not after) so a player standing over it -- e.g. the carrier
         # dribbling -- renders on top rather than the ball covering up the
         # (now much bigger/more detailed) player sprite.
-        self.renderer.draw_pitch_and_ball(self.surface, self.match.pitch, self.match.ball)
+        self.renderer.draw_pitch_and_ball(self.surface, self.match.pitch, self.match.ball, players=self.match.players)
 
         # Draw the ball carrier last among players so they render on top of
         # every other player, per the design spec.

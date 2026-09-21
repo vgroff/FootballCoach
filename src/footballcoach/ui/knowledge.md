@@ -36,6 +36,9 @@ swappable/removable without touching the engine, per the project's
   of the plain circle; see "Player visual indicators". Its module docstring
   holds the design rationale (supersample-then-`smoothscale`, 9 cached poses
   per shirt colour, speed-driven stride animation).
+- `sim_clock.py` - `SimTimeDelta`: sim seconds elapsed between rendered frames,
+  from the match's own `time_s` (resyncing across a new match/trial or a clock that
+  ran backwards). Drives the cosmetic animations; see "Animation clock".
 - `kick_trajectory.py` - pure-math helpers for the kick UI preview:
   forward-simulates the ball with the engine's own `ball_physics.step_ball`
   (deterministic, no random kick error), builds the 1-sigma error cone
@@ -131,6 +134,15 @@ positional constructors that a new required field would break.
   `_draw_world_polyline` with sub-pixel vertices (`Camera.world_to_screen_f`).
   This deliberately avoids `pygame.draw.arc`, whose thick strokes tear into
   gaps at high zoom. 1px lines use `aalines`, thicker ones `draw.lines`.
+- **Corner arcs are clipped to the pitch.** The boundary is drawn INSIDE its rectangle
+  (`rect_world`, `pygame.draw.rect(width=line_w)`), but each arc is a stroke centred on world
+  points that lie on the corner lines' OUTER edge, so the stroke's thickness and anti-aliased
+  edge poked past the boundary lines — measured 1 px outside at zoom 1 and 3-6 px at zoom 2-3
+  (none at 5x) at some corners. `draw_pitch` sets the surface clip to exactly the boundary
+  rectangle while drawing the four arcs. Tests: `test_corner_arcs_never_poke_out_past_the_boundary_lines`
+  (6 zooms x 4 corners), `test_corner_arcs_are_still_drawn_inside_the_pitch` and
+  `test_clipping_the_corner_arcs_removes_only_what_is_outside_the_pitch` (an over-tight clip
+  would detach the arc from its lines).
 - The geometry generators are unit-tested in
   `tests/unit/test_pitch_markings.py` (points on the circle, arc entirely
   outside the box and ending exactly on its edge, left/right mirror,
@@ -355,16 +367,17 @@ same as everything else in that method):
   goal frame. The pole is vertical, so its top is displaced **away from the
   pitch centre**, along the centre->corner line, by `pole_height_m ×
   (crossbar_lean_m / goal_height_m)` — the crossbar's parallax rate, so one
-  setting drives both (with the defaults 2.4 × 0.72/2.44 ≈ 0.71m, ~6px at the
-  default window, ~25px at 4x zoom). The pole is **yellow**
+  setting drives both (with the defaults 4.0 × 0.72/2.44 ≈ 1.18m, ~12px at the
+  default window, ~59px at 5x zoom; it was 2.4m/≈0.71m/~7px until the flags were
+  judged a little too small — see "Flag size" below). The pole is **yellow**
   (`style.CORNER_FLAG_POLE_COLOUR`); the pennant stays orange
   (`CORNER_FLAG_COLOUR`). The pole is at least 1px wide (a 2px minimum was
   tried and looked chunky/rectangular at the default zoom), and the foot dot
   marking the ground contact appears **only once the pole is ≥3px wide**
   (radius `pole_px//2 + 1`): a fixed 2px-radius dot is a 5px blob on the ~6px
   pole at 1x zoom and hid it entirely (compared five foot/pole variants at
-  zoom 1/2/4 before choosing). The pennant is attached along the upper `flag_drop_frac` (55%) of the pole with
-  the lower pole left bare. **The cloth's free end is aimed perpendicular to
+  zoom 1/2/4 before choosing). The pennant is attached along the top `flag_length_m` (0.32m apparent) of the pole with
+  the rest bare. **The cloth's free end is aimed perpendicular to
   the pole** (`flag_width_m` off it, on the side toward the pitch's middle
   along the touchline). Aiming it along the touchline instead ("inward" — the
   old design's direction) makes the pennant a needle: the pole leans along the
@@ -373,9 +386,32 @@ same as everything else in that method):
   (seen when first tried; reproduced across four parameter sets before
   changing the geometry). `pole_height_m` is *apparent* (real poles are
   ~1.5-1.8m) — bolder on purpose so the lean reads at the default zoom.
+  **Flag size**: eight variants were compared side by side (taller pole, bigger pennant, both,
+  and those plus an outline / white stripe / ground shadow). Chosen: the taller pole
+  (4.0m apparent) **without** a bigger pennant, plus the shadow. The cloth's length along the
+  pole is now an ABSOLUTE size, `flag_length_m` (the renderer derives the drop fraction
+  `flag_length_m / lean` — `_corner_flag_drop`), because the earlier fractional
+  `flag_drop_frac` (55% of the pole) made the pennant grow with the pole; the new default
+  0.32m is a little shorter than the old 0.39m. An outline muddied the ~6px pennant at 1x
+  and a white stripe turned into a noisy blob, so neither was kept.
+  **Flag shadow** (`_draw_corner_flag_shadow`, `shadow_alpha` 90, `shadow_height_m` 2.4):
+  cast by the scene light (see "Scene light and player lighting"): a point at height z above
+  ground point P shadows at `P × H / (H − z)`, so the pole throws a line from its foot
+  straight away from the pitch centre, `d × h / (H − h)` long, and the cloth a triangle. It
+  lies along the same line as the pole itself, so it reads as the pole's extension.
+  **`shadow_height_m` is deliberately NOT the physical pole height**: a corner is ~62m from the
+  point light, i.e. the light is only ~33° above the horizon there, so a 2.4m pole threw a ~4m
+  shadow (verified pixel-for-pixel against the formula: starts at the foot, ends at 4.0m) —
+  3.4x the drawn pole, which is only a ~1.2m stub (the drawn pole's lean is the fixed crossbar
+  parallax, not tied to the light, so the two models disagree in proportion). Set to 1.2m ->
+  ~1.9m (1.6x the drawn pole). Drawn first (under the pole/cloth) 2x supersampled on a small black transparent
+  layer and averaged down (soft edges, no halo), blitted at `shadow_alpha`.
   Config: `graphics.json["corner_flag"]`. Tests:
   `test_corner_flag_pole_leans_away_from_the_centre_and_the_cloth_is_a_real_triangle`,
-  `test_corner_flag_pole_and_cloth_are_drawn`.
+  `test_corner_flag_pole_and_cloth_are_drawn`,
+  `test_the_pennant_keeps_its_size_however_tall_the_pole_is`,
+  `test_a_corner_flag_casts_a_shadow_straight_away_from_the_pitch_centre`,
+  `test_flag_shadow_can_be_turned_off_and_shrinks_as_the_light_rises`.
 - **Sideline benches** (`_draw_sideline_benches`): a row of benches (`x`
   positions in `Renderer._BENCH_X_OFFSETS_M`, spread across the middle
   third of the pitch, clear of the boxes/corners regardless of pitch size)
@@ -484,11 +520,11 @@ spreads a line over more pixels at lower intensity but preserves the total.
 - **Sphere shading** (`ball_shading` in `graphics.json`, `_ball_shade_sprite`): a
   black overlay with per-pixel alpha, drawn last over the ball and its dots, so the
   ball is dark on the side facing away from the light and clear where it faces it. The
-  light is **the same point light as the ground shadow** (`ball_shadow.light_height_m`,
-  30m above the pitch's middle), via `_ball_light_angles`: horizontally from the ball
+  light is **the scene light** (`scene_light.height_m`, 40m above the pitch's middle;
+  see "Scene light and player lighting"), via `_ball_light_angles`: horizontally from the ball
   toward the centre, elevation `atan((H - z) / distance)` — so the lit side always faces
   the middle of the pitch, the light is overhead at the centre (bright middle, even dark
-  rim) and lower/more sideways toward the edges (about 30° at the far goal-line ends);
+  rim) and lower/more sideways toward the edges (about 37° at the far goal-line ends);
   a raised ball is nearer the light's height so it sees it lower still, not higher. (It was first a fixed top-left light,
   "variant C"; it now shares the shadow's light.) The sprite cache is keyed by
   (radius, azimuth, elevation) with the angles quantised to 10°/5° (bounded at 512); a
@@ -498,12 +534,12 @@ spreads a line over more pixels at lower intensity but preserves the total.
   side by side). The sprite is computed with numpy at 6x sub-sampling, cached per
   radius; the dots still read clearly through it (tested).
 - **Ground shadow** (`ball_shadow`, `_draw_ball_shadow`): the light is a **point
-  30m above the middle of the pitch**, so the shadow of a ball at height `z` (of its
+  40m above the middle of the pitch (`scene_light.height_m`)**, so the shadow of a ball at height `z` (of its
   underside) sits on the ground displaced radially AWAY from the centre by
   `distance × z / (H − z)`; zero on the ground and at the centre, growing with height
   and with distance from the middle (a high ball near a corner throws its shadow
-  several metres off; 15m was tried first and threw a 3.5m ball's shadow ~9m away, so
-  30m was chosen after a side-by-side — about half the offset, still clearly visible). Because that vanishes for a grounded ball, a **thin contact
+  several metres off; the height went 15m → 30m → 40m after side-by-sides: at 15m a 3.5m
+  ball's shadow landed ~9m away, 30m about half that, 40m closer still while remaining clearly visible). Because that vanishes for a grounded ball, a **thin contact
   shadow** (`contact_offset_m`, 0.10m) is added along the same radial direction —
   biased to the lower-right within ~3m of the centre so it doesn't flip when the ball
   crosses it. The shadow is ground-sized (NOT boosted with height like the drawn
@@ -515,6 +551,52 @@ spreads a line over more pixels at lower intensity but preserves the total.
 - The state rings (see "Ball state indicator rings") were tightened to
   `offset_px` 1 / `width_px` 1 (from 2 / 2) so they hug the ball and read as a thin
   status outline rather than a halo.
+
+## Scene light and player lighting
+
+One light drives every shadow and shading effect: a **point `scene_light.height_m`
+(40m) above the middle of the pitch** (`Renderer._light_height_m`,
+`_point_light_at(x, y, z)` -> azimuth toward the centre, elevation `atan((H - z) / d)`,
+distance `d`). Higher = shorter shadows, more from-above shading; lower = long sideways
+shadows and hard side-lighting toward the edges. It replaced the earlier
+`ball_shadow.light_height_m`. The goal frame keeps its own fixed centre-facing
+approximation (`style.LIGHT_*`), which is not tied to this height.
+
+- **Ground shadows are one pass under everything.** `draw_pitch_and_ball(surface,
+  pitch, ball, players=...)` draws the pitch's ground layer, then EVERY player's shadow
+  (`draw_player_shadows`) and the ball's shadow, then the goal frame / ball, and the app
+  draws the sprites after that: a shadow never falls on another player, the ball or the
+  net (drawing them per player, inside `draw_player`, put later players' shadows over
+  earlier sprites). `draw_ball(..., shadow=False)` is what `draw_pitch_and_ball` uses; the
+  default still draws the ball's shadow itself.
+- **Player shadow** (`player_shadow`: `alpha` 107, `contact_m` 0.18): a soft capsule from
+  under the player pointing straight away from the pitch centre, `d × h / (H − h)` long
+  (h = `player.height_m`, 1.8m; a 45m-out player gets ~2m, a player at the centre only the
+  contact length), half-width 0.85 × the drawn radius. Direction has a lower-right bias that
+  dominates within ~1.5m of the centre so it is continuous when a player crosses it.
+  Sprites are numpy capsules cached per (length, 5° angle, radius), bounded at 512.
+- **Player shading** (`player_shading.strength` 0.9; "option D" of the sheet compared with
+  a whole-sprite dome and a shadow-only option): the flat art is lit **per body part**.
+  `player_sprites.sprite_normals` treats the sprite's alpha, blurred at two scales, as a
+  height map, so shoulders, torso, head, legs and arms are each a rounded lump with the
+  tilt at their edges and flat tops; `shade_factors` is Lambert + ambient (0.45), scaled so
+  the best-lit part is exactly 1 (only far sides darken). It is applied to the BASE
+  80px pose **before** `rotozoom`, so the light is rotated into the sprite's frame:
+  `local = (c·lx − s·ly, s·lx + c·ly)` for rotation φ = `rotate_deg` (the inverse of
+  rotozoom's counter-clockwise-on-screen rotation), tested at 5 headings × 3 spots.
+  `PlayerSpriteSet.shaded(side, level, az, el, strength)` caches lit variants per (pose,
+  direction quantised to 15° / 5°, strength), bounded at 1024. The effect is strongest
+  under a low light (near the pitch edges) and gentle when it is overhead (near the middle)
+  — a higher `scene_light.height_m` softens it; under a 40m light the dark side of a
+  figure near the edge is ~0.85 of the lit side. Cost: ~3ms/frame more with all 22 players
+  turning (cache misses as headings change), ~0.5ms for shadows alone.
+- **Tests** (`tests/unit/test_player_sprites.py`): normals/factors maths; lit variants
+  keep alpha, never brighten, are cached; the near half of the figure (facing the centre)
+  is the bright one at every heading and spot (low light so the contrast is measurable);
+  shadow direction and `d·h/(H−h)` length; grows with distance and shrinks as the light
+  rises; contact shadow at the centre; **shadows under everything** (a player drawn earlier
+  and the ball are unchanged by a later player's shadow); the light height is one shared
+  setting. An autouse fixture forces player shading/shadows off for the flat-art tests.
 
 ## Turf texture (`_draw_turf`, `graphics.json["turf"]`)
 
@@ -582,12 +664,35 @@ of the ball, not this bug.
 
 - **Body**: by default (`graphics.json["player_sprites"]["enabled"]`, default
   true) each player is a rotated `player_sprites` sprite (see that module's
-  docstring), animated per-frame via `Renderer.update_player_animations`
+  docstring), lit per body part with a ground shadow (see "Scene light and player
+  lighting"), animated per-frame via `Renderer.update_player_animations`
   (only advanced while the match isn't paused). With sprites disabled it
   falls back to the plain filled circle described in the bullets below —
   the **heading V** is drawn *only* in that fallback mode (the sprite's own
   head/limb asymmetry already shows facing), and the translucent-inactive
   look is likewise done per-path.
+- **Animation clock** (`sim_clock.SimTimeDelta`, `App._animation_clock`): the
+  stride gait (`update_player_animations` -> `advance_gait_phase`) and the ball's
+  spin/roll (`update_ball_effects`) are advanced by the **simulation** time since
+  the last rendered frame — `match.time_s` deltas — NOT by `1 / target_fps`. The sim
+  runs `sim_speed` match-seconds per real second (and steps a whole number of
+  physics ticks per frame), so the old fixed step made strides and ball spin play
+  at `1 / sim_speed` of their true rate at any sim speed but 1x (and the ball's
+  spin drifted from its rolling, which was already right because it is derived
+  from position deltas). Paused matches don't animate (and, since the clock doesn't
+  move, don't bank time); a new match or scenario trial resyncs to a 0 delta; a
+  zero delta leaves the ball's orientation untouched. `advance_gait_phase` caps one
+  update at `_MAX_CYCLES_PER_UPDATE` (0.4) stride cycles: the legs alternate every
+  half cycle, so >= 0.5 cycles per frame would alias (stall / run backwards), which
+  a very high sim speed (up to 8x at 60fps) would otherwise reach — the drawn
+  stride then slows slightly instead of misleading.
+- **Tests**: `tests/unit/test_player_sprites.py` — gait maths (`advance_gait_phase`,
+  `pick_pose`), the 9-pose sprite sets (sizes, transparency, shirt/skin/hair colours,
+  hair at the back, standing symmetry, the two leading sides being mirror images,
+  stride length growing), drawing (rotated to the heading, sized from the radius,
+  team/keeper colours, translucent when inactive, longer sprite when striding),
+  `SimTimeDelta`, and the App wiring (strides and spin follow `match.time_s`
+  whatever `_sim_speed` / fps are; paused = no animation).
 - **Always-on extras** drawn around every player: a `player_id` label under
   them, two tiny stat bars beneath the label (stamina, then speed — the stamina
   bar is green / yellow / red by level, the speed bar light blue), motion "speed lines" trailing behind a

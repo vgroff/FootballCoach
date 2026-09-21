@@ -21,6 +21,9 @@ Design history / rationale lives in the conversation that produced this
   ``get_sprite_set`` caches one ``PlayerSpriteSet`` per distinct colour
   actually requested (team colours + the goalkeeper colour, typically 2-3
   total), since building them is a one-off cost, not a per-frame one.
+- ``sprite_normals`` / ``shade_factors`` / ``PlayerSpriteSet.shaded`` light the flat art per body
+  part (silhouette blurred into a height map -> normals -> Lambert), applied to the base pose
+  BEFORE the caller's rotation, from a light direction given in the sprite's own frame.
 - ``advance_gait_phase`` / ``pick_pose`` turn a player's current speed into
   an animated pose: stride frequency and how far the stride extends both
   scale with speed (a standing player mid-cycle at speed 0 still shows the
@@ -31,6 +34,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
+import numpy as np
 import pygame
 import pygame.gfxdraw
 
@@ -48,6 +52,12 @@ _SIZE = _BASE_SIZE * _SUPERSAMPLE
 _PX = _SUPERSAMPLE  # 1 final-image pixel, expressed in _SIZE-space units
 
 _OUTLINE_DARKEN = 0.55  # outline colour = fill colour darkened by this factor
+
+# One animation update never advances the stride by more than this many full cycles. A cycle
+# alternates the leading leg every half, so at >= 0.5 cycles per update the pose sequence
+# aliases (strides appear to stall or run backwards, like a wheel in film); staying under
+# that limit means a very fast sim slows the drawn stride slightly rather than misleading.
+_MAX_CYCLES_PER_UPDATE = 0.4
 
 
 def _darken(color: RGB, factor: float) -> RGB:
@@ -351,7 +361,10 @@ def _render_pose(params: PlayerSpriteParams, shirt_color: RGB, leg_extension: fl
 
 
 class PlayerSpriteSet:
-    """All 9 pose surfaces for one shirt colour, built once and cached."""
+    """All 9 pose surfaces for one shirt colour, built once and cached (plus, on demand, lit
+    variants of them -- see `shaded`)."""
+
+    _SHADED_CACHE_LIMIT = 1024
 
     def __init__(self, params: PlayerSpriteParams, shirt_color: RGB) -> None:
         self.standing = _render_pose(params, shirt_color, 0.0, 0.0, 1)
@@ -359,11 +372,44 @@ class PlayerSpriteSet:
         for side in (1, -1):
             for level in STRIDE_LEVELS:
                 self.running[(side, level)] = _render_pose(params, shirt_color, level, level, side)
+        self._normals: dict[tuple[int, float | None], np.ndarray] = {}
+        self._shaded: dict[tuple, pygame.Surface] = {}
 
     def get(self, side: int, level: float | None) -> pygame.Surface:
         if level is None:
             return self.standing
         return self.running[(side, level)]
+
+    def normals(self, side: int, level: float | None) -> np.ndarray:
+        """Per-pixel unit surface normals (h, w, 3) of a pose, built once (see `sprite_normals`)."""
+        key = (1 if level is None else side, level)
+        cached = self._normals.get(key)
+        if cached is None:
+            cached = sprite_normals(_alpha_of(self.get(side, level)))
+            self._normals[key] = cached
+        return cached
+
+    def shaded(self, side: int, level: float | None, azimuth_deg: int, elevation_deg: int,
+               strength: float) -> pygame.Surface:
+        """The pose lit from a direction given in the SPRITE'S OWN frame (azimuth measured like
+        screen angles: 0 = toward the sprite's right, 90 = toward its "down"/facing side; elevation
+        above the ground plane): each pixel's colour times `shade_factors`, alpha untouched. Cached
+        per (pose, direction, strength) -- the caller quantises the angles -- and bounded."""
+        key = (1 if level is None else side, level, azimuth_deg, elevation_deg, round(strength, 3))
+        cached = self._shaded.get(key)
+        if cached is None:
+            base = self.get(side, level)
+            alpha = _alpha_of(base)
+            factors = shade_factors(self.normals(side, level), alpha,
+                                    light_from_angles(azimuth_deg, elevation_deg), strength)
+            rgb = pygame.surfarray.array3d(base).transpose(1, 0, 2).astype(np.float32) * factors[..., None]
+            out = np.dstack([np.clip(rgb, 0, 255), alpha[..., None]]).astype(np.uint8)
+            h, w = alpha.shape
+            cached = pygame.image.frombuffer(np.ascontiguousarray(out).tobytes(), (w, h), "RGBA")
+            if len(self._shaded) >= self._SHADED_CACHE_LIMIT:
+                self._shaded.clear()
+            self._shaded[key] = cached
+        return cached
 
 
 _sprite_set_cache: dict[RGB, PlayerSpriteSet] = {}
@@ -382,19 +428,88 @@ def get_sprite_set(params: PlayerSpriteParams, shirt_color: RGB) -> PlayerSprite
 
 
 # ---------------------------------------------------------------------------
+# Lighting: per-part rounded shading of the flat sprite art.
+# ---------------------------------------------------------------------------
+
+_SHADE_AMBIENT = 0.45   # brightness of a surface facing away from the light, before `strength`
+
+
+def _alpha_of(sprite: pygame.Surface) -> np.ndarray:
+    """The sprite's alpha channel as a float32 (h, w) array in 0..255."""
+    return np.array(pygame.surfarray.array_alpha(sprite), dtype=np.float32).T
+
+
+def _box_blur(a: np.ndarray, radius: int) -> np.ndarray:
+    """Separable box blur with edge replication (cumulative sums: cheap at any radius)."""
+    radius = max(1, int(radius))
+    out = a
+    for axis in (0, 1):
+        pad = [(0, 0), (0, 0)]
+        pad[axis] = (radius + 1, radius)
+        c = np.cumsum(np.pad(out, pad, mode="edge"), axis=axis, dtype=np.float64)
+        n = out.shape[axis]
+        hi = np.take(c, np.arange(n) + 2 * radius + 1, axis=axis)
+        lo = np.take(c, np.arange(n), axis=axis)
+        out = (hi - lo) / (2 * radius + 1)
+    return out.astype(np.float32)
+
+
+def sprite_normals(alpha: np.ndarray) -> np.ndarray:
+    """Surface normals (h, w, 3, unit length, z up out of the pitch) for a flat sprite, from its
+    silhouette alone. Treats the (blurred, at two scales) alpha as a height map, so every body part
+    reads as its own rounded lump -- shoulders, torso, head, each leg and arm -- with the tilt
+    concentrated toward each part's edge, and broad flat areas facing straight up."""
+    a = alpha / 255.0
+    size = max(a.shape)
+    height = 0.55 * _box_blur(_box_blur(_box_blur(a, size * 0.035), size * 0.035), size * 0.035) \
+        + 0.45 * _box_blur(_box_blur(_box_blur(a, size * 0.09), size * 0.09), size * 0.09)
+    gy, gx = np.gradient(height)
+    k = size * 0.11
+    nx, ny, nz = -k * gx, -k * gy, np.ones_like(height)
+    norm = np.sqrt(nx * nx + ny * ny + nz * nz)
+    return np.stack([nx / norm, ny / norm, nz / norm], axis=-1).astype(np.float32)
+
+
+def light_from_angles(azimuth_deg: float, elevation_deg: float) -> tuple[float, float, float]:
+    """Unit vector TOWARD a light: azimuth is the screen-plane angle of its horizontal direction
+    (0 = +x, 90 = +y, y down), elevation the angle above the ground plane."""
+    az, el = math.radians(azimuth_deg), math.radians(elevation_deg)
+    return math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)
+
+
+def shade_factors(normals: np.ndarray, alpha: np.ndarray, light: tuple[float, float, float],
+                  strength: float) -> np.ndarray:
+    """Brightness factors (h, w), <= 1, to multiply the sprite's colours by: Lambert against
+    `light` plus an ambient floor, scaled so the best-lit part of the figure is exactly 1 (only
+    the far sides darken, never the whole sprite) and blended toward flat by `strength`
+    (0 = all ones)."""
+    lx, ly, lz = light
+    lit = np.clip(1.1 * (normals[..., 0] * lx + normals[..., 1] * ly + normals[..., 2] * lz), 0.0, 1.0)
+    f = _SHADE_AMBIENT + (1.0 - _SHADE_AMBIENT) * lit
+    body = alpha > 127
+    top = float(np.percentile(f[body], 92)) if body.any() else 1.0
+    f = np.clip(f / max(top, 1e-6), 0.0, 1.0)
+    return (1.0 - strength * (1.0 - f)).astype(np.float32)
+
+
+# ---------------------------------------------------------------------------
 # Gait animation: turns a player's current speed into a pose.
 # ---------------------------------------------------------------------------
 
 def advance_gait_phase(phase_rad: float, speed_mps: float, dt_s: float, params: PlayerSpriteParams) -> float:
-    """Advances the per-player stride phase by one rendered frame. Stride
-    frequency scales linearly with speed (0 at rest, `max_stride_hz` at
-    `top_speed_for_stride_mps`), so a stationary player's phase simply stops
-    advancing (see `pick_pose` for why a frozen phase still shows the
-    correct pose in that case)."""
+    """Advances the per-player stride phase by ``dt_s`` seconds of SIMULATION time
+    (the time between two rendered frames on the match's own clock -- see
+    ``ui/sim_clock.py``; a fixed 1/fps step made strides play at 1/sim_speed of
+    their true rate). Stride frequency scales linearly with speed (0 at rest,
+    `max_stride_hz` at `top_speed_for_stride_mps`), so a stationary player's phase
+    simply stops advancing (see `pick_pose` for why a frozen phase still shows the
+    correct pose in that case). A single update never advances more than
+    `_MAX_CYCLES_PER_UPDATE` cycles, so a very high sim speed can't alias the stride."""
     top_speed = max(params.top_speed_for_stride_mps, 1e-6)
     speed_frac = max(0.0, min(1.0, speed_mps / top_speed))
     freq_hz = params.max_stride_hz * speed_frac
-    return (phase_rad + 2.0 * math.pi * freq_hz * dt_s) % (2.0 * math.pi)
+    cycles = min(freq_hz * max(0.0, dt_s), _MAX_CYCLES_PER_UPDATE)
+    return (phase_rad + 2.0 * math.pi * cycles) % (2.0 * math.pi)
 
 
 def pick_pose(phase_rad: float, speed_mps: float, params: PlayerSpriteParams) -> tuple[int, float | None]:

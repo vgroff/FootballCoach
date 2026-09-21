@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import collections
 import math
+from collections.abc import Sequence
 from typing import TYPE_CHECKING, NamedTuple
 
 import numpy as np
@@ -423,13 +424,23 @@ class Renderer:
         # Ball: a soft ground shadow (light above the pitch's middle) and sphere shading.
         _bs = gcfg.get("ball_shadow", {})
         self._ball_shadow_enabled: bool = bool(_bs.get("enabled", True))
-        self._ball_shadow_light_height_m: float = max(1.0, float(_bs.get("light_height_m", 30.0)))
+        # ONE scene light for every shadow and shading effect: a point this high above the middle
+        # of the pitch (ball shadow + shading, player shadows + shading).
+        self._light_height_m: float = max(1.0, float(gcfg.get("scene_light", {}).get("height_m", 40.0)))
         self._ball_shadow_contact_m: float = max(0.0, float(_bs.get("contact_offset_m", 0.10)))
         self._ball_shadow_alpha: int = int(_bs.get("alpha", 120))
         self._ball_shadow_cache: dict[tuple, pygame.Surface] = {}
         _bsh = gcfg.get("ball_shading", {})
         self._ball_shading_strength: float = max(0.0, min(1.0, float(_bsh.get("strength", 0.85)))) if _bsh.get("enabled", True) else 0.0
         self._ball_shade_cache: dict[tuple, pygame.Surface] = {}
+        # Players: rounded per-part shading of the sprite art, and a ground shadow.
+        _pl = gcfg.get("player_shading", {})
+        self._player_shading_strength: float = max(0.0, min(1.0, float(_pl.get("strength", 0.9)))) if _pl.get("enabled", True) else 0.0
+        _psh = gcfg.get("player_shadow", {})
+        self._player_shadow_enabled: bool = bool(_psh.get("enabled", True))
+        self._player_shadow_alpha: int = int(_psh.get("alpha", 107))
+        self._player_shadow_contact_m: float = max(0.0, float(_psh.get("contact_m", 0.18)))
+        self._player_shadow_cache: dict[tuple, pygame.Surface] = {}
         # Turf: soft world-anchored light/dark patches, fine grain and a faint vignette
         # instead of one flat green fill (see `_draw_turf`).
         _tf = gcfg.get("turf", {})
@@ -447,10 +458,14 @@ class Renderer:
         self._turf_bg: pygame.Surface | None = None
         self._turf_bg_key: tuple | None = None
         _cf = gcfg.get("corner_flag", {})
-        self._corner_pole_height_m: float = float(_cf.get("pole_height_m", 2.4))
+        self._corner_pole_height_m: float = float(_cf.get("pole_height_m", 4.0))
         self._corner_pole_width_m: float = float(_cf.get("pole_width_m", 0.06))
         self._corner_flag_width_m: float = float(_cf.get("flag_width_m", 0.55))
-        self._corner_flag_drop_frac: float = float(_cf.get("flag_drop_frac", 0.55))
+        # The cloth's length along the pole is an absolute (apparent) size, so a taller pole
+        # doesn't make the pennant taller too.
+        self._corner_flag_length_m: float = float(_cf.get("flag_length_m", 0.32))
+        self._corner_shadow_alpha: int = int(_cf.get("shadow_alpha", 90))
+        self._corner_shadow_height_m: float = float(_cf.get("shadow_height_m", 1.2))
         _gn = gcfg.get("goal_net", {})
         self._goal_net_spacing_m: float = float(_gn.get("spacing_m", 0.35))
         self._goal_net_min_spacing_px: int = max(2, int(_gn.get("min_spacing_px", 8)))
@@ -513,9 +528,15 @@ class Renderer:
 
     def update_ball_effects(self, ball: Ball, dt_s: float) -> None:
         """Integrate 3D ball orientation from spin + rolling.
-        Call once per rendered frame (only when not paused)."""
+        Call once per rendered frame (only when not paused), with ``dt_s`` the SIMULATION
+        seconds since the previous call (``ui/sim_clock.py``) -- ``ball.spin`` is in rad per
+        sim second, so a wall-clock or 1/fps step under-rotates it whenever the sim is sped up.
+        A zero ``dt_s`` (no sim time passed) leaves the orientation untouched."""
         # Estimate XY velocity from position delta (works for both free and possessed).
         cur_x, cur_y = ball.position.x, ball.position.y
+        if dt_s <= 1e-9:
+            self._last_ball_pos = (cur_x, cur_y)
+            return
         est_vx = (cur_x - self._last_ball_pos[0]) / dt_s
         est_vy = (cur_y - self._last_ball_pos[1]) / dt_s
         self._last_ball_pos = (cur_x, cur_y)
@@ -549,7 +570,9 @@ class Renderer:
     def update_player_animations(self, players: list[Player], dt_s: float) -> None:
         """Advances each player's stride-gait phase (see player_sprites.py).
         Call once per rendered frame (only when not paused), before drawing
-        any players -- a no-op if sprites are disabled."""
+        any players -- a no-op if sprites are disabled. ``dt_s`` is the SIMULATION
+        time elapsed since the previous call (``ui/sim_clock.py``), so strides keep
+        pace with the players' sim speed at any sim-speed setting."""
         if not self._sprites_enabled:
             return
         for player in players:
@@ -612,12 +635,22 @@ class Renderer:
                 surface, penalty_arc_world_points(pitch, left=left, radius_m=self._penalty_arc_radius_m), line_w,
             )
 
-        # Corner arcs: a quarter circle inside each corner.
+        # Corner arcs: a quarter circle inside each corner. Each arc is drawn as a stroke centred
+        # on the arc's world points, whose ends sit on the boundary lines' outer edge -- so the
+        # stroke's thickness and anti-aliased edge would poke past the boundary lines (measured:
+        # 1-6 pixels outside at zoom 1-3). The boundary is drawn INSIDE the rectangle
+        # (`rect_world`), so clip the arcs to exactly that rectangle.
+        b0 = cam.world_to_screen(-pitch.half_length, -pitch.half_width)
+        b1 = cam.world_to_screen(pitch.half_length, pitch.half_width)
+        boundary = pygame.Rect(min(b0[0], b1[0]), min(b0[1], b1[1]), abs(b1[0] - b0[0]), abs(b1[1] - b0[1]))
+        previous_clip = surface.get_clip()
+        surface.set_clip(boundary.clip(previous_clip))
         for sx in (-1, 1):
             for sy in (-1, 1):
                 self._draw_world_polyline(
                     surface, corner_arc_world_points(pitch, sx, sy, radius_m=self._corner_arc_radius_m), line_w,
                 )
+        surface.set_clip(previous_clip)
 
         # Goals: ground footprint (side/back lines + faint mouth tint) and a
         # coloured bar behind each showing which team defends that end. The
@@ -1013,18 +1046,29 @@ class Renderer:
         layer = self._net_layer(("roof", w, h, spacing, line_w), w, h, draw_family, mirror_x=True)
         surface.blit(layer, (x_a, y_top))
 
-    def draw_pitch_and_ball(self, surface: pygame.Surface, pitch: Pitch, ball: Ball) -> None:
+    def draw_pitch_and_ball(
+        self, surface: pygame.Surface, pitch: Pitch, ball: Ball, players: Sequence[Player] = (),
+    ) -> None:
         """Draws the pitch and the ball with the goal's top layer (roof net,
         posts, crossbar) on the correct side of the ball, for a sense of depth:
         a ball that is inside a goal (past the goal line, between the posts,
         below the crossbar -- i.e. going in) is drawn UNDER the crossbar and
         net; any other ball -- including one above the crossbar, going over --
-        is drawn OVER them. Callers draw players after this call."""
+        is drawn OVER them. Callers draw players after this call.
+
+        Every ground shadow -- each of ``players``' and the ball's -- is drawn in ONE pass
+        right after the pitch's ground layer, i.e. under the goal frame, the ball, and every
+        sprite (a shadow never falls over another player, the ball, or the net)."""
         under = ball_under_goal_frame(
             pitch, ball.position.x, ball.position.y, ball.position.z, ball.radius_m,
         )
-        self.draw_pitch(surface, pitch, goal_tops=not under)
-        self.draw_ball(surface, ball)
+        self.draw_pitch(surface, pitch, goal_tops=False)
+        self.draw_player_shadows(surface, players)
+        if self._ball_shadow_enabled:
+            self._draw_ball_shadow(surface, ball, self._ball_base_radius_px(ball))
+        if not under:
+            self.draw_goal_tops(surface, pitch)
+        self.draw_ball(surface, ball, shadow=False)
         if under:
             self.draw_goal_tops(surface, pitch)
 
@@ -1058,10 +1102,9 @@ class Renderer:
         it. The pole's apparent length uses the crossbar's parallax rate
         (``crossbar_lean_m / goal_height_m`` metres per metre of height), so it
         scales with that one setting; ``corner_flag`` in graphics.json sets the
-        pole height and cloth size."""
+        pole height, cloth size and shadow. Each flag casts a soft shadow from the scene light
+        (`_draw_corner_flag_shadow`), drawn first so the pole and cloth sit on top of it."""
         cam = self.camera
-        rate = self._goal_lean_m(pitch) / pitch.goal_height_m
-        lean_m = rate * self._corner_pole_height_m
         # 1px minimum (a 2px pole looked chunky and rectangular at the default zoom),
         # and the ground-contact dot appears only once the pole is 3px+ wide, sized to
         # the pole -- a fixed 2px-radius dot is a 5px blob on the ~6px pole at 1x zoom
@@ -1070,10 +1113,9 @@ class Renderer:
         foot_r = pole_px // 2 + 1 if pole_px >= 3 else 0
         for sx in (-1, 1):
             for sy in (-1, 1):
-                geo = corner_flag_world_points(
-                    pitch, sx, sy, pole_lean_m=lean_m,
-                    flag_width_m=self._corner_flag_width_m, flag_drop_frac=self._corner_flag_drop_frac,
-                )
+                geo = self._corner_flag_geometry(pitch, sx, sy)
+                if self._corner_shadow_alpha > 0:
+                    self._draw_corner_flag_shadow(surface, geo, self._corner_flag_drop(pitch))
                 self._draw_world_polyline(surface, [geo.base, geo.top], pole_px, style.CORNER_FLAG_POLE_COLOUR)
                 if foot_r:
                     foot = cam.world_to_screen(*geo.base)
@@ -1082,6 +1124,64 @@ class Renderer:
                 tri = [cam.world_to_screen(*pt) for pt in (geo.top, geo.attach, geo.tip)]
                 pygame.gfxdraw.filled_polygon(surface, tri, style.CORNER_FLAG_COLOUR)
                 pygame.gfxdraw.aapolygon(surface, tri, style.CORNER_FLAG_COLOUR)
+
+    def _corner_flag_drop(self, pitch: Pitch) -> float:
+        """Fraction of the pole (from the top) the cloth is attached along: ``flag_length_m`` as a
+        share of the pole's apparent length, so the pennant keeps the same size however tall the
+        pole is."""
+        lean_m = self._goal_lean_m(pitch) / pitch.goal_height_m * self._corner_pole_height_m
+        return min(0.95, self._corner_flag_length_m / lean_m) if lean_m > 1e-9 else 0.95
+
+    def _corner_flag_geometry(self, pitch: Pitch, sx: int, sy: int) -> CornerFlagGeometry:
+        rate = self._goal_lean_m(pitch) / pitch.goal_height_m
+        return corner_flag_world_points(
+            pitch, sx, sy, pole_lean_m=rate * self._corner_pole_height_m,
+            flag_width_m=self._corner_flag_width_m, flag_drop_frac=self._corner_flag_drop(pitch),
+        )
+
+    def _draw_corner_flag_shadow(self, surface: pygame.Surface, geo: CornerFlagGeometry, drop: float) -> None:
+        """The flag's ground shadow from the scene light (a point ``scene_light.height_m`` above the
+        pitch's middle): a point at height z above ground point P throws its shadow at
+        P * H / (H - z) from the centre, i.e. displaced straight away from it. The pole (height
+        ``shadow_height_m`` -- deliberately short: the drawn pole is a stub, so a physically tall pole's
+        ~4m shadow at a corner looked absurd next to it) casts a line from its
+        foot and the cloth a triangle. Drawn 2x supersampled on a small transparent layer and
+        averaged down (soft, anti-aliased edges; the layer is black so there is no edge halo), then
+        blitted at ``shadow_alpha``."""
+        cam = self.camera
+        light_h, pole_h = self._light_height_m, self._corner_shadow_height_m
+
+        def shadow_of(x: float, y: float, z: float) -> tuple[float, float]:
+            k = light_h / max(light_h - z, 1.0)
+            return x * k, y * k
+
+        bx, by = geo.base
+        mid = ((geo.top[0] + geo.attach[0]) / 2.0, (geo.top[1] + geo.attach[1]) / 2.0)
+        tip_xy = (bx + geo.tip[0] - mid[0], by + geo.tip[1] - mid[1])       # the cloth's true (unleaned) end
+        world = [
+            geo.base,
+            shadow_of(bx, by, pole_h),
+            shadow_of(bx, by, pole_h * (1.0 - drop)),
+            shadow_of(tip_xy[0], tip_xy[1], pole_h * (1.0 - drop / 2.0)),
+        ]
+        pts = [cam.world_to_screen_f(*p) for p in world]
+        pad, ss = 4, 2
+        x0, y0 = int(math.floor(min(p[0] for p in pts))) - pad, int(math.floor(min(p[1] for p in pts))) - pad
+        w = int(math.ceil(max(p[0] for p in pts))) + pad - x0 + 1
+        h = int(math.ceil(max(p[1] for p in pts))) + pad - y0 + 1
+        if not pygame.Rect(x0, y0, w, h).colliderect(surface.get_clip()):
+            return
+        layer = pygame.Surface((w * ss, h * ss), pygame.SRCALPHA)
+        layer.fill((0, 0, 0, 0))
+        local = [((p[0] - x0) * ss, (p[1] - y0) * ss) for p in pts]
+        pole_w = max(ss, round(0.16 * cam.pixels_per_metre * ss))
+        pygame.draw.line(layer, (0, 0, 0, 255), local[0], local[1], pole_w)
+        tri = [(int(round(x)), int(round(y))) for x, y in local[1:]]
+        pygame.gfxdraw.filled_polygon(layer, tri, (0, 0, 0, 255))
+        pygame.gfxdraw.aapolygon(layer, tri, (0, 0, 0, 255))
+        soft = pygame.transform.smoothscale(layer, (w, h))
+        soft.set_alpha(self._corner_shadow_alpha)
+        surface.blit(soft, (x0, y0))
 
     # x-offsets (metres, from the halfway line) of each bench along a
     # touchline -- spread across the middle third of the pitch, well clear
@@ -1342,7 +1442,14 @@ class Renderer:
         big.blit(clip, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
         return pygame.transform.smoothscale(big, (pad * 2, pad * 2)), pad
 
-    def draw_ball(self, surface: pygame.Surface, ball: Ball) -> None:
+    def _ball_base_radius_px(self, ball: Ball) -> float:
+        """The ball's on-screen radius before the height boost (see `draw_ball`)."""
+        cam = self.camera
+        return max(self.min_ball_radius_px * cam.zoom_scale, cam.scale_length(ball.radius_m))
+
+    def draw_ball(self, surface: pygame.Surface, ball: Ball, *, shadow: bool = True) -> None:
+        """``shadow=False`` skips the ground shadow: `draw_pitch_and_ball` draws it in the shared
+        shadow pass (under every sprite) instead."""
         cam = self.camera
         pos = cam.world_to_screen(ball.position.x, ball.position.y)
 
@@ -1357,11 +1464,11 @@ class Renderer:
         # floor, while players (radius_m 0.3 vs the ball's 0.11) keep
         # growing well past it, leaving the ball looking disproportionately
         # tiny next to them once zoomed in.
-        base_radius_px = max(self.min_ball_radius_px * cam.zoom_scale, cam.scale_length(ball.radius_m))
+        base_radius_px = self._ball_base_radius_px(ball)
         height_boost = 1.0 + min(ball.height_m, 5.0) * self._ball_height_boost_per_m
         radius_px = max(2, int(base_radius_px * height_boost))
 
-        if self._ball_shadow_enabled:
+        if shadow and self._ball_shadow_enabled:
             self._draw_ball_shadow(surface, ball, base_radius_px)
 
         # --- Ghost trail: drawn before the ball so it's underneath ---
@@ -1453,18 +1560,26 @@ class Renderer:
     def _ball_light_angles(self, ball: Ball) -> tuple[int, int]:
         """Direction of the light on the ball as (azimuth, elevation) in whole degrees, quantised
         (10 / 5 degrees) so sprites can be cached. The light is the SAME point light as the ball's
-        shadow (``ball_shadow.light_height_m`` above the pitch's middle): horizontally it points from
-        the ball toward the centre (azimuth = screen angle of that direction, y down), and its
-        elevation is atan((H - ball height) / distance from the centre) -- overhead at the centre,
+        shadow (``scene_light.height_m`` above the pitch's middle, `_point_light_at`): horizontally it
+        points from the ball toward the centre (azimuth = screen angle of that direction, y down), and
+        its elevation is atan((H - ball height) / distance from the centre) -- overhead at the centre,
         lower and more sideways toward the edges."""
+        azimuth, elevation, _ = self._point_light_at(ball.position.x, ball.position.y, ball.position.z)
+        return int(round(azimuth / 10.0) * 10) % 360, int(min(90, round(elevation / 5.0) * 5))
+
+    def _point_light_at(self, wx: float, wy: float, z_m: float) -> tuple[float, float, float]:
+        """The scene's point light (``scene_light.height_m`` above the middle of the pitch) as seen
+        from the point (wx, wy) at height z_m: (azimuth in degrees -- the screen-plane angle from
+        the point toward the pitch centre, y down --, elevation in degrees above the ground plane,
+        distance from the centre in metres). Overhead (90) at the centre, lower toward the edges."""
         cam = self.camera
-        bx, by = cam.world_to_screen_f(ball.position.x, ball.position.y)
+        bx, by = cam.world_to_screen_f(wx, wy)
         cx, cy = cam.world_to_screen_f(0.0, 0.0)
         dist_m = math.hypot(cx - bx, cy - by) / cam.pixels_per_metre
-        rise = max(self._ball_shadow_light_height_m - ball.position.z, 0.5)
+        rise = max(self._light_height_m - z_m, 0.5)
         elevation = math.degrees(math.atan2(rise, dist_m))
         azimuth = math.degrees(math.atan2(cy - by, cx - bx)) if dist_m > 1e-6 else 0.0
-        return int(round(azimuth / 10.0) * 10) % 360, int(min(90, round(elevation / 5.0) * 5))
+        return azimuth, elevation, dist_m
 
     def _ball_shade_sprite(self, radius: int, azimuth_deg: int, elevation_deg: int) -> pygame.Surface:
         """Black overlay, per-pixel alpha, that shades the ball like a sphere lit from the given
@@ -1499,7 +1614,7 @@ class Renderer:
         return sprite
 
     def _draw_ball_shadow(self, surface: pygame.Surface, ball: Ball, base_radius_px: float) -> None:
-        """A soft shadow on the ground. The light is a point ``light_height_m`` above the pitch's
+        """A soft shadow on the ground. The light is a point ``scene_light.height_m`` above the pitch's
         middle, so a raised ball's shadow falls on the ground displaced radially AWAY from the
         centre by ``distance * z / (H - z)`` (zero at the centre or on the ground); a thin
         contact shadow (``contact_offset_m``, same direction, biased to the lower-right so it
@@ -1508,8 +1623,8 @@ class Renderer:
         higher the ball is."""
         cam = self.camera
         z = max(0.0, ball.position.z - ball.radius_m)
-        z_eff = min(z, 0.8 * self._ball_shadow_light_height_m)
-        k = z_eff / (self._ball_shadow_light_height_m - z_eff)
+        z_eff = min(z, 0.8 * self._light_height_m)
+        k = z_eff / (self._light_height_m - z_eff)
         bx, by = cam.world_to_screen_f(ball.position.x, ball.position.y)
         cx, cy = cam.world_to_screen_f(0.0, 0.0)
         vx, vy = bx - cx, by - cy
@@ -1576,6 +1691,19 @@ class Renderer:
         hx, hy = math.cos(-player.heading_rad), math.sin(-player.heading_rad)
         rotate_deg = 90.0 - math.degrees(math.atan2(hy, hx))
 
+        if self._player_shading_strength > 0.0:
+            # Light the sprite BEFORE rotating it: the scene light's direction (screen frame) is
+            # rotated into the sprite's own frame by the inverse of the rotation applied below.
+            az, el, _ = self._point_light_at(player.position.x, player.position.y, self._PLAYER_LIGHT_Z_M)
+            phi, elr, azr = math.radians(rotate_deg), math.radians(el), math.radians(az)
+            lx, ly = math.cos(elr) * math.cos(azr), math.cos(elr) * math.sin(azr)
+            local_az = math.degrees(math.atan2(math.sin(phi) * lx + math.cos(phi) * ly,
+                                               math.cos(phi) * lx - math.sin(phi) * ly))
+            base_sprite = sprite_set.shaded(
+                side, level, int(round(local_az / 15.0) * 15) % 360, int(min(90, round(el / 5.0) * 5)),
+                self._player_shading_strength,
+            )
+
         target_diameter = max(1.0, radius_px * self._sprite_params.size_scale)
         scale = target_diameter / base_sprite.get_width()
         rotated = pygame.transform.rotozoom(base_sprite, rotate_deg, scale)
@@ -1585,6 +1713,62 @@ class Renderer:
             rotated.set_alpha(self._inactive_alpha)
         rect = rotated.get_rect(center=pos)
         surface.blit(rotated, rect)
+
+    _PLAYER_LIGHT_Z_M = 0.9   # height at which a player's body is lit (roughly the torso)
+
+    def _player_radius_px(self, player: Player) -> int:
+        cam = self.camera
+        return int(max(self.min_player_radius_px * cam.zoom_scale, cam.scale_length(player.radius_m)))
+
+    def draw_player_shadows(self, surface: pygame.Surface, players: Sequence[Player]) -> None:
+        """Every player's ground shadow, in one pass (call it BEFORE drawing any sprite -- see
+        `draw_pitch_and_ball`, which does -- so a shadow never lands on top of another player).
+        The light is the scene's point light above the middle of the pitch: the shadow of a
+        figure of height h at distance d from the centre points straight away from it and is
+        d * h / (H - h) long (a thin contact shadow, `player_shadow.contact_m`, so a player at the
+        centre still has one), drawn as a soft capsule."""
+        if not self._player_shadow_enabled or self._player_shadow_alpha <= 0:
+            return
+        cam = self.camera
+        ppm = cam.pixels_per_metre
+        cx, cy = cam.world_to_screen_f(0.0, 0.0)
+        for player in players:
+            bx, by = cam.world_to_screen_f(player.position.x, player.position.y)
+            vx, vy = bx - cx, by - cy
+            dist_m = math.hypot(vx, vy) / ppm
+            h = max(player.height_m, 0.1)
+            length_px = max(dist_m * h / max(self._light_height_m - h, 1.0), self._player_shadow_contact_m) * ppm
+            # Direction: radially away from the centre, with a lower-right bias that dominates within
+            # ~1.5 m of it so the direction is continuous as a player crosses the middle.
+            dx, dy = vx + 1.5 * ppm * 0.7071, vy + 1.5 * ppm * 0.7071
+            angle = int(round(math.degrees(math.atan2(dy, dx)) / 5.0) * 5) % 360
+            sprite = self._player_shadow_sprite(int(round(length_px)), angle, int(round(self._player_radius_px(player) * 0.85)))
+            pos = cam.world_to_screen(player.position.x, player.position.y)
+            surface.blit(sprite, (pos[0] - sprite.get_width() // 2, pos[1] - sprite.get_height() // 2))
+
+    def _player_shadow_sprite(self, length_px: int, angle_deg: int, radius_px: int) -> pygame.Surface:
+        """A soft-edged black capsule of half-width ``radius_px`` running from the centre of the
+        sprite ``length_px`` px in the direction ``angle_deg`` (screen angle, y down); the sprite is
+        a square centred on the player. Cached per (length, angle, radius)."""
+        key = (length_px, angle_deg, radius_px)
+        sprite = self._player_shadow_cache.get(key)
+        if sprite is None:
+            soft = 0.35
+            r = max(1, radius_px)
+            pad = int(math.ceil(length_px + r * (1 + soft))) + 2
+            yy, xx = np.mgrid[-pad:pad + 1, -pad:pad + 1].astype(float)
+            sx, sy = math.cos(math.radians(angle_deg)) * length_px, math.sin(math.radians(angle_deg)) * length_px
+            t = np.clip((xx * sx + yy * sy) / max(sx * sx + sy * sy, 1e-9), 0.0, 1.0)
+            d = np.hypot(xx - t * sx, yy - t * sy)
+            a = np.clip((r * (1 + soft) - d) / (2 * r * soft), 0.0, 1.0)
+            a = a * a * (3.0 - 2.0 * a) * (self._player_shadow_alpha / 255.0)
+            sprite = pygame.Surface((2 * pad + 1, 2 * pad + 1), pygame.SRCALPHA)
+            sprite.fill((0, 0, 0, 0))
+            pygame.surfarray.pixels_alpha(sprite)[:] = np.clip(a * 255.0 + 0.5, 0, 255).astype(np.uint8).T
+            if len(self._player_shadow_cache) >= 512:
+                self._player_shadow_cache.clear()
+            self._player_shadow_cache[key] = sprite
+        return sprite
 
     def draw_player(
         self, surface: pygame.Surface, player: Player, selected: bool,
@@ -1607,7 +1791,7 @@ class Renderer:
         """
         cam = self.camera
         pos = cam.world_to_screen(player.position.x, player.position.y)
-        radius_px = int(max(self.min_player_radius_px * cam.zoom_scale, cam.scale_length(player.radius_m)))
+        radius_px = self._player_radius_px(player)
 
         if player.is_goalkeeper:
             colour = style.GOALKEEPER_COLOUR

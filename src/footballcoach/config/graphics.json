@@ -82,15 +82,29 @@
     "penalty_arc_radius_m": 9.15,
     "corner_arc_radius_m": 1.0
   },
-  "ball_shadow": {
-    "_comment": "Soft ground shadow under the ball. The light is a point light_height_m above the middle of the pitch, so a raised ball's shadow falls on the ground displaced away from the centre (none on the ground or at the centre). contact_offset_m: a thin always-visible contact shadow (same direction) so a grounded ball doesn't look pasted on; 0 = none. alpha: 0-255 darkness of the shadow under a ball on the ground (fainter and softer as it rises).",
+  "scene_light": {
+    "_comment": "The one light used by every shadow and shading effect (ball shadow + shading, player shadows + shading): a point height_m above the middle of the pitch. Higher = shadows shorter and closer to their casters, shading more from above; lower = long sideways shadows near the edges.",
+    "height_m": 40.0
+  },
+  "player_shading": {
+    "_comment": "Per-part rounded shading of the player sprites (shoulders, torso, head, limbs each lit as their own lump; dark on the side away from the scene light). strength 0-1; enabled false = the flat sprites.",
     "enabled": true,
-    "light_height_m": 30.0,
+    "strength": 0.9
+  },
+  "player_shadow": {
+    "_comment": "Ground shadow under each player, cast by the scene light (a figure's height h at distance d from the pitch centre throws a shadow d*h/(H-h) long straight away from the centre). alpha: 0-255 darkness. contact_m: minimum shadow length in metres so a player at the centre still has one. enabled false = none.",
+    "enabled": true,
+    "alpha": 107,
+    "contact_m": 0.18
+  },
+  "ball_shadow": {
+    "_comment": "Soft ground shadow under the ball, cast by the scene light (scene_light.height_m): a raised ball's shadow falls on the ground displaced away from the pitch centre (none on the ground or at the centre). contact_offset_m: a thin always-visible contact shadow (same direction) so a grounded ball doesn't look pasted on; 0 = none. alpha: 0-255 darkness of the shadow under a ball on the ground (fainter and softer as it rises).",
+    "enabled": true,
     "contact_offset_m": 0.10,
     "alpha": 120
   },
   "ball_shading": {
-    "_comment": "Sphere shading on the ball (dark on the side away from the light, clear where it faces it; the highlight is the unshaded part). The light is the same point light as the ball shadow (ball_shadow.light_height_m above the pitch's middle), so the lit side always faces the centre: overhead at the centre, lower and more sideways toward the edges. strength 0-1; enabled false = flat white ball.",
+    "_comment": "Sphere shading on the ball (dark on the side away from the light, clear where it faces it; the highlight is the unshaded part). The light is the scene light (scene_light.height_m above the pitch's middle), the same as the shadows, so the lit side always faces the centre: overhead at the centre, lower and more sideways toward the edges. strength 0-1; enabled false = flat white ball.",
     "enabled": true,
     "strength": 0.85
   },
@@ -112,11 +126,13 @@
     "shade_strength": 0.7
   },
   "corner_flag": {
-    "_comment": "Corner flags (ui/renderer.py _draw_corner_flags), drawn with the same top-down parallax as the goal frame: the pole is vertical, so its top is displaced away from the pitch centre by pole_height_m * (crossbar_lean_m / goal_height_m) -- one parallax setting drives both. pole_height_m: APPARENT pole height for the parallax (a real corner pole is ~1.5-1.8m; this is deliberately bolder so the leaning pole reads at the default zoom). pole_width_m: pole stroke (min 1px). flag_width_m: how far the cloth's free end streams off the pole (perpendicular to it, toward the pitch's middle along the touchline). flag_drop_frac: fraction of the pole (from the top) the cloth is attached along; the rest of the pole below it stays visible.",
-    "pole_height_m": 2.4,
+    "_comment": "Corner flags (ui/renderer.py _draw_corner_flags), drawn with the same top-down parallax as the goal frame: the pole is vertical, so its top is displaced away from the pitch centre by pole_height_m * (crossbar_lean_m / goal_height_m) -- one parallax setting drives both. pole_height_m: APPARENT pole height for the parallax (a real corner pole is ~1.5-1.8m; this is deliberately bold so the leaning pole reads at the default zoom). pole_width_m: pole stroke (min 1px). flag_width_m: how far the cloth's free end streams off the pole (perpendicular to it, toward the pitch's middle along the touchline). flag_length_m: the cloth's length ALONG the pole in apparent metres (an absolute size, so a taller pole doesn't grow the pennant); the rest of the pole below it stays visible. shadow_alpha: 0-255 darkness of the flag's ground shadow (0 = none), cast by the scene light. shadow_height_m: the pole height used for that shadow. NOT the physical height: at a corner the scene light is only ~33 degrees above the horizon, so a 2.4m pole would throw a ~4m shadow (3.4x the drawn 1.2m pole stub); 1.2 gives ~1.9m. Raise it for a longer shadow.",
+    "pole_height_m": 4.0,
     "pole_width_m": 0.06,
     "flag_width_m": 0.55,
-    "flag_drop_frac": 0.55
+    "flag_length_m": 0.32,
+    "shadow_alpha": 90,
+    "shadow_height_m": 1.2
   },
   "goal_net": {
     "_comment": "Diagonal mesh drawn inside each goal frame. spacing_m: gap between mesh lines in world metres (smaller = denser mesh). min_spacing_px: floor on that gap in screen pixels -- below ~5px the 1px diagonals alias into a checkerboard instead of a diamond lattice (0.35m is only ~3px at the default window), so the gap never drops under this; lower it only if you want the checker back. back_spacing_scale: the back-wall net's mesh spacing as a multiple of the roof's (the steep back-wall lines in the narrow ~6px strip alias into a moire at 1x; 2x reads as clean tall diamonds). sag_m: how far (metres) the middle of the roof net hangs below crossbar height; the mesh bows toward the pitch by that height's parallax (0 = flat). alpha: 0=invisible, 255=fully opaque. color: RGB.",

@@ -637,11 +637,7 @@ def test_corner_flag_pole_and_cloth_are_drawn():
     from footballcoach.ui.renderer import corner_flag_world_points
 
     pitch, cam, surface, renderer = _drawn_pitch_at_zoom(5.0, (-52.5 + 3.0, 34.0 - 3.0))
-    rate = renderer._goal_lean_m(pitch) / pitch.goal_height_m
-    geo = corner_flag_world_points(
-        pitch, -1, 1, pole_lean_m=rate * renderer._corner_pole_height_m,
-        flag_width_m=renderer._corner_flag_width_m, flag_drop_frac=renderer._corner_flag_drop_frac,
-    )
+    geo = renderer._corner_flag_geometry(pitch, -1, 1)
     # A point on the bare lower pole is pole-coloured.
     lower = ((geo.base[0] + geo.attach[0]) / 2, (geo.base[1] + geo.attach[1]) / 2)
     got = surface.get_at(cam.world_to_screen(*lower))[:3]
@@ -1062,7 +1058,7 @@ def test_ball_light_is_the_shadows_point_light_above_the_pitch_centre():
     for x, y, z in ((0.0, 0.0, 0.11), (-25.0, 12.0, 0.11), (30.0, -15.0, 6.0), (10.0, 5.0, 0.11)):
         cam, _, renderer, ball = _ball_frame(z, x=x, y=y, zoom=1.0)
         az, el = renderer._ball_light_angles(ball)
-        H = renderer._ball_shadow_light_height_m
+        H = renderer._light_height_m
         dist = m.hypot(x, y)
         assert abs(el - m.degrees(m.atan2(H - z, dist))) <= 2.6            # quantised to 5 degrees
         if dist > 1.0:
@@ -1116,7 +1112,7 @@ def test_raised_ball_shadow_lands_on_the_ground_away_from_the_pitch_centre():
     the centre, at d * H / (H - z) from it: displaced radially outward by d * z / (H - z)."""
     x, y, z = 28.0, 16.0, 5.0
     cam, surface, renderer, ball = _ball_frame(z, x=x, y=y, zoom=2.0, _ball_shadow_enabled=True)
-    H = renderer._ball_shadow_light_height_m
+    H = renderer._light_height_m
     under = z - ball.radius_m
     bx, by = cam.world_to_screen_f(x, y)
     cx, cy = cam.world_to_screen_f(0.0, 0.0)
@@ -1129,7 +1125,7 @@ def test_raised_ball_shadow_lands_on_the_ground_away_from_the_pitch_centre():
     sx = sum(p[0] * p[2] for p in shadow) / total
     sy = sum(p[1] * p[2] for p in shadow) / total
     assert math.hypot(sx - expect[0], sy - expect[1]) < 4.0
-    assert math.hypot(sx - bx, sy - by) > 4.0 * renderer._ball_shadow_light_height_m / 15.0   # visibly detached
+    assert math.hypot(sx - bx, sy - by) > 4.0 * renderer._light_height_m / 15.0   # visibly detached
 
 
 def test_ball_shadow_is_fainter_and_softer_as_the_ball_rises():
@@ -1235,3 +1231,219 @@ def test_roof_sag_displaces_toward_the_pitch_by_the_parallax_of_the_sag_depth():
     assert dx == pytest.approx(expected(r, p, c)) and dx > 0.5
     dx, r, p, c = calls[False]
     assert dx == pytest.approx(-expected(r, p, c)) and dx < -0.5
+
+
+# ---------------------------------------------------------------------------
+# Corner arcs stay inside the pitch; corner flag size and shadow
+# ---------------------------------------------------------------------------
+
+def _whiter_than_grass(px, margin=25):
+    return min(px[i] - style.PITCH_GREEN[i] for i in range(3)) > margin
+
+
+@pytest.mark.parametrize("zoom", [1.0, 1.5, 2.0, 3.0, 4.0, 5.0])
+@pytest.mark.parametrize("corner", [(-1, -1), (-1, 1), (1, -1), (1, 1)])
+def test_corner_arcs_never_poke_out_past_the_boundary_lines(zoom, corner):
+    """Regression: each arc is a stroke centred on world points that lie on the boundary lines'
+    OUTER edge, so its thickness and anti-aliased edge landed 1-6 pixels outside the pitch at
+    zoom 1-3. Nothing light may be drawn outside the rectangle the boundary lines are drawn in
+    (flags are yellow/orange and shadows dark, so they don't count as 'light')."""
+    sx, sy = corner
+    pitch = Pitch.standard()
+    follow = (0.0, 0.0) if zoom == 1.0 else (sx * (pitch.half_length - 3.0), sy * (pitch.half_width - 3.0))
+    _, cam, surface, _ = _drawn_pitch_at_zoom(zoom, follow)
+    b0 = cam.world_to_screen(-pitch.half_length, -pitch.half_width)
+    b1 = cam.world_to_screen(pitch.half_length, pitch.half_width)
+    left, top = min(b0[0], b1[0]), min(b0[1], b1[1])
+    right, bottom = left + abs(b1[0] - b0[0]), top + abs(b1[1] - b0[1])       # exclusive, like pygame.draw.rect
+    cx, cy = cam.world_to_screen(sx * pitch.half_length, sy * pitch.half_width)
+    outside = [
+        (x, y)
+        for x in range(max(0, cx - 45), min(surface.get_width(), cx + 46))
+        for y in range(max(0, cy - 45), min(surface.get_height(), cy + 46))
+        if (x < left or x >= right or y < top or y >= bottom) and _whiter_than_grass(surface.get_at((x, y)))
+    ]
+    assert not outside, outside[:5]
+
+
+@pytest.mark.parametrize("corner", [(-1, -1), (-1, 1), (1, -1), (1, 1)])
+def test_corner_arcs_are_still_drawn_inside_the_pitch(corner):
+    """...and clipping did not remove them: every sample along the quarter circle has light pixels
+    right on it."""
+    sx, sy = corner
+    pitch = Pitch.standard()
+    _, cam, surface, renderer = _drawn_pitch_at_zoom(3.0, (sx * (pitch.half_length - 3.0), sy * (pitch.half_width - 3.0)))
+    pts = corner_arc_world_points(pitch, sx, sy, radius_m=renderer._corner_arc_radius_m)
+    hits = 0
+    samples = pts[len(pts) // 5: -(len(pts) // 5)]              # the middle of the arc, away from the lines it meets
+    for wx, wy in samples:
+        px, py = cam.world_to_screen(wx, wy)
+        hits += any(_whiter_than_grass(surface.get_at((px + i, py + j))) for i in (-2, -1, 0, 1, 2) for j in (-2, -1, 0, 1, 2))
+    assert samples and hits == len(samples)
+
+
+def test_the_pennant_keeps_its_size_however_tall_the_pole_is():
+    """The cloth's length along the pole is `flag_length_m`, an absolute (apparent) size: a taller pole
+    (a bigger parallax lean) must not make the pennant taller too."""
+    pitch = Pitch.standard()
+    lengths = []
+    for pole_h in (2.4, 4.0, 6.0):
+        _, _, _, renderer = _drawn_pitch()
+        renderer._corner_pole_height_m = pole_h
+        geo = renderer._corner_flag_geometry(pitch, -1, 1)
+        lengths.append(math.hypot(geo.top[0] - geo.attach[0], geo.top[1] - geo.attach[1]))
+    assert lengths == pytest.approx([renderer._corner_flag_length_m] * 3, rel=1e-6)
+    # ...while the pole itself does get longer
+    poles = []
+    for pole_h in (2.4, 4.0):
+        _, _, _, renderer = _drawn_pitch()
+        renderer._corner_pole_height_m = pole_h
+        geo = renderer._corner_flag_geometry(pitch, 1, -1)
+        poles.append(math.hypot(geo.top[0] - geo.base[0], geo.top[1] - geo.base[1]))
+    assert poles[1] > 1.6 * poles[0]
+
+
+def test_default_flag_is_taller_but_not_bigger_than_the_old_one():
+    _, _, _, renderer = _drawn_pitch()
+    assert renderer._corner_pole_height_m >= 4.0
+    old_cloth = 0.55 * (0.72 / 2.44 * 2.4)                 # old design: 55% of a 2.4m pole's apparent lean
+    assert renderer._corner_flag_length_m < old_cloth       # "a little shorter"
+    assert renderer._corner_flag_length_m > 0.6 * old_cloth
+
+
+def _flag_scene(zoom=3.0, corner=(-1, 1), **attrs):
+    sx, sy = corner
+    pitch = Pitch.standard()
+    _, cam, surface, renderer = _drawn_pitch_at_zoom(
+        zoom, (sx * (pitch.half_length - 4.0), sy * (pitch.half_width - 3.0)), renderer_attrs=attrs,
+    )
+    return pitch, cam, surface, renderer
+
+
+def _darkness(surface, cam, wx, wy):
+    px = surface.get_at(cam.world_to_screen(wx, wy))[:3]
+    return sum(style.PITCH_GREEN) - sum(px)
+
+
+@pytest.mark.parametrize("corner", [(-1, 1), (1, -1), (1, 1), (-1, -1)])
+def test_a_corner_flag_casts_a_shadow_straight_away_from_the_pitch_centre(corner):
+    """The scene light is a point above the middle of the pitch, so the pole's shadow (height
+    `shadow_height_m`) is d * h / (H - h) long from its foot, radially away from the centre -- well
+    beyond the drawn pole's tip -- and nothing beside it is shaded."""
+    sx, sy = corner
+    pitch, cam, surface, renderer = _flag_scene(corner=corner)
+    bx, by = sx * pitch.half_length, sy * pitch.half_width
+    dist = math.hypot(bx, by)
+    ux, uy = bx / dist, by / dist
+    length = dist * renderer._corner_shadow_height_m / (renderer._light_height_m - renderer._corner_shadow_height_m)
+    assert length > 1.4                                              # long enough to be a real streak
+    pole_reach = renderer._goal_lean_m(pitch) / pitch.goal_height_m * renderer._corner_pole_height_m
+    beyond_pole = pole_reach + 0.6 * (length - pole_reach)           # on the shadow's axis, past the drawn pole's tip
+    assert _darkness(surface, cam, bx + ux * beyond_pole, by + uy * beyond_pole) > 8
+    # the same distance out but well off to the side, and just past the shadow's far end: bare grass
+    px, py = -uy, ux
+    assert _darkness(surface, cam, bx + ux * beyond_pole + px * 1.6, by + uy * beyond_pole + py * 1.6) <= 2
+    assert _darkness(surface, cam, bx + ux * (length + 1.5), by + uy * (length + 1.5)) <= 2
+
+
+def test_flag_shadow_can_be_turned_off_and_shrinks_as_the_light_rises():
+    corner = (-1, 1)
+    pitch = Pitch.standard()
+    bx, by = corner[0] * pitch.half_length, corner[1] * pitch.half_width
+    ux, uy = bx / math.hypot(bx, by), by / math.hypot(bx, by)
+
+    def dark_at(metres, **attrs):
+        _, cam, surface, _ = _flag_scene(corner=corner, **attrs)
+        return _darkness(surface, cam, bx + ux * metres, by + uy * metres)
+
+    assert dark_at(1.6) > 8
+    assert dark_at(1.6, _corner_shadow_alpha=0) <= 2
+    assert dark_at(1.6, _light_height_m=400.0) <= 2                  # a very high light: the shadow hugs the pole
+
+
+def test_the_flag_shadow_is_soft_and_never_covers_the_pole_or_cloth():
+    pitch, cam, surface, renderer = _flag_scene(zoom=5.0, corner=(-1, 1))
+    geo = renderer._corner_flag_geometry(pitch, -1, 1)
+    lower = ((geo.base[0] + geo.attach[0]) / 2, (geo.base[1] + geo.attach[1]) / 2)
+    got = surface.get_at(cam.world_to_screen(*lower))[:3]
+    assert all(abs(got[i] - style.CORNER_FLAG_POLE_COLOUR[i]) <= 25 for i in range(3)), got    # pole colour, not shadowed
+    cen = tuple(sum(pt[i] for pt in (geo.top, geo.attach, geo.tip)) / 3 for i in (0, 1))
+    got = surface.get_at(cam.world_to_screen(*cen))[:3]
+    assert all(abs(got[i] - style.CORNER_FLAG_COLOUR[i]) <= 25 for i in range(3)), got
+    # the shadow's edge is anti-aliased: a range of grass tints, not just grass and one dark level
+    bx, by = geo.base
+    ux, uy = bx / math.hypot(bx, by), by / math.hypot(bx, by)
+    tints = {
+        tuple(surface.get_at(cam.world_to_screen(bx + ux * t + (-uy) * s, by + uy * t + ux * s))[:3])
+        for t in (1.5, 1.7) for s in [i * 0.01 for i in range(-14, 15)]
+    }
+    assert len(tints) >= 3
+
+
+@pytest.mark.parametrize("zoom", [1.0, 2.0, 3.0])
+@pytest.mark.parametrize("corner", [(-1, -1), (1, 1)])
+def test_clipping_the_corner_arcs_removes_only_what_is_outside_the_pitch(zoom, corner):
+    """Every light pixel of the UNCLIPPED arc that lies inside the boundary rectangle is still there
+    in the real render (a clip that is too tight would leave the arc detached from the lines)."""
+    import pygame
+
+    sx, sy = corner
+    pitch = Pitch.standard()
+    follow = (0.0, 0.0) if zoom == 1.0 else (sx * (pitch.half_length - 3.0), sy * (pitch.half_width - 3.0))
+    _, cam, surface, renderer = _drawn_pitch_at_zoom(zoom, follow)
+    line_w = max(1, int(0.12 * cam.pixels_per_metre))
+    bare = pygame.Surface(surface.get_size())
+    bare.fill(style.PITCH_GREEN)
+    renderer._draw_world_polyline(bare, corner_arc_world_points(pitch, sx, sy, radius_m=renderer._corner_arc_radius_m), line_w)
+
+    b0 = cam.world_to_screen(-pitch.half_length, -pitch.half_width)
+    b1 = cam.world_to_screen(pitch.half_length, pitch.half_width)
+    left, top = min(b0[0], b1[0]), min(b0[1], b1[1])
+    right, bottom = left + abs(b1[0] - b0[0]), top + abs(b1[1] - b0[1])
+    cx, cy = cam.world_to_screen(sx * pitch.half_length, sy * pitch.half_width)
+    missing, seen = [], 0
+    for x in range(max(left, cx - 45), min(right, cx + 46)):
+        for y in range(max(top, cy - 45), min(bottom, cy + 46)):
+            if _whiter_than_grass(bare.get_at((x, y)), margin=40):
+                seen += 1
+                if not _whiter_than_grass(surface.get_at((x, y)), margin=25):
+                    missing.append((x, y))
+    assert seen > 10 and not missing, missing[:5]
+
+
+@pytest.mark.parametrize("corner", [(-1, 1), (1, -1)])
+def test_the_flag_shadow_is_in_proportion_to_the_drawn_pole(corner):
+    """Regression: a physical 2.4m pole under the 40m scene light threw a ~4m shadow at a corner
+    (the light is only ~33 degrees up there), 3.4x the ~1.2m stub that is drawn. The shadow may be a
+    streak beyond the pole, but not more than about twice its drawn length."""
+    sx, sy = corner
+    pitch = Pitch.standard()
+    _, _, _, renderer = _drawn_pitch()
+    geo = renderer._corner_flag_geometry(pitch, sx, sy)
+    pole = math.hypot(geo.top[0] - geo.base[0], geo.top[1] - geo.base[1])
+    dist = math.hypot(sx * pitch.half_length, sy * pitch.half_width)
+    h, light = renderer._corner_shadow_height_m, renderer._light_height_m
+    shadow = dist * h / (light - h)
+    assert pole < shadow <= 2.0 * pole
+
+
+@pytest.mark.parametrize("corner", [(-1, 1), (1, 1), (-1, -1), (1, -1)])
+def test_the_flag_shadow_starts_at_the_poles_foot_and_not_behind_it(corner):
+    """Measured on the pixels: at zoom 5 the shadow is visible either side of the pole all the way
+    from its foot outward, is absent just behind the foot (toward the pitch centre), and its far end is
+    where d*h/(H-h) says."""
+    sx, sy = corner
+    pitch, cam, surface, renderer = _flag_scene(zoom=5.0, corner=corner)
+    bx, by = sx * pitch.half_length, sy * pitch.half_width
+    dist = math.hypot(bx, by)
+    ux, uy = bx / dist, by / dist
+    px, py = -uy, ux
+    length = dist * renderer._corner_shadow_height_m / (renderer._light_height_m - renderer._corner_shadow_height_m)
+
+    def dark_beside(t):        # the shadow line is 0.16m wide and the pole ~0.06m, so 0.055m off-axis is shadow, not pole
+        return max(_darkness(surface, cam, bx + ux * t + px * s, by + uy * t + py * s) for s in (-0.055, 0.055))
+
+    assert dark_beside(0.15) > 8 and dark_beside(0.5) > 8                       # right from the foot
+    assert dark_beside(-0.5) <= 2 and dark_beside(-1.0) <= 2                     # nothing behind it
+    assert dark_beside(length * 0.9) > 8
+    assert dark_beside(length + 0.6) <= 2                                        # ends where the formula says
