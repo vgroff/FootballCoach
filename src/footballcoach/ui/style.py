@@ -1,7 +1,7 @@
 """Colour palette and small drawing constants for the pygame renderer."""
 from __future__ import annotations
 
-PITCH_GREEN = (34, 120, 50)
+PITCH_GREEN = (43, 141, 62)  # lightened from (34, 120, 50), which read as a bit dark
 PITCH_LINE_WHITE = (235, 235, 235)
 BALL_COLOUR = (255, 255, 255)
 BALL_OUTLINE = (40, 40, 40)
@@ -67,10 +67,17 @@ SPEED_LINE_COLOUR = (160, 210, 255)  # light blue
 # placeholder, and a filled-triangle badge before that).
 HEADING_INDICATOR_COLOUR = (255, 225, 60)  # yellow
 
+# Scene lighting for the cosmetic shading (goal frame now; anything else that wants a
+# consistent light later). Direction is TOWARD the light, in screen space (x right,
+# y down): the up-left diagonal (exactly 45 degrees, so a post and the crossbar shade
+# identically and meet in a clean mitre). Elevation is the light's angle above the ground.
+LIGHT_DIR_XY = (-1.0, -1.0)
+LIGHT_ELEVATION_DEG = 55.0
+
 # Pitch dressing: goal netting, corner flags, sideline benches.
 GOAL_NET_COLOUR = (230, 230, 230)          # net mesh lines drawn inside the goal frame
 GOAL_NET_ALPHA = 190                       # translucency of the net mesh — see graphics.json["goal_net"] to tune
-CORNER_FLAG_POLE_COLOUR = (235, 235, 235)
+CORNER_FLAG_POLE_COLOUR = (250, 210, 40)     # yellow pole (the pennant, below, stays orange)
 CORNER_FLAG_COLOUR = (235, 120, 30)        # orange pennant
 BENCH_SEAT_COLOUR = (90, 70, 50)           # technical-area bench
 BENCH_OUTLINE_COLOUR = (50, 38, 28)

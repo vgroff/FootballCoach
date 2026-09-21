@@ -7,6 +7,7 @@ import collections
 import math
 from typing import TYPE_CHECKING, NamedTuple
 
+import numpy as np
 import pygame
 import pygame.gfxdraw
 from footballcoach.config import load_graphics_config
@@ -131,6 +132,11 @@ _EMOJI_FONT_CANDIDATES = [
 ]
 
 
+# Stroke width (px) of the goal net's mesh lines AND of its border (side/back
+# outline) -- one constant so they can't drift apart: the border is drawn at the
+# mesh's own thickness, not the (zoom-scaled) pitch line width.
+_GOAL_NET_LINE_PX = 1
+
 _ARC_STEP_RAD = math.radians(3.0)
 
 
@@ -170,9 +176,61 @@ class _GoalPx(NamedTuple):
     """One goal's integer screen coordinates (see ``Renderer._goal_px``)."""
     line_x: int   # x of the goal line
     bar_x: int    # x the crossbar is drawn at (goal line + apparent lean)
-    back_x: int   # x of the back of the net
+    back_x: int   # x of the back of the net, where it meets the ground
+    back_top_x: int  # x the TOP of the back of the net is drawn at (back_x + the same apparent lean)
     y_top: int    # row of the top post's centre line
     y_bot: int    # row of the bottom post's centre line
+
+
+_SHADE_AMBIENT = 0.4  # fraction of full brightness an unlit surface still keeps
+_SHADE_GAIN = 1.1     # >1 so a round bar's best-lit strip reaches full brightness (its normal can't face the light head-on)
+
+
+def _light_vector(flip_x: bool = False, flip_y: bool = False) -> tuple[float, float, float]:
+    """Unit vector TOWARD the light in screen space (x right, y down, z up out of the
+    pitch), from `style.LIGHT_DIR_XY` / `style.LIGHT_ELEVATION_DEG`. ``flip_x`` / ``flip_y``
+    mirror the light across that axis: the goal frame is lit as if from a point above the
+    pitch's middle, so each part flips the light to point toward the centre (see
+    ``Renderer._draw_goal_top``)."""
+    lx, ly = style.LIGHT_DIR_XY
+    lx, ly = (-lx if flip_x else lx), (-ly if flip_y else ly)
+    norm = math.hypot(lx, ly) or 1.0
+    elev = math.radians(style.LIGHT_ELEVATION_DEG)
+    horiz = math.cos(elev)
+    return (lx / norm * horiz, ly / norm * horiz, math.sin(elev))
+
+
+def surface_shade(
+    nx: float, ny: float, nz: float, strength: float, flip_x: bool = False, flip_y: bool = False,
+) -> float:
+    """Brightness factor (<= 1) of a surface with unit normal (nx, ny, nz): Lambert against
+    the scene light plus an ambient floor, blended toward flat by ``strength`` (0 = 1.0
+    everywhere, 1 = the full lit-to-dark range)."""
+    lx, ly, lz = _light_vector(flip_x, flip_y)
+    lit = min(1.0, _SHADE_GAIN * max(0.0, nx * lx + ny * ly + nz * lz))
+    full = _SHADE_AMBIENT + (1.0 - _SHADE_AMBIENT) * lit
+    return 1.0 - strength * (1.0 - full)
+
+
+def cylinder_shades(n_px: int, across: str, strength: float, samples: int = 8, flip: bool = False) -> list[float]:
+    """Brightness factors for each pixel across a round bar ``n_px`` wide, lit by the scene
+    light. ``across`` is the screen axis the width runs along ("y" for a bar running left-right
+    such as a post, "x" for one running up-down such as the crossbar); index 0 is the low-coordinate
+    side (top / left). Each pixel averages ``samples`` sub-positions of the cylinder's cross-section,
+    so a 3px bar gets three sensible tones, not aliased extremes. ``flip`` mirrors the light
+    across the width axis (highlight and shadow swap sides)."""
+    out = []
+    for i in range(n_px):
+        acc = 0.0
+        for s in range(samples):
+            t = -1.0 + 2.0 * (i + (s + 0.5) / samples) / n_px
+            nz = math.sqrt(max(0.0, 1.0 - t * t))
+            if across == "x":
+                acc += surface_shade(t, 0.0, nz, strength, flip_x=flip)
+            else:
+                acc += surface_shade(0.0, t, nz, strength, flip_y=flip)
+        out.append(acc / samples)
+    return out
 
 
 def ball_under_goal_frame(pitch: Pitch, x: float, y: float, z: float, radius_m: float = 0.11) -> bool:
@@ -188,6 +246,71 @@ def ball_under_goal_frame(pitch: Pitch, x: float, y: float, z: float, radius_m: 
     if abs(y) > pitch.goal_width_m / 2.0 + radius_m:
         return False
     return z < pitch.goal_height_m
+
+
+def back_wall_net_segments(
+    length_px: float, rise_px: float, height_px: float, gap_px: float,
+) -> list[tuple[tuple[float, float], tuple[float, float]]]:
+    """Line segments of the back-of-net mesh in the strip's local pixel space:
+    x runs from 0 (where the wall meets the ground) to *length_px* (its top
+    edge), y from 0 to *height_px* (along the goal's width).
+
+    The back wall is vertical, and the top-down parallax maps a wall point's
+    HEIGHT to screen x (the short strip, *length_px* for the full crossbar
+    height) and its position ALONG THE GOAL to screen y. A 45-degree diamond
+    mesh on that wall (horizontal run == height) therefore appears as two
+    families of *steep* lines: over the strip's full length each rises
+    *rise_px* = (goal height in metres) x (pixels per metre) in y -- far more
+    than *length_px* -- rather than the roof's 45-degree lattice. *gap_px* is the
+    spacing of parallel lines along y (at the ground edge). The two families
+    are mirror images about the strip's centre line."""
+    segments = []
+    y = -math.ceil(rise_px)
+    while y < height_px:
+        segments.append(((0.0, float(y)), (length_px, y + rise_px)))
+        segments.append(((0.0, y + rise_px), (length_px, float(y))))
+        y += gap_px
+    return segments
+
+
+class CornerFlagGeometry(NamedTuple):
+    """World-space (x, y) points describing one corner flag as seen from above
+    with parallax; see ``corner_flag_world_points``."""
+    base: tuple[float, float]    # where the pole meets the ground (the pitch corner)
+    top: tuple[float, float]     # the top of the pole, displaced away from the pitch centre
+    attach: tuple[float, float]  # lower end of the cloth's edge along the pole
+    tip: tuple[float, float]     # free end of the cloth, streaming sideways off the pole
+
+
+def corner_flag_world_points(
+    pitch: Pitch, sx: int, sy: int, *, pole_lean_m: float, flag_width_m: float, flag_drop_frac: float,
+) -> CornerFlagGeometry:
+    """Where the parts of the corner flag at (sx * half_length, sy * half_width)
+    appear. The pole is vertical, so in the top-down view (with the same
+    parallax as the crossbar: tall things lean away from the point under the
+    camera) its top is displaced *outward from the pitch centre* by
+    *pole_lean_m*, along the centre->corner direction. The cloth is attached
+    along the upper *flag_drop_frac* of the pole and its free end streams
+    *flag_width_m* off the pole, perpendicular to it, on the side that runs
+    along the touchline toward the pitch's middle.
+
+    Perpendicular on purpose: aiming the tip along the touchline (the obvious
+    "inward") makes the pennant a needle, because the pole leans along the
+    corner diagonal and the cloth's base edge lies along the pole -- the tip
+    ends up only ~30 degrees off that edge, so the triangle has almost no
+    width. Perpendicular gives it its full *flag_width_m* of width."""
+    cx, cy = sx * pitch.half_length, sy * pitch.half_width
+    norm = math.hypot(cx, cy) or 1.0
+    ux, uy = cx / norm, cy / norm
+    top = (cx + ux * pole_lean_m, cy + uy * pole_lean_m)
+    keep = 1.0 - flag_drop_frac  # fraction of the pole's lean at the cloth's lower end
+    attach = (cx + ux * pole_lean_m * keep, cy + uy * pole_lean_m * keep)
+    mid = ((top[0] + attach[0]) / 2.0, (top[1] + attach[1]) / 2.0)
+    px, py = -uy, ux  # one of the two perpendiculars to the pole direction...
+    if -sx * px < 0:  # ...take the one whose x component points toward the pitch's middle
+        px, py = -px, -py
+    tip = (mid[0] + px * flag_width_m, mid[1] + py * flag_width_m)
+    return CornerFlagGeometry(base=(cx, cy), top=top, attach=attach, tip=tip)
 
 
 class Renderer:
@@ -294,9 +417,48 @@ class Renderer:
         self._crossbar_lean_m: float = float(_gf.get("crossbar_lean_m", 0.9))
         self._goal_post_width_m: float = float(_gf.get("post_width_m", 0.16))
         self._goal_mouth_alpha: int = int(_gf.get("mouth_alpha", 40))
+        self._goal_back_wall_alpha: int = int(_gf.get("back_wall_alpha", 30))
+        self._goal_shade_strength: float = max(0.0, min(1.0, float(_gf.get("shade_strength", 0.7))))
+        self._foot_cache: dict[tuple, pygame.Surface] = {}
+        # Ball: a soft ground shadow (light above the pitch's middle) and sphere shading.
+        _bs = gcfg.get("ball_shadow", {})
+        self._ball_shadow_enabled: bool = bool(_bs.get("enabled", True))
+        self._ball_shadow_light_height_m: float = max(1.0, float(_bs.get("light_height_m", 30.0)))
+        self._ball_shadow_contact_m: float = max(0.0, float(_bs.get("contact_offset_m", 0.10)))
+        self._ball_shadow_alpha: int = int(_bs.get("alpha", 120))
+        self._ball_shadow_cache: dict[tuple, pygame.Surface] = {}
+        _bsh = gcfg.get("ball_shading", {})
+        self._ball_shading_strength: float = max(0.0, min(1.0, float(_bsh.get("strength", 0.85)))) if _bsh.get("enabled", True) else 0.0
+        self._ball_shade_cache: dict[tuple, pygame.Surface] = {}
+        # Turf: soft world-anchored light/dark patches, fine grain and a faint vignette
+        # instead of one flat green fill (see `_draw_turf`).
+        _tf = gcfg.get("turf", {})
+        self._turf_enabled: bool = bool(_tf.get("enabled", True))
+        self._turf_patch_amp: float = float(_tf.get("patch_amp", 0.02))
+        _cells = _tf.get("patch_cell_m", [6.0, 2.2])
+        self._turf_patch_cells_m: tuple[float, float] = (float(_cells[0]), float(_cells[1]))
+        self._turf_noise_amp: float = float(_tf.get("noise_amp", 0.02))
+        self._turf_vignette: float = float(_tf.get("vignette", 0.14))
+        self._turf_seed: int = int(_tf.get("seed", 7))
+        self._turf_patch: pygame.Surface | None = None
+        self._turf_patch_key: tuple | None = None
+        self._turf_overlay: pygame.Surface | None = None
+        self._turf_overlay_key: tuple | None = None
+        self._turf_bg: pygame.Surface | None = None
+        self._turf_bg_key: tuple | None = None
+        _cf = gcfg.get("corner_flag", {})
+        self._corner_pole_height_m: float = float(_cf.get("pole_height_m", 2.4))
+        self._corner_pole_width_m: float = float(_cf.get("pole_width_m", 0.06))
+        self._corner_flag_width_m: float = float(_cf.get("flag_width_m", 0.55))
+        self._corner_flag_drop_frac: float = float(_cf.get("flag_drop_frac", 0.55))
         _gn = gcfg.get("goal_net", {})
         self._goal_net_spacing_m: float = float(_gn.get("spacing_m", 0.35))
+        self._goal_net_min_spacing_px: int = max(2, int(_gn.get("min_spacing_px", 8)))
+        self._goal_back_net_gap_scale: float = float(_gn.get("back_spacing_scale", 2.0))
+        self._aa_disc_cache: dict[tuple, pygame.Surface] = {}
+        self._net_layer_cache: dict[tuple, pygame.Surface] = {}
         self._goal_net_alpha: int = int(_gn.get("alpha", style.GOAL_NET_ALPHA))
+        self._goal_net_sag_m: float = max(0.0, float(_gn.get("sag_m", 0.3)))
         _gn_col = _gn.get("color", list(style.GOAL_NET_COLOUR))
         self._goal_net_colour: tuple = (int(_gn_col[0]), int(_gn_col[1]), int(_gn_col[2]))
 
@@ -402,8 +564,11 @@ class Renderer:
         ``draw_goal_tops``) so the caller can draw it AFTER the ball instead;
         ``draw_pitch_and_ball`` does exactly that when the ball is inside a
         goal. Everything else is always drawn here."""
-        surface.fill(style.PITCH_GREEN)
         cam = self.camera
+        if self._turf_enabled:
+            self._draw_turf(surface, pitch)
+        else:
+            surface.fill(style.PITCH_GREEN)
         line_w = max(1, int(0.12 * cam.pixels_per_metre))
 
         def rect_world(x0: float, y0: float, x1: float, y1: float) -> None:
@@ -461,9 +626,11 @@ class Renderer:
         half_goal_w = pitch.goal_width_m / 2.0
         goal_depth_m = pitch.goal_depth_m  # same depth the engine's back wall uses (ball_physics.resolve_goal_boundary)
         for left in (True, False):
-            self._draw_goal_footprint(surface, pitch, left=left, line_w=line_w)
-        self._draw_defending_marker(surface, -pitch.half_length - goal_depth_m, half_goal_w, style.TEAM_LEFT_COLOUR, faces_positive_x=False)
-        self._draw_defending_marker(surface, pitch.half_length + goal_depth_m, half_goal_w, style.TEAM_RIGHT_COLOUR, faces_positive_x=True)
+            self._draw_goal_footprint(surface, pitch, left=left)
+        # The marker sits behind the whole net, i.e. beyond the leaned top-back edge.
+        marker_back_m = goal_depth_m + self._goal_lean_m(pitch)
+        self._draw_defending_marker(surface, -pitch.half_length - marker_back_m, half_goal_w, style.TEAM_LEFT_COLOUR, faces_positive_x=False)
+        self._draw_defending_marker(surface, pitch.half_length + marker_back_m, half_goal_w, style.TEAM_RIGHT_COLOUR, faces_positive_x=True)
         if goal_tops:
             self.draw_goal_tops(surface, pitch)
 
@@ -481,20 +648,43 @@ class Renderer:
 
     def _draw_world_polyline(
         self, surface: pygame.Surface, points_world: list[tuple[float, float]], line_w: int,
+        colour: tuple[int, int, int] = style.PITCH_LINE_WHITE,
     ) -> None:
         """Draws an open curve given as dense world-space vertices, at the
-        same stroke width as the rest of the pitch lines. Segment count is
-        the caller's (see `penalty_arc_world_points`); at 3-degree steps the
-        joint notches a thick `draw.lines` leaves are sub-pixel, so this
-        avoids `pygame.draw.arc`, whose thick strokes tear into gaps.
-        1px lines use `aalines` for smoothness (matching the centre circle)."""
+        same stroke width as the rest of the pitch lines, anti-aliased at every
+        width. Segment count is the caller's (see `penalty_arc_world_points`).
+        This avoids `pygame.draw.arc`, whose thick strokes tear into gaps.
+        1px lines use `aalines` (matching the centre circle); thicker ones are
+        built as a polygon strip (the polyline offset +/- half the width along
+        its normals) and drawn with `gfxdraw.filled_polygon` + `aapolygon`, which
+        blend correctly onto the opaque pitch -- a plain `draw.lines` at that
+        width is aliased."""
         pts = [self.camera.world_to_screen_f(x, y) for x, y in points_world]
         if len(pts) < 2:
             return
         if line_w <= 1:
-            pygame.draw.aalines(surface, style.PITCH_LINE_WHITE, False, pts)
-        else:
-            pygame.draw.lines(surface, style.PITCH_LINE_WHITE, False, pts, line_w)
+            pygame.draw.aalines(surface, colour, False, pts)
+            return
+        half = line_w / 2.0
+        left, right = [], []
+        last = len(pts) - 1
+        for i, (x, y) in enumerate(pts):
+            x0, y0 = pts[max(i - 1, 0)]
+            x1, y1 = pts[min(i + 1, last)]
+            tx, ty = x1 - x0, y1 - y0
+            length = math.hypot(tx, ty) or 1.0
+            nx, ny = -ty / length, tx / length
+            left.append((round(x + nx * half), round(y + ny * half)))
+            right.append((round(x - nx * half), round(y - ny * half)))
+        strip = left + right[::-1]
+        pygame.gfxdraw.filled_polygon(surface, strip, colour)
+        pygame.gfxdraw.aapolygon(surface, strip, colour)
+
+    def _goal_lean_m(self, pitch: Pitch) -> float:
+        """The crossbar's (and back-of-net's) apparent displacement, in metres,
+        clamped to the net depth. Also sets the parallax rate (metres per metre
+        of height) the corner-flag poles use."""
+        return min(self._crossbar_lean_m, pitch.goal_depth_m)
 
     def _goal_px(self, pitch: Pitch, left: bool) -> "_GoalPx":
         """Integer screen coordinates for one goal, shared by everything that
@@ -507,29 +697,47 @@ class Renderer:
         cam = self.camera
         line_x_w = -pitch.half_length if left else pitch.half_length
         outward = -1.0 if left else 1.0
-        lean_m = min(self._crossbar_lean_m, pitch.goal_depth_m)
+        lean_m = self._goal_lean_m(pitch)
         k = round(pitch.goal_width_m / 2.0 * cam.pixels_per_metre)
         c = cam.world_to_screen(0.0, 0.0)[1]
         return _GoalPx(
             line_x=cam.world_to_screen(line_x_w, 0.0)[0],
             bar_x=cam.world_to_screen(line_x_w + outward * lean_m, 0.0)[0],
             back_x=cam.world_to_screen(line_x_w + outward * pitch.goal_depth_m, 0.0)[0],
+            back_top_x=cam.world_to_screen(line_x_w + outward * (pitch.goal_depth_m + lean_m), 0.0)[0],
             y_top=c - k,
             y_bot=c + k,
         )
 
-    def _draw_goal_footprint(self, surface: pygame.Surface, pitch: Pitch, *, left: bool, line_w: int) -> None:
-        """The goal's ground-level parts: the two side lines and the back line
-        (thin, at the pitch line width -- the goal line itself is already the
-        pitch boundary), plus a faint tint over the goal mouth (the opening
-        between the goal line and the crossbar). Drawn under the ball."""
+    def _draw_goal_footprint(self, surface: pygame.Surface, pitch: Pitch, *, left: bool) -> None:
+        """The goal's ground-level parts: the net's border (the two side lines
+        and the back line, drawn at the mesh's own thickness,
+        ``_GOAL_NET_LINE_PX`` -- NOT the zoom-scaled pitch line width, which
+        made the border several times thicker than the mesh when zoomed in;
+        the goal line itself is already the pitch boundary), plus faint tints
+        over the goal mouth (the opening between the goal line and the
+        crossbar) and over the back wall of the net (the strip between where the
+        back of the net meets the ground and its top edge -- the same parallax
+        as the crossbar). Drawn under the ball.
+
+        All the goal's horizontal edges (ground and top) lie on the same two
+        screen rows, since the parallax is purely along x, so the side lines
+        run continuously from the goal line to the top-back edge."""
         g = self._goal_px(pitch, left)
         white = style.PITCH_LINE_WHITE
+        line_w = _GOAL_NET_LINE_PX
         off = line_w // 2
-        x_a, x_b = sorted((g.line_x, g.back_x))
+        x_a, x_b = sorted((g.line_x, g.back_top_x))
         for y in (g.y_top, g.y_bot):
             surface.fill(white, pygame.Rect(x_a, y - off, x_b - x_a + 1, line_w))
+        # Where the back of the net touches the ground.
         surface.fill(white, pygame.Rect(g.back_x - off, g.y_top - off, line_w, g.y_bot - g.y_top + line_w))
+
+        if self._goal_back_wall_alpha > 0:
+            b_a, b_b = sorted((g.back_x, g.back_top_x))
+            wall = pygame.Surface((b_b - b_a + 1, g.y_bot - g.y_top + 1), pygame.SRCALPHA)
+            wall.fill((*white, self._goal_back_wall_alpha))
+            surface.blit(wall, (b_a, g.y_top))
 
         if self._goal_mouth_alpha > 0:
             post_w = self._goal_post_px()
@@ -539,14 +747,13 @@ class Renderer:
             surface.blit(mouth, (m_a, g.y_top - post_w // 2))
 
     def _goal_post_px(self) -> int:
-        """Post/crossbar stroke width in px: at least 2px thicker than the
-        pitch-line-width strokes used for the net's side and back lines (so the
-        frame reads as heavier than the net behind it at any zoom), and odd so
-        the stroke is exactly centred on its row/column."""
-        ppm = self.camera.pixels_per_metre
-        line_w = max(1, int(0.12 * ppm))
-        w = max(line_w + 2, round(self._goal_post_width_m * ppm))
-        return w if w % 2 == 1 else w + 1
+        """Post/crossbar stroke width in px: ``goal_frame.post_width_m`` at the
+        current zoom, but never less than 2px thicker than the net's own lines
+        (``_GOAL_NET_LINE_PX``) so the frame always reads heavier than the net
+        behind it. Any pixel count works: both posts are placed symmetrically
+        about the pitch centre row (see ``_goal_px``), an even width just
+        leaves the pair half a pixel off the centre row, which is invisible."""
+        return max(_GOAL_NET_LINE_PX + 2, round(self._goal_post_width_m * self.camera.pixels_per_metre))
 
     def draw_goal_tops(self, surface: pygame.Surface, pitch: Pitch) -> None:
         """The goal's "top" layer for both ends: the roof net, the two posts
@@ -575,32 +782,236 @@ class Renderer:
         post_w = self._goal_post_px()
         half = post_w // 2
 
-        # Roof net: from the crossbar back to the back of the net.
-        n_a, n_b = sorted((g.bar_x, g.back_x))
-        self._draw_goal_net(surface, n_a, n_b, g.y_top, g.y_bot)
+        # Back wall first (the strip between the ground line and the top-back edge),
+        # with its own mesh at the right (steep) angle; then the roof net over
+        # EVERYTHING from the crossbar to the top-back edge -- the roof is at
+        # crossbar height, nearer the camera than the wall, so its (see-through)
+        # mesh overlaps the wall strip and is drawn over it.
+        self._draw_goal_back_net(surface, pitch, left=left)
+        n_a, n_b = sorted((g.bar_x, g.back_top_x))
+        # The roof net hangs a little below crossbar height in the middle; lower points lean
+        # less, so the mesh bows toward the pitch there (0 at the frame, deepest in the middle).
+        sag_dx = (1 if left else -1) * (
+            self._goal_net_sag_m / pitch.goal_height_m * self._goal_lean_m(pitch) * self.camera.pixels_per_metre
+        )
+        self._draw_goal_net(surface, n_a, n_b, g.y_top, g.y_bot, sag_dx_px=sag_dx)
+        # The top edge of the back of the net (thin, like the net's border).
+        off = _GOAL_NET_LINE_PX // 2
+        surface.fill(white, pygame.Rect(
+            g.back_top_x - off, g.y_top - off, _GOAL_NET_LINE_PX, g.y_bot - g.y_top + _GOAL_NET_LINE_PX,
+        ))
 
         # Posts (feet on the goal line -> tops at the crossbar) and crossbar.
         p_a, p_b = sorted((g.line_x, g.bar_x))
+        strength = self._goal_shade_strength
+        # The bars are round: each pixel row across a post (column across the crossbar) gets the
+        # cylinder's shade for that position under the scene light, so the frame reads as tubes
+        # rather than flat strips. Posts run along x (width across y), the crossbar along y.
+        # The light is treated as a point above the middle of the goal / pitch: each part is lit
+        # on the side facing the centre and shaded on its OUTSIDE (top post: shaded on top;
+        # bottom post: on the bottom; crossbar: on the side away from the pitch).
+        foot_r = self._goal_foot_radius()
         for y in (g.y_top, g.y_bot):
-            surface.fill(white, pygame.Rect(p_a, y - half, p_b - p_a + 1, post_w))
-            pygame.draw.circle(surface, white, (g.line_x, y), half + 1)
-        surface.fill(white, pygame.Rect(g.bar_x - half, g.y_top - half, post_w, g.y_bot - g.y_top + post_w))
+            top_post = y == g.y_top
+            # The foot (a dome at the post's base) goes UNDER the post: only the part beyond the
+            # post's end and any bulge wider than it shows.
+            foot = self._shaded_foot(foot_r, white, strength, flip_x=left, flip_y=top_post)
+            fh = foot.get_width() // 2
+            surface.blit(foot, (g.line_x - fh, y - fh))
+            for i, f in enumerate(cylinder_shades(post_w, "y", strength, flip=top_post)):
+                surface.fill(self._shaded(white, f), pygame.Rect(p_a, y - half + i, p_b - p_a + 1, 1))
+        for i, f in enumerate(cylinder_shades(post_w, "x", strength, flip=left)):
+            surface.fill(self._shaded(white, f), pygame.Rect(g.bar_x - half + i, g.y_top - half, 1, g.y_bot - g.y_top + post_w))
+        # The two top corners are mitred so the shadow runs on round the corner from post to bar
+        # instead of the bar's column shading cutting straight across the post's end: each corner
+        # pixel takes the shade at its distance from the NEARER outer edge (the seam is the
+        # diagonal from the outer to the inner corner). Post and bar shade identically because
+        # the light is at exactly 45 degrees, so the profile is continuous across the seam.
+        outer_first = cylinder_shades(post_w, "x", strength, flip=True)  # index = distance from the outer edge
+        for top_corner in (True, False):
+            y0 = (g.y_top if top_corner else g.y_bot) - half
+            for j in range(post_w):
+                b = j if top_corner else post_w - 1 - j
+                for i in range(post_w):
+                    a = i if left else post_w - 1 - i
+                    surface.set_at((g.bar_x - half + i, y0 + j), self._shaded(white, outer_first[min(a, b)]))
 
-    def _draw_goal_net(self, surface: pygame.Surface, x_a: int, x_b: int, y_top: int, y_bot: int) -> None:
-        """Fills the screen-space rectangle (inclusive pixel bounds) with a
-        translucent diagonal net mesh, drawn on an isolated SRCALPHA surface
-        sized to the box so the diagonal lines clip cleanly at its edges
-        without per-line clamping math."""
+    @staticmethod
+    def _shaded(colour: tuple[int, int, int], factor: float) -> tuple[int, int, int]:
+        return (round(colour[0] * factor), round(colour[1] * factor), round(colour[2] * factor))
+
+    def _goal_foot_radius(self) -> float:
+        """Radius in px of the dome at the base of a post: a bit proud of the post's own
+        half-width, and proud by less on thin posts so it stays small at 1x (0.25px beyond
+        the post at 3px wide, growing 0.25px per extra post pixel up to 1px)."""
+        w = self._goal_post_px()
+        return w / 2.0 + min(1.0, 0.25 + max(0, w - 3) * 0.25)
+
+    def _shaded_foot(
+        self, radius: float, colour: tuple[int, int, int], strength: float,
+        flip_x: bool = False, flip_y: bool = False,
+    ) -> pygame.Surface:
+        """The foot of a post: a shaded, anti-aliased dome (a sphere under the scene light),
+        a square of side ``2 * (ceil(radius) + 1) + 1`` px with its centre pixel in the middle.
+        Coverage and shade are computed per pixel from a 8x8 sub-sample grid (so the edge is
+        anti-aliased without smoothscale darkening it) and the sprite is cached."""
+        key = (round(radius, 3), colour, round(strength, 4), flip_x, flip_y)
+        sprite = self._foot_cache.get(key)
+        if sprite is None:
+            margin = math.ceil(radius) + 1
+            size, sub = 2 * margin + 1, 8
+            sprite = pygame.Surface((size, size), pygame.SRCALPHA)
+            c = margin + 0.5  # pixel-centre coordinates: the centre pixel spans [margin, margin+1)
+            for py in range(size):
+                for px in range(size):
+                    cover, acc = 0, 0.0
+                    for sy in range(sub):
+                        for sx in range(sub):
+                            dx = (px + (sx + 0.5) / sub - c) / radius
+                            dy = (py + (sy + 0.5) / sub - c) / radius
+                            r2 = dx * dx + dy * dy
+                            if r2 <= 1.0:
+                                cover += 1
+                                acc += surface_shade(dx, dy, math.sqrt(1.0 - r2), strength, flip_x, flip_y)
+                    if cover:
+                        shade = self._shaded(colour, acc / cover)
+                        sprite.set_at((px, py), (*shade, round(255 * cover / (sub * sub))))
+            self._foot_cache[key] = sprite
+        return sprite
+
+    def _draw_goal_back_net(self, surface: pygame.Surface, pitch: Pitch, *, left: bool) -> None:
+        """The net on the back wall: the strip between where the net meets the
+        ground and its top-back edge. Same anti-aliased mesh as the roof (see
+        ``_net_layer``), but with the diagonals drawn as the vertical wall's mesh
+        actually projects (steep, see ``back_wall_net_segments``)."""
+        g = self._goal_px(pitch, left)
+        x_a, x_b = sorted((g.back_x, g.back_top_x))
+        length, h = x_b - x_a, g.y_bot - g.y_top + 1
+        if length < 1 or h < 2:
+            return
+        w = length + 1
+        scale = self._NET_SUPERSAMPLE
+        line_w = max(1, round(_GOAL_NET_LINE_PX * scale * self._GOAL_BACK_NET_LINE_WEIGHT))
+        rise = pitch.goal_height_m * self.camera.pixels_per_metre
+        # Rounded: a scale like 9/6 gives 8.999999999999998 px, which pygame would truncate.
+        gap = round(self._goal_net_gap_px() * self._goal_back_net_gap_scale, 4)
+        # Only ONE family is rasterised (the lines whose y grows with x); `_net_layer`
+        # mirrors it top-to-bottom for the other, so the two are exact mirror images.
+        family = [seg for seg in back_wall_net_segments(length, rise, h, gap) if seg[1][1] > seg[0][1]]
+
+        def draw_family(big: pygame.Surface, colour: tuple[int, int, int, int]) -> None:
+            for (x0, y0), (x1, y1) in family:
+                pygame.draw.line(big, colour, (x0 * scale, y0 * scale), (x1 * scale, y1 * scale), line_w)
+
+        layer = self._net_layer(
+            ("back", w, h, gap, rise, line_w, left), w, h, draw_family, mirror_y=True,
+            flip_x=left,  # the segments put the ground edge at local x=0; for the left goal it is the strip's right side
+        )
+        surface.blit(layer, (x_a, g.y_top))
+
+    def _net_layer(
+        self, key: tuple, w: int, h: int, draw_family, *, mirror_x: bool = False, mirror_y: bool = False,
+        flip_x: bool = False,
+    ) -> pygame.Surface:
+        """A cached, anti-aliased, translucent net-mesh layer (w x h px).
+
+        ``draw_family(big, colour)`` draws ONE family of parallel diagonal lines
+        onto the supersampled surface; the other family is that surface mirrored
+        (left-right for ``mirror_x``, top-bottom for ``mirror_y``) and merged with
+        ``BLEND_RGBA_MAX`` (so crossings aren't double-brightened). Mirroring rather
+        than drawing both families matters: ``pygame.draw.line`` rasterises
+        through pixel centres, i.e. offset (+0.5, +0.5) from its coordinates -- along
+        the line for one diagonal but *perpendicular* to it for the other -- so two
+        mirrored lines came out as different pixel profiles (measured on a single
+        line: one diagonal a narrow core over 3 pixels, the other split over 2 pixels half a
+        pixel off, looking wider and dimmer). A mirrored family is identical by
+        construction. ``flip_x`` mirrors the finished layer (for placement).
+
+        Drawn at ``_NET_SUPERSAMPLE``x and ``smoothscale``d down; the background is the
+        line colour at alpha 0, NOT transparent black (smoothscale averages RGB and
+        alpha independently, so black would darken every edge pixel -- measured ~26%
+        of net pixels darker than the grass); the net's translucency is applied
+        once to the whole layer with ``set_alpha``. Built once per ``key`` and cached
+        (the mesh only depends on its size, spacing and colour), so the finer
+        supersample costs nothing per frame."""
+        rgb = self._goal_net_colour
+        full_key = key + (tuple(rgb), self._goal_net_alpha, mirror_x, mirror_y, flip_x)
+        layer = self._net_layer_cache.get(full_key)
+        if layer is None:
+            scale = self._NET_SUPERSAMPLE
+            big = pygame.Surface((w * scale, h * scale), pygame.SRCALPHA)
+            big.fill((*rgb, 0))
+            draw_family(big, (*rgb, 255))
+            mirrored = pygame.transform.flip(big, mirror_x, mirror_y)
+            big.blit(mirrored, (0, 0), special_flags=pygame.BLEND_RGBA_MAX)
+            layer = pygame.transform.smoothscale(big, (w, h))
+            if flip_x:
+                layer = pygame.transform.flip(layer, True, False)
+            layer.set_alpha(self._goal_net_alpha)
+            if len(self._net_layer_cache) >= 64:  # zoom changes make new sizes; keep this bounded
+                self._net_layer_cache.clear()
+            self._net_layer_cache[full_key] = layer
+        return layer
+
+    def _goal_net_gap_px(self) -> int:
+        """Horizontal gap, in px, between the net's parallel diagonal mesh
+        lines: the physical mesh size (`goal_net.spacing_m`) at the current
+        zoom, but never below `goal_net.min_spacing_px`. The floor is what
+        keeps it a diamond lattice at every zoom: with 1px lines, a gap of ~3-4px
+        (what 0.35m works out to at the default window) aliases into a dense
+        checkerboard. It defaults to 7px, chosen by eye from 6-16px sweeps at 1x
+        (~5px is still blobby; 6 reads a bit checker-like now that both diagonals are
+        drawn identically; 8px is cleaner but leaves only ~2 diamonds across the
+        15px-wide roof)."""
+        return max(self._goal_net_min_spacing_px, int(self._goal_net_spacing_m * self.camera.pixels_per_metre))
+
+    def _draw_goal_net(
+        self, surface: pygame.Surface, x_a: int, x_b: int, y_top: int, y_bot: int, sag_dx_px: float = 0.0,
+    ) -> None:
+        """Fills the screen-space rectangle (inclusive pixel bounds) with the
+        translucent, anti-aliased 45-degree diamond net mesh (a cached layer, see
+        ``_net_layer``: one diagonal family rasterised, the other its exact
+        mirror).
+
+        ``sag_dx_px``: how far, in px along x, the deepest point of a sagging roof is
+        displaced (toward the pitch is the sign the caller passes). The mesh points are
+        displaced by ``sag_dx_px * (1-u^2) * (1-v^2)`` (u, v in [-1, 1] across and along the
+        roof), so the frame edges stay put and the middle bows. Below ~0.05px it is drawn
+        as the plain flat lattice."""
         w, h = x_b - x_a + 1, y_bot - y_top + 1
         if w < 2 or h < 2:
             return
-        net_surf = pygame.Surface((w, h), pygame.SRCALPHA)
-        spacing = max(2, int(self._goal_net_spacing_m * self.camera.pixels_per_metre))
-        colour = (*self._goal_net_colour, self._goal_net_alpha)
-        for i in range(-h, w, spacing):
-            pygame.draw.line(net_surf, colour, (i, 0), (i + h, h), 1)
-            pygame.draw.line(net_surf, colour, (i + h, 0), (i, h), 1)
-        surface.blit(net_surf, (x_a, y_top))
+        scale = self._NET_SUPERSAMPLE
+        spacing = self._goal_net_gap_px()
+        line_w = max(1, round(_GOAL_NET_LINE_PX * scale * self._GOAL_NET_LINE_SUPERSAMPLE_BOOST))
+
+        if abs(sag_dx_px) >= 0.05:
+            def draw_sag_family(big: pygame.Surface, colour: tuple[int, int, int, int]) -> None:
+                for i in range(-h, w, spacing):
+                    pts = []
+                    for k in range(0, 2 * h + 1):
+                        y = k / 2.0
+                        x = i + y
+                        if 0.0 <= x <= w:
+                            u, v = (y - h / 2.0) / (h / 2.0), (x - w / 2.0) / (w / 2.0)
+                            pts.append(((x + sag_dx_px * (1.0 - u * u) * (1.0 - v * v)) * scale, y * scale))
+                    if len(pts) > 1:
+                        pygame.draw.lines(big, colour, False, pts, line_w)
+
+            # Mirrored top-to-bottom, NOT left-to-right: the sag displacement is symmetric in y
+            # but not in x, so only a vertical mirror keeps the two diagonal families identical.
+            layer = self._net_layer(
+                ("roof-sag", w, h, spacing, line_w, round(sag_dx_px, 2)), w, h, draw_sag_family, mirror_y=True,
+            )
+            surface.blit(layer, (x_a, y_top))
+            return
+
+        def draw_family(big: pygame.Surface, colour: tuple[int, int, int, int]) -> None:
+            for i in range(-h, w, spacing):
+                pygame.draw.line(big, colour, (i * scale, 0), ((i + h) * scale, h * scale), line_w)
+
+        layer = self._net_layer(("roof", w, h, spacing, line_w), w, h, draw_family, mirror_x=True)
+        surface.blit(layer, (x_a, y_top))
 
     def draw_pitch_and_ball(self, surface: pygame.Surface, pitch: Pitch, ball: Ball) -> None:
         """Draws the pitch and the ball with the goal's top layer (roof net,
@@ -639,20 +1050,36 @@ class Renderer:
         surface.blit(bar_surf, (left, top))
 
     def _draw_corner_flags(self, surface: pygame.Surface, pitch: Pitch) -> None:
-        """Small pennant + pole at each of the 4 pitch corners."""
+        """A corner flag at each of the 4 pitch corners, with the same
+        parallax as the goal frame: the pole is vertical, so its top is
+        displaced *away from the pitch centre* (see ``corner_flag_world_points``)
+        -- a short pole visible from the corner out toward the top -- with the
+        cloth attached along the upper part of the pole and streaming sideways off
+        it. The pole's apparent length uses the crossbar's parallax rate
+        (``crossbar_lean_m / goal_height_m`` metres per metre of height), so it
+        scales with that one setting; ``corner_flag`` in graphics.json sets the
+        pole height and cloth size."""
         cam = self.camera
-        flag_h_m, flag_w_m = 0.55, 0.4
+        rate = self._goal_lean_m(pitch) / pitch.goal_height_m
+        lean_m = rate * self._corner_pole_height_m
+        # 1px minimum (a 2px pole looked chunky and rectangular at the default zoom),
+        # and the ground-contact dot appears only once the pole is 3px+ wide, sized to
+        # the pole -- a fixed 2px-radius dot is a 5px blob on the ~6px pole at 1x zoom
+        # and hides it entirely.
+        pole_px = max(1, round(self._corner_pole_width_m * cam.pixels_per_metre))
+        foot_r = pole_px // 2 + 1 if pole_px >= 3 else 0
         for sx in (-1, 1):
             for sy in (-1, 1):
-                cx, cy = sx * pitch.half_length, sy * pitch.half_width
-                pole = cam.world_to_screen(cx, cy)
-                pygame.draw.circle(surface, style.CORNER_FLAG_POLE_COLOUR, pole, 2)
-                # Pennant leans inward over the pitch so it's never clipped
-                # by the window edge, and its two "furled" points sit at the
-                # pole (up the pole a touch) — cloth billowing away from it.
-                tip = cam.world_to_screen(cx - sx * flag_w_m, cy - sy * flag_h_m * 0.35)
-                up = cam.world_to_screen(cx, cy - sy * flag_h_m)
-                tri = (pole, up, tip)
+                geo = corner_flag_world_points(
+                    pitch, sx, sy, pole_lean_m=lean_m,
+                    flag_width_m=self._corner_flag_width_m, flag_drop_frac=self._corner_flag_drop_frac,
+                )
+                self._draw_world_polyline(surface, [geo.base, geo.top], pole_px, style.CORNER_FLAG_POLE_COLOUR)
+                if foot_r:
+                    foot = cam.world_to_screen(*geo.base)
+                    pygame.gfxdraw.filled_circle(surface, foot[0], foot[1], foot_r, style.CORNER_FLAG_POLE_COLOUR)
+                    pygame.gfxdraw.aacircle(surface, foot[0], foot[1], foot_r, style.CORNER_FLAG_POLE_COLOUR)
+                tri = [cam.world_to_screen(*pt) for pt in (geo.top, geo.attach, geo.tip)]
                 pygame.gfxdraw.filled_polygon(surface, tri, style.CORNER_FLAG_COLOUR)
                 pygame.gfxdraw.aapolygon(surface, tri, style.CORNER_FLAG_COLOUR)
 
@@ -678,8 +1105,131 @@ class Renderer:
                 pygame.draw.rect(surface, style.BENCH_SEAT_COLOUR, rect, border_radius=2)
                 pygame.draw.rect(surface, style.BENCH_OUTLINE_COLOUR, rect, 1, border_radius=2)
 
+    _TURF_PATCH_PX_PER_M = 4      # resolution of the world-anchored patch texture
+    _TURF_PATCH_MARGIN_M = 15.0   # how far beyond the pitch the texture extends
+    _TURF_GAIN = 0.95             # mean of the grain/vignette overlay; the base colour is pre-divided by it
+
+    def _turf_patch_surface(self, pitch: Pitch) -> pygame.Surface:
+        """World-anchored, low-frequency light/dark patches of the grass: two octaves of smooth
+        value noise, slightly warmer where lighter, as a colour texture (pitch green times a
+        factor of about 1 +/- ``patch_amp``) over the pitch plus a margin. Built once."""
+        key = (pitch.half_length, pitch.half_width, self._turf_patch_amp, self._turf_patch_cells_m, self._turf_seed)
+        if self._turf_patch is not None and self._turf_patch_key == key:
+            return self._turf_patch
+        res = self._TURF_PATCH_PX_PER_M
+        tw = int(math.ceil(2 * (pitch.half_length + self._TURF_PATCH_MARGIN_M) * res))
+        th = int(math.ceil(2 * (pitch.half_width + self._TURF_PATCH_MARGIN_M) * res))
+        rng = np.random.default_rng(self._turf_seed)
+
+        def octave(cell_m: float) -> np.ndarray:
+            cell = max(1.0, cell_m * res)
+            gw, gh = int(tw / cell) + 3, int(th / cell) + 3
+            grid = rng.random((gw, gh))
+            fx, fy = np.arange(tw) / cell, np.arange(th) / cell
+            x0, y0 = fx.astype(int), fy.astype(int)
+            tx, ty = fx - x0, fy - y0
+            tx, ty = tx * tx * (3 - 2 * tx), ty * ty * (3 - 2 * ty)   # smoothstep fade: soft blobs, no creases
+            top = grid[x0][:, y0] * (1 - ty) + grid[x0][:, y0 + 1] * ty
+            bot = grid[x0 + 1][:, y0] * (1 - ty) + grid[x0 + 1][:, y0 + 1] * ty
+            return top * (1 - tx)[:, None] + bot * tx[:, None]
+
+        n = 0.65 * octave(self._turf_patch_cells_m[0]) + 0.35 * octave(self._turf_patch_cells_m[1]) - 0.5
+        n = n / max(float(np.abs(n).max()), 1e-6)
+        amp = self._turf_patch_amp
+        factor = np.stack([1 + 0.3 * amp * n, 1 + amp * n, 1 - 0.25 * amp * n], axis=-1)
+        rgb = np.clip(np.array(style.PITCH_GREEN, dtype=float) / self._TURF_GAIN * factor, 0, 255).astype(np.uint8)
+        self._turf_patch = pygame.surfarray.make_surface(rgb)
+        self._turf_patch_key = key
+        return self._turf_patch
+
+    def _turf_overlay_surface(self, w: int, h: int) -> pygame.Surface:
+        """Screen-sized multiply layer: a little per-pixel grain and a soft vignette (darker
+        toward the corners), with mean ``_TURF_GAIN`` so it averages back to the pitch green."""
+        key = (w, h, self._turf_noise_amp, self._turf_vignette, self._turf_seed)
+        if self._turf_overlay is not None and self._turf_overlay_key == key:
+            return self._turf_overlay
+        rng = np.random.default_rng(self._turf_seed + 1)
+        xs = (np.arange(w) - (w - 1) / 2) / (w / 2)
+        ys = (np.arange(h) - (h - 1) / 2) / (h / 2)
+        d = np.sqrt(xs[:, None] ** 2 + ys[None, :] ** 2) / math.sqrt(2)   # 0 centre .. 1 corner
+        vig = 1.0 - self._turf_vignette * d ** 2.2
+        grain = 1.0 + self._turf_noise_amp * rng.standard_normal((w, h))
+        g = np.clip(self._TURF_GAIN * vig * grain, 0.0, 1.0)
+        v = (g * 255.0 + 0.5).astype(np.uint8)
+        self._turf_overlay = pygame.surfarray.make_surface(np.stack([v, v, v], axis=-1))
+        self._turf_overlay_key = key
+        return self._turf_overlay
+
+    def _draw_turf(self, surface: pygame.Surface, pitch: Pitch) -> None:
+        """The grass: the world-anchored patch texture scaled to the camera, times a
+        screen-space grain + vignette layer. The composed background is cached and only
+        rebuilt when the camera actually moves (a static camera costs one blit)."""
+        cam = self.camera
+        w, h = surface.get_size()
+        margin = self._TURF_PATCH_MARGIN_M
+        x0, y0 = cam.world_to_screen_f(-pitch.half_length - margin, -pitch.half_width - margin)
+        x1, y1 = cam.world_to_screen_f(pitch.half_length + margin, pitch.half_width + margin)
+        left, right = sorted((x0, x1))
+        top, bot = sorted((y0, y1))
+        key = (w, h, round(left, 1), round(top, 1), round(right, 1), round(bot, 1),
+               self._turf_patch_amp, self._turf_patch_cells_m, self._turf_noise_amp, self._turf_vignette, self._turf_seed)
+        if self._turf_bg is None or self._turf_bg_key != key:
+            patch = self._turf_patch_surface(pitch)
+            tw, th = patch.get_size()
+            bg = pygame.Surface((w, h))
+            bg.fill(tuple(min(255, round(c / self._TURF_GAIN)) for c in style.PITCH_GREEN))
+            sx, sy = (right - left) / tw, (bot - top) / th        # screen px per texture px
+            if sx > 0 and sy > 0:
+                # The part of the texture that is on screen, in whole texture pixels.
+                tx0, ty0 = max(0, math.floor((0 - left) / sx)), max(0, math.floor((0 - top) / sy))
+                tx1, ty1 = min(tw, math.ceil((w - left) / sx)), min(th, math.ceil((h - top) / sy))
+                if tx1 > tx0 and ty1 > ty0:
+                    dest = pygame.Rect(
+                        round(left + tx0 * sx), round(top + ty0 * sy),
+                        max(1, round((tx1 - tx0) * sx)), max(1, round((ty1 - ty0) * sy)),
+                    )
+                    src = patch.subsurface(pygame.Rect(tx0, ty0, tx1 - tx0, ty1 - ty0))
+                    bg.blit(pygame.transform.smoothscale(src, dest.size), dest.topleft)
+            bg.blit(self._turf_overlay_surface(w, h), (0, 0), special_flags=pygame.BLEND_RGB_MULT)
+            self._turf_bg, self._turf_bg_key = bg, key
+        surface.blit(self._turf_bg, (0, 0))
+
     _RING_SUPERSAMPLE = 4
+    # The net meshes are built once and cached (see `_net_layer`), so they can afford a
+    # finer supersample than the per-frame rings/dots.
+    _NET_SUPERSAMPLE = 8
+    # Weight of the net mesh at supersample size, tuned so its total ink after the
+    # anti-aliased downscale matches the old aliased 1px mesh (~0.17-0.20 of the
+    # available lightening; measured by tests/unit/test_pitch_markings.py's
+    # ink metric). Raise it for a heavier net.
+    _GOAL_NET_LINE_SUPERSAMPLE_BOOST = 1.0
+    # pygame's thick lines are thicker (perpendicular to the line) the steeper they
+    # are, so the steep back-wall mesh is drawn at a lighter weight to keep about the
+    # same ink as the roof mesh.
+    _GOAL_BACK_NET_LINE_WEIGHT = 0.75
     _DOT_POLY_SEGMENTS = 14  # vertices approximating each ball spin-dot's outline
+
+    def _aa_disc(self, rgb: tuple[int, int, int], radius: int, alpha: int = 255) -> pygame.Surface:
+        """A filled, anti-aliased disc of *radius* px on a transparent
+        (radius*2+2)-square layer, centred at (radius+1, radius+1), with
+        overall opacity *alpha*. For small translucent discs (ball trail,
+        inactive-player fallback) where `draw.circle` is aliased and
+        `gfxdraw.aacircle` doesn't blend correctly onto a transparent layer.
+        Supersampled like `_draw_ring`; cached per (colour, radius) -- the
+        returned surface is shared, so blit it immediately."""
+        key = (tuple(rgb), radius)
+        disc = self._aa_disc_cache.get(key)
+        if disc is None:
+            scale = self._RING_SUPERSAMPLE
+            size = radius * 2 + 2
+            big = pygame.Surface((size * scale, size * scale), pygame.SRCALPHA)
+            big.fill((*rgb, 0))  # see _draw_goal_net: keep the edge RGB from averaging toward black
+            c = (radius + 1) * scale
+            pygame.draw.circle(big, (*rgb, 255), (c, c), radius * scale)
+            disc = pygame.transform.smoothscale(big, (size, size))
+            self._aa_disc_cache[key] = disc
+        disc.set_alpha(alpha)
+        return disc
 
     @classmethod
     def _draw_ring(
@@ -719,6 +1269,9 @@ class Renderer:
         pad = 2
         size = (outer_radius + pad) * 2
         big = pygame.Surface((size * scale, size * scale), pygame.SRCALPHA)
+        # Background = the ring's own colour at alpha 0 (not transparent black),
+        # or smoothscale averages black into the ring's edge pixels and dims them.
+        big.fill((*colour[:3], 0))
         c = (size * scale) // 2
         pygame.draw.circle(big, colour, (c, c), outer_radius * scale, width * scale)
         small = pygame.transform.smoothscale(big, (size, size))
@@ -808,6 +1361,9 @@ class Renderer:
         height_boost = 1.0 + min(ball.height_m, 5.0) * self._ball_height_boost_per_m
         radius_px = max(2, int(base_radius_px * height_boost))
 
+        if self._ball_shadow_enabled:
+            self._draw_ball_shadow(surface, ball, base_radius_px)
+
         # --- Ghost trail: drawn before the ball so it's underneath ---
         samples = list(self._ball_trail)
         n = len(samples)
@@ -843,9 +1399,7 @@ class Renderer:
                 ghost_base_r = max(1, int(base_radius_px * self._trail_radius_frac * (1.0 - age_frac * self._trail_radius_taper)))
                 gr = max(1, int(ghost_base_r * ghost_boost))
                 tp = self.camera.world_to_screen(wx, wy)
-                ts = pygame.Surface((gr * 2 + 2, gr * 2 + 2), pygame.SRCALPHA)
-                pygame.draw.circle(ts, (*style.BALL_COLOUR, alpha), (gr + 1, gr + 1), gr)
-                surface.blit(ts, (tp[0] - gr - 1, tp[1] - gr - 1))
+                surface.blit(self._aa_disc(style.BALL_COLOUR, gr, alpha), (tp[0] - gr - 1, tp[1] - gr - 1))
 
         pygame.draw.circle(surface, style.BALL_COLOUR, pos, radius_px)
         pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px, style.BALL_COLOUR)
@@ -888,9 +1442,112 @@ class Renderer:
         layer, pad = self._ball_dots_layer(radius_px)
         surface.blit(layer, (pos[0] - pad, pos[1] - pad))
 
+        if self._ball_shading_strength > 0.0:
+            shade = self._ball_shade_sprite(radius_px, *self._ball_light_angles(ball))
+            surface.blit(shade, (pos[0] - shade.get_width() // 2, pos[1] - shade.get_height() // 2))
+
         if ball.height_m > 0.15:
             label = self.hud_font.render(f"{ball.height_m:.1f}m", True, style.HUD_TEXT)
             surface.blit(label, (pos[0] + radius_px + 2, pos[1] - label.get_height() // 2))
+
+    def _ball_light_angles(self, ball: Ball) -> tuple[int, int]:
+        """Direction of the light on the ball as (azimuth, elevation) in whole degrees, quantised
+        (10 / 5 degrees) so sprites can be cached. The light is the SAME point light as the ball's
+        shadow (``ball_shadow.light_height_m`` above the pitch's middle): horizontally it points from
+        the ball toward the centre (azimuth = screen angle of that direction, y down), and its
+        elevation is atan((H - ball height) / distance from the centre) -- overhead at the centre,
+        lower and more sideways toward the edges."""
+        cam = self.camera
+        bx, by = cam.world_to_screen_f(ball.position.x, ball.position.y)
+        cx, cy = cam.world_to_screen_f(0.0, 0.0)
+        dist_m = math.hypot(cx - bx, cy - by) / cam.pixels_per_metre
+        rise = max(self._ball_shadow_light_height_m - ball.position.z, 0.5)
+        elevation = math.degrees(math.atan2(rise, dist_m))
+        azimuth = math.degrees(math.atan2(cy - by, cx - bx)) if dist_m > 1e-6 else 0.0
+        return int(round(azimuth / 10.0) * 10) % 360, int(min(90, round(elevation / 5.0) * 5))
+
+    def _ball_shade_sprite(self, radius: int, azimuth_deg: int, elevation_deg: int) -> pygame.Surface:
+        """Black overlay, per-pixel alpha, that shades the ball like a sphere lit from the given
+        direction (see `_ball_light_angles`): dark on the side facing away, clear where it faces the
+        light. Anti-aliased (6x sub-sampled coverage), (2r+3)px square centred on the ball, cached
+        per (radius, direction). A white ball can't get whiter, so the highlight is simply the
+        absence of shading; the overlay goes over the dots too, so they wrap round the sphere."""
+        key = (radius, azimuth_deg, elevation_deg)
+        sprite = self._ball_shade_cache.get(key)
+        if sprite is None:
+            ss, size = 6, 2 * radius + 3
+            n = size * ss
+            yy, xx = np.mgrid[0:n, 0:n].astype(float)
+            dx, dy = (xx + 0.5 - n / 2) / (radius * ss), (yy + 0.5 - n / 2) / (radius * ss)
+            r2 = dx * dx + dy * dy
+            nz = np.sqrt(np.clip(1.0 - r2, 0.0, 1.0))
+            az, el = math.radians(azimuth_deg), math.radians(elevation_deg)
+            lx, ly, lz = math.cos(el) * math.cos(az), math.cos(el) * math.sin(az), math.sin(el)
+            lit = np.clip(1.15 * (dx * lx + dy * ly + nz * lz), 0.0, 1.0)
+            shade = _SHADE_AMBIENT + (1.0 - _SHADE_AMBIENT) * lit
+            # Blinn-Phong highlight (view straight down) cancels the shading where it peaks.
+            hx, hy, hz = lx, ly, lz + 1.0
+            spec = np.clip((dx * hx + dy * hy + nz * hz) / math.sqrt(hx * hx + hy * hy + hz * hz), 0.0, 1.0) ** 40
+            dark = np.clip(self._ball_shading_strength * (1.0 - shade) * (1.0 - spec), 0.0, 1.0) * (r2 <= 1.0)
+            alpha = dark.reshape(size, ss, size, ss).mean(axis=(1, 3))
+            sprite = pygame.Surface((size, size), pygame.SRCALPHA)
+            sprite.fill((0, 0, 0, 0))
+            pygame.surfarray.pixels_alpha(sprite)[:] = np.clip(alpha * 255.0, 0, 255).astype(np.uint8).T
+            if len(self._ball_shade_cache) >= 512:
+                self._ball_shade_cache.clear()
+            self._ball_shade_cache[key] = sprite
+        return sprite
+
+    def _draw_ball_shadow(self, surface: pygame.Surface, ball: Ball, base_radius_px: float) -> None:
+        """A soft shadow on the ground. The light is a point ``light_height_m`` above the pitch's
+        middle, so a raised ball's shadow falls on the ground displaced radially AWAY from the
+        centre by ``distance * z / (H - z)`` (zero at the centre or on the ground); a thin
+        contact shadow (``contact_offset_m``, same direction, biased to the lower-right so it
+        never vanishes at the centre) keeps a grounded ball from looking pasted on. The shadow is
+        ground-sized (not boosted with height like the drawn ball), fainter and softer the
+        higher the ball is."""
+        cam = self.camera
+        z = max(0.0, ball.position.z - ball.radius_m)
+        z_eff = min(z, 0.8 * self._ball_shadow_light_height_m)
+        k = z_eff / (self._ball_shadow_light_height_m - z_eff)
+        bx, by = cam.world_to_screen_f(ball.position.x, ball.position.y)
+        cx, cy = cam.world_to_screen_f(0.0, 0.0)
+        vx, vy = bx - cx, by - cy
+        off_x, off_y = vx * k, vy * k
+        if self._ball_shadow_contact_m > 0.0:
+            # Direction: radial away from the centre, blended with a lower-right bias that
+            # dominates within ~3m of the centre (so it is continuous when the ball crosses it).
+            bias = 3.0 * cam.pixels_per_metre
+            dx, dy = vx + bias * 0.7071, vy + bias * 0.7071
+            norm = math.hypot(dx, dy) or 1.0
+            c = self._ball_shadow_contact_m * cam.pixels_per_metre
+            off_x, off_y = off_x + dx / norm * c, off_y + dy / norm * c
+        sprite = self._ball_shadow_sprite(
+            base_radius_px * (1.0 + 0.04 * z),
+            self._ball_shadow_alpha * (1.0 - 0.45 * min(z / 6.0, 1.0)),
+            0.15 + 0.06 * min(z, 6.0),
+        )
+        surface.blit(sprite, (round(bx + off_x) - sprite.get_width() // 2, round(by + off_y) - sprite.get_height() // 2))
+
+    def _ball_shadow_sprite(self, radius: float, alpha: float, softness: float) -> pygame.Surface:
+        """A soft-edged black disc (radius px at full alpha out to ``radius * (1 - softness)``,
+        fading to nothing at ``radius * (1 + softness)``), quantised so the cache stays small."""
+        radius, alpha, softness = round(radius * 2) / 2.0, int(round(alpha / 5.0) * 5), round(softness * 20) / 20.0
+        key = (radius, alpha, softness)
+        sprite = self._ball_shadow_cache.get(key)
+        if sprite is None:
+            outer = radius * (1.0 + softness)
+            n = int(math.ceil(outer)) + 2
+            yy, xx = np.mgrid[-n:n + 1, -n:n + 1].astype(float)
+            t = np.clip((outer - np.hypot(xx, yy)) / max(2.0 * radius * softness, 1e-6), 0.0, 1.0)
+            t = t * t * (3.0 - 2.0 * t)
+            sprite = pygame.Surface((2 * n + 1, 2 * n + 1), pygame.SRCALPHA)
+            sprite.fill((0, 0, 0, 0))
+            pygame.surfarray.pixels_alpha(sprite)[:] = (alpha * t).astype(np.uint8)
+            if len(self._ball_shadow_cache) >= 256:
+                self._ball_shadow_cache.clear()
+            self._ball_shadow_cache[key] = sprite
+        return sprite
 
     def _draw_player_sprite(
         self, surface: pygame.Surface, player: Player, pos: tuple[int, int], radius_px: int,
@@ -983,11 +1640,10 @@ class Renderer:
         elif is_inactive:
             # Draw on a small per-pixel-alpha surface so the player reads as
             # translucent rather than a flat grey substitute colour.
-            diameter = radius_px * 2 + 4
-            player_surf = pygame.Surface((diameter, diameter), pygame.SRCALPHA)
-            centre = (diameter // 2, diameter // 2)
-            pygame.draw.circle(player_surf, (*colour, self._inactive_alpha), centre, radius_px)
-            surface.blit(player_surf, (pos[0] - centre[0], pos[1] - centre[1]))
+            surface.blit(
+                self._aa_disc(colour, radius_px, self._inactive_alpha),
+                (pos[0] - radius_px - 1, pos[1] - radius_px - 1),
+            )
         else:
             pygame.draw.circle(surface, colour, pos, radius_px)
             pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px, colour)

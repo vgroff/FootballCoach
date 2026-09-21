@@ -70,8 +70,8 @@
     "show_rolling": true,
     "show_bounced": true,
     "flying_min_height_above_ground_m": 0.01,
-    "offset_px": 2.0,
-    "width_px": 2.0,
+    "offset_px": 1.0,
+    "width_px": 1.0,
     "color_flying": [180, 230, 255],
     "color_rolling": [180, 255, 180],
     "color_bounced": [255, 210, 80]
@@ -82,15 +82,48 @@
     "penalty_arc_radius_m": 9.15,
     "corner_arc_radius_m": 1.0
   },
+  "ball_shadow": {
+    "_comment": "Soft ground shadow under the ball. The light is a point light_height_m above the middle of the pitch, so a raised ball's shadow falls on the ground displaced away from the centre (none on the ground or at the centre). contact_offset_m: a thin always-visible contact shadow (same direction) so a grounded ball doesn't look pasted on; 0 = none. alpha: 0-255 darkness of the shadow under a ball on the ground (fainter and softer as it rises).",
+    "enabled": true,
+    "light_height_m": 30.0,
+    "contact_offset_m": 0.10,
+    "alpha": 120
+  },
+  "ball_shading": {
+    "_comment": "Sphere shading on the ball (dark on the side away from the light, clear where it faces it; the highlight is the unshaded part). The light is the same point light as the ball shadow (ball_shadow.light_height_m above the pitch's middle), so the lit side always faces the centre: overhead at the centre, lower and more sideways toward the edges. strength 0-1; enabled false = flat white ball.",
+    "enabled": true,
+    "strength": 0.85
+  },
+  "turf": {
+    "_comment": "Grass texture instead of a flat green fill. patch_amp: +/- fraction of brightness of the soft, world-anchored light/dark patches (0 = none); patch_cell_m: size in metres of the big and small patch octaves; noise_amp: per-pixel grain (screen-space); vignette: darkening at the screen corners (0 = none); seed: the random seed. enabled false = the old flat fill.",
+    "enabled": true,
+    "patch_amp": 0.02,
+    "patch_cell_m": [6.0, 2.2],
+    "noise_amp": 0.02,
+    "vignette": 0.14,
+    "seed": 7
+  },
   "goal_frame": {
-    "_comment": "Slight 3D look for the goal frame in the top-down view (ui/renderer.py _draw_goal_frame). crossbar_lean_m: how far (world metres) the crossbar is drawn displaced from the goal line, away from the pitch -- a purely apparent parallax for its 2.44m height, clamped to the net depth; 0 = crossbar hidden exactly on the goal line (the old flat look). The net is drawn only behind the crossbar (the roof); the mouth in front of it is open. post_width_m: post/crossbar stroke width in world metres, but never less than 2px thicker than the pitch-line-width strokes of the net's side/back lines (and rounded up to an odd pixel count so it centres exactly), so the frame always reads heavier than the net. mouth_alpha: 0-255 tint over the goal mouth (the opening between goal line and crossbar); 0 = none.",
-    "crossbar_lean_m": 0.9,
-    "post_width_m": 0.30,
-    "mouth_alpha": 40
+    "_comment": "Slight 3D look for the goal frame in the top-down view (ui/renderer.py _draw_goal_frame). crossbar_lean_m: how far (world metres) the crossbar is drawn displaced from the goal line, away from the pitch -- a purely apparent parallax for its 2.44m height, clamped to the net depth; 0 = crossbar hidden exactly on the goal line (the old flat look). The net is drawn only behind the crossbar (the roof); the mouth in front of it is open. post_width_m: post/crossbar stroke width in world metres, but never less than 2px thicker than the net's own 1px lines (mesh and border), so the frame always reads heavier than the net. mouth_alpha: 0-255 tint over the goal mouth (the opening between goal line and crossbar); 0 = none. back_wall_alpha: the same tint over the back wall of the net (the strip between where the back of the net meets the ground and its top edge, displaced by the same lean); 0 = none. shade_strength: 0-1, how strongly the posts/crossbar are shaded to look round (lit from the top-left, see ui/style.py LIGHT_*); 0 = flat white.",
+    "crossbar_lean_m": 0.72,
+    "post_width_m": 0.20,
+    "mouth_alpha": 40,
+    "back_wall_alpha": 30,
+    "shade_strength": 0.7
+  },
+  "corner_flag": {
+    "_comment": "Corner flags (ui/renderer.py _draw_corner_flags), drawn with the same top-down parallax as the goal frame: the pole is vertical, so its top is displaced away from the pitch centre by pole_height_m * (crossbar_lean_m / goal_height_m) -- one parallax setting drives both. pole_height_m: APPARENT pole height for the parallax (a real corner pole is ~1.5-1.8m; this is deliberately bolder so the leaning pole reads at the default zoom). pole_width_m: pole stroke (min 1px). flag_width_m: how far the cloth's free end streams off the pole (perpendicular to it, toward the pitch's middle along the touchline). flag_drop_frac: fraction of the pole (from the top) the cloth is attached along; the rest of the pole below it stays visible.",
+    "pole_height_m": 2.4,
+    "pole_width_m": 0.06,
+    "flag_width_m": 0.55,
+    "flag_drop_frac": 0.55
   },
   "goal_net": {
-    "_comment": "Diagonal mesh drawn inside each goal frame. spacing_m: gap between mesh lines in world metres (smaller = denser mesh). alpha: 0=invisible, 255=fully opaque. color: RGB.",
+    "_comment": "Diagonal mesh drawn inside each goal frame. spacing_m: gap between mesh lines in world metres (smaller = denser mesh). min_spacing_px: floor on that gap in screen pixels -- below ~5px the 1px diagonals alias into a checkerboard instead of a diamond lattice (0.35m is only ~3px at the default window), so the gap never drops under this; lower it only if you want the checker back. back_spacing_scale: the back-wall net's mesh spacing as a multiple of the roof's (the steep back-wall lines in the narrow ~6px strip alias into a moire at 1x; 2x reads as clean tall diamonds). sag_m: how far (metres) the middle of the roof net hangs below crossbar height; the mesh bows toward the pitch by that height's parallax (0 = flat). alpha: 0=invisible, 255=fully opaque. color: RGB.",
     "spacing_m": 0.35,
+    "sag_m": 0.3,
+    "min_spacing_px": 7,
+    "back_spacing_scale": 2.0,
     "alpha": 190,
     "color": [230, 230, 230]
   },

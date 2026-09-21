@@ -155,23 +155,117 @@ same as everything else in that method):
   whole depth.
 - **3D goal frame** (`_draw_goal_footprint` + `draw_goal_tops`): a slight
   parallax, since the view is top-down. The crossbar (2.44m up) is drawn
-  displaced `graphics.json["goal_frame"]["crossbar_lean_m"]` (0.9m) from the
+  displaced `graphics.json["goal_frame"]["crossbar_lean_m"]` (0.72m; was 0.9, cut ~20%
+  to tone the effect down) from the
   goal line **away from the pitch** (over the net) instead of hidden exactly
   on top of it, which reveals the goal mouth — the opening between the goal
   line on the ground and the crossbar — as a faint tinted rectangle
   (`mouth_alpha`), with the posts drawn as the lines joining their feet
   (small dots on the goal line) to the crossbar ends, all at `post_width_m`
-  (0.30m) — but never less than 2px thicker than the thin net side/back lines
-  (`_goal_post_px`; also forced odd so it centres exactly), so the frame
-  always reads heavier than the net at any zoom (3px vs 1px at the default
-  window). "Away from the pitch" is what a real overhead/broadcast view
+  (0.20m; thinned from 0.30 then 0.25 on request) — but never less than 2px
+  thicker than the net's own 1px lines (`_goal_post_px`), so the frame always
+  reads heavier than the net at any zoom (3px vs 1px at the default window —
+  the floor, so unchanged by further thinning `post_width_m`; 5px at 3x, 7px at
+  4x). A 2px post at 1x would be only 1px heavier than the net. "Away from the pitch" is what a real overhead/broadcast view
   does to tall objects (they lean away from the point under the camera); the
   opposite lean would put the frame sticking out over the pitch. The offset is
   **purely apparent** — clamped to the net depth, and the ball's ground truth
   is still the goal line (`Pitch.is_goal`); `crossbar_lean_m: 0` restores the
   flat look (net over the whole footprint).
+  - **The posts and crossbar are shaded to look round** (`goal_frame.shade_strength`,
+    0.7; 0 = the old flat white). The scene light is `style.LIGHT_DIR_XY`
+    (toward the light, screen space: the up-left diagonal, exactly 45° so a post
+    and the crossbar shade identically) at `style.LIGHT_ELEVATION_DEG` (55°) —
+    shared constants so any later shading (shadows, ball, sprites) stays
+    consistent. `surface_shade` is Lambert plus an
+    ambient floor (`_SHADE_AMBIENT`) with a small gain (`_SHADE_GAIN`, so a
+    cylinder's best-lit strip actually reaches full brightness), blended toward
+    flat by the strength. `cylinder_shades(n_px, across, strength)` gives one
+    brightness per pixel across a bar (each averaging 8 sub-positions of the
+    cross-section, so a 3px bar at 1x gets three sensible tones); posts run
+    along x so their width is across y ("y"), the crossbar the reverse.
+    **The frame is lit as if from a point above the middle of the goal/pitch**:
+    `flip_x`/`flip_y` mirror the light per part so each is highlighted on the
+    side facing the centre and shaded on its OUTSIDE — top post shaded on top,
+    bottom post on the bottom, crossbar on the side away from the pitch, feet
+    likewise (`_draw_goal_top` passes `flip=top_post` / `flip=left`). Both posts
+    are exact mirror images (tested), at every zoom (3 tones at 1x, a smooth
+    gradient at 4-5x). Bars are opaque per-row/column
+    fills, so the frame is still exactly pixel-aligned (symmetry/thickness
+    tests unchanged), but its pixels are now a neutral **grey ramp**, not line
+    white — tests detect the frame as `r == g == b >= 120` (nothing else near
+    it is neutral: net/tints are blended over green). The **feet** are shaded
+    domes (`_shaded_foot`: a sphere under the same light, cached sprite,
+    coverage/shade computed per pixel from an 8x8 sub-grid so the rim is
+    anti-aliased without smoothscale's edge darkening). It is drawn **under** the
+    post (only the half beyond the post's end and any bulge wider than the post
+    shows) and its radius is `_goal_foot_radius()`: the post's half-width plus a
+    proud margin that is 0.25px on a 3px post (1x — it used to be `half + 1`, a
+    5px blob on a 3px post) growing 0.25px per extra post pixel to a full pixel
+    (unchanged from 4x-5x up). **The two crossbar/post corners are
+    mitred** so the shadow wraps round the corner from post to bar: each pixel of
+    the corner square takes the shade at its distance from the NEARER outer edge
+    (`outer_first[min(a, b)]`; the seam is the diagonal from the outer to the
+    inner corner). That is only continuous because post and bar share one
+    profile — the reason the light is exactly 45° — asserted in
+    `test_post_and_crossbar_shade_identically_so_their_corners_can_mitre`.
+  - **The roof net sags** (`goal_net.sag_m`, 0.3m; 0 = flat). A roof hanging
+    `sag_m` below crossbar height leans less than the crossbar does, so its mesh
+    is displaced toward the pitch by `sag_m / goal_height × lean × ppm` px at its
+    deepest point (~0.9px at 1x, ~4px at 5x), scaled by `(1-u²)(1-v²)` (u across
+    the goal, v along the roof) so the crossbar, the posts' side edges and the
+    top-back edge stay put and the diamonds bow in between
+    (`_draw_goal_net(..., sag_dx_px)`, drawn as sampled polylines). Because the
+    displacement is along x, only a **top-bottom** mirror keeps the two diagonal
+    families identical, so the sagged roof layer (cache key `"roof-sag"`) is
+    mirrored vertically, whereas the flat one (`"roof"`, used below ~0.05px) is
+    mirrored left-right. A shading variant (mesh fading toward the middle + a soft
+    dark blotch) was tried and dropped as unnecessary.
   - **The mouth is open: the net is only the roof.** The net hatch is drawn
-    only from the crossbar back to the back of the net, never in the mouth.
+    only behind the crossbar (roof: crossbar -> top-back edge, drawn over the
+    back wall's own mesh, below), never in the mouth.
+  - **The back of the net has the same parallax** (`_GoalPx.back_top_x`): the
+    engine's goal is a box (vertical back wall, roof at crossbar height), so
+    the wall's *top* edge is displaced outward by the same lean as the crossbar
+    while its *foot* stays put. Drawn as: a 1px line where the net meets the
+    ground (`back_x`), a separate 1px top-back edge (`back_top_x`), and a faint
+    tint (`goal_frame.back_wall_alpha`) over the strip between them — the mouth
+    tint's counterpart at the back.
+  - **The back wall has its own mesh, at the right angle**
+    (`_draw_goal_back_net`, geometry in the pure `back_wall_net_segments`).
+    The wall is vertical, and the parallax maps a wall point's *height* to
+    screen x (the short strip, `lean` wide for the full crossbar height) and its
+    position *along the goal* to screen y. A 45° diamond mesh on that wall
+    (horizontal run == height) therefore projects to two mirrored families of
+    **steep** lines that rise `goal_height × ppm` px in y (22px at the default
+    window) over a strip only ~6-26px wide in x — squashed, tall diamonds,
+    visibly different from the roof's 45° lattice. Same supersampled,
+    anti-aliased, halo-free drawing as the roof mesh. **The roof net is drawn
+    over the wall mesh**: the roof is at crossbar height (nearer the camera) and
+    physically extends to the top-back edge, so its see-through mesh overlaps the
+    wall strip and both layers show there (wall drawn first, then the roof from
+    the crossbar to the top-back edge — a lace-like double lattice, busier than
+    either alone). An earlier version stopped the roof at the ground line so the
+    strip showed only the wall mesh; that was dropped as inaccurate. Two cosmetic
+    knobs: the wall mesh spacing is 2× the roof's (`goal_net.back_spacing_scale`,
+    formerly a constant;
+    at 1× the steep lines in a ~6px strip alias into a moiré, and 2× reads as
+    clean tall diamonds at both zoom 1 and 4 — compared 1×/1.5×/2×/3× side by
+    side) and its line weight is 0.75× (`_GOAL_BACK_NET_LINE_WEIGHT`;
+    pygame thickens steeper lines more). Tested by
+    `test_back_wall_net_segments_are_steep_mirrored_diagonals` (geometry) and
+    `test_back_wall_net_is_steep_and_the_roof_net_is_drawn_over_it`, which
+    renders the wall mesh and roof mesh separately (via `no_roof`/`no_wall` on the
+    test helper) and measures orientation as the ratio of brightness variation
+    along x vs y: roof ≈ 0.98 (45°), wall alone ≈ 2.6, and the combined strip
+    ≈ 1.5 (a mix), with more ink than the wall alone; a 45° wall mesh would give
+    1.0 and fail. All the
+    goal's horizontal edges (ground and top) fall on the same two screen rows
+    (the parallax is purely along x), so the side lines run continuously from
+    the goal line to the top-back edge. The defending-side marker sits
+    beyond that top-back edge (`marker_back_m = depth + lean`) so it doesn't
+    overlap the net. Tests: `test_back_of_net_*`,
+    `test_back_wall_strip_is_tinted_*`, `test_defending_marker_sits_beyond_*`.
   - **Two layers.** *Footprint* (drawn in `draw_pitch`, under everything):
     side/back lines + mouth tint. *Top* (`draw_goal_tops`): roof net, posts,
     crossbar. `draw_pitch(goal_tops=False)` skips the top layer so a caller
@@ -184,7 +278,7 @@ same as everything else in that method):
     `ball_physics.resolve_goal_boundary` — the top layer is drawn OVER the
     ball (the bar cuts across it, the roof net shows faintly over it). Any
     other ball, including one above the bar going over, is drawn over the
-    frame. The switch happens at the goal line, where the bar (displaced 0.9m
+    frame. The switch happens at the goal line, where the bar (displaced 0.72m
     behind it) doesn't yet overlap the ball, so there's no visible pop.
     Players are always drawn over the frame (not modelled — a keeper 1.8m
     tall is always under the bar anyway, and only rarely inside the net).
@@ -196,23 +290,48 @@ same as everything else in that method):
     `pygame.draw.line` (which extends a width-2 line *downward*) next to
     `pygame.draw.rect(width=...)` (which draws *inward*): together those put
     the top post 1px inside the mouth tint and the bottom post 1px outside it.
+    Any post width works (even leaves the pair half a pixel off the centre row,
+    invisible).
+  - **Net border = mesh thickness**: the net's side and back lines (the
+    "border"/outline) are drawn at `_GOAL_NET_LINE_PX` (1px), the same constant
+    the mesh lines use, so the two can't drift. They used to be drawn at the
+    zoom-scaled *pitch line width* (`0.12m × ppm` = 3px at 3x, 4px at 4x) while
+    the mesh stayed 1px — measured against the committed renderer: 1/3/4px
+    border vs a 1px mesh at zoom 1x/3x/4x. Posts and crossbar are the heavy
+    parts, then the goal line/pitch lines, then the net (border + mesh).
   - Tests (`tests/unit/test_pitch_markings.py`): symmetric posts on the mouth
     edges, no net hatch in the mouth, `ball_under_goal_frame` cases, and a
     pixel comparison that a ball at z=1.0 leaves the crossbar pixels exactly
     as in a ball-less render while z=3.2 changes them.
-- **Net mesh varies with zoom (accepted, not a bug):** the hatch gap is
-  `int(0.35m × pixels_per_metre)` px (3/6/9/12px at zoom 1x/2x/3x/4x) with
-  always-1px lines, so it reads as a dense checker at 1x and a sparse thin
-  lattice at 3-4x. Reviewed and left as is; scaling the line width / snapping
-  the gap to keep a constant diamond lattice would be the fix if it's ever
-  wanted. When comparing screenshots across zooms, don't upscale some and not
-  others.
+- **The net is always a diamond lattice, never a checkerboard**
+  (`_goal_net_gap_px`): the mesh gap is the physical `goal_net.spacing_m`
+  (0.35m) at the current zoom but never below `goal_net.min_spacing_px` (**7**).
+  Without the floor the gap was `int(0.35m × ppm)` = 3px at the default
+  window, and two families of 1px diagonals 3-4px apart alias into a dense
+  checker (measured: 58% of net pixels lit at 3px, 50% at 4px), while at 3-4x
+  zoom the same formula gave a proper lattice — so the net looked different at
+  every zoom level. Now: 7px at zoom 1x/2x, 9px at 3x, 12px at 4x (the floor
+  only bites below ~2.5x, so high-zoom looks are unchanged). The floor went 8 →
+  6 → 7 across sweeps at 1x: 5px is still blobby; 6px looked fine until both
+  diagonals were drawn identically (see the mirroring pitfall), after which it
+  read a little checker-like; 8px is cleaner but leaves only ~2 diamonds across
+  the 15px-wide roof. At the default window the mesh is coarser than 0.35m
+  (~0.7m), purely cosmetic. The back-wall mesh is 2× this (14px at 1x). Lines
+  stay 1px. `test_goal_net_is_a_sparse_diamond_lattice_at_every_zoom` asserts the
+  gap is ≥7 and the net's *ink* (mean lightening over grass) is <0.30 at
+  zoom 1-5 (measured ~0.17-0.20 at 7px vs ~0.45 for a 3px checker), and a
+  companion test shows the same metric flags the old behaviour with the floor
+  removed. (When comparing screenshots across zooms, don't upscale some and
+  not others.)
 - **Goal netting** (`_draw_goal_net`, called from `_draw_goal_top` for the
   roof region only — crossbar to back of net; see above): fills a
   screen-space rectangle (the roof, `goal_depth_m` deep minus the crossbar
-  lean, × `goal_width_m`) with a translucent diagonal
-  X-hatch, drawn on an isolated SRCALPHA surface sized to the box so the
-  diagonal lines clip cleanly at its edges. Colour/density/opacity are
+  lean, × `goal_width_m`) with a translucent, **anti-aliased** diagonal
+  X-hatch (drawn supersampled and `smoothscale`d down — see "Anti-aliasing
+  policy"; opacity applied once to the whole layer with `set_alpha`, so line
+  crossings aren't double-blended brighter) on an isolated SRCALPHA surface
+  sized to the box so the diagonal lines clip cleanly at its edges.
+  Colour/density/opacity are
   configurable via `graphics.json["goal_net"]` (`spacing_m`, `alpha`,
   `color`) rather than flat `style.py` constants, since "barely visible" was
   the first complaint about it — `style.GOAL_NET_COLOUR`/`GOAL_NET_ALPHA`
@@ -231,9 +350,32 @@ same as everything else in that method):
   is Team.LEFT's own goal and gets `style.TEAM_LEFT_COLOUR` (blue); the
   right goal gets `style.TEAM_RIGHT_COLOUR` (red). If that attack-direction
   convention is ever flipped, this needs to flip too.
-- **Corner flags** (`_draw_corner_flags`): a small pole dot + pennant
-  triangle at each of the 4 pitch corners, leaning inward over the pitch so
-  they're never clipped by the window edge at small margins.
+- **Corner flags** (`_draw_corner_flags`, geometry in the pure
+  `corner_flag_world_points`): drawn with the same top-down parallax as the
+  goal frame. The pole is vertical, so its top is displaced **away from the
+  pitch centre**, along the centre->corner line, by `pole_height_m ×
+  (crossbar_lean_m / goal_height_m)` — the crossbar's parallax rate, so one
+  setting drives both (with the defaults 2.4 × 0.72/2.44 ≈ 0.71m, ~6px at the
+  default window, ~25px at 4x zoom). The pole is **yellow**
+  (`style.CORNER_FLAG_POLE_COLOUR`); the pennant stays orange
+  (`CORNER_FLAG_COLOUR`). The pole is at least 1px wide (a 2px minimum was
+  tried and looked chunky/rectangular at the default zoom), and the foot dot
+  marking the ground contact appears **only once the pole is ≥3px wide**
+  (radius `pole_px//2 + 1`): a fixed 2px-radius dot is a 5px blob on the ~6px
+  pole at 1x zoom and hid it entirely (compared five foot/pole variants at
+  zoom 1/2/4 before choosing). The pennant is attached along the upper `flag_drop_frac` (55%) of the pole with
+  the lower pole left bare. **The cloth's free end is aimed perpendicular to
+  the pole** (`flag_width_m` off it, on the side toward the pitch's middle
+  along the touchline). Aiming it along the touchline instead ("inward" — the
+  old design's direction) makes the pennant a needle: the pole leans along the
+  corner diagonal and the cloth's base edge lies along the pole, so the tip
+  ends up only ~30° off that edge and the triangle has almost no width
+  (seen when first tried; reproduced across four parameter sets before
+  changing the geometry). `pole_height_m` is *apparent* (real poles are
+  ~1.5-1.8m) — bolder on purpose so the lean reads at the default zoom.
+  Config: `graphics.json["corner_flag"]`. Tests:
+  `test_corner_flag_pole_leans_away_from_the_centre_and_the_cloth_is_a_real_triangle`,
+  `test_corner_flag_pole_and_cloth_are_drawn`.
 - **Sideline benches** (`_draw_sideline_benches`): a row of benches (`x`
   positions in `Renderer._BENCH_X_OFFSETS_M`, spread across the middle
   third of the pitch, clear of the boxes/corners regardless of pitch size)
@@ -269,6 +411,132 @@ point per pixel, so leftover rasteriser noise blends into a soft
 anti-aliased edge instead of surviving as a hole. Any *new* circular outline
 added to the renderer should go through this helper rather than a fresh
 `draw.circle(..., width=N)` call.
+
+## Anti-aliasing policy
+
+Anything curved or diagonal is anti-aliased; axis-aligned rects/lines (pitch
+lines, posts, crossbar, tint rects, the help-overlay rules) are pixel-aligned
+and have nothing to smooth. Which technique depends on the destination:
+
+- **Opaque destination** (the pitch surface): `gfxdraw.aacircle` /
+  `filled_circle` for discs (spots, corner-flag pole, ball body; the post feet are
+  shaded per-pixel sprites, see the 3D goal frame),
+  `pygame.draw.aalines` for 1px curves (arcs at the default zoom, speed lines,
+  heading V), and `gfxdraw.filled_polygon` + `aapolygon` for filled shapes
+  (flag pennant, kick UI). **Thick arcs** (`_draw_world_polyline`, width > 1px
+  once zoomed) are a polygon strip — the polyline offset ±half the width along
+  its normals — drawn the same way; `pygame.draw.lines` at that width is
+  aliased, and `pygame.draw.arc` tears.
+- **Transparent / translucent layer** (net mesh, rings, ball dots, sprites,
+  ball-trail ghosts, inactive-player fallback disc): draw at
+  `_RING_SUPERSAMPLE`× (4×; the cached net meshes use `_NET_SUPERSAMPLE`, 8×)
+  with plain `pygame.draw.*` and `smoothscale` down.
+  `draw.aaline` and `gfxdraw.*` do **not** blend correctly onto a transparent
+  layer (measured on the ball dots: near-white notches inside dark dots, alpha
+  double-applied). Helper for small discs: `Renderer._aa_disc(rgb, radius,
+  alpha)` (cached per colour/radius; the surface is shared, blit immediately).
+  Apply a layer's translucency once, with `set_alpha` on the downscaled layer,
+  rather than per-line alpha.
+
+**Pitfall — fill the transparent background with the drawn colour at alpha 0
+(`big.fill((*rgb, 0))`), not the default transparent black.** `smoothscale`
+averages RGB and alpha *independently*, so a black background pulls every
+edge pixel's RGB toward black; composited, those edge pixels come out darker
+than both the shape and whatever it sits on — a dark halo. Measured: 161 of
+610 net pixels (26%) were darker than the grass under them at 1x zoom; the
+pre-existing `_draw_ring` had 72 ring-edge pixels dimmed below both ring and
+grass. Fixed in `_draw_goal_net`, `_aa_disc` and `_draw_ring` (which also
+brightens the selection/possession/control rings' edges). `_ball_dots_layer`
+doesn't need it (its dots are already near-black).
+
+**Pitfall — `pygame.draw.line` is not symmetric between the two diagonals.**
+It rasterises through pixel centres, i.e. offset (+0.5, +0.5) from the
+coordinates you give it — *along* the line for a down-right diagonal but
+*perpendicular* to it for an up-right one. Drawn directly, mirrored lines come
+out as different pixel profiles: measured on a single mirrored pair, `\` was a
+narrow core over 3 pixels (alpha 15/191/47) while `/` was split over 2 pixels
+half a pixel off (159/95) — same total ink (ratio 0.998-1.002), so an ink check
+can't see it, but the `/` lines look wider and dimmer, and the net looked
+uneven with a "shadow" on one side. **The net mesh therefore rasterises ONE
+diagonal family and produces the other as its exact mirror**
+(`Renderer._net_layer`: flip + `BLEND_RGBA_MAX`, so crossings aren't
+double-brightened): the roof layer is left-right symmetric and the back-wall
+layer top-bottom symmetric to the pixel (asserted in
+`test_net_mesh_diagonal_families_are_exact_mirror_images`; the old two-family
+layers were 94k-242k alpha-units asymmetric). Because the layers depend only on
+their size/spacing/colour they are **built once and cached**
+(`_net_layer_cache`, bounded at 64 entries — zoom changes make new sizes), which
+is why the nets can use a finer `_NET_SUPERSAMPLE` (8×) than the per-frame
+rings/dots (4×) at no per-frame cost. Any other mesh/hatch of mirrored diagonals
+should do the same.
+
+Not anti-aliased, deliberately or not yet: the ball's sub-pixel (<1px)
+outline path (a 1px `draw.circle` at reduced alpha, only if
+`ball.outline_width_px < 1`), and the legacy unused `draw_drag_indicator`.
+Tests: `tests/unit/test_pitch_markings.py` (`test_goal_net_mesh_is_anti_aliased
+_without_a_dark_halo`, `test_thick_pitch_arcs_are_anti_aliased`,
+`test_aa_disc_and_rings_have_no_dark_fringe`); the density test measures *ink*
+(mean lightening over grass), not a lit-pixel count, because anti-aliasing
+spreads a line over more pixels at lower intensity but preserves the total.
+
+## Ball shadow and shading (`draw_ball`)
+
+- **Sphere shading** (`ball_shading` in `graphics.json`, `_ball_shade_sprite`): a
+  black overlay with per-pixel alpha, drawn last over the ball and its dots, so the
+  ball is dark on the side facing away from the light and clear where it faces it. The
+  light is **the same point light as the ground shadow** (`ball_shadow.light_height_m`,
+  30m above the pitch's middle), via `_ball_light_angles`: horizontally from the ball
+  toward the centre, elevation `atan((H - z) / distance)` — so the lit side always faces
+  the middle of the pitch, the light is overhead at the centre (bright middle, even dark
+  rim) and lower/more sideways toward the edges (about 30° at the far goal-line ends);
+  a raised ball is nearer the light's height so it sees it lower still, not higher. (It was first a fixed top-left light,
+  "variant C"; it now shares the shadow's light.) The sprite cache is keyed by
+  (radius, azimuth, elevation) with the angles quantised to 10°/5° (bounded at 512); a
+  Blinn-Phong highlight cancels the shading where it peaks (a white ball cannot get
+  whiter, so "highlight" = no darkening; an earlier attempt that added white
+  produced a grey spot). `strength` 0.85 ("variant C" of the options compared
+  side by side). The sprite is computed with numpy at 6x sub-sampling, cached per
+  radius; the dots still read clearly through it (tested).
+- **Ground shadow** (`ball_shadow`, `_draw_ball_shadow`): the light is a **point
+  30m above the middle of the pitch**, so the shadow of a ball at height `z` (of its
+  underside) sits on the ground displaced radially AWAY from the centre by
+  `distance × z / (H − z)`; zero on the ground and at the centre, growing with height
+  and with distance from the middle (a high ball near a corner throws its shadow
+  several metres off; 15m was tried first and threw a 3.5m ball's shadow ~9m away, so
+  30m was chosen after a side-by-side — about half the offset, still clearly visible). Because that vanishes for a grounded ball, a **thin contact
+  shadow** (`contact_offset_m`, 0.10m) is added along the same radial direction —
+  biased to the lower-right within ~3m of the centre so it doesn't flip when the ball
+  crosses it. The shadow is ground-sized (NOT boosted with height like the drawn
+  ball), fainter (alpha 120 → ~66 at 6m) and softer the higher the ball is; drawn
+  before the trail and the ball. Sprites are numpy soft discs, quantised and cached.
+  Compared against a fixed top-left directional shadow (also fine, and consistent
+  with the ball's own shading); the centre-point light was chosen so the ball's
+  shadow matches the goal frame's centre-facing lighting.
+- The state rings (see "Ball state indicator rings") were tightened to
+  `offset_px` 1 / `width_px` 1 (from 2 / 2) so they hug the ball and read as a thin
+  status outline rather than a halo.
+
+## Turf texture (`_draw_turf`, `graphics.json["turf"]`)
+
+`draw_pitch` no longer fills one flat green. The background is the pitch green times
+(a) **soft, world-anchored patches** — two octaves of smoothstepped value noise
+(`patch_cell_m` 6.0m / 2.2m, `patch_amp` 0.02, slightly warmer where lighter), a
+colour texture at 4px/m covering the pitch ± 15m, scaled/cropped to the camera each
+time it moves so the patches stay glued to the pitch under pan and zoom — and (b) a
+**screen-space multiply layer** of fine per-pixel grain (`noise_amp` 0.02) and a soft
+vignette (`vignette` 0.14, darker toward the corners; applied to the grass only, so
+lines, players and the HUD are untouched). The overlay has mean `_TURF_GAIN` (0.95)
+and the base colour is pre-divided by it, so the average is exactly `PITCH_GREEN`.
+The composed background is cached and rebuilt only when the camera's mapping changes
+(a static camera = one blit, ~0.8ms/frame; following the ball at zoom 3-5 adds
+~2ms/frame for the smoothscale). Patch strength was set from a side-by-side of
+9 variants (fine noise alone looks grainy; patches at 6% were "a bit too strong" →
+4% with slightly larger cells → 3% → 2% with cells 4.5/1.6m → 6.0/2.2m). `PITCH_GREEN` was lightened from (34, 120, 50) to
+(43, 141, 62) after the textured pitch (with its vignette) read as a bit dark; several
+tests use `style.PITCH_GREEN` rather than a literal so it can be tuned freely. Mowing stripes were rejected. **Tests** run with
+`turf.enabled`, `ball_shadow.enabled` and `ball_shading.enabled` forced off by an
+autouse fixture (they measure lines/nets against exactly flat grass and a plain ball);
+the tests for those features switch them on explicitly.
 
 ## Ball spin dots (`draw_ball`'s dot-projection block)
 
