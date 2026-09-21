@@ -160,6 +160,9 @@ class Match:
 
     paused: bool = False
     time_s: float = 0.0
+    # Number of completed physics ticks (increments at the end of step()). The clock
+    # ActionOpportunity events are stamped with (entities/action_opportunity.py).
+    tick_index: int = field(default=0, init=False, repr=False)
 
     # Pickup radius: how close a loose ball must be to a player before that
     # player begins the first-touch control-time countdown. Synced from
@@ -328,6 +331,7 @@ class Match:
             self._check_goal()
 
         self.time_s += dt
+        self.tick_index += 1
 
     # -- logging helpers (zero cost when log_callback is None) ---------------
 
@@ -967,6 +971,9 @@ class Match:
         # physics.json's own _comment_armed_redirect_settle_vz for the full
         # sweep (0.01/0.5/0.7/1.0/1.5) and why 1.0 was chosen.
         ball_settled = abs(self.ball.velocity.z) < self.ball_pickup_params.armed_redirect_settle_vz_mps
+        # Loose-ball pickup = a kick opportunity for this player this tick, identical whether or
+        # not it armed a kick (the armed and the normal path below both grant possession here).
+        player.opportunity.note_kick_opp(self.tick_index)
         if player.kick_armed and player.kick_armed_direction is not None and ball_settled:
             self._set_possession(player.player_id)
             # kick_armed_power_fraction is already the final value (run-
@@ -1065,21 +1072,34 @@ class Match:
         carrier = self.ball_carrier()
         if carrier is None or carrier.is_inactive:
             return
+        # Opportunity accounting FIRST, for every player whether or not it armed a tackle and
+        # before any tackle this tick resolves (entities/action_opportunity.py): the tackle
+        # bit must not influence whether an opportunity is recorded.
+        for player in self.players:
+            if self._tackle_contact_possible(player, carrier):
+                player.opportunity.note_tack_opp(self.tick_index)
         for player in self.players:
             if not player.tackle_armed:
                 continue
-            if player.player_id == carrier.player_id:
-                continue
-            if player.team == carrier.team:
-                continue
-            # Use the same overlap radius as auto-tackle so tunnelled approaches
-            # are caught here; skip can_tackle's are_touching to avoid re-checking
-            # the tighter 0.65m threshold that was already passed during movement.
-            dist = player.position.xy().distance_to(carrier.position.xy())
-            overlap_threshold = self.tackling_params.auto_tackle_overlap_factor * (player.radius_m + carrier.radius_m)
-            if dist < overlap_threshold and player.is_available_to_tackle() and carrier.is_available_to_tackle():
+            if self._tackle_contact_possible(player, carrier):
+                player.tackle_fire_count += 1
                 self._attempt_tackle_contact(player, carrier)
                 return  # one tackle per tick
+
+    def _tackle_contact_possible(self, player: Player, carrier: Player) -> bool:
+        """The armed-tackle resolution predicate: an opposing carrier within auto-tackle overlap
+        range of *player*, both available. Shared by resolution and opportunity accounting so
+        the two can never disagree."""
+        if player.player_id == carrier.player_id:
+            return False
+        if player.team == carrier.team:
+            return False
+        # Use the same overlap radius as auto-tackle so tunnelled approaches
+        # are caught here; skip can_tackle's are_touching to avoid re-checking
+        # the tighter 0.65m threshold that was already passed during movement.
+        dist = player.position.xy().distance_to(carrier.position.xy())
+        overlap_threshold = self.tackling_params.auto_tackle_overlap_factor * (player.radius_m + carrier.radius_m)
+        return dist < overlap_threshold and player.is_available_to_tackle() and carrier.is_available_to_tackle()
 
     def _check_head_on_tackles(self) -> None:
         """Automatically triggers a tackle when two players from opposite teams

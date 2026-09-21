@@ -63,6 +63,9 @@ class StepInfo:
     # spans self._ticks_per_decision (>1) of them. Same rationale as the
     # trainee_gained_count/trainee_lost_count possession scan below.
     trainee_kicks_this_step: int = 0
+    # Subset of trainee_kicks_this_step that fired via the armed path (no ball at
+    # decision time, kick executed at pickup -- the "first touch" kicks).
+    trainee_armed_kicks_this_step: int = 0
 
 
 class ScenarioEnv:
@@ -147,6 +150,15 @@ class ScenarioEnv:
         cfg = load_ai_config()
         self._obs_cfg = cfg["observation"]
         self._reward_cfg = cfg["reward"]
+        # Per-decision "could the kick / armed tackle have taken effect" flags
+        # (entities/action_opportunity.py; agent_plans/masked_action_training_plan.md). Attached to
+        # every neural transition's raw_exec (=> the batch's action/opp_* tensors) only when
+        # something consumes them, so a run with both flags off is bit-identical to before.
+        _ppo_cfg = cfg.get("ppo", {})
+        self._opp_flags_enabled = bool(
+            _ppo_cfg.get("log_action_opportunity_stats", False) or _ppo_cfg.get("mask_untriggered_actions", False)
+        )
+        self._opp_cross_head_cutoff = bool(_ppo_cfg.get("action_opportunity_cross_head_cutoff", True))
         self._dt_s = float(self._obs_cfg.get("sim_dt_s", 1.0 / 30.0))
         self._decision_interval_s = float(self._obs_cfg["decision_interval_s"])
         self._ticks_per_decision = max(1, round(self._decision_interval_s / self._dt_s))
@@ -745,10 +757,15 @@ class ScenarioEnv:
         info.is_immobile_episode = getattr(match, "_opponent_is_immobile", False)
         info.ticks_elapsed = self._episode_ticks
         info.trainee_kicks_this_step = trainee_kicks_this_step
+        info.trainee_armed_kicks_this_step = trainee_armed_kicks_this_step
 
         # --- Collect trainee transition from NeuralPlayerAI ---
         if hasattr(player, "ai") and player.ai is not None and hasattr(player.ai, "last_transition"):
             self.last_trainee_transition = player.ai.last_transition
+            if self._opp_flags_enabled and self.last_trainee_transition is not None:
+                self.last_trainee_transition = self._with_opportunity_flags(
+                    self.last_trainee_transition, player, done,
+                )
 
         # --- Collect secondary player transitions from their NeuralPlayerAI ---
         self.last_secondary_results = []
@@ -843,8 +860,11 @@ class ScenarioEnv:
                 sec_reward = 0.0
                 _sec_comps = {}
 
+            _sec_transition = sec_player.ai.last_transition if _sec_has_transition else {}
+            if _sec_has_transition and self._opp_flags_enabled:
+                _sec_transition = self._with_opportunity_flags(_sec_transition, sec_player, done)
             self.last_secondary_results.append({
-                **(sec_player.ai.last_transition if _sec_has_transition else {}),
+                **_sec_transition,
                 "player_id": pid,
                 "reward": sec_reward,
                 "done": 1.0 if done else 0.0,
@@ -1073,7 +1093,11 @@ class ScenarioEnv:
         # Same "state at decision boundary represents the whole interval"
         # convention as _tackle_armed above -- see reward.py's "karm"
         # docstring entry.
-        _kick_armed = player_obj.kick_armed
+        # ... or an armed kick auto-fired earlier this interval (with
+        # action.kick_one_shot the intent is dropped once it fires, so the
+        # boundary flag alone would let a fired armed kick skip the cost it
+        # earns "katt" against; an in-possession kick never arms, stays free).
+        _kick_armed = player_obj.kick_armed or kick_attempt_was_armed_this_step
         return phase1_reward(
             prev_ball_dist=prev_ball_dist,
             curr_ball_dist=curr_ball_dist,
@@ -1219,6 +1243,37 @@ class ScenarioEnv:
 
     def _find_trainee(self, match: Match):
         return match.player_by_id(self.trainee_player_id)
+
+    def _with_opportunity_flags(self, transition: dict, player, done: bool) -> dict:
+        """Copy of a NeuralPlayerAI ``last_transition`` whose ``raw_exec`` also carries the
+        decision interval's opportunity flags (``entities/action_opportunity.OPP_ACTION_KEYS``),
+        so they ride through ``_action_to_numpy`` -> ``RolloutBuffer`` -> the batch's
+        ``action/*`` tensors exactly like the sampled action does (merge / chunk flush / replay /
+        augment tiling all handle ``action/*`` generically).
+
+        The flags describe the interval opened by this transition's decision: read here, at the
+        end of ``step()``, which normally spans exactly that interval. ``opp_partial`` marks the
+        exceptions -- an interval cut short by an early exit that is NOT the end of the episode
+        (the next ``step()`` starts mid-interval), whose flags are therefore incomplete; counted
+        so the size of that exception is visible instead of assumed. A copy, never an in-place
+        edit: on such a not-due step ``last_transition`` is still the previous decision's dict.
+        """
+        f = player.opportunity.flags(player.kick_count, player.tackle_fire_count, self._opp_cross_head_cutoff)
+        ai = player.ai
+        partial = (not done) and hasattr(ai, "is_due_for_decision") and not ai.is_due_for_decision()
+
+        def _arr(x) -> np.ndarray:
+            return np.array([1.0 if x else 0.0], dtype=np.float32)
+
+        raw_exec = dict(transition["raw_exec"])
+        raw_exec.update(
+            opp_kick=_arr(f.kick_opp), opp_kick_raw=_arr(f.kick_opp_raw), fired_kick=_arr(f.kick_fired),
+            opp_tack=_arr(f.tack_opp), opp_tack_raw=_arr(f.tack_opp_raw), fired_tack=_arr(f.tack_fired),
+            opp_partial=_arr(partial),
+        )
+        out = dict(transition)
+        out["raw_exec"] = raw_exec
+        return out
 
     def _on_trainee_tackle(self, player) -> None:  # noqa: ANN001
         """Player.on_tackle callback -- fires synchronously inside

@@ -257,8 +257,12 @@ class TestPPOTrainerIntegration:
         return PPOTrainer.from_config()
 
     def test_networks_are_wrapped(self, trainer):
-        assert isinstance(trainer.decision_net, CanonicalNetworkWrapper)
-        assert isinstance(trainer.execution_net, CanonicalNetworkWrapper)
+        from footballcoach.ai.obs.y_canonical import YCanonicalNetworkWrapper
+        for net in (trainer.decision_net, trainer.execution_net):
+            if trainer.y_canonical:  # ppo.y_canonical (config) adds the y-frame wrapper OUTSIDE the x-frame one
+                assert isinstance(net, YCanonicalNetworkWrapper)
+                net = net._wrapped
+            assert isinstance(net, CanonicalNetworkWrapper)
 
     def test_checkpoint_save_load_roundtrip(self, trainer, tmp_path):
         from pathlib import Path

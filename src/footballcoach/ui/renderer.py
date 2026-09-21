@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import collections
 import math
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NamedTuple
 
 import pygame
 import pygame.gfxdraw
@@ -131,6 +131,65 @@ _EMOJI_FONT_CANDIDATES = [
 ]
 
 
+_ARC_STEP_RAD = math.radians(3.0)
+
+
+def penalty_arc_world_points(pitch: Pitch, *, left: bool, radius_m: float = 9.15) -> list[tuple[float, float]]:
+    """World-space vertices of the penalty arc ("D") for one end: the part of
+    the circle of *radius_m* around that end's penalty spot that lies
+    *outside* the penalty box (Law 1). It meets the box's front edge at
+    y = +/- sqrt(r^2 - dx^2), where dx is the spot-to-box-edge distance.
+    Empty if the circle doesn't reach past the box edge."""
+    spot = pitch.penalty_spot(left=left)
+    dx = pitch.box_length_m - pitch.penalty_spot_distance_m  # spot -> box edge, toward midfield
+    if dx >= radius_m:
+        return []
+    half_sweep = math.acos(max(-1.0, dx / radius_m))
+    n = max(2, math.ceil(2 * half_sweep / _ARC_STEP_RAD))
+    toward_midfield = 1.0 if left else -1.0
+    pts = []
+    for i in range(n + 1):
+        psi = -half_sweep + 2 * half_sweep * i / n
+        pts.append((spot.x + toward_midfield * radius_m * math.cos(psi), spot.y + radius_m * math.sin(psi)))
+    return pts
+
+
+def corner_arc_world_points(pitch: Pitch, sx: int, sy: int, radius_m: float = 1.0) -> list[tuple[float, float]]:
+    """World-space vertices of the corner arc: a quarter circle of *radius_m*
+    centred on the corner at (sx * half_length, sy * half_width), curving
+    inside the pitch (sx, sy in {-1, +1})."""
+    cx, cy = sx * pitch.half_length, sy * pitch.half_width
+    n = math.ceil((math.pi / 2) / _ARC_STEP_RAD)
+    return [
+        (cx - sx * radius_m * math.cos(phi), cy - sy * radius_m * math.sin(phi))
+        for phi in (math.pi / 2 * i / n for i in range(n + 1))
+    ]
+
+
+class _GoalPx(NamedTuple):
+    """One goal's integer screen coordinates (see ``Renderer._goal_px``)."""
+    line_x: int   # x of the goal line
+    bar_x: int    # x the crossbar is drawn at (goal line + apparent lean)
+    back_x: int   # x of the back of the net
+    y_top: int    # row of the top post's centre line
+    y_bot: int    # row of the bottom post's centre line
+
+
+def ball_under_goal_frame(pitch: Pitch, x: float, y: float, z: float, radius_m: float = 0.11) -> bool:
+    """True if a ball at world (x, y, z) is *inside* a goal, i.e. beneath its
+    crossbar and roof net: past the goal line, no further than the back wall,
+    between the posts, and below crossbar height. This is the case where the
+    frame should be drawn OVER the ball; a ball above the bar (going over), or
+    outside the goal, is drawn over the frame instead. Mirrors the engine's
+    own "inside the goal" test in ``ball_physics.resolve_goal_boundary``."""
+    ax = abs(x)
+    if ax <= pitch.half_length or ax > pitch.half_length + pitch.goal_depth_m + radius_m:
+        return False
+    if abs(y) > pitch.goal_width_m / 2.0 + radius_m:
+        return False
+    return z < pitch.goal_height_m
+
+
 class Renderer:
     def __init__(self, camera: Camera) -> None:
         self.camera = camera
@@ -227,6 +286,14 @@ class Renderer:
         self._ring_color_bounced: tuple = _rgb("color_bounced", style.BALL_STATE_BOUNCED_OUTLINE)
 
         # Goal net mesh
+        _pm = gcfg.get("pitch_markings", {})
+        self._spot_radius_m: float = float(_pm.get("spot_radius_m", 0.18))
+        self._penalty_arc_radius_m: float = float(_pm.get("penalty_arc_radius_m", 9.15))
+        self._corner_arc_radius_m: float = float(_pm.get("corner_arc_radius_m", 1.0))
+        _gf = gcfg.get("goal_frame", {})
+        self._crossbar_lean_m: float = float(_gf.get("crossbar_lean_m", 0.9))
+        self._goal_post_width_m: float = float(_gf.get("post_width_m", 0.16))
+        self._goal_mouth_alpha: int = int(_gf.get("mouth_alpha", 40))
         _gn = gcfg.get("goal_net", {})
         self._goal_net_spacing_m: float = float(_gn.get("spacing_m", 0.35))
         self._goal_net_alpha: int = int(_gn.get("alpha", style.GOAL_NET_ALPHA))
@@ -329,7 +396,12 @@ class Renderer:
                 phase, player.speed_mps, dt_s, self._sprite_params
             )
 
-    def draw_pitch(self, surface: pygame.Surface, pitch: Pitch) -> None:
+    def draw_pitch(self, surface: pygame.Surface, pitch: Pitch, *, goal_tops: bool = True) -> None:
+        """Draws the pitch, goals and dressing. ``goal_tops=False`` leaves out
+        the goal's "top" layer (roof net, posts, crossbar -- see
+        ``draw_goal_tops``) so the caller can draw it AFTER the ball instead;
+        ``draw_pitch_and_ball`` does exactly that when the ball is inside a
+        goal. Everything else is always drawn here."""
         surface.fill(style.PITCH_GREEN)
         cam = self.camera
         line_w = max(1, int(0.12 * cam.pixels_per_metre))
@@ -356,6 +428,7 @@ class Renderer:
         pygame.gfxdraw.aacircle(surface, centre[0], centre[1], radius_px, style.PITCH_LINE_WHITE)
         if line_w > 1:
             pygame.gfxdraw.aacircle(surface, centre[0], centre[1], max(0, radius_px - line_w + 1), style.PITCH_LINE_WHITE)
+        self._draw_pitch_spot(surface, 0.0, 0.0)
 
         # Penalty boxes and six-yard boxes, both ends.
         half_box_w = pitch.box_width_m / 2.0
@@ -365,46 +438,184 @@ class Renderer:
         rect_world(-pitch.half_length, -half_six_w, -pitch.half_length + pitch.six_yard_length_m, half_six_w)
         rect_world(pitch.half_length - pitch.six_yard_length_m, -half_six_w, pitch.half_length, half_six_w)
 
-        # Penalty spots.
+        # Penalty spots, and the penalty arcs ("D") -- the part of the circle
+        # around each spot that lies outside the penalty box.
         for left in (True, False):
             spot = pitch.penalty_spot(left=left)
-            spot_px = cam.world_to_screen(spot.x, spot.y)
-            pygame.draw.circle(surface, style.PITCH_LINE_WHITE, spot_px, max(2, line_w // 2))
+            self._draw_pitch_spot(surface, spot.x, spot.y)
+            self._draw_world_polyline(
+                surface, penalty_arc_world_points(pitch, left=left, radius_m=self._penalty_arc_radius_m), line_w,
+            )
 
-        # Goal mouths: post/crossbar outline, netting, and a coloured bar
-        # behind each showing which team defends that end.
+        # Corner arcs: a quarter circle inside each corner.
+        for sx in (-1, 1):
+            for sy in (-1, 1):
+                self._draw_world_polyline(
+                    surface, corner_arc_world_points(pitch, sx, sy, radius_m=self._corner_arc_radius_m), line_w,
+                )
+
+        # Goals: ground footprint (side/back lines + faint mouth tint) and a
+        # coloured bar behind each showing which team defends that end. The
+        # goal's "top" layer (roof net, posts, crossbar) comes last, and only
+        # here if the caller isn't going to draw it over the ball itself.
         half_goal_w = pitch.goal_width_m / 2.0
-        goal_depth_m = 2.0
-        rect_world(-pitch.half_length - goal_depth_m, -half_goal_w, -pitch.half_length, half_goal_w)
-        rect_world(pitch.half_length, -half_goal_w, pitch.half_length + goal_depth_m, half_goal_w)
-        self._draw_goal_net(surface, -pitch.half_length - goal_depth_m, -pitch.half_length, half_goal_w)
-        self._draw_goal_net(surface, pitch.half_length, pitch.half_length + goal_depth_m, half_goal_w)
+        goal_depth_m = pitch.goal_depth_m  # same depth the engine's back wall uses (ball_physics.resolve_goal_boundary)
+        for left in (True, False):
+            self._draw_goal_footprint(surface, pitch, left=left, line_w=line_w)
         self._draw_defending_marker(surface, -pitch.half_length - goal_depth_m, half_goal_w, style.TEAM_LEFT_COLOUR, faces_positive_x=False)
         self._draw_defending_marker(surface, pitch.half_length + goal_depth_m, half_goal_w, style.TEAM_RIGHT_COLOUR, faces_positive_x=True)
+        if goal_tops:
+            self.draw_goal_tops(surface, pitch)
 
         self._draw_corner_flags(surface, pitch)
         self._draw_sideline_benches(surface, pitch)
 
-    def _draw_goal_net(self, surface: pygame.Surface, x0: float, x1: float, half_goal_w: float) -> None:
-        """Fills the goal frame's footprint (back panel + the two side
-        panels, which in this top-down view all project onto the same
-        rectangle) with a translucent diagonal net mesh, drawn on an
-        isolated SRCALPHA surface sized to the box so the diagonal lines
-        clip cleanly at its edges without per-line clamping math."""
+    def _draw_pitch_spot(self, surface: pygame.Surface, x: float, y: float) -> None:
+        """A filled pitch-marking spot (centre spot / penalty spot) at world
+        (x, y). True-to-scale (`graphics.json["pitch_markings"]["spot_radius_m"]`)
+        with a 2px floor so it stays visible when the whole pitch is on screen."""
+        cx, cy = self.camera.world_to_screen(x, y)
+        r = max(2, self.camera.scale_length(self._spot_radius_m))
+        pygame.gfxdraw.filled_circle(surface, cx, cy, r, style.PITCH_LINE_WHITE)
+        pygame.gfxdraw.aacircle(surface, cx, cy, r, style.PITCH_LINE_WHITE)
+
+    def _draw_world_polyline(
+        self, surface: pygame.Surface, points_world: list[tuple[float, float]], line_w: int,
+    ) -> None:
+        """Draws an open curve given as dense world-space vertices, at the
+        same stroke width as the rest of the pitch lines. Segment count is
+        the caller's (see `penalty_arc_world_points`); at 3-degree steps the
+        joint notches a thick `draw.lines` leaves are sub-pixel, so this
+        avoids `pygame.draw.arc`, whose thick strokes tear into gaps.
+        1px lines use `aalines` for smoothness (matching the centre circle)."""
+        pts = [self.camera.world_to_screen_f(x, y) for x, y in points_world]
+        if len(pts) < 2:
+            return
+        if line_w <= 1:
+            pygame.draw.aalines(surface, style.PITCH_LINE_WHITE, False, pts)
+        else:
+            pygame.draw.lines(surface, style.PITCH_LINE_WHITE, False, pts, line_w)
+
+    def _goal_px(self, pitch: Pitch, left: bool) -> "_GoalPx":
+        """Integer screen coordinates for one goal, shared by everything that
+        draws it (footprint lines, mouth tint, net, posts, crossbar) so they
+        line up to the pixel. The two post rows are placed *symmetrically*
+        about the pitch's centre row (``y_top = c - k``, ``y_bot = c + k``)
+        rather than each being independently truncated from world coords: the
+        old independent rounding put the top post 1px inside the goal mouth
+        and the bottom post 1px outside it."""
         cam = self.camera
-        p0 = cam.world_to_screen(x0, -half_goal_w)
-        p1 = cam.world_to_screen(x1, half_goal_w)
-        left, top = min(p0[0], p1[0]), min(p0[1], p1[1])
-        w, h = abs(p1[0] - p0[0]), abs(p1[1] - p0[1])
+        line_x_w = -pitch.half_length if left else pitch.half_length
+        outward = -1.0 if left else 1.0
+        lean_m = min(self._crossbar_lean_m, pitch.goal_depth_m)
+        k = round(pitch.goal_width_m / 2.0 * cam.pixels_per_metre)
+        c = cam.world_to_screen(0.0, 0.0)[1]
+        return _GoalPx(
+            line_x=cam.world_to_screen(line_x_w, 0.0)[0],
+            bar_x=cam.world_to_screen(line_x_w + outward * lean_m, 0.0)[0],
+            back_x=cam.world_to_screen(line_x_w + outward * pitch.goal_depth_m, 0.0)[0],
+            y_top=c - k,
+            y_bot=c + k,
+        )
+
+    def _draw_goal_footprint(self, surface: pygame.Surface, pitch: Pitch, *, left: bool, line_w: int) -> None:
+        """The goal's ground-level parts: the two side lines and the back line
+        (thin, at the pitch line width -- the goal line itself is already the
+        pitch boundary), plus a faint tint over the goal mouth (the opening
+        between the goal line and the crossbar). Drawn under the ball."""
+        g = self._goal_px(pitch, left)
+        white = style.PITCH_LINE_WHITE
+        off = line_w // 2
+        x_a, x_b = sorted((g.line_x, g.back_x))
+        for y in (g.y_top, g.y_bot):
+            surface.fill(white, pygame.Rect(x_a, y - off, x_b - x_a + 1, line_w))
+        surface.fill(white, pygame.Rect(g.back_x - off, g.y_top - off, line_w, g.y_bot - g.y_top + line_w))
+
+        if self._goal_mouth_alpha > 0:
+            post_w = self._goal_post_px()
+            m_a, m_b = sorted((g.line_x, g.bar_x))
+            mouth = pygame.Surface((m_b - m_a + 1, g.y_bot - g.y_top + post_w), pygame.SRCALPHA)
+            mouth.fill((*white, self._goal_mouth_alpha))
+            surface.blit(mouth, (m_a, g.y_top - post_w // 2))
+
+    def _goal_post_px(self) -> int:
+        """Post/crossbar stroke width in px: at least 2px thicker than the
+        pitch-line-width strokes used for the net's side and back lines (so the
+        frame reads as heavier than the net behind it at any zoom), and odd so
+        the stroke is exactly centred on its row/column."""
+        ppm = self.camera.pixels_per_metre
+        line_w = max(1, int(0.12 * ppm))
+        w = max(line_w + 2, round(self._goal_post_width_m * ppm))
+        return w if w % 2 == 1 else w + 1
+
+    def draw_goal_tops(self, surface: pygame.Surface, pitch: Pitch) -> None:
+        """The goal's "top" layer for both ends: the roof net, the two posts
+        and the crossbar. Split out from ``draw_pitch`` because it must be
+        drawn OVER a ball that is inside the goal (the ball is under the roof
+        and the bar) but UNDER a ball that is above it -- see
+        ``draw_pitch_and_ball``."""
+        for left in (True, False):
+            self._draw_goal_top(surface, pitch, left=left)
+
+    def _draw_goal_top(self, surface: pygame.Surface, pitch: Pitch, *, left: bool) -> None:
+        """Gives the goal a slight 3D look in the top-down view. The crossbar
+        (2.44m up) is drawn with a little parallax -- displaced
+        `graphics.json["goal_frame"]["crossbar_lean_m"]` from the goal line,
+        *away from the pitch* (over the net) -- so it no longer hides on top
+        of the goal line, and the goal mouth (the opening between the goal line
+        on the ground and the crossbar) is visible, with the posts as the
+        lines joining their feet to the crossbar ends. The net is drawn only
+        BEYOND the crossbar (it is the roof net); the mouth itself is open.
+
+        The displacement is purely apparent (clamped to the net depth); the
+        ball's ground truth is still the goal line at x = +/-half_length
+        (Pitch.is_goal)."""
+        g = self._goal_px(pitch, left)
+        white = style.PITCH_LINE_WHITE
+        post_w = self._goal_post_px()
+        half = post_w // 2
+
+        # Roof net: from the crossbar back to the back of the net.
+        n_a, n_b = sorted((g.bar_x, g.back_x))
+        self._draw_goal_net(surface, n_a, n_b, g.y_top, g.y_bot)
+
+        # Posts (feet on the goal line -> tops at the crossbar) and crossbar.
+        p_a, p_b = sorted((g.line_x, g.bar_x))
+        for y in (g.y_top, g.y_bot):
+            surface.fill(white, pygame.Rect(p_a, y - half, p_b - p_a + 1, post_w))
+            pygame.draw.circle(surface, white, (g.line_x, y), half + 1)
+        surface.fill(white, pygame.Rect(g.bar_x - half, g.y_top - half, post_w, g.y_bot - g.y_top + post_w))
+
+    def _draw_goal_net(self, surface: pygame.Surface, x_a: int, x_b: int, y_top: int, y_bot: int) -> None:
+        """Fills the screen-space rectangle (inclusive pixel bounds) with a
+        translucent diagonal net mesh, drawn on an isolated SRCALPHA surface
+        sized to the box so the diagonal lines clip cleanly at its edges
+        without per-line clamping math."""
+        w, h = x_b - x_a + 1, y_bot - y_top + 1
         if w < 2 or h < 2:
             return
         net_surf = pygame.Surface((w, h), pygame.SRCALPHA)
-        spacing = max(2, int(self._goal_net_spacing_m * cam.pixels_per_metre))
+        spacing = max(2, int(self._goal_net_spacing_m * self.camera.pixels_per_metre))
         colour = (*self._goal_net_colour, self._goal_net_alpha)
         for i in range(-h, w, spacing):
             pygame.draw.line(net_surf, colour, (i, 0), (i + h, h), 1)
             pygame.draw.line(net_surf, colour, (i + h, 0), (i, h), 1)
-        surface.blit(net_surf, (left, top))
+        surface.blit(net_surf, (x_a, y_top))
+
+    def draw_pitch_and_ball(self, surface: pygame.Surface, pitch: Pitch, ball: Ball) -> None:
+        """Draws the pitch and the ball with the goal's top layer (roof net,
+        posts, crossbar) on the correct side of the ball, for a sense of depth:
+        a ball that is inside a goal (past the goal line, between the posts,
+        below the crossbar -- i.e. going in) is drawn UNDER the crossbar and
+        net; any other ball -- including one above the crossbar, going over --
+        is drawn OVER them. Callers draw players after this call."""
+        under = ball_under_goal_frame(
+            pitch, ball.position.x, ball.position.y, ball.position.z, ball.radius_m,
+        )
+        self.draw_pitch(surface, pitch, goal_tops=not under)
+        self.draw_ball(surface, ball)
+        if under:
+            self.draw_goal_tops(surface, pitch)
 
     def _draw_defending_marker(
         self, surface: pygame.Surface, back_x: float, half_goal_w: float,
@@ -513,6 +724,71 @@ class Renderer:
         small = pygame.transform.smoothscale(big, (size, size))
         surface.blit(small, (pos[0] - size // 2, pos[1] - size // 2))
 
+    def _ball_dots_layer(
+        self, radius_px: int, orientation=None, dot_positions=None,
+    ) -> tuple[pygame.Surface, int]:
+        """The ball's spin dots as an SRCALPHA layer (and its half-size ``pad``,
+        for centring it on the ball), clipped to the ball's disc.
+
+        Drawn at ``_RING_SUPERSAMPLE``x resolution with plain
+        ``pygame.draw.polygon`` and downscaled with ``smoothscale`` -- the same
+        technique as ``_draw_ring``. The previous ``gfxdraw.filled_polygon`` +
+        ``gfxdraw.aapolygon`` pair, both alpha-blending onto a transparent
+        layer, left visible defects on these small dots (~8px across at
+        normal zoom): the fill stops short of the polygon's four extreme
+        vertices while the AA pass only covers 10-30% of the pixels there, so
+        near-white pixels (measured 210-248 against a dark ~85 interior) sat
+        in the middle of the dark dot as cross-shaped notches, and the
+        double-blended alpha made the interior lighter (~85) than the
+        intended colour (~62 on a white ball). Supersample-then-downscale
+        area-averages instead, so edges get a proper gradient and there are
+        no holes; the clip disc is supersampled the same way.
+
+        ``orientation`` / ``dot_positions`` default to the live ball's; they
+        are parameters so the layer can be unit-tested for a single dot."""
+        scale = self._RING_SUPERSAMPLE
+        orbit_r = radius_px * self._spin_orbit_frac
+        dot_r = max(1, int(radius_px * self._spin_dot_radius_frac))
+        pad = int(orbit_r) + dot_r + 2
+        big_size = pad * 2 * scale
+        centre = pad * scale
+        big = pygame.Surface((big_size, big_size), pygame.SRCALPHA)
+        R = self._ball_orientation if orientation is None else orientation
+        positions = self._ball_dot_positions if dot_positions is None else dot_positions
+        dot_epsilon = dot_r / orbit_r if orbit_r > 0 else 0.0
+        dot_colour = (*self._spin_dot_color, 220)
+        orbit_big = orbit_r * scale
+        for (lx, ly, lz) in positions:
+            wx = R[0][0]*lx + R[0][1]*ly + R[0][2]*lz
+            wy = R[1][0]*lx + R[1][1]*ly + R[1][2]*lz
+            wz = R[2][0]*lx + R[2][1]*ly + R[2][2]*lz
+            if wz < 0:
+                continue  # back hemisphere -- hidden from top-down camera
+            # Tangent basis (u, v) perpendicular to (wx, wy, wz): pick an
+            # "up" reference not nearly parallel to it, to keep the cross
+            # product well-conditioned near the poles.
+            up = (0.0, 1.0, 0.0) if abs(wz) > 0.9 else (0.0, 0.0, 1.0)
+            ux, uy, uz = wy*up[2] - wz*up[1], wz*up[0] - wx*up[2], wx*up[1] - wy*up[0]
+            ulen = math.sqrt(ux*ux + uy*uy + uz*uz) or 1.0
+            ux, uy, uz = ux/ulen, uy/ulen, uz/ulen
+            vx, vy, vz = wy*uz - wz*uy, wz*ux - wx*uz, wx*uy - wy*ux
+            poly = []
+            for k in range(self._DOT_POLY_SEGMENTS):
+                theta = 2 * math.pi * k / self._DOT_POLY_SEGMENTS
+                ct, st = math.cos(theta), math.sin(theta)
+                ex = wx + dot_epsilon * (ct*ux + st*vx)
+                ey = wy + dot_epsilon * (ct*uy + st*vy)
+                ez = wz + dot_epsilon * (ct*uz + st*vz)
+                elen = math.sqrt(ex*ex + ey*ey + ez*ez) or 1.0
+                poly.append((round(centre + (ex/elen)*orbit_big), round(centre - (ey/elen)*orbit_big)))
+            pygame.draw.polygon(big, dot_colour, poly)
+        # Clip dots inside the outline so they don't bleed over the alpha border.
+        clip = pygame.Surface((big_size, big_size), pygame.SRCALPHA)
+        clip_r = max(1, radius_px - int(max(1, self._ball_outline_width)))
+        pygame.draw.circle(clip, (255, 255, 255, 255), (centre, centre), clip_r * scale)
+        big.blit(clip, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
+        return pygame.transform.smoothscale(big, (pad * 2, pad * 2)), pad
+
     def draw_ball(self, surface: pygame.Surface, ball: Ball) -> None:
         cam = self.camera
         pos = cam.world_to_screen(ball.position.x, ball.position.y)
@@ -609,44 +885,8 @@ class Renderer:
         # through the same rotation + orthographic projection as the centre
         # point. The correct ellipse (or near-silhouette sliver) shape falls
         # out automatically, with no separate foreshortening-factor math.
-        orbit_r = radius_px * self._spin_orbit_frac
-        dot_r = max(1, int(radius_px * self._spin_dot_radius_frac))
-        pad = int(orbit_r) + dot_r + 2
-        ds = pygame.Surface((pad * 2, pad * 2), pygame.SRCALPHA)
-        R = self._ball_orientation
-        dot_epsilon = dot_r / orbit_r if orbit_r > 0 else 0.0
-        dot_colour = (*self._spin_dot_color, 220)
-        for (lx, ly, lz) in self._ball_dot_positions:
-            wx = R[0][0]*lx + R[0][1]*ly + R[0][2]*lz
-            wy = R[1][0]*lx + R[1][1]*ly + R[1][2]*lz
-            wz = R[2][0]*lx + R[2][1]*ly + R[2][2]*lz
-            if wz < 0:
-                continue  # back hemisphere — hidden from top-down camera
-            # Tangent basis (u, v) perpendicular to (wx, wy, wz): pick an
-            # "up" reference not nearly parallel to it, to keep the cross
-            # product well-conditioned near the poles.
-            up = (0.0, 1.0, 0.0) if abs(wz) > 0.9 else (0.0, 0.0, 1.0)
-            ux, uy, uz = wy*up[2] - wz*up[1], wz*up[0] - wx*up[2], wx*up[1] - wy*up[0]
-            ulen = math.sqrt(ux*ux + uy*uy + uz*uz) or 1.0
-            ux, uy, uz = ux/ulen, uy/ulen, uz/ulen
-            vx, vy, vz = wy*uz - wz*uy, wz*ux - wx*uz, wx*uy - wy*ux
-            poly = []
-            for k in range(self._DOT_POLY_SEGMENTS):
-                theta = 2 * math.pi * k / self._DOT_POLY_SEGMENTS
-                ct, st = math.cos(theta), math.sin(theta)
-                ex = wx + dot_epsilon * (ct*ux + st*vx)
-                ey = wy + dot_epsilon * (ct*uy + st*vy)
-                ez = wz + dot_epsilon * (ct*uz + st*vz)
-                elen = math.sqrt(ex*ex + ey*ey + ez*ez) or 1.0
-                poly.append((int(pad + (ex/elen)*orbit_r), int(pad - (ey/elen)*orbit_r)))
-            pygame.gfxdraw.filled_polygon(ds, poly, dot_colour)
-            pygame.gfxdraw.aapolygon(ds, poly, dot_colour)
-        # Clip dots inside the outline so they don't bleed over the alpha border
-        clip = pygame.Surface((pad * 2, pad * 2), pygame.SRCALPHA)
-        clip_r = max(1, radius_px - int(max(1, self._ball_outline_width)))
-        pygame.draw.circle(clip, (255, 255, 255, 255), (pad, pad), clip_r)
-        ds.blit(clip, (0, 0), special_flags=pygame.BLEND_RGBA_MIN)
-        surface.blit(ds, (pos[0] - pad, pos[1] - pad))
+        layer, pad = self._ball_dots_layer(radius_px)
+        surface.blit(layer, (pos[0] - pad, pos[1] - pad))
 
         if ball.height_m > 0.15:
             label = self.hud_font.render(f"{ball.height_m:.1f}m", True, style.HUD_TEXT)
@@ -1078,6 +1318,10 @@ class Renderer:
         """Draws the most recent log entries as a scrolling text box in the
         bottom-right corner of the screen.  Newest entries at the bottom.
         No interactive scrollbar — intentionally simple for a playtesting tool.
+        Runs of consecutive identical messages are merged into one row
+        (``GameLog.collapsed_entries``): the clock shows the first-last time
+        range and the message gets a trailing "(Nx)", so spam can't crowd
+        every other event out of the few visible lines.
         Each row is prefixed with its ``entry.time_s`` as elapsed match
         clock, MM:SS.mmm (``_format_match_clock``) -- millisecond precision
         so events logged close together are distinguishable, not all
@@ -1093,7 +1337,7 @@ class Renderer:
         before this param existed.
         """
         from footballcoach.ui.gamelog import LogLevel
-        entries = game_log.entries_above(min_level)[-max_lines:]
+        entries = game_log.collapsed_entries(min_level)[-max_lines:]
         linger_frac = getattr(game_log, "linger_frac", 0.0)  # 0.0 = not lingering
         show_linger = linger_frac > 0.0
         if not entries and not show_linger:
@@ -1119,14 +1363,30 @@ class Renderer:
             colour = style.HUD_TEXT if entry.level == LogLevel.INFO else style.HOTKEY_DISABLED
             row_y = box_y + 3 + i * line_h
 
-            clock = self.hud_font.render(_format_match_clock(entry.time_s), True, style.HOTKEY_DISABLED)
+            # A merged run of identical messages shows its first-last clock
+            # range (just the one clock if they all landed on the same tick)
+            # and a trailing "(Nx)" -- see GameLog.collapsed_entries.
+            clock_text = _format_match_clock(entry.time_s)
+            if entry.end_time_s is not None and entry.end_time_s != entry.time_s:
+                clock_text += "-" + _format_match_clock(entry.end_time_s)
+            clock = self.hud_font.render(clock_text, True, style.HOTKEY_DISABLED)
             surface.blit(clock, (box_x + 4, row_y))
             msg_x = box_x + 4 + clock.get_width() + 8
 
-            # Shorter than before this row also carried a clock prefix --
-            # box_w is a fixed width, not sized to content, so truncation
-            # length has to leave room for it.
-            line_text = entry.message[:44] if entry.detail is not None else entry.message[:56]
+            # box_w is a fixed width, not sized to content, so trim the
+            # message to whatever pixel width is left after the clock (wider
+            # on a merged row), the "(Nx)" count and any "[Explain]" suffix.
+            # The message itself is what gets cut, so the count and [Explain]
+            # are never the parts that fall off the end of the box.
+            count_suffix = f" ({entry.count}x)" if entry.count > 1 else ""
+            reserved_w = self.hud_font.size(count_suffix)[0] if count_suffix else 0
+            if entry.detail is not None:
+                reserved_w += self.hud_font.size(" [Explain]")[0]
+            max_msg_w = box_w - (msg_x - box_x) - reserved_w - 6
+            msg_text = entry.message
+            while len(msg_text) > 1 and self.hud_font.size(msg_text)[0] > max_msg_w:
+                msg_text = msg_text[:-1]
+            line_text = msg_text + count_suffix
             text = self.hud_font.render(line_text, True, colour)
             surface.blit(text, (msg_x, row_y))
             if entry.detail is not None:

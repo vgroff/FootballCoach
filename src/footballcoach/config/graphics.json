@@ -76,6 +76,18 @@
     "color_rolling": [180, 255, 180],
     "color_bounced": [255, 210, 80]
   },
+  "pitch_markings": {
+    "_comment": "Cosmetic pitch-line details (ui/renderer.py draw_pitch). spot_radius_m: centre spot and penalty spots (true-to-scale, with a 2px on-screen floor; the real mark is ~0.11m, bumped up so it reads next to the line width). penalty_arc_radius_m: radius of the arc outside each penalty box, centred on the penalty spot (Law 1: 9.15m). corner_arc_radius_m: quarter-circle at each corner (Law 1: 1m).",
+    "spot_radius_m": 0.18,
+    "penalty_arc_radius_m": 9.15,
+    "corner_arc_radius_m": 1.0
+  },
+  "goal_frame": {
+    "_comment": "Slight 3D look for the goal frame in the top-down view (ui/renderer.py _draw_goal_frame). crossbar_lean_m: how far (world metres) the crossbar is drawn displaced from the goal line, away from the pitch -- a purely apparent parallax for its 2.44m height, clamped to the net depth; 0 = crossbar hidden exactly on the goal line (the old flat look). The net is drawn only behind the crossbar (the roof); the mouth in front of it is open. post_width_m: post/crossbar stroke width in world metres, but never less than 2px thicker than the pitch-line-width strokes of the net's side/back lines (and rounded up to an odd pixel count so it centres exactly), so the frame always reads heavier than the net. mouth_alpha: 0-255 tint over the goal mouth (the opening between goal line and crossbar); 0 = none.",
+    "crossbar_lean_m": 0.9,
+    "post_width_m": 0.30,
+    "mouth_alpha": 40
+  },
   "goal_net": {
     "_comment": "Diagonal mesh drawn inside each goal frame. spacing_m: gap between mesh lines in world metres (smaller = denser mesh). alpha: 0=invisible, 255=fully opaque. color: RGB.",
     "spacing_m": 0.35,

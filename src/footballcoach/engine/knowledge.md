@@ -1113,3 +1113,13 @@ Order-based path):
 - AI must be punished for illegal attempts AND the engine must be a safe
   no-op — both protections coexist where implemented (see design doc 9.7);
   currently that's tackle only, per above.
+
+
+## Action opportunity accounting (2026-09-21)
+
+`Match.tick_index` (completed physics ticks) stamps events. `Player.opportunity` (`entities/action_opportunity.py`)
+records the FIRST tick per decision interval at which a kick (`Player.can_kick`, or a loose-ball pickup inside
+`_update_loose_ball_pickup`) or an armed tackle (`Match._tackle_contact_possible`, evaluated for every player before any
+tackle resolves) could take effect; `Player.tackle_fire_count` counts armed tackles that reached contact
+(`_check_armed_tackles`). `Player.can_kick` and `Match._tackle_contact_possible` are the single validity predicates,
+shared by execution and by the accounting -- do not re-implement either. See ai/knowledge.md "Action-opportunity flags".

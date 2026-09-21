@@ -354,6 +354,11 @@ def augment_batch(
                 "dones":          batch["dones"],
                 "sample_weights": batch["sample_weights"],
             }
+            if "mc_returns" in batch:
+                # Optional pure-MC return targets (ppg_value_refit's
+                # compare-to-original diagnostic): a per-row scalar, not
+                # geometric -- pass through like returns.
+                part["mc_returns"] = batch["mc_returns"]
             if has_head_log_probs:
                 # Per-head log_probs are not geometric (they're scalars per
                 # head, not positional/directional) — pass through unchanged,

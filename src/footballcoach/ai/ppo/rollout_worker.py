@@ -115,6 +115,10 @@ def _worker_main(
         episode_comp_accum: dict[str, float] = {}
         episode_comp_list: list[dict[str, float]] = []
         episode_durations_s: list[float] = []
+        episode_kick_counts: list[int] = []
+        episode_armed_kick_counts: list[int] = []
+        episode_kick_accum = 0
+        episode_armed_kick_accum = 0
         # live=False: several worker processes share one inherited terminal,
         # so a live \r-updating bar per worker would stomp on the others' --
         # coarse milestone lines are safe since each is newline-terminated.
@@ -131,6 +135,14 @@ def _worker_main(
         collected = 0
         while collected < n_steps:
             next_obs, reward, done, info = env.step()
+            if info is not None:
+                episode_kick_accum += info.trainee_kicks_this_step
+                episode_armed_kick_accum += info.trainee_armed_kicks_this_step
+            if done:
+                episode_kick_counts.append(episode_kick_accum)
+                episode_armed_kick_counts.append(episode_armed_kick_accum)
+                episode_kick_accum = 0
+                episode_armed_kick_accum = 0
             tr = env.last_trainee_transition
             if tr is None:
                 if done:
@@ -245,6 +257,8 @@ def _worker_main(
                 "episode_outcomes_vs_immobile": episode_outcomes_vs_immobile,
                 "episode_comp_list": episode_comp_list,
                 "episode_durations_s": episode_durations_s,
+                "episode_kick_counts": episode_kick_counts,
+                "episode_armed_kick_counts": episode_armed_kick_counts,
             },
         }
 

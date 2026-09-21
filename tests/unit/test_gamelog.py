@@ -81,6 +81,83 @@ def test_empty_log_returns_empty_list():
 
 
 # ---------------------------------------------------------------------------
+# collapsed_entries: consecutive identical messages merge into one row
+# ---------------------------------------------------------------------------
+
+def test_collapse_merges_consecutive_identical_messages():
+    log = GameLog()
+    log.add(LogLevel.INFO, "p1 tackles", time_s=1.0)
+    log.add(LogLevel.INFO, "p1 tackles", time_s=2.0)
+    rows = log.collapsed_entries(LogLevel.INFO)
+    assert len(rows) == 1
+    assert rows[0].message == "p1 tackles"
+    assert rows[0].count == 2
+    assert rows[0].time_s == 1.0
+    assert rows[0].end_time_s == 2.0
+
+
+def test_collapse_does_not_merge_across_a_different_message():
+    log = GameLog()
+    log.add(LogLevel.INFO, "a", time_s=1.0)
+    log.add(LogLevel.INFO, "b", time_s=2.0)
+    log.add(LogLevel.INFO, "a", time_s=3.0)
+    rows = log.collapsed_entries(LogLevel.INFO)
+    assert [(r.message, r.count) for r in rows] == [("a", 1), ("b", 1), ("a", 1)]
+
+
+def test_collapse_merges_across_filtered_out_debug_lines_in_info_view():
+    log = GameLog()
+    log.add(LogLevel.INFO, "tackle", time_s=1.0)
+    log.add(LogLevel.DEBUG, "roll breakdown", time_s=1.0)
+    log.add(LogLevel.INFO, "tackle", time_s=2.0)
+    info_rows = log.collapsed_entries(LogLevel.INFO)
+    assert [(r.message, r.count) for r in info_rows] == [("tackle", 2)]
+    # In DEBUG view the DEBUG line is visible between them, so no merge.
+    debug_rows = log.collapsed_entries(LogLevel.DEBUG)
+    assert [(r.message, r.count) for r in debug_rows] == [("tackle", 1), ("roll breakdown", 1), ("tackle", 1)]
+
+
+def test_collapse_does_not_merge_same_message_at_different_levels():
+    log = GameLog()
+    log.add(LogLevel.INFO, "same", time_s=1.0)
+    log.add(LogLevel.DEBUG, "same", time_s=2.0)
+    assert [r.count for r in log.collapsed_entries(LogLevel.DEBUG)] == [1, 1]
+
+
+def test_collapse_keeps_latest_detail_and_leaves_raw_entries_untouched():
+    log = GameLog()
+    log.add(LogLevel.INFO, "tackle", time_s=1.0, detail="roll 0.3")
+    log.add(LogLevel.INFO, "tackle", time_s=2.0, detail="roll 0.9")
+    log.add(LogLevel.INFO, "tackle", time_s=3.0)
+    rows = log.collapsed_entries(LogLevel.INFO)
+    assert len(rows) == 1 and rows[0].count == 3
+    assert rows[0].detail is None  # latest occurrence had no detail
+    raw = log.all_entries
+    assert len(raw) == 3
+    assert [e.count for e in raw] == [1, 1, 1]
+    assert [e.end_time_s for e in raw] == [1.0, 2.0, 3.0]
+    assert raw[0].detail == "roll 0.3"
+
+
+def test_collapse_single_entry_has_count_one_and_equal_end_time():
+    log = GameLog()
+    log.add(LogLevel.INFO, "solo", time_s=4.5)
+    (row,) = log.collapsed_entries(LogLevel.INFO)
+    assert row.count == 1
+    assert row.end_time_s == row.time_s == 4.5
+
+
+def test_collapse_calling_twice_is_stable():
+    """collapsed_entries builds fresh rows each call (it runs every frame),
+    so repeated calls must not accumulate counts."""
+    log = GameLog()
+    log.add(LogLevel.INFO, "x", time_s=1.0)
+    log.add(LogLevel.INFO, "x", time_s=2.0)
+    assert log.collapsed_entries(LogLevel.INFO)[0].count == 2
+    assert log.collapsed_entries(LogLevel.INFO)[0].count == 2
+
+
+# ---------------------------------------------------------------------------
 # Tackle-logging plumbing tests
 # ---------------------------------------------------------------------------
 

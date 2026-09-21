@@ -104,6 +104,21 @@ class MaskedCategorical:
 # Squashed Normal (continuous heads: move target, region, kick power, etc.)
 # ---------------------------------------------------------------------------
 
+def kick_power_from_raw(raw: torch.Tensor, floor: float = 0.0) -> torch.Tensor:
+    """Physical kick power fraction from the kick_power head's raw output:
+    ``floor + (1 - floor) * sigmoid(raw)`` -- the same mapping
+    ``SquashedNormalHead(low=floor, high=1.0).to_physical`` applies. floor=0.0
+    is the plain sigmoid. Single source of truth for every place that turns a
+    raw kick_power value into a power fraction outside the head itself."""
+    return floor + (1.0 - floor) * torch.sigmoid(raw)
+
+
+def configured_kick_power_floor() -> float:
+    """ai_config.json ``ppo.kick_power_floor`` (0.0 when absent)."""
+    from footballcoach.ai.config import load_ai_config
+    return float(load_ai_config().get("ppo", {}).get("kick_power_floor", 0.0))
+
+
 class SquashedNormalHead:
     """Gaussian (Normal) policy head with post-sample squashing.
 

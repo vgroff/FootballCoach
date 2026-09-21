@@ -82,7 +82,7 @@ def test_player_chasing_slow_ball_near_sideline_does_not_carry_it_out():
             got_possession = True
         # Real-time boundary check every tick, not just at the end -- the
         # ball must never leave the pitch, at any point in the chase.
-        assert abs(match.ball.position.y) <= pitch.half_width + 0.5, (
+        assert abs(match.ball.position.y) <= pitch.half_width + match.ball.radius_m, (
             f"ball carried out of bounds over the sideline (y={match.ball.position.y:.2f}, "
             f"boundary={pitch.half_width:.2f}) by the player's own sprint momentum after "
             f"picking up an almost-stationary ball"
@@ -116,7 +116,7 @@ def test_player_chasing_slow_ball_near_goal_line_does_not_carry_it_out():
         match.step()
         if match.ball.possessed_by == "p1":
             got_possession = True
-        assert abs(match.ball.position.x) <= pitch.half_length + 1.0, (
+        assert abs(match.ball.position.x) <= pitch.half_length + match.ball.radius_m, (
             f"ball carried out of bounds over the goal line (x={match.ball.position.x:.2f}, "
             f"boundary={pitch.half_length:.2f}) by the player's own sprint momentum after "
             f"picking up an almost-stationary ball"

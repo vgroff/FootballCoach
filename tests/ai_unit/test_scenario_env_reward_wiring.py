@@ -15,6 +15,8 @@ from __future__ import annotations
 import copy
 import math
 
+import pytest
+
 from footballcoach.ai.config import load_ai_config
 from footballcoach.ai.env.scenario_env import ScenarioEnv
 from footballcoach.mathutils.vector3 import Vector3
@@ -268,6 +270,69 @@ class TestPhase1RewardWiring:
             "ordinary (unarmed) kick attempt. If this is nonzero, "
             "kick_attempt_was_armed_this_step is not gating 'katt'."
         )
+
+    def test_fired_armed_kick_still_pays_karm_but_possession_kick_stays_free(self):
+        """With action.kick_one_shot the armed intent is dropped the moment an armed kick fires, so the boundary
+        kick_armed flag reads False for it -- it must still pay 'karm' (the cost 'katt' offsets); an ordinary
+        in-possession kick (never armed) must pay neither."""
+        env = _make_env()
+        env._reward_cfg["phase1"] = {
+            **env._reward_cfg["phase1"],
+            "kick_armed_penalty_per_second": -0.2,
+            "kick_attempt_bonus_multiplier": 1.0,
+        }
+        env.reset()
+        match = env._loop.match
+        player = match.player_by_id("trainee")
+        player.kick_armed = False
+
+        _kw = dict(
+            player_id="trainee", player_obj=player, ball_pos=match.ball.position,
+            start_stamina=env._trainee_start_stamina,
+            prev_ball_dist=1.0, curr_ball_dist=1.0,
+            has_possession_now=False, gained_possession_this_step=False,
+            lost_possession_this_step=False, ball_progress_toward_goal_m=0.0,
+            ball_went_out_after_touch=False, illegal_action_attempted=False,
+            reached_opponent_box_with_possession=False,
+            opponent_reached_trainee_box=False, timed_out=False, episode_done=False,
+        )
+        _, fired_armed, _ = env._compute_phase1_reward_for_player(
+            **_kw, kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True)
+        assert fired_armed["karm"] < 0.0 and fired_armed["katt"] > 0.0
+        assert fired_armed["katt"] == pytest.approx(-fired_armed["karm"])
+        _, possession_kick, _ = env._compute_phase1_reward_for_player(
+            **_kw, kick_attempted_this_step=True, kick_attempt_was_armed_this_step=False)
+        assert possession_kick["karm"] == 0.0 and possession_kick["katt"] == 0.0
+
+    def test_tackle_armed_while_possessing_multiplier_applies_through_wiring(self):
+        """Arming while holding the ball is now reachable (action.arm_tackle_without_carrier); it must cost
+        tackle_armed_while_possessing_multiplier times the ordinary armed cost."""
+        env = _make_env()
+        env._reward_cfg["phase1"] = {
+            **env._reward_cfg["phase1"],
+            "tackle_armed_penalty_per_second": -0.2,
+            "tackle_armed_while_possessing_multiplier": 2.5,
+        }
+        env.reset()
+        match = env._loop.match
+        player = match.player_by_id("trainee")
+        player.tackle_armed = True
+
+        def _tack(has_ball):
+            _, comps, _ = env._compute_phase1_reward_for_player(
+                player_id="trainee", player_obj=player, ball_pos=match.ball.position,
+                start_stamina=env._trainee_start_stamina,
+                prev_ball_dist=1.0, curr_ball_dist=1.0,
+                has_possession_now=has_ball, gained_possession_this_step=False,
+                lost_possession_this_step=False, ball_progress_toward_goal_m=0.0,
+                ball_went_out_after_touch=False, illegal_action_attempted=False,
+                reached_opponent_box_with_possession=False,
+                opponent_reached_trainee_box=False, timed_out=False, episode_done=False,
+            )
+            return comps["tack"]
+
+        assert _tack(False) < 0.0
+        assert _tack(True) == pytest.approx(2.5 * _tack(False))
 
     def test_stamina_penalty_nonzero_on_episode_done_when_stamina_used(self):
         """'stam' must reflect actual stamina drop on episode_done=True --

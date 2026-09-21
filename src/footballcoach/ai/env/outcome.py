@@ -169,15 +169,23 @@ def detect_trial_outcome(
     ball = match.ball
     scoreboard = match.scoreboard
 
-    if abs(ball.position.x) > pitch.half_length + 1.0:
-        match.notify_ball_out()
-        return "miss", True
-    if abs(ball.position.y) > pitch.half_width + 0.5:
-        match.notify_ball_out()
-        return "miss", True
-
+    # A goal must be checked before "out": Match scores it the tick the ball's
+    # centre crosses the goal line inside the mouth, but a hard shot moves
+    # ~0.7 m per tick, so the same tick can already put the centre more than a
+    # ball radius past the line.
     if (scoreboard.left_goals, scoreboard.right_goals) != initial_scoreboard:
         return "goal", False
+
+    # Laws of the Game, Law 9: the ball is out of play when the WHOLE ball has
+    # crossed the WHOLE line (on the ground or in the air), i.e. its centre is
+    # more than one ball radius beyond the painted line.
+    out_margin_m = ball.radius_m
+    if (
+        abs(ball.position.x) > pitch.half_length + out_margin_m
+        or abs(ball.position.y) > pitch.half_width + out_margin_m
+    ):
+        match.notify_ball_out()
+        return "miss", True
 
     if ball_released:
         if ball.possessed_by is not None and ball.possessed_by != initial_carrier_id:

@@ -110,6 +110,73 @@ class ScenarioParamsUIState:
         self.values = {}
 
 
+# Content of the in-match help overlay (`App._draw_help_overlay`): sections of
+# (key/label, description) rows. Descriptions are word-wrapped to the column, so
+# keep them short. Keep in sync with ui/input.py and `App._handle_keydown`.
+_HELP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
+    ("Mouse", [
+        ("Left-click player", "select them (either team; an opponent is inspect-only). "
+                              "Side panel shows AI, current order, attributes"),
+        ("Left-click selected", "if they have the ball: start kick aiming (below)"),
+        ("Left-click ground", "move the selected player there (sprinting)"),
+        ("Right-click opponent", "get possession: selected player chases the ball / "
+                                 "carrier and tackles on contact"),
+    ]),
+    ("Kick aiming (match pauses; 3 clicks)", [
+        ("1. Direction", "mouse sets aim + power (further = harder). Click"),
+        ("2. Loft", "mouse near the player = high lob, far = flat. Click"),
+        ("3. Spin", "mouse angle = axis, distance = amount. Click to fire"),
+        ("Mouse wheel", "fine-tune the current phase"),
+        ("Right-click", "back one phase (cancels from phase 1)"),
+        ("Esc", "cancel aiming and resume"),
+    ]),
+    ("Keys (act on the selected player)", [
+        ("K", "kick aiming if they have the ball; otherwise shoot mode: "
+              "next click aims a full-power shot"),
+        ("P", "pass mode: next click (player or ground) passes there"),
+        ("S", "save (goalkeeper only)"),
+        ("X", "stop: decelerate to a standstill"),
+        ("N", "training mode only: cycle trainee human / neural checkpoints"),
+    ]),
+    ("Match controls", [
+        ("Space", "pause / resume. Any new order resumes play; a completed "
+                  "order pauses it"),
+        ("] / [", "sim speed up / down (0.25x-8x); [-]/[+] control top right"),
+        ("Z", "step ball-follow zoom (1x-5x); [-]/[+] control top right"),
+        ("L", "game log level: INFO / DEBUG. Repeated messages merge as (Nx)"),
+        ("H", "toggle this help"),
+        ("Esc", "close help, cancel mode, then back to menu"),
+    ]),
+    ("Indicators", [
+        ("White ring", "has the ball"),
+        ("Yellow ring", "selected"),
+        ("Cyan ring", "first-touch control delay"),
+        ("Red ring", "inactive (just tackled); also drawn translucent"),
+        ("Pulsing red ring", "low stamina"),
+        ("Orange", "goalkeeper"),
+        ("Bars under player", "stamina (top), speed (bottom)"),
+        ("Icon above player", "recent kick / tackle / goalkeeper action"),
+        ("Ball ring", "blue airborne, green rolling, amber just bounced"),
+    ]),
+]
+
+
+def _wrap_help_text(font: pygame.font.Font, text: str, max_w: int) -> list[str]:
+    """Greedy word-wrap of *text* to *max_w* pixels for the help overlay. A
+    single word wider than *max_w* is left on its own line, not split."""
+    lines: list[str] = []
+    current = ""
+    for word in text.split():
+        candidate = word if not current else current + " " + word
+        if current and font.size(candidate)[0] > max_w:
+            lines.append(current)
+            current = word
+        else:
+            current = candidate
+    lines.append(current)
+    return lines
+
+
 class App:
     # Below this, HUD chrome (hotkey bar, game log, help button, ...) has
     # nowhere left to lay out -- see _handle_resize.
@@ -913,17 +980,18 @@ class App:
         assert self.match is not None and self.input_controller is not None
         if self.camera.zoomed:
             self.camera.follow(self.match.ball.position.x, self.match.ball.position.y)
-        self.renderer.draw_pitch(self.surface, self.match.pitch)
 
         selected_id = self.input_controller.selected_player_id
         carrier_id = self.match.ball.possessed_by
         if not self.match.paused:
             self.renderer.update_player_animations(self.match.players, 1.0 / self._target_fps)
             self.renderer.update_ball_effects(self.match.ball, 1.0 / self._target_fps)
-        # Ball drawn before players (not after) so a player standing over it
-        # -- e.g. the carrier dribbling -- renders on top rather than the
-        # ball covering up the (now much bigger/more detailed) player sprite.
-        self.renderer.draw_ball(self.surface, self.match.ball)
+        # Pitch, then ball, with the goal's crossbar/net drawn over a ball that
+        # is inside the goal and under one that is above it. Ball drawn before
+        # players (not after) so a player standing over it -- e.g. the carrier
+        # dribbling -- renders on top rather than the ball covering up the
+        # (now much bigger/more detailed) player sprite.
+        self.renderer.draw_pitch_and_ball(self.surface, self.match.pitch, self.match.ball)
 
         # Draw the ball carrier last among players so they render on top of
         # every other player, per the design spec.
@@ -1079,46 +1147,46 @@ class App:
         title = self.renderer.title_font.render("Controls", True, style.HUD_ACCENT)
         self.surface.blit(title, (60, 40))
 
-        lines = [
-            "Click a player           - select them (click again to deselect)",
-            "Click a team-mate        - switch selection (or pass to them in Pass mode)",
-            "Click an opponent        - select them too, for inspection only (see side panel below)",
-            "Click empty ground       - move there (sprinting)",
-            "Click-drag from selected - kick: drag direction=aim, length=power (only if they have the ball)",
-            "Hold Shift while dragging- loft/chip the kick instead of driving it low",
-            "P                        - pass mode: next click (ground or player) passes there",
-            "K                        - shoot mode: next click sets the aim point for a full-power shot",
-            "S                        - issue a Save order (goalkeeper only): tracks and blocks shots",
-            "X                        - stop: decelerate selected player to a standstill",
-            "Selecting a player       - side panel shows their AI type, current order, attributes",
-            "Right-click an opponent  - get possession: selected player chases/tackles them",
-            "                           (this replaces the old left-click-opponent behaviour)",
-            "N (training mode only)   - cycle trainee: human -> neural (checkpoint 1) -> ... -> human.",
-            "                           While neural, clicks/kicks still take over for one order.",
-            "Space                    - pause/resume the simulation",
-            "] / [                    - increase / decrease simulation speed (0.2x-8x)",
-            "[-]/[+] control (top right) - same simulation speed control, via mouse",
-            "Z or [-]/[+] Zoom control - step the ball-follow camera zoom (1.0x-5.0x)",
-            "H or Help button         - toggle this help overlay",
-            "L                        - cycle game log level (INFO / DEBUG)",
-            "Esc                      - close this overlay, or return to the menu / quit",
-            "",
-            "Visual indicators:",
-            "White outline            - player currently in possession of the ball",
-            "Cyan ring                - player mid first-touch control delay",
-            "Red ring                 - player temporarily inactive (just tackled)",
-            "Orange fill              - goalkeeper",
-            "Translucent              - player is temporarily inactive (just tackled, or",
-            "                           just missed a tackle attempt)",
-            "Blue ball ring           - ball airborne",
-            "Green ball ring          - ball rolling",
-            "Amber ball ring          - ball just bounced",
-        ]
-        y = 100
-        for line in lines:
-            rendered = self.renderer.hud_font.render(line, True, style.HUD_TEXT)
-            self.surface.blit(rendered, (60, y))
-            y += rendered.get_height() + 6
+        font = self.renderer.hud_font
+        line_h = font.get_linesize() + 3
+        top, bottom_margin, side, col_gap, block_gap = 100, 40, 60, 30, 10
+        min_col_w = 440
+        sw = self.camera.screen_width
+        # As many columns as fit at min_col_w; sections flow down a column and
+        # move to the next when one won't fit, so nothing runs off the bottom
+        # at the default window size the way the old single list did.
+        n_cols = max(1, (sw - 2 * side + col_gap) // (min_col_w + col_gap))
+        col_w = (sw - 2 * side - col_gap * (n_cols - 1)) // n_cols
+        key_w = min(max(font.size(k)[0] for _, rows in _HELP_SECTIONS for k, _ in rows) + 14, col_w // 2)
+        desc_w = col_w - key_w
+
+        blocks: list[list[tuple[str, str, str]]] = []
+        for heading, rows in _HELP_SECTIONS:
+            block = [("heading", heading, "")]
+            for key, desc in rows:
+                wrapped = _wrap_help_text(font, desc, desc_w)
+                block.append(("row", key, wrapped[0]))
+                block.extend(("cont", "", w) for w in wrapped[1:])
+            blocks.append(block)
+
+        max_y = self.camera.screen_height - bottom_margin
+        col, y = 0, top
+        for block in blocks:
+            block_h = len(block) * line_h + block_gap
+            if y > top and y + block_h > max_y and col < n_cols - 1:
+                col, y = col + 1, top
+            x = side + col * (col_w + col_gap)
+            for kind, key, text in block:
+                if kind == "heading":
+                    self.surface.blit(font.render(key, True, style.HUD_ACCENT), (x, y))
+                    rule_y = y + font.get_linesize() + 1
+                    pygame.draw.line(self.surface, style.HOTKEY_DISABLED, (x, rule_y), (x + col_w - 10, rule_y))
+                else:
+                    if key:
+                        self.surface.blit(font.render(key, True, style.HUD_ACCENT), (x, y))
+                    self.surface.blit(font.render(text, True, style.HUD_TEXT), (x + key_w, y))
+                y += line_h
+            y += block_gap
 
 
     def _hotkey_entries(self) -> list[tuple[str, str, bool, bool]]:

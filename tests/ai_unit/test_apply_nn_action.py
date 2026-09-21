@@ -49,7 +49,7 @@ def _gating(selected: SelectedAction, target_slot: int | None = None,
     )
 
 
-def _apply(gating, match, player_id, slot_player_ids=None, decision_physical=None):
+def _apply(gating, match, player_id, slot_player_ids=None, decision_physical=None, **kwargs):
     player = match.player_by_id(player_id)
     return apply_action_to_player(
         gating=gating,
@@ -57,6 +57,7 @@ def _apply(gating, match, player_id, slot_player_ids=None, decision_physical=Non
         match=match,
         slot_player_ids=slot_player_ids or [None] * 21,
         decision_physical=decision_physical or {},
+        **kwargs,
     )
 
 
@@ -131,10 +132,11 @@ class TestTackle:
                       rng_reduction=1.0, rng=_r.Random(0))
         result = _apply(
             _gating(SelectedAction.NONE, tackle_attempt=True),
-            match, "p1",
+            match, "p1", arm_tackle_without_carrier=False,
         )
         assert result.illegal_action
         assert "carrier" in result.illegal_reason
+        assert not match.player_by_id("p1").tackle_armed
 
     def test_tackle_own_team_carrier_illegal(self, standard_pitch):
         """tackle_attempt=True when only a same-team carrier exists -> illegal."""
@@ -153,10 +155,120 @@ class TestTackle:
                       rng_reduction=1.0, rng=_r.Random(0))
         result = _apply(
             _gating(SelectedAction.NONE, tackle_attempt=True),
-            match, "p1",
+            match, "p1", arm_tackle_without_carrier=False,
         )
         assert result.illegal_action
         assert "carrier" in result.illegal_reason
+        assert not match.player_by_id("p1").tackle_armed
+
+
+def _loose_ball_match(standard_pitch):
+    import random as _r
+    from footballcoach.engine.match import Match
+    from footballcoach.entities.player import Player, Team
+    from footballcoach.entities.attributes import PlayerAttributes
+    from footballcoach.entities.ball import Ball
+
+    attrs = PlayerAttributes(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+    p1 = Player.create("p1", Team.LEFT, attrs, position=Vector3(0, 0, 0))
+    p2 = Player.create("p2", Team.RIGHT, attrs, position=Vector3(5, 0, 0))
+    return Match(pitch=standard_pitch, players=[p1, p2], ball=Ball.at_rest(Vector3(20, 0, 0)),
+                 rng_reduction=1.0, rng=_r.Random(0))
+
+
+class TestTackleArmWithoutCarrier:
+    """action.arm_tackle_without_carrier: every sampled attempt arms (and is thus charged)."""
+
+    def test_arms_when_ball_is_loose(self, standard_pitch):
+        match = _loose_ball_match(standard_pitch)
+        result = _apply(_gating(SelectedAction.NONE, tackle_attempt=True), match, "p1",
+                        arm_tackle_without_carrier=True)
+        assert not result.illegal_action
+        assert match.player_by_id("p1").tackle_armed
+
+    def test_arms_while_holding_the_ball(self, duel_match):
+        # p1 carries the ball; arming while possessing is what tackle_armed_while_possessing_multiplier prices.
+        result = _apply(_gating(SelectedAction.NONE, tackle_attempt=True), duel_match, "p1",
+                        arm_tackle_without_carrier=True)
+        assert not result.illegal_action
+        assert duel_match.player_by_id("p1").tackle_armed
+
+    def test_arms_when_own_team_carries(self, standard_pitch):
+        import random as _r
+        from footballcoach.engine.match import Match
+        from footballcoach.entities.player import Player, Team
+        from footballcoach.entities.attributes import PlayerAttributes
+        from footballcoach.entities.ball import Ball
+
+        attrs = PlayerAttributes(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+        p1 = Player.create("p1", Team.LEFT, attrs, position=Vector3(0, 0, 0))
+        p2 = Player.create("p2", Team.LEFT, attrs, position=Vector3(5, 0, 0))
+        ball = Ball.at_rest(Vector3(5, 0, 0))
+        ball.possessed_by = "p2"
+        match = Match(pitch=standard_pitch, players=[p1, p2], ball=ball, rng_reduction=1.0, rng=_r.Random(0))
+        result = _apply(_gating(SelectedAction.NONE, tackle_attempt=True), match, "p1",
+                        arm_tackle_without_carrier=True)
+        assert not result.illegal_action
+        assert match.player_by_id("p1").tackle_armed
+
+    def test_inactive_player_still_cannot_arm(self, duel_match):
+        duel_match.player_by_id("p2").state = PlayerState.INACTIVE_TACKLED
+        result = _apply(_gating(SelectedAction.NONE, tackle_attempt=True), duel_match, "p2",
+                        arm_tackle_without_carrier=True)
+        assert result.illegal_action and "inactive" in result.illegal_reason
+        assert not duel_match.player_by_id("p2").tackle_armed
+
+    def test_no_attempt_no_arm(self, standard_pitch):
+        match = _loose_ball_match(standard_pitch)
+        _apply(_gating(SelectedAction.NONE, tackle_attempt=False), match, "p1", arm_tackle_without_carrier=True)
+        assert not match.player_by_id("p1").tackle_armed
+
+    def test_pre_armed_tackle_resolves_once_the_opponent_gets_the_ball(self, standard_pitch):
+        """Arm while the ball is loose, then the opponent takes it: the (re-applied) armed tackle resolves on contact."""
+        import random as _r
+        from footballcoach.engine.match import Match
+        from footballcoach.entities.player import Player, Team
+        from footballcoach.entities.attributes import PlayerAttributes
+        from footballcoach.entities.ball import Ball
+
+        attrs = PlayerAttributes(0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5, 0.5)
+        p1 = Player.create("p1", Team.LEFT, attrs, position=Vector3(0, 0, 0))
+        p2 = Player.create("p2", Team.RIGHT, attrs, position=Vector3(0.3, 0, 0))
+        match = Match(pitch=standard_pitch, players=[p1, p2], ball=Ball.at_rest(Vector3(30, 0, 0)),
+                      rng_reduction=1.0, rng=_r.Random(0))
+        p1 = match.player_by_id("p1")
+        gating = _gating(SelectedAction.NONE, tackle_attempt=True)
+        _apply(gating, match, "p1", arm_tackle_without_carrier=True)
+        assert p1.tackle_armed and match.ball_carrier() is None
+        match._check_armed_tackles()  # nobody carries -> nothing to resolve, no error
+        match.ball.possessed_by = "p2"
+        fired = []
+        p1.on_tackle = lambda pl: fired.append(pl.player_id)
+        _apply(gating, match, "p1", arm_tackle_without_carrier=True)
+        match._check_armed_tackles()
+        assert fired == ["p1"]
+
+
+class TestTackleConfigDefault:
+    def test_flag_reads_config_when_not_passed(self, standard_pitch, monkeypatch):
+        import footballcoach.ai.action.apply_nn_action as ana
+        match = _loose_ball_match(standard_pitch)
+        monkeypatch.setattr(ana, "action_flag", lambda name: True)
+        _apply(_gating(SelectedAction.NONE, tackle_attempt=True), match, "p1")
+        assert match.player_by_id("p1").tackle_armed
+        match2 = _loose_ball_match(standard_pitch)
+        monkeypatch.setattr(ana, "action_flag", lambda name: False)
+        result = _apply(_gating(SelectedAction.NONE, tackle_attempt=True), match2, "p1")
+        assert result.illegal_action and not match2.player_by_id("p1").tackle_armed
+
+    def test_config_declares_both_flags_as_booleans(self):
+        from footballcoach.ai.action.apply_nn_action import action_flag
+        from footballcoach.ai.config import load_ai_config
+        section = load_ai_config()["action"]
+        for key in ("arm_tackle_without_carrier", "kick_one_shot"):
+            assert isinstance(section[key], bool) and f"_comment_{key}" in section
+            assert action_flag(key) is section[key]
+        assert action_flag("nonexistent_flag") is False
 
 
 # GET_POSSESSION and MARK are decision-context inputs — the neural network
@@ -195,3 +307,25 @@ class TestMove:
         player = solo_match.player_by_id("p1")
         _apply(_gating(SelectedAction.NONE, exec_move=True, move_dir=np.array([1.0, 0.0]), sprint=True), solo_match, "p1")
         assert player.desired_speed_mode == SpeedMode.SPRINT
+
+
+class TestKickPowerValidation:
+    """A kick decision must carry a real power; the old silent 0.85 fallback is gone."""
+
+    @pytest.mark.parametrize("bad_power", [0.0, -0.1, float("nan")])
+    def test_non_positive_or_nan_power_raises(self, duel_match, bad_power):
+        with pytest.raises(ValueError, match="kick_power_fraction"):
+            _apply(_gating(SelectedAction.NONE, kick=True, kick_power=bad_power), duel_match, "p1")
+
+    def test_a_small_positive_power_is_used_as_is(self, duel_match):
+        p1 = duel_match.player_by_id("p1")
+        _apply(_gating(SelectedAction.NONE, kick=True, kick_power=0.03), duel_match, "p1")
+        assert p1.kicked_this_tick and p1.last_kick_power_fraction == pytest.approx(0.03, abs=1e-6)
+
+    def test_zero_power_without_a_kick_decision_is_fine(self, duel_match):
+        _apply(_gating(SelectedAction.NONE, kick=False, kick_power=0.0), duel_match, "p1")
+
+    def test_armed_kick_keeps_the_given_power(self, duel_match):
+        p2 = duel_match.player_by_id("p2")
+        _apply(_gating(SelectedAction.NONE, kick=True, kick_power=0.04), duel_match, "p2")
+        assert p2.kick_armed and p2.kick_armed_power_fraction == pytest.approx(0.04)

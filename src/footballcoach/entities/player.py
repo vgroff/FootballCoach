@@ -7,6 +7,7 @@ from enum import Enum, auto
 from typing import TYPE_CHECKING
 
 from footballcoach.config import load_physics_config
+from footballcoach.entities.action_opportunity import ActionOpportunity
 from footballcoach.entities.attributes import PlayerAttributes
 from footballcoach.mathutils import Vector3
 
@@ -171,6 +172,18 @@ class Player:
     # processing (e.g. BC label derivation) can check "did this player kick
     # THIS tick" without caring about order-type bookkeeping.
     kicked_this_tick: bool = field(default=False, repr=False, compare=False)
+    # Monotonic count of kicks this player has executed (never reset). Lets
+    # NeuralPlayerAI tell whether the kick it decided has already fired --
+    # kicked_this_tick can't, since it is cleared at the start of every tick.
+    kick_count: int = field(default=0, repr=False, compare=False)
+    # Monotonic count of ARMED tackles by this player that reached contact resolution
+    # (Match._check_armed_tackles -> _attempt_tackle_contact; win or lose). Head-on auto-tackles
+    # are not counted. Never reset. See entities/action_opportunity.py.
+    tackle_fire_count: int = field(default=0, repr=False, compare=False)
+    # Per-decision-interval record of whether a kick / armed tackle could have taken effect
+    # (agent_plans/masked_action_training_plan.md). Fed by Match hooks and NeuralPlayerAI;
+    # read by ScenarioEnv at the end of each decision interval.
+    opportunity: ActionOpportunity = field(default_factory=ActionOpportunity, repr=False, compare=False)
     # Set by GetPossessionOrder / neural AI; engine fires on_tackle on next contact.
     tackle_armed: bool = field(default=False, repr=False, compare=False)
     # Set by rules AI (orders.py's _try_push_kick, via MoveOrder /
@@ -321,6 +334,20 @@ class Player:
     def is_available_to_tackle(self) -> bool:
         return self.state != PlayerState.INACTIVE_TACKLED
 
+    def can_kick(self, match: "Match") -> bool:
+        """SINGLE SOURCE OF TRUTH for "a kick by this player can execute right now": it holds the ball.
+        (A kick decided without the ball is armed instead and executes at first touch in
+        Match._update_loose_ball_pickup.) Used by both kick executors below, by
+        ai/action/apply_nn_action.py's fire-vs-arm choice, and by the action-opportunity accounting
+        (note_kick_opportunity), so what counts as an opportunity can never drift from what the engine accepts."""
+        return match.ball.possessed_by == self.player_id
+
+    def note_kick_opportunity(self, match: "Match") -> None:
+        """Record a kick opportunity for this tick iff a kick could execute now (see can_kick and
+        entities/action_opportunity.py). Called wherever this player's kick intent is (re)applied."""
+        if self.can_kick(match):
+            self.opportunity.note_kick_opp(match.tick_index)
+
     # ------------------------------------------------------------------
     # Atomic action methods — the only correct way to assign Orders.
     # Rules-based PlayerAI subclasses, HybridPlayerAI's order-override
@@ -361,6 +388,7 @@ class Player:
             self.state_timer_s = 0.0
         match._log_debug(f"{self.player_id} kicked ({log_label})  power={log_power_fraction:.2f}")
         self.kicked_this_tick = True
+        self.kick_count += 1
         _vel = match.ball.velocity
         _vel_len = _vel.length()
         self.last_kick_direction = (_vel * (1.0 / _vel_len)) if _vel_len > 1e-6 else None
@@ -384,7 +412,7 @@ class Player:
         """
         from footballcoach.engine.kicking import kick_ball, compensate_power_for_run_mult, firsttime_difficulty_multiplier, running_power_multiplier
         from footballcoach.engine.movement import effective_top_speed
-        if match.ball.possessed_by != self.player_id:
+        if not self.can_kick(match):
             return
         is_first_touch = self.state == PlayerState.CONTROLLING_BALL
         diff_mult = (
@@ -453,7 +481,7 @@ class Player:
             running_power_multiplier, compensate_power_for_run_mult,
         )
         from footballcoach.engine.movement import effective_top_speed
-        if match.ball.possessed_by != self.player_id:
+        if not self.can_kick(match):
             return
         is_first_touch = self.state == PlayerState.CONTROLLING_BALL
         diff_mult = (

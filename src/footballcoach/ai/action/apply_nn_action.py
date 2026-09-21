@@ -34,6 +34,12 @@ from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
 
 
+def action_flag(name: str) -> bool:
+    """Read a boolean from ai_config.json's ``action`` section (absent = False)."""
+    from footballcoach.ai.config import load_ai_config
+    return bool(load_ai_config().get("action", {}).get(name, False))
+
+
 @dataclass
 class OrderTranslationResult:
     """Result of applying neural network outputs to a player."""
@@ -47,6 +53,7 @@ def apply_action_to_player(
     match: Match,
     slot_player_ids: list[Optional[str]],
     decision_physical: dict,
+    arm_tackle_without_carrier: Optional[bool] = None,
 ) -> OrderTranslationResult:
     """Apply execution-network outputs DIRECTLY to the player — no Orders.
 
@@ -101,10 +108,18 @@ def apply_action_to_player(
             direction_3d = Vector3(float(kick_dir[0]), float(kick_dir[1]), float(kick_dir[2]) if len(kick_dir) > 2 else 0.0)
         else:
             direction_3d = Vector3(1.0, 0.0, 0.0)  # safe fallback, should not occur
-        power_fraction = float(gating.kick_power_fraction) if gating.kick_power_fraction > 0 else 0.85
+        # A kick decision must carry a real power. The head's ppo.kick_power_floor
+        # keeps it > 0; a 0/negative/NaN here is a bug upstream, so fail loudly
+        # instead of silently substituting a (previously full-ish, 0.85) power.
+        power_fraction = float(gating.kick_power_fraction)
+        if not power_fraction > 0.0:
+            raise ValueError(
+                f"kick decided with non-positive/NaN kick_power_fraction={gating.kick_power_fraction!r} "
+                f"(check ppo.kick_power_floor and whatever built this GatingResult)"
+            )
         # Spin is disabled for the neural network for now -- see
         # agent_plans/spin_implementation_plan.md for the plan to re-enable it.
-        if match.ball.possessed_by == player.player_id:
+        if player.can_kick(match):
             player.kick_with_direction(match, direction_3d, power_fraction, Vector3.zero())
         else:
             player.kick_armed = True
@@ -114,10 +129,20 @@ def apply_action_to_player(
 
     # --- Tackle: arm intent; _check_armed_tackles resolves on contact ---
     # Target slot is not used — the engine finds the ball carrier directly.
+    # With arm_tackle_without_carrier (config action.arm_tackle_without_carrier)
+    # the intent is armed -- and so charged by the armed-tackle reward -- on
+    # every sampled attempt, even before an opponent has the ball (so a player
+    # can pre-arm and run into the tackle as the ball arrives); the engine
+    # already resolves an armed tackle only against an opposing carrier in
+    # range. Off: an attempt with no opposing carrier is a free, unarmed no-op.
     if gating.tackle_attempt:
         if not player.is_available_to_tackle():
             return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_while_inactive")
-        if match.ball_carrier() is None or match.ball_carrier().team == player.team:
+        if arm_tackle_without_carrier is None:
+            arm_tackle_without_carrier = action_flag("arm_tackle_without_carrier")
+        if not arm_tackle_without_carrier and (
+            match.ball_carrier() is None or match.ball_carrier().team == player.team
+        ):
             return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_no_carrier")
         player.tackle_armed = True
 

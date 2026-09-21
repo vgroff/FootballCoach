@@ -81,7 +81,14 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from footballcoach.ai.action.distributions import configured_kick_power_floor, kick_power_from_raw
 from footballcoach.ai.config import load_ai_config
+
+
+def _kick_power_physical(raw: "torch.Tensor") -> "torch.Tensor":
+    """The kick_power head's raw output as the executed power fraction
+    (ppo.kick_power_floor + (1 - floor) * sigmoid(raw)) -- what BC labels/targets are in."""
+    return kick_power_from_raw(raw, configured_kick_power_floor())
 
 log = logging.getLogger("footballcoach.ai.bc")
 
@@ -429,6 +436,7 @@ def phase1_labels_for_player(player: "Player", match: "Match") -> BCLabel:
         _snap_desired_dir = player.desired_direction
         _snap_desired_speed = player.desired_speed_mode
         _snap_kicked_this_tick = player.kicked_this_tick
+        _snap_kick_count = player.kick_count
         _snap_last_kick_dir = player.last_kick_direction
         _snap_last_kick_power = player.last_kick_power_fraction
         _snap_last_kick_spin = player.last_kick_spin
@@ -545,6 +553,7 @@ def phase1_labels_for_player(player: "Player", match: "Match") -> BCLabel:
             player.desired_direction = _snap_desired_dir
             player.desired_speed_mode = _snap_desired_speed
             player.kicked_this_tick = _snap_kicked_this_tick
+            player.kick_count = _snap_kick_count
             player.last_kick_direction = _snap_last_kick_dir
             player.last_kick_power_fraction = _snap_last_kick_power
             player.last_kick_spin = _snap_last_kick_spin
@@ -720,7 +729,7 @@ def phase1_labels_from_teacher(env, teacher_trainer, player_id: str = None) -> B
         ai_type=ai_type,
         opponent_ai_type=opponent_ai_type,
         kick_direction=kick_direction,
-        kick_power_fraction=float(torch.sigmoid(e_heads.kick_power)),
+        kick_power_fraction=float(_kick_power_physical(e_heads.kick_power)),
         kick_spin=kick_spin,
     )
 
@@ -1166,7 +1175,7 @@ def bc_loss_from_tensor(
         # --- Execution: kick_power (MSE) and kick_spin (MSE, normalized) ---
         kicked_mask = labels[:, _I_KICK_THIS_TICK] > 0.5
         if kicked_mask.any():
-            pred_power = torch.sigmoid(exec_heads.kick_power.squeeze(-1))
+            pred_power = _kick_power_physical(exec_heads.kick_power.squeeze(-1))
             target_power = labels[:, _I_KICK_POWER]
             power_mse = (pred_power - target_power) ** 2
             kick_power_loss_per = torch.where(kicked_mask, power_mse, torch.zeros_like(power_mse))

@@ -43,6 +43,51 @@ ticks within one decision interval and returned as one scalar per step.
 !! — do not reintroduce a start_*_m / start_stamina style parameter.     !!
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+!! STANDING GUIDELINE: BE VERY CAREFUL WITH ONE-OFF (EVENT-PAID) REWARDS !!
+!! AND PENALTIES -- AVOID THEM UNLESS THEY ARE TERMINAL. PREFER          !!
+!! PER-STEP OR POTENTIAL-BASED TERMS WHEREVER POSSIBLE.                  !!
+!!                                                                      !!
+!! Why (all measured 2026-09-20 when gain_possession_bonus +1.0 and     !!
+!! loss_of_possession_penalty -0.9 were removed):                       !!
+!!  1. The ground-truth return-to-go is a sum of FUTURE rewards, so it   !!
+!!     rises toward a one-off payment and DROPS by ~the payment the      !!
+!!     instant it is made -- right after the agent did something good.   !!
+!!     Measured: mean step -0.86 in return-to-go after a possession      !!
+!!     gain. The value net must forecast WHEN such events happen (mostly !!
+!!     unpredictable: tackles/turnovers): they added ~14% to the return  !!
+!!     variance and value error near them was 1.2x-6.8x higher (partly   !!
+!!     confounded with turnovers genuinely mattering).                   !!
+!!  2. A non-potential-based event payment changes the optimal policy,   !!
+!!     and gain +1.0 / loss -0.9 netted +0.1 per cycle (farmable).       !!
+!!  3. It was redundant: the win/lose terminals already separate having  !!
+!!     vs not having the ball by ~3.5 of return.                         !!
+!!  After removal the value fit improved (R2 ~0.77 -> ~0.81 on the new   !!
+!!  targets; not strictly comparable) and timeout-episode return std     !!
+!!  fell from ~0.46 to ~0.07 (it was mostly possession-event noise).     !!
+!!                                                                      !!
+!! Rules:                                                                !!
+!!  * Terminal one-offs are fine (box, lterm, tout, out, prox): the      !!
+!!    episode ends, there is no future for the return to drop into, and  !!
+!!    they ARE the objective.                                            !!
+!!  * Otherwise prefer a bounded PER-STEP term, or POTENTIAL-BASED       !!
+!!    shaping F = gamma*Phi(s') - Phi(s) with Phi(terminal) = 0 (appr is  !!
+!!    the model: it telescopes and keeps the optimal policy). A          !!
+!!    potential term still shifts the value by -Phi(s), but that offset  !!
+!!    is an observable function of state, not of future event timing.    !!
+!!  * Any per-step term must be bounded over the maximum episode length: !!
+!!    per_step * max_steps must stay well below the terminal win reward, !!
+!!    or holding/dawdling beats winning (use cumulative_clamped_delta).  !!
+!!  * Never pair a bonus with a near-equal offsetting penalty that nets  !!
+!!    non-zero.                                                          !!
+!!  * If you must add a non-terminal event term: justify it, default it  !!
+!!    to 0.0, and measure its effect first (recompute MC returns with    !!
+!!    and without it: return variance, value R2, per-outcome loss).      !!
+!!  * Still event-paid and non-terminal -- review before enabling or     !!
+!!    retuning: ill (illegal_action_penalty, currently 0.0) and the      !!
+!!    tatt / katt attempt bonuses.                                       !!
+!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
+
 phase1_reward() returns a (float, dict[str, float]) tuple where the dict
 breaks the total down by source key:
   appr  — linear ball approach bonus (potential-based; telescopes over an
@@ -75,7 +120,8 @@ breaks the total down by source key:
           (not one symmetric clamp) to match the independently-tunable
           bonus/penalty coefficients above.
   hdg   — heading penalty (moving away from the ball)
-  poss  — gain possession bonus
+  poss  — gain possession bonus (gain_possession_bonus). DISABLED (0.0) since
+          2026-09-20: a one-off event payment -- see STANDING GUIDELINE above.
   prog  — ball progress toward the opponent BOX while in possession (delta
           of _ball_dist_to_opponent_box(), i.e. box-distance closed this
           step — NOT raw goal-line x movement, so lateral movement into the
@@ -93,7 +139,8 @@ breaks the total down by source key:
   ill   — illegal action penalty
   box   — box possession terminal
   spd   — speed bonus (fast finish). speed_scale * time_remaining_fraction only.
-  lpos  — loss of possession penalty
+  lpos  — loss of possession penalty (loss_of_possession_penalty). DISABLED
+          (0.0) since 2026-09-20, same reason as poss.
   lterm — loss terminal (opponent reaches trainee box)
   tout  — timeout penalty
   prox  — proximity bonus on timeout. Uses a FIXED 40m pitch-scale reference

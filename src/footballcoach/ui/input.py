@@ -9,9 +9,12 @@ Interaction scheme:
   target whoever is selected, so you can look at an opponent without being
   able to command them any differently than before.
 - Right-click an opposing player while a DIFFERENT-team player is selected
-  -> GetPossessionOrder on the selected player (chase/tackle whoever you
-  right-clicked). This is the "do something" action that left-click used to
-  perform on an opposing-team click, before left-click became select-only.
+  -> GetPossessionOrder on the selected player. Note GetPossessionOrder has
+  no target-player field: it chases the ball, or whoever currently carries
+  it, and tackles on contact -- the clicked opponent only gates the action,
+  it does not choose who gets chased. This is the "do something" action
+  that left-click used to perform on an opposing-team click, before
+  left-click became select-only.
 - Click empty ground while a player is selected -> MoveOrder to that point
   (default OrderMode.MOVE).
 
@@ -146,8 +149,9 @@ class MatchInputController:
     def handle_right_click(self, screen_pos: tuple[int, int]) -> None:
         """Right-click (outside the kick UI, see app.py's dispatch, which
         takes priority) an OPPOSING-team player while a player is selected
-        -> GetPossessionOrder on the selected player (chase/tackle whoever
-        was right-clicked). The "do something" action that left-click used
+        -> GetPossessionOrder on the selected player (chases the ball /
+        current carrier, NOT specifically the clicked player -- the order
+        has no target field). The "do something" action that left-click used
         to perform on an opposing-team click before left-click became
         select-only (see module docstring). No-op for a same-team click,
         a click with nothing selected, or a click on empty ground --

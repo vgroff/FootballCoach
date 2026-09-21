@@ -826,8 +826,19 @@ class NeuralPlayerAI(PlayerAI):
         ema_smoothed: float = 0.0,
         rng=None,
         bc_label_fn=None,
+        kick_one_shot: bool | None = None,
     ) -> None:
         self.sample_action_fn = sample_action_fn
+        # One decision = at most one kick (config action.kick_one_shot; None =
+        # read it). Without it the cached action is re-applied every tick of
+        # the decision interval, so a kick decided while in possession
+        # re-arms and re-fires after the ball is released (measured: ~3 kicks
+        # per decision, kick_armed set at the interval boundary).
+        if kick_one_shot is None:
+            from footballcoach.ai.action.apply_nn_action import action_flag
+            kick_one_shot = action_flag("kick_one_shot")
+        self.kick_one_shot = bool(kick_one_shot)
+        self._kick_count_at_decision: int | None = None
         self.decision_interval_ticks = decision_interval_ticks
         self.max_episode_s = max_episode_s
         self.ema_smoothed = ema_smoothed
@@ -875,10 +886,45 @@ class NeuralPlayerAI(PlayerAI):
         self._episode_ticks = 0
         self.last_transition = None
         self._last_gating = None
+        self._kick_count_at_decision = None
         self._pending_obs_dict = None
         self._pending_bc_label = None
         self._precomputed_result = None
         self._pending_result = None
+
+    def _drop_fired_kick(self, player: "Player") -> None:
+        """kick_one_shot: once the kick this decision asked for has executed
+        (possession kick on the decision tick, or an armed kick auto-firing on
+        first touch later in the interval), stop re-applying it."""
+        g = self._last_gating
+        if (
+            self.kick_one_shot
+            and g is not None
+            and g.kick_this_tick
+            and self._kick_count_at_decision is not None
+            and player.kick_count > self._kick_count_at_decision
+        ):
+            g.kick_this_tick = False
+
+    def _reapply_cached_gating(self, player: "Player", match: "Match") -> None:
+        """Between-decision tick: re-apply the last decision so
+        desired_direction/speed_mode (and any held kick/tackle intent) persist."""
+        from footballcoach.ai.action.apply_nn_action import apply_action_to_player
+
+        if self._last_gating is None:
+            return
+        # Holding the ball at the moment this player's kick intent is (re)applied = a kick
+        # opportunity (entities/action_opportunity.py), evaluated whether or not a kick is
+        # pending so it cannot depend on the kick bit.
+        player.note_kick_opportunity(match)
+        self._drop_fired_kick(player)
+        apply_action_to_player(
+            gating=self._last_gating,
+            player=player,
+            match=match,
+            slot_player_ids=[None] * 21,
+            decision_physical={},
+        )
 
     def is_due_for_decision(self) -> bool:
         """True if the NEXT ``act()``/``prepare()`` call on this instance
@@ -924,22 +970,13 @@ class NeuralPlayerAI(PlayerAI):
         player -- ``act()`` below does exactly that, back-to-back, for the
         normal (unbatched) case.
         """
-        from footballcoach.ai.action.apply_nn_action import apply_action_to_player
-
         self._episode_ticks += 1
         self._ticks_since_decision += 1
 
         if self._ticks_since_decision < self.decision_interval_ticks:
             # Re-apply last cached gating so desired_direction/speed_mode
             # are set every tick (not just on decision ticks).
-            if self._last_gating is not None:
-                apply_action_to_player(
-                    gating=self._last_gating,
-                    player=player,
-                    match=match,
-                    slot_player_ids=[None] * 21,
-                    decision_physical={},
-                )
+            self._reapply_cached_gating(player, match)
             return None
 
         from footballcoach.ai.obs.encoder import encode_observation
@@ -999,6 +1036,12 @@ class NeuralPlayerAI(PlayerAI):
         slot_player_ids = [None] * MAX_OTHER_PLAYERS  # safe default; NeuralPlayerAI does not need target resolution
         gating = select_action(decision_probs, exec_phys, target_slots)
         self._last_gating = gating  # cache so between-decision ticks can re-apply direction/speed
+        self._kick_count_at_decision = player.kick_count
+        # A fresh decision opens a new opportunity interval (read by ScenarioEnv at the end of the
+        # step); holding the ball right now is the first possible kick opportunity, before
+        # apply_action_to_player below can fire (and release) a kick.
+        player.opportunity.begin_interval(match.tick_index, player.kick_count, player.tackle_fire_count)
+        player.note_kick_opportunity(match)
         translation = apply_action_to_player(
             gating=gating,
             player=player,
@@ -1006,6 +1049,7 @@ class NeuralPlayerAI(PlayerAI):
             slot_player_ids=slot_player_ids,
             decision_physical=dec_phys,
         )
+        self._drop_fired_kick(player)
 
         obs_dict = self._pending_obs_dict
         self._pending_obs_dict = None
@@ -1295,14 +1339,7 @@ class HybridPlayerAI(NeuralPlayerAI):
         self._ticks_since_decision += 1
 
         if self._ticks_since_decision < self.decision_interval_ticks:
-            if self._last_gating is not None:
-                apply_action_to_player(
-                    gating=self._last_gating,
-                    player=player,
-                    match=match,
-                    slot_player_ids=[None] * 21,
-                    decision_physical={},
-                )
+            self._reapply_cached_gating(player, match)
             return
 
         self.last_transition = None
@@ -1328,6 +1365,7 @@ class HybridPlayerAI(NeuralPlayerAI):
         slot_player_ids = [None] * MAX_OTHER_PLAYERS
         gating = select_action(decision_probs, exec_phys, target_slots)
         self._last_gating = gating
+        self._kick_count_at_decision = player.kick_count
         translation = apply_action_to_player(
             gating=gating,
             player=player,
@@ -1335,6 +1373,7 @@ class HybridPlayerAI(NeuralPlayerAI):
             slot_player_ids=slot_player_ids,
             decision_physical=dec_phys,
         )
+        self._drop_fired_kick(player)
 
         self.last_transition = {
             "obs": {k: v.numpy() for k, v in obs_dict.items()},

@@ -2,8 +2,10 @@
 
 A pygame-ce-based renderer and input layer sitting on top of the headless
 engine (`engine/match.py`). Nothing in here touches simulation logic - it
-only reads `Match`/`Player`/`Ball` state to draw, and writes
-`player.current_order` to issue Move/Kick/Tackle orders. This keeps the UI
+only reads `Match`/`Player`/`Ball` state to draw, and issues orders
+(Move/Pass/Shoot/GetPossession/Save/Stop) via `player.current_order` (or
+`HybridPlayerAI.issue_order()` for neural-controlled players) plus direct
+`player.kick_with_direction()` calls from the kick UI. This keeps the UI
 swappable/removable without touching the engine, per the project's
 "engine is UI-agnostic" design principle.
 
@@ -13,7 +15,9 @@ swappable/removable without touching the engine, per the project's
   pitch length axis, `y` = pitch width axis, origin at pitch centre) and
   screen pixels (origin top-left, `y` grows downward). The window is
   auto-sized to fit the whole pitch plus a margin at a fixed
-  `pixels_per_metre` (`Camera.fit_to_pitch`).
+  `pixels_per_metre` (`Camera.fit_to_pitch`). `world_to_screen` returns
+  truncated ints; `world_to_screen_f` returns the same mapping un-truncated,
+  for drawing smooth curves.
 - `style.py` - colour palette and rendering constants, including Phase G
   additions: `CONTROL_DELAY_OUTLINE` (cyan ring for `CONTROLLING_BALL`),
   `INACTIVE_OUTLINE` (red ring for `INACTIVE_TACKLED`), and three ball-state
@@ -23,16 +27,30 @@ swappable/removable without touching the engine, per the project's
   rings (CONTROLLING_BALL / INACTIVE_TACKLED), ball state rings (flying /
   rolling / just-bounced via `ball.just_bounced_timer_s`), `draw_game_log`
   (scrolling bottom-right log box), `draw_scenario_params` (param editing
-  screen with +/− buttons).
+  screen with +/− buttons). Also: `draw_kick_ui` (trajectory + error cone
+  preview for the multi-phase kick UI), `draw_player_inspector` (side panel,
+  see "Player inspector panel"), `draw_pause_notification` (banner above
+  the hotkey bar), `draw_speed_control`/`draw_zoom_control`.
+- `player_sprites.py` - procedurally-drawn top-down player sprites (head,
+  shoulders, torso, animated legs) used by `Renderer.draw_player` in place
+  of the plain circle; see "Player visual indicators". Its module docstring
+  holds the design rationale (supersample-then-`smoothscale`, 9 cached poses
+  per shirt colour, speed-driven stride animation).
+- `kick_trajectory.py` - pure-math helpers for the kick UI preview:
+  forward-simulates the ball with the engine's own `ball_physics.step_ball`
+  (deterministic, no random kick error), builds the 1-sigma error cone
+  (`compute_error_sigma`/`build_cone_boundaries`), maps height to colour
+  (`height_to_colour`), and maps mouse position to a spin vector
+  (`spin_from_mouse`). Its module docstring has the spin-axis convention.
 - `gamelog.py` - `LogLevel` enum (`INFO`, `DEBUG`) and `GameLog` (a
   `collections.deque` ring buffer of `LogEntry` objects). Zero cost in
   headless use — `Match.log_callback` is `None` by default and checked
   before any import or allocation. The UI attaches a callback in
   `App._wire_match_log()` and wires a new one each time a new trial is built.
 - `input.py` - `MatchInputController` translates raw mouse events into
-  orders on the engine's `Player.current_order`. See its docstring for the
-  full click/drag interaction scheme (click player to select, click ground
-  to move, click opponent to tackle, drag from the ball-carrier to kick).
+  orders on the engine's `Player.current_order`. See "Interaction scheme"
+  below (left-click selects/moves, right-click issues Get Possession, click
+  the selected ball-carrier to enter the multi-phase kick UI).
 - `scenarios.py` - builds `Match` instances for the two non-freeplay modes:
   `make_training_match()` (1 player + ball, full pitch, both goals live) and
   `SCENARIOS` (six parameterized balance scenarios — see "Scenarios" section
@@ -91,14 +109,108 @@ disproportionately tiny next to zoomed-in players even though it visually
 grew the least of anything on screen. Scaling both floors together keeps
 their relative sizes roughly constant across zoom levels.
 
+## Pitch markings (`draw_pitch`)
+
+The standard Law 1 line markings, all drawn every frame in `draw_pitch` at
+the shared line width (`0.12m * pixels_per_metre`, min 1px): boundary,
+halfway line, centre circle + **centre spot**, both penalty boxes and
+six-yard boxes, both **penalty spots**, both **penalty arcs** (the "D": the
+part of the 9.15m circle round each penalty spot that lies *outside* the
+box, meeting the box's front edge at y = ±√(r² − dx²) with dx = box length −
+spot distance = 5.5m), and the four **corner arcs** (1m quarter circles
+inside each corner). Tunables are in `graphics.json["pitch_markings"]`
+(`spot_radius_m`, `penalty_arc_radius_m`, `corner_arc_radius_m`) — cosmetic
+only, deliberately *not* on the engine's `Pitch` dataclass, which has many
+positional constructors that a new required field would break.
+
+- Spots (`_draw_pitch_spot`) are filled + anti-aliased circles, true to scale
+  with a 2px floor (`spot_radius_m` is 0.18 rather than the real ~0.11m so a
+  spot reads as distinct from the line width).
+- Arcs are dense world-space polylines from the pure functions
+  `penalty_arc_world_points` / `corner_arc_world_points` (3° steps), drawn by
+  `_draw_world_polyline` with sub-pixel vertices (`Camera.world_to_screen_f`).
+  This deliberately avoids `pygame.draw.arc`, whose thick strokes tear into
+  gaps at high zoom. 1px lines use `aalines`, thicker ones `draw.lines`.
+- The geometry generators are unit-tested in
+  `tests/unit/test_pitch_markings.py` (points on the circle, arc entirely
+  outside the box and ending exactly on its edge, left/right mirror,
+  corner arcs inside the pitch). The drawing was checked by rendering to an
+  offscreen surface at full view and 3–4x zoom.
+
 ## Pitch dressing (`draw_pitch` — nets, defending-side markers, corner flags, benches)
 
 Purely cosmetic additions with no gameplay meaning, all drawn as part of
 `draw_pitch` (so they redraw fresh every frame along with the pitch lines,
 same as everything else in that method):
 
-- **Goal netting** (`_draw_goal_net`): fills each goal frame's rectangular
-  footprint (`goal_depth_m` × `goal_width_m`) with a translucent diagonal
+- **Goal depth is the engine's**: `draw_pitch` uses `pitch.goal_depth_m`
+  (2.45m, `physics.json`) for the net footprint, net hatch and defending
+  marker — the same value `engine/ball_physics.py::resolve_goal_boundary`
+  puts the back wall at. It used to be a hardcoded 2.0m, so the ball visibly
+  passed through the drawn back of the net before bouncing off an invisible
+  wall 0.45m further on. Tested by `test_drawn_net_depth_matches_the_engines_back_wall`
+  (checks the outline pixel column at engine depth, and *no* line at 2.0m).
+  The engine models each goal as a box: back wall at that depth, side posts
+  at ±goal_width/2, and crossbar/roof at `goal_height_m` (2.44m) over the
+  whole depth.
+- **3D goal frame** (`_draw_goal_footprint` + `draw_goal_tops`): a slight
+  parallax, since the view is top-down. The crossbar (2.44m up) is drawn
+  displaced `graphics.json["goal_frame"]["crossbar_lean_m"]` (0.9m) from the
+  goal line **away from the pitch** (over the net) instead of hidden exactly
+  on top of it, which reveals the goal mouth — the opening between the goal
+  line on the ground and the crossbar — as a faint tinted rectangle
+  (`mouth_alpha`), with the posts drawn as the lines joining their feet
+  (small dots on the goal line) to the crossbar ends, all at `post_width_m`
+  (0.30m) — but never less than 2px thicker than the thin net side/back lines
+  (`_goal_post_px`; also forced odd so it centres exactly), so the frame
+  always reads heavier than the net at any zoom (3px vs 1px at the default
+  window). "Away from the pitch" is what a real overhead/broadcast view
+  does to tall objects (they lean away from the point under the camera); the
+  opposite lean would put the frame sticking out over the pitch. The offset is
+  **purely apparent** — clamped to the net depth, and the ball's ground truth
+  is still the goal line (`Pitch.is_goal`); `crossbar_lean_m: 0` restores the
+  flat look (net over the whole footprint).
+  - **The mouth is open: the net is only the roof.** The net hatch is drawn
+    only from the crossbar back to the back of the net, never in the mouth.
+  - **Two layers.** *Footprint* (drawn in `draw_pitch`, under everything):
+    side/back lines + mouth tint. *Top* (`draw_goal_tops`): roof net, posts,
+    crossbar. `draw_pitch(goal_tops=False)` skips the top layer so a caller
+    can draw it later.
+  - **Ball depth** (`draw_pitch_and_ball`, which `App._draw_match` calls
+    instead of `draw_pitch` + `draw_ball`): if the ball is *inside* a goal —
+    `ball_under_goal_frame`: past the goal line, no further than the back
+    wall, between the posts (±ball radius), and `z < goal_height_m`, mirroring
+    the engine's own inside-the-goal test in
+    `ball_physics.resolve_goal_boundary` — the top layer is drawn OVER the
+    ball (the bar cuts across it, the roof net shows faintly over it). Any
+    other ball, including one above the bar going over, is drawn over the
+    frame. The switch happens at the goal line, where the bar (displaced 0.9m
+    behind it) doesn't yet overlap the ball, so there's no visible pop.
+    Players are always drawn over the frame (not modelled — a keeper 1.8m
+    tall is always under the bar anyway, and only rarely inside the net).
+  - **Post alignment**: every goal part is placed from one set of integer
+    coordinates (`Renderer._goal_px` -> `_GoalPx`), with the two post rows
+    *symmetric about the pitch's centre row* (`c ± round(half_goal_width *
+    ppm)`) and every stroke drawn as a filled rect centred on its row. This
+    replaced independently-truncated world->screen coordinates plus
+    `pygame.draw.line` (which extends a width-2 line *downward*) next to
+    `pygame.draw.rect(width=...)` (which draws *inward*): together those put
+    the top post 1px inside the mouth tint and the bottom post 1px outside it.
+  - Tests (`tests/unit/test_pitch_markings.py`): symmetric posts on the mouth
+    edges, no net hatch in the mouth, `ball_under_goal_frame` cases, and a
+    pixel comparison that a ball at z=1.0 leaves the crossbar pixels exactly
+    as in a ball-less render while z=3.2 changes them.
+- **Net mesh varies with zoom (accepted, not a bug):** the hatch gap is
+  `int(0.35m × pixels_per_metre)` px (3/6/9/12px at zoom 1x/2x/3x/4x) with
+  always-1px lines, so it reads as a dense checker at 1x and a sparse thin
+  lattice at 3-4x. Reviewed and left as is; scaling the line width / snapping
+  the gap to keep a constant diamond lattice would be the fix if it's ever
+  wanted. When comparing screenshots across zooms, don't upscale some and not
+  others.
+- **Goal netting** (`_draw_goal_net`, called from `_draw_goal_top` for the
+  roof region only — crossbar to back of net; see above): fills a
+  screen-space rectangle (the roof, `goal_depth_m` deep minus the crossbar
+  lean, × `goal_width_m`) with a translucent diagonal
   X-hatch, drawn on an isolated SRCALPHA surface sized to the box so the
   diagonal lines clip cleanly at its edges. Colour/density/opacity are
   configurable via `graphics.json["goal_net"]` (`spacing_m`, `alpha`,
@@ -166,8 +278,8 @@ as **projected tangent-plane patches, not flat discs of constant size**.
 Each dot's outline is built from `_DOT_POLY_SEGMENTS` points arranged in a
 small circle in the dot's own tangent plane (`u`/`v`, both perpendicular to
 its centre direction `(wx,wy,wz)`), pushed through the *same* rotation +
-orthographic projection as the centre point, then filled/antialiased with
-`gfxdraw.filled_polygon` + `gfxdraw.aapolygon`. This is what makes dots near
+orthographic projection as the centre point, then rasterised by
+`Renderer._ball_dots_layer` (see below). This is what makes dots near
 the ball's silhouette edge correctly foreshorten into ellipses (a real
 football's panels do the same under orthographic projection), while dots
 near the visible "pole" stay circular — the shape falls out of the
@@ -177,8 +289,52 @@ single fixed radius with no antialiasing at all (visibly jagged, and flat
 rather than sphere-like) — if you need to touch this code again, keep both
 properties (foreshortening + AA) rather than reverting to a flat circle.
 
+**Rasterisation: supersample, don't `gfxdraw`.** `_ball_dots_layer` draws the
+dots with plain `pygame.draw.polygon` at `_RING_SUPERSAMPLE`x (4x) resolution
+onto a transparent layer, clips them to the ball disc (also at 4x), and
+`smoothscale`s down — the same trick as `_draw_ring`. The earlier
+`gfxdraw.filled_polygon` + `gfxdraw.aapolygon` pair (both alpha-blending onto
+the transparent layer) left visible defects on these ~8px dots: the fill stops
+short of the polygon's four extreme vertices while the AA pass only covers
+10-30% there, so near-white pixels (measured 210-248 against a ~85 interior)
+sat inside the dark dot as cross-shaped notches, and the double-blended alpha
+made the interior ~85 instead of the configured (30,30,30)@220 ≈ 62 over a
+white ball. Reproduced on a synthetic polygon and confirmed on the real ball
+at 4x zoom before changing it. The layer builder takes `orientation` /
+`dot_positions` so a *single* dot can be tested:
+`tests/unit/test_pitch_markings.py::test_ball_spin_dot_is_solid_without_light_holes`
+asserts each row and column of one dot's dark pixels is a single contiguous run
+(a convex dot has no light pixel between two dark ones) across radii and
+foreshortening; that same check flags the old drawing at every radius tried.
+Note the net drawn OVER a ball inside the goal (see the 3D goal frame) still
+lightens dark dots where its hatch lines cross them — that is the net in front
+of the ball, not this bug.
+
 ## Player visual indicators (`style.py` / `renderer.draw_player`)
 
+- **Body**: by default (`graphics.json["player_sprites"]["enabled"]`, default
+  true) each player is a rotated `player_sprites` sprite (see that module's
+  docstring), animated per-frame via `Renderer.update_player_animations`
+  (only advanced while the match isn't paused). With sprites disabled it
+  falls back to the plain filled circle described in the bullets below —
+  the **heading V** is drawn *only* in that fallback mode (the sprite's own
+  head/limb asymmetry already shows facing), and the translucent-inactive
+  look is likewise done per-path.
+- **Always-on extras** drawn around every player: a `player_id` label under
+  them, two tiny stat bars beneath the label (stamina, then speed — the stamina
+  bar is green / yellow / red by level, the speed bar light blue), motion "speed lines" trailing behind a
+  player above a speed threshold, a pulsing outermost ring when stamina is
+  low (`STAMINA_FLASH_OUTLINE`), and a `SELECTED_OUTLINE` ring on whoever is
+  selected. All tunables live in `graphics.json`.
+- **Action icons**: `App._wire_player_icon_callbacks` hooks each player's
+  `on_kick`/`on_tackle`/`on_possession_gained` to set `player.action_icon`
+  (⚽ kick, 🦵 tackle, 🧤 for a goalkeeper's tackle/possession);
+  `App._poll_action_icons` harvests and clears it each frame into
+  `ActionIconState`, which keeps the icon on screen for a wall-clock
+  `graphics.json["action_icons"]["linger_s"]` (independent of sim speed or
+  pausing) and `draw_player` floats it above the player. Emoji font lookup
+  is `_EMOJI_FONT_CANDIDATES` in `renderer.py` (matched by registered family
+  name, e.g. `segoeuiemoji`, not filename — see the comment there).
 - **Goalkeepers** are drawn in `GOALKEEPER_COLOUR` (a distinct orange)
   instead of their team colour, so the keeper is identifiable at a glance.
 - **Ball possession**: whichever player currently has the ball
@@ -195,7 +351,7 @@ properties (foreshortening + AA) rather than reverting to a flat circle.
   whichever player has the ball is drawn last, i.e. on top of every other
   player - avoids the possession ring/player circle being partially
   obscured by a nearby defender drawn afterwards.
-- **Heading indicator**: a broad, thin "V" — two unfilled lines touching
+- **Heading indicator** (sprites-disabled fallback only): a broad, thin "V" — two unfilled lines touching
   the rim at wide-spread points and meeting at a point just ahead in the
   facing direction (`draw_player`'s "Heading indicator" block, colour
   `style.HEADING_INDICATOR_COLOUR`, geometry tunable via
@@ -222,40 +378,112 @@ No ring is drawn when the ball is possessed or stationary on the ground.
 
 ## Interaction scheme (`input.py`)
 
-- **Click a player** -> select them. Click the same player again to
-  deselect. Click a different same-team player to switch selection.
-- **Click an opposing player** (while one of your players is selected) ->
-  issues a `TackleOrder` targeting the clicked player. No proximity check is
-  done client-side - the engine's `are_touching()` check in `Match` decides
-  whether the tackle actually resolves this tick or just sits pending.
-- **Click empty ground** (while a player is selected) -> issues a
-  `MoveOrder` to that world position (always `sprint=True` currently - no UI
-  toggle yet for jog vs sprint).
-- **Click-and-drag starting on the selected player** -> issues a
-  `KickOrder`. Drag direction sets aim direction; drag length (capped at
-  `MAX_KICK_DRAG_M`) sets `power_fraction`; the aim point is projected out
-  along the drag direction at `2x` the drag length (capped at 60m) at a
-  fixed height (`GROUND_AIM_HEIGHT_M` normally, `LOFTED_AIM_HEIGHT_M` if
-  Shift is held while dragging, for a chip/lob). This only does anything
-  useful if the selected player currently has the ball - `Match` silently
-  no-ops a `KickOrder` for a player without possession.
-- A short click (drag distance below `CLICK_DRAG_THRESHOLD_PX`) is always
-  treated as a click, not a drag, even if it started on the selected player
-  - this lets you re-click your own player to deselect without accidentally
-  triggering a tiny, useless kick.
-- **`P` key** -> enters one-shot "Pass mode" (`MatchInputController.
-  enter_pass_mode()`, tracked via the `OrderMode` enum). The next click on a
-  same-team player or empty ground issues a `PassOrder` at that
-  player/position instead of the normal select/move click handling, then
-  automatically reverts to `OrderMode.MOVE`. `Esc` cancels any transient
-  mode (`cancel_order_mode()`).
-- **`K` key** -> enters one-shot "Shoot mode" (`enter_shoot_mode()`). The
-  next click on any pitch point issues a `ShootOrder` aimed at that point
-  (z=1.0m, full power), then automatically reverts to `OrderMode.MOVE`.
-  `Esc` also cancels shoot mode.
-- **`S` key** -> issues a `SaveOrder` to the currently-selected player via
-  `MatchInputController.issue_save_order()`, but only if that player
-  `.is_goalkeeper` (a no-op otherwise).
+Mouse events are dispatched by `App._handle_match_mouse_event`. Left button:
+`MOUSEBUTTONDOWN` -> `handle_mouse_down`, `MOUSEBUTTONUP` ->
+`handle_mouse_up` (a click is resolved on *release*). Right button:
+`MOUSEBUTTONDOWN` only, routed to the kick UI's `regress_kick_ui()` if it's
+open, otherwise `handle_right_click()`.
+
+**Left-click — select / move / kick UI** (`_handle_click`):
+- **Click any player, either team** -> select them. Selecting an opponent is
+  *inspection-only* (the side panel, see "Player inspector panel"): every
+  order-issuing path below only ever targets whoever is currently selected,
+  so an opponent can be looked at but never commanded.
+- **Click the already-selected player** -> if they have the ball, enter the
+  multi-phase kick UI (below); otherwise **nothing happens**. There is no
+  click-again-to-deselect (an older version of this doc, and the in-app help
+  overlay, claim there is — the code never deselects; selection only ever
+  changes to another player).
+- **Click empty ground** (while a player is selected) -> `MoveOrder` to that
+  world position (always `sprint=True` - no UI toggle yet for jog vs
+  sprint). With nobody selected, a ground click does nothing.
+- A mouse-down/up pair further apart than `CLICK_DRAG_THRESHOLD_PX` is
+  treated as a drag and does **nothing** at all (the old click-drag-to-kick
+  scheme is gone; `DragState` and `drag_indicator()` survive only as legacy
+  shims).
+
+**Right-click — Get Possession** (`handle_right_click`): right-clicking an
+*opposing-team* player while any player is selected issues
+`GetPossessionOrder()` to the *selected* player. Two things to know:
+- It is **not** a targeted tackle. `GetPossessionOrder` has no
+  target-player field: it sprints at the ball if loose, or at whoever
+  *currently carries* it and attempts one tackle on contact
+  (`orders.py::GetPossessionOrder`). The clicked opponent only *gates* the
+  action (must be opposing-team) — right-clicking an opponent who isn't the
+  carrier still chases the ball/carrier, not them. If UI-driven targeted
+  tackles are wanted, that means wiring `Player.tackle_player()` /
+  `ChaseTackleOrder`, which the UI does not currently use anywhere.
+- No-op for a same-team click, empty ground, or nothing selected.
+It's shown in the log as "Get Possession". `TackleOrder` no longer exists
+(see the top-level `knowledge.md`); left-clicking an opponent used to issue
+one and now only selects.
+
+**Multi-phase kick UI** (`KickUIState`/`KickPhase`; replaces the old
+click-drag kick). Entered by left-clicking the selected ball-carrier, or by
+pressing `K` when the selected player has the ball (`try_enter_kick_ui`;
+`K` falls back to Shoot mode otherwise — see below). Entering it immediately
+issues a `StopOrder` (via `HybridPlayerAI.issue_order()` if neural) and
+**pauses the match** (`App._on_kick_ui_entered`), so all three phases happen
+frozen. Each phase is committed by a left-*click* (on mouse-up), previewed
+live by `Renderer.draw_kick_ui` (trajectory from `kick_trajectory.py`,
+coloured by height, plus a 1-sigma error cone):
+1. **`AIM_XY`** — mouse position relative to the player sets aim direction;
+   distance sets `power_fraction`, scaled against the distance to the nearest
+   goal clamped to [10, 20] m.
+2. **`AIM_Z`** — mouse *distance* from the player sets elevation (close = max
+   loft, far = flat; cap `graphics.json["kick_ui"]["max_loft_angle_deg"]`).
+3. **`SPIN`** — mouse angle around the player sets the spin axis, distance
+   sets magnitude (capped by `max_spin_rad_s` for the player's
+   `kick_precision`). Left-click fires `player.kick_with_direction()`
+   directly — no `KickOrder` — and the match stays paused
+   (`App._on_kick_issued`; press Space to watch it fly).
+
+`Esc` cancels at any phase and resumes play; **right-click regresses one
+phase** (and cancels from `AIM_XY`); the mouse wheel fine-tunes the current
+phase (`handle_mouse_wheel`: power ±0.00225/notch, elevation ±0.125°/notch,
+spin magnitude ±0.5/notch — a no-op on spin if it's currently zero). The
+UI aborts itself if the player loses the ball mid-phase. Right-click in the
+kick UI takes priority over Get Possession.
+
+**Keyboard-driven orders** (all act on the *selected* player):
+- **`P`** -> one-shot "Pass mode" (`enter_pass_mode()`, `OrderMode`). The
+  next click on a same-team player or empty ground issues a `PassOrder` at
+  that player/position, then auto-reverts to `OrderMode.MOVE`
+  (`_issue_transient_order`). Enters regardless of who has the ball, even
+  though the hotkey bar dims `[P]` when the selected player lacks it.
+- **`K`** -> if the selected player has the ball, enters the kick UI (above).
+  Otherwise enters one-shot "Shoot mode": the next click on any pitch point
+  issues a `ShootOrder` (z=1.0m, full power). Effectively Shoot mode is only
+  reachable by a player *without* the ball, and note the hotkey bar's `[K]`
+  entry is lit precisely in the case where `K` opens the kick UI.
+- **`S`** -> `SaveOrder`, goalkeepers only (`issue_save_order()`).
+- **`X`** -> `StopOrder` (`issue_stop_order()`).
+- `Esc` cancels, in order of priority: help overlay -> kick UI -> params
+  screen -> transient order mode -> back to menu (and finally quit).
+
+**Pause interplay** (`App._on_new_order`, `_on_human_order_complete`): issuing
+any new order resumes play automatically (no separate Space press), and when
+a human-issued order *completes* the match auto-pauses with a banner
+(`_pause_notification`, drawn by `draw_pause_notification`: "<id>:
+<order> complete — Space to resume"). Orders that never complete on their
+own (e.g. Save) therefore never trigger the auto-pause.
+
+## Player inspector panel (`renderer.draw_player_inspector`)
+
+Drawn top-right (below the help/speed/zoom row) for `panel_player()` — which
+is just `selected_player()`, so it appears for **either team's** player as
+soon as they're left-clicked. Read-only. Shows: `player_id (LEFT|RIGHT)`;
+what drives them (`_describe_player_ai`: "No AI (order-driven only)" for a
+human-controlled player, "Neural net", "Neural net (hybrid[, override
+active])" for `HybridPlayerAI`, else "Rules (<ClassName>)"); the active
+order's type plus one `field: value` line per dataclass field
+(`_format_order_lines`, generic via `dataclasses.fields()` so new Order types
+need no UI work; `on_complete` and `_private` fields skipped) or "(no active
+order)"; and the eight attribute ratings as red->green bars
+(`_ATTRIBUTE_LABELS`, HSV-interpolated by `_attribute_bar_colour`). Lines are
+truncated to 60 chars. When the match HUD has neural players it also shows
+a `Value:` line of each `NeuralPlayerAI`'s latest value-head prediction
+(`App._value_prediction_line`).
 
 ## Training mode goal reset (`app.py`)
 
@@ -274,12 +502,24 @@ living in the UI layer, not a general engine behaviour.
 `H` (or clicking the help button in the top-right corner of the match
 screen, drawn by `_draw_help_button`) toggles `App.show_help`. While shown,
 `_draw_help_overlay` renders a full-screen semi-transparent panel listing
-every control (click/drag/tackle/pass/save/pause/menu) and what each visual
-indicator means (goalkeeper colour, possession outline, inactive
-translucency). Match input events are suppressed while the overlay is open
-(only the help button/`H`/`Esc` are handled) so you can't accidentally
-issue orders while reading it; `Esc` closes the overlay first before
-falling back to its normal pass-mode-cancel / return-to-menu behaviour.
+every control and what each visual indicator means (goalkeeper colour,
+possession outline, inactive translucency, ball rings). Match input events
+are suppressed while the overlay is open (only the help button/`H`/`Esc`
+are handled) so you can't accidentally issue orders while reading it; `Esc`
+closes the overlay first before falling back to its normal kick-UI-cancel /
+pass-mode-cancel / return-to-menu behaviour.
+
+The overlay content is the module-level `_HELP_SECTIONS` list in `app.py`
+(sections of `(key, description)` rows: Mouse, Kick aiming, Keys, Match
+controls, Indicators). It is **hand-maintained, so update it whenever
+`input.py` or `App._handle_keydown` change** — it had drifted badly before
+(still describing click-drag kicking / Shift-lob, click-to-deselect, and
+right-click "tackling them"). `_draw_help_overlay` word-wraps each
+description (`_wrap_help_text`) to its column and flows whole sections down
+the columns, starting a new column when the next section won't fit; the
+column count is however many fit at a 440px minimum width (2 at the default
+~1150px window). At the 640x480 minimum window there is only one column and
+the last sections are clipped off the bottom — there is no scrolling.
 
 ## Hotkey bar (`renderer.draw_hotkey_bar` / `App._hotkey_entries`)
 
@@ -289,18 +529,30 @@ times.  Each entry is rendered in one of three states:
   `[P] Pass` while PASS mode is engaged.
 - **Enabled** (bright): the action is currently valid for the selected
   player (e.g. `[K] Shoot` lights up only if the selected player has the
-  ball).
+  ball — which, per `input.py`, is exactly when `K` opens the kick UI
+  rather than Shoot mode).
 - **Disabled** (dim but readable): action is not valid right now (no
   selection, wrong player type, etc.).
 
 This replaces the old inline key-hint text in the HUD, which only appeared
-when a player was selected. `App._hotkey_entries()` computes the seven
-entries (`[Spc]`, `[P]`, `[K]`, `[S]`, `[X]`, `[H]`, `[Esc]`) and their
-states from the current selection/ball/mode.
+when a player was selected. `App._hotkey_entries()` computes the nine
+entries (`[Spc]`, `[P]`, `[K]`, `[S]`, `[X]`, `[RClk] Get Possession`,
+`[Z]`, `[H]`, `[Esc]`) and their states from the current
+selection/ball/mode; training mode inserts a tenth, `[N]`, before `[H]`.
+(`[RClk]` is lit whenever *any* player is selected, though it only acts on
+an opposing-team right-click.)
 
 ## Scenarios (Phase H)
 
-`SCENARIOS` lists six `ScenarioDefinition` objects, all fully parameterized:
+`SCENARIOS` originally held six `ScenarioDefinition` objects, all fully
+parameterized (table below). It has since grown — the full key list in
+`scenarios.py` is `phase1_neural_ai`, `1v1_phase1` (both shown in the menu's
+left "AI Scenarios" column, everything else in the right "Balance Scenarios"
+column), `save_close`, `pass`, `tackle`, `goal_to_goal_sprint`,
+`sprint_shuttle`, `sprint`, `2v2`, `1v2`, `repulsion_obstacle`,
+`repulsion_obstacle_no_ball`, `mark_standoff`, `penalty_corner_accuracy`,
+`gk_far_post` — the newer ones aren't described in this file yet; read their
+`ScenarioDefinition` in `scenarios.py`. The original six:
 
 | key | Description |
 |---|---|
@@ -366,16 +618,39 @@ is new: ball repossessed by the non-attacking team before any shot is taken
 
 ## Game log (`gamelog.py` / `App._wire_match_log`, Phase G)
 
-`GameLog` is a `collections.deque(maxlen=50)` of `(time_s, level, message)`
-entries. `App._wire_match_log(match)` attaches a closure to
-`match.log_callback` that calls `game_log.add(level, msg, match.time_s)`.
+`GameLog` is a `collections.deque(maxlen=50)` of `LogEntry(time_s, level,
+message, detail)`. `App._wire_match_log(match)` attaches a closure to
+`match.log_callback` that calls `game_log.add(level, msg, match.time_s, detail)`.
 A new closure is attached each time a new match is built (new trial, training
 mode start) so old match references don't leak.
 
 `renderer.draw_game_log(surface, game_log, min_level)` draws the most recent
-entries in a semi-transparent box in the bottom-right corner, newest at the
-bottom. `L` hotkey in-match cycles `App.log_min_level` between `INFO` and
-`DEBUG`. DEBUG entries include full numeric roll breakdowns from tackles.
+8 rows in a semi-transparent box in the bottom-right corner, newest at the
+bottom, each prefixed with its match clock (`MM:SS.mmm`). `L` hotkey in-match
+cycles `App.log_min_level` between `INFO` and `DEBUG`. A tackle's numeric
+roll/modifier breakdown is attached to its (INFO) entry as `LogEntry.detail`
+— shown as a hover tooltip on rows with a dim `[Explain]` suffix, not as
+separate DEBUG lines.
+
+**Spam collapsing** (`GameLog.collapsed_entries`, what `draw_game_log`
+draws): a run of *consecutive* entries with an identical `message` (and
+level) is merged into one row, shown as a clock range plus a count, e.g.
+`00:12.000-00:13.000  p1 tackled p2 — won the ball (2x)`. Details:
+- Merging is done at *display time* over the level-filtered list, not in
+  `add()`, so raw entries (`all_entries`, `entries_above`) are never mutated
+  and an INFO message with DEBUG lines interleaved still collapses in INFO
+  view (in DEBUG view the interleaved line breaks the run, correctly).
+- Only exact message matches merge, and never across a different message
+  (A, B, A stays three rows).
+- The merged row keeps the *latest* occurrence's `detail` for the hover
+  tooltip; earlier occurrences' breakdowns aren't reachable from it.
+- Counts only cover entries still in the 50-entry ring buffer, so a run
+  longer than that reports at most 50 (and its start time drifts forward as
+  the oldest entries are evicted). Raise `GameLog(max_entries=...)` in
+  `App.__init__` if that ever matters.
+- Rows trim the *message* by pixel width (not a fixed character count) so
+  the `(Nx)` count and `[Explain]` suffix are never what gets cut off.
+Tests: `tests/unit/test_gamelog.py` (`test_collapse_*`).
 
 ## `Screen.SCENARIO_PARAMS` (Phase H)
 
@@ -612,7 +887,17 @@ so the ball stays in the net for the same duration as scenario trials.
 ## Known gaps / not yet implemented
 
 - No jog/sprint toggle for Move orders (always sprint).
-- Shoot mode (`K`) always fires at full power (`power_fraction=1.0`) with a
-  fixed aim height of 1.0m; no UI control for power or aim height yet.
+- Shoot mode (`K` without the ball) always fires at full power
+  (`power_fraction=1.0`) with a fixed aim height of 1.0m; power/height are
+  only controllable through the kick UI (which needs the ball).
+- Right-click Get Possession can't target a specific opponent (see
+  "Interaction scheme"); no UI path issues `ChaseTackleOrder`.
+- `MatchInputController.on_kick_ui_entered` is **not declared as a
+  dataclass field** — `App._wire_fresh_match` assigns it dynamically, but
+  `_enter_kick_ui` reads it unconditionally, so driving the controller
+  without an `App` (e.g. a unit test that calls `try_enter_kick_ui()`)
+  raises `AttributeError`. Confirmed: the attribute is absent from
+  `__dataclass_fields__`. There are currently no tests for
+  `MatchInputController` at all.
 - No sound, no game clock/timer, no formations/kickoff - out of scope for
   this milestone (mirrors the engine's own documented gaps).

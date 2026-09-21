@@ -61,6 +61,7 @@ from footballcoach.ai.action.distributions import (
     SquashedNormalHead,
     VonMisesDirectionHead,
     _von_mises_kl,
+    kick_power_from_raw,
 )
 from footballcoach.ai.action.gating import select_action
 from footballcoach.ai.action.schema import DecisionAction, DecisionHeadsRaw, ExecutionAction
@@ -76,6 +77,8 @@ from footballcoach.ai.eval.seeded_eval import (
 from footballcoach.ai.models.decision_network import DecisionNetwork, derive_get_possession_prob
 from footballcoach.ai.models.execution_network import ExecutionNetwork, flatten_decision_heads
 from footballcoach.ai.obs.augment import N_FLIP_VARIANTS, augment_batch, augment_obs_bc
+from footballcoach.ai.ppo import consistency as _consistency
+from footballcoach.ai.obs.y_canonical import YCanonicalNetworkWrapper, mirror_y_obs, y_flip_mask
 from footballcoach.ai.progress import ProgressReporter
 from footballcoach.ai.obs.canonical import (
     CanonicalNetworkWrapper,
@@ -85,7 +88,11 @@ from footballcoach.ai.obs.canonical import (
     x_sign_of,
 )
 from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer, HEAD_LP_KEYS
+from footballcoach.ai.ppo.action_opportunity_stats import (
+    format_opportunity_block, has_opportunity_flags, opportunity_masks, opportunity_stats,
+)
 from footballcoach.ai.ppo.schedules import TrainingSchedules
+from footballcoach.entities.action_opportunity import OPP_ACTION_KEYS
 
 log = logging.getLogger("footballcoach.ai.ppo")
 
@@ -548,6 +555,16 @@ def rebuild_inference_trainer(
     return trainer
 
 
+def _kick_power_frac_stats(batch: dict, floor: float = 0.0) -> dict:
+    """n / mean / std of the executed kick power fraction (floor + (1-floor) *
+    sigmoid of the stored raw draw) over the rows where a kick was sampled."""
+    kick = batch["action/kick"].reshape(-1) > 0.5
+    if not bool(kick.any()):
+        return {"n": 0, "mean": float("nan"), "std": float("nan")}
+    pf = kick_power_from_raw(batch["action/kick_power_raw"].reshape(-1)[kick].float(), floor)
+    return {"n": int(pf.numel()), "mean": float(pf.mean()), "std": float(pf.std()) if pf.numel() > 1 else 0.0}
+
+
 def _build_eval_env_factory(use_rules_ai: bool, max_episode_s: float):
     """Builds a ``seed -> ScenarioEnv`` factory for periodic phase-1 eval
     (rules or immobile opponent). Extracted out of ``_eval_worker_factory``
@@ -756,6 +773,192 @@ def _trimmed_mean_p25_p75(x: torch.Tensor) -> float:
     or is fairly stable regardless of how aggressively both tails are cut
     (the two read close together)."""
     return _trimmed_mean(x, 0.25, 0.75)
+
+
+_AI_TYPE_NAMES = ("rules", "immobile", "neural")  # order of obs/schema.py's AI-type one-hot
+
+
+def _episode_phase_fraction(track_ids: list, dones: np.ndarray, mc: np.ndarray) -> np.ndarray:
+    """Per-row position within its episode as ``(step_in_episode + 1) /
+    episode_length`` in (0, 1] (NaN for unfinished-tail rows). Rows of one
+    track are chronological; a new episode starts after a ``done=1`` row, and
+    ALSO where an unfinished tail (NaN ``mc``) is followed by a finite row --
+    that is the seam between two concatenated per-env buffers, which never
+    carries a done marker of its own."""
+    n = len(dones)
+    frac = np.full(n, np.nan, dtype=np.float64)
+    tracks = np.asarray(track_ids, dtype=object)
+    for t in set(track_ids):
+        idx = np.nonzero(tracks == t)[0]
+        if len(idx) == 0:
+            continue
+        d = dones[idx] > 0.5
+        nan = np.isnan(mc[idx])
+        is_start = np.zeros(len(idx), dtype=bool)
+        is_start[0] = True
+        is_start[1:] |= d[:-1]
+        is_start[1:] |= nan[:-1] & ~nan[1:]
+        ar = np.arange(len(idx))
+        start_pos = np.maximum.accumulate(np.where(is_start, ar, 0))
+        ep_id = np.cumsum(is_start) - 1
+        length = np.bincount(ep_id)
+        f = (ar - start_pos + 1) / length[ep_id]
+        f[nan] = np.nan
+        frac[idx] = f
+    return frac
+
+
+def _value_loss_breakdown(
+    preds: dict, mc, outcomes: list, track_ids: list, dones, other_type, ret_std: float,
+    n_worst_rows: int = 5, phase_frac=None,
+) -> list[str]:
+    """Human-readable breakdown of where the value error lives, for
+    ``ppg_value_refit``'s opt-in ``bc.ppg_loss_diagnostics``. Pure function
+    over per-row arrays (unit-tested without any network).
+
+    ``preds``: ``{"current": (N,), "original": (N,) optional}`` value
+    predictions; ``mc``: pure-MC returns with NaN on unfinished tails (only
+    finite rows are scored, so every figure is against value-net-free
+    targets); ``outcomes``/``track_ids``: per-row lists ('' outcome = unfinished);
+    ``dones``: (N,); ``other_type``: (N,) int index into ``_AI_TYPE_NAMES``
+    of the OTHER player as seen from the row's owner, or -1 if unknown (may be
+    None). All errors are normalised by ``ret_std**2`` like every other loss in
+    the refit logs. Returns log lines."""
+    mc = np.asarray(mc, dtype=np.float64)
+    dones = np.asarray(dones, dtype=np.float64)
+    valid = np.isfinite(mc)
+    var_norm = float(ret_std) ** 2
+    P = {k: np.asarray(v, dtype=np.float64) for k, v in preds.items()}
+    cur = P["current"]
+    orig = P.get("original")
+    n_valid = int(valid.sum())
+    lines: list[str] = []
+    if n_valid == 0:
+        return ["  [ppg loss diag] no rows with finished-episode MC targets"]
+
+    def _mse(p, m):
+        return float(np.mean((p[m] - mc[m]) ** 2)) / var_norm
+
+    tgt = mc[valid]
+    tot_var = float(np.var(tgt))
+    mse_cur = _mse(cur, valid)
+    lines.append(
+        f"  [ppg loss diag] {n_valid:,} rows with MC targets | target mean={tgt.mean():+.3f} std={tgt.std():.3f} | "
+        f"current: pred mean={cur[valid].mean():+.3f} std={cur[valid].std():.3f} bias={cur[valid].mean() - tgt.mean():+.3f} "
+        f"mse={mse_cur:.4f} R2={1.0 - mse_cur * var_norm / max(tot_var, 1e-12):.3f}"
+        + (f" | original mse={_mse(orig, valid):.4f}" if orig is not None else "")
+    )
+
+    header = (
+        f"    {'group':<34}{'n':>9}{'share':>7}{'tgt mean':>10}{'tgt std':>9}"
+        f"{'cur pred':>10}{'bias':>8}{'cur mse':>9}{'SSE%':>7}" + (f"{'orig mse':>10}" if orig is not None else "")
+    )
+    sse_total = float(np.sum((cur[valid] - mc[valid]) ** 2))
+
+    def _table(title: str, labels: np.ndarray, order=None) -> None:
+        lines.append(f"  [ppg loss diag] by {title}:")
+        lines.append(header)
+        uniq = order if order is not None else sorted({str(x) for x in labels[valid]})
+        for u in uniq:
+            m = valid & (labels == u)
+            k = int(m.sum())
+            if k == 0:
+                continue
+            sse = float(np.sum((cur[m] - mc[m]) ** 2))
+            row = (
+                f"    {str(u):<34}{k:>9,}{100.0 * k / n_valid:>6.1f}%{mc[m].mean():>+10.3f}{mc[m].std():>9.3f}"
+                f"{cur[m].mean():>+10.3f}{cur[m].mean() - mc[m].mean():>+8.3f}{_mse(cur, m):>9.4f}"
+                f"{100.0 * sse / max(sse_total, 1e-12):>6.1f}%"
+            )
+            if orig is not None:
+                row += f"{_mse(orig, m):>10.4f}"
+            lines.append(row)
+
+    trk = np.asarray(track_ids, dtype=object)
+    # The outcome label is the TRAINEE's view of the episode, so the opponent
+    # track's rows in a 'box_possession' episode are the losing side -- always
+    # split the outcome by the row owner's track or the groups are meaningless.
+    out_lab = np.asarray(
+        [f"{o if o else '?'} | {t}" for o, t in zip(outcomes, track_ids)], dtype=object,
+    )
+    _table("episode outcome (the trainee's view) x row owner", out_lab)
+
+    if other_type is not None:
+        ot = np.asarray(other_type)
+        names = np.asarray(
+            [_AI_TYPE_NAMES[i] if 0 <= i < len(_AI_TYPE_NAMES) else "?" for i in ot], dtype=object,
+        )
+        combo = np.asarray([f"{t} vs {n}" for t, n in zip(trk, names)], dtype=object)
+        _table("row owner (track) vs the other player's AI type", combo)
+    else:
+        _table("track (trainee / opponent)", trk)
+
+    if phase_frac is None:
+        phase_frac = _episode_phase_fraction(list(track_ids), dones, mc)
+    pf = np.asarray(phase_frac, dtype=np.float64)
+    bins = np.digitize(np.where(np.isfinite(pf), pf, 0.0), [0.25, 0.5, 0.75, 1.0000001, 9.0], right=True)
+    names_q = ["0-25% of episode", "25-50% of episode", "50-75% of episode", "75-100% of episode"]
+    plab = np.asarray([names_q[min(int(b), 3)] for b in bins], dtype=object)
+    plab[~np.isfinite(pf)] = "?"
+    _table("position within the episode", plab, order=names_q)
+
+    # Error concentration.
+    sq = (cur[valid] - tgt) ** 2
+    srt = np.sort(sq)[::-1]
+    csum = np.cumsum(srt) / max(float(srt.sum()), 1e-12)
+    top1 = float(csum[max(int(0.01 * len(srt)) - 1, 0)])
+    top10 = float(csum[max(int(0.10 * len(srt)) - 1, 0)])
+    lines.append(
+        f"  [ppg loss diag] error concentration: worst 1% of rows = {100 * top1:.0f}% of total squared error, "
+        f"worst 10% = {100 * top10:.0f}%"
+    )
+
+    # Yardstick: how much variance would be left if the episode's outcome (and
+    # the row owner and how far into the episode we are, in quartiles) were known?
+    # Row returns are DISCOUNTED, so even within one outcome they vary with
+    # time-to-go -- conditioning on the phase quartile removes most of that.
+    grp = np.asarray([f"{a}|{b}" for a, b in zip(out_lab[valid], plab[valid])], dtype=object)
+    within = 0.0
+    for u in set(grp.tolist()):
+        m = grp == u
+        within += float(np.var(tgt[m])) * int(m.sum())
+    within /= n_valid
+    lines.append(
+        f"  [ppg loss diag] target variance {tot_var:.3f}; with the outcome, row owner and episode quartile all "
+        f"known the remaining variance would be {within:.3f} ({100 * within / max(tot_var, 1e-12):.1f}% of total); "
+        f"current mse (raw) = {mse_cur * var_norm:.3f}. The gap is what predicting the outcome (which is not known "
+        f"in advance) costs the value net"
+    )
+
+    # Reliability: predicted-value deciles vs realised return.
+    edges = np.quantile(cur[valid], np.linspace(0, 1, 11))
+    lines.append("  [ppg loss diag] calibration (deciles of predicted value -> mean realised MC return):")
+    cells = []
+    for i in range(10):
+        lo, hi = edges[i], edges[i + 1]
+        m = valid & (cur >= lo) & ((cur <= hi) if i == 9 else (cur < hi))
+        if m.any():
+            cells.append(f"[{lo:+.2f},{hi:+.2f}]: pred {cur[m].mean():+.2f} -> real {mc[m].mean():+.2f}")
+    lines.append("    " + "  ".join(cells))
+
+    if n_worst_rows > 0:
+        worst = np.argsort(np.where(valid, (cur - np.where(valid, mc, 0.0)) ** 2, -1.0))[::-1][:n_worst_rows]
+        lines.append("  [ppg loss diag] worst rows (row, outcome, track, phase, target, pred):")
+        for i in worst:
+            lines.append(
+                f"    row {int(i)}: {out_lab[i]}, {trk[i]}, phase={pf[i]:.2f}, target={mc[i]:+.2f}, pred={cur[i]:+.2f}"
+            )
+    return lines
+
+
+def _lr_warmup_scale(step_idx: int, warmup_steps: int) -> float:
+    """Linear LR-warmup multiplier for the ``step_idx``-th (0-based) optimizer
+    step of a cycle: ``(step_idx + 1) / warmup_steps`` capped at 1.0, so the
+    first step runs at ``1/warmup_steps`` of the base lr and step
+    ``warmup_steps - 1`` onward at the full lr. ``warmup_steps <= 0`` = off."""
+    if warmup_steps <= 0:
+        return 1.0
+    return min(1.0, (step_idx + 1) / warmup_steps)
 
 
 def _trimmed_rmse(sq_err: torch.Tensor, trim_frac: float) -> float:
@@ -1085,7 +1288,10 @@ class PPOTrainer:
         separate_value_net: bool = False,
         share_value_grad_with_decision: bool = False,
         decision_value_coef: float = 0.5,
+        y_canonical: Optional[bool] = None,
     ):
+        # Opt-in y-canonical frame (ai/obs/y_canonical.py): None -> ppo.y_canonical from the config.
+        self.y_canonical = bool(cfg["ppo"].get("y_canonical", False)) if y_canonical is None else bool(y_canonical)
         # Wrapped so every forward call automatically canonicalizes
         # self_feat/other_feat/ball_feat into the canonical AI frame (see
         # ai/obs/canonical.py "CanonicalNetworkWrapper") — existing call
@@ -1094,6 +1300,9 @@ class PPOTrainer:
         # unaffected.
         self.decision_net = CanonicalNetworkWrapper(decision_net)
         self.execution_net = CanonicalNetworkWrapper(execution_net)
+        if self.y_canonical:
+            self.decision_net = YCanonicalNetworkWrapper(self.decision_net, "decision")
+            self.execution_net = YCanonicalNetworkWrapper(self.execution_net, "execution")
         self.device = device or torch.device("cpu")
         # --- Permanent separate-trunk value network (see CLI --separate-value-net) ---
         # A fully independent ExecutionNetwork (same class/config, own weights, zero
@@ -1119,6 +1328,8 @@ class PPOTrainer:
             self.value_net = CanonicalNetworkWrapper(ExecutionNetwork.from_config(
                 trunk_hidden_override=_value_trunk_override
             ))
+            if self.y_canonical:
+                self.value_net = YCanonicalNetworkWrapper(self.value_net, "execution")
         # --- Opt-in: let separate_value_net's critic gradient reach decision_net ---
         # Only meaningful when separate_value_net is on -- in the default
         # (non-separate) mode decision_net already receives value_loss's
@@ -1195,6 +1406,9 @@ class PPOTrainer:
             maxlen=_GRAD_NORM_SPIKE_HISTORY_MAXLEN,
         )
         self.n_epochs = int(ppo_cfg.get("n_epochs", 4))
+        # Linear LR warmup over the first N optimizer steps of EVERY PPO update
+        # (same idea as bc.ppg_warmup_steps; see _ppo_update). 0 = off.
+        self.lr_warmup_steps = max(0, int(ppo_cfg.get("lr_warmup_steps", 0)))
         _value_only_cont = ppo_cfg.get("value_only_continuation_epochs")
         self.value_only_continuation_epochs = int(_value_only_cont) if _value_only_cont is not None else self.n_epochs
         self.bc_only_continuation_epochs = int(bc_cfg.get("bc_only_continuation_epochs", 0))
@@ -1254,7 +1468,27 @@ class PPOTrainer:
         self.ent_kick_power_weight = float(ppo_cfg.get("ent_kick_power_weight", 1.0))
         self.ent_kick_spin_weight = float(ppo_cfg.get("ent_kick_spin_weight", 1.0))
         self.ent_decision_weight = float(ppo_cfg.get("ent_decision_weight", 1.0))
+        # Extra multiplier on the kick heads' entropy bonus in the PPO loss only
+        # (kick gate + kick_dir + kick_power); 1.0 = today's behaviour exactly.
+        self.ent_kick_weight = float(ppo_cfg.get("ent_kick_weight", 1.0))
+        # Lower bound of the executed kick power fraction (0.0 = plain sigmoid).
+        self.kick_power_floor = float(ppo_cfg.get("kick_power_floor", 0.0))
+        # agent_plans/masked_action_training_plan.md: per-decision "could the action take effect" flags
+        # (entities/action_opportunity.py). log_* = Phase-1 diagnostics only; mask_* = Phase-3 training masks
+        # (kick / tackle gates on opportunity rows, kick_dir / kick_power on rows where a kick fired).
+        self.mask_untriggered_actions = bool(ppo_cfg.get("mask_untriggered_actions", False))
+        self.mask_rescale_by_opportunity_rate = bool(ppo_cfg.get("mask_rescale_by_opportunity_rate", False))
+        self.log_action_opportunity_stats = bool(ppo_cfg.get("log_action_opportunity_stats", False)) or self.mask_untriggered_actions
         self.augment_n_slot_shuffles = int(ppo_cfg.get("augment_n_slot_shuffles", 0))
+        # Log-only: KL between the identity and flip_y augmentation copies (each with its y-mirrored
+        # output), from the pass _ppo_update already makes over the augmented batch. Needs augmentation.
+        self._log_flip_consistency = bool(ppo_cfg.get("log_flip_consistency", False))
+        if self.y_canonical and self.augment_n_slot_shuffles > 0:
+            log.warning(
+                "ppo.y_canonical is on but ppo.augment_n_slot_shuffles=%d: flip_y augmentation copies are exact "
+                "duplicates of the originals under the y-canonical frame (wasted compute, double-counted rows). "
+                "Set ppo.augment_n_slot_shuffles to 0.", self.augment_n_slot_shuffles,
+            )
         self.rollout_eval_trials = int(ppo_cfg.get("rollout_eval_trials", 10))
         # Seeded eval config (see ai/eval/seeded_eval.py) -- rollout_eval_trials
         # above is now just the on/off gate (<=0 disables); the actual seed
@@ -1509,6 +1743,46 @@ class PPOTrainer:
         # _trimmed_rmse). 0 disables the trimmed figure's trimming (== plain
         # rmse); never affects training or early stopping.
         self._ppg_rmse_trim_frac = min(max(float(bc_cfg.get("ppg_rmse_trim_frac", 0.10)), 0.0), 0.99)
+        # Fraction of each ppg_value_refit rollout's complete episodes held out
+        # as a val set (drives the val lines, early stopping and best-weights
+        # restore). 0 = no val set: every episode trains, and with nothing to
+        # early-stop or restore on, the refit just runs all its epochs.
+        self._ppg_val_episode_fraction = min(max(float(bc_cfg.get("ppg_val_episode_fraction", 0.15)), 0.0), 0.9)
+        # Linear LR warmup over the first N optimizer steps of EVERY refit
+        # cycle (the anchor is re-snapshotted per cycle, so the KL starts at
+        # exactly 0 each time and the value gradient overshoots before the KL
+        # pull catches up). 0 = off (constant lr, the previous behavior).
+        self._ppg_warmup_steps = max(0, int(bc_cfg.get("ppg_warmup_steps", 0)))
+        # Diagnostic: keep a frozen copy of the networks as loaded at the START
+        # of ppg_value_refit and, on every rollout's fresh data (before
+        # training on it), score both it and the current weights against
+        # pure-MC returns. The paired difference cancels the rollout-to-rollout
+        # noise that swamps the raw baselines. Log-only; never affects training.
+        self._ppg_compare_to_original = bool(bc_cfg.get("ppg_compare_to_original", False))
+        # Diagnostic: per-cycle breakdown of where the value error lives
+        # (outcome / opponent type / track / episode phase / calibration --
+        # see _value_loss_breakdown), logged on fresh rows before training on
+        # them; every ppg_diag_every_n_cycles-th cycle (and cycle 1) also dumps
+        # the per-row arrays to <checkpoint_dir>/ppg_diag_cycle<k>.npz.
+        self._ppg_loss_diagnostics = bool(bc_cfg.get("ppg_loss_diagnostics", False))
+        self._ppg_diag_every_n_cycles = max(1, int(bc_cfg.get("ppg_diag_every_n_cycles", 5)))
+        # Experiment: collect the refit's rollouts with the policy acting
+        # deterministically (each head's mode/mean, no sampling), to test how
+        # much of the value loss floor is the agent's own action-sampling
+        # noise. Off for real use. Needs the batched collection path.
+        self._ppg_rollout_deterministic = bool(bc_cfg.get("ppg_rollout_deterministic", False))
+        # flip_y consistency refit (consistency_refit(); CLI --consistency-refit-only) -- see
+        # ai_config.json's _comment_consistency and ai/knowledge.md "flip_y consistency refit".
+        self._consistency_epochs = int(bc_cfg.get("consistency_epochs", 5))
+        self._consistency_lr = float(bc_cfg.get("consistency_lr", 1e-4))
+        self._consistency_num_rollouts = int(bc_cfg.get("consistency_num_rollouts", 10))
+        self._consistency_val_episode_fraction = float(bc_cfg.get("consistency_val_episode_fraction", 0.15))
+        self._consistency_warmup_steps = max(0, int(bc_cfg.get("consistency_warmup_steps", 50)))
+        self._consistency_logit_bound = float(bc_cfg.get("consistency_logit_bound", 6.907))
+        self._consistency_kappa_deg = float(bc_cfg.get("consistency_kappa_deg", 22.0))
+        # Diagnostic only: when set to a list, ppg_value_refit appends one
+        # (epoch_idx, value_loss, total_kl) tuple per minibatch.
+        self._ppg_minibatch_trace: Optional[list] = None
         self._bc_pretrain_early_stop_patience = int(bc_cfg.get("bc_pretrain_early_stop_patience", 0))
         self._bc_pretrain_early_stop_min_delta = float(bc_cfg.get("bc_pretrain_early_stop_min_delta", 1e-4))
         self._p0_early_stop_patience = int(bc_cfg.get("demo_pretrain_early_stop_patience", 0))
@@ -1996,6 +2270,10 @@ class PPOTrainer:
         # Episode durations in sim-seconds (StepInfo.ticks_elapsed * env dt), for
         # the mean/std episode-length line alongside the other per-rollout logs.
         episode_durations_s: list[float] = []
+        episode_kick_counts: list[int] = []
+        episode_armed_kick_counts: list[int] = []
+        episode_kick_accum = 0
+        episode_armed_kick_accum = 0
 
         log.info(f"PPO training started: steps_so_far={self._total_steps:,}  target={self._total_steps + total_steps:,}  (+{total_steps:,} this run)")
 
@@ -2017,6 +2295,14 @@ class PPOTrainer:
             # --- Collect one decision step ---
             # NeuralPlayerAI fires inside env.step() — no pre-sampling needed here.
             next_obs, reward, done, info = env.step()
+            if info is not None:
+                episode_kick_accum += info.trainee_kicks_this_step
+                episode_armed_kick_accum += info.trainee_armed_kicks_this_step
+            if done:
+                episode_kick_counts.append(episode_kick_accum)
+                episode_armed_kick_counts.append(episode_armed_kick_accum)
+                episode_kick_accum = 0
+                episode_armed_kick_accum = 0
 
             # Read transition data from the trainee's NeuralPlayerAI
             tr = env.last_trainee_transition
@@ -2178,6 +2464,8 @@ class PPOTrainer:
                     episode_durations_s=episode_durations_s,
                     comp_step_stats=_comp_step_stats,
                     n_reward_comp_steps=len(_rcomp_raw),
+                    episode_kick_counts=episode_kick_counts,
+                    episode_armed_kick_counts=episode_armed_kick_counts,
                 )
                 episode_rewards.clear()
                 secondary_episode_rewards.clear()
@@ -2187,6 +2475,8 @@ class PPOTrainer:
                 rollout_components.clear()
                 episode_comp_list.clear()
                 episode_durations_s.clear()
+                episode_kick_counts.clear()
+                episode_armed_kick_counts.clear()
 
                 buffer.clear()
                 steps_this_rollout = 0
@@ -2224,6 +2514,8 @@ class PPOTrainer:
         episode_durations_s: list[float],
         comp_step_stats: dict[str, dict],
         n_reward_comp_steps: int,
+        episode_kick_counts: Optional[list[int]] = None,
+        episode_armed_kick_counts: Optional[list[int]] = None,
     ) -> None:
         """Emit the full multi-line per-rollout summary (reward breakdown,
         per-episode reward stats, per-component GAE/TD stats, direction
@@ -2405,6 +2697,11 @@ class PPOTrainer:
                 # sigma directly.
                 mv_ls_str += f" (σ≈{','.join(f'{s:.4f}' for s in _kp_sig)})"
             mv_ls_str += _kp_delta_str
+            _kpf = metrics.get("kick_power_frac")
+            if _kpf and _kpf.get("n", 0) > 0:
+                # The power fraction actually sampled on this rollout's kick rows
+                # (sigmoid of the stored raw draw), not the log_std parameter.
+                mv_ls_str += f"  | sampled power over {_kpf['n']:,} kicks: mean={_kpf['mean']:.3f} std={_kpf['std']:.3f}"
         ha = metrics.get("head_act", {})
         _ta_p = ha.get('ta_p', float('nan'))
         _kk_p = ha.get('kk_p', float('nan'))
@@ -2519,6 +2816,22 @@ class PPOTrainer:
             + (f"  {bc_str.strip()}" if bc_str else ""),
             f"  value    {_val_diag_str}",
         ]
+        _fc = metrics.get("flip_consistency")
+        if _fc:
+            _m = _fc["metrics"]
+            _inact = self._inactive_head_lp_keys()
+            _lines.append(
+                f"  flip     consistency KL={_fc['kl']:.4f}  move_dir err p50/p90={_m['move_dir_err_p50_deg']:.1f}/{_m['move_dir_err_p90_deg']:.1f} deg"
+                f"  >90deg={_m['move_dir_err_gt90_pct']:.1f}%  hard-decision disagree%: "
+                + "  ".join(f"{h}={_m.get(k, float('nan')):.1f}" for h, k in (
+                    ("exec_move", "exec_move_sign_disagree_pct"), ("sprint", "sprint_sign_disagree_pct"),
+                    ("kick", "kick_sign_disagree_pct"), ("tackle_att", "tackle_attempt_sign_disagree_pct")))
+            )
+            _lines.append(
+                "           by head: " + "  ".join(f"{k}={v:.3f}" for k, v in _fc["per_head"].items()
+                                                    if k not in _inact and v >= 0.0005)
+                + f"  (n={_fc['n']:,} state pairs, pre-update weights)"
+            )
         if _ent_bkdn:
             _mid_e = (len(_ent_parts) + 1) // 2
             _lines.append(f"  entropy  {'  '.join(_ent_parts[:_mid_e])}")
@@ -2543,6 +2856,17 @@ class PPOTrainer:
             _lines.append(
                 f"  ep_len   {_dur_arr.mean():.1f}\u00b1{_dur_arr.std():.1f}s"
                 f"  (n={len(episode_durations_s)}, min={_dur_arr.min():.1f}s, max={_dur_arr.max():.1f}s)"
+            )
+        if episode_kick_counts:
+            _kk = np.array(episode_kick_counts, dtype=np.float64)
+            _ka = np.array(episode_armed_kick_counts or [], dtype=np.float64)
+            _armed_str = (
+                f"  first-touch(armed)={_ka.mean():.3f}/ep ({100.0 * _ka.sum() / max(_kk.sum(), 1.0):.0f}% of kicks)"
+                if len(_ka) == len(_kk) else ""
+            )
+            _lines.append(
+                f"  kicks    {_kk.mean():.3f}±{_kk.std():.3f}/ep (trainee, all real kicks)"
+                f"{_armed_str}  0-kick eps={100.0 * float((_kk == 0).mean()):.0f}%  max={int(_kk.max())}  (n={len(_kk)})"
             )
         if comp_str:
             _comp_body = comp_str.strip().lstrip('rew:').strip()
@@ -2677,6 +3001,8 @@ class PPOTrainer:
                 episode_outcomes_vs_immobile: list[str] = []
                 episode_comp_list: list[dict[str, float]] = []
                 episode_durations_s: list[float] = []
+                episode_kick_counts: list[int] = []
+                episode_armed_kick_counts: list[int] = []
                 rollout_components: dict[str, float] = {}
                 for r in results:
                     advantages, returns = r["buffer"].compute_gae(self.gamma, self.lam, r["last_value"])
@@ -2689,6 +3015,8 @@ class PPOTrainer:
                     episode_outcomes_vs_immobile.extend(stats["episode_outcomes_vs_immobile"])
                     episode_comp_list.extend(stats["episode_comp_list"])
                     episode_durations_s.extend(stats["episode_durations_s"])
+                    episode_kick_counts.extend(stats.get("episode_kick_counts", []))
+                    episode_armed_kick_counts.extend(stats.get("episode_armed_kick_counts", []))
                     # rollout_components (rollout-total reward breakdown) is summed
                     # from each worker's completed-episode component dicts, since
                     # workers don't expose an in-progress per-step accumulator
@@ -2747,6 +3075,8 @@ class PPOTrainer:
                     episode_durations_s=episode_durations_s,
                     comp_step_stats=_comp_step_stats,
                     n_reward_comp_steps=len(_rcomp_raw),
+                    episode_kick_counts=episode_kick_counts,
+                    episode_armed_kick_counts=episode_armed_kick_counts,
                 )
 
                 if self.checkpoint_dir is not None:
@@ -2939,6 +3269,8 @@ class PPOTrainer:
                 episode_outcomes_vs_immobile: list[str] = []
                 episode_comp_list: list[dict[str, float]] = []
                 episode_durations_s: list[float] = []
+                episode_kick_counts: list[int] = []
+                episode_armed_kick_counts: list[int] = []
                 rollout_components: dict[str, float] = {}
                 # (seed, reward, mean_abs_advantage) for every completed
                 # trainee episode this rollout with a recorded seed -- only
@@ -2962,6 +3294,8 @@ class PPOTrainer:
                     episode_outcomes_vs_immobile.extend(stats["episode_outcomes_vs_immobile"])
                     episode_comp_list.extend(stats["episode_comp_list"])
                     episode_durations_s.extend(stats["episode_durations_s"])
+                    episode_kick_counts.extend(stats.get("episode_kick_counts", []))
+                    episode_armed_kick_counts.extend(stats.get("episode_armed_kick_counts", []))
                     for ep in stats["episode_comp_list"]:
                         for _k, _v in ep.items():
                             rollout_components[_k] = rollout_components.get(_k, 0.0) + _v
@@ -3055,6 +3389,8 @@ class PPOTrainer:
                     episode_durations_s=episode_durations_s,
                     comp_step_stats=_comp_step_stats,
                     n_reward_comp_steps=len(_rcomp_raw),
+                    episode_kick_counts=episode_kick_counts,
+                    episode_armed_kick_counts=episode_armed_kick_counts,
                 )
 
                 if self.checkpoint_dir is not None:
@@ -4826,7 +5162,8 @@ class PPOTrainer:
 
     def _collect_value_pretrain_rollout(
         self, env, n_steps: int, phase_id: Optional[int], use_gae: bool = False,
-        pool: Optional["_ValuePretrainWorkers"] = None,
+        pool: Optional["_ValuePretrainWorkers"] = None, with_mc_returns: bool = False,
+        deterministic: bool = False,
     ) -> tuple[dict, dict]:
         """Collect ``n_steps`` of on-policy experience for value warm-up.
 
@@ -4942,7 +5279,9 @@ class PPOTrainer:
                 else:
                     # Legacy shape ({"buffer", ...}): plain workers, or a batched
                     # worker spoken to without a returns spec.
-                    tensors, n_dropped = _finalize_value_pretrain_result(r, self.gamma, self.lam, use_gae)
+                    tensors, n_dropped = _finalize_value_pretrain_result(
+                        r, self.gamma, self.lam, use_gae, with_mc_returns=with_mc_returns,
+                    )
                 n_dropped_total += n_dropped
                 _n_rows_total += (int(tensors["returns"].shape[0]) if tensors is not None else 0) + n_dropped
                 if tensors is not None:
@@ -4971,9 +5310,16 @@ class PPOTrainer:
                 _returns_spec = {
                     "mode": "gae" if use_gae else "mc", "gamma": self.gamma, "lam": self.lam,
                 }
+                if with_mc_returns:
+                    _returns_spec["with_mc"] = True
+                if deterministic and not pool.batched:
+                    raise ValueError(
+                        "deterministic value-pretrain rollouts need the BATCHED collection path "
+                        "(ppo.value_pretrain_batched_rollout=true)"
+                    )
                 for w in pool.handles:
                     if pool.batched:
-                        w.collect(steps_per_worker, returns=_returns_spec)
+                        w.collect(steps_per_worker, returns=_returns_spec, deterministic=deterministic)
                     else:
                         w.collect(steps_per_worker, progress=0.0)
                 _agg_progress = ProgressReporter(
@@ -5078,7 +5424,7 @@ class PPOTrainer:
             # No "last_value" in this bare result dict -> the helper takes its
             # truncate-then-(MC | zero-bootstrap GAE) path, same as before.
             batch, n_dropped = _finalize_value_pretrain_result(
-                {"buffer": buffer}, self.gamma, self.lam, use_gae,
+                {"buffer": buffer}, self.gamma, self.lam, use_gae, with_mc_returns=with_mc_returns,
             )
             if n_dropped:
                 log.info(
@@ -5675,6 +6021,18 @@ class PPOTrainer:
         # on every cycle for no reason (weights still get re-synced each
         # cycle regardless, since the policy keeps moving). None when
         # parallel collection doesn't apply (single-process branch).
+        _orig_nets = None
+        if self._ppg_compare_to_original:
+            _orig_nets = (
+                copy.deepcopy(self.decision_net).eval(), copy.deepcopy(self.execution_net).eval(),
+            )
+            for _m in _orig_nets:
+                for _p in _m.parameters():
+                    _p.requires_grad_(False)
+        _mc_kw = {"with_mc_returns": True} if (self._ppg_compare_to_original or self._ppg_loss_diagnostics) else {}
+        if self._ppg_rollout_deterministic:
+            _mc_kw["deterministic"] = True
+            log.info("  [ppg value refit] rollouts are collected DETERMINISTICALLY (bc.ppg_rollout_deterministic)")
         _pool = self._spawn_value_pretrain_workers(phase_id)
         if _pool is not None and num_rollouts > 1:
             log.info(
@@ -5701,7 +6059,7 @@ class PPOTrainer:
                 # avoid a real circularity problem GAE would have there.
                 log.info("Doing PPG value refit rollout collection now (reuses pretrain_value()'s rollout collector, hence the '[value pretrain rollout]' label below)...")
                 batch, _rollout_stats = self._collect_value_pretrain_rollout(
-                    env, n_steps, phase_id, use_gae=True, pool=_pool,
+                    env, n_steps, phase_id, use_gae=True, pool=_pool, **_mc_kw,
                 )
 
                 # --- Episode-level 85/15 train/val split (overfit detection) ---
@@ -5709,7 +6067,10 @@ class PPOTrainer:
                 dones_arr = batch["dones"].numpy()
                 episode_end_idxs = np.where(dones_arr > 0.5)[0]
                 n_complete_eps = len(episode_end_idxs)
-                n_val_eps = max(1, round(0.15 * n_complete_eps)) if n_complete_eps >= 2 else 0
+                n_val_eps = (
+                    max(1, round(self._ppg_val_episode_fraction * n_complete_eps))
+                    if (self._ppg_val_episode_fraction > 0.0 and n_complete_eps >= 2) else 0
+                )
                 n_train_eps = n_complete_eps - n_val_eps
                 n_total = len(dones_arr)
                 val_mask = np.zeros(n_total, dtype=bool)
@@ -5741,6 +6102,7 @@ class PPOTrainer:
                 # exact same (possibly-augmented, larger) row set being trained on
                 # -- so augment_batch()'s known old_log_prob approximation for
                 # flip_y copies (see augment.py) simply never comes into play here.
+                _n_base = len(train_batch_raw["returns"])  # identity copy = the first _n_base rows after augmentation
                 if self.augment_n_slot_shuffles > 0:
                     train_batch = augment_batch(train_batch_raw, self.augment_n_slot_shuffles, self._aug_rng)
                     del train_batch_raw  # the un-augmented copy is dead weight from here on
@@ -5793,19 +6155,9 @@ class PPOTrainer:
                     k.replace("obs/", ""): v
                     for k, v in train_batch.items() if k.startswith("obs/")
                 }
-                anchor = self._ppg_snapshot_anchor(
-                    _train_obs_full, _batch_size,
-                    progress=ProgressReporter(
-                        len(_train_obs_full["self_feat"]), prefix="  [ppg] anchor snapshot (train): ", live=True,
-                    ),
-                )
+                anchor = self._ppg_snapshot_anchor(_train_obs_full, _batch_size)
                 val_anchor = (
-                    self._ppg_snapshot_anchor(
-                        val_obs_dict, _batch_size,
-                        progress=ProgressReporter(
-                            len(val_obs_dict["self_feat"]), prefix="  [ppg] anchor snapshot (val):   ", live=True,
-                        ),
-                    )
+                    self._ppg_snapshot_anchor(val_obs_dict, _batch_size)
                     if val_obs_dict is not None else None
                 )
                 anchor_globals = {
@@ -5823,15 +6175,13 @@ class PPOTrainer:
                 # num_rollouts cycles within this one call.
 
                 def _eval_value_loss(
-                    obs_source: dict, ret_source: torch.Tensor, progress_prefix: str = "",
+                    obs_source: dict, ret_source: torch.Tensor,
                 ) -> tuple[float, float, float]:
                     """Returns (normalized_mse, rmse, rmse excluding the worst
-                    ``ppg_rmse_trim_frac`` rows -- see ``_trimmed_rmse``).
-                    ``progress_prefix`` (optional) shows a per-chunk progress bar."""
+                    ``ppg_rmse_trim_frac`` rows -- see ``_trimmed_rmse``)."""
                     total_sq = 0.0
                     n_rows = 0
                     sq_chunks: list[torch.Tensor] = []
-                    _bar = ProgressReporter(len(ret_source), prefix=progress_prefix, live=True) if progress_prefix else None
                     with torch.no_grad():
                         for start in range(0, len(ret_source), _batch_size):
                             mb_ret = ret_source[start:start + _batch_size]
@@ -5854,8 +6204,6 @@ class PPOTrainer:
                             sq_chunks.append(_sq)
                             total_sq += float(_sq.sum())
                             n_rows += len(mb_ret)
-                            if _bar is not None:
-                                _bar.update(min(start + _batch_size, len(ret_source)))
                     mse = total_sq / max(n_rows, 1)
                     norm_mse = mse / float(ret_std ** 2)
                     _trim_rmse = _trimmed_rmse(torch.cat(sq_chunks) if sq_chunks else torch.empty(0), self._ppg_rmse_trim_frac)
@@ -5863,21 +6211,18 @@ class PPOTrainer:
 
                 def _eval_value_and_kl(
                     obs_source: dict, actions_source: dict, ret_source: torch.Tensor, anchor_source: dict,
-                    progress_prefix: str = "",
-                ) -> tuple[float, float, float, float, dict[str, float]]:
+                ) ->tuple[float, float, float, float, dict[str, float]]:
                     """Same value-loss computation as _eval_value_loss, PLUS the KL
                     penalty against anchor_source -- used for the held-out val set
                     each epoch (never trained on; purely diagnostic) so the log can
                     show kl_val alongside kl_train instead of only measuring drift
                     on the data actually being optimized. Returns
-                    (normalized_mse, rmse, trimmed_rmse, mean_kl, per_head_kl).
-                    ``progress_prefix`` (optional) shows a per-chunk progress bar."""
+                    (normalized_mse, rmse, trimmed_rmse, mean_kl, per_head_kl)."""
                     total_sq = 0.0
                     n_rows = 0
                     sq_chunks: list[torch.Tensor] = []
                     kl_sum = 0.0
                     per_head_sum: dict[str, float] = {}
-                    _bar = ProgressReporter(len(ret_source), prefix=progress_prefix, live=True) if progress_prefix else None
                     with torch.no_grad():
                         for start in range(0, len(ret_source), _batch_size):
                             mb_ret = ret_source[start:start + _batch_size]
@@ -5908,8 +6253,6 @@ class PPOTrainer:
                             kl_sum += float(total_kl) * bsz
                             for k, v in per_head_kl.items():
                                 per_head_sum[k] = per_head_sum.get(k, 0.0) + float(v) * bsz
-                            if _bar is not None:
-                                _bar.update(min(start + _batch_size, len(ret_source)))
                     mse = total_sq / max(n_rows, 1)
                     norm_mse = mse / float(ret_std ** 2)
                     rmse = float(ret_std) * math.sqrt(norm_mse)
@@ -5920,11 +6263,11 @@ class PPOTrainer:
 
                 _trim_tag = f"ex{int(round(self._ppg_rmse_trim_frac * 100))}"
                 _baseline_train_loss, _baseline_train_rmse, _baseline_train_trim = _eval_value_loss(
-                    _train_obs_full, returns_t, progress_prefix="  [ppg] baseline eval (train): ",
+                    _train_obs_full, returns_t,
                 )
                 if val_obs_dict is not None and val_returns_t is not None:
                     _baseline_val_loss, _baseline_val_rmse, _baseline_val_trim = _eval_value_loss(
-                        val_obs_dict, val_returns_t, progress_prefix="  [ppg] baseline eval (val):   ",
+                        val_obs_dict, val_returns_t,
                     )
                     log.info(
                         f"  PPG refit epoch   0/{epochs} (baseline): "
@@ -5939,6 +6282,117 @@ class PPOTrainer:
                         f"(returns std={float(ret_std):.1f})"
                     )
 
+                if _orig_nets is not None and "mc_returns" in train_batch:
+                    # Paired, noise-cancelling check of whether the refit is
+                    # actually getting better: score the frozen ORIGINAL
+                    # networks and the CURRENT ones (identical to the last
+                    # cycle's end weights) on this rollout's rows -- fresh, not
+                    # yet trained on -- against pure-MC returns. Not GAE
+                    # returns: those contain the sampling (current) network's
+                    # own value predictions, which would favour it by exactly
+                    # its disagreement with any other network.
+                    _mc_t = train_batch["mc_returns"].to(self.device)
+
+                    def _mse_vs_mc(dec_net, exec_net) -> tuple[float, int]:
+                        _sq_sum, _cnt = 0.0, 0
+                        with torch.no_grad():
+                            for _s in range(0, len(_mc_t), _batch_size):
+                                _tgt = _mc_t[_s:_s + _batch_size]
+                                _ok = torch.isfinite(_tgt)
+                                if not bool(_ok.any()):
+                                    continue
+                                _o = {k: v[_s:_s + _batch_size].to(self.device) for k, v in _train_obs_full.items()}
+                                _sat, _oat = _ai_types(_o)
+                                _dh = dec_net(
+                                    _o["self_feat"], _o["other_feat"], _o["exists_mask"],
+                                    _o["ball_feat"], _o["global_feat"], _sat, _oat,
+                                    ball_physics_full=_o.get("ball_physics_full"),
+                                    self_physics_full=_o.get("self_physics_full"),
+                                    other_physics_full=_o.get("other_physics_full"),
+                                )
+                                _v = exec_net(
+                                    _o["self_feat"], _o["other_feat"], _o["exists_mask"],
+                                    _o["ball_feat"], _o["global_feat"], _dh, _sat, _oat,
+                                    value_only=True,
+                                ).squeeze(-1)
+                                _sq_sum += float((((_v - _tgt) ** 2)[_ok]).sum())
+                                _cnt += int(_ok.sum())
+                        return _sq_sum / max(_cnt, 1) / float(ret_std ** 2), _cnt
+
+                    _orig_mse, _n_mc = _mse_vs_mc(*_orig_nets)
+                    _cur_mse, _ = _mse_vs_mc(self.decision_net, self.execution_net)
+                    log.info(
+                        f"  [ppg compare vs pure-MC returns] n={_n_mc:,} fresh rows: "
+                        f"original={_orig_mse:.4f}  current={_cur_mse:.4f}  "
+                        f"delta(original-current)={_orig_mse - _cur_mse:+.4f} "
+                        f"({(_orig_mse - _cur_mse) / max(_orig_mse, 1e-12) * 100:+.1f}%; positive = refit better)"
+                    )
+                    _mc_t = None
+
+                _diag_cycle = _rollout_i + 1
+                if (
+                    self._ppg_loss_diagnostics and "mc_returns" in train_batch
+                    and (_diag_cycle == 1 or _diag_cycle % self._ppg_diag_every_n_cycles == 0)
+                ):
+                    _nb = _n_base
+
+                    def _predict_rows(dec_net, exec_net) -> torch.Tensor:
+                        _out = []
+                        with torch.no_grad():
+                            for _s in range(0, _nb, _batch_size):
+                                _e = min(_s + _batch_size, _nb)
+                                _o = {k: v[_s:_e].to(self.device) for k, v in _train_obs_full.items()}
+                                _sat, _oat = _ai_types(_o)
+                                _dh = dec_net(
+                                    _o["self_feat"], _o["other_feat"], _o["exists_mask"],
+                                    _o["ball_feat"], _o["global_feat"], _sat, _oat,
+                                    ball_physics_full=_o.get("ball_physics_full"),
+                                    self_physics_full=_o.get("self_physics_full"),
+                                    other_physics_full=_o.get("other_physics_full"),
+                                )
+                                _out.append(exec_net(
+                                    _o["self_feat"], _o["other_feat"], _o["exists_mask"],
+                                    _o["ball_feat"], _o["global_feat"], _dh, _sat, _oat,
+                                    value_only=True,
+                                ).squeeze(-1).float().cpu())
+                        return torch.cat(_out)
+
+                    _preds = {"current": _predict_rows(self.decision_net, self.execution_net)}
+                    if _orig_nets is not None:
+                        _preds["original"] = _predict_rows(*_orig_nets)
+                    _mc_np = train_batch["mc_returns"][:_nb].numpy()
+                    _dones_np = train_batch["dones"][:_nb].numpy()
+                    _trk = train_batch["track_ids"][:_nb]
+                    _other = None
+                    if "obs/other_ai_type" in train_batch:
+                        _oat_t = train_batch["obs/other_ai_type"][:_nb]
+                        _ex_t = train_batch["obs/exists_mask"][:_nb]
+                        _oh = (_oat_t * _ex_t.unsqueeze(-1)).sum(dim=1)
+                        _other = torch.where(_oh.sum(dim=-1) > 0, _oh.argmax(dim=-1), torch.full_like(_oh.argmax(dim=-1), -1)).numpy()
+                    _phase = _episode_phase_fraction(list(_trk), _dones_np, _mc_np)
+                    _lines = _value_loss_breakdown(
+                        {k: v.numpy() for k, v in _preds.items()}, _mc_np,
+                        train_batch["step_outcomes"][:_nb], list(_trk), _dones_np, _other, float(ret_std),
+                        phase_frac=_phase,
+                    )
+                    for _ln in _lines:
+                        # every line carries the tag so a log filter / monitor can grab the whole block
+                        log.info(_ln if "[ppg loss diag]" in _ln else "  [ppg loss diag]" + _ln)
+                    if self.checkpoint_dir is not None:
+                        _npz = self.checkpoint_dir / f"ppg_diag_cycle{_diag_cycle}.npz"
+                        np.savez_compressed(
+                            _npz, mc=_mc_np.astype(np.float32), gae_return=train_batch["returns"][:_nb].numpy(),
+                            pred_current=_preds["current"].numpy(),
+                            pred_original=(_preds["original"].numpy() if "original" in _preds else np.zeros(0, np.float32)),
+                            phase=_phase.astype(np.float32), dones=_dones_np.astype(np.float32),
+                            other_ai_type=(_other if _other is not None else np.zeros(0, np.int64)),
+                            track=np.asarray(_trk, dtype=object).astype(str),
+                            outcome=np.asarray(train_batch["step_outcomes"][:_nb], dtype=object).astype(str),
+                            ret_std=np.float32(float(ret_std)),
+                        )
+                        log.info(f"  [ppg loss diag] per-row arrays saved to {_npz}")
+                    del _preds, _mc_np, _dones_np, _trk, _other, _phase, _lines
+
                 _best_val_loss = float("inf")
                 _best_decision_state: Optional[dict] = None
                 _best_execution_state: Optional[dict] = None
@@ -5947,6 +6401,7 @@ class PPOTrainer:
                 _EARLY_STOP_MIN_DELTA = self._value_pretrain_early_stop_min_delta
                 mean_loss = float(_baseline_train_loss)
                 epochs_done = 0
+                _steps_this_cycle = 0
 
                 for ep in range(epochs):
                     indices = torch.randperm(n)
@@ -5954,11 +6409,6 @@ class PPOTrainer:
                     ep_sq_errs: list[torch.Tensor] = []
                     ep_kl_totals = []
                     ep_head_kl_accum: dict[str, list[float]] = {}
-                    # Live per-epoch training bar (rows/s; falls back to 10%
-                    # milestone lines when stderr isn't a terminal). Its final
-                    # update at start+batch >= n prints the closing newline, so
-                    # the epoch's log line below never lands on the bar's row.
-                    _ep_bar = ProgressReporter(n, prefix=f"  [ppg] epoch {ep + 1}/{epochs} train: ", live=True)
                     for start in range(0, n, _batch_size):
                         mb_idx = indices[start:start + _batch_size]
                         mb_obs = {k.replace("obs/", ""): train_batch[k][mb_idx].to(self.device)
@@ -6001,6 +6451,11 @@ class PPOTrainer:
                         nn.utils.clip_grad_norm_(_non_direction_params, self.max_grad_norm)
                         if _direction_params:
                             nn.utils.clip_grad_norm_(_direction_params, self.direction_max_grad_norm)
+                        if self._ppg_warmup_steps > 0:
+                            _warm_scale = _lr_warmup_scale(_steps_this_cycle, self._ppg_warmup_steps)
+                            for _g in ppg_opt.param_groups:
+                                _g["lr"] = lr * _warm_scale
+                        _steps_this_cycle += 1
                         ppg_opt.step()
 
                         ep_value_losses.append(value_loss.item())
@@ -6009,12 +6464,10 @@ class PPOTrainer:
                         # so the trimmed rmse below can drop the worst tail.
                         ep_sq_errs.append(((new_values.detach() - mb_ret) ** 2))
                         ep_kl_totals.append(total_kl.item())
+                        if self._ppg_minibatch_trace is not None:
+                            self._ppg_minibatch_trace.append((ep, ep_value_losses[-1], ep_kl_totals[-1]))
                         for k, v in per_head_kl.items():
                             ep_head_kl_accum.setdefault(k, []).append(v.item())
-                        _ep_bar.update(
-                            min(start + _batch_size, n),
-                            postfix=f"value_loss={np.mean(ep_value_losses):.4f} kl={np.mean(ep_kl_totals):.4f}",
-                        )
 
                     mean_loss = float(np.mean(ep_value_losses))
                     mean_kl_train = float(np.mean(ep_kl_totals))
@@ -6029,7 +6482,6 @@ class PPOTrainer:
                     if val_obs_dict is not None and val_returns_t is not None and val_anchor is not None:
                         _vl, _val_rmse, _val_trim_rmse, mean_kl_val, _val_head_kl = _eval_value_and_kl(
                             val_obs_dict, val_actions_dict, val_returns_t, val_anchor,
-                            progress_prefix=f"  [ppg] epoch {epochs_done}/{epochs} val:   ",
                         )
                         log.info(
                             f"  PPG refit epoch {epochs_done}/{epochs}: "
@@ -6107,6 +6559,288 @@ class PPOTrainer:
 
         return _rollout_stats
 
+    def consistency_refit(
+        self,
+        env,
+        n_steps: int,
+        phase_id: Optional[int] = None,
+        teacher_checkpoint: Optional[Path] = None,
+        epochs: Optional[int] = None,
+        lr: Optional[float] = None,
+        batch_size: Optional[int] = None,
+        num_rollouts: Optional[int] = None,
+        val_episode_fraction: Optional[float] = None,
+        logit_bound: Optional[float] = None,
+        kappa_deg: Optional[float] = None,
+    ) -> dict:
+        """flip_y consistency refit: make the policy give the same answer to a state and its y-mirror.
+
+        Each cycle collects a fresh rollout with the CURRENT (student) policy, then for every state:
+        the "primary" orientation is the one where the observer's own y is >= 0; a frozen teacher
+        (``teacher_checkpoint`` -- the network BEFORE any --reset-bernoullis/kappa reset -- or a copy
+        of the current nets if None) is evaluated on it; the student is trained (analytic per-head KL,
+        the same ``_ppg_kl_penalty`` PPG uses) so that the primary state reproduces the teacher's
+        output and the mirror state reproduces the y-mirrored output. Both orientations therefore
+        share one target. Bernoulli targets are clamped to ``+-logit_bound`` so the trained heads end
+        up bounded (default 6.907 = probabilities within [0.001, 0.999]).
+
+        Frozen for the duration (restored afterwards): the direction/power/spin spread parameters
+        (a trainable kappa would let the consistency KL be reduced by simply widening the
+        distributions), the value head + its value-only helper modules (the shared trunk still
+        moves, so value error is logged before/after), and the physics encoders (always frozen).
+        ``kappa_deg`` > 0 first sets move_dir/kick_dir kappa to 1/radians(kappa_deg)**2.
+
+        Cycle structure mirrors ``ppg_value_refit`` (persistent worker pool, one Adam across cycles,
+        episode-level train/val split, best-val restore, checkpoint every cycle -- here to
+        ``checkpoint_consistency.pt``). Held-out validation reports the quantity that actually
+        matters, the student's own mirror consistency (angle error, hard-decision disagreement),
+        alongside teacher fidelity, boundedness and value drift.
+        """
+        epochs = epochs if epochs is not None else self._consistency_epochs
+        lr = lr if lr is not None else self._consistency_lr
+        _bs = batch_size if batch_size is not None else self._value_pretrain_batch_size
+        num_rollouts = num_rollouts if num_rollouts is not None else self._consistency_num_rollouts
+        val_frac = val_episode_fraction if val_episode_fraction is not None else self._consistency_val_episode_fraction
+        bound = logit_bound if logit_bound is not None else self._consistency_logit_bound
+        kdeg = kappa_deg if kappa_deg is not None else self._consistency_kappa_deg
+
+        if teacher_checkpoint is not None:
+            _t = PPOTrainer.from_config(
+                device=self.device, inference_only=True, separate_value_net=self.separate_value_net,
+            )
+            _t.load_checkpoint(Path(teacher_checkpoint))
+            teacher_nets = (_t.decision_net.eval(), _t.execution_net.eval())
+        else:
+            teacher_nets = (copy.deepcopy(self.decision_net).eval(), copy.deepcopy(self.execution_net).eval())
+        for _m in teacher_nets:
+            for _p in _m.parameters():
+                _p.requires_grad_(False)
+
+        en = self.execution_net
+        _spread_params = [en.move_dir_log_kappa, en.kick_dir_log_kappa, en.kick_dir_z_log_std,
+                          en.kick_power_log_std, en.kick_spin_log_std]
+        if kdeg > 0:
+            _kappa = 1.0 / math.radians(kdeg) ** 2
+            with torch.no_grad():
+                en.move_dir_log_kappa.fill_(math.log(_kappa))
+                en.kick_dir_log_kappa.fill_(math.log(_kappa))
+        _value_only_names = ("value_head", "value_ai_type_channel")
+        _restore_grad: list[tuple[torch.nn.Parameter, bool]] = []
+        for _name, _p in list(self.decision_net.named_parameters()) + list(self.execution_net.named_parameters()):
+            if any(s in _name for s in _value_only_names) or any(_p is g for g in _spread_params):
+                _restore_grad.append((_p, _p.requires_grad))
+                _p.requires_grad_(False)
+        trainable = [p for p in list(self.decision_net.parameters()) + list(self.execution_net.parameters()) if p.requires_grad]
+        _dir_ids = getattr(self, "direction_param_ids", set())
+        _non_dir = [p for p in trainable if id(p) not in _dir_ids]
+        _dir = [p for p in trainable if id(p) in _dir_ids]
+        opt = torch.optim.Adam(trainable, lr=lr, eps=1e-5)
+        anchor_globals = {
+            "move_dir_log_kappa": en.move_dir_log_kappa.detach().clone(),
+            "kick_dir_log_kappa": en.kick_dir_log_kappa.detach().clone(),
+            "kick_dir_z_log_std": en.kick_dir_z_log_std.detach().clone(),
+            "kick_power_log_std": en.kick_power_log_std.detach().clone(),
+        }
+        if not self._kick_spin_frozen:
+            anchor_globals["kick_spin_log_std"] = en.kick_spin_log_std.detach().clone()
+        _kd = math.degrees(1.0 / math.sqrt(math.exp(en.move_dir_log_kappa.item())))
+        log.info(
+            f"Consistency refit: {num_rollouts} rollout(s) x {n_steps} steps, {epochs} epochs, lr={lr}, "
+            f"batch_size={_bs}, val_episode_fraction={val_frac}, logit_bound={bound}, "
+            f"move_dir kappa={math.exp(en.move_dir_log_kappa.item()):.2f} (~{_kd:.1f} deg std), "
+            f"{len(trainable)} trainable tensors ({len(_restore_grad)} frozen: spread params + value-only modules)"
+        )
+
+        def _batch_obs(d: dict, idx=None, sl=None):
+            src = (lambda v: v[idx]) if idx is not None else (lambda v: v[sl])
+            return {k: src(v).to(self.device) for k, v in d.items()}
+
+        def _forward(mb_obs):
+            sat, oat = _ai_types(mb_obs)
+            d_heads = self.decision_net(
+                mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"],
+                mb_obs["ball_feat"], mb_obs["global_feat"], sat, oat,
+                ball_physics_full=mb_obs.get("ball_physics_full"),
+                self_physics_full=mb_obs.get("self_physics_full"),
+                other_physics_full=mb_obs.get("other_physics_full"),
+            )
+            e_heads = self.execution_net(
+                mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"],
+                mb_obs["ball_feat"], mb_obs["global_feat"], d_heads, sat, oat,
+            )
+            return d_heads, e_heads
+
+        _ACT_KEYS = ("exec_move", "kick", "pass_", "tackle", "mark")
+
+        def _build_set(raw: dict) -> dict:
+            """2n rows: first n = primary orientation, last n = its y-mirror, with matching teacher anchors."""
+            obs = {k: v for k, v in raw.items() if k.startswith("obs/")}
+            n = len(obs["obs/self_feat"])
+            primary, mirror = _consistency.orientation_pair(obs)
+            both = {k: torch.cat([primary[k], mirror[k]], dim=0) for k in obs}
+            both.update(self._precompute_physics_full(both, _bs))
+            obs_dict = {k.replace("obs/", ""): v for k, v in both.items()}
+            teacher_obs = {k: v[:n] for k, v in obs_dict.items() if not k.endswith("physics_full")}
+            anc_p = _consistency.bound_bernoulli_anchor(
+                self._ppg_snapshot_anchor(teacher_obs, _bs, nets=teacher_nets), bound,
+            )
+            anchor = _consistency.concat_anchors(anc_p, _consistency.mirror_anchor_y(anc_p))
+            acts = {k: torch.cat([raw[f"action/{k}"]] * 2, dim=0) for k in _ACT_KEYS}
+            return {"obs": obs_dict, "acts": acts, "anchor": anchor,
+                    "returns": torch.cat([raw["returns"]] * 2, dim=0), "n": n}
+
+        def _evaluate(ds: dict, ret_std: float) -> dict:
+            n = ds["n"]
+            kl_sum, head_sum, sq_sum = 0.0, {}, 0.0
+            rows: dict[str, list[torch.Tensor]] = {}
+            with torch.no_grad():
+                for s in range(0, 2 * n, _bs):
+                    sl = slice(s, min(s + _bs, 2 * n))
+                    mb = _batch_obs(ds["obs"], sl=sl)
+                    d_heads, e_heads = _forward(mb)
+                    acts = {k: v[sl].to(self.device) for k, v in ds["acts"].items()}
+                    anc = {k: v[sl] for k, v in ds["anchor"].items()}
+                    total_kl, per_head = self._ppg_kl_penalty(d_heads, e_heads, anc, anchor_globals, acts, mb["exists_mask"])
+                    bsz = sl.stop - sl.start
+                    kl_sum += float(total_kl) * bsz
+                    for k, v in per_head.items():
+                        head_sum[k] = head_sum.get(k, 0.0) + float(v) * bsz
+                    sq_sum += float(((e_heads.value.squeeze(-1) - ds["returns"][sl].to(self.device)) ** 2).sum())
+                    for k, v in self._snapshot_row(d_heads, e_heads).items():
+                        rows.setdefault(k, []).append(v.detach())
+            student = {k: torch.cat(v, dim=0) for k, v in rows.items()}
+            sp = {k: v[:n] for k, v in student.items()}
+            sq = {k: v[n:] for k, v in student.items()}
+            moving = ds["acts"]["exec_move"][:n].squeeze(-1).to(sp["move_direction"].device) > 0.5
+            out = {
+                "kl": kl_sum / (2 * n), "per_head": {k: v / (2 * n) for k, v in head_sum.items()},
+                "value_norm_mse": sq_sum / (2 * n) / ret_std ** 2,
+                "consistency": _consistency.flip_consistency_metrics(sp, sq, moving),
+                "bounded_pct": _consistency.bounded_share_pct(sp, bound if bound > 0 else 6.907),
+            }
+            anc_p = {k: v[:n] for k, v in ds["anchor"].items()}
+            agree = {}
+            for key in ("exec_move_logit", "sprint_logit", "kick_logit", "tackle_attempt_logit"):
+                agree[key.replace("_logit", "")] = float(((sp[key] > 0) == (anc_p[key] > 0)).float().mean() * 100)
+            ang_s = torch.atan2(sp["move_direction"][:, 1], sp["move_direction"][:, 0])
+            ang_t = torch.atan2(anc_p["move_direction"][:, 1], anc_p["move_direction"][:, 0])
+            err = torch.rad2deg((torch.remainder(ang_s - ang_t + math.pi, 2 * math.pi) - math.pi).abs())[moving]
+            out["teacher_agree_pct"] = agree
+            out["teacher_move_dir_err_p50_deg"] = float(err.quantile(0.5)) if len(err) else float("nan")
+            return out
+
+        def _fmt(m: dict, tag: str) -> list[str]:
+            c = m["consistency"]
+            heads = ("exec_move", "sprint", "kick", "tackle_attempt")
+            return [
+                f"    [consistency {tag}] val_kl={m['kl']:.4f}  value_norm_mse={m['value_norm_mse']:.4f}",
+                f"    [consistency {tag}] flip-consistency: move_dir err p50/p90={c['move_dir_err_p50_deg']:.1f}/{c['move_dir_err_p90_deg']:.1f} deg "
+                f">90deg={c['move_dir_err_gt90_pct']:.1f}%  |  hard-decision disagree%: "
+                + "  ".join(f"{h}={c.get(h + '_sign_disagree_pct', float('nan')):.1f}" for h in heads),
+                f"    [consistency {tag}] teacher fidelity: move_dir err p50={m['teacher_move_dir_err_p50_deg']:.1f} deg  decision agree%: "
+                + "  ".join(f"{h}={m['teacher_agree_pct'][h]:.1f}" for h in heads)
+                + "  |  within-bound%: " + "  ".join(f"{k}={v:.1f}" for k, v in m["bounded_pct"].items()),
+                "    [consistency " + tag + "] KL by head: " + "  ".join(f"{k}={v:+.4f}" for k, v in m["per_head"].items()
+                                                                       if k not in self._inactive_head_lp_keys()),
+            ]
+
+        _pool = self._spawn_value_pretrain_workers(phase_id)
+        _first_val: Optional[dict] = None
+        _last_val: dict = {}
+        try:
+            for _ci in range(num_rollouts):
+                log.info(f"=== Consistency refit: rollout {_ci + 1}/{num_rollouts} ===")
+                batch, _stats = self._collect_value_pretrain_rollout(env, n_steps, phase_id, use_gae=True, pool=_pool)
+                dones = batch["dones"].numpy()
+                ends = np.where(dones > 0.5)[0]
+                n_eps = len(ends)
+                n_val_eps = max(1, round(val_frac * n_eps)) if (val_frac > 0.0 and n_eps >= 2) else 0
+                n_train_eps = n_eps - n_val_eps
+                val_mask = np.zeros(len(dones), dtype=bool)
+                if n_val_eps > 0:
+                    starts = np.concatenate([[0], ends[:-1] + 1])
+                    for _i in range(n_train_eps, n_eps):
+                        val_mask[starts[_i]:ends[_i] + 1] = True
+                ret_std = float(batch["returns"].std().clamp(min=1.0))
+                train_raw, val_raw = _split_batch_releasing(batch, ~val_mask, val_mask if n_val_eps > 0 else None)
+                log.info(
+                    f"  consistency split: {n_train_eps} train eps ({int((~val_mask).sum())} states)"
+                    + (f"  |  {n_val_eps} val eps ({int(val_mask.sum())} states)" if n_val_eps > 0 else "")
+                    + "  (each state is used in both orientations)"
+                )
+                train = _build_set(train_raw)
+                val = _build_set(val_raw) if val_raw is not None else None
+                train_raw = val_raw = None
+                n2 = 2 * train["n"]
+
+                if val is not None:
+                    _m0 = _evaluate(val, ret_std)
+                    if _first_val is None:
+                        _first_val = _m0
+                    for _ln in _fmt(_m0, "epoch 0 (baseline)"):
+                        log.info(_ln)
+
+                best_val, best_state, patience, steps = float("inf"), None, 0, 0
+                for ep in range(epochs):
+                    perm = torch.randperm(n2)
+                    kl_list, head_acc = [], {}
+                    for s in range(0, n2, _bs):
+                        idx = perm[s:s + _bs]
+                        mb = _batch_obs(train["obs"], idx=idx)
+                        acts = {k: v[idx].to(self.device) for k, v in train["acts"].items()}
+                        idx_dev = idx.to(self.device)
+                        anc = {k: v[idx_dev] for k, v in train["anchor"].items()}
+                        d_heads, e_heads = _forward(mb)
+                        total_kl, per_head = self._ppg_kl_penalty(d_heads, e_heads, anc, anchor_globals, acts, mb["exists_mask"])
+                        opt.zero_grad()
+                        total_kl.backward()
+                        nn.utils.clip_grad_norm_(_non_dir, self.max_grad_norm)
+                        if _dir:
+                            nn.utils.clip_grad_norm_(_dir, self.direction_max_grad_norm)
+                        if self._consistency_warmup_steps > 0:
+                            _w = _lr_warmup_scale(steps, self._consistency_warmup_steps)
+                            for _g in opt.param_groups:
+                                _g["lr"] = lr * _w
+                        steps += 1
+                        opt.step()
+                        kl_list.append(total_kl.item())
+                        for k, v in per_head.items():
+                            head_acc.setdefault(k, []).append(v.item())
+                    log.info(f"  consistency epoch {ep + 1}/{epochs}: train_kl={np.mean(kl_list):.4f}")
+                    if val is not None:
+                        _last_val = _evaluate(val, ret_std)
+                        for _ln in _fmt(_last_val, f"epoch {ep + 1}/{epochs} val"):
+                            log.info(_ln)
+                        if _last_val["kl"] < best_val - self._value_pretrain_early_stop_min_delta:
+                            best_val, patience = _last_val["kl"], 0
+                            best_state = (copy.deepcopy(self.decision_net.state_dict()), copy.deepcopy(self.execution_net.state_dict()))
+                        else:
+                            patience += 1
+                            if patience >= self._value_pretrain_early_stop_patience:
+                                log.info(f"  [consistency] early stop at epoch {ep + 1} (val_kl stagnant, best={best_val:.4f})")
+                                break
+                if best_state is not None:
+                    _load_state_dict_tolerant(self.decision_net, best_state[0], "consistency_refit decision_net restore")
+                    _load_state_dict_tolerant(self.execution_net, best_state[1], "consistency_refit execution_net restore")
+                    log.info(f"  [consistency] restored best-val weights (val_kl={best_val:.4f})")
+                if self.checkpoint_dir is not None:
+                    _ckpt = self.checkpoint_dir / "checkpoint_consistency.pt"
+                    self._save_checkpoint_to(_ckpt)
+                    log.info(f"  [consistency] checkpoint saved to {_ckpt}")
+                train = val = None
+        finally:
+            self._close_value_pretrain_workers(_pool)
+            for _p, _rg in _restore_grad:
+                _p.requires_grad_(_rg)
+
+        if _first_val is not None and _last_val:
+            log.info("Consistency refit summary (val, first-cycle baseline -> last epoch):")
+            for _ln in _fmt(_first_val, "baseline"):
+                log.info(_ln)
+            for _ln in _fmt(_last_val, "final"):
+                log.info(_ln)
+        return {"first_val": _first_val, "last_val": _last_val}
+
     # -----------------------------------------------------------------------
     # Policy sampling
     # -----------------------------------------------------------------------
@@ -6136,7 +6870,10 @@ class PPOTrainer:
         also feed an explicit restoring-force regularizer this scoped fix
         does not add for kick_power/kick_spin).
         """
-        return SquashedNormalHead(raw_mean, log_std_param, low=0.0, high=1.0, squash="sigmoid")
+        # low = ppo.kick_power_floor: the executed power fraction is
+        # floor + (1 - floor) * sigmoid(raw). Only to_physical/mode_physical see
+        # it; log_prob/entropy/KL are on the raw draw, so PPO's maths is unchanged.
+        return SquashedNormalHead(raw_mean, log_std_param, low=self.kick_power_floor, high=1.0, squash="sigmoid")
 
     def _kick_spin_dist(self, raw_mean: torch.Tensor, log_std_param: torch.Tensor) -> torch.distributions.Normal:
         """kick_spin: plain unsquashed 3D Normal, no L2-normalize.
@@ -6242,11 +6979,14 @@ class PPOTrainer:
         other_parts: list[torch.Tensor] = []
         for start in range(0, n, chunk_size):
             idx = torch.arange(start, min(start + chunk_size, n))
-            sf_c, of_c, bf_c, _ = canonicalize_obs(
-                batch["obs/self_feat"][idx].to(self.device),
-                batch["obs/other_feat"][idx].to(self.device),
-                batch["obs/ball_feat"][idx].to(self.device),
-            )
+            _sf = batch["obs/self_feat"][idx].to(self.device)
+            _of = batch["obs/other_feat"][idx].to(self.device)
+            _bf = batch["obs/ball_feat"][idx].to(self.device)
+            if self.y_canonical:
+                # The wrapped networks mirror y-negative rows before their forward pass and pass these
+                # cached tensors through untouched, so they must be computed from the mirrored rows.
+                _sf, _of, _bf = mirror_y_obs(_sf, _of, _bf, y_flip_mask(_sf))
+            sf_c, of_c, bf_c, _ = canonicalize_obs(_sf, _of, _bf)
             gf_c = batch["obs/global_feat"][idx].to(self.device)
             if dn.ball_physics_encoder is not None:
                 ball_parts.append(dn.ball_physics_encoder(bf_c, gf_c).cpu())
@@ -6264,6 +7004,7 @@ class PPOTrainer:
     @torch.no_grad()
     def _ppg_snapshot_anchor(
         self, obs: dict, batch_size: int, progress: Optional["ProgressReporter"] = None,
+        nets: Optional[tuple] = None,
     ) -> dict[str, torch.Tensor]:
         """Snapshot the state-dependent policy outputs needed to compute a
         per-head KL penalty later, for ``ppg_value_refit()``. Called ONCE,
@@ -6300,51 +7041,63 @@ class PPOTrainer:
         """
         n = len(obs["self_feat"])
         chunks: dict[str, list[torch.Tensor]] = {}
+        # ``nets`` = (decision_net, execution_net) of some OTHER network (e.g. a frozen teacher);
+        # its frozen physics encoders are re-run on the obs rather than fed the caller's
+        # precomputed physics_full, so it never depends on the caller's encoder weights.
+        _dec_net, _exec_net = nets if nets is not None else (self.decision_net, self.execution_net)
         for start in range(0, n, batch_size):
             mb_obs = {k: v[start:start + batch_size].to(self.device) for k, v in obs.items()}
             sat, oat = _ai_types(mb_obs)
-            d_heads = self.decision_net(
+            _phys = {} if nets is not None else {
+                "ball_physics_full": mb_obs.get("ball_physics_full"),
+                "self_physics_full": mb_obs.get("self_physics_full"),
+                "other_physics_full": mb_obs.get("other_physics_full"),
+            }
+            d_heads = _dec_net(
                 mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"],
-                mb_obs["ball_feat"], mb_obs["global_feat"], sat, oat,
-                ball_physics_full=mb_obs.get("ball_physics_full"),
-                self_physics_full=mb_obs.get("self_physics_full"),
-                other_physics_full=mb_obs.get("other_physics_full"),
+                mb_obs["ball_feat"], mb_obs["global_feat"], sat, oat, **_phys,
             )
-            e_heads = self.execution_net(
+            e_heads = _exec_net(
                 mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"],
                 mb_obs["ball_feat"], mb_obs["global_feat"], d_heads, sat, oat,
             )
-            row: dict[str, torch.Tensor] = {
-                "shoot_logit": d_heads.shoot_logit,
-                "pass_logit": d_heads.pass_logit,
-                "move_logit": d_heads.move_logit,
-                "tackle_logit": d_heads.tackle_logit,
-                "get_possession_raw": d_heads.get_possession_raw,
-                "mark_logit": d_heads.mark_logit,
-                "hold_position_logit": d_heads.hold_position_logit,
-                "pass_target_logits": d_heads.pass_target_logits,
-                "tackle_target_logits": d_heads.tackle_target_logits,
-                "mark_target_logits": d_heads.mark_target_logits,
-                "exec_move_logit": e_heads.exec_move_logit,
-                "sprint_logit": e_heads.sprint_logit,
-                "kick_logit": e_heads.kick_logit,
-                "tackle_attempt_logit": e_heads.tackle_attempt_logit,
-                "move_direction": e_heads.move_direction,
-                "kick_direction": e_heads.kick_direction,
-                "kick_power": e_heads.kick_power,
-            }
-            if not self._kick_spin_frozen:
-                row["kick_spin"] = e_heads.kick_spin
+            row = self._snapshot_row(d_heads, e_heads)
             for k, v in row.items():
                 chunks.setdefault(k, []).append(v.detach())
             if progress is not None:
                 progress.update(min(start + batch_size, n))
         return {k: torch.cat(v, dim=0) for k, v in chunks.items()}
 
+    def _snapshot_row(self, d_heads, e_heads) -> dict[str, torch.Tensor]:
+        """The per-row state-dependent head outputs ``_ppg_kl_penalty`` needs (the "anchor" layout)."""
+        row: dict[str, torch.Tensor] = {
+            "shoot_logit": d_heads.shoot_logit,
+            "pass_logit": d_heads.pass_logit,
+            "move_logit": d_heads.move_logit,
+            "tackle_logit": d_heads.tackle_logit,
+            "get_possession_raw": d_heads.get_possession_raw,
+            "mark_logit": d_heads.mark_logit,
+            "hold_position_logit": d_heads.hold_position_logit,
+            "pass_target_logits": d_heads.pass_target_logits,
+            "tackle_target_logits": d_heads.tackle_target_logits,
+            "mark_target_logits": d_heads.mark_target_logits,
+            "exec_move_logit": e_heads.exec_move_logit,
+            "sprint_logit": e_heads.sprint_logit,
+            "kick_logit": e_heads.kick_logit,
+            "tackle_attempt_logit": e_heads.tackle_attempt_logit,
+            "move_direction": e_heads.move_direction,
+            "kick_direction": e_heads.kick_direction,
+            "kick_power": e_heads.kick_power,
+        }
+        if not self._kick_spin_frozen:
+            row["kick_spin"] = e_heads.kick_spin
+        return row
+
     def _ppg_kl_penalty(
         self, d_heads, e_heads, anchor: dict[str, torch.Tensor],
         anchor_globals: dict[str, torch.Tensor], mb_actions: dict, exists_mask: torch.Tensor,
-    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        return_per_row: bool = False,
+    ) -> tuple:
         """Analytic per-head KL(current policy || anchor snapshot), for
         ``ppg_value_refit()``'s KL-anchor loss term.
 
@@ -6514,6 +7267,8 @@ class PPOTrainer:
         }
         total_per_row = sum(per_head.values())
         per_head_mean = {k: v.mean() for k, v in per_head.items()}
+        if return_per_row:
+            return total_per_row.mean(), per_head_mean, total_per_row.detach(), {k: v.detach() for k, v in per_head.items()}
         return total_per_row.mean(), per_head_mean
 
     @torch.no_grad()
@@ -7512,6 +8267,9 @@ class PPOTrainer:
         val_adv = val_batch["advantages"]
         val_adv = (val_adv - val_adv.mean()) / (val_adv.std() + 1e-8)
         val_old_lp = val_batch["log_probs"]
+        _val_opp_mask = self._opp_head_mask_matrix(val_batch)
+        if _val_opp_mask is not None:
+            val_old_lp = self._mask_total_log_probs(val_old_lp, val_batch["head_log_probs"], _val_opp_mask)
         val_returns = val_batch["returns"]
         val_ret_var = val_returns.var().clamp(min=1.0)
 
@@ -7549,6 +8307,11 @@ class PPOTrainer:
                 mb_actions = {k.replace("action/", ""): val_batch[k][idx].to(self.device)
                               for k in val_batch if k.startswith("action/")}
                 new_log_probs = self._recompute_log_prob(d_heads, e_heads, mb_actions, em)
+                if _val_opp_mask is not None:
+                    new_log_probs = self._mask_total_log_probs(
+                        new_log_probs, self._per_head_new_log_probs(d_heads, e_heads, mb_actions, em),
+                        _val_opp_mask[idx].to(self.device),
+                    )
 
                 mb_adv = val_adv[idx].to(self.device)
                 mb_ret = val_returns[idx].to(self.device)
@@ -7620,7 +8383,7 @@ class PPOTrainer:
     # -----------------------------------------------------------------------
 
     def _recompute_old_log_probs_for_augmented_batch(
-        self, batch: dict,
+        self, batch: dict, pair_out: Optional[dict] = None,
     ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
         """Properly recompute old_log_prob (+ per-head old_log_prob) for
         EVERY row of an augmented batch, replacing ``augment_batch()``'s
@@ -7664,11 +8427,21 @@ class PPOTrainer:
         Returns ``(log_probs, head_log_probs)`` -- ``head_log_probs`` is
         ``None`` when ``"head_log_probs"`` isn't present in ``batch``
         (matches ``RolloutBuffer.add()``'s own optionality for that field).
+
+        ``pair_out``: when a dict is passed, it is filled with ``"id"`` and ``"flip"`` -- CPU
+        head-output snapshots (``_snapshot_row`` layout) of the identity block and the flip_y block
+        (both with identity slot order) that this same pass already computed, for
+        ``_flip_consistency_stats``. Frozen categorical target logits are replaced by a placeholder.
         """
         n = len(batch["log_probs"])
         has_head_lp = "head_log_probs" in batch
         lp_parts: list[torch.Tensor] = []
         head_lp_parts: list[torch.Tensor] = []
+        _k = max(1, self.augment_n_slot_shuffles)
+        _n_base = n // (2 * _k)
+        _blocks = {"id": (0, _n_base), "flip": (_k * _n_base, _k * _n_base + _n_base)}
+        _pair_parts: dict[str, list[dict]] = {"id": [], "flip": []}
+        _inactive = self._inactive_head_lp_keys() if pair_out is not None else frozenset()
         with torch.no_grad():
             for start in range(0, n, self.minibatch_size):
                 idx = torch.arange(start, min(start + self.minibatch_size, n))
@@ -7691,9 +8464,130 @@ class PPOTrainer:
                     head_lp_parts.append(
                         self._per_head_new_log_probs(d_heads, e_heads, mb_actions, em).cpu()
                     )
+                if pair_out is not None:
+                    _row = None
+                    for _name, (_lo, _hi) in _blocks.items():
+                        _a, _b = max(start, _lo), min(start + len(idx), _hi)
+                        if _a >= _b:
+                            continue
+                        if _row is None:
+                            _row = self._snapshot_row(d_heads, e_heads)
+                            for _short, _key in (("pass_", "pass_target_logits"), ("tackle", "tackle_target_logits"),
+                                                 ("mark", "mark_target_logits")):
+                                if _short in _inactive:
+                                    _row[_key] = torch.zeros(len(idx), 1, device=self.device)
+                        _pair_parts[_name].append(
+                            {k: v[_a - start:_b - start].detach().cpu() for k, v in _row.items()}
+                        )
+        if pair_out is not None:
+            for _name, _parts in _pair_parts.items():
+                pair_out[_name] = {k: torch.cat([p[k] for p in _parts], dim=0) for k in _parts[0]} if _parts else {}
         log_probs = torch.cat(lp_parts, dim=0)
         head_log_probs = torch.cat(head_lp_parts, dim=0) if has_head_lp else None
         return log_probs, head_log_probs
+
+    def _flip_consistency_stats(self, batch: dict, pair: dict) -> Optional[dict]:
+        """How consistent is the (pre-update) policy between each state and its y-mirror?
+
+        ``pair`` comes from ``_recompute_old_log_probs_for_augmented_batch(..., pair_out=pair)``.
+        Returns the analytic KL(policy(state) || y-mirror of policy(flipped state)) summed over
+        heads (``_ppg_kl_penalty``, the same quantity ``consistency_refit`` trains down), its per-head
+        breakdown, and the hard-decision / direction-angle disagreement stats. None if unavailable.
+        """
+        from types import SimpleNamespace
+
+        id_rows, flip_rows = pair.get("id"), pair.get("flip")
+        if not id_rows or not flip_rows:
+            return None
+        n_base = len(id_rows["move_direction"])
+        en = self.execution_net
+        globals_ = {
+            "move_dir_log_kappa": en.move_dir_log_kappa.detach(), "kick_dir_log_kappa": en.kick_dir_log_kappa.detach(),
+            "kick_dir_z_log_std": en.kick_dir_z_log_std.detach(), "kick_power_log_std": en.kick_power_log_std.detach(),
+        }
+        if not self._kick_spin_frozen:
+            globals_["kick_spin_log_std"] = en.kick_spin_log_std.detach()
+        mirrored = _consistency.mirror_anchor_y(flip_rows)
+        kl_sum, head_sum = 0.0, {}
+        with torch.no_grad():
+            for lo in range(0, n_base, self.minibatch_size):
+                hi = min(lo + self.minibatch_size, n_base)
+                ns = SimpleNamespace(**{k: v[lo:hi].to(self.device) for k, v in id_rows.items()})
+                anchor = {k: v[lo:hi].to(self.device) for k, v in mirrored.items()}
+                acts = {k: batch[f"action/{k}"][lo:hi].to(self.device) for k in ("exec_move", "kick", "pass_", "tackle", "mark")}
+                em = batch["obs/exists_mask"][lo:hi].to(self.device)
+                total, per_head = self._ppg_kl_penalty(ns, ns, anchor, globals_, acts, em)
+                kl_sum += float(total) * (hi - lo)
+                for k, v in per_head.items():
+                    head_sum[k] = head_sum.get(k, 0.0) + float(v) * (hi - lo)
+        moving = batch["action/exec_move"][:n_base].squeeze(-1) > 0.5
+        metrics = _consistency.flip_consistency_metrics(id_rows, flip_rows, moving)
+        return {"kl": kl_sum / n_base, "per_head": {k: v / n_base for k, v in head_sum.items()}, "metrics": metrics, "n": n_base}
+
+    # HEAD_LP_KEYS column -> opportunity_masks() key for the heads that only carry policy-gradient signal where the
+    # action could take effect (agent_plans/masked_action_training_plan.md). kick_spin is permanently frozen
+    # (log-prob column always 0) but is listed with its parent params for completeness.
+    _OPP_HEAD_MASK_KEY = {
+        "kick": "kick", "tackle_attempt": "tackle_attempt",
+        "kick_dir": "kick_dir", "kick_power": "kick_power", "kick_spin": "kick_dir",
+    }
+
+    def _opp_head_mask_matrix(self, batch: dict) -> Optional[torch.Tensor]:
+        """(n, len(HEAD_LP_KEYS)) float mask (1 = that head trains on that row) or None when
+        ``ppo.mask_untriggered_actions`` is off. Fails loudly if masking is on but the rollout carries no flags."""
+        if not self.mask_untriggered_actions:
+            return None
+        if not has_opportunity_flags(batch):
+            raise ValueError(
+                "ppo.mask_untriggered_actions is on but the rollout batch has no action/opp_* flags -- the "
+                "rollout producer did not attach them (ScenarioEnv._with_opportunity_flags)."
+            )
+        _decision_parents = {"pass_logit", "tackle_logit", "mark_logit"}
+        if not _decision_parents <= set(self._ppo_lp_masked_heads):
+            raise NotImplementedError(
+                "ppo.mask_untriggered_actions is only implemented for curriculum phases whose pass/tackle/mark "
+                "decision heads are frozen (their target-categorical log-prob terms are outside the per-head "
+                "log-prob columns the mask is applied to)."
+            )
+        masks = opportunity_masks(batch)
+        m = torch.ones(len(batch["log_probs"]), len(HEAD_LP_KEYS))
+        for head, key in self._OPP_HEAD_MASK_KEY.items():
+            m[:, HEAD_LP_KEYS.index(head)] = masks[key].reshape(-1)
+        return m
+
+    def _opp_head_grad_scale(self, mask_matrix: Optional[torch.Tensor]) -> Optional[torch.Tensor]:
+        """Per-head gradient multiplier 1/mean(mask) (plan D9, ``ppo.mask_rescale_by_opportunity_rate``),
+        capped at 100; None when rescaling (or masking) is off. Value-preserving: see _mask_total_log_probs."""
+        if mask_matrix is None or not self.mask_rescale_by_opportunity_rate:
+            return None
+        return (1.0 / mask_matrix.mean(dim=0).clamp(min=0.01)).to(self.device)
+
+    @staticmethod
+    def _mask_total_log_probs(
+        total: torch.Tensor, cols: torch.Tensor, mask: torch.Tensor, grad_scale: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """Total log-prob with the masked-out heads' terms removed: ``sum_h mask_h * col_h`` plus whatever the
+        total holds beyond the per-head columns (0 in the supported phases; detached when ``total`` carries a
+        graph so masked heads receive EXACTLY zero gradient). ``cols`` = per-head log-probs (n, 15) of the same
+        rows (``head_log_probs`` for the old policy, ``_per_head_new_log_probs`` for the current one).
+        ``grad_scale`` multiplies each head's gradient without changing any value."""
+        residual = total - cols.sum(dim=-1)
+        if total.requires_grad:
+            residual = residual.detach()
+        c = cols
+        if grad_scale is not None:
+            c = cols.detach() + grad_scale * (cols - cols.detach())
+        return (c * mask).sum(dim=-1) + residual
+
+    def _log_action_opportunity(self, batch: dict) -> None:
+        """[action opp] block (Phase 1 of agent_plans/masked_action_training_plan.md): how often a kick / armed
+        tackle could actually take effect, and how the gates behave inside vs outside those rows."""
+        st = opportunity_stats(batch)
+        if st is None:
+            log.warning("[action opp] enabled but the batch carries no action/opp_* flags (rollout producer did not attach them)")
+            return
+        for line in format_opportunity_block(st):
+            log.info(line)
 
     def _ppo_update(self, batch: dict, progress: float) -> dict:
         """Run N epochs of minibatch PPO updates over the collected rollout.
@@ -7721,6 +8615,9 @@ class PPOTrainer:
             batch = augment_batch(batch, self.augment_n_slot_shuffles, self._aug_rng)
 
         n = len(batch["log_probs"])
+
+        if self.log_action_opportunity_stats:
+            self._log_action_opportunity(batch)
 
         # --- Precompute frozen physics-encoder features ONCE for this
         # rollout's batch (fixed by this point -- augmentation above, if
@@ -7756,10 +8653,17 @@ class PPOTrainer:
         # just above (consumes those obs/*_physics_full fields) and is only
         # meaningful when augmentation actually ran -- an unaugmented batch's
         # log_probs are already exact.
+        flip_consistency = None
         if self.augment_n_slot_shuffles > 0:
-            batch["log_probs"], _recomputed_head_lp = self._recompute_old_log_probs_for_augmented_batch(batch)
+            _flip_pair: Optional[dict] = {} if self._log_flip_consistency else None
+            batch["log_probs"], _recomputed_head_lp = self._recompute_old_log_probs_for_augmented_batch(
+                batch, pair_out=_flip_pair,
+            )
             if _recomputed_head_lp is not None:
                 batch["head_log_probs"] = _recomputed_head_lp
+            if _flip_pair is not None:
+                flip_consistency = self._flip_consistency_stats(batch, _flip_pair)
+            _flip_pair = None
 
         clip = self.schedules.clip(progress)
         lr = self.schedules.lr(progress)
@@ -7770,8 +8674,12 @@ class PPOTrainer:
         ent_coef = self.schedules.ent(progress)
         for pg in self.optimizer.param_groups:
             pg["lr"] = value_lr if pg.get("name") == "value" else lr
+        # Per-update LR warmup: remember this update's scheduled lrs and
+        # scale them for the first lr_warmup_steps optimizer steps below.
+        _warm_base_lrs = [pg["lr"] for pg in self.optimizer.param_groups]
+        _warm_steps_done = 0
 
-        has_bc = "bc_labels" in batch and (bc_coeff > 0.0 or bc_kick_coeff > 0.0 or bc_tackle_coeff > 0.0)
+        has_bc ="bc_labels" in batch and (bc_coeff > 0.0 or bc_kick_coeff > 0.0 or bc_tackle_coeff > 0.0)
 
         # Normalize advantages
         adv = batch["advantages"]
@@ -7779,6 +8687,15 @@ class PPOTrainer:
 
         old_log_probs = batch["log_probs"]
         returns = batch["returns"]
+        # ppo.mask_untriggered_actions: heads that could not take effect on a row carry no policy-gradient signal
+        # there -- the ratio is built from log-probs with those heads' terms removed on BOTH sides. The unmasked
+        # old_log_probs stays for the whole-policy diagnostics further down.
+        _opp_mask = self._opp_head_mask_matrix(batch)
+        _opp_grad_scale = self._opp_head_grad_scale(_opp_mask)
+        old_log_probs_ratio = (
+            old_log_probs if _opp_mask is None
+            else self._mask_total_log_probs(old_log_probs, batch["head_log_probs"], _opp_mask)
+        )
 
         all_policy_loss = []
         all_value_loss = []
@@ -8054,7 +8971,7 @@ class PPOTrainer:
                 all_adv_min.append(_adv_stats[2])
                 all_adv_max.append(_adv_stats[3])
                 mb_ret = returns[mb_idx].to(self.device)
-                mb_old_lp = old_log_probs[mb_idx].to(self.device)
+                mb_old_lp = old_log_probs_ratio[mb_idx].to(self.device)
                 # Normalised per-sample weights: sum to minibatch size so loss scale is stable
                 mb_w_raw = batch["sample_weights"][mb_idx].to(self.device)
                 mb_w = mb_w_raw * (len(mb_w_raw) / mb_w_raw.sum().clamp(min=1e-8))
@@ -8111,6 +9028,12 @@ class PPOTrainer:
                 mb_actions = {k.replace("action/", ""): batch[k][mb_idx].to(self.device)
                               for k in batch if k.startswith("action/")}
                 new_log_probs = self._recompute_log_prob(d_heads, e_heads, mb_actions, em)
+                _mb_opp_mask = None if _opp_mask is None else _opp_mask[mb_idx].to(self.device)
+                if _mb_opp_mask is not None:
+                    new_log_probs = self._mask_total_log_probs(
+                        new_log_probs, self._per_head_new_log_probs(d_heads, e_heads, mb_actions, em),
+                        _mb_opp_mask, _opp_grad_scale,
+                    )
 
                 # Per-head log_prob breakdown (debug only, first mb of first epoch)
                 if not _diag_done and log.isEnabledFor(logging.DEBUG):
@@ -8224,7 +9147,10 @@ class PPOTrainer:
                         _head_min_surr = self._apply_dual_clip(
                             torch.min(_head_surr1, _head_surr2), _head_adv
                         )
-                        _head_policy_loss = -(_head_min_surr * _head_w).mean(dim=0)
+                        _head_policy_loss = (
+                            -(_head_min_surr * _head_w).mean(dim=0) if _mb_opp_mask is None
+                            else -(_head_min_surr * _head_w * _mb_opp_mask).sum(dim=0) / _mb_opp_mask.sum(dim=0).clamp(min=1.0)
+                        )
                     all_head_policy_loss.append(_head_policy_loss.cpu())
 
                 # Value loss — normalise by return variance so it stays ~O(1)
@@ -8237,7 +9163,15 @@ class PPOTrainer:
                 _accum_value_by_outcome(new_values, mb_ret, mb_idx)
 
                 # Entropy bonus
-                entropy, _ent_bkdn = self._compute_entropy(d_heads, e_heads, em, return_breakdown=True)
+                _opp_entropy_masks = None
+                if _mb_opp_mask is not None:
+                    _ik, _it = HEAD_LP_KEYS.index("kick"), HEAD_LP_KEYS.index("tackle_attempt")
+                    _opp_entropy_masks = {"kick": _mb_opp_mask[:, _ik], "tackle_attempt": _mb_opp_mask[:, _it]}
+                    if _opp_grad_scale is not None:
+                        _opp_entropy_masks["kick_scale"] = float(_opp_grad_scale[_ik])
+                        _opp_entropy_masks["tackle_attempt_scale"] = float(_opp_grad_scale[_it])
+                entropy, _ent_bkdn, _kick_ent_boost = self._compute_entropy(
+                    d_heads, e_heads, em, return_breakdown=True, return_kick_boost=True, opp_masks=_opp_entropy_masks)
                 for _ek, _ev in _ent_bkdn.items():
                     all_entropy_breakdown.setdefault(_ek, []).append(_ev)
 
@@ -8283,7 +9217,7 @@ class PPOTrainer:
 
                 total_loss = (policy_loss
                               + self.vf_coef * value_loss
-                              - ent_coef * entropy
+                              - ent_coef * (entropy + _kick_ent_boost)
                               + dir_log_std_reg
                               + dir_mag_reg)
 
@@ -8462,7 +9396,15 @@ class PPOTrainer:
                     all_grad_norm_dir.append(_gn_dir)
                     if _gn_dir > self.direction_max_grad_norm:
                         clip_triggered_dir += 1
+                if self.lr_warmup_steps > 0 and _warm_steps_done < self.lr_warmup_steps:
+                    _ws = _lr_warmup_scale(_warm_steps_done, self.lr_warmup_steps)
+                    for _pg, _base in zip(self.optimizer.param_groups, _warm_base_lrs):
+                        _pg["lr"] = _base * _ws
+                _warm_steps_done += 1
                 self.optimizer.step()
+                if self.lr_warmup_steps > 0 and _warm_steps_done == self.lr_warmup_steps:
+                    for _pg, _base in zip(self.optimizer.param_groups, _warm_base_lrs):
+                        _pg["lr"] = _base
                 if _direction_params:
                     _dir_delta_norm = torch.sqrt(sum(
                         (p.detach() - p_before).pow(2).sum()
@@ -8480,6 +9422,10 @@ class PPOTrainer:
                     )
                     e_after = self.execution_net(sf, of, em, bf, gf, d_after, sat, oat)
                     lp_after = self._recompute_log_prob(d_after, e_after, mb_actions, em)
+                    if _mb_opp_mask is not None:
+                        lp_after = self._mask_total_log_probs(
+                            lp_after, self._per_head_new_log_probs(d_after, e_after, mb_actions, em), _mb_opp_mask,
+                        )
                     # Kept as tensors (not .item()'d) -- see the single
                     # combined sync below, gathering every scalar diagnostic
                     # in this whole "after step" section (roughly a dozen
@@ -8504,7 +9450,11 @@ class PPOTrainer:
                     if "head_log_probs" in batch:
                         mb_old_head_lp = batch["head_log_probs"][mb_idx].to(self.device)
                         per_head_new_lp_after = self._per_head_new_log_probs(d_after, e_after, mb_actions, em)
-                        per_head_kl_mb = (mb_old_head_lp - per_head_new_lp_after).mean(dim=0)  # (13,)
+                        per_head_kl_mb = (
+                            (mb_old_head_lp - per_head_new_lp_after).mean(dim=0) if _mb_opp_mask is None
+                            else ((mb_old_head_lp - per_head_new_lp_after) * _mb_opp_mask).sum(dim=0)
+                            / _mb_opp_mask.sum(dim=0).clamp(min=1.0)
+                        )  # (15,)
                         all_head_kl.append(per_head_kl_mb.detach().cpu())
 
                     _shift_tensors: dict[str, torch.Tensor] = {
@@ -9598,6 +10548,7 @@ class PPOTrainer:
             "policy_loss": float(np.mean(all_policy_loss)),
             "value_loss": float(np.mean(all_value_loss)),
             "pre_update_value_loss": pre_update_value_loss,
+            "flip_consistency": flip_consistency,
             "entropy": float(np.mean(all_entropy)),
             "entropy_breakdown": {k: float(np.mean(v)) for k, v in all_entropy_breakdown.items()},
             "ent_coef": ent_coef,
@@ -9614,6 +10565,7 @@ class PPOTrainer:
             "kick_power_log_std": kick_power_log_std,
             "mv_ls_grad": mean_mv_ls_grad,
             "head_act": head_act,
+            "kick_power_frac": _kick_power_frac_stats(batch, self.kick_power_floor),
             "grad_clip_pct_main": grad_clip_pct_main,
             "grad_clip_pct_dir": grad_clip_pct_dir,
             "grad_clip_mean_norm_main": grad_clip_mean_main,
@@ -9715,7 +10667,8 @@ class PPOTrainer:
 
         return lp
 
-    def _compute_entropy(self, d_heads, e_heads, exists_mask, return_breakdown: bool = False):
+    def _compute_entropy(self, d_heads, e_heads, exists_mask, return_breakdown: bool = False,
+                         return_kick_boost: bool = False, opp_masks: Optional[dict] = None):
         """Entropy bonus, consistent with the masked log_prob.
 
         Restricted to exactly the heads in HEAD_LP_KEYS (rollout_buffer.py)
@@ -9740,6 +10693,14 @@ class PPOTrainer:
         ent_decision_weight, separate from execution_net's exec_move/kick/
         tackle_attempt (always weight 1.0). See ai_config.json's
         ent_decision_weight comment.
+
+        ``opp_masks`` (ppo.mask_untriggered_actions, agent_plans/masked_action_training_plan.md):
+        ``{"kick": (B,), "tackle_attempt": (B,)}`` per-row opportunity masks (1 = the action could take
+        effect on that row), optionally with ``"kick_scale"``/``"tackle_attempt_scale"`` floats (the
+        1/P(opportunity) rescale). The kick gate / tackle_attempt entropy is then the mask-weighted mean over
+        rows, and kick_dir / kick_power (/ spin) entropy is weighted per row by ``mask_kick * p_kick(row)`` (the
+        E[kick] weighting restricted to rows where a kick could happen) instead of by the batch-mean p_kick.
+        ``None`` = the unmasked formulas below, unchanged.
 
         Args:
             return_breakdown: if True, also return a dict of each head's own
@@ -9774,6 +10735,8 @@ class PPOTrainer:
         ]:
             if mask_key is not None and mask_key in masked:
                 h = torch.zeros((), device=self.device)
+            elif opp_masks is not None and name in ("kick", "tackle_attempt"):
+                h = (opp_masks[name] * IndependentBernoulli(logit).entropy().reshape(-1)).mean() * opp_masks.get(f"{name}_scale", 1.0)
             else:
                 h = IndependentBernoulli(logit).entropy().mean()
                 if mask_key is not None:
@@ -9794,27 +10757,43 @@ class PPOTrainer:
         p_kick = torch.sigmoid(e_heads.kick_logit).mean()
         h_sprint = p_exec_move * IndependentBernoulli(e_heads.sprint_logit).entropy().mean()
         h_move_dir = p_exec_move * self.ent_dir_weight * self._move_dir_head(e_heads.move_direction, log_kappa_move).entropy().mean()
-        h_kick_dir = p_kick * self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).entropy().mean()
-        h_kick_power = p_kick * self.ent_kick_power_weight * self._kick_power_head(e_heads.kick_power, log_std_power).entropy().mean()
-        # kick_spin is permanently frozen (see agent_plans/spin_implementation_plan.md
-        # section 0) -- its entropy term is masked to exactly zero rather than
-        # computed and discarded, same rationale as the log_prob masking above.
-        h_kick_spin = (
-            torch.zeros((), device=self.device) if self._kick_spin_frozen else
-            p_kick * self.ent_kick_spin_weight * self._kick_spin_dist(e_heads.kick_spin, log_std_spin).entropy().sum(dim=-1).mean()
-        )
+        if opp_masks is None:
+            h_kick_dir = p_kick * self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).entropy().mean()
+            h_kick_power = p_kick * self.ent_kick_power_weight * self._kick_power_head(e_heads.kick_power, log_std_power).entropy().mean()
+            # kick_spin is permanently frozen (see agent_plans/spin_implementation_plan.md
+            # section 0) -- its entropy term is masked to exactly zero rather than
+            # computed and discarded, same rationale as the log_prob masking above.
+            h_kick_spin = (
+                torch.zeros((), device=self.device) if self._kick_spin_frozen else
+                p_kick * self.ent_kick_spin_weight * self._kick_spin_dist(e_heads.kick_spin, log_std_spin).entropy().sum(dim=-1).mean()
+            )
+        else:
+            _w_kick = opp_masks["kick"] * torch.sigmoid(e_heads.kick_logit).reshape(-1) * opp_masks.get("kick_scale", 1.0)
+            h_kick_dir = (_w_kick * self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).entropy().reshape(-1)).mean()
+            h_kick_power = (_w_kick * self.ent_kick_power_weight * self._kick_power_head(e_heads.kick_power, log_std_power).entropy().reshape(-1)).mean()
+            h_kick_spin = (
+                torch.zeros((), device=self.device) if self._kick_spin_frozen else
+                (_w_kick * self.ent_kick_spin_weight * self._kick_spin_dist(e_heads.kick_spin, log_std_spin).entropy().sum(dim=-1).reshape(-1)).mean()
+            )
         ent += h_sprint + h_move_dir + h_kick_dir + h_kick_power + h_kick_spin
         _bkdn_tensors["sprint"] = h_sprint
         _bkdn_tensors["move_dir"] = h_move_dir
         _bkdn_tensors["kick_dir"] = h_kick_dir
         _bkdn_tensors["kick_power"] = h_kick_power
         _bkdn_tensors["kick_spin"] = h_kick_spin
+        # ent_kick_weight: extra bonus on the kick gate + kick_dir + kick_power
+        # entropy terms, returned SEPARATELY (return_kick_boost) so the logged
+        # `entropy` / per-head breakdown keep meaning "the unboosted entropy"
+        # and the caller adds the boost only where it builds the loss.
+        kick_boost = (self.ent_kick_weight - 1.0) * (_bkdn_tensors["kick"] + h_kick_dir + h_kick_power)
+        result = [ent]
         if return_breakdown:
             _names = list(_bkdn_tensors.keys())
             _vals = torch.stack([_bkdn_tensors[n] for n in _names]).tolist()
-            breakdown = dict(zip(_names, _vals))
-            return ent, breakdown
-        return ent
+            result.append(dict(zip(_names, _vals)))
+        if return_kick_boost:
+            result.append(kick_boost)
+        return result[0] if len(result) == 1 else tuple(result)
 
     # -----------------------------------------------------------------------
     # Checkpointing
@@ -10026,7 +11005,21 @@ class PPOTrainer:
 # ---------------------------------------------------------------------------
 
 def _action_to_numpy(action: DecisionAction, exec_samples: dict) -> dict[str, np.ndarray]:
-    """Flatten a DecisionAction + raw execution samples to a numpy dict for the rollout buffer."""
+    """Flatten a DecisionAction + raw execution samples to a numpy dict for the rollout buffer.
+
+    ``exec_samples`` may also carry the action-opportunity flags (``OPP_ACTION_KEYS``,
+    attached by ``ScenarioEnv`` when ``ppo.log_action_opportunity_stats`` /
+    ``ppo.mask_untriggered_actions`` is on); they are copied through so they become
+    ``action/opp_*`` batch tensors. Absent otherwise (=> the batch has no such keys).
+    """
+    out = _action_dict(action, exec_samples)
+    for _k in OPP_ACTION_KEYS:
+        if _k in exec_samples:
+            out[_k] = exec_samples[_k]
+    return out
+
+
+def _action_dict(action: DecisionAction, exec_samples: dict) -> dict[str, np.ndarray]:
     return {
         "shoot": np.array([action.shoot], dtype=np.float32),
         "pass_": np.array([action.pass_], dtype=np.float32),
@@ -10165,6 +11158,7 @@ class _ValuePretrainWorkers:
 
 def _finalize_value_pretrain_result(
     r: dict, gamma: float, lam: float, use_gae: bool, allow_empty: bool = False,
+    with_mc_returns: bool = False,
 ) -> tuple[Optional[dict], int]:
     """Turn ONE worker/env result dict (``{"buffer", "last_value"?, "stats"}``)
     from the value-pretrain rollout into an ``as_tensors()`` batch dict with
@@ -10180,6 +11174,11 @@ def _finalize_value_pretrain_result(
     False keeps the old keep-everything behaviour for the callers that can't
     tolerate an empty result (single-process collection, plain workers whose
     single per-worker buffer always spans many episodes).
+
+    ``with_mc_returns``: additionally attach an ``"mc_returns"`` tensor (pure
+    Monte-Carlo returns, NaN on each track's unfinished tail -- see
+    ``_mc_returns_nan_tail``) alongside whatever ``"returns"`` the mode above
+    produced. Used by ``ppg_value_refit``'s compare-to-original diagnostic.
 
     Never concatenate raw transitions across result boundaries before this
     (same per-worker discipline as ``_merge_worker_batches``'s docstring).
@@ -10210,4 +11209,29 @@ def _finalize_value_pretrain_result(
         else:
             advantages = [0.0] * len(buf.rewards)
             returns = buf.compute_mc_returns(gamma)
-    return buf.as_tensors(advantages, returns), n_dropped
+    tensors = buf.as_tensors(advantages, returns)
+    if with_mc_returns:
+        tensors["mc_returns"] = _mc_returns_nan_tail(buf, gamma)
+    return tensors, n_dropped
+
+
+def _mc_returns_nan_tail(buf, gamma: float) -> torch.Tensor:
+    """Pure Monte-Carlo discounted returns for every row of ``buf``, with NaN
+    on each track's unfinished tail (rows after that track's last ``done=1``:
+    their true return isn't known yet, so a truncated sum would be garbage).
+
+    Independent of ANY value net -- unlike GAE returns (``A + V_sampler``),
+    which contain the sampling network's own predictions and therefore
+    always favour whichever network generated the rollout when two value
+    nets are scored against them. That independence is why
+    ``ppg_value_refit``'s compare-to-original diagnostic scores against
+    THESE targets."""
+    mc = np.asarray(buf.compute_mc_returns(gamma), dtype=np.float32)
+    for _track, idxs in buf._track_index_groups().items():
+        last_done_pos = -1
+        for pos, i in enumerate(idxs):
+            if buf.dones[i] > 0.5:
+                last_done_pos = pos
+        for i in idxs[last_done_pos + 1:]:
+            mc[i] = np.nan
+    return torch.from_numpy(mc)

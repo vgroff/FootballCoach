@@ -604,7 +604,56 @@ adv=mean±std]` (value/return/advantage stats), with a DEBUG-level
 per-minibatch block showing the d_val/e_val split (d_val is static now that
 it's frozen) — useful for spotting value/return miscalibration at a glance.
 
+### Reward design rule: avoid one-off (event-paid) rewards unless terminal
+
+**Be very careful with one-off rewards/penalties; avoid them unless they are
+terminal. Prefer per-step or potential-based terms wherever possible.** (Also
+a banner in `ai/env/reward.py`'s module docstring, which is where reward
+changes get reviewed.)
+
+Why -- measured 2026-09-20 when `gain_possession_bonus` (+1.0) and
+`loss_of_possession_penalty` (-0.9) were removed from phase 1:
+- The ground-truth return-to-go is a sum of *future* rewards, so it climbs
+  toward a one-off payment and *drops* by about that payment the moment it is
+  made -- right after the agent did something good (mean step -0.86 in
+  return-to-go after a possession gain, n=1,404). The value net must forecast
+  when such events happen (largely unpredictable: tackles, turnovers). Events
+  added ~14% to the return variance (4.28 vs 3.68 without them); value squared
+  error within -3..+1 steps of an event was higher than elsewhere in the same
+  episode phase (1.2x early, up to 6.8x late), though that is confounded with
+  turnovers genuinely deciding games.
+- A non-potential-based event payment changes the optimal policy; gain +1.0 /
+  loss -0.9 netted +0.1 per gain/loss cycle (farmable, though only ~13% of
+  episodes had 2+ gains).
+- It was redundant: with the ball the trainee won ~77% / lost ~9%, without it
+  ~19% / ~66% -- the win/lose terminals already separate the two by ~3.5 of
+  return, against +1.0 from the bonus.
+- After removal (refit run282): value R2 ~0.77 -> ~0.81 on the new targets (not
+  strictly comparable across reward definitions), and the return std inside
+  `timeout` episodes fell from ~0.46 to ~0.07 (it was mostly possession-event
+  noise).
+
+Rules: (1) terminal one-offs (box, lterm, tout, out, prox) are fine -- the
+episode ends so there is nothing for the return to drop into, and they are the
+objective. (2) Otherwise use a bounded per-step term or potential-based shaping
+`F = gamma*Phi(s') - Phi(s)` with `Phi(terminal)=0` (`appr` is the model: it
+telescopes and preserves the optimal policy; note it still offsets the value by
+`-Phi(s)`, an observable state function, not a function of future event
+timing). (3) A per-step term must be bounded over the max episode length --
+`per_step * max_steps` well below the terminal win reward, or holding/dawdling
+beats winning (use `cumulative_clamped_delta`). (4) Never pair a bonus with a
+near-equal offsetting penalty that nets non-zero. (5) If a non-terminal event
+term is truly needed: justify it, default it to 0.0, and measure it first
+(recompute MC returns with/without it: return variance, value R2, per-outcome
+loss). Still event-paid and non-terminal, so review before enabling/retuning:
+`ill` (`illegal_action_penalty`, currently 0.0) and the `tatt`/`katt` attempt
+bonuses.
+
 ### Possession gain/loss reward: real turnovers only
+
+**Both rewards are DISABLED as of 2026-09-20** (`gain_possession_bonus` and
+`loss_of_possession_penalty` = 0.0 -- see the rule above). The transition
+counting below is still computed and still correct; it just no longer pays.
 
 `ScenarioEnv.step()` scans every engine tick within a decision interval (not
 just before/after the whole interval) to count possession transitions, via
@@ -1427,6 +1476,114 @@ explicit caution: if a frozen/older-checkpoint opponent is ever added, the
 and an explicit per-row "is this the live network" signal would be needed
 before secondary rows can keep being included unconditionally.
 
+## flip_y consistency (measured 2026-09-20): augmentation, consistency refit, y-canonical frame
+
+**Finding (run283, 68 PPO iterations from a PPG-refit checkpoint).** Eval vs rules slid from about checkpoint 18 onward
+while training win rate stayed flat and value loss stayed good. Same pattern in run265 (99 iterations, different reward).
+The `[ratio spike]` line (max ratio 1e7 growing to 1e15 over the run) is `move_dir` in 65 of 66 logs; the rows are the
+**flip_y augmentation copies**, not ordinary samples: `_ppo_update` recomputes each copy's "old" log-prob with the
+pre-update weights (`_recompute_old_log_probs_for_augmented_batch`), and the network is far from flip_y-equivariant.
+Measured on 30k real states (mirror of the state vs mirror of the output): median `move_dir` mean-angle error 22 deg at the
+PPO start (8% of states off by more than 90 deg) growing to 39 deg / 24% by checkpoint 68; hard-decision (sign) disagreement
+between a state and its mirror 9-23% for exec_move / sprint / tackle_attempt; Bernoulli logits saturated (median |logit| 23 for
+exec_move) with mirror log-prob tails down to -394. About 27% of active `move_dir` rows had a flip-copy log-prob below -15
+(a real sample at kappa~14 essentially never goes below -14; verified on 10M PyTorch VonMises draws). Correlational only: PPO
+weight steps are nearly uncorrelated across iterations (cosine ~0), the step size is constant (Adam) while KL per update rose
+5x, clipping went from 25% to 82% of steps, and eval declined once KL per update passed ~0.1. Whether the augmentation *causes*
+the decline was not isolated by an intervention.
+
+**Also measured:** `val_pre` (pre-update value loss) is inflated from iteration 2 on by `episode_replay` (top-20% |advantage|
+seeds re-queued): replayed episodes 0.305 vs fresh 0.175 under the same checkpoint. Not value degradation.
+
+**Fix 1 -- `PPOTrainer.consistency_refit` (`train.py --consistency-refit-only`, `bc.consistency_*`).** A PPG-style phase: every
+state is used in both orientations, the orientation where the observer's y >= 0 is "primary", a frozen teacher (the un-reset
+`--checkpoint`, or `--consistency-teacher`) is evaluated on it, and the student is trained with the existing analytic per-head
+KL (`_ppg_kl_penalty`) toward the teacher's output (mirrored for the mirror orientation). Spread params (kappa etc.), the
+value head and the physics encoders are frozen for the call (a trainable kappa would let the KL be lowered by widening
+distributions); Bernoulli targets are clamped to +-`consistency_logit_bound`; kappa is set from `consistency_kappa_deg`
+(22 deg = 6.78). Helpers are in `ai/ppo/consistency.py`. Result from checkpoint 18 (Bernoulli heads reset with
+`--reset-bernoullis` scales fitted so 97% of states fall within +-6.9, kappa 22 deg): mirror error p50/p90 25.0/98.0 deg ->
+6.3/20.3 deg, states over 90 deg 11.8% -> 0.5%, hard-decision disagreement (exec_move/sprint/kick/tackle) 10.4/15.4/1.6/16.2%
+-> about 2.2/3.5/0.2/5.2%, eval vs rules unchanged within noise (38.4% -> 40.9% win). Validation KL plateaued around 0.47
+after ~110 rollouts at batch 8000, 6 epochs (later epochs within a rollout only overfit that rollout; gains come from fresh
+data). Caveats: the KL is nearly blind to 0.001 vs 0.0001 probability, so Bernoulli logits re-saturate after the reset (73% of
+exec_move states beyond +-6.9) -- bounding needs a separate term or another reset; the loss is heavy-tailed (top 5% of rows carry
+~48% of the KL; mirror rows fit worse than primary rows, 1.07 vs 0.48 at run284).
+
+**Fix 2 -- `ppo.y_canonical` (`ai/obs/y_canonical.py`, opt-in).** A second wrapper outside `CanonicalNetworkWrapper` mirrors
+every row whose observer is at y < 0 before the network and mirrors the y-signed outputs back, so the policy is *exactly*
+flip_y-equivariant (unit-tested on the real networks, with and without the frozen physics encoders). Consequences: flip_y
+augmentation copies become exact duplicates -> set `ppo.augment_n_slot_shuffles` to 0 (a warning is logged otherwise; with
+n_slot_shuffles=1 the flip is the only thing augmentation does today). `_precompute_physics_full` mirrors first so the cached
+encoder outputs match what the wrapper feeds the network. State-dict keys are unchanged. Cost: the policy is discontinuous
+across y = 0 wherever the underlying network is asymmetric. Measured: wrapping did not change eval vs rules within noise
+(run290 checkpoint 40.9% -> 39.9% win; original checkpoint 18 38.4% -> 41.0%), so the original asymmetry was not doing useful work.
+Old snapshot opponents in the neural pool are y-symmetrised too when it is on, so evals vs neural snapshots are not comparable
+with earlier runs.
+
+**Diagnostics.** `ppo.log_flip_consistency` adds a `flip` line to every `[PPO]` block (KL between the policy on each rollout
+state and the y-mirror of the policy on its flip_y copy, `move_dir` mirror error, hard-decision disagreement), computed from the
+pass `_ppo_update` already makes over the augmented batch; needs augmentation on (it reads zero under `y_canonical`).
+
+**Mirror-symmetry tests (`tests/ai_unit/test_mirrored_match.py`, `test_mirrored_match_simulation.py`).** A random real `Match` and its
+true mirror (x = team swap, y, both) are encoded with the real `encode_observation` and driven through the wrapped networks with the frozen
+physics encoders enabled: every canonical input feature, encoder output, latent vector, value, head and chosen action is identical;
+removing any single feature from the flip index lists is caught (17 mutations checked). Simulated forward, the state of a match and its
+mirror agree to rounding (~1e-14): neural-driven 300 ticks, rules-AI-driven (dribbling, kicking, tackling, 6 possession changes over 3
+matches) 200 ticks -- so the rules-AI opponents are mirror-symmetric too. Two limits, both engine-side and not mirror-specific:
+(1) rounding noise (~1e-15) is amplified exponentially by the rules AI's pursuit dynamics (x1e6 in ~65 ticks), so exact agreement lasts
+~230 ticks for that driver; (2) **contact knife-edge**: `resolve_all_overlaps` pushes a colliding pair to exactly the touching distance,
+after which the second push iteration and `_damp_overlap_velocity` test `distance >= min_distance` on numbers within 1 ulp of it, so the
+last rounding bit decides whether velocity damping applies (measured +2.2e-16 in one match, -1.1e-16 in its mirror) and a 1e-16 difference
+becomes a 2-6 m/s velocity difference after the first contact between opposing players (`xfail(strict)` test documents it; the other
+long-horizon tests switch contact damping off with `CollisionParams(retention=1.0)`). Damping therefore applies to roughly half of
+contacts at random; making it depend on the pre-push overlap (or an epsilon) would be a behaviour change and has not been done.
+
+## Neural action application: tackle arming and kick one-shot (measured 2026-09-20 on run293)
+
+`NeuralPlayerAI` re-applies its cached decision every tick of the decision interval (`prepare()` -> `_reapply_cached_gating`),
+and `player.tackle_armed`/`kick_armed` are reset every engine tick, so the flags read at the interval boundary by the reward
+(`ScenarioEnv._compute_phase1_reward_for_player`) reflect only the LAST tick. A probe (single process, checkpoint 57, 25.6k trainee
+decisions vs the rules AI, `scratchpad/arm_probe.py`) found two problems, both now fixed behind opt-in-style flags in
+`ai_config.json["action"]` (both set true):
+
+- **Tackle (`arm_tackle_without_carrier`)**: `apply_action_to_player` used to reject a tackle attempt with no opposing carrier as
+  illegal and NOT arm it. 96% of sampled tackles were such free no-ops (the head fired 37% of the time while the trainee itself held
+  the ball, 26% with nobody holding it, only 3.4% while the opponent did -- inverted, no gradient in the no-op states) and the
+  `tackle_armed_while_possessing_multiplier` could never fire (0/3508). Now every sampled attempt arms (unless the player is knocked
+  down) and is charged; `Match._check_armed_tackles` already resolves only against an opposing carrier in range, so a pre-armed
+  player still runs into a tackle when the ball arrives, and `tackle_attempted_bonus` still pays only on real contact.
+- **Kick (`kick_one_shot`)**: the cached kick was re-applied every tick, so an in-possession kick released the ball and then
+  re-armed/re-fired: ~3.1 physical kicks per decision (72% >= 2, 50% via the armed auto-fire) and `kick_armed` true at the boundary
+  in 96% of possession kicks (the armed-kick cost was charged to ordinary kicks). `NeuralPlayerAI` now drops the cached kick once
+  `Player.kick_count` (monotonic, bumped in `_finish_kick`, snapshot/restored in the BC label path) exceeds its count at decision
+  time. A fired ARMED kick still pays `karm` (boundary flag OR `kick_attempt_was_armed_this_step`) and earns `katt`; an in-possession
+  kick pays neither, as `reward.py`'s docstring always intended. Untested hypothesis: the kick chain (not the small armed penalty,
+  ~-0.1 per decision) is why the kick gate collapsed to ~0.15% during run293 -- compare kick_prob in the next run.
+- Both flags only take effect in newly started processes (config is read once per process); comparable runs need the same setting.
+- **Kicks per episode ([PPO] `kicks` line)**: `StepInfo.trainee_kicks_this_step` / `trainee_armed_kicks_this_step` (per-physics-tick scan of
+  `kicked_this_tick`, armed = `kick_armed` still set when it fired = first-touch kicks) are summed per episode in
+  `BatchedEnvGroup.collect`, `rollout_worker` and the single-process loop (stats keys `episode_kick_counts`,
+  `episode_armed_kick_counts`) and rendered by `_log_rollout_summary`. It counts every real trainee kick, unlike `kick_armed_penalty`
+  steps or the `kick_attempted_bonus` count. Test: `tests/ai_scenario/test_episode_kick_counts.py` (exact match vs an independent
+  `Player._finish_kick` counter).
+- **Possession-conditional kick gate (run302 start, 2026-09-21)**: a probe of run301 showed the trained gate was INVERTED (mean p 28%
+  without the ball vs 0.9% with it: 97% of kick decisions fired with no ball). `checkpoint3_posgate.pt` replaces
+  `execution_net.kick_logit` by a least-squares read-out of the final trunk layer onto logit(1e-4) (no ball) / logit(1e-2) (ball),
+  median-calibrated on train rows, 20% held-out: no ball mean 0.014% (p99 0.08%), ball mean 1.08% (p95 1.8%, p99 2.6%). Only
+  `kick_logit.weight/bias` changed; Adam moments for them are stale (old regime). `scratchpad/possession_gate_surgery.py`.
+  That first version armed almost never without the ball (run302 rollout 1: 31 `karm` steps, 1 `katt`; PPO also halved the with-ball gate in
+  2 rollouts), so no signal reached the first-touch path. **Second version (`checkpoint3_posgate2.pt`, run303)**: an imminent first touch IS
+  decodable from the final trunk layer (random arming converts only ~4% of armed decisions to a fired armed kick; a linear read-out reaches
+  ~90% precision at ~1k armed attempts/rollout, held-out AUC ~0.97 in the pilot). Fit: force-arm 50% of no-ball decisions, label each armed
+  decision by `StepInfo.trainee_armed_kicks_this_step`, then optimise ONE linear head on `E[p(y-mu)]` (mu = price per armed attempt, 0.88) with a
+  hinge keeping with-ball gate in [0.3%, 3%] (mean 1.06%). Pitfalls hit on the way: (1) a point target for ball rows (1%) collapses precision
+  to ~5% because "imminent touch" and "has the ball" overlap in trunk space -- use a band; (2) never re-shift the bias to hit the attempt
+  budget after fitting (drags ball rows to ~0) -- control attempts via mu; (3) high mu from a cold start sticks at the p~0 optimum -- warm-start
+  the mu sweep upward; (4) `_collect_value_pretrain_rollout` records no `reward_comps` and drops the trailing incomplete episode -- take
+  labels from the env `StepInfo` and truncate them to the batch length. Real-play check (24 workers, 287k trainee rows, no forcing): 387 armed
+  attempts / 358 fired (92.5%) vs held-out prediction 979 / 906 per 750k rollout. Scripts: `scratchpad/gate_label_collect.py`, `gate_opt.py`, `apply_gate.py`.
+
 ## PPG-style value refit (`PPOTrainer.ppg_value_refit`)
 
 `pretrain_value()`'s shared-trunk mode (`separate_value_net=False`) only
@@ -1604,6 +1761,61 @@ Key implementation points, in case any of this needs revisiting:
   instead of the earlier truncate-then-`last_value=0.0`; only the bare
   single-process branch (no `last_value`) still truncates + zero-bootstraps.
   MC mode (`pretrain_value`) is unchanged: truncate, then pure MC returns.
+- **LR warmup (`bc.ppg_warmup_steps`, and `ppo.lr_warmup_steps` for the main
+  update).** Each refit cycle re-snapshots the anchor, so KL starts at exactly
+  0 and the first Adam steps overshoot before the KL pull catches up (epoch-1
+  peak `kl_train` ~0.0034 at minibatch ~4 vs ~0.0008 by epoch 5, lr 5e-5,
+  kl_coef 100, offline experiment on one 300k-row rollout, 2 cycles per
+  setting). Linear warmup over the first N steps of every cycle: N=10 cut the
+  peak ~45%, N=25 ~60%, N=50 ~70%; N>=100 (about 2 epochs at that size) just
+  moves the bump into later epochs (epoch-5 KL 0.0007-0.0010, no lower than
+  no warmup). Equilibrium KL is set by kl_coef vs the value gradient, not by
+  warmup. lr 1e-4 without warmup peaked at 0.014 (4x). Val loss was WORSE after
+  5 epochs in every setting (0.1916 -> 0.1969-0.1999; longer warmup only
+  looks better because it fits less): the refit mostly fits its own rollout's
+  episodes, and fresh-data baselines across rollouts stay flat (~0.19).
+  `ppo.lr_warmup_steps` applies the same linear ramp to every PPO update
+  (`_lr_warmup_scale`); its right N there is untested.
+- **Compare-to-original diagnostic (`bc.ppg_compare_to_original`).** The
+  per-rollout baseline losses are dominated by rollout-to-rollout noise
+  (~0.184-0.200 across rollouts for a flat model), so "is the refit improving"
+  can't be read off them. The fix is a PAIRED check: keep a frozen copy of the
+  networks as loaded at the start of the call and, on each rollout's fresh rows
+  (before training on them), score both it and the current weights on the same
+  targets; the delta cancels the data noise. The targets must be PURE-MC
+  returns (`mc_returns`, NaN on unfinished tails -- `_mc_returns_nan_tail`),
+  NOT the GAE returns the refit trains on: GAE returns = A + V_sampler contain
+  the sampling network's own predictions, so any other network scored against
+  them loses by ~its squared disagreement with the sampler -- the same order
+  as the effect being measured (~0.003). `mc_returns` is attached by the
+  worker-side finalize when the returns spec has `"with_mc": true`, and passes
+  through merge / `_split_batch_releasing` / `augment_batch` as a plain
+  per-row scalar. Cycle 1's delta is 0 by construction (same weights).
+- **Value-loss diagnostics (`bc.ppg_loss_diagnostics`).**
+  `_value_loss_breakdown` (pure numpy, unit-tested) reports, on a rollout's
+  fresh identity-copy rows and pure-MC targets: error by episode outcome x row
+  owner (the outcome label is the TRAINEE's view, so the opponent track's
+  rows in a 'box_possession' episode are the losing side -- pooled they look
+  like ~2.4 std of nonsense; ALWAYS split by track), by row owner x the OTHER
+  player's AI type (`other_ai_type` one-hot, [rules, immobile, neural]), by
+  position within the episode (`_episode_phase_fraction`: quartiles; per-track
+  counters reset at `done` and at the NaN-tail -> finite seam between
+  concatenated per-env buffers), the share of squared error from the worst
+  1%/10% of rows, the variance left if outcome + owner + episode quartile were
+  known (row returns are DISCOUNTED, so within one outcome they still vary with
+  time-to-go; an earlier version of this note claimed returns are ~a function of
+  the outcome with within-outcome std ~0.09 -- that was the UNDISCOUNTED
+  episode total, wrong for per-row returns), a decile calibration table and the
+  worst rows. Cycle 1 and every `ppg_diag_every_n_cycles`-th cycle also dump the
+  per-row arrays to `<checkpoint_dir>/ppg_diag_cycle<k>.npz`.
+  First real reading (deterministic rollouts, R2 0.78, normalised mse 0.234):
+  the value net is essentially perfectly CALIBRATED (predicted deciles match
+  realised returns to ~0.03), so the error is discrimination not bias; 71% of
+  the squared error is in the first half of episodes (0-25%: mse 0.363, 75-100%:
+  0.074) -- outcome uncertainty that resolves as the episode plays out; the
+  worst 10% of rows carry 69% of the error; the top worst rows are all 'miss'
+  (ball out of play, 0.7% of rows, 3.3% of the error) where the net was
+  confidently (+3.8) wrong.
 - **Refit obs stays on CPU; physics features are precomputed once.** Per row,
   `other_feat` is 21x39 floats but the frozen player-physics encoder's
   `other_physics_full` is 21x74 -- caching it (as `_ppo_update` does, via the
@@ -1617,6 +1829,93 @@ Key implementation points, in case any of this needs revisiting:
   the encoders were NOT the bottleneck -- suspected VRAM overflow into
   shared memory (12 GB card). Unconfirmed until the CPU-resident version's
   epoch speed is measured.
+- **The value plateau (held-out R2 ~0.73 stochastic / ~0.78 deterministic) is
+  NOT a capacity or structure limit.** Offline probe on a frozen run276
+  policy (3.0M stochastic rows / 2.4M deterministic rows, split by GAME so both
+  players' rows stay together; inputs = canonical raw obs + frozen physics
+  encodings; target = pure MC return): every fresh value net -- linear 0.60,
+  128x2 MLP 0.723, a 256->48->64->1 bottleneck (mimicking a value head that
+  reads the 48-wide exec trunk) 0.724, 4x1024 on raw only 0.726, 4x1024 on
+  raw+physics 0.728 -- lands at or below the sampling net's own 0.732. The big
+  nets memorise (train mse ~0.006 vs val ~0.28 normalised). Learning curve
+  is slow log-linear in data (+~0.02 R2 per 3x games: 0.709 / 0.734 / 0.753 at
+  10% / 30% / 70% on deterministic rows). The big nets are NOT undertrained:
+  train mse ~0.006 (normalised), best val at epoch 1-3 -- they memorise.
+  **A deterministic policy does not make the return a function of the
+  observation: the sim itself is random during play** (kick yaw/pitch gauss
+  error, control-time gauss noise, tackle skill rolls; per-match
+  `Match.rng`). Fork test (384 mid-episode states x 16 forks, same state,
+  different `match.rng`, deterministic policy rolled to episode end): 18% of
+  trainee-track states span >3 in return (different win/loss outcome from
+  the identical state); irreducible within-state variance = 13% of total
+  => **R2 ceiling ~0.87 for any predictor** (trainee 0.871, opponent 0.872).
+  The sampling net scores ~0.70-0.78, so ~0.1-0.17 R2 of *learnable*
+  variance remains, and fresh big nets (0.75) don't close it -- it is a
+  data/generalisation gap, not capacity (about half the current MSE is
+  irreducible noise). Near-boundary `miss`: a dedicated 12-feature classifier
+  gets AUC 0.93 (final row) / 0.80 / 0.74 among at-the-line rows. NOTE
+  `-value` is a poor miss SCORE (value is dominated by who is winning), so
+  the value net's "AUC ~0.55" alone does not show it ignores miss risk; the
+  right test is the residual slope (MC - pred) on the classifier's P(miss),
+  owner-touched & possessed rows: sampling net -4.6 +/- 0.5, fresh big MLP
+  -4.9 (a value that ignores the risk scores ~ -4, one that accounts ~ 0).
+  It moves to -4.0 with 10 hand-built geometry columns (dist-to-line,
+  outward speed, time-to-line, ...) and to -0.9 +/- 0.5 with those columns
+  AND a x300 loss weight on near-line rows (band MSE -10%, overall R2 -0.002).
+  So the miss risk is missed because of signal density (near-line rows ~0.3%
+  of data, positives ~0.06%; MSE gradient negligible, early stopping hits
+  first) plus feature accessibility, NOT capacity. Worth <0.001 of the
+  ~0.235 overall MSE. Don't re-chase capacity: widening / bigger heads /
+  bottleneck changes have nothing to gain.
+  **Correction (2026-09-20): misses ARE decisive once conditioned on speed.**
+  Pooling outward speeds from 0.5 m/s hid it. Possessed, owner-touched-last,
+  outward 4-6 m/s: P(miss<=3 rows) = 0.63 (0-0.5 m inside the painted line),
+  0.92 (0-0.3 m outside), 1.00 (0.3-0.8 m outside); MC -2.7 / -3.95 / -4.5 vs
+  value -0.85 / -1.3 / -0.8. White-box checks on the real run276 net
+  (143 decisive rows): recomputed value == recorded (no plumbing/lag bug);
+  value barely moves for ball 4 m inward (+0.13), velocity reversed (+0.24),
+  both (+0.36), vs ideal ~+3; last-touch -> other team only +0.62 (ideal
+  ~+2.5); single physics-encoder columns DO separate misses (AUC up to 0.80),
+  so the information reaches the net. The PRODUCTION architecture can learn
+  it: offline value-only fine-tune (physics encoders frozen, 315k params) with
+  near-line rows weighted x100, 3 epochs, held-out decisive rows: mean value
+  -0.85 -> -2.12 (MC -2.83), band mse 2.24 -> 2.14, but overall random-row R2
+  0.781 -> 0.765 (shared-trunk interference). Root cause is mainly the
+  rare-event / gradient-density problem (decisive rows ~0.006% of data).
+  The physics encoders' crossing heads are FED to the net (ball
+  `crossing_head` = cols 40-43 / `event_head` 48-49 of the 98-dim ball block;
+  PLAYER `crossing_head` = cols 24-27 of the 74-dim player block, "will this
+  player leave the painted line if its current intent persists", used for
+  self and other) but are SATURATED and non-discriminative here: on decisive
+  rows ball crosses_prob 0.984 (miss) vs 0.984 (no miss), event 0.95 vs 0.95,
+  player(self) crosses_prob 0.94 vs 0.86 (AUC 0.62); every row in the
+  near-line outward population "crosses the painted line", the question is
+  how far past it the ball/player goes before turning back, which the heads
+  don't model (first-crossing only). What DOES discriminate is raw outward
+  speed (AUC 0.71) and distance to the line (0.75), which the value net
+  underuses (0.54-0.61). Env note: `detect_trial_outcome` ends the episode
+  only when |ball.x| > half_length + 1.0 or |ball.y| > half_width + 0.5 (not
+  the painted line; no documented rationale, present since outcome.py was
+  created; nothing clamps players to the pitch and the ball is glued to the
+  carrier). At 4-6 m/s that margin is ~0.1 s so it does NOT explain the
+  decisive-state failure; it only adds turn-back ambiguity at low speed.
+  **FIXED 2026-09-20**: `detect_trial_outcome` now applies Law 9 (out only
+  when the WHOLE ball is over the WHOLE line: centre more than `ball.radius_m`
+  past the painted line, both axes, any height) and checks the scoreboard for a
+  goal BEFORE "out" (a hard shot moves ~0.7 m/tick, so the goal tick can
+  already have the centre past the line). Tests: tests/ai_unit/test_outcome.py,
+  tests/scenario/test_ball_out_overrun.py. Returns/value targets from before
+  this date used the loose 0.5 m / 1.0 m rule, so they are not comparable.
+  Origin: first appears 2026-07-28 in the UI scenario loop's `_trial_outcome`
+  ("Ball out of bounds (touchline or behind goal without scoring)" -- the
+  x margin is plausibly so a goal can register first), later reused for RL
+  termination. The engine has NO out-of-play rule of its own; this function
+  is the only place "out" is defined, so the effective RL out line is 0.5 m
+  (touchline) / 1.0 m (goal line) beyond the painted line. Size (2.4M det
+  rows / 29k games): ball outside the painted line on 0.145% of trainee rows,
+  in 2.7% of games at some decision row; of those 795 games 522 ended via the
+  out rule and 273 (0.9% of all games) carried on with the ball back in play
+  -- the only episodes a painted-line rule would cut short.
 
 ## Batched rollouts: whole-episode chunks, worker-side finalization, RAM
 
@@ -1668,3 +1967,67 @@ per-cycle name at the end of each `ppg_value_refit` cycle so the previous
 cycle isn't resident during the next rollout. NOT changed: `_ppo_update`'s own
 `_split_train_val_episodes`/`augment_batch` copies (a separate, delicate
 phase).
+
+
+## Action-opportunity flags and masked action training (2026-09-21)
+
+Plan: `agent_plans/masked_action_training_plan.md`. Problem it fixes: the kick gate, the kick direction/power heads
+and the tackle gate were trained on EVERY decision row, but the action can only take effect in a small share of them
+(measured on run 303 checkpoint 95, 750k rows: a kick could execute in 37-38% of rows, an armed tackle could reach
+contact in only 1.5-1.6%, and only 0.5% of rows had a kick actually fire; 88% of the tackle_attempt=1 samples had no
+opposing carrier in reach). The gradient from the other rows is pure noise for those heads and the entropy bonus
+inflates them there. Fix: record, per decision interval, whether the action COULD take effect, and train the heads
+only on those rows.
+
+**What an "opportunity" is** (one definition, evaluated by the engine, never re-derived in the env/trainer):
+* kick: the player could execute a kick at some tick of the interval -- it holds the ball when its kick intent is
+  (re)applied (`Player.can_kick`, THE single validity predicate: both kick executors, the fire-vs-arm branch of
+  `apply_action_to_player` and the accounting all call it), OR it gains the ball by a LOOSE-BALL PICKUP
+  (`Match._update_loose_ball_pickup`, hook inside the engine's own pickup code) -- i.e. first touch counts, both the
+  armed redirect-at-pickup and the possession kick from `CONTROLLING_BALL` when the ball was still bouncing. Possession
+  won by a tackle is NOT a kick opportunity (it depends on the player's own tackle bit, see the independence rule).
+* tackle: an opposing player is the ball carrier within contact range with both players available
+  (`Match._tackle_contact_possible` -- the exact predicate armed-tackle resolution uses; it includes the
+  `INACTIVE_TACKLED` checks on both sides). Evaluated for every player every tick, before any tackle resolves, whether
+  or not the player armed one.
+* fired: `Player.kick_count` advanced (kick) / `Player.tackle_fire_count` advanced (an ARMED tackle reached
+  `_attempt_tackle_contact`; head-on auto-tackles are not fires).
+
+**Independence rule (I1).** A masked policy gradient is unbiased only if "an opportunity existed" does not depend on the
+gate bit being trained. It holds for the FIRST opportunity tick of an interval (the world is identical up to it for either
+bit value) but not after: a fired kick releases the ball, a won tackle hands this player the ball. So only whichever head's
+opportunity comes FIRST in the interval counts (`ppo.action_opportunity_cross_head_cutoff`, default true; the raw flags
+`opp_kick_raw`/`opp_tack_raw` are always recorded). Measured cost: both-raw = 0.5% of intervals; the rule drops 1.2% of raw
+kick and 2.2-2.6% of raw tackle opportunities. Tested by running all four (kick, tackle) bit combinations from identical
+seeded states: the cut flags never differ (with the rule off the same test fails).
+
+**Plumbing.** `entities/action_opportunity.py` (`ActionOpportunity`, one per `Player`, `begin_interval` at every fresh
+`NeuralPlayerAI.apply`) -> `ScenarioEnv._with_opportunity_flags` (end of `step()`; only when
+`ppo.log_action_opportunity_stats` or `ppo.mask_untriggered_actions`) -> `raw_exec` -> `_action_to_numpy` -> the batch's
+`action/opp_kick, opp_kick_raw, fired_kick, opp_tack, opp_tack_raw, fired_tack, opp_partial` tensors. They ride the
+existing `action/*` machinery, so merge / chunked flush / episode replay / train-val split / augmentation tiling need no
+changes (augment treats unknown `action/*` keys as flip-invariant). Absent keys => all-ones masks => old behaviour.
+`opp_partial` marks the rare (0.1-0.2%) intervals cut short by a non-terminal early exit (flags incomplete).
+
+**Training** (`ppo.mask_untriggered_actions`, default false; needs the flags; phases with frozen pass/tackle/mark heads):
+* kick gate trains on rows with a kick opportunity (both bit values), tackle_attempt gate on tackle-opportunity rows,
+  kick_dir/kick_power on rows where a kick fired (whether it fires does not depend on dir/power, so conditioning on it
+  is unbiased for them). NOT "fire-only positives, all negatives" (Design A) -- that is biased and kept as a negative test.
+* the PPO ratio uses log-probs summed over exactly those masked heads on BOTH sides
+  (`_mask_total_log_probs`: `sum_h mask_h * col_h` + the total's non-column residual, detached, so a masked head gets
+  EXACTLY zero gradient); the stored `head_log_probs` columns must equal the terms of the stored total (tested).
+* entropy: kick / tackle_attempt gate entropy is the mask-weighted mean; kick_dir/kick_power entropy is weighted per row by
+  `opp_kick * p_kick(row)`. Per-head KL / counterfactual policy loss diagnostics average over mask rows only.
+  Whole-policy diagnostics (worst-sample, ratio spike per-head) stay on the unmasked policy.
+* not masked: PPG / consistency anchors, BC aux loss.
+* `ppo.mask_rescale_by_opportunity_rate` (default false): per-head gradient x 1/mean(mask), value-preserving (plan D9).
+
+**Diagnostics.** `[action opp]` block per rollout (P(opportunity), P(kick|opp), P(kick|no opp), P(fired|kick), rows that
+would train each head, invariant-violation counters that must be 0). Instrument first, then the loss change.
+Rollout-level numbers at checkpoint 95: kicks are ~97% possession/first-touch kicks that all fire; P(kick=1|opp)=1.3%;
+tackle: P(tackle=1|opp)=28% but only 12% of tackle=1 samples have an opportunity, P(fired|tackle=1)=12.5%;
+rows that would train: kick gate ~280k, tackle gate ~11-12k, kick dir/power ~3.6-3.8k per 750k-row rollout.
+
+**Known limits.** (1) `opp_partial` intervals. (2) tackle opportunity is contact range, so a tackle blocked by aerial
+control / GK immunity still counts as an opportunity (the bit has a reward effect there). (3) The tackle gate and kick
+dir/power heads get 1-2 orders of magnitude fewer training rows than before (plan D9/D12) -- watch their learning speed.

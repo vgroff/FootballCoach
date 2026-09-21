@@ -298,12 +298,22 @@ class TestBCLossFromTensor:
         _, breakdown = bc_loss_from_tensor(labels, d_heads, e_heads, return_breakdown=True)
         assert breakdown["kick_direction"] == pytest.approx(0.0, abs=1e-4)
 
-    def test_kick_power_loss_matches_mse(self):
+    def test_kick_power_loss_matches_mse(self, monkeypatch):
+        from footballcoach.ai.ppo import bc as _bc
+        monkeypatch.setattr(_bc, "configured_kick_power_floor", lambda: 0.0)  # independent of the live ppo.kick_power_floor
         n = 1
         labels = _make_labels([BCLabel(kick_this_tick=1.0, kick_power_fraction=0.8, valid=True)])
         d_heads, e_heads = _zeros_heads(n)  # sigmoid(0) = 0.5
         _, breakdown = bc_loss_from_tensor(labels, d_heads, e_heads, return_breakdown=True)
         assert breakdown["kick_power"] == pytest.approx((0.5 - 0.8) ** 2, abs=1e-4)
+
+    def test_kick_power_loss_uses_the_floored_power(self, monkeypatch):
+        from footballcoach.ai.ppo import bc as _bc
+        monkeypatch.setattr(_bc, "configured_kick_power_floor", lambda: 0.03)
+        labels = _make_labels([BCLabel(kick_this_tick=1.0, kick_power_fraction=0.8, valid=True)])
+        d_heads, e_heads = _zeros_heads(1)  # raw 0 -> 0.03 + 0.97 * 0.5 = 0.515
+        _, breakdown = bc_loss_from_tensor(labels, d_heads, e_heads, return_breakdown=True)
+        assert breakdown["kick_power"] == pytest.approx((0.515 - 0.8) ** 2, abs=1e-4)
 
     def test_kick_power_loss_gated_on_kick_this_tick(self):
         n = 1

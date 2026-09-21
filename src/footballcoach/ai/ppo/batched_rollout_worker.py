@@ -257,6 +257,8 @@ def _new_episode_stats() -> dict:
         "episode_outcomes_vs_immobile": [],
         "episode_comp_list": [],
         "episode_durations_s": [],
+        "episode_kick_counts": [],
+        "episode_armed_kick_counts": [],
     }
 
 
@@ -444,6 +446,8 @@ class BatchedEnvGroup:
         episode_reward_accum = [0.0] * n
         secondary_episode_reward_accum = [0.0] * n
         episode_comp_accum = [dict() for _ in range(n)]
+        episode_kick_accum = [0] * n
+        episode_armed_kick_accum = [0] * n
         _replay_queue: list[int] = list(replay_seeds) if replay_seeds else []
 
         def _next_episode_seed() -> int:
@@ -517,6 +521,14 @@ class BatchedEnvGroup:
             # rollout_worker.py._collect() exactly, once per env). ---
             for i, env in enumerate(self.envs):
                 next_obs, reward, done, info = env.step(timers_already_advanced=env_has_due_decision[i])
+                if info is not None:
+                    episode_kick_accum[i] += info.trainee_kicks_this_step
+                    episode_armed_kick_accum[i] += info.trainee_armed_kicks_this_step
+                if done:
+                    stats[i]["episode_kick_counts"].append(episode_kick_accum[i])
+                    stats[i]["episode_armed_kick_counts"].append(episode_armed_kick_accum[i])
+                    episode_kick_accum[i] = 0
+                    episode_armed_kick_accum[i] = 0
                 tr = env.last_trainee_transition
                 if tr is None:
                     # Structurally shouldn't happen given the precomputed
@@ -722,7 +734,7 @@ def finalize_result_for_wire(r: dict, returns_spec: dict) -> dict:
 
     tensors, n_dropped = _finalize_value_pretrain_result(
         r, float(returns_spec["gamma"]), float(returns_spec["lam"]), returns_spec["mode"] == "gae",
-        allow_empty=True,
+        allow_empty=True, with_mc_returns=bool(returns_spec.get("with_mc", False)),
     )
     return {
         "batch": _batch_to_wire(tensors) if tensors is not None else None,
@@ -801,16 +813,17 @@ def _batched_worker_main(
                     chunk = [finalize_result_for_wire(r, _spec) for r in chunk]
                 conn.send({"chunk": chunk})
 
+            _det = bool(msg.get("deterministic", False))
             if chunk_steps:
                 group.collect(
-                    msg["n_steps"], replay_seeds=msg.get("replay_seeds"),
+                    msg["n_steps"], deterministic=_det, replay_seeds=msg.get("replay_seeds"),
                     chunk_steps=chunk_steps,
                     on_chunk=_emit,
                     progress_value=progress_value,
                 )
             else:
                 results = group.collect(
-                    msg["n_steps"], replay_seeds=msg.get("replay_seeds"),
+                    msg["n_steps"], deterministic=_det, replay_seeds=msg.get("replay_seeds"),
                     progress_value=progress_value,
                 )
                 if results:
@@ -840,7 +853,7 @@ class BatchedRolloutWorkerHandle:
 
     def collect(
         self, n_steps: int, replay_seeds: Optional[list[int]] = None,
-        returns: Optional[dict] = None,
+        returns: Optional[dict] = None, deterministic: bool = False,
     ) -> None:
         """``returns`` (optional): ``{"mode": "gae" | "mc", "gamma": float,
         "lam": float}`` -- ask the worker to finalize each result (GAE/MC
@@ -850,9 +863,15 @@ class BatchedRolloutWorkerHandle:
         caller's values are the source of truth -- a worker reads its own
         ai_config.json at spawn time, which can drift from the main process's
         if the file is edited mid-run). None (default) = legacy wire format
-        (``{"buffer", "last_value", "stats"}``)."""
+        (``{"buffer", "last_value", "stats"}``).
+
+        ``deterministic``: every batched decision this collect uses each head's
+        mode/mean instead of sampling (see ``BatchedEnvGroup.collect``). Off
+        for all real rollouts; used by ppg_value_refit's opt-in
+        ``bc.ppg_rollout_deterministic`` experiment."""
         self.conn.send({
             "cmd": "collect", "n_steps": n_steps, "replay_seeds": replay_seeds, "returns": returns,
+            "deterministic": deterministic,
         })
 
     def recv_result(self) -> list:

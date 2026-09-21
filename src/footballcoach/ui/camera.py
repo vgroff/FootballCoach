@@ -123,11 +123,18 @@ class Camera:
         self.offset_x = self.screen_width / 2.0 - (world_x + self.pitch.half_length) * self.pixels_per_metre
         self.offset_y = self.screen_height / 2.0 - (self.pitch.half_width - world_y) * self.pixels_per_metre
 
+    def world_to_screen_f(self, x: float, y: float) -> tuple[float, float]:
+        """Like ``world_to_screen`` but un-truncated (sub-pixel) -- for
+        drawing smooth curves, where int-truncating every vertex makes a
+        small arc visibly jitter."""
+        screen_x = self.offset_x + (x + self.pitch.half_length) * self.pixels_per_metre
+        screen_y = self.offset_y + (self.pitch.half_width - y) * self.pixels_per_metre
+        return screen_x, screen_y
+
     def world_to_screen(self, x: float, y: float) -> tuple[int, int]:
         """World (x=length axis, y=width axis, origin at pitch centre) to
         screen pixels (origin top-left, y grows downward)."""
-        screen_x = self.offset_x + (x + self.pitch.half_length) * self.pixels_per_metre
-        screen_y = self.offset_y + (self.pitch.half_width - y) * self.pixels_per_metre
+        screen_x, screen_y = self.world_to_screen_f(x, y)
         return int(screen_x), int(screen_y)
 
     def screen_to_world(self, screen_x: float, screen_y: float) -> tuple[float, float]:

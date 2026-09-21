@@ -253,12 +253,15 @@ class TestPhase1Reward:
         assert comps["hdg"] == pytest.approx(0.0, abs=1e-7)
 
     def test_gaining_possession_bonus(self):
+        """The live config sets gain_possession_bonus to 0.0 (2026-09-20), so
+        exercise the mechanism with an explicit non-zero value."""
+        cfg = {**_CFG1, "step_penalty": 0.0, "gain_possession_bonus": 1.0}
         total, comps = self._call(
             has_possession_now=True, gained_possession_this_step=True,
-            prev_ball_dist=1.0, curr_ball_dist=1.0,
+            prev_ball_dist=1.0, curr_ball_dist=1.0, cfg=cfg,
         )
-        assert comps["poss"] == pytest.approx(_CFG1["gain_possession_bonus"], rel=1e-5)
-        assert total == pytest.approx(_CFG1["gain_possession_bonus"], rel=1e-5)
+        assert comps["poss"] == pytest.approx(1.0, rel=1e-5)
+        assert total == pytest.approx(1.0, rel=1e-5)
 
     def test_ball_progress_when_possessed(self):
         progress_m = 3.0
@@ -341,8 +344,11 @@ class TestPhase1Reward:
         assert r_both < r_ill
 
     def test_loss_of_possession_penalty(self):
-        total, comps = self._call(lost_possession_this_step=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
-        assert comps["lpos"] == pytest.approx(_CFG1.get("loss_of_possession_penalty", 0.0), rel=1e-5)
+        """The live config sets loss_of_possession_penalty to 0.0 (2026-09-20),
+        so exercise the mechanism with an explicit non-zero value."""
+        cfg = {**_CFG1, "step_penalty": 0.0, "loss_of_possession_penalty": -0.9}
+        total, comps = self._call(lost_possession_this_step=True, prev_ball_dist=1.0, curr_ball_dist=1.0, cfg=cfg)
+        assert comps["lpos"] == pytest.approx(-0.9, rel=1e-5)
         assert total < 0.0
 
     def test_opponent_reached_box_loss_terminal(self):

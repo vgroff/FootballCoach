@@ -186,6 +186,25 @@ class TestPPGValueRefitIntegration:
         result = t.ppg_value_refit(env, n_steps=200, phase_id=None, epochs=1)
         assert result == {}
 
+    def test_val_fraction_zero_trains_on_everything_and_never_restores_best(self, trainer, caplog):
+        """``bc.ppg_val_episode_fraction=0`` = no val set: the split log line
+        shows no held-out episodes, per-epoch lines carry no val figures, and
+        with nothing to early-stop on there is no best-weights restore."""
+        import logging
+
+        trainer._ppg_val_episode_fraction = 0.0
+        env = _make_env(trainer)
+        with caplog.at_level(logging.INFO, logger="footballcoach.ai.ppo"):
+            trainer.ppg_value_refit(env, n_steps=600, phase_id=None, epochs=2, kl_coef=1.0, lr=1e-4)
+
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        assert "PPG refit split:" in text and "val eps" not in text
+        assert "val_rmse" not in text
+        assert "restored best-val weights" not in text
+        assert "early stop" not in text
+        # both epochs ran and were logged
+        assert "PPG refit epoch 2/2" in text
+
     def test_kl_coef_actually_protects_the_policy(self, trainer):
         """The property that matters: a larger kl_coef must leave the policy
         CLOSER to where it started than kl_coef=0, measured via the same KL
@@ -256,3 +275,73 @@ class TestPPGValueRefitIntegration:
             v for k, v in t_large.decision_net.state_dict().items() if "trunk" in k and k.endswith("weight")
         )
         assert not torch.allclose(trunk_before, trunk_after), "trunk weights should have moved after the refit"
+
+
+class TestPPGCompareToOriginal:
+    def test_compare_line_is_logged_and_first_cycle_delta_is_zero(self, trainer, caplog):
+        """The refit starts from the very weights the frozen 'original' copy was
+        taken from, so on cycle 1 original == current and delta must be ~0 --
+        and the line must actually appear (i.e. mc_returns survived merge,
+        split and augmentation)."""
+        import logging
+        import re
+
+        trainer._ppg_compare_to_original = True
+        trainer._ppg_val_episode_fraction = 0.0
+        env = _make_env(trainer)
+        with caplog.at_level(logging.INFO, logger="footballcoach.ai.ppo"):
+            trainer.ppg_value_refit(env, n_steps=600, phase_id=None, epochs=1, kl_coef=1.0, lr=1e-4)
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        m = re.search(r"\[ppg compare vs pure-MC returns\].*?delta\(original-current\)=([+-][0-9.]+)", text)
+        assert m, f"compare line missing:\n{text[-1500:]}"
+        assert abs(float(m.group(1))) < 1e-6
+
+    def test_off_by_default_logs_nothing(self, trainer, caplog):
+        import logging
+
+        trainer._ppg_compare_to_original = False
+        env = _make_env(trainer)
+        with caplog.at_level(logging.INFO, logger="footballcoach.ai.ppo"):
+            trainer.ppg_value_refit(env, n_steps=400, phase_id=None, epochs=1, kl_coef=1.0, lr=1e-4)
+        assert "[ppg compare" not in "\n".join(r.getMessage() for r in caplog.records)
+
+
+class TestPPGLossDiagnostics:
+    def test_breakdown_is_logged_and_per_row_arrays_saved(self, trainer, caplog, tmp_path):
+        """Cycle 1 prints the full tagged breakdown (with the original column
+        when compare-to-original is on) and writes the per-row npz."""
+        import logging
+
+        import numpy as np
+
+        trainer._ppg_loss_diagnostics = True
+        trainer._ppg_compare_to_original = True
+        trainer._ppg_val_episode_fraction = 0.0
+        trainer.checkpoint_dir = tmp_path
+        env = _make_env(trainer)
+        with caplog.at_level(logging.INFO, logger="footballcoach.ai.ppo"):
+            trainer.ppg_value_refit(env, n_steps=800, phase_id=None, epochs=1, kl_coef=1.0, lr=1e-4)
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        assert "[ppg loss diag]" in text and "by episode outcome" in text
+        assert "by position within the episode" in text and "calibration" in text
+        assert "orig mse" in text, "original column expected when compare-to-original is on"
+        f = tmp_path / "ppg_diag_cycle1.npz"
+        assert f.exists()
+        d = np.load(f, allow_pickle=False)
+        n = len(d["mc"])
+        assert n > 0 and len(d["pred_current"]) == n and len(d["phase"]) == n and len(d["outcome"]) == n
+        assert len(d["pred_original"]) == n
+        # current == original on cycle 1 (same weights)
+        assert np.allclose(d["pred_current"], d["pred_original"], atol=1e-6)
+
+    def test_off_by_default_logs_and_saves_nothing(self, trainer, caplog, tmp_path):
+        import logging
+
+        trainer._ppg_loss_diagnostics = False
+        trainer._ppg_compare_to_original = False
+        trainer.checkpoint_dir = tmp_path
+        env = _make_env(trainer)
+        with caplog.at_level(logging.INFO, logger="footballcoach.ai.ppo"):
+            trainer.ppg_value_refit(env, n_steps=400, phase_id=None, epochs=1, kl_coef=1.0, lr=1e-4)
+        assert "[ppg loss diag]" not in "\n".join(r.getMessage() for r in caplog.records)
+        assert not list(tmp_path.glob("ppg_diag_cycle*.npz"))

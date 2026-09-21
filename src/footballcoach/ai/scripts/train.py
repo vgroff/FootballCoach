@@ -213,6 +213,27 @@ def main() -> None:
                             "by a KL-anchor penalty, without risking policy damage. A no-op (with "
                             "a warning) if --separate-value-net is set."
                         ))
+    parser.add_argument("--ppg-num-rollouts", type=int, default=None,
+                        help="--ppg-refit-only: override bc.ppg_num_rollouts (collect+fit cycles in the call).")
+    parser.add_argument("--consistency-refit-only", action="store_true",
+                        help=(
+                            "After checkpoint loading (and any --reset-bernoullis/--bernoulli-scale-* "
+                            "reset, applied to the STUDENT), run PPOTrainer.consistency_refit() once "
+                            "and save checkpoint_consistency.pt, then exit WITHOUT running PPO. Requires "
+                            "--checkpoint, which is also loaded, un-reset, as the frozen TEACHER. The "
+                            "student is trained with a per-head KL so that a state and its y-mirror "
+                            "(observer at y >= 0 is the primary orientation) give the same answer; see "
+                            "ai_config.json's bc.consistency_* comments."
+                        ))
+    parser.add_argument("--consistency-teacher", type=str, default=None, metavar="CKPT",
+                        help="--consistency-refit-only: checkpoint to use as the frozen teacher "
+                             "(default: --checkpoint). Lets a run continue refining an already-refit "
+                             "student (--checkpoint) against the original teacher.")
+    parser.add_argument("--consistency-lr", type=float, default=None, help="Override bc.consistency_lr.")
+    parser.add_argument("--consistency-batch-size", type=int, default=None,
+                        help="Override the consistency refit minibatch size (default: bc.value_pretrain_batch_size).")
+    parser.add_argument("--consistency-epochs", type=int, default=None, help="Override bc.consistency_epochs.")
+    parser.add_argument("--consistency-num-rollouts", type=int, default=None, help="Override bc.consistency_num_rollouts.")
     parser.add_argument("--pre-ppo-eval-trials", type=int, default=None,
                         help="Number of distinct eval seeds for ALL pre-PPO evals run after "
                              "pre-training, before PPO starts -- vs rules-based AI, vs immobile, "
@@ -883,10 +904,30 @@ def main() -> None:
             env,
             n_steps=int(bc_cfg.get("ppg_rollout_steps", 110000)),
             phase_id=args.phase,
+            num_rollouts=args.ppg_num_rollouts,
         )
         _refit_ckpt_path = checkpoint_dir / "checkpoint_pretrained.pt"
         trainer._save_checkpoint_to(_refit_ckpt_path)
         log.info(f"--ppg-refit-only: refit complete, checkpoint saved to {_refit_ckpt_path}, exiting.")
+        return
+
+    if args.consistency_refit_only:
+        if not args.checkpoint:
+            log.error("--consistency-refit-only requires --checkpoint (it is also the frozen teacher).")
+            return
+        trainer.consistency_refit(
+            env,
+            n_steps=int(bc_cfg.get("consistency_rollout_steps", 300000)),
+            phase_id=args.phase,
+            teacher_checkpoint=Path(args.consistency_teacher or args.checkpoint),
+            epochs=args.consistency_epochs,
+            lr=args.consistency_lr,
+            batch_size=args.consistency_batch_size,
+            num_rollouts=args.consistency_num_rollouts,
+        )
+        _cons_ckpt_path = checkpoint_dir / "checkpoint_consistency.pt"
+        trainer._save_checkpoint_to(_cons_ckpt_path)
+        log.info(f"--consistency-refit-only: done, checkpoint saved to {_cons_ckpt_path}, exiting.")
         return
 
     # PPO training (with optional BC aux loss if label_fn and aux_coeff > 0).

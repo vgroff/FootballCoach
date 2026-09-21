@@ -269,13 +269,15 @@ class _FakeHandle:
         self.weights_calls = 0
         self.collect_calls: list = []
         self.returns_specs: list = []
+        self.deterministic_flags: list = []
 
     def set_weights(self, dec, exec_, val):
         self.weights_calls += 1
 
-    def collect(self, n_steps, progress=None, returns=None):
+    def collect(self, n_steps, progress=None, returns=None, deterministic=False):
         self.collect_calls.append(n_steps)
         self.returns_specs.append(returns)
+        self.deterministic_flags.append(deterministic)
 
         def _send():
             for m in self._messages:
@@ -445,7 +447,8 @@ class TestCollectConsumesWorkerFinalizedChunks:
         new_handles = []
         for results in per_worker:
             msgs = [
-                {"chunk": [finalize_result_for_wire(copy.deepcopy(r), _spec(mode))]} for r in results
+                {"chunk": [finalize_result_for_wire(copy.deepcopy(r), _spec(mode) | {"gamma": trainer.gamma, "lam": trainer.lam})]}
+                for r in results
             ] + [{"done": True}]
             new_handles.append(_FakeHandle(msgs, batched=True))
         new_batch, new_stats = trainer._collect_value_pretrain_rollout(
@@ -470,7 +473,7 @@ class TestCollectConsumesWorkerFinalizedChunks:
         monkeypatch.setattr(trainer, "_close_value_pretrain_workers", lambda p: None)
         import logging
 
-        with caplog.at_level(logging.INFO, logger="footballcoach.ai.ppo.ppo_trainer"):
+        with caplog.at_level(logging.INFO, logger="footballcoach.ai.ppo"):
             batch, _ = trainer._collect_value_pretrain_rollout(
                 env=None, n_steps=200, phase_id=1, use_gae=False,
                 pool=self._pool([_FakeHandle(msgs, batched=True)]),
@@ -551,3 +554,103 @@ class TestTailOnlyResults:
         monkeypatch.setattr(trainer, "_close_value_pretrain_workers", lambda p: None)
         with pytest.raises(RuntimeError, match="no usable rows"):
             trainer._collect_value_pretrain_rollout(env=None, n_steps=100, phase_id=1, use_gae=False, pool=pool)
+
+
+class TestMCReturnsForCompareToOriginal:
+    """``with_mc_returns`` (ppg_value_refit's compare-to-original diagnostic):
+    pure-MC targets alongside the normal returns, NaN on each track's
+    unfinished tail, independent of any value net."""
+
+    def test_mc_returns_match_reference_and_are_nan_only_on_unfinished_tails(self, trainer):
+        saw_nan = False
+        for r in _collect_results(trainer):
+            buf = r["buffer"]
+            expected = buf.compute_mc_returns(_GAMMA)
+            tail_start = {}
+            for track, idxs in buf._track_index_groups().items():
+                last_done = max((p for p, i in enumerate(idxs) if buf.dones[i] > 0.5), default=-1)
+                tail_start[track] = {i for i in idxs[last_done + 1:]}
+            tail_rows = set().union(*tail_start.values()) if tail_start else set()
+
+            tensors, n_dropped = _finalize_value_pretrain_result(
+                r, _GAMMA, _LAM, use_gae=True, with_mc_returns=True,
+            )
+            mc = tensors["mc_returns"]
+            assert n_dropped == 0 and len(mc) == len(expected)
+            for i, e in enumerate(expected):
+                if i in tail_rows:
+                    assert torch.isnan(mc[i]), f"unfinished-tail row {i} must be NaN"
+                    saw_nan = True
+                else:
+                    assert float(mc[i]) == pytest.approx(e, rel=1e-5, abs=1e-6)
+        assert saw_nan, "fixture should produce at least one unfinished tail"
+
+    def test_absent_unless_requested(self, trainer):
+        r = _collect_results(trainer, n_envs=1, n_steps=200)[0]
+        tensors, _ = _finalize_value_pretrain_result(r, _GAMMA, _LAM, use_gae=True)
+        assert "mc_returns" not in tensors
+
+    def test_mc_returns_do_not_depend_on_the_recorded_values(self, trainer):
+        """The whole point: unlike GAE returns, MC returns must not move when
+        the value estimates stored in the buffer change."""
+        r = _collect_results(trainer, n_envs=1, n_steps=300)[0]
+        r2 = copy.deepcopy(r)
+        r2["buffer"].values = [v + 5.0 for v in r2["buffer"].values]
+        lv = r["last_value"]
+        r2["last_value"] = {k: v + 5.0 for k, v in lv.items()} if isinstance(lv, dict) else float(lv) + 5.0
+        a, _ = _finalize_value_pretrain_result(r, _GAMMA, _LAM, use_gae=True, with_mc_returns=True)
+        b, _ = _finalize_value_pretrain_result(r2, _GAMMA, _LAM, use_gae=True, with_mc_returns=True)
+        assert torch.allclose(a["mc_returns"], b["mc_returns"], equal_nan=True)
+        assert not torch.allclose(a["returns"], b["returns"]), "GAE returns DO depend on the values"
+
+    def test_survives_the_wire_and_the_spec_flag_is_honoured(self, trainer):
+        r = _collect_results(trainer, n_envs=1, n_steps=200)[0]
+        with_mc = finalize_result_for_wire(copy.deepcopy(r), _spec("gae") | {"with_mc": True})
+        without = finalize_result_for_wire(copy.deepcopy(r), _spec("gae"))
+        assert "mc_returns" in with_mc["batch"] and "mc_returns" not in without["batch"]
+        after_pipe = batch_from_wire(pickle.loads(pickle.dumps(with_mc))["batch"])
+        local, _ = _finalize_value_pretrain_result(
+            copy.deepcopy(r), _GAMMA, _LAM, use_gae=True, with_mc_returns=True,
+        )
+        assert torch.allclose(after_pipe["mc_returns"], local["mc_returns"], equal_nan=True)
+
+
+class TestDeterministicRolloutFlag:
+    def _pool(self, handles, batched: bool):
+        return _ValuePretrainWorkers(
+            handles=handles, batched=batched, progress_value=multiprocessing.Value("l", 0),
+            n_processes=len(handles), envs_per_process=2,
+        )
+
+    @pytest.mark.parametrize("flag", [False, True])
+    def test_flag_reaches_every_batched_worker(self, trainer, monkeypatch, flag):
+        results = _collect_results(trainer, n_envs=2, n_steps=200)
+        handles = [
+            _FakeHandle([{"chunk": copy.deepcopy(results)}, {"done": True}], batched=True) for _ in range(2)
+        ]
+        monkeypatch.setattr(trainer, "_close_value_pretrain_workers", lambda p: None)
+        trainer._collect_value_pretrain_rollout(
+            env=None, n_steps=400, phase_id=1, use_gae=True, pool=self._pool(handles, True),
+            deterministic=flag,
+        )
+        assert [h.deterministic_flags for h in handles] == [[flag], [flag]]
+
+    def test_plain_workers_refuse_deterministic_instead_of_silently_ignoring_it(self, trainer, monkeypatch):
+        handles = [_FakeHandle([], batched=False)]
+        monkeypatch.setattr(trainer, "_close_value_pretrain_workers", lambda p: None)
+        with pytest.raises(ValueError, match="BATCHED"):
+            trainer._collect_value_pretrain_rollout(
+                env=None, n_steps=100, phase_id=1, use_gae=True, pool=self._pool(handles, False),
+                deterministic=True,
+            )
+        assert handles[0].collect_calls == [], "must fail BEFORE dispatching any work"
+
+    def test_handle_message_carries_the_flag(self):
+        from footballcoach.ai.ppo.batched_rollout_worker import BatchedRolloutWorkerHandle
+
+        parent, child = multiprocessing.Pipe()
+        h = BatchedRolloutWorkerHandle(process=None, conn=parent, worker_idx=0)
+        h.collect(100, deterministic=True)
+        assert child.recv()["deterministic"] is True
+        h.collect(100)
+        assert child.recv()["deterministic"] is False
