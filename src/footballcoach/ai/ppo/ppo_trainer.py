@@ -1471,6 +1471,9 @@ class PPOTrainer:
         # Extra multiplier on the kick heads' entropy bonus in the PPO loss only
         # (kick gate + kick_dir + kick_power); 1.0 = today's behaviour exactly.
         self.ent_kick_weight = float(ppo_cfg.get("ent_kick_weight", 1.0))
+        # Extra multiplier on the move_dir entropy bonus in the PPO loss only (on top of ent_dir_weight); 1.0 = today's behaviour exactly.
+        # Only reaches move_dir_log_kappa (see _compute_entropy) -- slows the head's sharpening without touching the exec_move gate.
+        self.ent_move_dir_weight = float(ppo_cfg.get("ent_move_dir_weight", 1.0))
         # Lower bound of the executed kick power fraction (0.0 = plain sigmoid).
         self.kick_power_floor = float(ppo_cfg.get("kick_power_floor", 0.0))
         # agent_plans/masked_action_training_plan.md: per-decision "could the action take effect" flags
@@ -10702,6 +10705,9 @@ class PPOTrainer:
         E[kick] weighting restricted to rows where a kick could happen) instead of by the batch-mean p_kick.
         ``None`` = the unmasked formulas below, unchanged.
 
+        ``return_kick_boost`` returns the extra bonus terms that only enter the PPO loss (never the logged entropy): the
+        ``ent_kick_weight`` boost on the kick heads plus the ``ent_move_dir_weight`` boost on move_dir.
+
         Args:
             return_breakdown: if True, also return a dict of each head's own
                 (already E[parent active]-weighted, matching what's actually
@@ -10756,7 +10762,8 @@ class PPOTrainer:
         p_exec_move = torch.sigmoid(e_heads.exec_move_logit).mean()
         p_kick = torch.sigmoid(e_heads.kick_logit).mean()
         h_sprint = p_exec_move * IndependentBernoulli(e_heads.sprint_logit).entropy().mean()
-        h_move_dir = p_exec_move * self.ent_dir_weight * self._move_dir_head(e_heads.move_direction, log_kappa_move).entropy().mean()
+        _h_move_dir_raw = self._move_dir_head(e_heads.move_direction, log_kappa_move).entropy().mean()
+        h_move_dir = p_exec_move * self.ent_dir_weight * _h_move_dir_raw
         if opp_masks is None:
             h_kick_dir = p_kick * self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).entropy().mean()
             h_kick_power = p_kick * self.ent_kick_power_weight * self._kick_power_head(e_heads.kick_power, log_std_power).entropy().mean()
@@ -10786,6 +10793,10 @@ class PPOTrainer:
         # `entropy` / per-head breakdown keep meaning "the unboosted entropy"
         # and the caller adds the boost only where it builds the loss.
         kick_boost = (self.ent_kick_weight - 1.0) * (_bkdn_tensors["kick"] + h_kick_dir + h_kick_power)
+        # ent_move_dir_weight: extra bonus on the move_dir entropy, carried in the same separate term (so the logged entropy and
+        # breakdown stay unboosted). p_exec_move is detached: the von Mises entropy depends only on kappa, so this boost pulls
+        # move_dir_log_kappa down (slower sharpening) without also pushing the exec_move gate toward "stand still".
+        kick_boost = kick_boost + (self.ent_move_dir_weight - 1.0) * p_exec_move.detach() * self.ent_dir_weight * _h_move_dir_raw
         result = [ent]
         if return_breakdown:
             _names = list(_bkdn_tensors.keys())

@@ -2031,3 +2031,29 @@ rows that would train: kick gate ~280k, tackle gate ~11-12k, kick dir/power ~3.6
 **Known limits.** (1) `opp_partial` intervals. (2) tackle opportunity is contact range, so a tackle blocked by aerial
 control / GK immunity still counts as an opportunity (the bit has a reward effect there). (3) The tackle gate and kick
 dir/power heads get 1-2 orders of magnitude fewer training rows than before (plan D9/D12) -- watch their learning speed.
+
+## move_dir kappa: gradient scale, reset + cap, and `ppo.ent_move_dir_weight` (2026-09-21, run 304 -> 305)
+
+**What run 304 showed.** move_dir kappa sharpened ~+0.011 in log kappa per checkpoint for 110+ checkpoints (133 -> ~470) while the
+"main" grad-clip group (trunk + all non-direction heads) went from 4% of steps clipped (mean pre-clip norm 2.6) to ~50% (4.3). The
+direction group (move_direction.* / move_dir_log_kappa / kick_direction.*, own clip, limit 4.0) stayed at ~2 and is rarely clipped, but
+the main-group norm moved with it (r = +0.90 in checkpoint-to-checkpoint changes; its own head-norm ~ kappa^0.44, main ~ kappa^0.40, both
+confounded with time). Offline seeded eval vs rules of checkpoint 108 with only move_dir kappa overridden (1300 episodes each, sem 0.07):
+kappa 800 +0.96, 390 (native) +0.92, 300 +0.93, 200 +0.89, 150 +0.85, 100 +0.88, 50 +0.76, 25 +0.51; deterministic heading +1.04 --
+i.e. flat above ~300, ~-0.05 at 100-150, -0.16 at 50. `ppo.dir_log_kappa_max` (default 10) is a hard clamp in the head's forward, so it
+is a usable cap; `ppo.move_dir_log_kappa_max` overrides it for move_dir only.
+
+**Run 305 restart recipe** (run 305 = run 304 at checkpoint 126, step 545,964,837, with move_dir kappa reset to 130 -- Adam moments of that one
+parameter dropped, nothing else touched; `--checkpoint <reset>.pt --checkpoint-dir checkpoints/phase1_run305 --total-steps 105500000`):
+* `progress` (0..1) restarts at 0 on every `train.py` invocation and only drives `ppo.ent_coef_start/end/anneal_fraction` here (lr, clip range are
+  constant, BC coefficients are 0). To continue run 304's entropy schedule, set ent_coef_start = its value at the restart step,
+  ent_coef_end unchanged, anneal_fraction = (steps left until the old end step) / new total-steps (0.005 -> 0.001 over 0.6 x 200M steps from 451.4M).
+* `ppo.move_dir_log_kappa_max` = ln 1000 (kappa cap).
+* `ppo.ent_move_dir_weight` (default 1.0 = off): extra multiplier on the move_dir entropy bonus, carried in the same separate term as
+  `ent_kick_weight` (so the logged entropy / per-head breakdown stay unboosted), with P(exec_move) detached so the boost reaches ONLY
+  move_dir_log_kappa (von Mises entropy depends on kappa alone) -- it slows sharpening without pushing the exec_move gate toward standing
+  still (the ordinary move_dir entropy term does pull on exec_move through its P(exec_move) factor). Run 305 uses 8.0 (on top of
+  `ent_dir_weight` 1.5). Tests: tests/ai_unit/test_move_dir_entropy_weight.py (mutation-checked: removing the detach fails it).
+* Run 304's log-kappa growth showed no detectable dependence on ent_coef (0.0047 -> 0.0019), so the entropy lever at weight 1 is weak; the
+  value 8 is a first setting, tune from the observed log-kappa growth per checkpoint (~0.011 before).
+* The eval "original" opponent is always the run's own checkpoint1.pt, so `vs neural:original` restarts from the reset policy in run 305.
