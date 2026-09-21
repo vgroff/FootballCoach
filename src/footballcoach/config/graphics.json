@@ -92,16 +92,18 @@
     "strength": 0.9
   },
   "player_shadow": {
-    "_comment": "Ground shadow under each player, cast by the scene light (a figure's height h at distance d from the pitch centre throws a shadow d*h/(H-h) long straight away from the centre). alpha: 0-255 darkness. contact_m: minimum shadow length in metres so a player at the centre still has one. enabled false = none.",
+    "_comment": "Ground shadow under each player, cast by the scene light (a figure's height h at distance d from the pitch centre throws a shadow d*h/(H-h) long straight away from the centre). alpha: 0-255 darkness. tip_fade: 0-0.9, how much lighter the shadow is at its tip than at the feet (like a real shadow it is also softer-edged toward the tip); 0 = uniform. contact_m: minimum shadow length in metres so a player at the centre still has one. enabled false = none.",
     "enabled": true,
-    "alpha": 107,
+    "alpha": 90,
+    "tip_fade": 0.3,
     "contact_m": 0.18
   },
   "ball_shadow": {
-    "_comment": "Soft ground shadow under the ball, cast by the scene light (scene_light.height_m): a raised ball's shadow falls on the ground displaced away from the pitch centre (none on the ground or at the centre). contact_offset_m: a thin always-visible contact shadow (same direction) so a grounded ball doesn't look pasted on; 0 = none. alpha: 0-255 darkness of the shadow under a ball on the ground (fainter and softer as it rises).",
+    "_comment": "Soft ground shadow under the ball, cast by the scene light (scene_light.height_m). A sphere's shadow is an ellipse: semi-minor axis the drawn ball's radius, semi-major radius/sin(light elevation), elongated away from the pitch centre and centred where the light through the ball's centre lands (distance*z/(H-z) beyond it). A grounded ball's shadow is a circle hidden under it at the centre that stretches and slides out with distance from it; a raised ball's lies further out. contact_radius_frac / contact_min_px: the MINIMUM contact shadow -- the ellipse is slid outward until its far tip clears the ball's edge by this fraction of the ball's drawn radius (so it scales with zoom exactly like the ball) or this many pixels, whichever is more; it fades out as the ball rises. 0 = none. alpha: 0-255 darkness of the shadow under a ball on the ground (fainter and softer as it rises).",
     "enabled": true,
-    "contact_offset_m": 0.10,
-    "alpha": 120
+    "contact_radius_frac": 0.33,
+    "contact_min_px": 2,
+    "alpha": 100
   },
   "ball_shading": {
     "_comment": "Sphere shading on the ball (dark on the side away from the light, clear where it faces it; the highlight is the unshaded part). The light is the scene light (scene_light.height_m above the pitch's middle), the same as the shadows, so the lit side always faces the centre: overhead at the centre, lower and more sideways toward the edges. strength 0-1; enabled false = flat white ball.",
@@ -131,7 +133,7 @@
     "pole_width_m": 0.06,
     "flag_width_m": 0.55,
     "flag_length_m": 0.32,
-    "shadow_alpha": 90,
+    "shadow_alpha": 75,
     "shadow_height_m": 1.2
   },
   "goal_net": {

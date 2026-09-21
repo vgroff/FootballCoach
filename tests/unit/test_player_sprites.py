@@ -672,7 +672,7 @@ def test_the_shadow_sprite_is_cached_soft_edged_and_bounded():
     assert any(0 < a.get_at((x, a.get_height() // 2))[3] < renderer._player_shadow_alpha for x in range(a.get_width()))
     for i in range(600):
         renderer._player_shadow_sprite(5 + i % 40, 5 * (i % 72), 3)
-    assert len(renderer._player_shadow_cache) <= 512
+    assert len(renderer._shadow_cache) <= 512
 
 
 def test_all_shadows_are_drawn_under_every_player_sprite_and_the_ball():

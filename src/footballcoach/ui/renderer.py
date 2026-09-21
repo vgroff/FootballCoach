@@ -427,9 +427,12 @@ class Renderer:
         # ONE scene light for every shadow and shading effect: a point this high above the middle
         # of the pitch (ball shadow + shading, player shadows + shading).
         self._light_height_m: float = max(1.0, float(gcfg.get("scene_light", {}).get("height_m", 40.0)))
-        self._ball_shadow_contact_m: float = max(0.0, float(_bs.get("contact_offset_m", 0.10)))
-        self._ball_shadow_alpha: int = int(_bs.get("alpha", 120))
-        self._ball_shadow_cache: dict[tuple, pygame.Surface] = {}
+        # Minimum contact shadow, as a fraction of the drawn ball's radius (so it scales with zoom
+        # exactly like the ball does), with a small pixel floor for the default zoom.
+        self._ball_shadow_contact_frac: float = max(0.0, float(_bs.get("contact_radius_frac", 0.33)))
+        self._ball_shadow_contact_min_px: float = max(0.0, float(_bs.get("contact_min_px", 2.0)))
+        self._ball_shadow_alpha: int = int(_bs.get("alpha", 100))
+        self._shadow_cache: dict[tuple, pygame.Surface] = {}     # soft capsules, shared by ball and players
         _bsh = gcfg.get("ball_shading", {})
         self._ball_shading_strength: float = max(0.0, min(1.0, float(_bsh.get("strength", 0.85)))) if _bsh.get("enabled", True) else 0.0
         self._ball_shade_cache: dict[tuple, pygame.Surface] = {}
@@ -438,9 +441,10 @@ class Renderer:
         self._player_shading_strength: float = max(0.0, min(1.0, float(_pl.get("strength", 0.9)))) if _pl.get("enabled", True) else 0.0
         _psh = gcfg.get("player_shadow", {})
         self._player_shadow_enabled: bool = bool(_psh.get("enabled", True))
-        self._player_shadow_alpha: int = int(_psh.get("alpha", 107))
+        self._player_shadow_alpha: int = int(_psh.get("alpha", 90))
         self._player_shadow_contact_m: float = max(0.0, float(_psh.get("contact_m", 0.18)))
-        self._player_shadow_cache: dict[tuple, pygame.Surface] = {}
+        # How much a player's shadow lightens from the feet (full strength) to the tip (1 - tip_fade).
+        self._player_shadow_tip_fade: float = max(0.0, min(0.9, float(_psh.get("tip_fade", 0.3))))
         # Turf: soft world-anchored light/dark patches, fine grain and a faint vignette
         # instead of one flat green fill (see `_draw_turf`).
         _tf = gcfg.get("turf", {})
@@ -464,7 +468,7 @@ class Renderer:
         # The cloth's length along the pole is an absolute (apparent) size, so a taller pole
         # doesn't make the pennant taller too.
         self._corner_flag_length_m: float = float(_cf.get("flag_length_m", 0.32))
-        self._corner_shadow_alpha: int = int(_cf.get("shadow_alpha", 90))
+        self._corner_shadow_alpha: int = int(_cf.get("shadow_alpha", 75))
         self._corner_shadow_height_m: float = float(_cf.get("shadow_height_m", 1.2))
         _gn = gcfg.get("goal_net", {})
         self._goal_net_spacing_m: float = float(_gn.get("spacing_m", 0.35))
@@ -1614,54 +1618,89 @@ class Renderer:
         return sprite
 
     def _draw_ball_shadow(self, surface: pygame.Surface, ball: Ball, base_radius_px: float) -> None:
-        """A soft shadow on the ground. The light is a point ``scene_light.height_m`` above the pitch's
-        middle, so a raised ball's shadow falls on the ground displaced radially AWAY from the
-        centre by ``distance * z / (H - z)`` (zero at the centre or on the ground); a thin
-        contact shadow (``contact_offset_m``, same direction, biased to the lower-right so it
-        never vanishes at the centre) keeps a grounded ball from looking pasted on. The shadow is
-        ground-sized (not boosted with height like the drawn ball), fainter and softer the
-        higher the ball is."""
+        """The ball's ground shadow, cast by the scene light (a point ``scene_light.height_m`` above
+        the pitch's middle). A sphere's shadow is an ELLIPSE: semi-minor axis its radius ``r``,
+        semi-major ``r / sin(e)`` for light elevation ``e`` (``atan((H - zc) / d)`` for a ball centre
+        at height ``zc``, distance ``d`` from the middle), elongated along the light's direction
+        (radially away from the centre) and centred where the light through the ball's centre lands:
+        ``d * zc / (H - zc)`` beyond the ball. The radius used is the DRAWN (enlarged) ball's,
+        ground-sized (not boosted with height), so the shadow keeps that ball's proportions. So a
+        ball on the ground casts a circle straight under it at the centre of the pitch (overhead
+        light -- hidden) that stretches and slides out with distance from the middle; a raised
+        ball's whole shadow also lies further out.
+
+        Where that would be too little to see (near the middle, near the ground) a MINIMUM contact
+        shadow slides the ellipse outward until its far tip clears the ball's edge by
+        ``contact_radius_frac`` of the ball's radius (at least ``contact_min_px``) -- a fraction of
+        the DRAWN radius so it scales with zoom exactly like the ball, still pointing radially away
+        from the centre (with a fixed lower-right bias within ~3m of it, where the overhead light
+        has no true direction). It fades out as the ball rises (gone by 1.5m). Fainter and softer
+        the higher the ball is."""
         cam = self.camera
-        z = max(0.0, ball.position.z - ball.radius_m)
-        z_eff = min(z, 0.8 * self._light_height_m)
-        k = z_eff / (self._light_height_m - z_eff)
+        ppm = cam.pixels_per_metre
+        light_h = self._light_height_m
+        z_under = max(0.0, ball.position.z - ball.radius_m)
+        r_px = base_radius_px * (1.0 + 0.04 * z_under)                    # ground radius of the shadow
+        z_centre = z_under + base_radius_px / ppm                         # centre height of the DRAWN sphere (m)
+        z_eff = min(z_centre, 0.8 * light_h)
+
         bx, by = cam.world_to_screen_f(ball.position.x, ball.position.y)
         cx, cy = cam.world_to_screen_f(0.0, 0.0)
         vx, vy = bx - cx, by - cy
-        off_x, off_y = vx * k, vy * k
-        if self._ball_shadow_contact_m > 0.0:
-            # Direction: radial away from the centre, blended with a lower-right bias that
-            # dominates within ~3m of the centre (so it is continuous when the ball crosses it).
-            bias = 3.0 * cam.pixels_per_metre
-            dx, dy = vx + bias * 0.7071, vy + bias * 0.7071
-            norm = math.hypot(dx, dy) or 1.0
-            c = self._ball_shadow_contact_m * cam.pixels_per_metre
-            off_x, off_y = off_x + dx / norm * c, off_y + dy / norm * c
-        sprite = self._ball_shadow_sprite(
-            base_radius_px * (1.0 + 0.04 * z),
-            self._ball_shadow_alpha * (1.0 - 0.45 * min(z / 6.0, 1.0)),
-            0.15 + 0.06 * min(z, 6.0),
+        dist_px = math.hypot(vx, vy)
+        elevation = math.atan2(light_h - z_eff, dist_px / ppm)
+        semi_major = r_px / max(math.sin(elevation), 0.2)                # cap the stretch at a 5:1 ellipse
+        k = z_eff / (light_h - z_eff)
+        offset = dist_px * k                                              # where the sphere's centre casts, from the ball
+
+        # Direction: radially away from the centre, with a lower-right bias that dominates within ~3m
+        # of it so the direction is continuous as the ball crosses the middle.
+        bias = 3.0 * ppm
+        dx, dy = vx + bias * 0.7071, vy + bias * 0.7071
+        norm = math.hypot(dx, dy) or 1.0
+        ux, uy = dx / norm, dy / norm
+        angle = int(round(math.degrees(math.atan2(uy, ux)) / 5.0) * 5) % 360
+
+        wanted_tip = r_px + max(self._ball_shadow_contact_frac * r_px, self._ball_shadow_contact_min_px)
+        grounded = max(0.0, 1.0 - z_under / 1.5)
+        extra = max(0.0, wanted_tip - (offset + semi_major)) * grounded
+        centre_x, centre_y = bx + vx * k + ux * extra, by + vy * k + uy * extra
+        sprite = self._shadow_ellipse_sprite(
+            semi_major, r_px, angle, self._ball_shadow_alpha * (1.0 - 0.45 * min(z_under / 6.0, 1.0)),
+            0.15 + 0.06 * min(z_under, 6.0),
         )
-        surface.blit(sprite, (round(bx + off_x) - sprite.get_width() // 2, round(by + off_y) - sprite.get_height() // 2))
+        surface.blit(sprite, (round(centre_x) - sprite.get_width() // 2, round(centre_y) - sprite.get_height() // 2))
 
     def _ball_shadow_sprite(self, radius: float, alpha: float, softness: float) -> pygame.Surface:
-        """A soft-edged black disc (radius px at full alpha out to ``radius * (1 - softness)``,
-        fading to nothing at ``radius * (1 + softness)``), quantised so the cache stays small."""
-        radius, alpha, softness = round(radius * 2) / 2.0, int(round(alpha / 5.0) * 5), round(softness * 20) / 20.0
-        key = (radius, alpha, softness)
-        sprite = self._ball_shadow_cache.get(key)
+        """A soft-edged black disc (a circular ellipse; see `_shadow_ellipse_sprite`)."""
+        return self._shadow_ellipse_sprite(radius, radius, 0, alpha, softness)
+
+    def _shadow_ellipse_sprite(
+        self, semi_major_px: float, semi_minor_px: float, angle_deg: int, alpha: float, softness: float,
+    ) -> pygame.Surface:
+        """A soft-edged black ellipse centred in a square sprite, its long axis pointing ``angle_deg``
+        (screen angle, y down): solid to ``1 - softness`` of its radius in every direction (the elliptical
+        distance) and fading to nothing at ``1 + softness``. ``alpha`` is 0-255 at full strength.
+        Parameters are quantised (axes 0.5px, alpha 5, softness 0.05) and the sprites cached, bounded at 512."""
+        a = max(0.5, round(semi_major_px * 2) / 2.0)
+        b = max(0.5, round(semi_minor_px * 2) / 2.0)
+        alpha, softness = int(round(alpha / 5.0) * 5), round(softness * 20) / 20.0
+        key = (a, b, angle_deg, alpha, softness)
+        sprite = self._shadow_cache.get(key)
         if sprite is None:
-            outer = radius * (1.0 + softness)
-            n = int(math.ceil(outer)) + 2
-            yy, xx = np.mgrid[-n:n + 1, -n:n + 1].astype(float)
-            t = np.clip((outer - np.hypot(xx, yy)) / max(2.0 * radius * softness, 1e-6), 0.0, 1.0)
-            t = t * t * (3.0 - 2.0 * t)
-            sprite = pygame.Surface((2 * n + 1, 2 * n + 1), pygame.SRCALPHA)
+            pad = int(math.ceil(max(a, b) * (1.0 + softness))) + 2
+            yy, xx = np.mgrid[-pad:pad + 1, -pad:pad + 1].astype(float)
+            cos_a, sin_a = math.cos(math.radians(angle_deg)), math.sin(math.radians(angle_deg))
+            along, across = xx * cos_a + yy * sin_a, -xx * sin_a + yy * cos_a
+            rho = np.hypot(along / a, across / b)                       # 1.0 on the ellipse's edge
+            t = np.clip((1.0 + softness - rho) / max(2.0 * softness, 1e-6), 0.0, 1.0)
+            t = t * t * (3.0 - 2.0 * t) * (alpha / 255.0)
+            sprite = pygame.Surface((2 * pad + 1, 2 * pad + 1), pygame.SRCALPHA)
             sprite.fill((0, 0, 0, 0))
-            pygame.surfarray.pixels_alpha(sprite)[:] = (alpha * t).astype(np.uint8)
-            if len(self._ball_shadow_cache) >= 256:
-                self._ball_shadow_cache.clear()
-            self._ball_shadow_cache[key] = sprite
+            pygame.surfarray.pixels_alpha(sprite)[:] = np.clip(t * 255.0 + 0.5, 0, 255).astype(np.uint8).T
+            if len(self._shadow_cache) >= 512:
+                self._shadow_cache.clear()
+            self._shadow_cache[key] = sprite
         return sprite
 
     def _draw_player_sprite(
@@ -1726,7 +1765,10 @@ class Renderer:
         The light is the scene's point light above the middle of the pitch: the shadow of a
         figure of height h at distance d from the centre points straight away from it and is
         d * h / (H - h) long (a thin contact shadow, `player_shadow.contact_m`, so a player at the
-        centre still has one), drawn as a soft capsule."""
+        centre still has one), drawn as a capsule from the feet to the tip that softens and fades
+        toward the tip (`_player_shadow_sprite`). An ellipse was tried for players and rejected --
+        the bar read better on a figure -- while the BALL, a sphere, keeps its exact elliptical
+        shadow (`_draw_ball_shadow`)."""
         if not self._player_shadow_enabled or self._player_shadow_alpha <= 0:
             return
         cam = self.camera
@@ -1742,32 +1784,42 @@ class Renderer:
             # ~1.5 m of it so the direction is continuous as a player crosses the middle.
             dx, dy = vx + 1.5 * ppm * 0.7071, vy + 1.5 * ppm * 0.7071
             angle = int(round(math.degrees(math.atan2(dy, dx)) / 5.0) * 5) % 360
-            sprite = self._player_shadow_sprite(int(round(length_px)), angle, int(round(self._player_radius_px(player) * 0.85)))
+            width = int(round(self._player_radius_px(player) * 0.85))
+            sprite = self._player_shadow_sprite(int(round(length_px)), angle, width)
             pos = cam.world_to_screen(player.position.x, player.position.y)
             surface.blit(sprite, (pos[0] - sprite.get_width() // 2, pos[1] - sprite.get_height() // 2))
 
+    # A player's shadow is sharpest at the feet and blurs (the penumbra widens) with distance from
+    # them: half-softness of the edge at the feet / at the tip, as a fraction of the shadow's half-width.
+    _PLAYER_SHADOW_SOFT_NEAR = 0.2
+    _PLAYER_SHADOW_SOFT_FAR = 0.8
+
     def _player_shadow_sprite(self, length_px: int, angle_deg: int, radius_px: int) -> pygame.Surface:
-        """A soft-edged black capsule of half-width ``radius_px`` running from the centre of the
-        sprite ``length_px`` px in the direction ``angle_deg`` (screen angle, y down); the sprite is
-        a square centred on the player. Cached per (length, angle, radius)."""
-        key = (length_px, angle_deg, radius_px)
-        sprite = self._player_shadow_cache.get(key)
+        """A player's shadow: a capsule of half-width ``radius_px`` (its 50%-alpha edge is a constant-width
+        bar with a round end) running from the CENTRE of the returned square sprite -- the player's feet --
+        ``length_px`` px in direction ``angle_deg`` (screen angle, y down). Like a real shadow it is sharpest
+        and darkest at the feet and gets softer-edged (`_PLAYER_SHADOW_SOFT_NEAR` -> `_FAR`) and lighter
+        (``player_shadow.alpha`` at the feet to ``alpha * (1 - tip_fade)`` at the tip) with distance from
+        them. Cached per (length, angle, radius, alpha, fade) in `_shadow_cache`, shared with the ball's
+        ellipses (bounded at 512)."""
+        key = ("capsule", length_px, angle_deg, radius_px, self._player_shadow_alpha, round(self._player_shadow_tip_fade, 3))
+        sprite = self._shadow_cache.get(key)
         if sprite is None:
-            soft = 0.35
             r = max(1, radius_px)
-            pad = int(math.ceil(length_px + r * (1 + soft))) + 2
+            pad = int(math.ceil(length_px + r * (1 + self._PLAYER_SHADOW_SOFT_FAR))) + 2
             yy, xx = np.mgrid[-pad:pad + 1, -pad:pad + 1].astype(float)
             sx, sy = math.cos(math.radians(angle_deg)) * length_px, math.sin(math.radians(angle_deg)) * length_px
-            t = np.clip((xx * sx + yy * sy) / max(sx * sx + sy * sy, 1e-9), 0.0, 1.0)
+            t = np.clip((xx * sx + yy * sy) / max(sx * sx + sy * sy, 1e-9), 0.0, 1.0)     # 0 at the feet, 1 at the tip
             d = np.hypot(xx - t * sx, yy - t * sy)
+            soft = self._PLAYER_SHADOW_SOFT_NEAR + (self._PLAYER_SHADOW_SOFT_FAR - self._PLAYER_SHADOW_SOFT_NEAR) * t
             a = np.clip((r * (1 + soft) - d) / (2 * r * soft), 0.0, 1.0)
-            a = a * a * (3.0 - 2.0 * a) * (self._player_shadow_alpha / 255.0)
+            a = a * a * (3.0 - 2.0 * a) * (self._player_shadow_alpha / 255.0) * (1.0 - self._player_shadow_tip_fade * t)
             sprite = pygame.Surface((2 * pad + 1, 2 * pad + 1), pygame.SRCALPHA)
             sprite.fill((0, 0, 0, 0))
             pygame.surfarray.pixels_alpha(sprite)[:] = np.clip(a * 255.0 + 0.5, 0, 255).astype(np.uint8).T
-            if len(self._player_shadow_cache) >= 512:
-                self._player_shadow_cache.clear()
-            self._player_shadow_cache[key] = sprite
+            if len(self._shadow_cache) >= 512:
+                self._shadow_cache.clear()
+            self._shadow_cache[key] = sprite
         return sprite
 
     def draw_player(

@@ -394,7 +394,7 @@ same as everything else in that method):
   `flag_drop_frac` (55% of the pole) made the pennant grow with the pole; the new default
   0.32m is a little shorter than the old 0.39m. An outline muddied the ~6px pennant at 1x
   and a white stripe turned into a noisy blob, so neither was kept.
-  **Flag shadow** (`_draw_corner_flag_shadow`, `shadow_alpha` 90, `shadow_height_m` 2.4):
+  **Flag shadow** (`_draw_corner_flag_shadow`, `shadow_alpha` 75, `shadow_height_m` 1.2):
   cast by the scene light (see "Scene light and player lighting"): a point at height z above
   ground point P shadows at `P × H / (H − z)`, so the pole throws a line from its foot
   straight away from the pitch centre, `d × h / (H − h)` long, and the cloth a triangle. It
@@ -533,26 +533,44 @@ spreads a line over more pixels at lower intensity but preserves the total.
   produced a grey spot). `strength` 0.85 ("variant C" of the options compared
   side by side). The sprite is computed with numpy at 6x sub-sampling, cached per
   radius; the dots still read clearly through it (tested).
-- **Ground shadow** (`ball_shadow`, `_draw_ball_shadow`): the light is a **point
-  40m above the middle of the pitch (`scene_light.height_m`)**, so the shadow of a ball at height `z` (of its
-  underside) sits on the ground displaced radially AWAY from the centre by
-  `distance × z / (H − z)`; zero on the ground and at the centre, growing with height
-  and with distance from the middle (a high ball near a corner throws its shadow
-  several metres off; the height went 15m → 30m → 40m after side-by-sides: at 15m a 3.5m
-  ball's shadow landed ~9m away, 30m about half that, 40m closer still while remaining clearly visible). Because that vanishes for a grounded ball, a **thin contact
-  shadow** (`contact_offset_m`, 0.10m) is added along the same radial direction —
-  biased to the lower-right within ~3m of the centre so it doesn't flip when the ball
-  crosses it. The shadow is ground-sized (NOT boosted with height like the drawn
-  ball), fainter (alpha 120 → ~66 at 6m) and softer the higher the ball is; drawn
-  before the trail and the ball. Sprites are numpy soft discs, quantised and cached.
-  Compared against a fixed top-left directional shadow (also fine, and consistent
-  with the ball's own shading); the centre-point light was chosen so the ball's
-  shadow matches the goal frame's centre-facing lighting.
+- **Ground shadow** (`ball_shadow`, `_draw_ball_shadow`): cast by the scene light — a **point
+  40m above the middle of the pitch (`scene_light.height_m`)**. A sphere's shadow is an
+  **ellipse**: semi-minor axis its radius `r` (the DRAWN, enlarged ball's ground radius, so it
+  keeps that ball's proportions), semi-major `r / sin(e)` for light elevation
+  `e = atan((H − zc) / d)` (`zc` the drawn sphere's centre height, `d` its distance from the
+  middle), elongated radially away from the centre and centred where the light through the ball's
+  centre lands, `d × zc / (H − zc)` beyond the ball (`shadow of a point at height z sits at
+  P × H / (H − z)`). So a grounded ball's shadow **depends on the light**: a circle hidden right
+  under it at the centre (overhead light) that stretches and slides out with distance from it
+  (~1.5 radii semi-major at the far edge, where the light is ~40° up at the ball's height); a
+  raised ball's whole shadow lies further out. (It was a capsule — a constant-width bar with round
+  ends, "cylinders", which looked wrong — first with a constant 0.10m contact offset that was ~1px,
+  hidden at 1x and identical at every spot, measured before changing it.)
+  **Minimum contact shadow**: where the physical ellipse would be too little to see, it is slid
+  outward until its far tip clears the ball's edge by `contact_radius_frac` (0.33) of the DRAWN
+  radius, at least `contact_min_px` (2px) — it fades out as the ball rises (gone by 1.5m), and points
+  radially away from the centre, with a fixed lower-right bias within ~3m of it (where the overhead
+  light has no true direction; keeps the direction continuous as the ball crosses the middle). It
+  is a fraction of the drawn radius, NOT metres or a fixed pixel count, so it scales with zoom
+  exactly like the ball: a fixed 5px minimum was a third of the ball's radius at zoom 3 but a whole
+  radius at zoom 1 ("too big at zoom 1"). Fainter (alpha 100 → ~55 at 6m) and softer the higher the
+  ball is; drawn in the shared shadow pass, under everything. Sprites are numpy soft ellipses
+  (`_shadow_ellipse_sprite`: alpha fades over the elliptical distance from `1 − softness` to
+  `1 + softness`; shared with the players' shadows), quantised and cached, bounded at 512.
+  Tests: `test_a_grounded_balls_shadow_depends_on_the_light_it_grows_with_distance_from_the_centre`,
+  `test_the_grounded_ball_shadow_is_the_ellipse_the_light_casts` (far tip within 2px of the formula
+  at zoom 1, 3, 5), `test_the_ball_shadow_is_an_ellipse_not_a_constant_width_bar` (half-width at
+  0.8 of the semi-major axis is 0.6 of the minor axis; a capsule would still be full width),
+  `test_the_minimum_contact_shadow_scales_with_the_ball_across_zoom_levels`,
+  `test_the_minimum_contact_shadow_still_points_radially_away_from_the_centre`.
 - The state rings (see "Ball state indicator rings") were tightened to
   `offset_px` 1 / `width_px` 1 (from 2 / 2) so they hug the ball and read as a thin
   status outline rather than a halo.
 
 ## Scene light and player lighting
+
+*Shadow strengths (`alpha`s: ball 100, players 90, flags 75): the first set was 120 / 107 / 90, raised ~25% to
+150 / 135 / 115 (too dark), then set lighter than the original after a side-by-side of four options.*
 
 One light drives every shadow and shading effect: a **point `scene_light.height_m`
 (40m) above the middle of the pitch** (`Renderer._light_height_m`,
@@ -569,12 +587,25 @@ approximation (`style.LIGHT_*`), which is not tied to this height.
   net (drawing them per player, inside `draw_player`, put later players' shadows over
   earlier sprites). `draw_ball(..., shadow=False)` is what `draw_pitch_and_ball` uses; the
   default still draws the ball's shadow itself.
-- **Player shadow** (`player_shadow`: `alpha` 107, `contact_m` 0.18): a soft capsule from
-  under the player pointing straight away from the pitch centre, `d × h / (H − h)` long
-  (h = `player.height_m`, 1.8m; a 45m-out player gets ~2m, a player at the centre only the
-  contact length), half-width 0.85 × the drawn radius. Direction has a lower-right bias that
-  dominates within ~1.5m of the centre so it is continuous when a player crosses it.
-  Sprites are numpy capsules cached per (length, 5° angle, radius), bounded at 512.
+- **Player shadow** (`player_shadow`: `alpha` 90, `tip_fade` 0.3, `contact_m` 0.18): a **capsule**
+  — a constant-width bar with a round end ("cylinder") — from the feet straight away from the pitch
+  centre, **sharpest and darkest at the feet and softer-edged and lighter toward the tip**
+  (`_player_shadow_sprite`: the penumbra widens from 0.2 to 0.8 of the half-width along the
+  shadow and the strength falls to `alpha × (1 − tip_fade)` — a real shadow's contact hardening;
+  the 50%-alpha edge stays a constant-width bar). Its length is `d × h / (H − h)` (h =
+  `player.height_m`, 1.8m; a 45m-out player gets ~2m, a player at the centre only the contact
+  length), half-width 0.85 × the drawn radius. Direction has a lower-right bias that dominates within
+  ~1.5m of the centre so it is continuous when a player crosses it. Options compared side by side:
+  a plain capsule, this fading/softening one (**chosen**, with the fade cut from a first 0.55 to 0.3
+  as "a bit strong"), a body-shaped width profile (legs / wide torso / head — rejected: it would have
+  to rotate with the player's heading), and the player's own silhouette swept along the shadow
+  (rejected: blocky and per-heading, so hard to cache). **An ellipse was tried for players too and
+  rejected — the bar read better on a figure**; the ball, a sphere, keeps its exact ellipse. Sprites
+  are numpy capsules cached per (length, 5° angle, radius, alpha, fade) in `_shadow_cache` (shared
+  with the ball's ellipses, bounded at 512). Tests:
+  `test_a_player_shadow_fades_and_softens_toward_the_tip_but_keeps_its_width`,
+  `test_the_player_shadow_tip_fade_is_configurable_and_zero_means_uniform`,
+  `test_a_player_shadow_still_reaches_the_length_the_light_gives`.
 - **Player shading** (`player_shading.strength` 0.9; "option D" of the sheet compared with
   a whole-sprite dome and a shadow-only option): the flat art is lit **per body part**.
   `player_sprites.sprite_normals` treats the sprite's alpha, blurred at two scales, as a

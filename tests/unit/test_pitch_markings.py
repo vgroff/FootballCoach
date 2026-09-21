@@ -1108,16 +1108,19 @@ def test_grounded_ball_has_a_thin_contact_shadow_and_it_can_be_turned_off():
 
 
 def test_raised_ball_shadow_lands_on_the_ground_away_from_the_pitch_centre():
-    """A point light H above the pitch centre puts the shadow of a ball at height z, distance d from
-    the centre, at d * H / (H - z) from it: displaced radially outward by d * z / (H - z)."""
+    """A point light H above the pitch centre puts the shadow of a point at height z, distance d from
+    the centre, at d * H / (H - z) from it: displaced radially outward by d * z / (H - z). The ball's
+    shadow is the streak from the shadow of its underside to the shadow of the top of the drawn ball
+    (an ellipse), centred where the light through the drawn ball's centre lands."""
     x, y, z = 28.0, 16.0, 5.0
     cam, surface, renderer, ball = _ball_frame(z, x=x, y=y, zoom=2.0, _ball_shadow_enabled=True)
     H = renderer._light_height_m
     under = z - ball.radius_m
     bx, by = cam.world_to_screen_f(x, y)
     cx, cy = cam.world_to_screen_f(0.0, 0.0)
-    k = under / (H - under)
-    expect = (bx + (bx - cx) * k, by + (by - cy) * k)
+    zc = under + renderer._ball_base_radius_px(ball) / cam.pixels_per_metre       # the drawn sphere's centre height
+    mid_k = zc / (H - zc)
+    expect = (bx + (bx - cx) * mid_k, by + (by - cy) * mid_k)
     r_ball = renderer.min_ball_radius_px * cam.zoom_scale * (1 + z * renderer._ball_height_boost_per_m) + 8
     shadow = [p for p in _shadow_pixels(surface, (bx, by), r_ball) if math.hypot(p[0] - expect[0], p[1] - expect[1]) < 40]
     assert shadow
@@ -1447,3 +1450,232 @@ def test_the_flag_shadow_starts_at_the_poles_foot_and_not_behind_it(corner):
     assert dark_beside(-0.5) <= 2 and dark_beside(-1.0) <= 2                     # nothing behind it
     assert dark_beside(length * 0.9) > 8
     assert dark_beside(length + 0.6) <= 2                                        # ends where the formula says
+
+
+def _grounded_streak(x, y, zoom, **attrs):
+    """(farthest darkened pixel's distance beyond the ball's edge, count of shadow pixels outside the ball and
+    its state ring, ball, renderer, cam) for a ball resting on the ground at (x, y)."""
+    # The far tip is where the soft edge fades below the visibility threshold of `_shadow_pixels`, so the
+    # shadow's strength is pinned here (not the configured default) to keep these measurements stable.
+    attrs.setdefault("_ball_shadow_alpha", 150)
+    cam, surface, renderer, ball = _ball_frame(
+        0.11, x=x, y=y, zoom=zoom, _ball_shadow_enabled=True,
+        _ring_show_rolling=False, _ring_show_flying=False, _ring_show_bounced=False, **attrs,
+    )
+    bx, by = cam.world_to_screen(x, y)
+    rad = renderer._ball_base_radius_px(ball)
+    pts = _shadow_pixels(surface, (bx, by), rad + 1)
+    far = max((math.hypot(px - bx, py - by) for px, py, _ in pts), default=rad) - rad
+    return far, len(pts), ball, renderer, cam
+
+
+def test_a_grounded_balls_shadow_depends_on_the_light_it_grows_with_distance_from_the_centre():
+    """Regression: a grounded ball's shadow was a constant 0.10m offset -- ~1px, i.e. completely hidden
+    under the ball at 1x, and the same size wherever the ball was. It is now the streak from the contact
+    point to the shadow of the ball's top, so it follows the light: nothing but the contact minimum at
+    the centre, long at the far edge, and visible at the default zoom."""
+    at_centre = _grounded_streak(0.0, 0.0, 3.0)[0]
+    mid = _grounded_streak(20.0, 0.0, 3.0)[0]
+    far_edge = _grounded_streak(45.0, 0.0, 3.0)[0]
+    assert at_centre < mid < far_edge
+    assert far_edge > 2.5 * at_centre and far_edge - at_centre > 8          # clearly not the old constant ~4px
+
+    # ...and at the default zoom (ball ~5px radius) it is really there to see, and much longer than the
+    # minimum contact shadow that the middle of the pitch gets
+    centre_1x, far_1x = _grounded_streak(0.0, 0.0, 1.0), _grounded_streak(45.0, 0.0, 1.0)
+    assert centre_1x[1] > 0                                                  # the minimum contact shadow shows at 1x
+    assert far_1x[1] > 2 * centre_1x[1] and far_1x[0] > centre_1x[0] + 5
+
+
+@pytest.mark.parametrize("zoom", [1.0, 3.0, 5.0])
+@pytest.mark.parametrize("spot", [(45.0, 0.0), (-40.0, 20.0), (30.0, -25.0), (20.0, 0.0)])
+def test_the_grounded_ball_shadow_is_the_ellipse_the_light_casts(spot, zoom):
+    """A sphere's shadow is an ellipse: semi-minor its radius, semi-major r / sin(elevation), centred
+    where the light through the ball's centre lands (d * zc / (H - zc) beyond the ball). Its far tip
+    (where it fades out, ~0.45 of the soft edge past the nominal one) is within 2px of the formula."""
+    x, y = spot
+    far, n, ball, renderer, cam = _grounded_streak(x, y, zoom)
+    ppm = cam.pixels_per_metre
+    H = renderer._light_height_m
+    rad = renderer._ball_base_radius_px(ball)
+    z_centre = rad / ppm                                                     # the drawn ball's centre height (grounded)
+    dist_px = math.hypot(*[a - b for a, b in zip(cam.world_to_screen_f(x, y), cam.world_to_screen_f(0.0, 0.0))])
+    elevation = math.atan2(H - z_centre, dist_px / ppm)
+    semi_major = rad / math.sin(elevation)
+    offset = dist_px * z_centre / (H - z_centre)
+    soft = 0.15                                                              # a grounded ball's shadow softness
+    assert abs((far + rad) - (offset + semi_major * (1 + 0.45 * soft))) < 2.0
+
+
+def test_a_higher_light_shortens_the_grounded_ball_shadow_and_contact_is_the_minimum():
+    base = _grounded_streak(45.0, 0.0, 3.0)[0]
+    assert _grounded_streak(45.0, 0.0, 3.0, _light_height_m=100.0)[0] < base < _grounded_streak(45.0, 0.0, 3.0, _light_height_m=20.0)[0]
+    # at the centre the physical streak is ~0, so the contact minimum is what shows -- in metres or in pixels,
+    # whichever is longer
+    none = _grounded_streak(0.0, 0.0, 3.0, _ball_shadow_contact_frac=0.0, _ball_shadow_contact_min_px=0.0)[0]
+    assert _grounded_streak(0.0, 0.0, 3.0, _ball_shadow_contact_frac=1.0, _ball_shadow_contact_min_px=0.0)[0] > none + 8
+    assert _grounded_streak(0.0, 0.0, 3.0, _ball_shadow_contact_frac=0.0, _ball_shadow_contact_min_px=12.0)[0] > none + 8
+    # ...and the minimum never shrinks the physical shadow at the edge
+    edge = _grounded_streak(45.0, 0.0, 3.0)[0]
+    assert _grounded_streak(45.0, 0.0, 3.0, _ball_shadow_contact_frac=1.0, _ball_shadow_contact_min_px=12.0)[0] == pytest.approx(edge, abs=1.0)
+
+
+@pytest.mark.parametrize("spot", [(0.0, 0.0), (1.0, 0.5), (-40.0, 20.0), (30.0, -25.0)])
+def test_the_minimum_contact_shadow_still_points_radially_away_from_the_centre(spot):
+    """Where the minimum contact shadow is what shows, it still lies on the side of the ball away from the
+    pitch centre (near the exact centre, where the light is overhead and there is no true direction, it
+    is the fixed lower-right)."""
+    x, y = spot
+    cam, surface, renderer, ball = _ball_frame(0.11, x=x, y=y, zoom=3.0, _ball_shadow_enabled=True, _ball_shadow_contact_frac=1.0, _ball_shadow_contact_min_px=0.0)
+    bx, by = cam.world_to_screen(x, y)
+    rad = renderer._ball_base_radius_px(ball)
+    pts = _shadow_pixels(surface, (bx, by), rad + renderer._ring_offset_px + renderer._ring_width_px + 1)
+    assert pts
+    mx = sum(p[0] for p in pts) / len(pts) - bx
+    my = sum(p[1] for p in pts) / len(pts) - by
+    cx, cy = cam.world_to_screen_f(0.0, 0.0)
+    away = (bx - cx, by - cy) if math.hypot(bx - cx, by - cy) > 3.0 * cam.pixels_per_metre else (1.0, 1.0)
+    cos = (mx * away[0] + my * away[1]) / (math.hypot(mx, my) * math.hypot(*away))
+    assert cos > 0.9
+
+
+
+def _slice_half_width(pts, centre, u, s):
+    """Half-width (perpendicular to the axis ``u``) of the dark region in a 2px-thick slice at signed
+    distance ``s`` along the axis from ``centre``."""
+    px, py = -u[1], u[0]
+    across = [abs((x - centre[0]) * px + (y - centre[1]) * py) for x, y, _ in pts
+              if abs((x - centre[0]) * u[0] + (y - centre[1]) * u[1] - s) <= 1.0]
+    return max(across, default=0.0)
+
+
+@pytest.mark.parametrize("zoom", [3.0, 5.0])
+def test_the_ball_shadow_is_an_ellipse_not_a_constant_width_bar(zoom):
+    """Regression: the shadows were capsules (a constant-width bar with round ends), which looked like
+    cylinders. An ellipse narrows toward its ends: at 0.8 of the semi-major axis from the centre its half-
+    width is sqrt(1 - 0.8^2) = 0.6 of the minor axis -- a capsule would still be full width there."""
+    x, y = 45.0, 0.0
+    cam, surface, renderer, ball = _ball_frame(
+        0.11, x=x, y=y, zoom=zoom, _ball_shadow_enabled=True, _ball_shadow_alpha=150,
+        _ring_show_rolling=False, _ring_show_flying=False, _ring_show_bounced=False,
+    )
+    ppm = cam.pixels_per_metre
+    H = renderer._light_height_m
+    rad = renderer._ball_base_radius_px(ball)
+    zc = rad / ppm
+    bx, by = cam.world_to_screen_f(x, y)
+    cx, cy = cam.world_to_screen_f(0.0, 0.0)
+    dist_px = math.hypot(bx - cx, by - cy)
+    u = ((bx - cx) / dist_px, (by - cy) / dist_px)
+    a = rad / math.sin(math.atan2(H - zc, dist_px / ppm))
+    off = dist_px * zc / (H - zc)
+    centre = (bx + u[0] * off, by + u[1] * off)
+    pts = _shadow_pixels(surface, (bx, by), 0)
+    mid = _slice_half_width(pts, centre, u, 0.0)
+    near_tip = _slice_half_width(pts, centre, u, 0.8 * a)
+    assert mid == pytest.approx(rad, abs=2.5)                                  # the minor axis is the ball's radius
+    assert near_tip == pytest.approx(0.6 * rad, abs=0.12 * rad + 1.5)          # ...and it tapers at the ends
+    assert near_tip < 0.8 * mid
+
+
+def _capsule_slice(sprite, angle_deg, s_px, half_range):
+    """Alpha values across a player-shadow sprite (angle 0 = the shadow runs along +x from the sprite's
+    centre): the perpendicular slice at ``s_px`` from the feet, as {offset: alpha}."""
+    cx, cy = sprite.get_width() // 2, sprite.get_height() // 2
+    assert angle_deg == 0
+    return {dy: sprite.get_at((cx + s_px, cy + dy))[3] for dy in range(-half_range, half_range + 1)}
+
+
+def _edge_width(profile, fraction):
+    """Half-width (px, interpolated) where the alpha falls to ``fraction`` of the on-axis value."""
+    peak = profile[0]
+    target = fraction * peak
+    prev = 0
+    for dy in range(1, len(profile)):
+        if profile[dy] <= target:
+            lo, hi = profile[dy - 1], profile[dy]
+            return (dy - 1) + (lo - target) / max(lo - hi, 1e-9)
+        prev = dy
+    return float(prev)
+
+
+def test_a_player_shadow_fades_and_softens_toward_the_tip_but_keeps_its_width():
+    """Like a real shadow it is sharpest and darkest at the feet and lighter and softer-edged toward the tip
+    (the fade is `tip_fade`), while its 50%-alpha edge is a constant-width bar -- still a capsule."""
+    _, _, renderer, _ = _ball_frame(0.11, _player_shadow_enabled=True)
+    L, r = 80, 10
+    sprite = renderer._player_shadow_sprite(L, 0, r)
+    rows = {}
+    for label, frac in (("near", 0.15), ("mid", 0.5), ("far", 0.85)):
+        s_px = int(frac * L)
+        prof = _capsule_slice(sprite, 0, s_px, 3 * r)
+        half = [prof[dy] for dy in range(0, 3 * r + 1)]
+        rows[label] = (half[0], half)
+    fade = renderer._player_shadow_tip_fade
+    alpha = renderer._player_shadow_alpha
+    # darkest at the feet, lighter toward the tip, following alpha * (1 - fade * t)
+    for label, frac in (("near", 0.15), ("mid", 0.5), ("far", 0.85)):
+        assert rows[label][0] == pytest.approx(alpha * (1 - fade * frac), abs=3)
+    assert rows["near"][0] > rows["mid"][0] > rows["far"][0]
+    # the 50% contour (relative to the local peak) is the same half-width at every slice: a constant-width bar
+    widths = [_edge_width(rows[k][1], 0.5) for k in ("near", "mid", "far")]
+    assert max(widths) - min(widths) < 1.2 and widths[0] == pytest.approx(r, abs=1.2)
+    # ...but the edge gets softer: the 80%-to-20% falloff band widens with distance from the feet
+    band = [_edge_width(rows[k][1], 0.2) - _edge_width(rows[k][1], 0.8) for k in ("near", "mid", "far")]
+    assert band[0] < band[1] < band[2] and band[2] > 1.8 * band[0]
+
+
+def test_the_player_shadow_tip_fade_is_configurable_and_zero_means_uniform():
+    _, _, renderer, _ = _ball_frame(0.11, _player_shadow_enabled=True)
+    renderer._player_shadow_tip_fade = 0.0
+    flat = renderer._player_shadow_sprite(80, 0, 10)
+    cx, cy = flat.get_width() // 2, flat.get_height() // 2
+    assert flat.get_at((cx + 8, cy))[3] == pytest.approx(flat.get_at((cx + 72, cy))[3], abs=1)
+    renderer._player_shadow_tip_fade = 0.6
+    faded = renderer._player_shadow_sprite(80, 0, 10)
+    assert faded is not flat                                               # a different cache entry
+    assert faded.get_at((cx + 72, cy))[3] < 0.6 * faded.get_at((cx + 8, cy))[3] + 6
+
+
+def test_a_player_shadow_still_reaches_the_length_the_light_gives():
+    """...and drawn for a player the shadow's visible far end is where d*h/(H-h) says (within its round end
+    and the soft edge)."""
+    from footballcoach.entities import PlayerAttributes
+    from footballcoach.entities.player import Player
+    from footballcoach.entities import Team
+    from footballcoach.mathutils import Vector3
+
+    attrs = PlayerAttributes(top_speed=0.78, acceleration=0.78, stamina=0.78, kick_precision=0.78,
+                             kick_power=0.78, dribbling=0.78, ball_control=0.78, tackling=0.78)
+    world = (-45.0, 0.0)
+    cam, surface, renderer, ball = _ball_frame(0.11, x=world[0], y=world[1], zoom=3.0, _player_shadow_enabled=True)
+    surface.fill(style.PITCH_GREEN)
+    p = Player.create("p", Team.LEFT, attrs, position=Vector3(world[0], world[1], 0.0))
+    renderer.draw_player_shadows(surface, [p])
+    foot = cam.world_to_screen_f(*world)
+    cx, cy = cam.world_to_screen_f(0.0, 0.0)
+    dist_px = math.hypot(foot[0] - cx, foot[1] - cy)
+    u = ((foot[0] - cx) / dist_px, (foot[1] - cy) / dist_px)
+    length = dist_px * p.height_m / (renderer._light_height_m - p.height_m)
+    w = int(round(renderer._player_radius_px(p) * 0.85))
+    pts = _shadow_pixels(surface, (0, 0), 0)
+    tip = max((x - foot[0]) * u[0] + (y - foot[1]) * u[1] for x, y, _ in pts)
+    assert length + 0.6 * w < tip < length + w * 1.9                          # past the axis end by the round cap
+
+
+@pytest.mark.parametrize("zoom", [2.0, 3.0, 4.0, 5.0])
+def test_the_minimum_contact_shadow_scales_with_the_ball_across_zoom_levels(zoom):
+    """Regression: the minimum contact shadow was a fixed 5px, i.e. a third of the ball's radius at zoom 3
+    but a whole radius at zoom 1. It is now a fraction of the DRAWN radius, so the crescent that shows
+    beyond the ball is the same proportion of the ball at every zoom (and small at the default zoom)."""
+    far, n, ball, renderer, cam = _grounded_streak(0.0, 0.0, zoom)          # the middle: only the minimum shows
+    rad = renderer._ball_base_radius_px(ball)
+    assert far / rad == pytest.approx(0.33 + 0.07, abs=0.05)
+
+
+def test_the_minimum_contact_shadow_is_modest_at_the_default_zoom():
+    far, n, ball, renderer, cam = _grounded_streak(0.0, 0.0, 1.0)
+    rad = renderer._ball_base_radius_px(ball)
+    assert 0 < far < 0.6 * rad                                              # was ~1 radius (5px on a 5px ball)
+    far3, _, ball3, r3, _ = _grounded_streak(0.0, 0.0, 3.0)
+    assert far / rad < 1.4 * (far3 / r3._ball_base_radius_px(ball3))         # about the same proportion as at zoom 3
