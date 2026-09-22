@@ -252,6 +252,107 @@ def _draw_leg(surf: pygame.Surface, params: PlayerSpriteParams, x: float, hip_y:
     _rounded_rect(surf, (x - half_w, y0, x + half_w, y1), half_w, corners, shorts, shorts_outline)
 
 
+def _pose_geometry() -> dict:
+    """Body-proportion constants shared by `_render_pose` and `_render_pose_layers` (pure numbers,
+    no drawing -- extracting them changes nothing about either function's output). See the module
+    docstring before retuning any of these in isolation; they were tuned as an interdependent set."""
+    torso_w, torso_h = _SIZE * 0.62 * 0.85, _SIZE * 0.44 * 0.70 * 0.90
+    shorts_width = _SIZE * 0.15
+    shoe_ry = shorts_width * 0.68 * 0.85
+    shorts_len_max = _SIZE * 0.09 + 1 * _PX
+    # 0.95x size, corner radius 0.4x of that size: chosen from a 9-way grid (size in {1.0,0.9,0.8} x
+    # corner in {0.35,0.40,0.45}) shown to the user -- less square/"strong"-looking, a bit smaller,
+    # without going as round/small as the more extreme variants shown alongside it.
+    shoulder_size = _SIZE * 0.22 * 0.90 * 0.95
+    shoulder_x_offset = torso_w / 2 + shoulder_size / 2 - (shoulder_size * 0.30 + 1 * _PX)
+    return dict(
+        torso_w=torso_w, torso_h=torso_h, corner_r=_SIZE * 0.14,
+        hip_inset=_SIZE * 0.03, hip_x_offset=_SIZE * 0.13 - 1.5 * _PX,
+        shorts_width=shorts_width, shaft_width=shorts_width - 2 * _PX,
+        leg_reach=_SIZE * 0.30 * 0.75 * 0.80 * 1.10 * 1.10 + 2 * _PX,
+        foot_rx=shorts_width * 0.42 * 0.85, foot_ry=shorts_width * 0.58 * 0.85,
+        shoe_rx=shorts_width * 0.50 * 0.85, shoe_ry=shoe_ry,
+        shorts_len_max=shorts_len_max,
+        base_min_leg_len=max(shorts_len_max - shoe_ry + 1 * _PX, shoe_ry * 0.3),
+        shoulder_size=shoulder_size, shoulder_corner_r=shoulder_size * 0.4,
+        shoulder_x_offset=shoulder_x_offset, shoulder_y=_SIZE / 2 - torso_h * 0.12 + 2 * _PX,
+        arm_width=_SIZE * 0.115, arm_reach=_SIZE * 0.30 * 1.10 * 0.90 * 0.90,
+        head_rx=_SIZE * 0.19 * 0.94, head_ry=_SIZE * 0.19 * 1.04, head_y=_SIZE / 2 - _SIZE * 0.03,
+    )
+
+
+def _draw_pose_legs(
+    surf: pygame.Surface, params: PlayerSpriteParams, geo: dict, leg_extension: float, leading_side: int,
+) -> None:
+    """Both legs (shafts, feet, shoes, shorts) -- the exact draw calls `_render_pose` uses,
+    factored out so `_render_pose` and `_render_pose_layers` share one implementation (each
+    still draws onto its OWN surface, so their own supersample/downscale stays independent)."""
+    cx = cy = _SIZE / 2
+    is_standing = leg_extension <= 1e-6
+    for side, base_sign in ((leading_side, 1.0), (-leading_side, -1.0)):
+        sign = 1.0 if is_standing else base_sign
+        is_front = sign > 0
+        show_studs = (not is_front) and (leg_extension >= 0.75 - 1e-6)
+        min_leg_len = geo["base_min_leg_len"] + (1 * _PX if is_standing else -2 * _PX)
+        hip_y = cy + sign * (geo["torso_h"] / 2 - geo["hip_inset"])
+        total_len = min_leg_len + leg_extension * geo["leg_reach"]
+        x = cx + side * geo["hip_x_offset"]
+        is_second_least_extended = abs(leg_extension - 0.5) < 1e-6
+        shorts_len_max_this = geo["shorts_len_max"] - (1 * _PX if is_second_least_extended else 0)
+        _draw_leg(surf, params, x, hip_y, sign, total_len, geo["shaft_width"], geo["shorts_width"], shorts_len_max_this,
+                  geo["foot_rx"], geo["foot_ry"], geo["shoe_rx"], geo["shoe_ry"], is_front, show_studs)
+
+
+def _draw_pose_upper(
+    surf: pygame.Surface, params: PlayerSpriteParams, geo: dict, shirt_color: RGB,
+    arm_extension: float, leading_side: int,
+) -> None:
+    """Arms, shoulders, torso and head -- the exact draw calls `_render_pose` uses (see
+    `_draw_pose_legs`), in the original order: arms -> shoulders (under the torso) -> torso
+    -> head, so the torso overlaps the shoulders' inner edge and the head sits topmost."""
+    cx = cy = _SIZE / 2
+    shirt_outline = _darken(shirt_color, _OUTLINE_DARKEN)
+    skin, skin_outline = params.skin_color, _darken(params.skin_color, _OUTLINE_DARKEN)
+
+    for side, sign in ((leading_side, -1.0), (-leading_side, 1.0)):
+        total_len = arm_extension * geo["arm_reach"]
+        x = cx + side * geo["shoulder_x_offset"]
+        if total_len > 1e-6:
+            y1 = geo["shoulder_y"] + sign * total_len
+            _capsule(surf, (x, geo["shoulder_y"]), (x, y1), geo["arm_width"], skin, skin_outline)
+            hand_r = geo["arm_width"] * 0.42
+            _ellipse(surf, (x - hand_r, y1 - hand_r, x + hand_r, y1 + hand_r), skin, skin_outline)
+
+    for side in (leading_side, -leading_side):
+        x = cx + side * geo["shoulder_x_offset"]
+        ss = geo["shoulder_size"]
+        _rounded_rect(
+            surf, (x - ss / 2, geo["shoulder_y"] - ss / 2, x + ss / 2, geo["shoulder_y"] + ss / 2),
+            geo["shoulder_corner_r"], (True, True, True, True), shirt_color, shirt_outline,
+            outline_width=int(_SIZE * 0.02) + 1,
+        )
+
+    tw, th = geo["torso_w"], geo["torso_h"]
+    _rounded_rect(
+        surf, (cx - tw / 2, cy - th / 2, cx + tw / 2, cy + th / 2),
+        geo["corner_r"], (True, True, True, True), shirt_color, shirt_outline,
+        outline_width=int(_SIZE * 0.02) + 1,
+    )
+
+    head_rx, head_ry, head_y = geo["head_rx"], geo["head_ry"], geo["head_y"]
+    head_box = (cx - head_rx, head_y - head_ry, cx + head_rx, head_y + head_ry)
+    _ellipse(surf, head_box, skin, skin_outline, outline_width=int(_SIZE * 0.015) + 1)
+
+    # Hair: a patch centred on the back of the head (-y, opposite the +y
+    # "down" facing direction). See ``_pie_wedge``'s docstring for the angle
+    # convention; `hair_coverage_deg` is the total wedge width centred on
+    # 270 degrees (straight up).
+    half_cov = params.hair_coverage_deg / 2.0
+    hair, hair_outline = params.hair_color, _darken(params.hair_color, 0.63)
+    _pie_wedge(surf, head_box, 270.0 - half_cov, 270.0 + half_cov, hair, hair_outline,
+               outline_width=int(_SIZE * 0.015) + 1)
+
+
 def _render_pose(params: PlayerSpriteParams, shirt_color: RGB, leg_extension: float,
                   arm_extension: float, leading_side: int) -> pygame.Surface:
     """Renders one top-down player sprite pose at ``_BASE_SIZE``.
@@ -283,8 +384,10 @@ def _render_pose(params: PlayerSpriteParams, shirt_color: RGB, leg_extension: fl
     peek_past_shorts = 1 * _PX
     base_min_leg_len = max(shorts_len_max - shoe_ry + peek_past_shorts, shoe_ry * 0.3)
 
-    shoulder_size = _SIZE * 0.22 * 0.90
-    shoulder_corner_r = shoulder_size * 0.35
+    # 0.95x size, corner radius 0.4x of that size -- see the matching comment in `_pose_geometry`;
+    # kept in sync there by hand since this function stays independent (see the module note above).
+    shoulder_size = _SIZE * 0.22 * 0.90 * 0.95
+    shoulder_corner_r = shoulder_size * 0.4
     shoulder_overlap = shoulder_size * 0.30 + 1 * _PX
     shoulder_x_offset = torso_w / 2 + shoulder_size / 2 - shoulder_overlap
     shoulder_y = cy - torso_h * 0.12 + 2 * _PX
@@ -360,9 +463,37 @@ def _render_pose(params: PlayerSpriteParams, shirt_color: RGB, leg_extension: fl
     return pygame.transform.smoothscale(big, (_BASE_SIZE, _BASE_SIZE))
 
 
+def _render_pose_layers(
+    params: PlayerSpriteParams, shirt_color: RGB, leg_extension: float, arm_extension: float, leading_side: int,
+) -> tuple[pygame.Surface, pygame.Surface]:
+    """Renders one pose as TWO separate ``_BASE_SIZE`` layers instead of one combined image:
+    (legs -- both shafts, feet, shoes and shorts --, upper body -- arms, shoulders, torso, head).
+    Lets the caller sandwich the ball between them (legs under, upper over) so a player standing
+    over the ball reads as the ball resting at their feet, rather than the whole figure sitting flatly
+    under or over it -- see ``Renderer.draw_player_legs`` / ``draw_player(..., legs=False)``.
+
+    Independent of ``_render_pose`` (which keeps drawing everything onto ONE surface before its
+    single downscale) on purpose: compositing two SEPARATELY downscaled layers is not pixel-identical
+    to one combined downscale (their shared seam -- where the shorts tuck under the shirt hem -- would
+    anti-alias slightly differently), and ``_render_pose``'s existing output is depended on by tests
+    and by every OTHER caller (`draw_player`'s default, sprites-enabled non-split path); duplicating
+    the handful of draw calls here (via the shared `_draw_pose_legs` / `_draw_pose_upper` /
+    `_pose_geometry` helpers) keeps that path completely unchanged."""
+    geo = _pose_geometry()
+    legs_big = pygame.Surface((_SIZE, _SIZE), pygame.SRCALPHA)
+    upper_big = pygame.Surface((_SIZE, _SIZE), pygame.SRCALPHA)
+    _draw_pose_legs(legs_big, params, geo, leg_extension, leading_side)
+    _draw_pose_upper(upper_big, params, geo, shirt_color, arm_extension, leading_side)
+    return (
+        pygame.transform.smoothscale(legs_big, (_BASE_SIZE, _BASE_SIZE)),
+        pygame.transform.smoothscale(upper_big, (_BASE_SIZE, _BASE_SIZE)),
+    )
+
+
 class PlayerSpriteSet:
     """All 9 pose surfaces for one shirt colour, built once and cached (plus, on demand, lit
-    variants of them -- see `shaded`)."""
+    variants of them -- see `shaded`), PLUS the same 9 poses as separate legs/upper-body layers
+    (`get_legs` / `get_upper`; see `_render_pose_layers`) for the ball-between-the-feet effect."""
 
     _SHADED_CACHE_LIMIT = 1024
 
@@ -375,41 +506,89 @@ class PlayerSpriteSet:
         self._normals: dict[tuple[int, float | None], np.ndarray] = {}
         self._shaded: dict[tuple, pygame.Surface] = {}
 
+        self.legs_standing, self.upper_standing = _render_pose_layers(params, shirt_color, 0.0, 0.0, 1)
+        self.legs_running: dict[tuple[int, float], pygame.Surface] = {}
+        self.upper_running: dict[tuple[int, float], pygame.Surface] = {}
+        for side in (1, -1):
+            for level in STRIDE_LEVELS:
+                legs, upper = _render_pose_layers(params, shirt_color, level, level, side)
+                self.legs_running[(side, level)] = legs
+                self.upper_running[(side, level)] = upper
+        self._legs_normals: dict[tuple[int, float | None], np.ndarray] = {}
+        self._upper_normals: dict[tuple[int, float | None], np.ndarray] = {}
+        self._legs_shaded: dict[tuple, pygame.Surface] = {}
+        self._upper_shaded: dict[tuple, pygame.Surface] = {}
+
     def get(self, side: int, level: float | None) -> pygame.Surface:
         if level is None:
             return self.standing
         return self.running[(side, level)]
 
-    def normals(self, side: int, level: float | None) -> np.ndarray:
-        """Per-pixel unit surface normals (h, w, 3) of a pose, built once (see `sprite_normals`)."""
+    def get_legs(self, side: int, level: float | None) -> pygame.Surface:
+        if level is None:
+            return self.legs_standing
+        return self.legs_running[(side, level)]
+
+    def get_upper(self, side: int, level: float | None) -> pygame.Surface:
+        if level is None:
+            return self.upper_standing
+        return self.upper_running[(side, level)]
+
+    def _normals_for(self, cache: dict, get_fn, side: int, level: float | None) -> np.ndarray:
+        """Shared by `normals` / `legs_normals` / `upper_normals`: per-pixel unit surface normals
+        of a pose (see `sprite_normals`), built once per (pose, layer) and cached."""
         key = (1 if level is None else side, level)
-        cached = self._normals.get(key)
+        cached = cache.get(key)
         if cached is None:
-            cached = sprite_normals(_alpha_of(self.get(side, level)))
-            self._normals[key] = cached
+            cached = sprite_normals(_alpha_of(get_fn(side, level)))
+            cache[key] = cached
         return cached
 
-    def shaded(self, side: int, level: float | None, azimuth_deg: int, elevation_deg: int,
-               strength: float) -> pygame.Surface:
-        """The pose lit from a direction given in the SPRITE'S OWN frame (azimuth measured like
-        screen angles: 0 = toward the sprite's right, 90 = toward its "down"/facing side; elevation
-        above the ground plane): each pixel's colour times `shade_factors`, alpha untouched. Cached
-        per (pose, direction, strength) -- the caller quantises the angles -- and bounded."""
+    def normals(self, side: int, level: float | None) -> np.ndarray:
+        return self._normals_for(self._normals, self.get, side, level)
+
+    def legs_normals(self, side: int, level: float | None) -> np.ndarray:
+        return self._normals_for(self._legs_normals, self.get_legs, side, level)
+
+    def upper_normals(self, side: int, level: float | None) -> np.ndarray:
+        return self._normals_for(self._upper_normals, self.get_upper, side, level)
+
+    def _shaded_for(
+        self, cache: dict, get_fn, normals_fn, side: int, level: float | None,
+        azimuth_deg: int, elevation_deg: int, strength: float,
+    ) -> pygame.Surface:
+        """Shared by `shaded` / `legs_shaded` / `upper_shaded`: the pose lit from a direction given
+        in the SPRITE'S OWN frame (azimuth measured like screen angles: 0 = toward the sprite's
+        right, 90 = toward its "down"/facing side; elevation above the ground plane): each pixel's
+        colour times `shade_factors`, alpha untouched. Cached per (pose, direction, strength) -- the
+        caller quantises the angles -- and bounded."""
         key = (1 if level is None else side, level, azimuth_deg, elevation_deg, round(strength, 3))
-        cached = self._shaded.get(key)
+        cached = cache.get(key)
         if cached is None:
-            base = self.get(side, level)
+            base = get_fn(side, level)
             alpha = _alpha_of(base)
-            factors = shade_factors(self.normals(side, level), alpha,
+            factors = shade_factors(normals_fn(side, level), alpha,
                                     light_from_angles(azimuth_deg, elevation_deg), strength)
             rgb = pygame.surfarray.array3d(base).transpose(1, 0, 2).astype(np.float32) * factors[..., None]
             out = np.dstack([np.clip(rgb, 0, 255), alpha[..., None]]).astype(np.uint8)
             h, w = alpha.shape
             cached = pygame.image.frombuffer(np.ascontiguousarray(out).tobytes(), (w, h), "RGBA")
-            if len(self._shaded) >= self._SHADED_CACHE_LIMIT:
-                self._shaded.clear()
-            self._shaded[key] = cached
+            if len(cache) >= self._SHADED_CACHE_LIMIT:
+                cache.clear()
+            cache[key] = cached
         return cached
+
+    def shaded(self, side: int, level: float | None, azimuth_deg: int, elevation_deg: int,
+               strength: float) -> pygame.Surface:
+        return self._shaded_for(self._shaded, self.get, self.normals, side, level, azimuth_deg, elevation_deg, strength)
+
+    def legs_shaded(self, side: int, level: float | None, azimuth_deg: int, elevation_deg: int,
+                     strength: float) -> pygame.Surface:
+        return self._shaded_for(self._legs_shaded, self.get_legs, self.legs_normals, side, level, azimuth_deg, elevation_deg, strength)
+
+    def upper_shaded(self, side: int, level: float | None, azimuth_deg: int, elevation_deg: int,
+                      strength: float) -> pygame.Surface:
+        return self._shaded_for(self._upper_shaded, self.get_upper, self.upper_normals, side, level, azimuth_deg, elevation_deg, strength)
 
 
 _sprite_set_cache: dict[RGB, PlayerSpriteSet] = {}

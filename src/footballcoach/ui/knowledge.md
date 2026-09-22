@@ -109,8 +109,35 @@ ball, 0.11m, vs a player's 0.3m) stops growing under zoom as soon as its
 true-to-scale size overtakes its *unscaled* floor — which happens much
 sooner for the ball than for players — leaving the ball looking
 disproportionately tiny next to zoomed-in players even though it visually
-grew the least of anything on screen. Scaling both floors together keeps
-their relative sizes roughly constant across zoom levels.
+grew the least of anything on screen.
+
+**The floors don't scale with a flat `zoom_scale` any more, though —
+`graphics.json["size_floor"]["zoom_decay"]` (0.45): `floor_px = min_radius_px *
+zoom_scale ** zoom_decay`.** A flat `* zoom_scale` (`zoom_decay = 1.0`, the old
+behaviour) keeps the floor growing at *exactly* the same rate as true-to-scale
+size — so once the floor wins the `max()` at 1x (it always does: measured
+~4.6x oversized for the ball, ~2.0x for a player, both floor-dominated), it
+keeps winning by that SAME ratio forever, at every zoom, since neither side of
+the `max()` ever catches up to the other. The ball/player never look properly
+life-sized-relative-to-the-accurately-scaled-pitch no matter how far you zoom
+in — confirmed by computing the ratio at zoom 1/2/3/4/5 before touching
+anything (constant 4.64x / 2.00x throughout). A `zoom_decay < 1` floor still
+equals `min_radius_px` at zoom 1 (`1 ** anything == 1`, so nothing changes at
+the default view) but grows SLOWER than true size as you zoom in, so true
+size increasingly overtakes it — the drawn size converges toward actually
+life-sized (measured with `zoom_decay=0.45`: ball 4.64x → 2.07x oversized by
+zoom 5, player 2.00x → exactly 1.00x, i.e. true-to-scale). Both entities share
+the SAME exponent (rather than, say, only decaying the ball's) so they
+approach true scale together instead of one catching up much sooner than the
+other and briefly looking wrong-sized next to each other along the way — the
+original rationale above (why the floor scales with zoom AT ALL, rather than
+being a flat pixel count) still holds, just with the growth rate slowed
+rather than removed. `_ball_base_radius_px` / `_player_radius_px` are the two
+(and only two) places this floor is computed — every shadow, ring, sprite
+scale and the goal-frame's own shading all derive their radius from one of
+these, so the fix applies everywhere automatically. Doesn't touch hit-testing
+(`input.py`'s click tolerance uses the player's true `radius_m` directly, no
+floor at all, already independent of the drawn radius).
 
 ## Pitch markings (`draw_pitch`)
 
@@ -171,8 +198,7 @@ same as everything else in that method):
   to tone the effect down) from the
   goal line **away from the pitch** (over the net) instead of hidden exactly
   on top of it, which reveals the goal mouth — the opening between the goal
-  line on the ground and the crossbar — as a faint tinted rectangle
-  (`mouth_alpha`), with the posts drawn as the lines joining their feet
+  line on the ground and the crossbar — with the posts drawn as the lines joining their feet
   (small dots on the goal line) to the crossbar ends, all at `post_width_m`
   (0.20m; thinned from 0.30 then 0.25 on request) — but never less than 2px
   thicker than the net's own 1px lines (`_goal_post_px`), so the frame always
@@ -240,9 +266,19 @@ same as everything else in that method):
     engine's goal is a box (vertical back wall, roof at crossbar height), so
     the wall's *top* edge is displaced outward by the same lean as the crossbar
     while its *foot* stays put. Drawn as: a 1px line where the net meets the
-    ground (`back_x`), a separate 1px top-back edge (`back_top_x`), and a faint
-    tint (`goal_frame.back_wall_alpha`) over the strip between them — the mouth
-    tint's counterpart at the back.
+    ground (`back_x`), a separate 1px top-back edge (`back_top_x`), and an
+    optional tint over the strip between them.
+  - **The mouth and the back-wall strip share ONE tint, `goal_frame.footprint_tint_alpha`**
+    (default 0 — no tint, same plain pitch green as everywhere else). They used to be two
+    separate values (`mouth_alpha` 40, `back_wall_alpha` 30), which — measured with the net
+    mesh removed so the flat tints alone were compared — came out as genuinely different
+    colours ((73,156,89) vs (66,152,83) against a (43,141,62) pitch): a real, if subtle,
+    inconsistency, not something imagined. Consolidated into one value on request ("I don't
+    think we even need different values at all"), defaulted to off. The back-wall strip still
+    reads visually denser than the roof net even with the tint off, purely because its own
+    steep mesh and the roof mesh are both drawn there (see below) — nothing to do with tint.
+    Tests: `test_the_mouth_and_back_wall_tints_are_always_the_same`,
+    `test_the_goal_footprint_has_no_tint_by_default`.
   - **The back wall has its own mesh, at the right angle**
     (`_draw_goal_back_net`, geometry in the pure `back_wall_net_segments`).
     The wall is vertical, and the parallax maps a wall point's *height* to
@@ -558,11 +594,36 @@ spreads a line over more pixels at lower intensity but preserves the total.
   (`_shadow_ellipse_sprite`: alpha fades over the elliptical distance from `1 − softness` to
   `1 + softness`; shared with the players' shadows), quantised and cached, bounded at 512.
   Tests: `test_a_grounded_balls_shadow_depends_on_the_light_it_grows_with_distance_from_the_centre`,
-  `test_the_grounded_ball_shadow_is_the_ellipse_the_light_casts` (far tip within 2px of the formula
-  at zoom 1, 3, 5), `test_the_ball_shadow_is_an_ellipse_not_a_constant_width_bar` (half-width at
-  0.8 of the semi-major axis is 0.6 of the minor axis; a capsule would still be full width),
+  `test_the_grounded_ball_shadow_is_the_ellipse_the_light_casts` (far tip within 1.5px of a formula
+  that now accounts for the fade below, at zoom 1, 3, 5), `test_the_ball_shadow_is_an_ellipse_not_a_constant_width_bar`
+  (half-width at 0.8 of the semi-major axis is 0.6 of the minor axis; a capsule would still be full width),
   `test_the_minimum_contact_shadow_scales_with_the_ball_across_zoom_levels`,
   `test_the_minimum_contact_shadow_still_points_radially_away_from_the_centre`.
+  - **The ellipse itself fades near→far, like the players' capsules** (`tip_fade`, 0.3): the uniform
+    ellipse above looked "too perfect" next to a player's shadow (which is sharp/dark at the feet and
+    soft/light at the tip). `_shadow_ellipse_sprite` gained an along-its-own-major-axis fade: `t=0` at
+    the end nearest the ball (`along = -a`, i.e. toward the side actually closest to the object —
+    NOT necessarily toward the pitch centre, since the ellipse sits beyond the ball), `t=1` at the far
+    tip (`along = +a`). Local softness is interpolated between `softness × _SHADOW_FADE_SOFT_NEAR_FRAC`
+    (0.2) and `softness × _SHADOW_FADE_SOFT_FAR_FRAC` (0.8) — the same 0.2/0.8 split the players use —
+    and the alpha is scaled by `1 - tip_fade × t`. `tip_fade=0` (the default for the parameter, used
+    by `_ball_shadow_sprite`'s plain disc and any other non-directional caller) reproduces the old
+    symmetric ellipse exactly; the ball's own draw call always passes `tip_fade=0.3`. A closed-form
+    check: at the geometric edge (`rho=1`) the raw falloff is always exactly 0.5 (independent of
+    softness), so near/far alpha there is exactly `1 : 1 − tip_fade`.
+  - **The fade deepens and softens further the higher the ball is** (an airborne shadow has no sharp
+    contact edge anywhere, so it should look uniformly hazier, not just fainter — it already faded in
+    alpha and grew softer with height, but had no directional component of its own before this).
+    `height_frac` (0 grounded, ramping linearly to 1 over `height_fade_ramp_m`) adds up to
+    `height_extra_soft` to BOTH near/far softness and up to `height_extra_fade` to the fade. Sized by
+    eye against a grid of options (labelled "C"/"D" during review, each a `(ramp_m, extra_soft,
+    extra_fade)` triple; an even stronger first attempt, "too strong", was rejected) and landed 20% of
+    the way from "C" (3.0m / +0.7 / +0.18) toward "D" (4.5m / +0.5 / +0.12): **3.3m / +0.66 / +0.168**.
+  Tests: `test_ball_shadow_fade_defaults_come_from_the_config`,
+  `test_the_ball_shadow_is_darker_and_sharper_near_the_ball_than_on_its_far_tip`,
+  `test_zero_tip_fade_is_the_old_symmetric_uniform_ellipse`,
+  `test_the_ball_shadow_fade_deepens_and_softens_further_the_higher_the_ball_is`,
+  `test_a_grounded_ball_at_the_centre_has_no_height_fade_and_a_high_one_has_the_full_amount`.
 - The state rings (see "Ball state indicator rings") were tightened to
   `offset_px` 1 / `width_px` 1 (from 2 / 2) so they hug the ball and read as a thin
   status outline rather than a halo.
@@ -653,8 +714,9 @@ the tests for those features switch them on explicitly.
 
 ## Ball spin dots (`draw_ball`'s dot-projection block)
 
-The ball's surface dots (fixed points on a Fibonacci-lattice unit sphere,
-rotated each frame by `_ball_orientation` and projected top-down) are drawn
+The ball's surface dots (fixed points on a unit sphere — see "dot placement"
+below for which lattice — rotated each frame by `_ball_orientation` and
+projected top-down) are drawn
 as **projected tangent-plane patches, not flat discs of constant size**.
 Each dot's outline is built from `_DOT_POLY_SEGMENTS` points arranged in a
 small circle in the dot's own tangent plane (`u`/`v`, both perpendicular to
@@ -691,6 +753,41 @@ Note the net drawn OVER a ball inside the goal (see the 3D goal frame) still
 lightens dark dots where its hatch lines cross them — that is the net in front
 of the ball, not this bug.
 
+**Dot placement: icosahedron for the classic 12, Fibonacci lattice otherwise.**
+`Renderer._make_ball_dot_positions(n)` dispatches to
+`_make_icosahedron_vertices()` when `n == 12` (the config default,
+`ball_spin_dots.count`), and to `_make_fibonacci_sphere(n)` for any other
+count. The old code always used the Fibonacci lattice, at `n=15`: measured,
+its closest pair of dots was only ~31° apart even though its *average*
+coverage was even — visibly "two dots too close together", which is what the
+user flagged. A real football is a truncated icosahedron (12 pentagons + 20
+hexagons); each pentagon's centre sits exactly on the untruncated
+icosahedron's 12 vertices, so using those 12 vertices both matches the real
+panel layout and is the Tammes-optimal (provably most-even) placement for 12
+points on a sphere — every point's nearest neighbours (5 of them, one per
+icosahedron edge) sit at a uniform 63.4°, confirmed for all 30 nearest-
+neighbour edges, not just the closest pair. The Fibonacci lattice is kept as
+the fallback for any other configured count, since there's no equivalent
+regular solid for arbitrary n.
+
+**Dot size no longer swings with zoom.** `_ball_dots_layer` used to compute
+`dot_r = max(1, int(radius_px * frac))` — but `radius_px` (the ball's own
+drawn radius) is *already* an int, so truncating `dot_r` a second time on top
+of that compounded: measured, the actual dot/ball ratio swung between ~0.167
+and ~0.25 across zoom 1–5 for a configured `dot_radius_fraction` of 0.25, i.e.
+visibly changing relative dot size purely from zoom, not a deliberate design
+choice. The formula now lives in its own method, `_spin_dot_radius_px`,
+returns a float, and is only rounded once — at the final per-vertex pixel
+snap, same as every other coordinate in `_ball_dots_layer` already was. Tests:
+`tests/unit/test_pitch_markings.py`'s
+`test_the_default_12_dots_are_the_icosahedrons_vertices_evenly_spaced`,
+`test_the_old_fibonacci_lattice_is_kept_for_non_classic_dot_counts`,
+`test_a_real_footballs_15_point_fibonacci_lattice_really_did_have_a_close_pair`,
+`test_the_dot_to_ball_size_ratio_no_longer_swings_with_zoom`,
+`test_the_spin_dot_radius_formula_itself_is_not_truncated_to_an_int`,
+`test_the_code_level_default_dot_count_is_12_even_if_config_omits_it`,
+`test_dot_layer_pad_still_fits_the_dot_at_every_radius`.
+
 ## Player visual indicators (`style.py` / `renderer.draw_player`)
 
 - **Body**: by default (`graphics.json["player_sprites"]["enabled"]`, default
@@ -702,6 +799,46 @@ of the ball, not this bug.
   the **heading V** is drawn *only* in that fallback mode (the sprite's own
   head/limb asymmetry already shows facing), and the translucent-inactive
   look is likewise done per-path.
+- **Legs drawn under the ball, upper body over it** (`draw_player_legs`, `draw_player(..., legs=False)`):
+  every sprite pose exists as TWO layers as well as the combined image --
+  `player_sprites._render_pose_layers` (legs: shafts/feet/shoes/shorts; upper: arms/shoulders/
+  torso/head) -- built independently of `_render_pose` (deliberately: compositing two separately
+  downscaled layers isn't pixel-identical to one combined downscale at their seam, where the shorts
+  tuck under the shirt hem, so `_render_pose` -- and everything that used to depend on it -- is left
+  completely untouched; the split layers instead share the drawing code via `_pose_geometry` /
+  `_draw_pose_legs` / `_draw_pose_upper`). `draw_pitch_and_ball` calls `draw_player_legs` for every
+  player right before drawing the ball (in the same "under everything" pass as the shadows/rings);
+  `App._draw_match` then draws each player's upper body only (`draw_player(..., legs=False)`) in its
+  usual per-player loop, so the ball ends up sandwiched between the two -- a player standing over or
+  near the ball shows it resting at their feet (the ball covers an outstretched foot where they
+  overlap) with the torso still in front of it, rather than the whole figure sitting flatly on one
+  side. `draw_player`'s default (`legs=True`) still draws one combined sprite in one call, unchanged,
+  for standalone use (every existing test). No-op (both `draw_player_legs` and the `legs` flag) with
+  sprites disabled -- the flat-circle fallback has nothing to split. Costs roughly another
+  2-4ms/frame with all 22 players moving (two rotozooms per player instead of one) -- measured, not
+  yet a problem at the 16ms/frame budget.
+  **Known trade-off**: legs are drawn for every player in one pass before ANY player's upper body, so
+  if two different players' sprites overlap (e.g. a tackle) the later-drawn one's upper body can cover
+  the earlier one's legs regardless of intended stacking (normally the ball carrier is drawn last, on
+  top) -- rare, and only affects the pixels where two players' sprites directly overlap.
+  Tests: `test_legs_and_upper_layers_recomposite_close_to_the_combined_pose`,
+  `test_the_legs_layer_has_no_shirt_or_hair_colour_and_the_upper_layer_has_no_shorts_or_shoe_colour`,
+  `test_legs_plus_upper_bounding_box_matches_the_combined_pose_bounding_box`,
+  `test_the_ball_is_drawn_over_an_outstretched_foot_but_under_the_torso` (4 headings, a full-stride
+  front foot; compares against the old draw-ball-then-whole-sprite order),
+  `test_a_ball_at_the_players_own_centre_still_sits_under_the_upper_body`,
+  `test_app_draws_each_player_with_legs_false_since_draw_pitch_and_ball_already_drew_them`.
+- **Shoulder shape** (`_pose_geometry`'s `shoulder_size` / `shoulder_corner_r`, and the matching
+  inline constants near the top of `_render_pose` — kept in sync by hand since `_render_pose` stays
+  independent, see the bullet above): `0.95x` size on top of the existing `0.9x`, corner radius
+  `0.4x` of that size (up from `0.35x`) — less square/"too strong"-looking and a touch smaller,
+  chosen from a 9-way grid (size in {1.0, 0.9, 0.8} × corner in {0.35, 0.40, 0.45}) shown to the
+  user. Shrinking the shoulders very slightly reduced how far they poke out past the sprite's own
+  drawn radius, which dropped two ring-placement tests' `covered` sample count from `>10` to exactly
+  `10` (`test_rings_are_drawn_under_the_player_sprite`,
+  `test_the_pipeline_draws_player_rings_under_every_sprite`) — real, measured, not a masked bug (the
+  actual no-overdraw assertion still holds for every covered point); their bound was adjusted to
+  `>= 10` with a comment, same pattern as the stamina-ring threshold above.
 - **Animation clock** (`sim_clock.SimTimeDelta`, `App._animation_clock`): the
   stride gait (`update_player_animations` -> `advance_gait_phase`) and the ball's
   spin/roll (`update_ball_effects`) are advanced by the **simulation** time since

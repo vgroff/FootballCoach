@@ -1009,7 +1009,7 @@ class App:
             pid = player.player_id
             action_icon = self._action_icons.active_icon(pid, now_s)
             self.renderer.draw_player(
-                self.surface, player, action_icon=action_icon,
+                self.surface, player, action_icon=action_icon, legs=False,
             )
 
         kick_state = self.input_controller.kick_ui_state()

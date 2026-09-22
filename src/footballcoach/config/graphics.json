@@ -9,6 +9,10 @@
     "max_zoom": 5.0,
     "zoom_step": 0.5
   },
+  "size_floor": {
+    "_comment": "How the ball's and each player's on-screen MINIMUM visibility floor (ball.min_radius_px, player.min_radius_px) behaves as the camera zooms in. zoom_decay: 0-1; the floor grows as zoom_scale**zoom_decay instead of a flat zoom_scale, so it grows SLOWER than true-to-scale size does -- at zoom_scale=1 (the default whole-pitch view) nothing changes (any exponent of 1 is 1), but at higher zoom the true size increasingly overtakes the floor, so the ball/player converge toward looking properly life-sized instead of staying a constant multiple too big forever. 1.0 = the old behaviour (floor scales exactly with zoom, never converges). Applies to BOTH the ball and every player, with the same exponent, so they approach true scale together rather than at different rates.",
+    "zoom_decay": 0.45
+  },
   "player": {
     "_comment": "min_radius_px: smallest on-screen circle radius drawn for a player. Physical world positions are unaffected — only the rendered dot size is boosted for visibility. inactive_alpha: opacity (0-255) of a player drawn translucent after being tackled (0=invisible, 255=fully opaque).",
     "min_radius_px": 6,
@@ -57,8 +61,8 @@
     "font_size_px": 26
   },
   "ball_spin_dots": {
-    "_comment": "Dots on the 3D ball surface (Fibonacci sphere), always shown, rotating with ball spin. Only front-hemisphere dots (facing camera) are drawn — back hemisphere is hidden. count: number of dots. projection_scale_fraction: how wide the projected sphere appears relative to ball drawn radius (1.0 = dots reach ball edge). dot_radius_fraction: dot radius / ball drawn radius. color: RGB.",
-    "count": 15,
+    "_comment": "Dots on the 3D ball surface, always shown, rotating with ball spin. Only front-hemisphere dots (facing camera) are drawn — back hemisphere is hidden. count: number of dots; 12 (the default, matching a real ball's 12 pentagon centres) uses the icosahedron's vertices, the known-optimal even spacing for 12 points on a sphere — any other count falls back to a Fibonacci-lattice approximation. projection_scale_fraction: how wide the projected sphere appears relative to ball drawn radius (1.0 = dots reach ball edge). dot_radius_fraction: dot radius / ball drawn radius. color: RGB.",
+    "count": 12,
     "projection_scale_fraction": 0.98,
     "dot_radius_fraction": 0.25,
     "color": [30, 30, 30]
@@ -106,7 +110,11 @@
     "enabled": true,
     "contact_radius_frac": 0.33,
     "contact_min_px": 2,
-    "alpha": 100
+    "alpha": 100,
+    "tip_fade": 0.3,
+    "height_fade_ramp_m": 3.3,
+    "height_extra_soft": 0.66,
+    "height_extra_fade": 0.168
   },
   "ball_shading": {
     "_comment": "Sphere shading on the ball (dark on the side away from the light, clear where it faces it; the highlight is the unshaded part). The light is the scene light (scene_light.height_m above the pitch's middle), the same as the shadows, so the lit side always faces the centre: overhead at the centre, lower and more sideways toward the edges. strength 0-1; enabled false = flat white ball.",
@@ -123,11 +131,10 @@
     "seed": 7
   },
   "goal_frame": {
-    "_comment": "Slight 3D look for the goal frame in the top-down view (ui/renderer.py _draw_goal_frame). crossbar_lean_m: how far (world metres) the crossbar is drawn displaced from the goal line, away from the pitch -- a purely apparent parallax for its 2.44m height, clamped to the net depth; 0 = crossbar hidden exactly on the goal line (the old flat look). The net is drawn only behind the crossbar (the roof); the mouth in front of it is open. post_width_m: post/crossbar stroke width in world metres, but never less than 2px thicker than the net's own 1px lines (mesh and border), so the frame always reads heavier than the net. mouth_alpha: 0-255 tint over the goal mouth (the opening between goal line and crossbar); 0 = none. back_wall_alpha: the same tint over the back wall of the net (the strip between where the back of the net meets the ground and its top edge, displaced by the same lean); 0 = none. shade_strength: 0-1, how strongly the posts/crossbar are shaded to look round (lit from the top-left, see ui/style.py LIGHT_*); 0 = flat white.",
+    "_comment": "Slight 3D look for the goal frame in the top-down view (ui/renderer.py _draw_goal_frame). crossbar_lean_m: how far (world metres) the crossbar is drawn displaced from the goal line, away from the pitch -- a purely apparent parallax for its 2.44m height, clamped to the net depth; 0 = crossbar hidden exactly on the goal line (the old flat look). The net is drawn only behind the crossbar (the roof); the mouth in front of it is open. post_width_m: post/crossbar stroke width in world metres, but never less than 2px thicker than the net's own 1px lines (mesh and border), so the frame always reads heavier than the net. footprint_tint_alpha: 0-255 tint over BOTH the goal mouth (the opening between goal line and crossbar) and the back wall of the net (the strip between where the back of the net meets the ground and its top edge, displaced by the same lean) -- one shared value, so the two always match; 0 (the default) = neither tinted, same plain pitch green as everywhere else. shade_strength: 0-1, how strongly the posts/crossbar are shaded to look round (lit from the top-left, see ui/style.py LIGHT_*); 0 = flat white.",
     "crossbar_lean_m": 0.72,
     "post_width_m": 0.20,
-    "mouth_alpha": 40,
-    "back_wall_alpha": 30,
+    "footprint_tint_alpha": 0,
     "shade_strength": 0.7
   },
   "corner_flag": {

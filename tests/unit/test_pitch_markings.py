@@ -193,10 +193,12 @@ def test_posts_are_symmetric_about_the_centre_row_and_sit_on_the_mouth_edges(lef
     # Outside each post is plain pitch...
     assert tuple(surface.get_at((mid_x, bright[0] - 1)))[:3] == pitch_green
     assert tuple(surface.get_at((mid_x, bright[-1] + 1)))[:3] == pitch_green
-    # ...and just inside each is the (identical) mouth tint.
+    # ...and just inside each is identical too (the goal mouth has no tint by default any more --
+    # footprint_tint_alpha is 0 -- so this is plain pitch green as well; see
+    # test_the_mouth_and_back_wall_tints_are_always_the_same for the tinted case).
     inner_top = tuple(surface.get_at((mid_x, bright[0] + post_w)))[:3]
     inner_bot = tuple(surface.get_at((mid_x, bright[-1] - post_w)))[:3]
-    assert inner_top == inner_bot != pitch_green
+    assert inner_top == inner_bot == pitch_green
 
 
 @pytest.mark.parametrize("left", [True, False])
@@ -578,7 +580,10 @@ def test_back_of_net_ground_line_and_top_edge_are_separate_lines(left):
     assert abs(abs(g.back_top_x - g.back_x) - abs(g.bar_x - g.line_x)) <= 1
 
 
-def test_back_wall_strip_is_tinted_more_than_the_roof_net_in_front_of_it():
+def test_back_wall_strip_is_denser_than_the_roof_net_in_front_of_it():
+    """The back-wall strip shows its OWN steep mesh plus the roof mesh drawn over it (see
+    `_draw_goal_top`'s comment on why), so it reads as denser than the roof net alone -- true purely
+    from that double layering, with no tint needed (`footprint_tint_alpha` defaults to 0)."""
     pitch, cam, surface, renderer = _drawn_pitch_at_zoom(4.0)
     g = renderer._goal_px(pitch, True)
     post_w = renderer._goal_post_px()
@@ -588,7 +593,7 @@ def test_back_wall_strip_is_tinted_more_than_the_roof_net_in_front_of_it():
         px = [surface.get_at((x, y))[:3] for x in range(x_lo, x_hi) for y in rows]
         return sum(min(p) - _GRASS[0] for p in px) / len(px) / (255 - _GRASS[0])
 
-    back = ink(g.back_top_x + 2, g.back_x - 1)              # back wall strip (roof mesh + wall tint)
+    back = ink(g.back_top_x + 2, g.back_x - 1)              # back wall strip (wall mesh + roof mesh, no tint)
     roof = ink(g.back_x + 2, g.bar_x - post_w // 2 - 1)     # roof mesh only
     assert back > roof + 0.06
 
@@ -1010,12 +1015,12 @@ def test_ball_is_shaded_like_a_sphere_lit_from_the_pitch_centre_but_keeps_its_do
         cam, surface, renderer, ball = _ball_frame(0.11, x=x, y=y, **attrs)
         px, py = cam.world_to_screen(ball.position.x, ball.position.y)
         cx, cy = cam.world_to_screen_f(0.0, 0.0)
-        return surface, px, py, renderer, ((cx - px) / math.hypot(cx - px, cy - py), (cy - py) / math.hypot(cx - px, cy - py))
+        return surface, px, py, renderer, ball, ((cx - px) / math.hypot(cx - px, cy - py), (cy - py) / math.hypot(cx - px, cy - py))
 
     for x, y in ((-25.0, 12.0), (30.0, -15.0)):
-        flat, px, py, r, (ux, uy) = ball_pixels(x, y)
-        shaded, _, _, rs, _ = ball_pixels(x, y, _ball_shading_strength=0.85)
-        radius = int(r.min_ball_radius_px * 5.0)          # the ball's radius at zoom 5 (12px at the default config)
+        flat, px, py, r, ball, (ux, uy) = ball_pixels(x, y)
+        shaded, _, _, rs, _, _ = ball_pixels(x, y, _ball_shading_strength=0.85)
+        radius = int(r._ball_base_radius_px(ball))        # the ball's drawn radius at this zoom
         # the side facing the pitch centre is clearly brighter than the far side (compared as shaded/flat
         # over each half-disc, which cancels the dots)
         def half_ratio(sign):
@@ -1094,7 +1099,7 @@ def _shadow_pixels(surface, exclude_centre, exclude_r):
 def test_grounded_ball_has_a_thin_contact_shadow_and_it_can_be_turned_off():
     cam, surface, renderer, ball = _ball_frame(0.11, x=-20.0, y=10.0, zoom=5.0, _ball_shadow_enabled=True)
     bx, by = cam.world_to_screen(ball.position.x, ball.position.y)
-    r = max(renderer.min_ball_radius_px * cam.zoom_scale, cam.scale_length(ball.radius_m))
+    r = renderer._ball_base_radius_px(ball)
     ring = _shadow_pixels(surface, (bx, by), r + 5)   # the ball's own state ring is within ~5px of its edge
     assert ring, "a grounded ball should still show a contact shadow"
     # ...pushed away from the pitch centre (this ball is up-left of it), i.e. the shadow is on the far side
@@ -1121,7 +1126,7 @@ def test_raised_ball_shadow_lands_on_the_ground_away_from_the_pitch_centre():
     zc = under + renderer._ball_base_radius_px(ball) / cam.pixels_per_metre       # the drawn sphere's centre height
     mid_k = zc / (H - zc)
     expect = (bx + (bx - cx) * mid_k, by + (by - cy) * mid_k)
-    r_ball = renderer.min_ball_radius_px * cam.zoom_scale * (1 + z * renderer._ball_height_boost_per_m) + 8
+    r_ball = renderer._ball_base_radius_px(ball) * (1 + z * renderer._ball_height_boost_per_m) + 8
     shadow = [p for p in _shadow_pixels(surface, (bx, by), r_ball) if math.hypot(p[0] - expect[0], p[1] - expect[1]) < 40]
     assert shadow
     total = sum(p[2] for p in shadow)
@@ -1491,8 +1496,11 @@ def test_a_grounded_balls_shadow_depends_on_the_light_it_grows_with_distance_fro
 @pytest.mark.parametrize("spot", [(45.0, 0.0), (-40.0, 20.0), (30.0, -25.0), (20.0, 0.0)])
 def test_the_grounded_ball_shadow_is_the_ellipse_the_light_casts(spot, zoom):
     """A sphere's shadow is an ellipse: semi-minor its radius, semi-major r / sin(elevation), centred
-    where the light through the ball's centre lands (d * zc / (H - zc) beyond the ball). Its far tip
-    (where it fades out, ~0.45 of the soft edge past the nominal one) is within 2px of the formula."""
+    where the light through the ball's centre lands (d * zc / (H - zc) beyond the ball). Its far tip is
+    where the visible pixel threshold `_shadow_pixels` uses is crossed -- softened further by the far-
+    side softness (`_SHADOW_FADE_SOFT_FAR_FRAC` of the base) AND dimmed by `1 - tip_fade` (the far end's
+    directional fade), both from `_shadow_ellipse_sprite`; solving that threshold crossing for the
+    geometric distance gives a formula within 1.5px of the measured tip."""
     x, y = spot
     far, n, ball, renderer, cam = _grounded_streak(x, y, zoom)
     ppm = cam.pixels_per_metre
@@ -1503,8 +1511,23 @@ def test_the_grounded_ball_shadow_is_the_ellipse_the_light_casts(spot, zoom):
     elevation = math.atan2(H - z_centre, dist_px / ppm)
     semi_major = rad / math.sin(elevation)
     offset = dist_px * z_centre / (H - z_centre)
-    soft = 0.15                                                              # a grounded ball's shadow softness
-    assert abs((far + rad) - (offset + semi_major * (1 + 0.45 * soft))) < 2.0
+    soft_far = 0.15 * renderer._SHADOW_FADE_SOFT_FAR_FRAC                    # a grounded ball's far-side softness
+    # `_grounded_streak` pins alpha to 150 and PITCH_GREEN sums to 246, so `_shadow_pixels`' "> 30" cutoff
+    # is a smoothstep(x)*(1-tip_fade) value of exactly this, at the sprite's far end (t_axis=1):
+    target = (30 * 255 / sum(style.PITCH_GREEN) / 150) / (1 - renderer._ball_shadow_tip_fade)
+
+    def smoothstep(x):
+        return x * x * (3 - 2 * x)
+
+    lo, hi = 1e-6, 1 - 1e-6
+    for _ in range(40):
+        mid = (lo + hi) / 2
+        if smoothstep(mid) < target:
+            lo = mid
+        else:
+            hi = mid
+    rho_detect = 1 + soft_far - 2 * soft_far * (lo + hi) / 2
+    assert abs((far + rad) - (offset + semi_major * rho_detect)) < 1.5
 
 
 def test_a_higher_light_shortens_the_grounded_ball_shadow_and_contact_is_the_minimum():
@@ -1679,3 +1702,259 @@ def test_the_minimum_contact_shadow_is_modest_at_the_default_zoom():
     assert 0 < far < 0.6 * rad                                              # was ~1 radius (5px on a 5px ball)
     far3, _, ball3, r3, _ = _grounded_streak(0.0, 0.0, 3.0)
     assert far / rad < 1.4 * (far3 / r3._ball_base_radius_px(ball3))         # about the same proportion as at zoom 3
+
+
+# ---------------------------------------------------------------------------
+# Ball shadow: fades near->far like the players' capsules, deepening with height
+# ---------------------------------------------------------------------------
+
+def test_ball_shadow_fade_defaults_come_from_the_config():
+    from footballcoach.config import load_graphics_config
+
+    _, _, renderer, _ = _ball_frame(0.11)
+    cfg = load_graphics_config()["ball_shadow"]
+    assert renderer._ball_shadow_tip_fade == pytest.approx(float(cfg["tip_fade"]))
+    assert renderer._ball_shadow_height_fade_ramp_m == pytest.approx(float(cfg["height_fade_ramp_m"]))
+    assert renderer._ball_shadow_height_extra_soft == pytest.approx(float(cfg["height_extra_soft"]))
+    assert renderer._ball_shadow_height_extra_fade == pytest.approx(float(cfg["height_extra_fade"]))
+
+
+def _sample_ellipse(sprite, dx, dy=0):
+    pad = sprite.get_width() // 2
+    return sprite.get_at((pad + dx, pad + dy))[3]
+
+
+def test_the_ball_shadow_is_darker_and_sharper_near_the_ball_than_on_its_far_tip():
+    """`tip_fade` makes the ellipse asymmetric along its own axis: dark/sharp on the end nearest the
+    ball (`along = -a`, toward the pitch centre-facing side that's actually closest to the object),
+    lighter/softer on the far tip (`along = +a`) -- the ball's counterpart to the players' capsule
+    shadows. At the geometric edge (rho=1) the raw falloff is always exactly 0.5 regardless of
+    softness, so the near/far alpha ratio there is exactly `1 - tip_fade`; a bit further out the near
+    side has already faded to nothing while the far side (wider transition band) is still visible."""
+    _, _, renderer, _ = _ball_frame(0.11)
+    a, b, alpha, soft = 40.0, 15.0, 200.0, 0.2
+    fade = renderer._ball_shadow_tip_fade
+    lit = renderer._shadow_ellipse_sprite(a, b, 0, alpha, soft, tip_fade=fade)
+
+    near_edge = _sample_ellipse(lit, -int(a))
+    far_edge = _sample_ellipse(lit, int(a))
+    assert near_edge == pytest.approx(round(0.5 * alpha), abs=2)
+    assert far_edge == pytest.approx(round(0.5 * alpha * (1.0 - fade)), abs=2)
+    assert near_edge > far_edge
+
+    beyond = int(a * 1.08)                                       # just past the edge
+    assert _sample_ellipse(lit, -beyond) <= 2                    # near: already fully faded (tight edge)...
+    assert _sample_ellipse(lit, beyond) >= 15                    # ...far: still clearly visible (soft edge)
+
+
+def test_zero_tip_fade_is_the_old_symmetric_uniform_ellipse():
+    """`tip_fade=0` (unused by the ball's own draw call, but the default, and what `_ball_shadow_sprite`
+    -- the disc used elsewhere -- relies on) must reproduce the plain, direction-independent ellipse."""
+    _, _, renderer, _ = _ball_frame(0.11)
+    a, alpha, soft = 40.0, 200.0, 0.2
+    flat = renderer._shadow_ellipse_sprite(a, 15.0, 0, alpha, soft)
+    assert flat is renderer._shadow_ellipse_sprite(a, 15.0, 0, alpha, soft, tip_fade=0.0)
+    assert _sample_ellipse(flat, -int(a)) == _sample_ellipse(flat, int(a))
+    assert _sample_ellipse(flat, -int(a * 1.08)) == _sample_ellipse(flat, int(a * 1.08))
+
+
+def test_the_ball_shadow_fade_deepens_and_softens_further_the_higher_the_ball_is():
+    """`height_frac` (0 grounded, ramping to 1 over `height_fade_ramp_m`) pushes the far tip's dimming
+    beyond the base `tip_fade` (deeper fade) AND widens the far-side softness (a taller ball's shadow
+    has no sharp contact edge anywhere, so it should look uniformly hazier, not just fainter)."""
+    _, _, renderer, _ = _ball_frame(0.11)
+    a, b, alpha, soft = 40.0, 15.0, 200.0, 0.2
+    tip_fade = renderer._ball_shadow_tip_fade
+    edge_alpha = [
+        _sample_ellipse(renderer._shadow_ellipse_sprite(
+            a, b, 0, alpha, soft, tip_fade=tip_fade, height_frac=hf,
+            height_extra_soft=renderer._ball_shadow_height_extra_soft,
+            height_extra_fade=renderer._ball_shadow_height_extra_fade,
+        ), int(a))
+        for hf in (0.0, 0.5, 1.0)
+    ]
+    assert edge_alpha[0] > edge_alpha[1] > edge_alpha[2]              # deeper fade right at the old edge...
+
+    far_beyond = [
+        _sample_ellipse(renderer._shadow_ellipse_sprite(
+            a, b, 0, alpha, soft, tip_fade=tip_fade, height_frac=hf,
+            height_extra_soft=renderer._ball_shadow_height_extra_soft,
+            height_extra_fade=renderer._ball_shadow_height_extra_fade,
+        ), int(a * 1.15))
+        for hf in (0.0, 0.5, 1.0)
+    ]
+    assert far_beyond[0] < far_beyond[1] < far_beyond[2]               # ...but reaches further out (wider/softer)
+    assert far_beyond[0] == 0 and far_beyond[2] > 20                   # grounded: nothing there; airborne: clearly visible
+
+
+def test_a_grounded_ball_at_the_centre_has_no_height_fade_and_a_high_one_has_the_full_amount():
+    """`height_frac` in the real draw path is derived from the ball's height above ground, not its
+    distance from the pitch centre -- it should be ~0 for any grounded ball and ramp to 1 by
+    `height_fade_ramp_m` regardless of where on the pitch it is."""
+    _, _, renderer, ball = _ball_frame(0.11, x=-40.0, y=15.0)
+    z_under = max(0.0, ball.position.z - ball.radius_m)
+    assert min(z_under / renderer._ball_shadow_height_fade_ramp_m, 1.0) == pytest.approx(0.0, abs=1e-6)
+    _, _, renderer2, ball2 = _ball_frame(renderer._ball_shadow_height_fade_ramp_m + 1.0, x=-40.0, y=15.0)
+    z_under2 = max(0.0, ball2.position.z - ball2.radius_m)
+    assert min(z_under2 / renderer2._ball_shadow_height_fade_ramp_m, 1.0) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_the_mouth_and_back_wall_tints_are_always_the_same():
+    """Regression: the mouth and the back wall used to have DIFFERENT alphas (40 vs 30), which read
+    as an unexplained colour mismatch between the two (measured: (73,156,89) vs (66,152,83) against a
+    (43,141,62) pitch, with the net mesh removed so the flat tints alone were being compared). There
+    is now one shared `footprint_tint_alpha`; sampling a flat point in each (net mesh left out via
+    `goal_tops=False`, exactly like that original measurement, so a mesh line can't land on either
+    sample point and confuse the comparison) must give the exact same colour."""
+    import pygame
+
+    from footballcoach.ui.camera import Camera
+    from footballcoach.ui.renderer import Renderer
+
+    pitch = Pitch.standard()
+    cam = Camera.fit_to_pitch(pitch)
+    surface = pygame.Surface((cam.screen_width, cam.screen_height))
+    renderer = Renderer(cam)
+    renderer._goal_footprint_tint_alpha = 45
+    cam.set_zoom_level(3.0)
+    cam.follow(-52.5 + 1.0, 0.0)
+    renderer.draw_pitch(surface, pitch, goal_tops=False)
+    g = renderer._goal_px(pitch, True)
+    mouth_pt = surface.get_at(((g.line_x + g.bar_x) // 2, (g.y_top + g.y_bot) // 2))[:3]
+    wall_pt = surface.get_at(((g.back_x + g.back_top_x) // 2, (g.y_top + g.y_bot) // 2))[:3]
+    assert tuple(mouth_pt) == tuple(wall_pt) != tuple(style.PITCH_GREEN)
+
+
+def test_the_goal_footprint_has_no_tint_by_default():
+    pitch, cam, surface, renderer = _drawn_pitch_at_zoom(3.0)
+    assert renderer._goal_footprint_tint_alpha == 0
+    g = renderer._goal_px(pitch, True)
+    mouth_pt = surface.get_at(((g.line_x + g.bar_x) // 2, (g.y_top + g.y_bot) // 2))[:3]
+    assert tuple(mouth_pt) == tuple(style.PITCH_GREEN)
+
+
+# ---------------------------------------------------------------------------
+# Ball spin dots: even (icosahedral) spacing, and a stable dot/ball size ratio
+# ---------------------------------------------------------------------------
+
+def _pairwise_angles_deg(points):
+    import itertools
+
+    out = []
+    for a, b in itertools.combinations(points, 2):
+        dot = max(-1.0, min(1.0, sum(x * y for x, y in zip(a, b))))
+        out.append(math.degrees(math.acos(dot)))
+    return sorted(out)
+
+
+def test_the_default_12_dots_are_the_icosahedrons_vertices_evenly_spaced():
+    """Regression: the old 15-point Fibonacci lattice had dots as close as 31 degrees apart in
+    places ("two dots too close together") despite averaging even coverage. The classic 12-dot
+    pattern (a real ball's pentagon centres) is now the icosahedron's own vertices: every point is a
+    unit vector, and every NEAREST-neighbour pair is exactly the same angle apart (the Tammes-optimal
+    spacing for 12 points), not just approximately even."""
+    _, _, _, renderer = _drawn_pitch()
+    assert renderer._spin_dot_count == 12
+    positions = renderer._ball_dot_positions
+    assert len(positions) == 12
+    for x, y, z in positions:
+        assert math.hypot(x, y, z) == pytest.approx(1.0, abs=1e-9)
+    angles = _pairwise_angles_deg(positions)
+    assert angles[0] == pytest.approx(63.4, abs=0.1)
+    # every point has exactly 5 neighbours at that nearest distance (each vertex of an icosahedron
+    # touches 5 edges) -- not just the single closest pair being far enough apart by luck
+    nearest_per_point = sorted(round(x, 1) for x in angles[:30])   # 12*5/2 = 30 nearest-neighbour edges
+    assert all(a == pytest.approx(63.4, abs=0.1) for a in nearest_per_point)
+
+
+def test_the_code_level_default_dot_count_is_12_even_if_config_omits_it(monkeypatch):
+    """The `_drawn_pitch()`/`_plain_cosmetics` renderers all go through the real graphics.json, which
+    does set `count: 12` explicitly -- that alone wouldn't catch a regression to the OLD code-level
+    fallback (`_sd.get("count", 9)`) if the config value were ever removed. Delete the key from a copy
+    of the real config and confirm the renderer still lands on 12, not the old 9, from its own default."""
+    import copy
+
+    from footballcoach.ui import renderer as renderer_mod
+    from footballcoach.ui.camera import Camera
+
+    cfg = copy.deepcopy(renderer_mod.load_graphics_config())
+    cfg.get("ball_spin_dots", {}).pop("count", None)
+    monkeypatch.setattr(renderer_mod, "load_graphics_config", lambda: cfg)
+
+    pitch = Pitch.standard()
+    cam = Camera.fit_to_pitch(pitch)
+    renderer = renderer_mod.Renderer(cam)
+    assert renderer._spin_dot_count == 12
+
+
+def test_the_old_fibonacci_lattice_is_kept_for_non_classic_dot_counts():
+    from footballcoach.ui.renderer import Renderer
+
+    for n in (9, 15, 20):
+        pts = Renderer._make_ball_dot_positions(n)
+        assert len(pts) == n
+        for x, y, z in pts:
+            assert math.hypot(x, y, z) == pytest.approx(1.0, abs=1e-9)
+        assert pts == Renderer._make_fibonacci_sphere(n)
+    assert Renderer._make_ball_dot_positions(12) == Renderer._make_icosahedron_vertices()
+    assert Renderer._make_ball_dot_positions(12) != Renderer._make_fibonacci_sphere(12)
+
+
+def test_a_real_footballs_15_point_fibonacci_lattice_really_did_have_a_close_pair():
+    """The specific, measured regression this fixes: at the old default count (15), the closest two
+    dots were only ~31 degrees apart -- well under half the new 12-point pattern's uniform 63.4."""
+    from footballcoach.ui.renderer import Renderer
+
+    angles = _pairwise_angles_deg(Renderer._make_fibonacci_sphere(15))
+    assert angles[0] < 35.0
+
+
+@pytest.mark.parametrize("zoom", [1.0, 1.5, 2.0, 3.0, 4.0, 5.0])
+def test_the_dot_to_ball_size_ratio_no_longer_swings_with_zoom(zoom):
+    """Regression: `dot_r` used to be `int(radius_px * frac)` on top of `radius_px` ALREADY being an
+    int -- two roundings compounding at small pixel counts made the actual ratio swing between ~0.167
+    and ~0.25 for a configured 0.25 (measured across zoom 1-5 before fixing it). `dot_r` is a float now
+    (rounded only once, at the final per-vertex pixel snap, like every other coordinate here), so the
+    ratio should be the configured value at every zoom, not just by chance at any particular one."""
+    from footballcoach.entities.ball import Ball
+    from footballcoach.mathutils import Vector3
+    from footballcoach.ui.camera import Camera
+    from footballcoach.ui.renderer import Renderer
+
+    pitch = Pitch.standard()
+    cam = Camera.fit_to_pitch(pitch)
+    renderer = Renderer(cam)
+    cam.set_zoom_level(zoom)
+    ball = Ball()
+    ball.position = Vector3(0.0, 0.0, 0.11)
+    radius_px = max(2, int(renderer._ball_base_radius_px(ball)))
+    # calls the renderer's own formula method (not a re-derivation of it) -- this is what the
+    # mutation this regression-tests reintroduces a truncation into, so it has to go through it
+    dot_r = renderer._spin_dot_radius_px(radius_px)
+    assert dot_r / radius_px == pytest.approx(renderer._spin_dot_radius_frac, abs=1e-9)
+
+
+def test_the_spin_dot_radius_formula_itself_is_not_truncated_to_an_int():
+    """The regression this is really about: the OLD code computed `max(1, int(radius_px * frac))`,
+    which silently discards the fraction whenever `radius_px * frac` isn't a whole number -- exactly
+    the case at the ball's normal on-screen sizes. Pick a radius_px/frac combination where that
+    truncation is unmistakable (an exact 0.5px difference) and confirm the real value is not an
+    integer, i.e. genuinely a float, not an int that merely prints as one."""
+    _, _, _, renderer = _drawn_pitch()
+    renderer._spin_dot_radius_frac = 0.25
+    dot_r = renderer._spin_dot_radius_px(10)   # 10 * 0.25 = 2.5 exactly -- int() would make it 2
+    assert dot_r == pytest.approx(2.5)
+    assert not float(dot_r).is_integer()
+
+
+def test_dot_layer_pad_still_fits_the_dot_at_every_radius():
+    """`pad` changed from `int(orbit_r) + dot_r + 2` (both terms truncated) to
+    `int(ceil(orbit_r + dot_r)) + 2` (summed as floats first, ceil'd once) -- confirm it's still
+    always big enough to contain a dot at the ball's own silhouette edge, at a range of radii."""
+    _, _, _, renderer = _drawn_pitch()
+    for radius_px in (2, 5, 8, 13, 24, 41, 70):
+        layer, pad = renderer._ball_dots_layer(radius_px, orientation=_IDENTITY, dot_positions=[(0.0, 0.0, 1.0)])
+        assert layer.get_size() == (pad * 2, pad * 2)
+        opaque = [(x, y) for x in range(layer.get_width()) for y in range(layer.get_height()) if layer.get_at((x, y))[3] > 0]
+        assert opaque, radius_px
+        assert all(0 < x < layer.get_width() - 1 and 0 < y < layer.get_height() - 1 for x, y in opaque)

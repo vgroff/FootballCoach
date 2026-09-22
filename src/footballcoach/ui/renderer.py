@@ -360,6 +360,9 @@ class Renderer:
         # are drawn under the players and the ball (see `draw_pitch_and_ball`).
         self._ring_alpha: int = max(0, min(255, int(gcfg.get("rings", {}).get("alpha", 110))))
         self.min_ball_radius_px: int = gcfg["ball"]["min_radius_px"]
+        # How much the minimum-visibility SIZE FLOORS (min_radius_px, both entities) shrink, relative
+        # to true-to-scale size, as the camera zooms in -- see `_ball_base_radius_px` / `_player_radius_px`.
+        self._size_floor_zoom_decay: float = max(0.0, min(1.0, float(gcfg.get("size_floor", {}).get("zoom_decay", 0.45))))
         self._ball_outline: bool = gcfg["ball"].get("outline", False)
         # outline_width_px may be a float: values >= 1 → integer pixel width at full
         # opacity; values in (0, 1) → 1px outline drawn at that fraction of full opacity
@@ -384,7 +387,7 @@ class Renderer:
 
         # Ball spin dots — 3D model projected to top-down view
         _sd = gcfg.get("ball_spin_dots", {})
-        self._spin_dot_count: int = _sd.get("count", 9)
+        self._spin_dot_count: int = _sd.get("count", 12)
         self._spin_orbit_frac: float = _sd.get("projection_scale_fraction", _sd.get("orbit_radius_fraction", 0.93))
         self._spin_dot_radius_frac: float = _sd.get("dot_radius_fraction", 0.25)
         _col = _sd.get("color", [30, 30, 30])
@@ -392,7 +395,7 @@ class Renderer:
         # 3x3 rotation matrix tracking ball orientation (identity = initial pose)
         self._ball_orientation: list = [[1.0,0.0,0.0],[0.0,1.0,0.0],[0.0,0.0,1.0]]
         # Fixed dot positions on unit sphere (Fibonacci lattice)
-        self._ball_dot_positions: list = self._make_fibonacci_sphere(self._spin_dot_count)
+        self._ball_dot_positions: list = self._make_ball_dot_positions(self._spin_dot_count)
         # Last ball position for estimating rolling velocity each frame
         self._last_ball_pos: tuple[float, float] = (0.0, 0.0)
 
@@ -419,8 +422,10 @@ class Renderer:
         _gf = gcfg.get("goal_frame", {})
         self._crossbar_lean_m: float = float(_gf.get("crossbar_lean_m", 0.9))
         self._goal_post_width_m: float = float(_gf.get("post_width_m", 0.16))
-        self._goal_mouth_alpha: int = int(_gf.get("mouth_alpha", 40))
-        self._goal_back_wall_alpha: int = int(_gf.get("back_wall_alpha", 30))
+        # ONE alpha for both the goal-mouth tint and the back-wall tint (they used to differ --
+        # 40 vs 30 -- which read as an unexplained colour mismatch between the two; now they're
+        # either both this or both off). 0 = neither drawn, the goal footprint is plain pitch green.
+        self._goal_footprint_tint_alpha: int = int(_gf.get("footprint_tint_alpha", 0))
         self._goal_shade_strength: float = max(0.0, min(1.0, float(_gf.get("shade_strength", 0.7))))
         self._foot_cache: dict[tuple, pygame.Surface] = {}
         # Ball: a soft ground shadow (light above the pitch's middle) and sphere shading.
@@ -434,6 +439,15 @@ class Renderer:
         self._ball_shadow_contact_frac: float = max(0.0, float(_bs.get("contact_radius_frac", 0.33)))
         self._ball_shadow_contact_min_px: float = max(0.0, float(_bs.get("contact_min_px", 2.0)))
         self._ball_shadow_alpha: int = int(_bs.get("alpha", 100))
+        # Along-axis fade (see `_shadow_ellipse_sprite`): like the players' capsules, the ball's
+        # shadow is sharp/dark on the end nearest the ball and soft/light on the far tip.
+        self._ball_shadow_tip_fade: float = max(0.0, min(0.95, float(_bs.get("tip_fade", 0.3))))
+        # ...and it fades/softens further, the higher the ball is (an airborne shadow has no sharp
+        # contact edge anywhere): ramps in linearly over `height_fade_ramp_m` of height, up to
+        # `height_extra_soft` / `height_extra_fade` on top of the base fade above.
+        self._ball_shadow_height_fade_ramp_m: float = max(0.1, float(_bs.get("height_fade_ramp_m", 3.3)))
+        self._ball_shadow_height_extra_soft: float = max(0.0, float(_bs.get("height_extra_soft", 0.66)))
+        self._ball_shadow_height_extra_fade: float = max(0.0, float(_bs.get("height_extra_fade", 0.168)))
         self._shadow_cache: dict[tuple, pygame.Surface] = {}     # soft capsules, shared by ball and players
         _bsh = gcfg.get("ball_shading", {})
         self._ball_shading_strength: float = max(0.0, min(1.0, float(_bsh.get("strength", 0.85)))) if _bsh.get("enabled", True) else 0.0
@@ -504,8 +518,33 @@ class Renderer:
         self._player_gait_phase: dict[str, float] = {}
 
     @staticmethod
+    def _make_icosahedron_vertices() -> list:
+        """The 12 vertices of a regular icosahedron, projected onto the unit sphere -- the classic
+        football's own pattern: a real ball is a TRUNCATED icosahedron (12 pentagons + 20 hexagons),
+        and each pentagon's centre sits exactly where the untruncated icosahedron's 12 vertices are.
+        It's also the known-optimal (Tammes problem) even distribution of 12 points on a sphere: every
+        point's nearest neighbours are equally far away (measured: a uniform 63.4 degrees, vs. as
+        close as 31 degrees between the two nearest dots in the old 15-point Fibonacci lattice --
+        "two dots too close together" was a real, measurable unevenness, not just an impression)."""
+        phi = (1.0 + math.sqrt(5.0)) / 2.0
+        raw = []
+        for s1 in (1.0, -1.0):
+            for s2 in (1.0, -1.0):
+                raw.append((0.0, s1, s2 * phi))
+                raw.append((s1, s2 * phi, 0.0))
+                raw.append((s2 * phi, 0.0, s1))
+        points = []
+        for x, y, z in raw:
+            n = math.sqrt(x * x + y * y + z * z)
+            points.append((x / n, y / n, z / n))
+        return points
+
+    @staticmethod
     def _make_fibonacci_sphere(n: int) -> list:
-        """Evenly distribute n points on the unit sphere using the Fibonacci lattice."""
+        """Evenly distribute n points on the unit sphere using the Fibonacci lattice. Used as a
+        general fallback for any dot count OTHER than the classic 12 (see `_make_icosahedron_vertices`,
+        `_make_ball_dot_positions`) -- reasonably even for most n, but not the provably-optimal
+        spacing an exact regular solid gives for the counts that have one."""
         points = []
         phi = math.pi * (3.0 - math.sqrt(5.0))  # golden angle
         for i in range(n):
@@ -514,6 +553,12 @@ class Renderer:
             theta = phi * i
             points.append((math.cos(theta) * r, y, math.sin(theta) * r))
         return points
+
+    @classmethod
+    def _make_ball_dot_positions(cls, n: int) -> list:
+        """Dot positions for the ball's spin markers: the icosahedron's 12 vertices for the classic
+        count, a Fibonacci lattice otherwise."""
+        return cls._make_icosahedron_vertices() if n == 12 else cls._make_fibonacci_sphere(n)
 
     @staticmethod
     def _mat_mul3(A: list, B: list) -> list:
@@ -772,17 +817,16 @@ class Renderer:
         # Where the back of the net touches the ground.
         surface.fill(white, pygame.Rect(g.back_x - off, g.y_top - off, line_w, g.y_bot - g.y_top + line_w))
 
-        if self._goal_back_wall_alpha > 0:
+        if self._goal_footprint_tint_alpha > 0:
             b_a, b_b = sorted((g.back_x, g.back_top_x))
             wall = pygame.Surface((b_b - b_a + 1, g.y_bot - g.y_top + 1), pygame.SRCALPHA)
-            wall.fill((*white, self._goal_back_wall_alpha))
+            wall.fill((*white, self._goal_footprint_tint_alpha))
             surface.blit(wall, (b_a, g.y_top))
 
-        if self._goal_mouth_alpha > 0:
             post_w = self._goal_post_px()
             m_a, m_b = sorted((g.line_x, g.bar_x))
             mouth = pygame.Surface((m_b - m_a + 1, g.y_bot - g.y_top + post_w), pygame.SRCALPHA)
-            mouth.fill((*white, self._goal_mouth_alpha))
+            mouth.fill((*white, self._goal_footprint_tint_alpha))
             surface.blit(mouth, (m_a, g.y_top - post_w // 2))
 
     def _goal_post_px(self) -> int:
@@ -1068,7 +1112,10 @@ class Renderer:
         sprite (a shadow never falls over another player, the ball, or the net). The translucent
         RINGS -- every player's state / selection / stamina ring (``selected_id`` is the selected
         player's id) and the ball's state ring -- come next, still under the goal frame, the ball
-        and every sprite."""
+        and every sprite. Then every player's LEGS layer (see ``draw_player_legs``), so a player
+        standing over/near the ball shows it resting at their feet; callers draw the rest of each
+        player (``draw_player(..., legs=False)``) after this call, so the upper body ends up in
+        front of the ball."""
         under = ball_under_goal_frame(
             pitch, ball.position.x, ball.position.y, ball.position.z, ball.radius_m,
         )
@@ -1080,6 +1127,7 @@ class Renderer:
         self._draw_ball_state_ring(surface, ball)
         if not under:
             self.draw_goal_tops(surface, pitch)
+        self.draw_player_legs(surface, players)
         self.draw_ball(surface, ball, shadow=False, ring=False)
         if under:
             self.draw_goal_tops(surface, pitch)
@@ -1391,6 +1439,17 @@ class Renderer:
             small.set_alpha(alpha)
         surface.blit(small, (pos[0] - size // 2, pos[1] - size // 2))
 
+    def _spin_dot_radius_px(self, radius_px: int) -> float:
+        """A spin dot's drawn radius in pixels, as a float. `radius_px` (the ball's own drawn
+        radius) is itself already an int -- the ball's outer circle has to be, for
+        `smoothscale`/`pygame.draw` -- so truncating this to an int AGAIN on top of that made the
+        dot/ball size ratio swing between ~0.17 and ~0.25 across zoom levels for a configured 0.25
+        (measured before fixing it): two roundings compounding at these small pixel counts, not a
+        real design choice. Kept as a float here and only rounded at the final per-vertex pixel
+        snap (like every other coordinate in `_ball_dots_layer` already does), the ratio stays at
+        the configured fraction regardless of zoom."""
+        return max(1.0, radius_px * self._spin_dot_radius_frac)
+
     def _ball_dots_layer(
         self, radius_px: int, orientation=None, dot_positions=None,
     ) -> tuple[pygame.Surface, int]:
@@ -1415,8 +1474,8 @@ class Renderer:
         are parameters so the layer can be unit-tested for a single dot."""
         scale = self._RING_SUPERSAMPLE
         orbit_r = radius_px * self._spin_orbit_frac
-        dot_r = max(1, int(radius_px * self._spin_dot_radius_frac))
-        pad = int(orbit_r) + dot_r + 2
+        dot_r = self._spin_dot_radius_px(radius_px)
+        pad = int(math.ceil(orbit_r + dot_r)) + 2
         big_size = pad * 2 * scale
         centre = pad * scale
         big = pygame.Surface((big_size, big_size), pygame.SRCALPHA)
@@ -1457,9 +1516,16 @@ class Renderer:
         return pygame.transform.smoothscale(big, (pad * 2, pad * 2)), pad
 
     def _ball_base_radius_px(self, ball: Ball) -> float:
-        """The ball's on-screen radius before the height boost (see `draw_ball`)."""
+        """The ball's on-screen radius before the height boost (see `draw_ball`). The minimum-
+        visibility floor (`min_ball_radius_px`) grows with zoom, but SLOWER than true size does
+        (`** self._size_floor_zoom_decay`, < 1) -- see that attribute's comment and
+        `_player_radius_px`'s docstring for why: at 1x (zoom_scale=1) this is identical to before
+        (any exponent of 1 is 1), but as you zoom in, true size (growing linearly) increasingly
+        overtakes the floor (growing sub-linearly), so the ball converges toward looking properly
+        life-sized rather than staying a constant ~4.6x too big at every zoom forever."""
         cam = self.camera
-        return max(self.min_ball_radius_px * cam.zoom_scale, cam.scale_length(ball.radius_m))
+        floor_px = self.min_ball_radius_px * cam.zoom_scale ** self._size_floor_zoom_decay
+        return max(floor_px, cam.scale_length(ball.radius_m))
 
     def _ball_draw_radius_px(self, ball: Ball) -> int:
         """The ball's drawn radius: the enlarged ground radius times the height boost."""
@@ -1657,7 +1723,9 @@ class Renderer:
         the DRAWN radius so it scales with zoom exactly like the ball, still pointing radially away
         from the centre (with a fixed lower-right bias within ~3m of it, where the overhead light
         has no true direction). It fades out as the ball rises (gone by 1.5m). Fainter and softer
-        the higher the ball is."""
+        the higher the ball is, and (see `_shadow_ellipse_sprite`) darker/sharper on the end nearest
+        the ball than on its far tip -- the same directional fade the players' shadows use -- with
+        that fade widening further the higher the ball is."""
         cam = self.camera
         ppm = cam.pixels_per_metre
         light_h = self._light_height_m
@@ -1687,9 +1755,11 @@ class Renderer:
         grounded = max(0.0, 1.0 - z_under / 1.5)
         extra = max(0.0, wanted_tip - (offset + semi_major)) * grounded
         centre_x, centre_y = bx + vx * k + ux * extra, by + vy * k + uy * extra
+        height_frac = min(z_under / self._ball_shadow_height_fade_ramp_m, 1.0)
         sprite = self._shadow_ellipse_sprite(
             semi_major, r_px, angle, self._ball_shadow_alpha * (1.0 - 0.45 * min(z_under / 6.0, 1.0)),
-            0.15 + 0.06 * min(z_under, 6.0),
+            0.15 + 0.06 * min(z_under, 6.0), tip_fade=self._ball_shadow_tip_fade, height_frac=height_frac,
+            height_extra_soft=self._ball_shadow_height_extra_soft, height_extra_fade=self._ball_shadow_height_extra_fade,
         )
         surface.blit(sprite, (round(centre_x) - sprite.get_width() // 2, round(centre_y) - sprite.get_height() // 2))
 
@@ -1697,26 +1767,64 @@ class Renderer:
         """A soft-edged black disc (a circular ellipse; see `_shadow_ellipse_sprite`)."""
         return self._shadow_ellipse_sprite(radius, radius, 0, alpha, softness)
 
+    # Near/far softness of the ball's directional fade, as multiples of the base `softness` (see
+    # `_shadow_ellipse_sprite`) -- the same 0.2/0.8 split the players' capsules use, so both read as
+    # the same kind of shadow. Only applied when `tip_fade` (or the height extras) is non-zero.
+    _SHADOW_FADE_SOFT_NEAR_FRAC = 0.2
+    _SHADOW_FADE_SOFT_FAR_FRAC = 0.8
+
     def _shadow_ellipse_sprite(
         self, semi_major_px: float, semi_minor_px: float, angle_deg: int, alpha: float, softness: float,
+        *, tip_fade: float = 0.0, height_frac: float = 0.0, height_extra_soft: float = 0.0, height_extra_fade: float = 0.0,
     ) -> pygame.Surface:
         """A soft-edged black ellipse centred in a square sprite, its long axis pointing ``angle_deg``
         (screen angle, y down): solid to ``1 - softness`` of its radius in every direction (the elliptical
         distance) and fading to nothing at ``1 + softness``. ``alpha`` is 0-255 at full strength.
-        Parameters are quantised (axes 0.5px, alpha 5, softness 0.05) and the sprites cached, bounded at 512."""
+
+        With ``tip_fade`` > 0 (used for the ball's shadow; 0 -- the default -- is the plain uniform
+        ellipse above, e.g. for `_ball_shadow_sprite`'s disc) the ellipse fades along its OWN major
+        axis instead, from the NEAR end (``t=0``, the ``angle_deg + 180`` side -- nearer the object
+        that cast it) to the FAR end (``t=1``, the ``angle_deg`` side): darker/sharper near, lighter/
+        softer far, like a real shadow's sharp contact point diffusing into its penumbra -- the same
+        idea already used for the players' capsule shadows (`_player_shadow_sprite`). The softness at
+        a point is interpolated between ``softness * _SHADOW_FADE_SOFT_NEAR_FRAC`` and ``softness *
+        _SHADOW_FADE_SOFT_FAR_FRAC`` by ``t``; the alpha is scaled by ``1 - tip_fade * t``.
+        ``height_frac`` (0-1, how "airborne" the caster is -- 0 for a grounded ball) additionally
+        widens the softness band by up to ``height_extra_soft`` and deepens the fade by up to
+        ``height_extra_fade``, since an airborne shadow has no sharp contact edge anywhere.
+
+        Parameters are quantised (axes 0.5px, alpha 5, softness 0.05, the fade knobs to 3dp) and the
+        sprites cached, bounded at 512 (shared with the players' capsules)."""
         a = max(0.5, round(semi_major_px * 2) / 2.0)
         b = max(0.5, round(semi_minor_px * 2) / 2.0)
         alpha, softness = int(round(alpha / 5.0) * 5), round(softness * 20) / 20.0
-        key = (a, b, angle_deg, alpha, softness)
+        tip_fade = round(min(0.95, max(0.0, tip_fade)), 3)
+        height_frac = round(min(1.0, max(0.0, height_frac)), 3)
+        height_extra_soft = round(max(0.0, height_extra_soft), 3)
+        height_extra_fade = round(max(0.0, height_extra_fade), 3)
+        key = (a, b, angle_deg, alpha, softness, tip_fade, height_frac, height_extra_soft, height_extra_fade)
         sprite = self._shadow_cache.get(key)
         if sprite is None:
-            pad = int(math.ceil(max(a, b) * (1.0 + softness))) + 2
+            soft_far_bound = softness * self._SHADOW_FADE_SOFT_FAR_FRAC + height_frac * height_extra_soft if tip_fade > 0.0 else softness
+            pad = int(math.ceil(max(a, b) * (1.0 + soft_far_bound))) + 2
             yy, xx = np.mgrid[-pad:pad + 1, -pad:pad + 1].astype(float)
             cos_a, sin_a = math.cos(math.radians(angle_deg)), math.sin(math.radians(angle_deg))
             along, across = xx * cos_a + yy * sin_a, -xx * sin_a + yy * cos_a
             rho = np.hypot(along / a, across / b)                       # 1.0 on the ellipse's edge
-            t = np.clip((1.0 + softness - rho) / max(2.0 * softness, 1e-6), 0.0, 1.0)
-            t = t * t * (3.0 - 2.0 * t) * (alpha / 255.0)
+            if tip_fade > 0.0:
+                axis_t = np.clip((along / a + 1.0) / 2.0, 0.0, 1.0)     # 0 at the near end, 1 at the far tip
+                soft = (
+                    softness * self._SHADOW_FADE_SOFT_NEAR_FRAC
+                    + (softness * self._SHADOW_FADE_SOFT_FAR_FRAC - softness * self._SHADOW_FADE_SOFT_NEAR_FRAC) * axis_t
+                    + height_frac * height_extra_soft
+                )
+                fade = min(0.95, tip_fade + height_frac * height_extra_fade)
+                strength = 1.0 - fade * axis_t
+            else:
+                soft = softness
+                strength = 1.0
+            t = np.clip((1.0 + soft - rho) / np.maximum(2.0 * soft, 1e-6), 0.0, 1.0)
+            t = t * t * (3.0 - 2.0 * t) * (alpha / 255.0) * strength
             sprite = pygame.Surface((2 * pad + 1, 2 * pad + 1), pygame.SRCALPHA)
             sprite.fill((0, 0, 0, 0))
             pygame.surfarray.pixels_alpha(sprite)[:] = np.clip(t * 255.0 + 0.5, 0, 255).astype(np.uint8).T
@@ -1725,20 +1833,29 @@ class Renderer:
             self._shadow_cache[key] = sprite
         return sprite
 
-    def _draw_player_sprite(
+    _PLAYER_LIGHT_Z_M = 0.9   # height at which a player's body is lit (roughly the torso)
+
+    def _draw_player_pose_layer(
         self, surface: pygame.Surface, player: Player, pos: tuple[int, int], radius_px: int,
-        colour: tuple[int, int, int], is_inactive: bool,
+        colour: tuple[int, int, int], is_inactive: bool, layer: str,
     ) -> None:
-        """Draws the rotated/scaled top-down sprite in place of the plain
-        circle (see player_sprites.py). `colour` is the same team/goalkeeper
-        colour `draw_player` already resolved -- reused as the sprite's
-        shirt colour, so a keeper's sprite set is cached under its own
-        distinct colour exactly like the old circle was."""
+        """Draws the rotated/scaled top-down sprite in place of the plain circle (see
+        player_sprites.py). `colour` is the same team/goalkeeper colour `draw_player` already
+        resolved -- reused as the sprite's shirt colour, so a keeper's sprite set is cached under
+        its own distinct colour exactly like the old circle was. `layer` selects which of
+        `PlayerSpriteSet`'s three parallel sprite families to draw: "combined" (the whole figure,
+        one sprite -- what `draw_player`'s default, non-split path uses), "legs" or "upper" (see
+        `_render_pose_layers` / `draw_player_legs` for why the figure is ever split in two)."""
         side, level = player_sprites.pick_pose(
             self._player_gait_phase.get(player.player_id, 0.0), player.speed_mps, self._sprite_params
         )
         sprite_set = player_sprites.get_sprite_set(self._sprite_params, colour)
-        base_sprite = sprite_set.get(side, level)
+        get_fn, shaded_fn = {
+            "combined": (sprite_set.get, sprite_set.shaded),
+            "legs": (sprite_set.get_legs, sprite_set.legs_shaded),
+            "upper": (sprite_set.get_upper, sprite_set.upper_shaded),
+        }[layer]
+        base_sprite = get_fn(side, level)
 
         # Rotate to match heading: the sprite's own local art faces "down"
         # (+y); `hx, hy` is the same screen-space facing vector the heading
@@ -1760,7 +1877,7 @@ class Renderer:
             lx, ly = math.cos(elr) * math.cos(azr), math.cos(elr) * math.sin(azr)
             local_az = math.degrees(math.atan2(math.sin(phi) * lx + math.cos(phi) * ly,
                                                math.cos(phi) * lx - math.sin(phi) * ly))
-            base_sprite = sprite_set.shaded(
+            base_sprite = shaded_fn(
                 side, level, int(round(local_az / 15.0) * 15) % 360, int(min(90, round(el / 5.0) * 5)),
                 self._player_shading_strength,
             )
@@ -1775,7 +1892,60 @@ class Renderer:
         rect = rotated.get_rect(center=pos)
         surface.blit(rotated, rect)
 
-    _PLAYER_LIGHT_Z_M = 0.9   # height at which a player's body is lit (roughly the torso)
+    def _draw_player_sprite(
+        self, surface: pygame.Surface, player: Player, pos: tuple[int, int], radius_px: int,
+        colour: tuple[int, int, int], is_inactive: bool,
+    ) -> None:
+        """The whole player, one sprite (legs and upper body together) -- `draw_player`'s default
+        (`legs=True`) path. See `_draw_player_pose_layer`."""
+        self._draw_player_pose_layer(surface, player, pos, radius_px, colour, is_inactive, "combined")
+
+    def _draw_player_legs_sprite(
+        self, surface: pygame.Surface, player: Player, pos: tuple[int, int], radius_px: int,
+        colour: tuple[int, int, int], is_inactive: bool,
+    ) -> None:
+        """Just the legs (shafts, feet, shoes, shorts) -- see `draw_player_legs`."""
+        self._draw_player_pose_layer(surface, player, pos, radius_px, colour, is_inactive, "legs")
+
+    def _draw_player_upper_sprite(
+        self, surface: pygame.Surface, player: Player, pos: tuple[int, int], radius_px: int,
+        colour: tuple[int, int, int], is_inactive: bool,
+    ) -> None:
+        """Just the upper body (arms, shoulders, torso, head) -- `draw_player(..., legs=False)`,
+        used once the legs have already been drawn earlier by `draw_player_legs`."""
+        self._draw_player_pose_layer(surface, player, pos, radius_px, colour, is_inactive, "upper")
+
+    def _player_draw_colour(self, player: Player) -> tuple[int, int, int]:
+        if player.is_goalkeeper:
+            return style.GOALKEEPER_COLOUR
+        return style.TEAM_LEFT_COLOUR if player.team == Team.LEFT else style.TEAM_RIGHT_COLOUR
+
+    def draw_player_legs(self, surface: pygame.Surface, players: Sequence[Player]) -> None:
+        """Every player's LEGS layer only (shafts, feet, shoes, shorts -- see
+        `player_sprites._render_pose_layers`), meant to be called in the shared "under everything"
+        pass, before the ball (see `draw_pitch_and_ball`): a player standing over/near the ball then
+        shows it resting between their feet, with the torso/arms/head (drawn afterwards, by
+        `draw_player(..., legs=False)`) appearing in front of it, the way an overhead photo of
+        someone dribbling reads -- rather than the whole figure sitting flatly on one side of the
+        ball. `draw_player`'s own default (`legs=True`) draws the combined sprite instead, for
+        standalone use (tests, or a caller that never calls this).
+
+        A no-op with sprites disabled -- the flat-circle fallback has no separate legs to draw.
+
+        Known trade-off: legs are drawn for ALL players here, before ANY player's upper body, so if
+        two players' sprites happen to overlap (standing right next to each other, e.g. a tackle)
+        the later one's upper body can cover the earlier one's legs regardless of which of the two
+        is meant to be "on top" (e.g. the ball carrier, normally drawn last) -- a rare case, and
+        harmless since it only affects the few pixels where two players' sprites directly overlap."""
+        if not self._sprites_enabled:
+            return
+        cam = self.camera
+        for player in players:
+            pos = cam.world_to_screen(player.position.x, player.position.y)
+            radius_px = self._player_radius_px(player)
+            colour = self._player_draw_colour(player)
+            is_inactive = player.state == PlayerState.INACTIVE_TACKLED
+            self._draw_player_legs_sprite(surface, player, pos, radius_px, colour, is_inactive)
 
     def draw_player_rings(
         self, surface: pygame.Surface, players: Sequence[Player], selected_id: str | None = None,
@@ -1807,8 +1977,17 @@ class Renderer:
                 self._draw_ring(surface, style.SELECTED_OUTLINE, pos, radius_px + 7, 2, alpha)
 
     def _player_radius_px(self, player: Player) -> int:
+        """The player's on-screen radius. Same sub-linear floor-growth idea as `_ball_base_radius_px`
+        (`Camera.zoom_scale ** self._size_floor_zoom_decay`, not a flat `zoom_scale`): a player is
+        physically bigger than the ball (0.3m vs 0.11m) so overtakes its OWN floor sooner regardless,
+        but without the shared decay exponent the two would converge to true scale at noticeably
+        different zooms, briefly looking wrong-sized relative to EACH OTHER during the transition
+        (this is what the docstring on `Camera.zoom_scale` warns a naive fix could cause -- a truly
+        FIXED, non-zoom-scaled floor would make that worse still, not better, since the player would
+        then race away toward true scale almost immediately while the ball stayed floor-locked)."""
         cam = self.camera
-        return int(max(self.min_player_radius_px * cam.zoom_scale, cam.scale_length(player.radius_m)))
+        floor_px = self.min_player_radius_px * cam.zoom_scale ** self._size_floor_zoom_decay
+        return int(max(floor_px, cam.scale_length(player.radius_m)))
 
     def draw_player_shadows(self, surface: pygame.Surface, players: Sequence[Player]) -> None:
         """Every player's ground shadow, in one pass (call it BEFORE drawing any sprite -- see
@@ -1874,7 +2053,7 @@ class Renderer:
         return sprite
 
     def draw_player(
-        self, surface: pygame.Surface, player: Player, action_icon: str | None = None,
+        self, surface: pygame.Surface, player: Player, action_icon: str | None = None, *, legs: bool = True,
     ) -> None:
         """Draws one player. Per the design spec:
         - goalkeepers are drawn in a distinct orange colour rather than
@@ -1891,15 +2070,18 @@ class Renderer:
           still faintly visible.
         - `action_icon`: if set, a small emoji/text label is drawn above the
           player for the configured linger duration (tracked by app.py).
+        - `legs`: True (default) draws the WHOLE sprite, legs and upper body together, as one
+          image -- the usual choice for a standalone call (e.g. every test in this file). False
+          draws ONLY the upper body (arms/shoulders/torso/head), because the legs were already
+          drawn earlier by `draw_player_legs`, in the shared pass under the ball -- this is what
+          `App._draw_match` passes, via `draw_pitch_and_ball`, so the ball reads as resting at a
+          nearby player's feet rather than flatly on top of or under their whole figure. Ignored
+          with sprites disabled (the flat-circle fallback has no legs/upper split).
         """
         cam = self.camera
         pos = cam.world_to_screen(player.position.x, player.position.y)
         radius_px = self._player_radius_px(player)
-
-        if player.is_goalkeeper:
-            colour = style.GOALKEEPER_COLOUR
-        else:
-            colour = style.TEAM_LEFT_COLOUR if player.team == Team.LEFT else style.TEAM_RIGHT_COLOUR
+        colour = self._player_draw_colour(player)
 
         is_inactive = player.state == PlayerState.INACTIVE_TACKLED
 
@@ -1923,7 +2105,10 @@ class Renderer:
                 pygame.draw.aaline(surface, style.SPEED_LINE_COLOUR, (sx, sy), (ex, ey))
 
         if self._sprites_enabled:
-            self._draw_player_sprite(surface, player, pos, radius_px, colour, is_inactive)
+            if legs:
+                self._draw_player_sprite(surface, player, pos, radius_px, colour, is_inactive)
+            else:
+                self._draw_player_upper_sprite(surface, player, pos, radius_px, colour, is_inactive)
         elif is_inactive:
             # Draw on a small per-pixel-alpha surface so the player reads as
             # translucent rather than a flat grey substitute colour.

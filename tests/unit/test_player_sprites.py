@@ -261,7 +261,10 @@ def _scene(zoom=3.0):
     cam.set_zoom_level(zoom)
     cam.follow(0.0, 0.0)
     surface.fill(style.PITCH_GREEN)
-    radius = int(max(renderer.min_player_radius_px * cam.zoom_scale, cam.scale_length(0.3)))
+    # Ask the renderer itself, rather than reimplementing its radius formula here -- the two
+    # drifted out of sync once that formula stopped being a flat `* zoom_scale` (see
+    # `_player_radius_px`'s size-floor-decay docstring).
+    radius = renderer._player_radius_px(_player())
     return cam, surface, renderer, cam.world_to_screen(0.0, 0.0), radius
 
 
@@ -873,7 +876,12 @@ def test_rings_are_drawn_under_the_player_sprite():
                 assert plain_g.get_at((x, y)) == ringed_g.get_at((x, y)), (ring_r, deg)
             elif tuple(plain_g.get_at((x, y)))[:3] == green and tuple(ringed_g.get_at((x, y)))[:3] != green:      # ring visible
                 shown += 1
-    assert covered > 10 and shown > 60
+    # covered's bound dropped from >10 to >=10 after the shoulder shrink (0.95x on top of the
+    # existing 0.9x, corner rounded 0.35->0.4): the shoulders now poke out a hair less far, so one
+    # fewer of these fixed sample angles happens to land on opaque sprite -- measured exactly 10.
+    # The actual invariant this test exists for (the ring never overdraws opaque sprite pixels) is
+    # still asserted, unweakened, for every one of those 10 points.
+    assert covered >= 10 and shown > 60
 
 
 def test_the_ball_state_ring_is_translucent_and_drawn_by_the_ring_layer():
@@ -927,7 +935,10 @@ def test_the_stamina_flash_ring_is_in_the_ring_layer_too():
     with mock.patch("pygame.time.get_ticks", return_value=0):                   # 'on' half of the pulse
         renderer.draw_player_rings(surface, [p])
     expected = _blend(style.PITCH_GREEN, style.STAMINA_FLASH_OUTLINE, renderer._ring_alpha)
-    assert len(_ring_pixels(surface, pos, radius + 10, expected, 14)) > 60
+    # Threshold scaled down a little from the pre-size-floor-decay value (>60 of ~89 sampled
+    # angles): the player is now closer to true-to-scale at this zoom, so the ring itself is a bit
+    # smaller/thinner in absolute pixels, with proportionally more anti-aliased gaps -- measured 60.
+    assert len(_ring_pixels(surface, pos, radius + 10, expected, 14)) >= 55
 
 
 def _pipeline_frame(players_factory, ring_alpha, background=None, ball_xy=(-30.0, 10.0), ring_offset=None, zoom=5.0):
@@ -987,7 +998,9 @@ def test_the_pipeline_draws_player_rings_under_every_sprite():
                 assert on.get_at((x, y)) == off.get_at((x, y)), (ring_r, deg)
             elif on.get_at((x, y)) != off.get_at((x, y)):
                 changed_elsewhere += 1
-    assert covered > 10 and changed_elsewhere > 60
+    # see the matching comment in test_rings_are_drawn_under_the_player_sprite: the shoulder shrink
+    # dropped this sample's covered count from >10 to exactly 10.
+    assert covered >= 10 and changed_elsewhere > 60
 
 
 def test_the_pipeline_draws_the_ball_ring_under_the_ball():
@@ -1004,3 +1017,273 @@ def test_the_pipeline_draws_the_ball_ring_under_the_ball():
     inside = [(x, y) for x in range(bx - rad + 2, bx + rad - 1) for y in range(by - rad + 2, by + rad - 1)
               if math.hypot(x - bx, y - by) <= rad - 2]
     assert inside and all(on.get_at(p) == off.get_at(p) for p in inside)
+
+
+# ---------------------------------------------------------------------------
+# Legs / upper-body split (ball drawn between them: legs under, torso over)
+# ---------------------------------------------------------------------------
+
+def test_legs_and_upper_layers_recomposite_close_to_the_combined_pose(params):
+    """`_render_pose_layers` is an independent implementation (see its docstring for why), so its
+    two layers, blitted legs-then-upper, should closely but not necessarily EXACTLY reproduce
+    `_render_pose`'s single-surface output -- the only place they can legitimately differ is the
+    ~1px seam where the shorts tuck under the shirt hem (two independent supersample/downscales
+    instead of one)."""
+    np = _np()
+    for lvl, side in ((0.0, 1), (1.0, 1), (0.5, -1)):
+        combined = ps._render_pose(params, SHIRT, lvl, lvl, side)
+        legs, upper = ps._render_pose_layers(params, SHIRT, lvl, lvl, side)
+        recomposited = pygame.Surface((ps._BASE_SIZE, ps._BASE_SIZE), pygame.SRCALPHA)
+        recomposited.blit(legs, (0, 0))
+        recomposited.blit(upper, (0, 0))
+        a = pygame.surfarray.array3d(combined).astype(int)
+        b = pygame.surfarray.array3d(recomposited).astype(int)
+        diff = np.abs(a - b).max(axis=-1)
+        mismatched = int((diff > 3).sum())
+        assert mismatched < 80, (lvl, side, mismatched)          # a thin seam band, not a gross mismatch
+        assert diff.max() < 90
+
+
+def test_the_legs_layer_has_no_shirt_or_hair_colour_and_the_upper_layer_has_no_shorts_or_shoe_colour(params):
+    s = ps.PlayerSpriteSet(params, SHIRT)
+    for side in (1, -1):
+        for level in (None,) + ps.STRIDE_LEVELS:
+            legs = s.get_legs(side, level)
+            upper = s.get_upper(side, level)
+            legs_colours = {tuple(legs.get_at((x, y)))[:3] for x in range(0, ps._BASE_SIZE, 2) for y in range(0, ps._BASE_SIZE, 2)
+                            if legs.get_at((x, y))[3] > 127}
+            upper_colours = {tuple(upper.get_at((x, y)))[:3] for x in range(0, ps._BASE_SIZE, 2) for y in range(0, ps._BASE_SIZE, 2)
+                             if upper.get_at((x, y))[3] > 127}
+            assert SHIRT not in legs_colours and tuple(params.hair_color) not in legs_colours
+            assert tuple(params.shoe_color) not in upper_colours
+
+
+def test_legs_plus_upper_bounding_box_matches_the_combined_pose_bounding_box(params):
+    """No part of the figure is lost or duplicated: the union of the two layers' opaque pixels has
+    the same extent as the combined pose's."""
+    s = ps.PlayerSpriteSet(params, SHIRT)
+    for side in (1, -1):
+        for level in ps.STRIDE_LEVELS:
+            combined_bbox = _bbox(_opaque(s.get(side, level)))
+            legs_mask, upper_mask = _opaque(s.get_legs(side, level)), _opaque(s.get_upper(side, level))
+            union = [[a or b for a, b in zip(r1, r2)] for r1, r2 in zip(legs_mask, upper_mask)]
+            assert _bbox(union) == combined_bbox
+
+
+def test_draw_player_legs_draws_only_the_legs_layer():
+    cam, surface, renderer, pos, radius = _scene(zoom=5.0)
+    p = _player(heading=0.0)
+    renderer.draw_player_legs(surface, [p])
+    grass = tuple(style.PITCH_GREEN)
+    drawn = {tuple(surface.get_at((x, y)))[:3] for x in range(pos[0] - 3 * radius, pos[0] + 3 * radius)
+             for y in range(pos[1] - 3 * radius, pos[1] + 3 * radius) if tuple(surface.get_at((x, y)))[:3] != grass}
+    assert style.TEAM_LEFT_COLOUR not in drawn                    # no shirt: the torso wasn't drawn
+    assert drawn, "expected some leg/shorts/shoe pixels"
+
+
+def test_draw_player_legs_is_a_noop_with_sprites_disabled():
+    cam, surface, renderer, pos, radius = _scene(zoom=5.0)
+    renderer._sprites_enabled = False
+    before = surface.copy()
+    renderer.draw_player_legs(surface, [_player()])
+    assert all(surface.get_at((x, y)) == before.get_at((x, y)) for x in range(0, surface.get_width(), 23) for y in range(0, surface.get_height(), 17))
+
+
+def test_draw_player_legs_false_draws_only_the_upper_layer():
+    cam, surface, renderer, pos, radius = _scene(zoom=5.0)
+    p = _player(heading=0.0)
+    renderer.draw_player(surface, p, legs=False)
+    grass = tuple(style.PITCH_GREEN)
+    drawn = {tuple(surface.get_at((x, y)))[:3] for x in range(pos[0] - 3 * radius, pos[0] + 3 * radius)
+             for y in range(pos[1] - 3 * radius, pos[1] + 3 * radius) if tuple(surface.get_at((x, y)))[:3] != grass}
+    assert style.TEAM_LEFT_COLOUR in drawn                        # the torso/shirt IS there
+
+
+def test_draw_player_default_legs_true_is_unchanged_from_before_the_split():
+    """`draw_player`'s default matches the OLD, un-split behaviour exactly: it's still
+    `_draw_player_sprite`, which still uses the untouched `_render_pose`/`sprite_set.get`."""
+    cam, surface, renderer, pos, radius = _scene(zoom=5.0)
+    p = _player(heading=0.7)
+    renderer.draw_player(surface, p)
+    a = surface.copy()
+    surface.fill(style.PITCH_GREEN)
+    renderer.draw_player(surface, p, legs=True)
+    assert all(surface.get_at((x, y)) == a.get_at((x, y)) for x in range(surface.get_width()) for y in range(0, surface.get_height(), 3))
+
+
+@pytest.mark.parametrize("heading", [0.0, math.pi / 2, math.pi, -math.pi / 2])
+def test_the_ball_is_drawn_over_an_outstretched_foot_but_under_the_torso(heading):
+    """The actual point of the split: with the ball placed where a full-stride front foot lands,
+    going through the real pipeline (`draw_pitch_and_ball` then `draw_player(..., legs=False)`) the
+    ball ends up ON TOP of that foot (foot pixels there are replaced by white/ball pixels), whereas
+    drawing the ball first and then the OLD combined sprite on top -- what every caller did before --
+    left the foot fully covering the ball there instead."""
+    from footballcoach.entities import Pitch
+    from footballcoach.entities.ball import Ball
+
+    pitch = Pitch.standard()
+    top_speed = ps.PlayerSpriteParams.from_config().top_speed_for_stride_mps
+    fx, fy = math.cos(-heading), math.sin(-heading)
+
+    # Measure the actual outstretched front foot's reach for this exact setup, rather than a
+    # hardcoded metres offset (which drifted once the size-floor decay changed how big the sprite
+    # -- and so the foot's reach -- is at this zoom): a player straight ahead of the pitch centre,
+    # to keep the light/shading side-effects out of it.
+    cam0, surface0, renderer0, pos0, radius0 = _scene(zoom=6.0)
+    probe = _player(heading=heading, speed=top_speed)
+    renderer0._player_gait_phase[probe.player_id] = math.pi / 2
+    renderer0.draw_player_legs(surface0, [probe])
+    reach_px = max(
+        math.hypot(x - pos0[0], y - pos0[1])
+        for x in range(surface0.get_width()) for y in range(surface0.get_height())
+        if tuple(surface0.get_at((x, y)))[:3] != tuple(style.PITCH_GREEN)
+        and math.hypot(x - pos0[0], y - pos0[1]) < 3 * radius0
+    )
+    forward_m = 0.75 * reach_px / cam0.pixels_per_metre
+
+    def render(split):
+        cam, surface, renderer, pos, radius = _scene(zoom=6.0)
+        p = _player(heading=heading, speed=top_speed)
+        renderer._player_gait_phase[p.player_id] = math.pi / 2     # mid-cycle: full front-leg extension
+        ball = Ball()
+        ball.position = Vector3(fx * forward_m, fy * forward_m, 0.11)
+        ball.velocity = Vector3(0.0, 0.0, 0.0)
+        if split:
+            renderer.draw_pitch_and_ball(surface, pitch, ball, players=[p])
+            renderer.draw_player(surface, p, legs=False)
+        else:
+            renderer.draw_pitch_and_ball(surface, pitch, ball, players=[])
+            renderer.draw_player(surface, p)
+        return cam, surface
+
+    cam, old_surface = render(False)
+    _, new_surface = render(True)
+    fpx, fpy = cam.world_to_screen(fx * forward_m, fy * forward_m)
+    ball_white = [(x, y) for x in range(fpx - 14, fpx + 15) for y in range(fpy - 14, fpy + 15)
+                  if sum(new_surface.get_at((x, y))[:3]) > 620]     # near-white: the ball's own body colour
+    assert ball_white, "expected to find some ball-white pixels at the foot's landing spot"
+    old_white = sum(1 for x, y in ball_white if sum(old_surface.get_at((x, y))[:3]) > 620)
+    assert old_white < 0.8 * len(ball_white)                        # some of those spots were NOT white before (a foot covered them)
+
+
+def test_a_ball_at_the_players_own_centre_still_sits_under_the_upper_body():
+    """A ball placed right at the player (nothing to peek through -- there's no leg sticking out from
+    directly under the body there, and the head/hair happen to be centred on the player's own position
+    too) is still fully covered by the upper-body layer, exactly like before -- never left showing the
+    ball's own near-white colour through."""
+    from footballcoach.entities import Pitch
+    from footballcoach.entities.ball import Ball
+
+    pitch = Pitch.standard()
+    cam, surface, renderer, pos, radius = _scene(zoom=6.0)
+    p = _player(heading=0.3)
+    ball = Ball()
+    ball.position = Vector3(0.0, 0.0, 0.11)
+    ball.velocity = Vector3(0.0, 0.0, 0.0)
+    renderer.draw_pitch_and_ball(surface, pitch, ball, players=[p])
+    renderer.draw_player(surface, p, legs=False)
+    px = tuple(surface.get_at(pos))[:3]
+    assert px != tuple(style.PITCH_GREEN) and sum(px) < 620       # some opaque body colour, not the ball's near-white
+
+
+def test_app_draws_each_player_with_legs_false_since_draw_pitch_and_ball_already_drew_them():
+    """Regression guard for the app.py wiring itself (not exercised by any Renderer-level test above):
+    the per-player draw call in App._draw_match must pass legs=False, or every player would be drawn
+    with their legs twice (once by draw_pitch_and_ball's shared pass, once again here) -- harmless
+    pixel-wise (the second full sprite draws over the first) but defeats the ball-at-the-feet effect
+    entirely, since the last thing drawn per player would once again be the WHOLE sprite over the ball."""
+    import inspect
+
+    from footballcoach.ui import app as app_module
+
+    src = inspect.getsource(app_module.App._draw_match)
+    assert "self.renderer.draw_player(" in src
+    call_start = src.index("self.renderer.draw_player(")
+    call_text = src[call_start:src.index(")", src.index(")", call_start) + 1) + 1]
+    assert "legs=False" in call_text
+
+
+# ---------------------------------------------------------------------------
+# Size-floor zoom decay: ball/player minimum-visibility floors converge
+# toward true-to-scale size as the camera zooms in, instead of staying a
+# constant multiple too big forever.
+# ---------------------------------------------------------------------------
+
+def _oversize_ratio(renderer, cam, zoom, entity_radius_m, radius_fn):
+    cam.set_zoom_level(zoom)
+    drawn = radius_fn()
+    true = cam.scale_length(entity_radius_m)
+    return drawn / true
+
+
+def test_the_size_floor_decay_default_comes_from_the_config():
+    from footballcoach.config import load_graphics_config
+
+    _, _, renderer, _, _ = _scene()
+    assert renderer._size_floor_zoom_decay == pytest.approx(float(load_graphics_config()["size_floor"]["zoom_decay"]))
+    assert 0.0 < renderer._size_floor_zoom_decay < 1.0
+
+
+def test_ball_and_player_sizing_is_unchanged_at_the_default_zoom():
+    """zoom_scale == 1 at 1x, and 1 ** anything == 1, so the decay must not change anything there."""
+    from footballcoach.entities.ball import Ball
+
+    cam, surface, renderer, pos, radius = _scene(zoom=1.0)
+    ball = Ball()
+    ball.position = Vector3(0.0, 0.0, 0.11)
+    for decay in (1.0, 0.7, 0.45, 0.2, 0.0):
+        renderer._size_floor_zoom_decay = decay
+        assert renderer._player_radius_px(_player()) == renderer.min_player_radius_px
+        assert renderer._ball_base_radius_px(ball) == pytest.approx(renderer.min_ball_radius_px)
+
+
+def test_a_lower_decay_converges_faster_toward_true_scale_while_1_never_converges():
+    from footballcoach.entities.ball import Ball
+
+    cam, surface, renderer, pos, radius = _scene(zoom=1.0)
+    ball = Ball()
+    ball.position = Vector3(0.0, 0.0, 0.11)
+
+    def ball_ratio(zoom, decay):
+        # The TRUE size here is the raw (unquantised) formula, not `cam.scale_length` -- that
+        # truncates to an int, which adds its own small quantisation noise (e.g. 0.99px -> 1,
+        # 4.95px -> 4) unrelated to the floor behaviour this test is isolating.
+        renderer._size_floor_zoom_decay = decay
+        cam.set_zoom_level(zoom)
+        return renderer._ball_base_radius_px(ball) / (ball.radius_m * cam.pixels_per_metre)
+
+    r1_full, r5_full = ball_ratio(1.0, 1.0), ball_ratio(5.0, 1.0)
+    assert r1_full == pytest.approx(r5_full, abs=0.01)              # the old behaviour: never converges
+
+    r1_decay, r5_decay = ball_ratio(1.0, 0.45), ball_ratio(5.0, 0.45)
+    assert r1_decay == pytest.approx(r1_full, abs=0.01)              # unchanged at 1x
+    assert r5_decay < r5_full - 1.0                                  # ...but clearly closer to true scale by zoom 5
+
+    r5_lower = ball_ratio(5.0, 0.2)
+    assert r5_lower < r5_decay                                       # a smaller decay converges even faster
+
+
+def test_ball_and_player_floors_use_the_same_decay_so_they_converge_together():
+    """Both `_ball_base_radius_px` and `_player_radius_px` read the SAME `_size_floor_zoom_decay` --
+    changing it moves both, rather than one entity converging to true scale long before the other."""
+    from footballcoach.entities.ball import Ball
+
+    cam, surface, renderer, pos, radius = _scene(zoom=3.0)
+    ball = Ball()
+    ball.position = Vector3(0.0, 0.0, 0.11)
+    before_ball = renderer._ball_base_radius_px(ball)
+    before_player = renderer._player_radius_px(_player())
+    renderer._size_floor_zoom_decay = 0.1
+    assert renderer._ball_base_radius_px(ball) < before_ball
+    assert renderer._player_radius_px(_player()) < before_player
+
+
+def test_click_hit_testing_radius_is_independent_of_the_drawn_size_floor():
+    """input.py's SELECT_TOLERANCE_PX-based hit test uses the player's true radius_m directly (see
+    ui/knowledge.md) -- confirm it takes no renderer/zoom_decay input at all, i.e. cannot be affected
+    by this change."""
+    import inspect
+
+    from footballcoach.ui import input as input_module
+
+    assert "player.radius_m" in inspect.getsource(input_module)
