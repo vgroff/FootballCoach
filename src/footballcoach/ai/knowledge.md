@@ -2057,3 +2057,77 @@ parameter dropped, nothing else touched; `--checkpoint <reset>.pt --checkpoint-d
 * Run 304's log-kappa growth showed no detectable dependence on ent_coef (0.0047 -> 0.0019), so the entropy lever at weight 1 is weak; the
   value 8 is a first setting, tune from the observed log-kappa growth per checkpoint (~0.011 before).
 * The eval "original" opponent is always the run's own checkpoint1.pt, so `vs neural:original` restarts from the reset policy in run 305.
+
+## kick_power/kick_dir sharpening, `ent_kick_power_only_weight`/`ent_kick_dir_only_weight`, and the `p_kick` detach (2026-09-22, run 305 -> 306 -> 307)
+
+**What run 305 -> 306 showed.** `ent_move_dir_weight` 8 -> 10 worked: over run 306 (checkpoint1 -> 135, weight 10, `ent_coef` flat
+at its 0.001 floor the whole run) move_dir log-kappa drift was ~+0.00056/checkpoint, essentially flat (was +0.0055-0.0063/checkpoint at
+weight 8). But the run's own main-group grad-clip share still climbed 6% -> 19% over that time, i.e. the SAME collateral-clipping
+mechanism that motivated the move_dir reset was still active, just via a different head: `kick_power_log_std` shrank fast (sigma 0.34 ->
+0.15 over run 306 alone; entropy crossed from +0.011 to -0.004, i.e. differential entropy went negative), and `kick_dir_log_kappa` roughly
+doubled (7.6 -> 14.8, log-kappa drift ~+0.0056/checkpoint -- almost exactly move_dir's rate at weight 8 before that needed raising).
+`kick_power`'s per-head KL was still ACCELERATING at the end of the run (0.0098 -> 0.0365, not levelling off), unlike kick_dir's milder,
+steadier climb (0.0071 -> 0.0178) -- the qualitative "still experimenting with kicks, mixed success" read from watching play matched this:
+kick_power hadn't settled.
+
+**Why `kick_power_log_std` (unlike `kick_dir_log_kappa`) causes collateral damage.** The isolated `direction_max_grad_norm` clip group
+(`ppo_trainer.py` __init__, ~line 1876) is built from named params: `move_direction.*` / `move_dir_log_kappa` / `kick_direction.*` /
+`kick_dir_log_kappa` / `kick_dir_z_log_std`. `kick_power_log_std` (and its head's mean-predicting weight) is NOT in that set -- it's a
+raw `nn.Parameter` attribute of `ExecutionNetwork`, not caught by the `named_parameters()` prefix/name checks, so it sits in the "main"
+clip group with the trunk and every other head. Its backprop through the shared trunk inflates the main group's shared norm exactly like
+move_dir's did in run 304, and the SAME clip factor then shrinks exec_move/sprint/tackle/value's gradients too. User's call: fix this on
+the entropy side (slow the actual sharpening), not by moving `kick_power_log_std` into the isolated clip group.
+
+**Why `ent_kick_weight` (already boosting kick_power's entropy, at 6.0) didn't stop it.** Its `p_kick = sigmoid(kick_logit).mean()`
+gating factor is NOT detached (`ppo_trainer.py` `_compute_entropy`, ~line 10763 pre-change) -- unlike `ent_move_dir_weight`'s
+`p_exec_move.detach()`. So `ent_kick_weight`'s extra boost sends gradient into BOTH the spread parameter (`kick_power_log_std`/
+`kick_dir_log_kappa`) AND `kick_logit` itself. That's deliberate for `ent_kick_weight`'s original purpose (added because the kick gate's
+own probability was collapsing early in training, starving `kick_dir`/`kick_power` of any masked-training rows at all -- one of its three
+summed terms, the kick gate's own entropy, is squarely meant to push `p(kick)` up). It's the wrong tool for slowing an already-stable
+gate's spread parameters specifically, since the network can "cheat" the bonus by raising `p(kick)` instead of actually widening the
+spread -- entangling two different decisions (whether to kick vs. how precisely).
+
+**`ppo.ent_kick_power_only_weight` / `ppo.ent_kick_dir_only_weight`** (both default 1.0 = off): same `ent_move_dir_weight` pattern, one
+per kick head. Detach only the `sigmoid(kick_logit)` factor of the (E[kick]-weighted) gating term -- `opp_masks["kick"]` itself already
+carries no gradient (an env-recorded flag, not a network output) so only the sigmoid needs it -- so the boost reaches ONLY
+`kick_power_log_std`, or only `kick_dir_log_kappa`/`kick_dir_z_log_std`, never `kick_logit`. Implementation needed the raw (un-gated,
+UNREDUCED per-row) entropy tensors of both heads as new intermediates (`_h_kick_dir_raw`/`_h_kick_power_raw` in `_compute_entropy`)
+because the masked branch's weighting is `mean(_w_kick * entropy_per_row)`, not `mean(_w_kick) * mean(entropy_per_row)` -- those differ
+whenever the per-row gate varies, so the detached-gate boost has to reproduce the exact same per-row-weighted-then-meaned structure, not
+a simplified scalar product. Gradient sign note (caught while writing the test, easy to get backwards): `kick_power_log_std` and
+`kick_dir_z_log_std` are plain Gaussian-family scale parameters, entropy = log_std + const, so it INCREASES with the parameter -- the
+raw `d(boost)/d(log_std)` is POSITIVE (opposite sign from `move_dir_log_kappa`/`kick_dir_log_kappa`, which are concentration parameters
+where entropy DECREASES as the parameter rises, so their boost gradient is negative). Both signs correctly result in the parameter moving
+toward MORE spread under gradient ascent on the boost (which is what the trainer's `-ent_coef*boost` loss term produces) -- the sign
+difference is just which raw parameterization the head uses, not a bug. Tests: `tests/ai_unit/test_kick_power_dir_only_entropy_weight.py`
+(11 tests, unmasked + masked branches; mutation-checked by hand: removing `p_kick.detach()` makes the kick_logit-isolation test fail with
+a nonzero `kick_logit.weight.grad`).
+
+**Run 307 recipe** (continues from run 306's final checkpoint135, step 752,341,801):
+* `ent_kick_power_only_weight` 8.0 (first guess, same order as move_dir's initial pick, since kick_power's KL was accelerating not just
+  elevated), `ent_kick_dir_only_weight` 5.0 (lower, since kick_dir's drift was milder and not accelerating). Tune both from observed
+  drift, same process as move_dir's weight was tuned across runs 305/306.
+* `kick_power_log_std` reset (widen sigma back up a bit from its 0.1466 end-of-run-306 value; user confirmed direction: widen, analogous
+  to the move_dir kappa reset, not sharpen further) -- sized via `kick_power_sigma_sweep.py` (seeded eval vs rules of checkpoint135 with
+  only `kick_power_log_std` overridden, everything else untouched; same pattern as `kappa_sweep.py`). `run_seeded_evaluation_batched` here
+  is single-process (batches across `envs_per_process` within one process, no `n_workers`) -- ~225s per setting at 115 seeds x 20 repeats
+  x 2 sides = 4600 episodes, not a hang despite the long silent gap between print lines.
+* `eval.eval_n_seeds` 130 -> 115, `eval.eval_repeats_per_seed` 5 -> 4 (920 episodes/comparison now, was 1300) and
+  `eval.neural_snapshot_lookbacks` dropped the `5` entry, keeping `[1, 0.5]` -- see the neural-snapshot-lookback fractional-entry note
+  below; done together to keep the added `0.5_back` comparison's cost roughly neutral against the trimmed seed budget.
+* Before launching: a 5-rollout PPG value refit (`train.py --ppg-refit-only --ppg-num-rollouts 5` against the sigma-reset checkpoint) --
+  the value function was fit against the old, sharper kick_power policy's return distribution, so this recalibrates V(s)/the trunk to the
+  reset policy under a KL-anchor before resuming full PPO, without a full pretrain_value() run.
+* `ent_coef` re-based flat again (same reasoning as the 305 -> 306 transition: it was already at its 0.001 floor for run 306's whole back
+  half, so `ent_coef_start = ent_coef_end = 0.001` rather than re-deriving a schedule -- there's nothing left to anneal).
+
+## Fractional `eval.neural_snapshot_lookbacks` entries (2026-09-22)
+
+A non-integer entry in `eval.neural_snapshot_lookbacks` (e.g. `0.5`) is a FRACTION of the run's checkpoint count so far, not a fixed
+number of rollouts back: target checkpoint = `current_count - round(k * current_count)`. `0.5` therefore always compares against the
+checkpoint sitting at the run's current halfway point -- a target that moves forward as the run progresses, unlike a fixed lookback
+(`1`, `5`, ...) whose usefulness as a *signal* fades once the run is much longer than that fixed distance. Whole-number entries (`1`,
+`5`, or even a whole-number float like `2.0`) keep the exact original fixed-lookback behaviour. See `_resolve_snapshot_lookback()` in
+`ppo_trainer.py` (a pure, directly-testable helper extracted from `_maybe_run_neural_snapshot_eval`) and
+`tests/ai_unit/test_neural_snapshot_lookback.py`. The label in logs/graphs keeps the CONFIGURED fraction (`"0.5_back"`), not the drifting
+computed distance, so it groups consistently across a whole run despite the underlying checkpoint number changing every time.

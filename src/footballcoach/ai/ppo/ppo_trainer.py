@@ -1034,6 +1034,33 @@ def outcome_breakdown(outcomes: list[str]) -> str:
     return "/".join(parts)
 
 
+def _resolve_snapshot_lookback(k: int | float, current_count: int) -> tuple[str, int] | None:
+    """Turn one ``eval.neural_snapshot_lookbacks`` entry into (label, target checkpoint number),
+    or None if there isn't enough run history yet for it (silently skipped by the caller, same as
+    before this function existed).
+
+    A WHOLE-NUMBER entry (1, 5, 2.0, ...) is a FIXED number of rollouts back: target =
+    current_count - k, label "{k}_back" -- exactly the original behaviour, and int-vs-float typing
+    of an already-integral value doesn't change that (json.load hands back a plain int for "5" and
+    a float for "5.0", and both mean the same fixed lookback here). A NON-integral entry (e.g. 0.5)
+    is instead a FRACTION of the run's checkpoint count so far: target = current_count -
+    round(k * current_count), so e.g. 0.5 always points at the checkpoint sitting at the run's
+    current halfway point -- a target that moves forward as current_count grows, unlike a fixed
+    lookback. The label keeps the CONFIGURED fraction (e.g. "0.5_back"), not the drifting computed
+    distance, so it groups consistently across a whole run's logs/graphs despite the underlying
+    checkpoint number changing every time it's evaluated.
+    """
+    is_fraction = float(k) != int(k)
+    k_effective = round(k * current_count) if is_fraction else int(k)
+    if k_effective < 1:
+        return None
+    target_count = current_count - k_effective
+    if target_count < 1:
+        return None
+    label = f"{k:g}_back" if is_fraction else f"{int(k)}_back"
+    return label, target_count
+
+
 def format_outcomes_with_pct(outcomes: dict) -> str:
     """Format an outcome-count dict as ``{'key': N (P%), ...}`` so relative
     shares are visible in logs alongside the raw counts, without requiring
@@ -1474,6 +1501,11 @@ class PPOTrainer:
         # Extra multiplier on the move_dir entropy bonus in the PPO loss only (on top of ent_dir_weight); 1.0 = today's behaviour exactly.
         # Only reaches move_dir_log_kappa (see _compute_entropy) -- slows the head's sharpening without touching the exec_move gate.
         self.ent_move_dir_weight = float(ppo_cfg.get("ent_move_dir_weight", 1.0))
+        # Same idea as ent_move_dir_weight but for kick_power_log_std / kick_dir_log_kappa+kick_dir_z_log_std specifically: the
+        # kick gate's contribution to their (E[kick]-weighted) entropy bonus is detached, so these boosts only reach the spread
+        # parameter, not kick_logit. See _compute_entropy. 1.0 = today's behaviour exactly for both.
+        self.ent_kick_power_only_weight = float(ppo_cfg.get("ent_kick_power_only_weight", 1.0))
+        self.ent_kick_dir_only_weight = float(ppo_cfg.get("ent_kick_dir_only_weight", 1.0))
         # Lower bound of the executed kick power fraction (0.0 = plain sigmoid).
         self.kick_power_floor = float(ppo_cfg.get("kick_power_floor", 0.0))
         # agent_plans/masked_action_training_plan.md: per-decision "could the action take effect" flags
@@ -1548,9 +1580,15 @@ class PPOTrainer:
         # the same checkpoint_dir -- read fresh each time, nothing extra to
         # keep in memory. 'original' is always checkpoint1.pt.
         self._neural_snapshot_every_n = int(eval_cfg.get("neural_snapshot_eval_every_n_rollouts", 0))
-        self._neural_snapshot_lookbacks: list[int] = [
-            int(k) for k in eval_cfg.get("neural_snapshot_lookbacks", [1, 5, 20])
-        ]
+        # Whole-number entries (1, 5, 20, ...) are a FIXED number of rollouts back, unchanged from
+        # before. A non-integral entry (e.g. 0.5) is a FRACTION of the run's checkpoint count so far
+        # -- see _resolve_snapshot_lookback -- so "0.5" always means "the checkpoint at the run's
+        # current halfway point", a target that moves forward as the run progresses, unlike a fixed
+        # lookback. Kept as whatever type json.load hands back (int or float); the distinction that
+        # matters is made in _resolve_snapshot_lookback, not here.
+        self._neural_snapshot_lookbacks: list[int | float] = list(
+            eval_cfg.get("neural_snapshot_lookbacks", [1, 5, 20])
+        )
         self._nn_snapshot_rollout_count = 0
         self.n_processes = int(ppo_cfg.get("n_processes", 1))
         self.worker_torch_threads = int(ppo_cfg.get("worker_torch_threads", 1))
@@ -3716,15 +3754,17 @@ class PPOTrainer:
     def _maybe_run_neural_snapshot_eval(self, max_episode_s: float) -> None:
         """Every eval.neural_snapshot_eval_every_n_rollouts rollouts: compare
         the CURRENT live policy against the checkpoint saved
-        eval.neural_snapshot_lookbacks[i] rollouts ago, for every entry in
-        that list, plus 'original' (this run's checkpoint1.pt) -- using the
+        eval.neural_snapshot_lookbacks[i] rollouts ago (or, for a float
+        entry, at the corresponding fraction of the run's checkpoint count
+        so far -- see _resolve_snapshot_lookback), for every entry in that
+        list, plus 'original' (this run's checkpoint1.pt) -- using the
         checkpoint FILES _save_checkpoint() already writes every rollout
         regardless of this feature, rather than keeping a separate in-memory
         snapshot ring. Requires self.checkpoint_dir (no-op without one,
         since there's nothing on disk to compare against). Lookbacks with
-        not-yet-enough history (checkpoint count - k < 1) are silently
-        skipped, not logged as failures -- this is expected early in a run
-        and self-resolves as more checkpoints accumulate.
+        not-yet-enough history are silently skipped, not logged as failures
+        -- this is expected early in a run and self-resolves as more
+        checkpoints accumulate.
 
         All comparisons this cycle share ONE throwaway worker pool (spawned
         once here, closed at the end) instead of each
@@ -3745,18 +3785,19 @@ class PPOTrainer:
         current_count = self._checkpoint_count  # _save_checkpoint() already ran this rollout
         comparisons: list[tuple[str, dict]] = []
         for k in self._neural_snapshot_lookbacks:
-            target_count = current_count - k
-            if target_count < 1:
+            resolved = _resolve_snapshot_lookback(k, current_count)
+            if resolved is None:
                 continue
+            label, target_count = resolved
             ckpt_path = self.checkpoint_dir / f"checkpoint{target_count}.pt"
             if not ckpt_path.exists():
                 continue
             try:
                 snapshot = self._load_snapshot_dict_from_checkpoint(ckpt_path)
             except Exception as _e:
-                log.warning(f"  [eval vs neural:{k}_back] failed to load {ckpt_path}: {_e}")
+                log.warning(f"  [eval vs neural:{label}] failed to load {ckpt_path}: {_e}")
                 continue
-            comparisons.append((f"{k}_back", snapshot))
+            comparisons.append((label, snapshot))
 
         # checkpoint1.pt always exists by this point (current_count >= 1 is
         # guaranteed -- _save_checkpoint() already ran this rollout, see the
@@ -10706,7 +10747,9 @@ class PPOTrainer:
         ``None`` = the unmasked formulas below, unchanged.
 
         ``return_kick_boost`` returns the extra bonus terms that only enter the PPO loss (never the logged entropy): the
-        ``ent_kick_weight`` boost on the kick heads plus the ``ent_move_dir_weight`` boost on move_dir.
+        ``ent_kick_weight`` boost on the kick heads, ``ent_move_dir_weight`` on move_dir, and
+        ``ent_kick_power_only_weight`` / ``ent_kick_dir_only_weight`` on kick_power / kick_dir specifically (detached
+        kick-gate weighting, so unlike ``ent_kick_weight`` these never also push on ``kick_logit``).
 
         Args:
             return_breakdown: if True, also return a dict of each head's own
@@ -10764,9 +10807,16 @@ class PPOTrainer:
         h_sprint = p_exec_move * IndependentBernoulli(e_heads.sprint_logit).entropy().mean()
         _h_move_dir_raw = self._move_dir_head(e_heads.move_direction, log_kappa_move).entropy().mean()
         h_move_dir = p_exec_move * self.ent_dir_weight * _h_move_dir_raw
+        # Raw (un-gated) entropy of kick_dir/kick_power, kept UNREDUCED (per-row) here so the
+        # opportunity-weighted mean below (masked branch) can be reproduced exactly for the
+        # detached-gate boosts further down -- mean(w * x) != mean(w) * mean(x) when w varies per
+        # row, so this can't just be a scalar the way _h_move_dir_raw is (move_dir's gate,
+        # p_exec_move, is always a plain batch-mean scalar, never per-row).
+        _h_kick_dir_raw = self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).entropy()
+        _h_kick_power_raw = self._kick_power_head(e_heads.kick_power, log_std_power).entropy()
         if opp_masks is None:
-            h_kick_dir = p_kick * self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).entropy().mean()
-            h_kick_power = p_kick * self.ent_kick_power_weight * self._kick_power_head(e_heads.kick_power, log_std_power).entropy().mean()
+            h_kick_dir = p_kick * self.ent_dir_weight * _h_kick_dir_raw.mean()
+            h_kick_power = p_kick * self.ent_kick_power_weight * _h_kick_power_raw.mean()
             # kick_spin is permanently frozen (see agent_plans/spin_implementation_plan.md
             # section 0) -- its entropy term is masked to exactly zero rather than
             # computed and discarded, same rationale as the log_prob masking above.
@@ -10774,14 +10824,24 @@ class PPOTrainer:
                 torch.zeros((), device=self.device) if self._kick_spin_frozen else
                 p_kick * self.ent_kick_spin_weight * self._kick_spin_dist(e_heads.kick_spin, log_std_spin).entropy().sum(dim=-1).mean()
             )
+            # Detached-gate versions for ent_kick_power_only_weight/ent_kick_dir_only_weight below:
+            # p_kick.detach() has the identical forward value, so these still scale correctly by
+            # "how often kicks happen right now", but carry no gradient into kick_logit.
+            _kick_power_only_raw = p_kick.detach() * self.ent_kick_power_weight * _h_kick_power_raw.mean()
+            _kick_dir_only_raw = p_kick.detach() * self.ent_dir_weight * _h_kick_dir_raw.mean()
         else:
             _w_kick = opp_masks["kick"] * torch.sigmoid(e_heads.kick_logit).reshape(-1) * opp_masks.get("kick_scale", 1.0)
-            h_kick_dir = (_w_kick * self.ent_dir_weight * self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).entropy().reshape(-1)).mean()
-            h_kick_power = (_w_kick * self.ent_kick_power_weight * self._kick_power_head(e_heads.kick_power, log_std_power).entropy().reshape(-1)).mean()
+            h_kick_dir = (_w_kick * self.ent_dir_weight * _h_kick_dir_raw.reshape(-1)).mean()
+            h_kick_power = (_w_kick * self.ent_kick_power_weight * _h_kick_power_raw.reshape(-1)).mean()
             h_kick_spin = (
                 torch.zeros((), device=self.device) if self._kick_spin_frozen else
                 (_w_kick * self.ent_kick_spin_weight * self._kick_spin_dist(e_heads.kick_spin, log_std_spin).entropy().sum(dim=-1).reshape(-1)).mean()
             )
+            # opp_masks["kick"] carries no gradient either way (an env-recorded flag, not a network
+            # output); only the sigmoid(kick_logit) factor needs detaching.
+            _w_kick_detached = opp_masks["kick"] * torch.sigmoid(e_heads.kick_logit).detach().reshape(-1) * opp_masks.get("kick_scale", 1.0)
+            _kick_power_only_raw = (_w_kick_detached * self.ent_kick_power_weight * _h_kick_power_raw.reshape(-1)).mean()
+            _kick_dir_only_raw = (_w_kick_detached * self.ent_dir_weight * _h_kick_dir_raw.reshape(-1)).mean()
         ent += h_sprint + h_move_dir + h_kick_dir + h_kick_power + h_kick_spin
         _bkdn_tensors["sprint"] = h_sprint
         _bkdn_tensors["move_dir"] = h_move_dir
@@ -10797,6 +10857,13 @@ class PPOTrainer:
         # breakdown stay unboosted). p_exec_move is detached: the von Mises entropy depends only on kappa, so this boost pulls
         # move_dir_log_kappa down (slower sharpening) without also pushing the exec_move gate toward "stand still".
         kick_boost = kick_boost + (self.ent_move_dir_weight - 1.0) * p_exec_move.detach() * self.ent_dir_weight * _h_move_dir_raw
+        # ent_kick_power_only_weight / ent_kick_dir_only_weight: same pattern as ent_move_dir_weight, but for the kick heads'
+        # own spread parameters. Unlike ent_kick_weight above (which deliberately also pushes p(kick) itself -- see its
+        # comment -- it was added to stop the kick gate collapsing early), these use the DETACHED kick-gate weighting
+        # (_kick_power_only_raw / _kick_dir_only_raw), so the extra boost reaches only kick_power_log_std, or only
+        # kick_dir_log_kappa/kick_dir_z_log_std, never kick_logit.
+        kick_boost = kick_boost + (self.ent_kick_power_only_weight - 1.0) * _kick_power_only_raw
+        kick_boost = kick_boost + (self.ent_kick_dir_only_weight - 1.0) * _kick_dir_only_raw
         result = [ent]
         if return_breakdown:
             _names = list(_bkdn_tensors.keys())

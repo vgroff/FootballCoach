@@ -14,6 +14,17 @@ def trainer():
     return PPOTrainer.from_config(device=torch.device("cpu"), inference_only=True, separate_value_net=False)
 
 
+@pytest.fixture(autouse=True)
+def _isolate_move_dir_weight(trainer):
+    # ent_move_dir_weight/ent_kick_power_only_weight/ent_kick_dir_only_weight all come from the live
+    # config (non-1.0 since runs 305/307) and would otherwise leak extra boost terms into every "kick
+    # boost" assertion here, which only cares about ent_kick_weight.
+    old = (trainer.ent_move_dir_weight, trainer.ent_kick_power_only_weight, trainer.ent_kick_dir_only_weight)
+    trainer.ent_move_dir_weight, trainer.ent_kick_power_only_weight, trainer.ent_kick_dir_only_weight = 1.0, 1.0, 1.0
+    yield
+    trainer.ent_move_dir_weight, trainer.ent_kick_power_only_weight, trainer.ent_kick_dir_only_weight = old
+
+
 def _heads(trainer, n=16, seed=0):
     torch.manual_seed(seed)
     sf, of, bf, gf = torch.randn(n, 39), torch.randn(n, 21, 39), torch.randn(n, 12), torch.randn(n, 31)
