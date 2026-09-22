@@ -317,10 +317,10 @@ def test_team_and_goalkeeper_colours_are_drawn():
         _centroid_of(surface, pos, radius, colour)          # asserts the shirt colour is present
 
     surface.fill(style.PITCH_GREEN)
-    renderer.draw_player(surface, _player(keeper=True), selected=False)          # public API: keeper in orange
+    renderer.draw_player(surface, _player(keeper=True))          # public API: keeper in orange
     _centroid_of(surface, pos, radius, style.GOALKEEPER_COLOUR)
     surface.fill(style.PITCH_GREEN)
-    renderer.draw_player(surface, _player(team=Team.RIGHT), selected=False)
+    renderer.draw_player(surface, _player(team=Team.RIGHT))
     _centroid_of(surface, pos, radius, style.TEAM_RIGHT_COLOUR)
 
 
@@ -694,7 +694,7 @@ def test_all_shadows_are_drawn_under_every_player_sprite_and_the_ball():
         ball.velocity = Vector3(0.0, 0.0, 0.0)
         renderer.draw_pitch_and_ball(surface, pitch, ball, players=players)
         for pl in players:
-            renderer.draw_player(surface, pl, selected=False)
+            renderer.draw_player(surface, pl)
         return cam, surface
 
     near_centre = _player("a")                       # closer to the middle: its shadow reaches back over `b`
@@ -731,3 +731,276 @@ def test_the_scene_light_is_one_setting_shared_by_ball_and_players():
     renderer._light_height_m = 15.0
     assert renderer._ball_light_angles(ball)[1] < high                # one attribute moves ball and player lighting alike
     assert renderer._point_light_at(40.0, 0.0, 0.9)[1] < el
+
+
+# ---------------------------------------------------------------------------
+# Rings: translucent, in one layer UNDER the players and the ball
+# ---------------------------------------------------------------------------
+
+def test_there_is_no_possession_ring_and_draw_player_draws_no_rings_itself():
+    """The white ring on the ball carrier was removed. All the other rings (selected, first-touch, tackled,
+    low stamina, and the ball's state ring) are drawn by the separate translucent ring layer, not by
+    `draw_player`."""
+    import inspect
+
+    from footballcoach.ui.renderer import Renderer
+
+    params = inspect.signature(Renderer.draw_player).parameters
+    assert "has_ball" not in params and "selected" not in params
+    assert not hasattr(style, "POSSESSION_OUTLINE")
+    assert hasattr(style, "INACTIVE_OUTLINE") and hasattr(style, "CONTROL_DELAY_OUTLINE") and hasattr(style, "SELECTED_OUTLINE")
+    _, _, renderer, _, _ = _scene()
+    assert not hasattr(renderer, "_possession_outline_thickness")
+    assert 0 < renderer._ring_alpha < 255                       # translucent by default
+
+
+def _ring_pixels(surface, pos, radius, colour, tol):
+    """Angles (degrees, skipping the sector below the player where its label and stat bars are) at which the
+    circle of `radius` around `pos` is within `tol` of `colour` on every channel."""
+    hits = []
+    for deg in range(0, 360, 3):
+        if 45 <= deg <= 135:                                   # screen angle: +y is down
+            continue
+        x = pos[0] + radius * math.cos(math.radians(deg))
+        y = pos[1] + radius * math.sin(math.radians(deg))
+        px = surface.get_at((round(x), round(y)))[:3]
+        if all(abs(px[i] - colour[i]) <= tol for i in range(3)):
+            hits.append(deg)
+    return hits
+
+
+@pytest.mark.parametrize("state_name", ["ACTIVE", "INACTIVE_TACKLED"])
+def test_drawing_a_player_never_adds_a_white_possession_ring(state_name):
+    from footballcoach.entities.player import PlayerState
+
+    cam, surface, renderer, pos, radius = _scene(zoom=5.0)
+    p = _player(heading=0.0)
+    p.state = getattr(PlayerState, state_name)
+    renderer.draw_player(surface, p)
+    renderer.draw_player_rings(surface, [p], selected_id=None)
+    assert not _ring_pixels(surface, pos, radius + 2, (255, 255, 255), 2)
+
+
+def _blend(bg, colour, alpha):
+    return tuple(round(bg[i] * (1 - alpha / 255.0) + colour[i] * alpha / 255.0) for i in range(3))
+
+
+def _ring_scene(state=None, selected=False, zoom=5.0, **attrs):
+    from footballcoach.entities.player import PlayerState
+
+    cam, surface, renderer, pos, radius = _scene(zoom)
+    for k, v in attrs.items():
+        setattr(renderer, k, v)
+    p = _player(heading=0.0)
+    if state is not None:
+        p.state = getattr(PlayerState, state)
+    renderer.draw_player_rings(surface, [p], selected_id=p.player_id if selected else None)
+    return cam, surface, renderer, pos, radius, p
+
+
+@pytest.mark.parametrize("state, colour_name, offset", [
+    ("CONTROLLING_BALL", "CONTROL_DELAY_OUTLINE", 4),
+    ("INACTIVE_TACKLED", "INACTIVE_OUTLINE", 4),
+])
+def test_the_state_rings_are_translucent_and_the_tackled_red_ring_is_kept(state, colour_name, offset):
+    cam, surface, renderer, pos, radius, p = _ring_scene(state=state)
+    colour = getattr(style, colour_name)
+    expected = _blend(style.PITCH_GREEN, colour, renderer._ring_alpha)
+    # the ring is 2px wide with outer radius radius+offset: sample its middle
+    hits = _ring_pixels(surface, pos, radius + offset - 1, expected, 14)
+    assert len(hits) > 60                                                  # (a ring all the way round, sector below skipped)
+    assert not _ring_pixels(surface, pos, radius + offset - 1, colour, 14)  # ...and NOT the opaque colour
+
+
+def test_the_selected_ring_is_translucent_and_a_normal_player_has_none():
+    cam, surface, renderer, pos, radius, p = _ring_scene(selected=True)
+    expected = _blend(style.PITCH_GREEN, style.SELECTED_OUTLINE, renderer._ring_alpha)
+    assert len(_ring_pixels(surface, pos, radius + 6, expected, 14)) > 60
+    cam, surface, renderer, pos, radius, p = _ring_scene(selected=False)      # ACTIVE, not selected
+    assert not _ring_pixels(surface, pos, radius + 6, expected, 14)
+    assert all(tuple(surface.get_at((pos[0] + i, pos[1] + j)))[:3] == tuple(style.PITCH_GREEN) for i in range(-3, 4) for j in range(-3, 4))
+
+
+@pytest.mark.parametrize("alpha", [0, 60, 110, 200, 255])
+def test_the_ring_alpha_is_configurable(alpha):
+    cam, surface, renderer, pos, radius, p = _ring_scene(state="INACTIVE_TACKLED", _ring_alpha=alpha)
+    expected = _blend(style.PITCH_GREEN, style.INACTIVE_OUTLINE, alpha)
+    hits = _ring_pixels(surface, pos, radius + 3, expected, 14)
+    if alpha == 0:
+        assert not _ring_pixels(surface, pos, radius + 3, style.INACTIVE_OUTLINE, 60)      # nothing drawn at all
+        assert all(tuple(surface.get_at((pos[0] + radius + 3, pos[1])))[:3] == tuple(style.PITCH_GREEN) for _ in (0,))
+    else:
+        assert len(hits) > 60
+
+
+def test_the_ring_alpha_default_comes_from_the_config():
+    from footballcoach.config import load_graphics_config
+
+    _, _, renderer, _, _ = _scene()
+    assert renderer._ring_alpha == int(load_graphics_config()["rings"]["alpha"])
+
+
+def test_rings_are_drawn_under_the_player_sprite():
+    """A ring lies under the sprite: wherever the sprite is fully opaque (its pixel is the same on two different
+    backgrounds), the picture with the ring layer equals the picture without it; wherever the ring is clear of the
+    sprite, it shows."""
+    from footballcoach.entities.player import PlayerState
+
+    def frame(with_rings, background):
+        cam, surface, renderer, pos, radius = _scene(zoom=5.0)
+        surface.fill(background)
+        renderer._ring_alpha = 255                                     # strong, so any overdraw would be obvious
+        renderer._inactive_alpha = 255                                 # solid sprite
+        p = _player(heading=0.0)
+        p.state = PlayerState.INACTIVE_TACKLED
+        if with_rings:
+            renderer.draw_player_rings(surface, [p], selected_id=p.player_id)
+        renderer.draw_player(surface, p)
+        return surface, pos, radius
+
+    green, magenta = tuple(style.PITCH_GREEN), (255, 0, 255)
+    plain_g, pos, radius = frame(False, green)
+    plain_m, _, _ = frame(False, magenta)
+    ringed_g, _, _ = frame(True, green)
+    covered = shown = 0
+    for ring_r in (radius + 4, radius + 7):                          # the tackled and the selected rings
+        for deg in range(0, 360, 2):
+            if 45 <= deg <= 135:
+                continue
+            x, y = round(pos[0] + ring_r * math.cos(math.radians(deg))), round(pos[1] + ring_r * math.sin(math.radians(deg)))
+            if plain_g.get_at((x, y)) == plain_m.get_at((x, y)) and tuple(plain_g.get_at((x, y)))[:3] != green:   # opaque sprite
+                covered += 1
+                assert plain_g.get_at((x, y)) == ringed_g.get_at((x, y)), (ring_r, deg)
+            elif tuple(plain_g.get_at((x, y)))[:3] == green and tuple(ringed_g.get_at((x, y)))[:3] != green:      # ring visible
+                shown += 1
+    assert covered > 10 and shown > 60
+
+
+def test_the_ball_state_ring_is_translucent_and_drawn_by_the_ring_layer():
+    """`draw_pitch_and_ball` draws the ball's state ring (in the ring layer, under the ball); standalone
+    `draw_ball` draws it too by default and `ring=False` leaves it out. The ring is 1px wide, so it is measured
+    as the pixels that differ from the same frame with the ring switched off."""
+    from footballcoach.entities import Pitch
+    from footballcoach.entities.ball import Ball
+
+    pitch = Pitch.standard()
+    ball = Ball()
+    ball.position = Vector3(0.0, 0.0, 0.11)
+    ball.velocity = Vector3(0.0, 0.0, 0.0)
+
+    def render(show_ring, alpha=200, standalone=None):
+        cam, surface, renderer, pos, radius = _scene(3.0)
+        renderer._ring_alpha = alpha
+        renderer._ring_show_rolling = show_ring
+        if standalone is None:
+            renderer.draw_pitch_and_ball(surface, pitch, ball)
+        else:
+            renderer.draw_ball(surface, ball, ring=standalone)
+        return surface, pos, renderer
+
+    def diff(a, b):
+        return [(x, y) for x in range(a.get_width()) for y in range(a.get_height()) if a.get_at((x, y)) != b.get_at((x, y))]
+
+    on, pos, renderer = render(True)
+    off, _, _ = render(False)
+    ring_r = renderer._ball_draw_radius_px(ball) + renderer._ring_offset_px
+    changed = diff(on, off)
+    assert len(changed) > 40                                                    # the ring is drawn by draw_pitch_and_ball...
+    assert all(abs(math.hypot(x - pos[0], y - pos[1]) - (ring_r - 0.5)) <= 2.0 for x, y in changed)   # ...on its radius
+    weaker = diff(render(True, alpha=60)[0], off)
+    assert weaker and max(sum(abs(a - b) for a, b in zip(render(True, alpha=60)[0].get_at(p)[:3], off.get_at(p)[:3])) for p in weaker) < \
+        max(sum(abs(a - b) for a, b in zip(on.get_at(p)[:3], off.get_at(p)[:3])) for p in changed)          # lower alpha = fainter
+
+    alone_on, _, _ = render(True, standalone=True)
+    alone_off, _, _ = render(True, standalone=False)
+    blank, _, _ = render(False, standalone=True)
+    assert len(diff(alone_on, blank)) > 40 and not diff(alone_off, blank)         # default draws it; ring=False does not
+
+
+def test_the_stamina_flash_ring_is_in_the_ring_layer_too():
+    """Low-stamina players get the pulsing outermost ring from the same translucent layer."""
+    import unittest.mock as mock
+
+    cam, surface, renderer, pos, radius = _scene(zoom=5.0)
+    p = _player()
+    p.stamina = 0.0
+    with mock.patch("pygame.time.get_ticks", return_value=0):                   # 'on' half of the pulse
+        renderer.draw_player_rings(surface, [p])
+    expected = _blend(style.PITCH_GREEN, style.STAMINA_FLASH_OUTLINE, renderer._ring_alpha)
+    assert len(_ring_pixels(surface, pos, radius + 10, expected, 14)) > 60
+
+
+def _pipeline_frame(players_factory, ring_alpha, background=None, ball_xy=(-30.0, 10.0), ring_offset=None, zoom=5.0):
+    """The app's order: draw_pitch_and_ball (shadows, rings, ball), then every player's sprite."""
+    from footballcoach.entities import Pitch
+    from footballcoach.entities.ball import Ball
+
+    pitch = Pitch.standard()
+    cam, surface, renderer, _, radius = _scene(zoom)
+    cam.follow(0.0, 0.0)
+    renderer._ring_alpha = ring_alpha
+    renderer._inactive_alpha = 255
+    if ring_offset is not None:
+        renderer._ring_offset_px = ring_offset
+    ball = Ball()
+    ball.position = Vector3(ball_xy[0], ball_xy[1], 0.11)
+    ball.velocity = Vector3(0.0, 0.0, 0.0)
+    players = players_factory()
+    renderer.draw_pitch_and_ball(surface, pitch, ball, players=players, selected_id=players[0].player_id if players else None)
+    for p in players:
+        renderer.draw_player(surface, p)
+    return cam, surface, renderer, ball, players
+
+
+def test_the_pipeline_draws_player_rings_under_every_sprite():
+    """Through draw_pitch_and_ball then draw_player (the app's order), a ring never lands on top of a sprite:
+    wherever the sprite is opaque the picture is the same with the rings on or off."""
+    from footballcoach.entities.player import PlayerState
+
+    def one():
+        p = _player("a", heading=0.0)
+        p.state = PlayerState.INACTIVE_TACKLED
+        return [p]
+
+    cam, on, renderer, _, players = _pipeline_frame(one, 255)
+    _, off, _, _, _ = _pipeline_frame(one, 0)
+    pos = cam.world_to_screen(0.0, 0.0)
+    radius = renderer._player_radius_px(players[0])
+    # which pixels are opaque sprite: identical when the player is drawn on two different backgrounds
+    def sprite_only(bg):
+        cam2, surface, r2, _, radius2 = _scene(5.0)
+        surface.fill(bg)
+        r2._inactive_alpha = 255
+        p = one()[0]
+        r2.draw_player(surface, p)
+        return surface
+    on_green, on_magenta = sprite_only(style.PITCH_GREEN), sprite_only((255, 0, 255))
+    covered = 0
+    changed_elsewhere = 0
+    for ring_r in (radius + 4, radius + 7):
+        for deg in range(0, 360, 2):
+            if 45 <= deg <= 135:
+                continue
+            x, y = round(pos[0] + ring_r * math.cos(math.radians(deg))), round(pos[1] + ring_r * math.sin(math.radians(deg)))
+            if on_green.get_at((x, y)) == on_magenta.get_at((x, y)) and tuple(on_green.get_at((x, y)))[:3] != tuple(style.PITCH_GREEN):
+                covered += 1
+                assert on.get_at((x, y)) == off.get_at((x, y)), (ring_r, deg)
+            elif on.get_at((x, y)) != off.get_at((x, y)):
+                changed_elsewhere += 1
+    assert covered > 10 and changed_elsewhere > 60
+
+
+def test_the_pipeline_draws_the_ball_ring_under_the_ball():
+    """The ball's state ring is under the ball: with the ring pulled inside the ball's body (a negative
+    offset) the ball's own pixels are the same with the ring on or off."""
+    def none():
+        return []
+
+    ball_xy = (5.0, 3.0)
+    cam, on, renderer, ball, _ = _pipeline_frame(none, 255, ball_xy=ball_xy, ring_offset=-3, zoom=3.0)
+    _, off, _, _, _ = _pipeline_frame(none, 0, ball_xy=ball_xy, ring_offset=-3, zoom=3.0)
+    bx, by = cam.world_to_screen(*ball_xy)
+    rad = renderer._ball_draw_radius_px(ball)
+    inside = [(x, y) for x in range(bx - rad + 2, bx + rad - 1) for y in range(by - rad + 2, by + rad - 1)
+              if math.hypot(x - bx, y - by) <= rad - 2]
+    assert inside and all(on.get_at(p) == off.get_at(p) for p in inside)

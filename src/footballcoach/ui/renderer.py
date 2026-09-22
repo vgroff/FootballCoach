@@ -355,8 +355,10 @@ class Renderer:
         # Pre-render + scale-down cache so we don't do the slow transform every frame.
         self._icon_cache: dict[str, pygame.Surface] = {}
         self.min_player_radius_px: int = gcfg["player"]["min_radius_px"]
-        self._possession_outline_thickness: int = gcfg["player"].get("possession_outline_thickness", 2)
         self._inactive_alpha: int = int(gcfg["player"].get("inactive_alpha", style.INACTIVE_ALPHA))
+        # Opacity of every ring (player state / selection / stamina rings and the ball's state ring); they
+        # are drawn under the players and the ball (see `draw_pitch_and_ball`).
+        self._ring_alpha: int = max(0, min(255, int(gcfg.get("rings", {}).get("alpha", 110))))
         self.min_ball_radius_px: int = gcfg["ball"]["min_radius_px"]
         self._ball_outline: bool = gcfg["ball"].get("outline", False)
         # outline_width_px may be a float: values >= 1 → integer pixel width at full
@@ -1052,6 +1054,7 @@ class Renderer:
 
     def draw_pitch_and_ball(
         self, surface: pygame.Surface, pitch: Pitch, ball: Ball, players: Sequence[Player] = (),
+        selected_id: str | None = None,
     ) -> None:
         """Draws the pitch and the ball with the goal's top layer (roof net,
         posts, crossbar) on the correct side of the ball, for a sense of depth:
@@ -1062,7 +1065,10 @@ class Renderer:
 
         Every ground shadow -- each of ``players``' and the ball's -- is drawn in ONE pass
         right after the pitch's ground layer, i.e. under the goal frame, the ball, and every
-        sprite (a shadow never falls over another player, the ball, or the net)."""
+        sprite (a shadow never falls over another player, the ball, or the net). The translucent
+        RINGS -- every player's state / selection / stamina ring (``selected_id`` is the selected
+        player's id) and the ball's state ring -- come next, still under the goal frame, the ball
+        and every sprite."""
         under = ball_under_goal_frame(
             pitch, ball.position.x, ball.position.y, ball.position.z, ball.radius_m,
         )
@@ -1070,9 +1076,11 @@ class Renderer:
         self.draw_player_shadows(surface, players)
         if self._ball_shadow_enabled:
             self._draw_ball_shadow(surface, ball, self._ball_base_radius_px(ball))
+        self.draw_player_rings(surface, players, selected_id)
+        self._draw_ball_state_ring(surface, ball)
         if not under:
             self.draw_goal_tops(surface, pitch)
-        self.draw_ball(surface, ball, shadow=False)
+        self.draw_ball(surface, ball, shadow=False, ring=False)
         if under:
             self.draw_goal_tops(surface, pitch)
 
@@ -1338,11 +1346,11 @@ class Renderer:
     @classmethod
     def _draw_ring(
         cls, surface: pygame.Surface, colour: tuple[int, int, int],
-        pos: tuple[int, int], outer_radius: int, width: int,
+        pos: tuple[int, int], outer_radius: int, width: int, alpha: int = 255,
     ) -> None:
         """Draws a smooth circular outline (a "ring"/annulus) around a player
-        or the ball (selection/possession/control-delay/stamina-flash/
-        ball-state indicators).
+        or the ball (selection/control-delay/inactive/stamina-flash/
+        ball-state indicators), at overall opacity ``alpha`` (0-255).
 
         This deliberately avoids drawing a single ``pygame.draw.circle(...,
         width=N)`` at game resolution: at the small radii these rings use
@@ -1379,6 +1387,8 @@ class Renderer:
         c = (size * scale) // 2
         pygame.draw.circle(big, colour, (c, c), outer_radius * scale, width * scale)
         small = pygame.transform.smoothscale(big, (size, size))
+        if alpha < 255:
+            small.set_alpha(alpha)
         surface.blit(small, (pos[0] - size // 2, pos[1] - size // 2))
 
     def _ball_dots_layer(
@@ -1451,9 +1461,27 @@ class Renderer:
         cam = self.camera
         return max(self.min_ball_radius_px * cam.zoom_scale, cam.scale_length(ball.radius_m))
 
-    def draw_ball(self, surface: pygame.Surface, ball: Ball, *, shadow: bool = True) -> None:
-        """``shadow=False`` skips the ground shadow: `draw_pitch_and_ball` draws it in the shared
-        shadow pass (under every sprite) instead."""
+    def _ball_draw_radius_px(self, ball: Ball) -> int:
+        """The ball's drawn radius: the enlarged ground radius times the height boost."""
+        height_boost = 1.0 + min(ball.height_m, 5.0) * self._ball_height_boost_per_m
+        return max(2, int(self._ball_base_radius_px(ball) * height_boost))
+
+    def _draw_ball_state_ring(self, surface: pygame.Surface, ball: Ball) -> None:
+        """The ball's state ring (just bounced amber > flying blue > rolling green), translucent
+        (``rings.alpha``). Drawn by `draw_pitch_and_ball` UNDER the ball; `draw_ball(ring=True)` (the
+        default, for standalone use) draws it on top."""
+        pos = self.camera.world_to_screen(ball.position.x, ball.position.y)
+        ring_r = self._ball_draw_radius_px(ball) + self._ring_offset_px
+        if self._ring_show_bounced and ball.just_bounced_timer_s > 0.0:
+            self._draw_ring(surface, self._ring_color_bounced, pos, ring_r, self._ring_width_px, self._ring_alpha)
+        elif self._ring_show_flying and ball.position.z > ball.radius_m + self._flying_min_height_m and ball.possessed_by is None:
+            self._draw_ring(surface, self._ring_color_flying, pos, ring_r, self._ring_width_px, self._ring_alpha)
+        elif self._ring_show_rolling:
+            self._draw_ring(surface, self._ring_color_rolling, pos, ring_r, self._ring_width_px, self._ring_alpha)
+
+    def draw_ball(self, surface: pygame.Surface, ball: Ball, *, shadow: bool = True, ring: bool = True) -> None:
+        """``shadow=False`` skips the ground shadow and ``ring=False`` the state ring:
+        `draw_pitch_and_ball` draws both in its layers UNDER every sprite instead."""
         cam = self.camera
         pos = cam.world_to_screen(ball.position.x, ball.position.y)
 
@@ -1524,15 +1552,9 @@ class Renderer:
                 pygame.draw.circle(_ots, (*style.BALL_OUTLINE, _oa), (radius_px + 1, radius_px + 1), radius_px, 1)
                 surface.blit(_ots, (pos[0] - radius_px - 1, pos[1] - radius_px - 1))
 
-        # Ball state indicator rings (drawn on top of the ball circle).
-        # Priority: just_bounced > flying > rolling (mutually exclusive for display).
-        _ring_r = radius_px + self._ring_offset_px
-        if self._ring_show_bounced and ball.just_bounced_timer_s > 0.0:
-            self._draw_ring(surface, self._ring_color_bounced, pos, _ring_r, self._ring_width_px)
-        elif self._ring_show_flying and ball.position.z > ball.radius_m + self._flying_min_height_m and ball.possessed_by is None:
-            self._draw_ring(surface, self._ring_color_flying, pos, _ring_r, self._ring_width_px)
-        elif self._ring_show_rolling:
-            self._draw_ring(surface, self._ring_color_rolling, pos, _ring_r, self._ring_width_px)
+        # Ball state indicator ring (see `_draw_ball_state_ring`) -- only when drawing the ball standalone.
+        if ring:
+            self._draw_ball_state_ring(surface, ball)
 
         # --- Dots: fixed points on the 3D ball surface, projected top-down ---
         # Always shown; rotate as the ball spins. Front hemisphere only.
@@ -1755,6 +1777,35 @@ class Renderer:
 
     _PLAYER_LIGHT_Z_M = 0.9   # height at which a player's body is lit (roughly the torso)
 
+    def draw_player_rings(
+        self, surface: pygame.Surface, players: Sequence[Player], selected_id: str | None = None,
+    ) -> None:
+        """Every player's rings, translucent (``rings.alpha``) and in ONE layer meant to be drawn UNDER
+        the sprites and the ball (see `draw_pitch_and_ball`): the pulsing low-stamina flash (outermost,
+        +11px), the selected player's ring (+7px), and the state ring at +4px -- cyan for
+        CONTROLLING_BALL (mid first-touch control delay), red for INACTIVE_TACKLED. There is no ring
+        for possession."""
+        alpha = self._ring_alpha
+        if alpha <= 0:
+            return
+        cam = self.camera
+        for player in players:
+            pos = cam.world_to_screen(player.position.x, player.position.y)
+            radius_px = self._player_radius_px(player)
+            is_inactive = player.state == PlayerState.INACTIVE_TACKLED
+            # --- Low-stamina flash: outermost ring, pulsing at configured hz ---
+            if player.stamina < self._stamina_flash_threshold and not is_inactive:
+                period_ms = 1000.0 / max(self._stamina_flash_hz, 0.1)
+                if (pygame.time.get_ticks() % int(period_ms * 2)) < int(period_ms):
+                    self._draw_ring(surface, style.STAMINA_FLASH_OUTLINE, pos, radius_px + 11, 2, alpha)
+            # --- State ring: CONTROLLING_BALL (cyan) / INACTIVE_TACKLED (red) ---
+            if player.state == PlayerState.CONTROLLING_BALL:
+                self._draw_ring(surface, style.CONTROL_DELAY_OUTLINE, pos, radius_px + 4, 2, alpha)
+            elif is_inactive:
+                self._draw_ring(surface, style.INACTIVE_OUTLINE, pos, radius_px + 4, 2, alpha)
+            if player.player_id == selected_id:
+                self._draw_ring(surface, style.SELECTED_OUTLINE, pos, radius_px + 7, 2, alpha)
+
     def _player_radius_px(self, player: Player) -> int:
         cam = self.camera
         return int(max(self.min_player_radius_px * cam.zoom_scale, cam.scale_length(player.radius_m)))
@@ -1823,16 +1874,16 @@ class Renderer:
         return sprite
 
     def draw_player(
-        self, surface: pygame.Surface, player: Player, selected: bool,
-        has_ball: bool = False, action_icon: str | None = None,
+        self, surface: pygame.Surface, player: Player, action_icon: str | None = None,
     ) -> None:
         """Draws one player. Per the design spec:
         - goalkeepers are drawn in a distinct orange colour rather than
           their team colour.
-        - the player currently in possession (`has_ball`) gets a white
-          outline. Callers are responsible for drawing the ball-carrier
-          *last* among players (see app.py's draw order) so they render on
-          top of everyone else, since a raw z-order isn't otherwise tracked.
+        - the rings (selected / control-delay / tackled / low stamina) are NOT drawn
+          here: `draw_player_rings` draws them in a translucent layer under every sprite
+          and the ball (there is no ring for possession any more). Callers still draw the
+          ball-carrier *last* among players -- see app.py -- so they render on top of
+          everyone else.
         - inactive players (`PlayerState.INACTIVE_TACKLED`, including a
           tackler briefly off-balance after a failed tackle - see
           engine/knowledge.md) are drawn translucent rather than solid,
@@ -1883,24 +1934,6 @@ class Renderer:
         else:
             pygame.draw.circle(surface, colour, pos, radius_px)
             pygame.gfxdraw.aacircle(surface, pos[0], pos[1], radius_px, colour)
-
-        # --- Low-stamina flash: outermost ring, pulsing at configured hz ---
-        if player.stamina < self._stamina_flash_threshold and not is_inactive:
-            period_ms = 1000.0 / max(self._stamina_flash_hz, 0.1)
-            flash_on = (pygame.time.get_ticks() % int(period_ms * 2)) < int(period_ms)
-            if flash_on:
-                self._draw_ring(surface, style.STAMINA_FLASH_OUTLINE, pos, radius_px + 11, 2)
-
-        # State outline rings: CONTROLLING_BALL (cyan) and INACTIVE_TACKLED (red).
-        if player.state == PlayerState.CONTROLLING_BALL:
-            self._draw_ring(surface, style.CONTROL_DELAY_OUTLINE, pos, radius_px + 4, 2)
-        elif is_inactive:
-            self._draw_ring(surface, style.INACTIVE_OUTLINE, pos, radius_px + 4, 2)
-
-        if has_ball:
-            self._draw_ring(surface, style.POSSESSION_OUTLINE, pos, radius_px + 2, self._possession_outline_thickness)
-        if selected:
-            self._draw_ring(surface, style.SELECTED_OUTLINE, pos, radius_px + 7, 2)
 
         # Heading indicator - a broad, thin "V": two lines touching the rim
         # at points spread wide around the front of the player, meeting at

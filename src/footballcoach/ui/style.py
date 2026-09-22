@@ -11,7 +11,6 @@ TEAM_RIGHT_COLOUR = (220, 70, 70)
 DEFENDING_SIDE_MARKER_ALPHA = 140  # translucency of the blue/red "defends this end" goal-line bar
 SELECTED_OUTLINE = (255, 220, 40)
 GOALKEEPER_COLOUR = (235, 140, 30)  # orange fill, overrides team colour
-POSSESSION_OUTLINE = (255, 255, 255)  # white outline on the player in possession
 INACTIVE_ALPHA = 110  # 0-255; inactive players are drawn translucent
 
 HUD_BG = (15, 15, 20)

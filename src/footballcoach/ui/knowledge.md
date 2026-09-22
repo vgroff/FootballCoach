@@ -428,7 +428,7 @@ whenever height exceeds 0.15m.
 
 ## Ring drawing (`Renderer._draw_ring`) — supersampled, not `pygame.draw.circle(..., width=N)`
 
-Every circular outline (selection, possession, control-delay/inactive,
+Every circular outline (selection, control-delay/inactive,
 stamina-flash, and the ball's outline + state rings) is drawn via the shared
 `Renderer._draw_ring()` helper, **not** a direct `pygame.draw.circle(...,
 width=N)` + `gfxdraw.aacircle` pair. At the small radii these rings use
@@ -741,20 +741,35 @@ of the ball, not this bug.
   name, e.g. `segoeuiemoji`, not filename — see the comment there).
 - **Goalkeepers** are drawn in `GOALKEEPER_COLOUR` (a distinct orange)
   instead of their team colour, so the keeper is identifiable at a glance.
-- **Ball possession**: whichever player currently has the ball
-  (`has_ball`, passed in by `App._draw_match`) gets a white
-  `POSSESSION_OUTLINE` ring drawn around their circle.
+- **No possession outline.** The player with the ball used to get a white ring
+  (`has_ball` argument, `POSSESSION_OUTLINE`, `player.possession_outline_thickness`);
+  removed — the action icons say enough. `draw_player` no longer takes `has_ball`.
+- **All rings are one translucent layer UNDER the players and the ball**
+  (`Renderer.draw_player_rings` + `_draw_ball_state_ring`, called by
+  `draw_pitch_and_ball(..., players=, selected_id=)` right after the shadow pass and before
+  the goal frame, the ball and every sprite — `draw_player` no longer draws any ring and no
+  longer takes `selected`). They used to be drawn on top of everything. Their opacity is
+  **`graphics.json["rings"]["alpha"]`** (0-255, default 140 — raised from an initial 110 on
+  request; 0 hides every ring): it applies to
+  the selection, control-delay, tackled and low-stamina rings and the ball's state ring alike
+  (`_draw_ring(..., alpha)` sets the alpha on the supersampled ring layer). `draw_ball(ring=True)`,
+  the default for standalone use, still draws the ball's ring on top; `draw_pitch_and_ball` passes
+  `ring=False` and draws it in the layer. Radii: stamina flash +11px, selection +7px, state ring
+  +4px. Tests: `test_the_state_rings_are_translucent_and_the_tackled_red_ring_is_kept`,
+  `test_the_ring_alpha_is_configurable`, `test_rings_are_drawn_under_the_player_sprite`,
+  `test_the_pipeline_draws_player_rings_under_every_sprite`,
+  `test_the_pipeline_draws_the_ball_ring_under_the_ball`.
 - **CONTROLLING_BALL** (`PlayerState.CONTROLLING_BALL`): a cyan
-  `CONTROL_DELAY_OUTLINE` ring, visually distinct from the possession ring.
+  `CONTROL_DELAY_OUTLINE` ring.
   Indicates the player is mid first-touch control delay and can't yet move
   or be given orders. (Phase G)
 - **Inactive players** (`PlayerState.INACTIVE_TACKLED`): translucent fill
-  (`INACTIVE_ALPHA`) **plus** a red `INACTIVE_OUTLINE` ring, so the state
-  is visible even when the player blends into the pitch. (Phase G)
+  (`INACTIVE_ALPHA`) **plus** a red `INACTIVE_OUTLINE` ring (removed for a while, then restored
+  on request), so the state is visible even when the player blends into the pitch. (Phase G)
 - **Top layer for ball carrier**: `App._draw_match` sorts the player list so
   whichever player has the ball is drawn last, i.e. on top of every other
-  player - avoids the possession ring/player circle being partially
-  obscured by a nearby defender drawn afterwards.
+  player - so the ball carrier is never partly covered by a nearby defender drawn
+  afterwards.
 - **Heading indicator** (sprites-disabled fallback only): a broad, thin "V" — two unfilled lines touching
   the rim at wide-spread points and meeting at a point just ahead in the
   facing direction (`draw_player`'s "Heading indicator" block, colour
@@ -770,8 +785,8 @@ of the ball, not this bug.
 
 ## Ball state indicator rings (Phase G)
 
-`renderer.draw_ball` draws a thin outline ring on top of the ball circle
-indicating its current state.  Priority (only one ring shown at a time):
+`Renderer._draw_ball_state_ring` draws a thin translucent (`rings.alpha`) outline ring around the
+ball, UNDER it (see "All rings are one translucent layer"), indicating its current state.  Priority (only one ring shown at a time):
 - **Amber** (`BALL_STATE_BOUNCED_OUTLINE`): `ball.just_bounced_timer_s > 0` —
   ball made a real bounce recently (decays after 0.3 s).
 - **Blue** (`BALL_STATE_FLYING_OUTLINE`): ball is airborne (`z > 0.05 m`) and
@@ -907,7 +922,7 @@ living in the UI layer, not a general engine behaviour.
 screen, drawn by `_draw_help_button`) toggles `App.show_help`. While shown,
 `_draw_help_overlay` renders a full-screen semi-transparent panel listing
 every control and what each visual indicator means (goalkeeper colour,
-possession outline, inactive translucency, ball rings). Match input events
+inactive translucency and its red ring, ball rings). Match input events
 are suppressed while the overlay is open (only the help button/`H`/`Esc`
 are handled) so you can't accidentally issue orders while reading it; `Esc`
 closes the overlay first before falling back to its normal kick-UI-cancel /

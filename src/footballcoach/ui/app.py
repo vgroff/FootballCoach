@@ -149,7 +149,6 @@ _HELP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         ("Esc", "close help, cancel mode, then back to menu"),
     ]),
     ("Indicators", [
-        ("White ring", "has the ball"),
         ("Yellow ring", "selected"),
         ("Cyan ring", "first-touch control delay"),
         ("Red ring", "inactive (just tackled); also drawn translucent"),
@@ -998,7 +997,9 @@ class App:
         # players (not after) so a player standing over it -- e.g. the carrier
         # dribbling -- renders on top rather than the ball covering up the
         # (now much bigger/more detailed) player sprite.
-        self.renderer.draw_pitch_and_ball(self.surface, self.match.pitch, self.match.ball, players=self.match.players)
+        self.renderer.draw_pitch_and_ball(
+            self.surface, self.match.pitch, self.match.ball, players=self.match.players, selected_id=selected_id,
+        )
 
         # Draw the ball carrier last among players so they render on top of
         # every other player, per the design spec.
@@ -1008,9 +1009,7 @@ class App:
             pid = player.player_id
             action_icon = self._action_icons.active_icon(pid, now_s)
             self.renderer.draw_player(
-                self.surface, player, selected=pid == selected_id,
-                has_ball=pid == carrier_id,
-                action_icon=action_icon,
+                self.surface, player, action_icon=action_icon,
             )
 
         kick_state = self.input_controller.kick_ui_state()

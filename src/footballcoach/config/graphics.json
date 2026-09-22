@@ -10,9 +10,8 @@
     "zoom_step": 0.5
   },
   "player": {
-    "_comment": "min_radius_px: smallest on-screen circle radius drawn for a player. Physical world positions are unaffected — only the rendered dot size is boosted for visibility. possession_outline_thickness: pixel width of the white ring drawn around the ball carrier (1=thin, 3=bold). inactive_alpha: opacity (0-255) of a player drawn translucent after being tackled (0=invisible, 255=fully opaque).",
+    "_comment": "min_radius_px: smallest on-screen circle radius drawn for a player. Physical world positions are unaffected — only the rendered dot size is boosted for visibility. inactive_alpha: opacity (0-255) of a player drawn translucent after being tackled (0=invisible, 255=fully opaque).",
     "min_radius_px": 6,
-    "possession_outline_thickness": 1,
     "inactive_alpha": 170
   },
   "ball": {
@@ -63,6 +62,10 @@
     "projection_scale_fraction": 0.98,
     "dot_radius_fraction": 0.25,
     "color": [30, 30, 30]
+  },
+  "rings": {
+    "_comment": "Opacity of EVERY ring: the players' selected / control-delay (cyan) / tackled (red) / low-stamina rings and the ball's state ring (blue airborne, green rolling, amber just bounced). 0-255; 0 hides them all, 255 is fully opaque. They are drawn UNDER the players and the ball, so a low alpha makes them a soft ground marking rather than an outline on top.",
+    "alpha": 140
   },
   "ball_state_rings": {
     "_comment": "Coloured indicator rings drawn around the ball to show its state. offset_px: how far outside the ball circle the ring sits. width_px: ring line width. Set show_flying/show_rolling/show_bounced to false to hide individual rings. Colors are [R,G,B]. bounce_duration_s: how long the amber bounce ring stays visible after a bounce (also controls physics.json just_bounced_display_duration_s if you want them in sync — but this one only affects the renderer display; to change the underlying timer duration edit physics.json). flying_min_height_above_ground_m: margin above ball.radius_m at which the flying ring activates (0.01 = only genuinely airborne).",
