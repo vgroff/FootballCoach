@@ -304,3 +304,45 @@ def test_draw_scenario_params_accepts_a_type_ahead_query_without_crashing_or_los
         type_ahead_query="checkpoints/run3",
     )
     assert any("__folder__" in k for k in button_rects)
+
+
+def test_start_and_back_buttons_never_overlap_an_open_dropdown():
+    """Regression test: Start/Back used to be anchored right below the last
+    param row regardless of what was open, so an open dropdown for an early
+    row -- which can extend ~300px down -- painted underneath them, and the
+    buttons visually sat on top of (obscuring) the dropdown's own items.
+    Spotted directly in a rendered screenshot."""
+    renderer = _renderer()
+    surface = pygame.Surface((1400, 900))
+    # a checkbox row placed first, then the big dropdown -- so the dropdown
+    # opens right at the top of the screen, maximising how far it reaches
+    bool_param = scenarios.ScenarioBoolParam("b", "B", False)
+    param = _grouped_param(n_groups=30)
+    button_rects, _scroll, _geom = renderer.draw_scenario_params(
+        surface, [bool_param, param], {param.name: param.default}, open_choice_param=param.name,
+    )
+    start_rect, _ = button_rects["__start__"]
+    back_rect, _ = button_rects["__back__"]
+
+    dropdown_item_rects = [r for k, (r, _) in button_rects.items() if "__folder__" in k]
+    assert dropdown_item_rects, "expected the group list to be open and drawn"
+    dropdown_bottom = max(r.bottom for r in dropdown_item_rects)
+
+    assert start_rect.top >= dropdown_bottom
+    assert back_rect.top >= dropdown_bottom
+
+
+def test_start_and_back_buttons_move_back_up_once_the_dropdown_closes():
+    """The push-down is dynamic, not a permanently-lower fixed position:
+    closing the dropdown returns Start/Back to their normal compact spot
+    right below the param rows."""
+    renderer = _renderer()
+    surface = pygame.Surface((1400, 900))
+    param = _grouped_param(n_groups=30)
+    open_rects, _s1, _g1 = renderer.draw_scenario_params(
+        surface, [param], {param.name: param.default}, open_choice_param=param.name,
+    )
+    closed_rects, _s2, _g2 = renderer.draw_scenario_params(
+        surface, [param], {param.name: param.default}, open_choice_param=None,
+    )
+    assert closed_rects["__start__"][0].top < open_rects["__start__"][0].top

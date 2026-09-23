@@ -1588,6 +1588,20 @@ component."
   `renderer.py` — not fixed here (out of scope for this ask, not reported),
   flagged here for whoever next touches those.
 
+- **Start/Back buttons used to sit on top of an open dropdown, not below
+  it** — spotted directly in a rendered screenshot (*"in your screenshot,
+  the buttons are displayed on top of the dropdown"*), then confirmed by
+  reasoning through the draw order: they were anchored at a fixed
+  `start_y + len(params) * row_h + 30`, independent of whether a dropdown
+  was open or how far it extended (an open list can reach ~300px below its
+  row), and drawn *after* the dropdown block so they visually painted over
+  it. `_draw_dropdown_list` now also records the deepest Y it drew
+  (`dropdown_bottom_y`, captured the same way as `scrollbar_geom`); Start/
+  Back use `max(normal_bottom_y, dropdown_bottom_y + 20)` so they're pushed
+  down to clear an open dropdown and return to the compact position the
+  moment it closes (user: *"you can just have them under the dropdown when
+  it's being used"* — i.e. dynamic, not a permanently-lower fixed spot).
+
 Tests: `tests/unit/test_scenario_params_dropdown.py` — pure
 `dropdown_items_for`/`leaf_label` cases; wheel accumulation (whole-notch,
 missing-`precise_y` fallback, fractional-accumulation, never-negative);
@@ -1595,9 +1609,11 @@ scrollbar drag (extremes, out-of-track clamping, no-geometry no-op);
 type-ahead (prefix match, contains fallback, no-match no-op, empty-buffer/
 closed-dropdown no-op, confirm-into-folder, confirm-selects-leaf,
 confirm-no-match no-op); renderer's `scrollbar_geom` presence/absence and
-`total`/`visible` correctness. All mutation-checked (wheel-truncation
-reverted, drag-clamp removed, contains-fallback removed, folder-drill
-disabled, scrollbar-geom forced `None` — all caught).
+`total`/`visible` correctness; Start/Back never overlapping an open
+dropdown, and moving back up once it closes. All mutation-checked
+(wheel-truncation reverted, drag-clamp removed, contains-fallback removed,
+folder-drill disabled, scrollbar-geom forced `None`, Start/Back push-down
+reverted — all caught).
 
 ## Phase 1 UI scenario vs. actual PPO training conditions (`_make_phase1_scenario_pair`)
 

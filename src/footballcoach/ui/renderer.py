@@ -3128,6 +3128,7 @@ class Renderer:
         # from a folder list to a shorter value list).
         clamped_scroll = dropdown_scroll
         scrollbar_geom: "DropdownScrollbar | None" = None
+        dropdown_bottom_y: int | None = None  # deepest Y the open dropdown reaches, so Start/Back can clear it
         MAX_VISIBLE_ITEMS = 10
         ITEM_H = 28
         CHEV_H = 16  # top/bottom click-to-page chevrons; the rest of the column is the drag track
@@ -3150,7 +3151,7 @@ class Renderer:
             alongside the mouse-wheel/keyboard scroll paths, since wheel
             events aren't reliably delivered on every platform/window-manager
             combo. Returns the clamped scroll offset used for this list."""
-            nonlocal scrollbar_geom
+            nonlocal scrollbar_geom, dropdown_bottom_y
             total = len(items)
             visible = min(total, MAX_VISIBLE_ITEMS)
             scroll = max(0, min(dropdown_scroll, max(0, total - visible)))
@@ -3208,6 +3209,7 @@ class Renderer:
                 pygame.draw.rect(surface, (150, 170, 200) if hov_thumb else (100, 110, 130), thumb_rect, border_radius=3)
                 button_rects[f"{scroll_name}__scrollthumb__"] = (thumb_rect, thumb_rect)
                 scrollbar_geom = DropdownScrollbar(track_rect=track_rect, thumb_h=thumb_h, total=total, visible=visible)
+            dropdown_bottom_y = list_rect.bottom
             return scroll
 
         if open_choice_param is not None:
@@ -3253,8 +3255,16 @@ class Renderer:
                         items, current, list_x, open_y + ITEM_H + 4, list_w, f"{open_param.name}__option__", open_param.name,
                     )
 
-        # Start / Back buttons near the bottom.
+        # Start / Back buttons near the bottom -- pushed down further when an
+        # open dropdown would otherwise extend past them (previously always
+        # anchored right below the last param row regardless of what was
+        # drawn beneath it, so an open dropdown for an early row could paint
+        # underneath -- not over -- these buttons, since they're drawn after;
+        # spotted directly in a rendered screenshot: "Start"/"Back" sitting
+        # on top of, and partly obscuring, an open dropdown's items).
         bottom_y = start_y + len(params) * row_h + 30
+        if dropdown_bottom_y is not None:
+            bottom_y = max(bottom_y, dropdown_bottom_y + 20)
         start_rect = pygame.Rect(sw // 2 - 110, bottom_y, 100, 38)
         back_rect = pygame.Rect(sw // 2 + 20, bottom_y, 100, 38)
         for rect, label, colour in (
