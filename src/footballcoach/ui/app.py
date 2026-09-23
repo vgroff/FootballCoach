@@ -163,7 +163,7 @@ _HELP_SECTIONS: list[tuple[str, list[tuple[str, str]]]] = [
         ("Space", "pause / resume. Any new order resumes play; a completed "
                   "order pauses it"),
         ("] / [", "sim speed up / down (0.25x-8x); [-]/[+] control top right"),
-        ("Z", "step ball-follow zoom (1x-5x); [-]/[+] control top right"),
+        ("Z / Shift+Z", "step ball-follow zoom in / out (1x-5x); [-]/[+] control top right"),
         ("L", "game log level: INFO / DEBUG. Repeated messages merge as (Nx)"),
         ("H", "toggle this help"),
         ("Esc", "close help, cancel mode, then back to menu"),
@@ -551,7 +551,8 @@ class App:
         elif key == pygame.K_LEFTBRACKET:
             self._cycle_sim_speed(-1)
         elif key == pygame.K_z:
-            self._cycle_zoom(1)
+            shift_held = bool(pygame.key.get_mods() & pygame.KMOD_SHIFT)
+            self._cycle_zoom(-1 if shift_held else 1)
 
     def _cycle_sim_speed(self, direction: int) -> None:
         """Steps `self._sim_speed` to the next (`direction=1`) or previous

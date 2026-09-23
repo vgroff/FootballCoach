@@ -1764,8 +1764,8 @@ view). `App._ZOOM_LEVELS` is a linear sequence from 1.0 up to
 increments (default 0.5), built once in `__init__` the same way
 `_SIM_SPEED_OPTIONS` is; `App._cycle_zoom(direction)` snaps to the nearest
 level and steps (wrapping at either end, same as `_cycle_sim_speed`),
-shared by the `Z` hotkey (always steps forward) and the on-screen
-`Renderer.draw_zoom_control`'s `[-]`/`[+]` buttons (drawn immediately to
+shared by the `Z` (`Shift+Z` to step backward, see below) hotkey and the
+on-screen `Renderer.draw_zoom_control`'s `[-]`/`[+]` buttons (drawn immediately to
 the *left* of the sim-speed control so neither it nor the value box
 collides with the player-inspector panel that appears just below that
 row — the value box itself highlights in the accent colour whenever
@@ -1783,18 +1783,25 @@ state persists across matches/trials (not reset by `_start_match`/
 sequence (0.2/0.5/1/2/4/8) — finer control around normal speed, at the
 cost of more `]`/`[`/click steps to reach the extremes.
 
-**Z is deliberately forward-only-with-wraparound**, not a bidirectional
-pair like the sim-speed `[`/`]` hotkeys — already documented above, not an
-oversight. User feedback (*"I feel like the zoom key zooms differently to
-the zoom buttons at the top (faster?)"*) confirmed the STEP SIZE is
-identical either way (measured: `[+]`-click and `Z`-press both move
-`zoom_factor` by exactly one `zoom_step`, e.g. `0.5`) — the only real
-asymmetry is that `Z` can only go forward, and wrapping from `max_zoom`
-straight back to `1.0` (a full-range jump in one press) is what likely
-read as "faster": there's no keyboard zoom-OUT at all, unlike sim-speed's
-`[`/`]` pair. Flagged to the user; not changed without a decision on
-whether a bidirectional zoom hotkey (e.g. `Shift+Z`) is wanted, since the
-forward-only design was a previous deliberate choice, not a bug.
+**`Z` used to be forward-only-with-wraparound** (a previous deliberate
+choice, not an oversight — was already documented as such). User feedback
+(*"I feel like the zoom key zooms differently to the zoom buttons at the
+top (faster?)"*) prompted a closer look: the STEP SIZE was always identical
+either way (measured: `[+]`-click and `Z`-press both move `zoom_factor` by
+exactly one `zoom_step`, e.g. `0.5`) — the real asymmetry was that `Z`
+could only go forward, so wrapping from `max_zoom` straight back to `1.0`
+(a full-range jump in one press) is what likely read as "faster": there was
+no keyboard zoom-OUT at all, unlike sim-speed's `[`/`]` pair. Fixed (user
+confirmed): `Shift+Z` steps backward (`App._handle_keydown` checks
+`pygame.key.get_mods() & pygame.KMOD_SHIFT`, same pattern
+`_handle_match_mouse_event` already used for shift-modified clicks),
+calling the exact same `_cycle_zoom(-1)` the on-screen `[-]` button does.
+Plain `Z` is unchanged (still wraps forward past the top); `Shift+Z` wraps
+backward past the bottom the same way, symmetrically.
+
+Tests: `tests/unit/test_zoom_hotkey.py` — `Z`/`Shift+Z` step sizes, `Shift+Z`
+producing byte-identical results to `_cycle_zoom(-1)` (the `[-]` button's own
+call), both directions' wraparound. Mutation-checked.
 
 ## Sim speed: menu value vs. actual tick rate (Phase I)
 
