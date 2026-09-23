@@ -4,6 +4,7 @@ screen used by both.
 """
 from __future__ import annotations
 
+import math
 import sys
 from dataclasses import dataclass, field
 from enum import Enum, auto
@@ -677,9 +678,24 @@ class App:
         """
         def _kick_cb(player):  # noqa: ANN001
             player.action_icon = "⚽"
+            # The proper field, not a workaround: player.last_kick_direction is only set by
+            # KickOrder (kick_direct, via _finish_kick) -- PassOrder/ShootOrder currently skip
+            # that bookkeeping entirely (a real engine bug, see agent_plans/kick_recording_bug.md),
+            # so this stays None for most AI passes/shots today. Rather than reading something
+            # else (e.g. the ball's velocity) to paper over that, fall back to "straight ahead"
+            # when it's missing -- on_kick only ever fires after a real kick, so we know one
+            # happened, just not which way; once the engine bug is fixed this branch stops firing
+            # and every kick gets its real direction with no further change needed here.
+            if player.last_kick_direction is not None:
+                direction = (player.last_kick_direction.x, player.last_kick_direction.y)
+            else:
+                direction = (math.cos(player.heading_rad), math.sin(player.heading_rad))
+            self.renderer.trigger_kick_swing(player, direction)
 
         def _tackle_cb(player):  # noqa: ANN001
             player.action_icon = "🧤" if player.is_goalkeeper else "🦵"
+            if player.last_tackle_direction is not None:
+                self.renderer.trigger_tackle_swing(player, (player.last_tackle_direction.x, player.last_tackle_direction.y))
 
         def _possession_cb(player):  # noqa: ANN001
             # Only show icon for goalkeepers (catch/save); outfield first-touch

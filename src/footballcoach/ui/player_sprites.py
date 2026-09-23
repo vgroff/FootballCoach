@@ -252,6 +252,330 @@ def _draw_leg(surf: pygame.Surface, params: PlayerSpriteParams, x: float, hip_y:
     _rounded_rect(surf, (x - half_w, y0, x + half_w, y1), half_w, corners, shorts, shorts_outline)
 
 
+def _draw_shoe_laces_dir(surf: pygame.Surface, params: PlayerSpriteParams, foot_x: float, foot_y: float,
+                          direction: tuple[float, float], shoe_rx: float, shoe_ry: float) -> None:
+    """Like `_draw_shoe_laces`, generalised to an arbitrary `direction` unit vector instead of
+    assuming the leg points straight along +-y: the two lace ticks sit toward the ankle (i.e.
+    `-direction` from the foot) and are drawn PERPENDICULAR to `direction` rather than always
+    horizontal, so they still read as laces across the top of the foot at any swing angle."""
+    dx, dy = direction
+    perp_x, perp_y = -dy, dx
+    for frac in (0.18, 0.62):
+        cx = foot_x - dx * shoe_ry * frac
+        cy = foot_y - dy * shoe_ry * frac
+        half_len = shoe_rx * 0.8
+        pygame.draw.line(
+            surf, params.lace_color,
+            (cx - perp_x * half_len, cy - perp_y * half_len),
+            (cx + perp_x * half_len, cy + perp_y * half_len), int(_PX),
+        )
+
+
+def _draw_leg_swing(surf: pygame.Surface, params: PlayerSpriteParams, geo: dict, x: float, hip_y: float,
+                     direction: tuple[float, float], signed_len: float) -> None:
+    """One leg reaching toward an arbitrary DIRECTION (a unit vector in the sprite's own local
+    frame, i.e. before the caller's heading rotation) by a SIGNED distance from the hip -- used for
+    the kick/tackle swing (`render_kick_pose`), where the leg needs to reach toward the kick's
+    actual target direction rather than only straight forward/backward like `_draw_leg`.
+
+    `signed_len` negative draws the foot BEHIND the hip (backswing) along the SAME line, the
+    opposite way -- not to the side. An earlier prototype swept the *direction* itself over time
+    (angle from 0 to 180ish) and it visibly arced the foot out to the side and back before settling,
+    which read as the leg "swinging around" rather than kicking; this version fixes `direction` for
+    the whole animation and only moves `signed_len` back and forth along that one line, so there is
+    no sideways component at all.
+
+    The foot/shoe ellipses stay axis-aligned (not rotated to match `direction`) -- a deliberate
+    simplification, matching what was shown and approved; for the swing angles this is actually
+    used at (close to the kick's own forward-ish target direction, not extreme sideways/behind
+    angles) the difference is barely visible. Shorts are NOT drawn here -- see `_draw_shorts_hem`,
+    called separately, since real fabric drapes from the hip regardless of how the leg under it
+    swings (unlike `_draw_leg`, which is only ever used for a plain vertical stride)."""
+    dx, dy = direction
+    foot_x, foot_y = x + dx * signed_len, hip_y + dy * signed_len
+
+    skin, skin_outline = params.skin_color, _darken(params.skin_color, _OUTLINE_DARKEN)
+    shoe, shoe_outline = params.shoe_color, _darken(params.shoe_color, _OUTLINE_DARKEN)
+
+    _flat_line(surf, (x, hip_y), (foot_x, foot_y), geo["shaft_width"], skin, skin_outline)
+    fr, fy = geo["foot_rx"], geo["foot_ry"]
+    _ellipse(surf, (foot_x - fr, foot_y - fy, foot_x + fr, foot_y + fy), skin, skin_outline)
+    sr, sy = geo["shoe_rx"], geo["shoe_ry"]
+    _ellipse(surf, (foot_x - sr, foot_y - sy, foot_x + sr, foot_y + sy), shoe, shoe_outline)
+    if signed_len >= 0.0:
+        _draw_shoe_laces_dir(surf, params, foot_x, foot_y, direction, sr, sy)
+    else:
+        _draw_shoe_studs(surf, params, foot_x, foot_y, sr, sy)
+
+
+def _draw_shorts_hem(surf: pygame.Surface, params: PlayerSpriteParams, geo: dict, x: float, hip_y: float,
+                      leg_len: float) -> None:
+    """The plain vertical shorts hem at one hip, hanging straight down -- like `_draw_leg`'s own
+    shorts, clamped to `min(leg_len, shorts_len_max)` (NOT an unconditional `shorts_len_max`, which
+    an earlier version of this used): a short/near-zero `leg_len` (the planted leg, whose visible
+    length is just `base_min_leg_len`) would otherwise get a shorts block AS LONG AS the entire leg
+    -- no exposed shaft/skin at all, reading as one flat block rather than a leg wearing shorts. The
+    DIRECTION/angle still doesn't follow the swing (see `_draw_leg_swing`'s note -- real fabric
+    drapes from the hip regardless of how the leg under it swings); only the LENGTH now tracks it,
+    same as the gait poses always did."""
+    shorts, shorts_outline = params.shorts_color, _darken(params.shorts_color, 0.8)
+    shorts_len = min(abs(leg_len), geo["shorts_len_max"])
+    half_w = geo["shorts_width"] / 2
+    _rounded_rect(
+        surf, (x - half_w, hip_y, x + half_w, hip_y + shorts_len), half_w,
+        (True, True, False, False), shorts, shorts_outline,
+    )
+
+
+def _kick_pad_px() -> int:
+    """Extra padding (in `_SIZE`-space units, beyond the module's normal canvas) the kick/tackle
+    swing's two layer renderers need so the leg can't get clipped, for the CURRENTLY configured
+    `KICK_BACK_FRAC`/`KICK_CONTACT_FRAC` -- computed, not hand-tuned, so it stays correct if those
+    get retuned again. `_render_pose`'s normal `_SIZE` canvas was sized for a running stride, which
+    never reaches anywhere near this far from centre (see those constants' own comment for the
+    measured, visually-confirmed reason the swing needs to reach much further); the worst case
+    (over every possible `direction`) is bounded by the triangle inequality: the swinging hip's own
+    distance from centre, plus the full reach magnitude, is always >= the foot's actual distance
+    from centre, regardless of which way `direction` points. The hip itself is offset from centre
+    in BOTH x (`hip_x_offset`) and y (dropped below centre so the shorts hem clears the torso, see
+    `render_kick_pose_legs`) -- both have to go into the hip's own distance from centre, not just
+    the x one (an earlier version of this only used `hip_x_offset`, which under-padded once the y
+    offset was added, and would have clipped the leg for some directions)."""
+    geo = _pose_geometry()
+    hip_y_offset = geo["torso_h"] / 2 - geo["hip_inset"]
+    hip_dist_from_centre = math.hypot(geo["hip_x_offset"], hip_y_offset)
+    max_frac = max(abs(KICK_BACK_FRAC), KICK_CONTACT_FRAC)
+    max_reach = hip_dist_from_centre + max_frac * geo["leg_reach"] + geo["shoe_ry"] * 1.5
+    extra = max_reach - _SIZE / 2
+    return max(0, int(math.ceil(extra / _SUPERSAMPLE)) * _SUPERSAMPLE)
+
+
+# The un-padded torso's reference size: `Renderer._draw_player_pose_layer` scales a swing sprite by
+# `target_diameter / KICK_POSE_REFERENCE_SIZE` rather than by its actual (padded, so bigger than
+# this) width -- otherwise the extra canvas `_kick_pad_px` adds to fit the reaching leg would also
+# shrink the on-screen TORSO (since a bigger denominator makes the whole sprite scale down more),
+# making a kicking player visibly shrink for the duration of the swing.
+KICK_POSE_REFERENCE_SIZE = _BASE_SIZE
+
+
+def render_kick_pose_legs(
+    params: PlayerSpriteParams, swing_side: int, direction: tuple[float, float], signed_len_frac: float,
+) -> pygame.Surface:
+    """Just the legs half of the kick/tackle swing (planted leg + the swinging one, both legs'
+    shorts) -- for `Renderer.draw_player_legs`'s per-player legs-under-the-ball pass while a swing
+    is active (the app *always* draws players split, legs then upper -- see `draw_player_legs` /
+    `draw_player(..., legs=False)` -- so a swing that only had a "combined" renderer would never
+    actually show up in a real running match, only in a standalone `legs=True` call).
+
+    `signed_len_frac` is a fraction of `leg_reach` (see `kick_swing_state_at`, which is what
+    callers should drive this from -- pixel conversion happens here, not at the call site, so
+    geometry stays encapsulated in this module). The returned surface is `_BASE_SIZE +
+    2*_kick_pad_px()//_SUPERSAMPLE` square -- BIGGER than the normal `_BASE_SIZE` gait sprites, to
+    fit the leg's reach (see `_kick_pad_px`); callers that scale by `target_diameter /
+    width` need `KICK_POSE_REFERENCE_SIZE` instead of the actual width, or the extra canvas shrinks
+    the on-screen torso (see there). `render_kick_pose` (composes this with
+    `render_kick_pose_upper`) is the single-surface convenience version used by tests/demos. Not
+    cached -- see `render_kick_pose`."""
+    geo = _pose_geometry()
+    pad = _kick_pad_px()
+    big_size = _SIZE + 2 * pad
+    big = pygame.Surface((big_size, big_size), pygame.SRCALPHA)
+    inner = big.subsurface((pad, pad, _SIZE, _SIZE))  # shares pixels with `big`, offset by `pad`
+    cx = cy = _SIZE / 2
+    # The gait poses offset each leg's hip below centre by (torso_h/2 - hip_inset) -- the "front"
+    # leg's own sign in _draw_pose_legs/_render_pose -- specifically so the shorts hem (drawn from
+    # that hip, a short FIXED distance further down) clears the torso's own bottom edge and is
+    # actually visible. Using a dead-centre hip_y here (`cy`) put the whole shorts hem INSIDE the
+    # torso's vertical span, entirely hidden under it once composited -- confirmed by comparing the
+    # spans, not just a look. Both legs share this one offset (unlike the gait poses' alternating
+    # front/back), since a kicking/tackling stance doesn't have the running stride's depth cue.
+    hip_y = cy + (geo["torso_h"] / 2 - geo["hip_inset"])
+    signed_len_px = signed_len_frac * geo["leg_reach"]
+
+    planted_x = cx - swing_side * geo["hip_x_offset"]
+    _draw_leg_swing(inner, params, geo, planted_x, hip_y, (0.0, 1.0), geo["base_min_leg_len"])
+    _draw_shorts_hem(inner, params, geo, planted_x, hip_y, geo["base_min_leg_len"])
+
+    swing_x = cx + swing_side * geo["hip_x_offset"]
+    _draw_leg_swing(inner, params, geo, swing_x, hip_y, direction, signed_len_px)
+    _draw_shorts_hem(inner, params, geo, swing_x, hip_y, signed_len_px)
+
+    base_size = big_size // _SUPERSAMPLE
+    return pygame.transform.smoothscale(big, (base_size, base_size))
+
+
+def render_kick_pose_upper(params: PlayerSpriteParams, shirt_color: RGB, swing_side: int, arm_extension: float) -> pygame.Surface:
+    """Just the upper-body half of the kick/tackle swing (arms/shoulders/torso/head) -- the
+    `legs=False` counterpart to `render_kick_pose_legs`, see there (including why this ALSO needs
+    the same padded canvas -- not because the upper body needs the extra room, but so both layers
+    are the same size/centred the same way, and stay aligned when `_draw_player_pose_layer` rotates
+    and blits each one independently at the same screen position)."""
+    geo = _pose_geometry()
+    pad = _kick_pad_px()
+    big_size = _SIZE + 2 * pad
+    big = pygame.Surface((big_size, big_size), pygame.SRCALPHA)
+    inner = big.subsurface((pad, pad, _SIZE, _SIZE))
+    _draw_pose_upper(inner, params, geo, shirt_color, arm_extension, swing_side)
+    base_size = big_size // _SUPERSAMPLE
+    return pygame.transform.smoothscale(big, (base_size, base_size))
+
+
+def render_kick_pose(
+    params: PlayerSpriteParams, shirt_color: RGB, swing_side: int,
+    direction: tuple[float, float], signed_len_frac: float, arm_extension: float,
+) -> pygame.Surface:
+    """One full frame of the kick/tackle swing -- `render_kick_pose_legs` and
+    `render_kick_pose_upper` composited onto one surface (legs first, upper drawn over them, same
+    order `_render_pose`/`_render_pose_layers` use), for standalone use (tests, demos) where the
+    legs-under-the-ball split doesn't matter. The real per-frame draw path
+    (`Renderer._draw_player_pose_layer`) calls the two layer functions directly instead, so a
+    player's swinging leg still sits under the ball and their torso still sits over it."""
+    legs = render_kick_pose_legs(params, swing_side, direction, signed_len_frac)
+    upper = render_kick_pose_upper(params, shirt_color, swing_side, arm_extension)
+    out = legs.copy()
+    out.blit(upper, (0, 0))
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Kick/tackle swing timing curve
+# ---------------------------------------------------------------------------
+
+# Backswing depth and max forward reach, as a fraction of `leg_reach`.
+#
+# The first values tried here (-0.5 / 1.15) looked fine in an isolated leg-only prototype (no
+# torso/arms drawn), but once actually composited with the rest of the body at real size, the leg
+# was almost entirely swallowed by the torso -- `leg_reach` is calibrated for a normal running
+# stride, where the foot only needs to peek out a little, not a full kick's much bigger reach.
+# Bumping both up to -2.0 / 2.4 fixed that, but was ALSO tried and tuned before a separate, more
+# fundamental bug was caught and fixed: `swinging_side_for_direction` -- which leg swings -- had
+# the anatomy backwards (see there), so what was being reach-tuned at the time was a same-side,
+# non-crossing "reach out sideways" motion, not a real kick; -2.0/2.4 was a correspondingly
+# overcorrected reach for that wrong motion, and read as "way too much" once the leg was actually
+# crossing the body properly. Re-tuned again after that fix, by eye against the same kind of
+# composited-render sweep: -1.0 / 1.6 are visible and readable without the earlier values' excess.
+KICK_BACK_FRAC = -1.0
+KICK_CONTACT_FRAC = 1.6
+
+# Backswing / strike / recovery durations (seconds) -- a first-pass timing, not yet tuned against
+# real gameplay pacing: slow-ish wind-up, a fast sweep through contact, a slower recovery back to
+# rest. `KICK_SWING_DURATION_S` is the total, so callers know when the animation is over.
+KICK_BACKSWING_S = 0.15
+KICK_STRIKE_S = 0.12
+KICK_RECOVER_S = 0.18
+KICK_SWING_DURATION_S = KICK_BACKSWING_S + KICK_STRIKE_S + KICK_RECOVER_S
+
+
+def _ease_out_cubic(p: float) -> float:
+    return 1.0 - (1.0 - p) ** 3
+
+
+def _ease_in_out_cubic(p: float) -> float:
+    return 4.0 * p ** 3 if p < 0.5 else 1.0 - (-2.0 * p + 2.0) ** 3 / 2.0
+
+
+def kick_swing_state_at(t_s: float) -> tuple[float, float]:
+    """(signed_len_frac, arm_extension) at `t_s` seconds into a kick/tackle swing (see
+    `render_kick_pose`): `signed_len_frac` is a fraction of `leg_reach`, negative during the
+    backswing (foot drawn behind the hip), ramping through 0 and up to `KICK_CONTACT_FRAC` during
+    the strike, then easing back to 0 during recovery. `t_s` past `KICK_SWING_DURATION_S` returns
+    the rest state (0.0, 0.0) -- callers should stop calling this and drop back to the normal gait
+    pose once `t_s >= KICK_SWING_DURATION_S` (see `Renderer.update_player_animations`)."""
+    if t_s < KICK_BACKSWING_S:
+        p = t_s / KICK_BACKSWING_S
+        return KICK_BACK_FRAC * _ease_out_cubic(p), 0.5 * _ease_out_cubic(p)
+    if t_s < KICK_BACKSWING_S + KICK_STRIKE_S:
+        p = (t_s - KICK_BACKSWING_S) / KICK_STRIKE_S
+        frac = KICK_BACK_FRAC + (KICK_CONTACT_FRAC - KICK_BACK_FRAC) * _ease_in_out_cubic(p)
+        return frac, 0.5 + 0.4 * _ease_in_out_cubic(p)
+    if t_s < KICK_SWING_DURATION_S:
+        p = (t_s - KICK_BACKSWING_S - KICK_STRIKE_S) / KICK_RECOVER_S
+        return KICK_CONTACT_FRAC * (1.0 - _ease_out_cubic(p)), 0.9 * (1.0 - _ease_out_cubic(p))
+    return 0.0, 0.0
+
+
+def local_direction_from_world(wx: float, wy: float, heading_rad: float) -> tuple[float, float]:
+    """Converts a world-space XY direction (e.g. `player.last_kick_direction`) to the sprite's own
+    local frame (the frame `render_kick_pose`'s `direction` and every pose in this module is drawn
+    in, BEFORE the caller's heading rotation) -- i.e. the exact inverse of the rotation
+    `Renderer.draw_player` applies (`rotate_deg` from `heading_rad`, see there).
+
+    Derived and verified empirically (not from pygame's rotozoom docs): a marker at local (0, +1)
+    ("forward", per this module's docstring) lands, after that rotation, at world direction
+    (cos(heading), sin(heading)) at every heading tried (0/45/90/180/-90/-45 degrees); a marker at
+    local (1, 0) ("local right") lands at the world direction 90 degrees CCW from that. That 2x2
+    change-of-basis matrix is both orthogonal AND symmetric (an involution), so its own inverse is
+    itself -- this function applies the exact same matrix to go from world back to local.
+    (wx, wy) need not be normalised; the result has the same magnitude."""
+    s, c = math.sin(heading_rad), math.cos(heading_rad)
+    return -wx * s + wy * c, wx * c + wy * s
+
+
+# Beyond this angle (degrees) from straight-forward (local (0,1)), a CROSSING (far-side) leg stops
+# looking plausible -- reaching that far across the body isn't how real kicks work -- so
+# `swinging_side_for_direction` switches to the NEAR-side leg instead past this point (still able to
+# reach a wide target, just without crossing).
+MAX_CROSS_ANGLE_DEG = 40.0
+
+# Absolute cap on how far off-forward the animated leg is EVER allowed to aim, near leg or far --
+# past this a real player would turn to face the target rather than reach for it at all. This is
+# the direct descendant of an earlier cap on how far a (since-rejected) angle-SWEEPING design's
+# follow-through was allowed to cross past contact ("cap it before 60, maybe 30") -- that concept
+# didn't carry over automatically when the design changed to a single FIXED direction (there's no
+# sweep left to cap), so this reintroduces an equivalent limit for the new design. First tried at
+# 90 (unconstrained sideways reach); the user brought it down to 60. Clamping only affects the
+# ANIMATION's direction, never the actual kick physics -- the ball still goes exactly where aimed,
+# only the leg's drawn reach is capped.
+MAX_SWING_ANGLE_DEG = 60.0
+
+
+def clamp_swing_direction(direction: tuple[float, float], max_angle_deg: float = MAX_SWING_ANGLE_DEG) -> tuple[float, float]:
+    """Clamps `direction` (a local-frame unit vector, e.g. from `local_direction_from_world`) to
+    within `max_angle_deg` of straight-forward (local (0,1)) -- see `MAX_SWING_ANGLE_DEG`.
+    `direction` need not be normalised on the way in; the result always is (or exactly (0.0, 1.0)
+    for a degenerate all-zero input, rather than dividing by zero)."""
+    dx, dy = direction
+    n = math.hypot(dx, dy)
+    if n < 1e-9:
+        return 0.0, 1.0
+    dx, dy = dx / n, dy / n
+    angle_deg = math.degrees(math.atan2(dx, dy))  # 0 = straight forward, +/- = to either side
+    clamped_deg = max(-max_angle_deg, min(max_angle_deg, angle_deg))
+    rad = math.radians(clamped_deg)
+    return math.sin(rad), math.cos(rad)
+
+
+def swinging_side_for_direction(
+    direction: tuple[float, float], fallback_side: int, deadzone: float = 0.15,
+    max_cross_angle_deg: float = MAX_CROSS_ANGLE_DEG,
+) -> int:
+    """Which side (the `swing_side` convention `render_kick_pose_legs` uses: the swinging leg's hip
+    sits at local `+swing_side * hip_x_offset`) should be the leg that swings to reach `direction`.
+
+    Up to `max_cross_angle_deg` off straight-forward, it's the leg on the OPPOSITE lateral side from
+    the target, crossing the body, with the OTHER leg (on the target's own side) planted as the
+    contact point -- real kicks plant the near-side foot next to the ball as the pivot/balance point
+    and swing the FAR-side leg across to strike it; reaching sideways with the near-side foot has no
+    power and barely happens. (An earlier version of this always picked the same-side leg, reasoned
+    as "avoids an awkward cross-body reach" -- backwards, caught by the user: "nobody kicks outwards
+    like that... you cross your right foot across your body".) PAST `max_cross_angle_deg`, though,
+    even a real crossing kick stops being plausible -- so this switches back to the NEAR-side leg
+    for a wide-angle target, a simpler reach/poke rather than a full crossing strike (per the user:
+    "if the player is kicking past that point, use the nearer leg").
+
+    Falls back to `fallback_side` (typically the gait's current leading side) only when
+    `direction`'s lateral (x) component is within `deadzone` of straight ahead/behind, where either
+    foot is equally natural."""
+    dx, dy = direction
+    if abs(dx) < deadzone:
+        return fallback_side
+    angle_deg = abs(math.degrees(math.atan2(dx, dy)))
+    crossing = angle_deg <= max_cross_angle_deg
+    if crossing:
+        return -1 if dx > 0 else 1
+    return 1 if dx > 0 else -1
+
+
 def _pose_geometry() -> dict:
     """Body-proportion constants shared by `_render_pose` and `_render_pose_layers` (pure numbers,
     no drawing -- extracting them changes nothing about either function's output). See the module

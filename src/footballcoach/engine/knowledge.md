@@ -1041,6 +1041,12 @@ player.on_tackle  = lambda player: ...   # ChaseTackleOrder (when contact is mad
   executes, before the tackle outcome is resolved.
 - Both default to `None` (no-op, zero cost).
 - Useful for: BC recording, UI action icons, statistics, logging.
+- `on_tackle` fires with only the tackler (`player`), not the target -- callers that need the
+  tackle's actual direction (the UI's kick/tackle swing animation, `ui/knowledge.md`) read
+  `player.last_tackle_direction` (an XY unit `Vector3`, set by `_attempt_tackle_contact`
+  immediately before firing the callback, from `target.position - player.position`) instead of
+  `on_tackle`'s signature gaining a second argument -- mirrors `last_kick_direction`'s existing
+  pattern (set before `on_kick` fires) rather than introducing a second way to pass event data.
 
 ## Game log (`Match.log_callback`, Phase G)
 

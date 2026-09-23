@@ -861,6 +861,139 @@ snap, same as every other coordinate in `_ball_dots_layer` already was. Tests:
   team/keeper colours, translucent when inactive, longer sprite when striding),
   `SimTimeDelta`, and the App wiring (strides and spin follow `match.time_s`
   whatever `_sim_speed` / fps are; paused = no animation).
+- **Kick/tackle swing animation** (`player_sprites.render_kick_pose_*`/`kick_swing_state_at`/
+  `local_direction_from_world`, `Renderer._player_swing`/`trigger_kick_swing`/`trigger_tackle_swing`):
+  when a player kicks or attempts a tackle, one leg swings toward the actual target direction
+  instead of just showing the normal stride pose.
+  - **Design, iterated by eye against several rejected variants** (shown to the user as GIFs
+    before implementing): the leg's DIRECTION is fixed for the whole animation (the kick/tackle's
+    real target direction, computed once at trigger time -- it does not have to be straight
+    ahead, the target can be off to the side); only the SIGNED DISTANCE along that one line
+    varies over time -- negative (behind the hip) during the backswing, through zero (contact),
+    up to `KICK_CONTACT_FRAC` during the strike, easing back to 0 during recovery. An earlier
+    version instead swept the ANGLE itself over time (so the foot traced an arc, sideways then
+    back) -- visibly looked like the leg "swinging around" and was rejected; this fixes that by
+    construction (`_draw_leg_swing` takes a `direction` unit vector and a scalar `signed_len`,
+    never an angle that changes mid-swing).
+  - **Which leg swings: `swinging_side_for_direction`, CROSSES the body up to `MAX_CROSS_ANGLE_DEG`
+    (40 degrees), then switches to the NEAR leg beyond that.** A real kick plants the near-side foot
+    next to the ball as the pivot/balance point and swings the FAR-side leg across the body to
+    strike -- not the other way around (reaching sideways with the near-side foot has no power and
+    barely happens). An earlier version of this picked the SAME-side leg instead, reasoned as
+    "avoids an awkward cross-body reach" -- backwards, and wrong regardless of how plausible that
+    reasoning sounded; the user caught it by eye once the reach was fixed enough to actually see
+    which leg was moving ("nobody kicks outwards like that... you cross your right foot across your
+    body to kick left"). But crossing isn't right at EVERY angle either -- past ~40 degrees off
+    straight ahead even a real crossing kick stops being plausible, so past
+    `MAX_CROSS_ANGLE_DEG` this switches back to the near-side leg instead (the user: "if the player
+    is kicking past that point, use the nearer leg") -- a simpler reach/poke rather than a full
+    crossing strike, itself capped at `MAX_SWING_ANGLE_DEG` (60 degrees -- first tried at 90, the
+    user brought it down) via `clamp_swing_direction`, applied to the direction BEFORE
+    side-selection so both the near and far cases share one consistent outer bound. Falls back to
+    the gait's current "leading" side (`pick_pose`) only when the target is
+    close enough to straight ahead/behind (within `deadzone`) that either foot is equally natural.
+    **Open question, not yet resolved**: the user separately noted a tackle might reasonably use a
+    different convention throughout (always near-side, a poke/block rather than a full instep
+    strike, needing much less force) -- `trigger_tackle_swing` currently shares the exact same
+    cross/near logic as `trigger_kick_swing` via `_trigger_swing`; splitting them is a plausible
+    follow-up, not done.
+  - **Reach: `KICK_BACK_FRAC = -1.0`, `KICK_CONTACT_FRAC = 1.6`** (both x `leg_reach`) -- the THIRD
+    set of values tried, and tangled up with the side-selection bug above in an instructive way:
+    - The first values (-0.5 / 1.15) looked fine in an isolated leg-only prototype (no torso/arms
+      drawn), but once actually composited with the rest of the body at real size, the leg was
+      almost entirely swallowed by the torso -- `leg_reach` is calibrated for a normal running
+      stride, which only needs the foot to peek out a little, and a real kick's leg extends much
+      further than a jog.
+    - Bumped to -2.0 / 2.4 to fix that (confirmed by rendering the real composited sprite at
+      several multiples and looking at them, not guessed) -- but this reach was tuned BEFORE the
+      side-selection bug above was caught, so what got tuned was actually a same-side, non-crossing
+      "reach out sideways" motion, and -2.0/2.4 was a correspondingly overcorrected reach for that
+      wrong motion. Once crossing was fixed, the user immediately flagged it as "way too much".
+    - Re-tuned a third time, by eye against the same kind of composited-render sweep, now with
+      crossing fixed: -1.0 / 1.6 read as clearly visible without the earlier values' excess. Still
+      a first-pass call, not exhaustively tuned.
+  - **Shorts, two separate bugs, both caught by the user's eye, not noticed while iterating on
+    reach/side alone:**
+    - **Fully hidden under the torso.** The swing legs' hips were originally placed at dead centre
+      (`cy`, same as the torso's own centre); since `_draw_shorts_hem` draws a hem straight down
+      from the hip, that put the entire shorts rectangle inside the torso's own vertical span --
+      completely painted over once the upper body (drawn after) was composited on top. The gait
+      poses avoid this by offsetting each leg's hip below centre by `torso_h/2 - hip_inset` before
+      drawing shorts; the swing legs (both of them, planted and swinging -- unlike the gait poses'
+      alternating front/back offset, a kicking stance doesn't have the running stride's depth cue
+      to represent) now use that same offset ("doesn't this sprite have shorts?").
+    - **A flat, un-leglike block once they WERE visible.** `_draw_shorts_hem` then drew an
+      UNCONDITIONAL `shorts_len_max` hem regardless of the actual leg's length -- for the planted
+      leg (whose real length is just `base_min_leg_len`, much shorter than `shorts_len_max`), that
+      put a shorts block as long as the entire leg, no exposed shaft/skin at all, reading as one
+      flat white bar rather than a leg wearing shorts ("some real bizarre stuff going on with the
+      shorts... I remember them being done well in the original sprites"). `_draw_leg`'s own gait-
+      pose shorts always clamped to `min(total_len, shorts_len_max)`; `_draw_shorts_hem` now takes
+      the leg's actual length and does the same clamp -- so a short (planted) leg shows only a
+      sliver of shorts (the user, after this specific fix: "we should see a pixel or two of shorts
+      when normal standing also" -- confirming that sliver, not a full hem, is the expected look
+      for a short leg, matching the standing gait pose), while a fully extended swinging leg's
+      shorts clamp to the same `shorts_len_max` a gait-pose stride shows.
+  - **Padding**: reaching this much further, from a hip that's now offset in BOTH x and y, means
+    the leg no longer fits the module's normal `_SIZE` canvas (sized for a running stride) --
+    `_kick_pad_px()` computes exactly how much extra canvas is needed (via the triangle inequality:
+    the hip's own distance from centre, `hypot(hip_x_offset, hip_y_offset)`, plus the max reach,
+    plus a shoe-radius margin -- bounding every possible `direction`, not just the ones tested by
+    eye) and `render_kick_pose_legs`/`_upper` both use a canvas padded by that amount, via a
+    `subsurface` so the existing `_draw_leg_swing`/`_draw_pose_upper`/`_draw_shorts_hem` drawing
+    code needs no changes. Because the resulting surface is now BIGGER than the normal `_BASE_SIZE`
+    gait sprites, `_draw_player_pose_layer` must scale it by `target_diameter /
+    KICK_POSE_REFERENCE_SIZE` (a fixed constant equal to the un-padded torso reference size) rather
+    than by the sprite's own (padded) width -- getting this wrong makes a kicking player's whole
+    body, torso included, visibly shrink for the swing's duration, since the same on-screen target
+    diameter would then be divided by a bigger number.
+  - **Direction conversion**: `player.last_kick_direction` (kick) / `player.last_tackle_direction`
+    (tackle, `engine/knowledge.md`) are world-space XY; `local_direction_from_world` converts to
+    the sprite's own local frame (before the caller's heading rotation) via the exact inverse of
+    `_draw_player_pose_layer`'s `rotate_deg` formula -- derived and verified empirically (a
+    rendered marker's actual on-screen position at several headings), not from pygame docs, and
+    the matrix used is provably an involution (its own inverse), which the tests check directly.
+    This part held up through every round of the debugging above -- the bugs were all in how the
+    (correctly-computed) direction was then USED, not in the direction itself.
+  - **Timing** (`kick_swing_state_at`, a first-pass curve, not yet tuned against real gameplay
+    pacing): ~150ms ease-out backswing, ~120ms ease-in-out strike (sweeping through contact),
+    ~180ms ease-out recovery back to rest -- `KICK_SWING_DURATION_S` total (~0.45s). Advanced by
+    `update_player_animations` on the same simulation-time clock as the gait phase; the entry is
+    dropped from `Renderer._player_swing` once elapsed time reaches the duration, reverting the
+    player to their normal gait pose.
+  - **Rendering**: `render_kick_pose_legs`/`render_kick_pose_upper` (the app *always* draws
+    players split -- `draw_player_legs` then `draw_player(legs=False)` -- so a swing needed both
+    layers, not just a combined-sprite renderer, to actually show up in a real running match);
+    `render_kick_pose` composites the two for standalone/test use. Foot/shoe ellipses stay
+    axis-aligned rather than rotating to match `direction` (a deliberate simplification, shown and
+    approved as part of the prototype). **Known limitation**: swing frames are drawn fresh every
+    frame (never cached, since `signed_len`/`direction` vary continuously) and skip the per-part
+    Lambert shading pass applied to the cached gait poses -- flat-shaded for the ~0.45s a swing
+    lasts.
+  - **Tests**: `tests/unit/test_player_sprites.py` — the direction-conversion involution property,
+    the basis vectors at 7 headings, an end-to-end check against the renderer's own real rotation
+    code; `swinging_side_for_direction` crosses the body within `MAX_CROSS_ANGLE_DEG`, switches to
+    the near leg past it, and falls back correctly inside the deadzone, with the renderer's trigger
+    confirmed to actually use it (both cases) rather than the gait side alone; `clamp_swing_direction`
+    actually pulls an out-of-range angle back to the cap (not just a no-op at a boundary angle); the
+    timing curve's rest/behind/contact/reach values and phase-boundary continuity; the swinging
+    foot's rendered position staying collinear with the hip (not arcing) across the whole swing;
+    shorts length clamped to the leg's own actual length rather than always `shorts_len_max`,
+    measured directly off the rendered pixels; the shorts hem clearing the torso's bottom edge,
+    both analytically and after real compositing; `render_kick_pose` composing exactly from its two
+    layer functions; `trigger_kick_swing`/
+    `trigger_tackle_swing` starting (and no-op-ing for a zero direction or disabled sprites),
+    `update_player_animations` advancing and then clearing the entry, and the draw path actually
+    substituting the swing pose (both the combined and the real split legs/upper path);
+    `_kick_pad_px` is analytically big enough for the worst-case direction (a pure arithmetic
+    check, independent of rendering, since a fully-off-canvas shape draws nothing at all rather
+    than a visibly clipped edge); a real render at the worst-case direction actually contains a
+    leg-sized blob of opaque pixels (catches exactly that "fully clipped, nothing drawn" failure
+    the arithmetic check alone can't, since it only checks the border, which a totally missing
+    shape leaves untouched); the leg never touches the padded canvas's edge across a sweep of
+    directions; and a kicking player's TORSO (measured by its own pixel footprint, not the padded
+    sprite's bounding box) stays the same on-screen size as a non-swinging one, at the same
+    `radius_px`.
 - **Always-on extras** drawn around every player: a `player_id` label under
   them, two tiny stat bars beneath the label (stamina, then speed — the stamina
   bar is green / yellow / red by level, the speed bar light blue), motion "speed lines" trailing behind a
@@ -876,6 +1009,26 @@ snap, same as every other coordinate in `_ball_dots_layer` already was. Tests:
   pausing) and `draw_player` floats it above the player. Emoji font lookup
   is `_EMOJI_FONT_CANDIDATES` in `renderer.py` (matched by registered family
   name, e.g. `segoeuiemoji`, not filename — see the comment there).
+  Also wires the kick/tackle swing animation (see above): `_kick_cb` reads
+  `player.last_kick_direction` -- the proper field, not a workaround --
+  falling back to "straight ahead" (`cos(heading_rad), sin(heading_rad)`)
+  when it's `None`, rather than reading something else (e.g. the ball's
+  velocity) to paper over the gap. It IS `None` for most real gameplay
+  kicks today: traced through a real `Match`, `PassOrder` and `ShootOrder`
+  both fire `on_kick` directly from their own `execute()`, bypassing
+  `Player._finish_kick` entirely (the only place that sets
+  `last_kick_direction`), so that field is only ever set for a raw
+  `KickOrder` (human kick-aiming/direct scenario setup) -- a real engine
+  bug, written up in `agent_plans/kick_recording_bug.md` (traces the same
+  gap into `bc.py`'s BC-label generation and `scenario_env.py`'s opponent-
+  kick tracking, where a straight-ahead guess isn't an option and it needs
+  fixing properly) rather than worked around here. Once that's fixed, every
+  kick gets its real direction with no further change needed in this
+  callback -- the fallback branch just stops firing. `_tackle_cb` still
+  reads `player.last_tackle_direction` correctly as-is, since
+  `Match._attempt_tackle_contact` sets that one directly rather than via an
+  Order's own `execute()` -- no equivalent gap there. Tests:
+  `tests/unit/test_app_kick_tackle_wiring.py`.
 - **Goalkeepers** are drawn in `GOALKEEPER_COLOUR` (a distinct orange)
   instead of their team colour, so the keeper is identifiable at a glance.
 - **No possession outline.** The player with the ball used to get a white ring

@@ -1287,3 +1287,507 @@ def test_click_hit_testing_radius_is_independent_of_the_drawn_size_floor():
     from footballcoach.ui import input as input_module
 
     assert "player.radius_m" in inspect.getsource(input_module)
+
+
+# ---------------------------------------------------------------------------
+# Kick/tackle swing animation
+# ---------------------------------------------------------------------------
+
+def test_local_direction_from_world_is_its_own_inverse():
+    """`local_direction_from_world`'s docstring claims the change-of-basis matrix is an involution
+    (its own inverse) -- so applying it twice should return to the original vector. This is the
+    actual property the function relies on (there's no separate "world_direction_from_local" to
+    round-trip against), checked at several headings and directions rather than assumed."""
+    import random
+
+    rng = random.Random(0)
+    for _ in range(20):
+        heading = rng.uniform(-math.pi, math.pi)
+        wx, wy = rng.uniform(-1, 1), rng.uniform(-1, 1)
+        if math.hypot(wx, wy) < 1e-6:
+            continue
+        lx, ly = ps.local_direction_from_world(wx, wy, heading)
+        rx, ry = ps.local_direction_from_world(lx, ly, heading)
+        assert rx == pytest.approx(wx, abs=1e-9)
+        assert ry == pytest.approx(wy, abs=1e-9)
+
+
+def test_local_forward_and_sideways_map_to_the_expected_world_directions():
+    """The two basis directions, checked against the values this module's docstring claims were
+    measured empirically (rotating a real marker through the renderer's own rotozoom formula):
+    local (0,1) ("forward") -> world (cos(heading), sin(heading)); local (1,0) ("local right") ->
+    world 90 degrees CCW from that."""
+    for heading_deg in (0, 45, 90, 135, 180, -45, -90):
+        heading = math.radians(heading_deg)
+        # local_direction_from_world is the INVERSE map; feed it the claimed world direction and
+        # confirm it recovers the local basis vector, rather than re-deriving the forward map here.
+        world_forward = (math.cos(heading), math.sin(heading))
+        assert ps.local_direction_from_world(*world_forward, heading) == pytest.approx((0.0, 1.0), abs=1e-9)
+        world_right = (math.cos(heading + math.pi / 2), math.sin(heading + math.pi / 2))
+        assert ps.local_direction_from_world(*world_right, heading) == pytest.approx((1.0, 0.0), abs=1e-9)
+
+
+def test_local_direction_matches_the_renderers_own_rotation_end_to_end():
+    """Places a synthetic marker at a claimed local direction, rotates it through the ACTUAL
+    renderer rotation formula (`_draw_player_pose_layer`'s `rotate_deg`, copied here since it's not
+    itself a standalone function), and confirms it lands on the correct side on screen -- ties the
+    direction math to the real rendering code, not just to its own docstring's claim."""
+    from footballcoach.entities import Pitch
+    from footballcoach.ui.camera import Camera
+    from footballcoach.ui.renderer import Renderer
+
+    for heading_deg in (0, 90, -90, 180):
+        heading = math.radians(heading_deg)
+        pitch = Pitch.standard()
+        cam = Camera.fit_to_pitch(pitch)
+        renderer = Renderer(cam)
+        marker = pygame.Surface((ps._SIZE, ps._SIZE), pygame.SRCALPHA)
+        marker.fill((0, 0, 0, 0))
+        local_x, local_y = ps._SIZE / 2, ps._SIZE / 2 + ps._SIZE * 0.3  # local "forward" marker
+        pygame.draw.circle(marker, (255, 255, 255, 255), (local_x, local_y), 6)
+
+        hx, hy = math.cos(-heading), math.sin(-heading)
+        rotate_deg = 90.0 - math.degrees(math.atan2(hy, hx))
+        rotated = pygame.transform.rotozoom(marker, rotate_deg, 1.0)
+        rw, rh = rotated.get_size()
+        xs = ys = wsum = 0.0
+        for y in range(rh):
+            for x in range(rw):
+                a = rotated.get_at((x, y))[3]
+                if a > 30:
+                    xs += x * a
+                    ys += y * a
+                    wsum += a
+        sx, sy = xs / wsum - (rw - 1) / 2.0, ys / wsum - (rh - 1) / 2.0
+        world_dx, world_dy = sx, -sy  # screen -> world (world_to_screen_f flips y, see camera.py)
+        n = math.hypot(world_dx, world_dy)
+        world_dx, world_dy = world_dx / n, world_dy / n
+        assert (world_dx, world_dy) == pytest.approx((math.cos(heading), math.sin(heading)), abs=0.05)
+
+
+def test_kick_swing_state_starts_and_ends_at_rest():
+    frac0, arm0 = ps.kick_swing_state_at(0.0)
+    assert frac0 == pytest.approx(0.0)
+    assert arm0 == pytest.approx(0.0)
+    frac_end, arm_end = ps.kick_swing_state_at(ps.KICK_SWING_DURATION_S)
+    assert frac_end == pytest.approx(0.0, abs=1e-9)
+    assert arm_end == pytest.approx(0.0, abs=1e-9)
+    # well past the end: still rest, not an index error or extrapolation
+    frac_late, arm_late = ps.kick_swing_state_at(ps.KICK_SWING_DURATION_S + 5.0)
+    assert (frac_late, arm_late) == (0.0, 0.0)
+
+
+def test_kick_swing_state_is_continuous_across_phase_boundaries():
+    """No pop/discontinuity where the piecewise curve hands off between backswing -> strike ->
+    recover -- each phase's own formula should agree with its neighbour's at the shared instant."""
+    eps = 1e-7
+    for boundary in (ps.KICK_BACKSWING_S, ps.KICK_BACKSWING_S + ps.KICK_STRIKE_S):
+        before = ps.kick_swing_state_at(boundary - eps)
+        after = ps.kick_swing_state_at(boundary + eps)
+        assert before[0] == pytest.approx(after[0], abs=1e-3)
+        assert before[1] == pytest.approx(after[1], abs=1e-3)
+
+
+def test_kick_swing_goes_behind_then_reaches_past_full_extension():
+    """The whole point of the axis design: negative (behind the hip) during backswing, ramping
+    through zero (contact) up to `KICK_CONTACT_FRAC` (a full, reaching extension) during the
+    strike -- and it actually reaches those configured extremes, not just trends toward them."""
+    backswing_frac, _ = ps.kick_swing_state_at(ps.KICK_BACKSWING_S)
+    assert backswing_frac == pytest.approx(ps.KICK_BACK_FRAC, abs=1e-6)
+    strike_end_frac, _ = ps.kick_swing_state_at(ps.KICK_BACKSWING_S + ps.KICK_STRIKE_S)
+    assert strike_end_frac == pytest.approx(ps.KICK_CONTACT_FRAC, abs=1e-6)
+
+    # somewhere in the strike phase, the leg is actually behind (negative) at the start and ahead
+    # (positive) by the end -- i.e. it genuinely swings THROUGH the hip, not just up to it
+    fracs = [ps.kick_swing_state_at(ps.KICK_BACKSWING_S + f * ps.KICK_STRIKE_S)[0] for f in (0.0, 0.3, 0.6, 1.0)]
+    assert fracs[0] < 0.0 < fracs[-1]
+    assert fracs == sorted(fracs)  # monotonically increasing through the strike -- no back-and-forth wobble
+
+
+def test_render_kick_pose_returns_the_expected_size_and_is_the_sum_of_its_layers():
+    """The returned surface is bigger than the normal `_BASE_SIZE` gait sprites (padded so the
+    reaching leg can't be clipped -- see `_kick_pad_px`), so the expected size is derived from that
+    same formula rather than hardcoded -- a literal `_BASE_SIZE` would just be wrong here, not a
+    meaningful regression check, once the padding exists at all."""
+    params = ps.PlayerSpriteParams.from_config()
+    legs = ps.render_kick_pose_legs(params, 1, (0.0, 1.0), 0.5)
+    upper = ps.render_kick_pose_upper(params, (200, 30, 30), 1, 0.5)
+    combined = ps.render_kick_pose(params, (200, 30, 30), 1, (0.0, 1.0), 0.5, 0.5)
+    expected_base_size = (ps._SIZE + 2 * ps._kick_pad_px()) // ps._SUPERSAMPLE
+    assert expected_base_size > ps._BASE_SIZE, "this test is only meaningful once padding is non-zero"
+    assert legs.get_size() == (expected_base_size, expected_base_size)
+    assert upper.get_size() == (expected_base_size, expected_base_size)
+    assert combined.get_size() == (expected_base_size, expected_base_size)
+    expected = legs.copy()
+    expected.blit(upper, (0, 0))
+    for y in range(expected_base_size):
+        for x in range(expected_base_size):
+            assert combined.get_at((x, y)) == expected.get_at((x, y))
+
+
+def test_kick_pose_reference_size_matches_the_normal_gait_sprites_base_size():
+    """`Renderer._draw_player_pose_layer` scales a swing sprite by `target_diameter /
+    KICK_POSE_REFERENCE_SIZE`, not by its actual (padded) width -- confirm that reference really is
+    the un-padded torso size, i.e. exactly what the normal gait sprites use, so a kicking player's
+    on-screen torso size doesn't change just because the padding does."""
+    assert ps.KICK_POSE_REFERENCE_SIZE == ps._BASE_SIZE
+
+
+def test_shorts_length_is_clamped_to_the_legs_own_length_not_always_shorts_len_max():
+    """Regression: `_draw_shorts_hem` originally drew an UNCONDITIONAL `shorts_len_max` hem
+    regardless of how long the leg under it actually was -- for the planted leg (whose real length
+    is just `base_min_leg_len`, much shorter than `shorts_len_max`), that put a shorts block AS
+    LONG AS the entire leg, with no exposed shaft/skin at all -- reading as one flat white block
+    rather than a leg wearing shorts (the user: "some real bizarre stuff going on with the
+    shorts... I remember them being done well in the original sprites"). The gait poses always
+    clamped shorts length to `min(total_len, shorts_len_max)`; the swing legs now match."""
+    geo = ps._pose_geometry()
+    short_leg_len = geo["base_min_leg_len"]
+    assert short_leg_len < geo["shorts_len_max"], "this test needs a leg shorter than the shorts hem to be meaningful"
+
+    params = ps.PlayerSpriteParams.from_config()
+    surf = pygame.Surface((ps._SIZE, ps._SIZE), pygame.SRCALPHA)
+    x, hip_y = ps._SIZE / 2, ps._SIZE / 2
+    ps._draw_shorts_hem(surf, params, geo, x, hip_y, short_leg_len)
+    # the rendered shorts hem's own bottom edge should sit at hip_y + short_leg_len, not
+    # hip_y + shorts_len_max -- measured by the lowest shorts-coloured pixel at this column
+    ys = [y for y in range(surf.get_height()) if _near(surf.get_at((int(x), y)), params.shorts_color, tol=15)]
+    assert ys, "no shorts pixels rendered at all"
+    measured_bottom = max(ys)
+    assert measured_bottom == pytest.approx(hip_y + short_leg_len, abs=3)
+    assert measured_bottom < hip_y + geo["shorts_len_max"] - 5, "shorts must NOT reach all the way to shorts_len_max for a short leg"
+
+
+def test_the_swing_poses_shorts_are_not_fully_hidden_under_the_torso():
+    """Regression: the swing legs' hips were originally placed at dead centre (`cy`), same as the
+    torso's own centre -- since `_draw_shorts_hem` draws a short, FIXED-length hem straight down
+    from the hip, that put the ENTIRE shorts rectangle inside the torso's own vertical span, so it
+    was completely painted over once the upper body (drawn after) was composited on top -- the user
+    caught this by eye ("doesn't this sprite have shorts?"). The gait poses avoid this by offsetting
+    each leg's hip below centre by (torso_h/2 - hip_inset) before drawing its shorts; the swing legs
+    now use that same offset. Checked directly: the shorts hem's own y-range must extend below the
+    torso's bottom edge, not merely that shorts pixels exist somewhere (they existed before the fix
+    too -- in the legs layer alone -- they just never survived compositing)."""
+    geo = ps._pose_geometry()
+    hip_y = ps._SIZE / 2 + (geo["torso_h"] / 2 - geo["hip_inset"])
+    torso_bottom = ps._SIZE / 2 + geo["torso_h"] / 2
+    shorts_bottom = hip_y + geo["shorts_len_max"]
+    assert shorts_bottom > torso_bottom + 2, "the shorts hem must clear the torso's own bottom edge"
+
+    # and confirm it survives actual compositing: render the full pose and find shorts-coloured
+    # pixels (near-white) below where the torso's shirt colour ends
+    params = ps.PlayerSpriteParams.from_config()
+    combined = ps.render_kick_pose(params, (13, 77, 201), 1, (0.3, 0.9), 1.0, 0.3)
+    w, h = combined.get_size()
+    shorts_like = [
+        (x, y) for x in range(w) for y in range(h)
+        if _near(combined.get_at((x, y)), params.shorts_color, tol=15)
+    ]
+    assert shorts_like, "no shorts-coloured pixels survived compositing at all"
+
+
+def test_a_kicking_players_torso_is_the_same_on_screen_size_as_a_normal_one():
+    """End-to-end regression for the scaling bug `KICK_POSE_REFERENCE_SIZE` fixes: if
+    `_draw_player_pose_layer` ever scaled a swing sprite by its actual (padded, hence bigger) width
+    instead of that fixed reference, the whole sprite -- torso included -- would render visibly
+    SMALLER than a non-swinging player at the same radius_px, since the same target_diameter would
+    then be divided by a bigger denominator. Measured via the rendered TORSO's own pixel footprint
+    (a contiguous blob of shirt colour near the player's centre), not just overall sprite bbox,
+    since the padding intentionally makes the full bbox bigger -- only the torso itself must match."""
+    cam, surface, renderer, pos, radius = _scene(zoom=5.0)
+    p = _player(heading=0.3)
+    shirt = renderer._player_draw_colour(p)
+
+    def torso_area(swinging):
+        surf = pygame.Surface(surface.get_size())
+        surf.fill(style.PITCH_GREEN)
+        if swinging:
+            renderer.trigger_kick_swing(p, (1.0, 0.2))
+            renderer.update_player_animations([p], ps.KICK_BACKSWING_S)
+        renderer.draw_player_legs(surf, [p])
+        renderer.draw_player(surf, p, legs=False)
+        count = 0
+        for dx in range(-30, 30):
+            for dy in range(-30, 30):
+                x, y = pos[0] + dx, pos[1] + dy
+                if 0 <= x < surf.get_width() and 0 <= y < surf.get_height() and _near(surf.get_at((x, y)), shirt, tol=25):
+                    count += 1
+        return count
+
+    plain_area = torso_area(False)
+    renderer._player_swing.clear()
+    swing_area = torso_area(True)
+    assert plain_area > 20 and swing_area > 20
+    assert swing_area == pytest.approx(plain_area, rel=0.35)
+
+
+def test_kick_pad_is_analytically_big_enough_for_the_worst_case_direction():
+    """A direct, pre-render arithmetic check on `_kick_pad_px()` against the exact worst-case
+    (triangle-inequality) requirement its own docstring claims -- independent of any rendering, so
+    it can't be fooled by a shape that clips so completely it leaves nothing at the edge at all
+    (see `test_the_swing_leg_is_never_fully_clipped_off_canvas` for why that's a real risk, not a
+    hypothetical one, for a shape entirely off-canvas rather than merely touching the border)."""
+    geo = ps._pose_geometry()
+    max_frac = max(abs(ps.KICK_BACK_FRAC), ps.KICK_CONTACT_FRAC)
+    required_half = geo["hip_x_offset"] + max_frac * geo["leg_reach"] + geo["shoe_ry"] * 1.5
+    pad = ps._kick_pad_px()
+    actual_half = ps._SIZE / 2 + pad
+    assert actual_half >= required_half
+
+
+def test_the_swing_leg_is_never_fully_clipped_off_canvas():
+    """The real failure mode an insufficient pad causes: not a visibly cut-off edge (a shape that's
+    ENTIRELY outside the canvas draws nothing at all, leaving the edge transparent, not opaque --
+    so a same only checking the border misses this), but the foot silently vanishing. Checked at
+    the worst-case direction (aligned with the hip's own offset axis, where the hip offset and the
+    swing distance add most directly -- see `_kick_pad_px`'s docstring) by confirming a skin/shoe-
+    coloured blob of a sane minimum size actually exists somewhere in the rendered image, not just
+    that pixels exist at all (an empty canvas with one stray pixel shouldn't pass either)."""
+    params = ps.PlayerSpriteParams.from_config()
+    for direction in ((1.0, 0.0), (-1.0, 0.0)):
+        for frac in (ps.KICK_BACK_FRAC, ps.KICK_CONTACT_FRAC):
+            surf = ps.render_kick_pose_legs(params, 1, direction, frac)
+            opaque = sum(
+                1 for x in range(surf.get_width()) for y in range(surf.get_height())
+                if surf.get_at((x, y))[3] > 100
+            )
+            assert opaque > 40, (direction, frac, opaque)
+
+
+def test_the_swing_leg_never_gets_clipped_by_the_padded_canvas_at_any_direction():
+    """`_kick_pad_px`'s whole job: at the configured reach extremes, the foot must stay inside the
+    canvas for EVERY direction, not just the ones already exercised by other tests -- checked here
+    by sweeping many directions at both `KICK_BACK_FRAC` and `KICK_CONTACT_FRAC` and confirming the
+    rendered opaque pixels never touch the canvas's own edge (a PARTIALLY clipped shape would have
+    opaque pixels running right up to row/column 0 or the last one; a FULLY clipped one is instead
+    caught by `test_the_swing_leg_is_never_fully_clipped_off_canvas`, since this check alone can't
+    tell a shape that's fully off-canvas from one that comfortably fits)."""
+    params = ps.PlayerSpriteParams.from_config()
+    for angle_deg in range(0, 360, 15):
+        rad = math.radians(angle_deg)
+        direction = (math.sin(rad), math.cos(rad))
+        for frac in (ps.KICK_BACK_FRAC, ps.KICK_CONTACT_FRAC):
+            surf = ps.render_kick_pose_legs(params, 1, direction, frac)
+            w, h = surf.get_size()
+            edge_opaque = any(surf.get_at((x, 0))[3] > 0 or surf.get_at((x, h - 1))[3] > 0 for x in range(w))
+            edge_opaque = edge_opaque or any(
+                surf.get_at((0, y))[3] > 0 or surf.get_at((w - 1, y))[3] > 0 for y in range(h)
+            )
+            assert not edge_opaque, (angle_deg, frac)
+
+
+def test_the_swinging_foot_moves_along_one_fixed_line_not_an_arc():
+    """The actual regression this design fixes: the foot's position, sampled across the whole
+    swing, should lie on ONE straight line through the hip (the fixed `direction`) -- not trace an
+    arc, which is what an earlier (rejected) angle-sweeping version did. Checked by measuring the
+    rendered foot's pixel centroid at several points in the swing and confirming they're all
+    collinear with the hip, allowing for anti-aliasing/downscale noise."""
+    params = ps.PlayerSpriteParams.from_config()
+
+    def foot_centroid(signed_len_frac):
+        surf = ps.render_kick_pose_legs(params, 1, (0.3, 0.95), signed_len_frac)
+        # crop to the right half (swing_side=1 -> the swinging leg's hip is at cx + offset > cx)
+        w, h = surf.get_size()
+        xs = ys = wsum = 0.0
+        for y in range(h):
+            for x in range(w // 2, w):
+                a = surf.get_at((x, y))[3]
+                if a > 100:
+                    xs += x * a
+                    ys += y * a
+                    wsum += a
+        return xs / wsum, ys / wsum
+
+    # backswing (behind) and two forward reach points -- all should sit on the same line through
+    # the hip since `direction` never changes, only `signed_len_frac` (the distance along it) does
+    points = [foot_centroid(f) for f in (-0.5, 0.3, 0.8, 1.15)]
+    # fit: check every point's perpendicular distance from the line through the first two points is
+    # small relative to the swing's own reach (a real arc would bow out by a large fraction of it)
+    (x0, y0), (x1, y1) = points[0], points[1]
+    dx, dy = x1 - x0, y1 - y0
+    line_len = math.hypot(dx, dy)
+    assert line_len > 1.0, "backswing and forward-reach points should be well separated"
+    for x, y in points[2:]:
+        perp_dist = abs(dx * (y0 - y) - (x0 - x) * dy) / line_len
+        assert perp_dist < line_len * 0.15, (points, perp_dist)
+
+
+def test_renderer_trigger_kick_swing_starts_the_animation():
+    cam, surface, renderer, pos, radius = _scene(zoom=3.0)
+    p = _player()
+    assert p.player_id not in renderer._player_swing
+    renderer.trigger_kick_swing(p, (1.0, 0.0))
+    assert p.player_id in renderer._player_swing
+    side, direction, elapsed_s = renderer._player_swing[p.player_id]
+    assert elapsed_s == 0.0
+    assert side in (1, -1)
+    assert math.hypot(*direction) == pytest.approx(1.0, abs=1e-6)
+
+
+def test_renderer_trigger_swing_is_a_noop_for_a_degenerate_direction():
+    cam, surface, renderer, pos, radius = _scene(zoom=3.0)
+    p = _player()
+    renderer.trigger_kick_swing(p, (0.0, 0.0))
+    assert p.player_id not in renderer._player_swing
+
+
+def test_renderer_trigger_swing_is_a_noop_with_sprites_disabled():
+    cam, surface, renderer, pos, radius = _scene(zoom=3.0)
+    renderer._sprites_enabled = False
+    p = _player()
+    renderer.trigger_kick_swing(p, (1.0, 0.0))
+    assert p.player_id not in renderer._player_swing
+
+
+def test_update_player_animations_advances_and_then_clears_the_swing():
+    cam, surface, renderer, pos, radius = _scene(zoom=3.0)
+    p = _player()
+    renderer.trigger_kick_swing(p, (1.0, 0.0))
+    renderer.update_player_animations([p], ps.KICK_SWING_DURATION_S * 0.5)
+    assert p.player_id in renderer._player_swing
+    _, _, elapsed_s = renderer._player_swing[p.player_id]
+    assert elapsed_s == pytest.approx(ps.KICK_SWING_DURATION_S * 0.5)
+
+    renderer.update_player_animations([p], ps.KICK_SWING_DURATION_S)  # well past the remainder
+    assert p.player_id not in renderer._player_swing
+
+
+def _dir_at(angle_deg):
+    """A unit direction `angle_deg` degrees from straight-forward (local (0,1)), matching
+    `swinging_side_for_direction`'s own `atan2(dx, dy)` convention."""
+    rad = math.radians(angle_deg)
+    return math.sin(rad), math.cos(rad)
+
+
+def test_swinging_side_for_direction_crosses_the_body_within_the_cross_angle():
+    """The actual anatomy: real kicks plant the near-side foot and swing the FAR-side leg across
+    the body to strike -- not the other way around -- for a target up to `MAX_CROSS_ANGLE_DEG` off
+    straight ahead. `render_kick_pose_legs`'s swing leg hip sits at local `+swing_side *
+    hip_x_offset`, so for a target with a positive local x-component (to the swing_side=+1 leg's
+    own side), the CORRECT (crossing) choice is swing_side=-1 (the opposite leg), and vice versa.
+    An earlier version of this picked the SAME-side leg (reasoned as "avoids an awkward cross-body
+    reach") -- backwards, and the user caught it by eye ("nobody kicks outwards like that... you
+    cross your right foot across your body")."""
+    assert ps.swinging_side_for_direction(_dir_at(20), fallback_side=1) == -1
+    assert ps.swinging_side_for_direction(_dir_at(-20), fallback_side=1) == 1
+    assert ps.swinging_side_for_direction(_dir_at(ps.MAX_CROSS_ANGLE_DEG), fallback_side=1) == -1  # inclusive
+
+
+def test_swinging_side_for_direction_uses_the_near_leg_past_the_cross_angle():
+    """Past `MAX_CROSS_ANGLE_DEG`, even a real crossing kick stops being plausible -- switches back
+    to the NEAR-side leg for a wide-angle target, per the user: "if the player is kicking past that
+    point, use the nearer leg". This is the opposite side choice from the crossing case at the same
+    lateral sign, not just a clamp on the same leg."""
+    assert ps.swinging_side_for_direction(_dir_at(60), fallback_side=1) == 1
+    assert ps.swinging_side_for_direction(_dir_at(-60), fallback_side=1) == -1
+    assert ps.swinging_side_for_direction(_dir_at(ps.MAX_CROSS_ANGLE_DEG + 0.5), fallback_side=1) == 1
+
+
+def test_swinging_side_for_direction_falls_back_for_a_near_straight_target():
+    """A target close enough to straight ahead/behind that its lateral component is inside the
+    deadzone -- either foot is equally natural, so the caller's fallback (the gait's current
+    leading side) is used instead of forcing a side from a near-zero, noisy sign."""
+    assert ps.swinging_side_for_direction((0.01, 1.0), fallback_side=1) == 1
+    assert ps.swinging_side_for_direction((0.01, 1.0), fallback_side=-1) == -1
+    assert ps.swinging_side_for_direction((0.01, -1.0), fallback_side=-1) == -1
+
+
+def test_renderer_trigger_picks_the_crossing_side_not_the_gait_leading_side():
+    """End-to-end: `_trigger_swing` must actually use `swinging_side_for_direction`, not just have
+    it defined and unused -- confirmed by triggering with a lateral-but-within-cap target and
+    checking the stored side is the CROSSING one regardless of what the gait phase alone would have
+    picked. World (0.940, 0.342) at heading=0 -> local (0.342, 0.940), a 20 degree target (within
+    `MAX_CROSS_ANGLE_DEG`) toward the swing_side=+1 leg's own side -- crossing needs side=-1."""
+    cam, surface, renderer, pos, radius = _scene(zoom=3.0)
+    p = _player(heading=0.0)
+    renderer.trigger_kick_swing(p, (0.940, 0.342))
+    side, direction, _ = renderer._player_swing[p.player_id]
+    assert direction == pytest.approx((0.342, 0.940), abs=1e-3)
+    assert side == -1
+
+
+def test_clamp_swing_direction_actually_clamps_past_the_outer_cap():
+    """`test_renderer_trigger_uses_the_near_leg_past_the_cross_angle` uses a 90-degree target, which
+    sits right AT the default `MAX_SWING_ANGLE_DEG` boundary -- clamping is a no-op there regardless
+    of what the cap's value actually is, so it can't catch a broken/disabled cap on its own. This
+    test uses an angle clearly PAST the cap (150 degrees) and confirms the result is pulled back to
+    exactly the cap, not left at 150."""
+    far = ps.clamp_swing_direction(_dir_at(150), max_angle_deg=90.0)
+    assert far == pytest.approx(_dir_at(90), abs=1e-6)
+    far_negative = ps.clamp_swing_direction(_dir_at(-150), max_angle_deg=90.0)
+    assert far_negative == pytest.approx(_dir_at(-90), abs=1e-6)
+    # and using the module's actual current default, not a passed-in override
+    default_far = ps.clamp_swing_direction(_dir_at(150))
+    assert default_far == pytest.approx(_dir_at(ps.MAX_SWING_ANGLE_DEG), abs=1e-6)
+
+
+def test_renderer_trigger_uses_the_near_leg_past_the_cross_angle():
+    """Same as the crossing test above, but with a target BEYOND `MAX_CROSS_ANGLE_DEG` -- confirms
+    the renderer's wiring picks up the near-leg switch too, not just the pure function in
+    isolation. World (0, 1) at heading=0 -> local (1, 0), a 90 degree target -- past the cross
+    angle, so the NEAR leg (side=+1) should be used, clamped to `MAX_SWING_ANGLE_DEG`."""
+    cam, surface, renderer, pos, radius = _scene(zoom=3.0)
+    p = _player(heading=0.0)
+    renderer.trigger_kick_swing(p, (0.0, 1.0))
+    side, direction, _ = renderer._player_swing[p.player_id]
+    assert side == 1
+    expected = ps.clamp_swing_direction((1.0, 0.0))
+    assert direction == pytest.approx(expected, abs=1e-6)
+
+
+def test_trigger_tackle_swing_uses_the_direction_toward_the_target():
+    """`trigger_tackle_swing` takes the same (player, world_direction) shape as
+    `trigger_kick_swing` -- confirm it stores that direction (converted to local, THEN clamped --
+    see `test_renderer_trigger_uses_the_near_leg_past_the_cross_angle` for a dedicated clamp check;
+    world (0,1) at heading=0 is a 90 degree target, past `MAX_SWING_ANGLE_DEG`) rather than
+    silently ignoring it or reusing some other state."""
+    cam, surface, renderer, pos, radius = _scene(zoom=3.0)
+    p = _player(heading=0.0)
+    renderer.trigger_tackle_swing(p, (0.0, 1.0))  # world "sideways" relative to heading=0 forward
+    _, direction, _ = renderer._player_swing[p.player_id]
+    raw = ps.local_direction_from_world(0.0, 1.0, 0.0)
+    expected = ps.clamp_swing_direction(raw)
+    assert direction == pytest.approx(expected, abs=1e-9)
+
+
+def test_a_mid_swing_player_draws_a_different_sprite_than_the_normal_gait_pose():
+    """Sanity/regression check that `_draw_player_pose_layer` actually substitutes the swing pose
+    (rather than the trigger being recorded but silently ignored by the draw path): the rendered
+    pixels differ between a player mid-swing and the same player with no swing active."""
+    cam, surface, renderer, pos, radius = _scene(zoom=5.0)
+    p = _player(heading=0.4)
+
+    plain = pygame.Surface(surface.get_size())
+    plain.fill(style.PITCH_GREEN)
+    renderer.draw_player(plain, p)
+
+    renderer.trigger_kick_swing(p, (1.0, 0.3))
+    renderer.update_player_animations([p], ps.KICK_BACKSWING_S + ps.KICK_STRIKE_S * 0.5)  # mid-strike
+    swinging = pygame.Surface(surface.get_size())
+    swinging.fill(style.PITCH_GREEN)
+    renderer.draw_player(swinging, p)
+
+    diffs = sum(
+        1 for x in range(plain.get_width()) for y in range(plain.get_height())
+        if plain.get_at((x, y)) != swinging.get_at((x, y))
+    )
+    assert diffs > 20
+
+
+def test_a_mid_swing_player_still_draws_correctly_through_the_split_legs_upper_path():
+    """The app *always* draws players split (`draw_player_legs` then `draw_player(legs=False)`) --
+    confirm a mid-swing player renders without error through that exact path too, not just the
+    combined `legs=True` default (see `render_kick_pose_legs`'s docstring for why this matters)."""
+    cam, surface, renderer, pos, radius = _scene(zoom=5.0)
+    p = _player(heading=-1.2)
+    renderer.trigger_kick_swing(p, (0.5, -0.5))
+    renderer.update_player_animations([p], ps.KICK_BACKSWING_S)
+
+    surface.fill(style.PITCH_GREEN)
+    renderer.draw_player_legs(surface, [p])
+    renderer.draw_player(surface, p, legs=False)  # should not raise, and should draw something
+    non_green = sum(
+        1 for x in range(surface.get_width()) for y in range(surface.get_height())
+        if tuple(surface.get_at((x, y))[:3]) != style.PITCH_GREEN
+    )
+    assert non_green > 20

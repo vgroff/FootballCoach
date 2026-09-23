@@ -1320,6 +1320,9 @@ class Match:
         recording captures the event regardless of which order type triggered
         the tackle (``ChaseTackleOrder`` or ``GetPossessionOrder``).
         """
+        _delta = target.position - player.position
+        _delta_len = _delta.length()
+        player.last_tackle_direction = (_delta * (1.0 / _delta_len)) if _delta_len > 1e-6 else None
         if player.on_tackle is not None:
             player.on_tackle(player)
         if self.match_logger is not None:

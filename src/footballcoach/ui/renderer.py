@@ -516,6 +516,13 @@ class Renderer:
         self._sprites_enabled: bool = bool(gcfg.get("player_sprites", {}).get("enabled", True))
         self._sprite_params = player_sprites.PlayerSpriteParams.from_config() if self._sprites_enabled else None
         self._player_gait_phase: dict[str, float] = {}
+        # Kick/tackle swing: player_id -> (swing_side, direction, elapsed_s). Started by
+        # trigger_kick_swing/trigger_tackle_swing, advanced by update_player_animations (same
+        # SIMULATION-time clock as the gait phase), and consulted by _draw_player_pose_layer, which
+        # substitutes the swing pose for the normal gait sprite while elapsed_s is still within
+        # player_sprites.KICK_SWING_DURATION_S. Renderer-side only, like the gait phase -- purely
+        # cosmetic, doesn't belong on the engine's Player.
+        self._player_swing: dict[str, tuple[int, tuple[float, float], float]] = {}
 
     @staticmethod
     def _make_icosahedron_vertices() -> list:
@@ -631,6 +638,53 @@ class Renderer:
             self._player_gait_phase[player.player_id] = player_sprites.advance_gait_phase(
                 phase, player.speed_mps, dt_s, self._sprite_params
             )
+        if self._player_swing:
+            expired = []
+            for player_id, (side, direction, elapsed_s) in self._player_swing.items():
+                elapsed_s += dt_s
+                if elapsed_s >= player_sprites.KICK_SWING_DURATION_S:
+                    expired.append(player_id)
+                else:
+                    self._player_swing[player_id] = (side, direction, elapsed_s)
+            for player_id in expired:
+                del self._player_swing[player_id]
+
+    def _trigger_swing(self, player: Player, world_direction: tuple[float, float]) -> None:
+        """Shared body of `trigger_kick_swing`/`trigger_tackle_swing`: starts (or restarts) the
+        swing animation for `player`, aimed at `world_direction` (a world-space XY vector, e.g.
+        `player.last_kick_direction`; need not be normalised, but must be non-zero). The animated
+        direction is clamped to `player_sprites.MAX_SWING_ANGLE_DEG` of straight-forward (see
+        there) -- the actual kick physics/target are never touched by this, only how far off-centre
+        the drawn leg is allowed to aim. Which leg swings crosses the body toward the (clamped)
+        target (`player_sprites.swinging_side_for_direction`, see there for why -- real kicks plant
+        the near-side foot and swing the far one across), falling back to whichever side is
+        currently "leading" in the player's own gait cycle (`player_sprites.pick_pose`'s `side`)
+        only for a near-straight-ahead target, where either foot is equally natural. No-op if
+        sprites are disabled or the direction is degenerate (zero vector -- nothing sensible to aim
+        the leg at)."""
+        if not self._sprites_enabled:
+            return
+        wx, wy = world_direction
+        if math.hypot(wx, wy) < 1e-9:
+            return
+        local_dir = player_sprites.local_direction_from_world(wx, wy, player.heading_rad)
+        local_dir = player_sprites.clamp_swing_direction(local_dir)
+        gait_side, _ = player_sprites.pick_pose(
+            self._player_gait_phase.get(player.player_id, 0.0), player.speed_mps, self._sprite_params
+        )
+        side = player_sprites.swinging_side_for_direction(local_dir, gait_side)
+        self._player_swing[player.player_id] = (side, local_dir, 0.0)
+
+    def trigger_kick_swing(self, player: Player, world_direction: tuple[float, float]) -> None:
+        """Starts the kick swing animation for `player`, aimed at `world_direction` (world-space
+        XY, e.g. `player.last_kick_direction`). Call from the engine's `on_kick` callback."""
+        self._trigger_swing(player, world_direction)
+
+    def trigger_tackle_swing(self, player: Player, world_direction: tuple[float, float]) -> None:
+        """Starts the tackle swing animation for `player` (the tackler), aimed at
+        `world_direction` (world-space XY, e.g. the direction from the tackler toward the ball
+        carrier). Call from the engine's `on_tackle` callback."""
+        self._trigger_swing(player, world_direction)
 
     def draw_pitch(self, surface: pygame.Surface, pitch: Pitch, *, goal_tops: bool = True) -> None:
         """Draws the pitch, goals and dressing. ``goal_tops=False`` leaves out
@@ -1845,17 +1899,37 @@ class Renderer:
         its own distinct colour exactly like the old circle was. `layer` selects which of
         `PlayerSpriteSet`'s three parallel sprite families to draw: "combined" (the whole figure,
         one sprite -- what `draw_player`'s default, non-split path uses), "legs" or "upper" (see
-        `_render_pose_layers` / `draw_player_legs` for why the figure is ever split in two)."""
-        side, level = player_sprites.pick_pose(
-            self._player_gait_phase.get(player.player_id, 0.0), player.speed_mps, self._sprite_params
-        )
-        sprite_set = player_sprites.get_sprite_set(self._sprite_params, colour)
-        get_fn, shaded_fn = {
-            "combined": (sprite_set.get, sprite_set.shaded),
-            "legs": (sprite_set.get_legs, sprite_set.legs_shaded),
-            "upper": (sprite_set.get_upper, sprite_set.upper_shaded),
-        }[layer]
-        base_sprite = get_fn(side, level)
+        `_render_pose_layers` / `draw_player_legs` for why the figure is ever split in two).
+
+        While a kick/tackle swing is active for this player (`self._player_swing`, started by
+        `trigger_kick_swing`/`trigger_tackle_swing`), the normal gait-phase pose is substituted
+        with a swing-pose frame instead (`player_sprites.render_kick_pose_*`) -- continuously
+        varying per frame, so unlike the gait poses these are drawn fresh each time, not fetched
+        from `PlayerSpriteSet`'s cache. **Known limitation**: swing frames skip the per-part
+        Lambert shading pass (`_player_shading_strength`) applied to the cached gait poses below,
+        since that pass is keyed by a small fixed set of cached base poses and the swing isn't one
+        -- a swinging player's sprite is flat-shaded for the ~0.45s the swing lasts."""
+        swing = self._player_swing.get(player.player_id)
+        if swing is not None:
+            side, local_dir, elapsed_s = swing
+            frac, arm = player_sprites.kick_swing_state_at(elapsed_s)
+            if layer == "legs":
+                base_sprite = player_sprites.render_kick_pose_legs(self._sprite_params, side, local_dir, frac)
+            elif layer == "upper":
+                base_sprite = player_sprites.render_kick_pose_upper(self._sprite_params, colour, side, arm)
+            else:
+                base_sprite = player_sprites.render_kick_pose(self._sprite_params, colour, side, local_dir, frac, arm)
+        else:
+            side, level = player_sprites.pick_pose(
+                self._player_gait_phase.get(player.player_id, 0.0), player.speed_mps, self._sprite_params
+            )
+            sprite_set = player_sprites.get_sprite_set(self._sprite_params, colour)
+            get_fn, shaded_fn = {
+                "combined": (sprite_set.get, sprite_set.shaded),
+                "legs": (sprite_set.get_legs, sprite_set.legs_shaded),
+                "upper": (sprite_set.get_upper, sprite_set.upper_shaded),
+            }[layer]
+            base_sprite = get_fn(side, level)
 
         # Rotate to match heading: the sprite's own local art faces "down"
         # (+y); `hx, hy` is the same screen-space facing vector the heading
@@ -1869,7 +1943,7 @@ class Renderer:
         hx, hy = math.cos(-player.heading_rad), math.sin(-player.heading_rad)
         rotate_deg = 90.0 - math.degrees(math.atan2(hy, hx))
 
-        if self._player_shading_strength > 0.0:
+        if swing is None and self._player_shading_strength > 0.0:
             # Light the sprite BEFORE rotating it: the scene light's direction (screen frame) is
             # rotated into the sprite's own frame by the inverse of the rotation applied below.
             az, el, _ = self._point_light_at(player.position.x, player.position.y, self._PLAYER_LIGHT_Z_M)
@@ -1883,7 +1957,12 @@ class Renderer:
             )
 
         target_diameter = max(1.0, radius_px * self._sprite_params.size_scale)
-        scale = target_diameter / base_sprite.get_width()
+        # A swing sprite's canvas is padded bigger than the normal gait sprites' (see
+        # player_sprites.KICK_POSE_REFERENCE_SIZE) so the reaching leg doesn't get clipped -- scale
+        # against that fixed torso reference, not the actual (padded) width, or the extra canvas
+        # would also shrink the on-screen TORSO, not just extend how far the leg can reach.
+        reference_width = player_sprites.KICK_POSE_REFERENCE_SIZE if swing is not None else base_sprite.get_width()
+        scale = target_diameter / reference_width
         rotated = pygame.transform.rotozoom(base_sprite, rotate_deg, scale)
 
         if is_inactive:

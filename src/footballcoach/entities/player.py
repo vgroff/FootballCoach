@@ -233,6 +233,13 @@ class Player:
     last_kick_power_fraction: float | None = field(default=None, repr=False, compare=False)
     last_kick_spin: Vector3 | None = field(default=None, repr=False, compare=False)
 
+    # XY unit vector from this player toward whoever they just attempted a tackle on, set by the
+    # engine (Match._attempt_tackle_contact) immediately before firing on_tackle -- mirrors
+    # last_kick_direction's rationale: gives any on_tackle callback (currently just the UI's
+    # kick/tackle swing-animation trigger) the tackle's actual direction with no per-caller wiring,
+    # rather than changing on_tackle's own call signature to also pass the target player.
+    last_tackle_direction: Vector3 | None = field(default=None, repr=False, compare=False)
+
     # Display hint: set by the engine when an action fires (kick, tackle,
     # first-touch control, GK save).  The UI layer polls this each frame,
     # records the icon with a wall-clock expiry, then clears it.  Engine
