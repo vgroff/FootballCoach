@@ -49,7 +49,7 @@ from footballcoach.ui import scenarios, style
 from footballcoach.ui.camera import Camera
 from footballcoach.ui.gamelog import GameLog, LogLevel
 from footballcoach.ui.input import MatchInputController, OrderMode
-from footballcoach.ui.renderer import Renderer
+from footballcoach.ui.renderer import DropdownScrollbar, Renderer
 from footballcoach.ui.scenarios import ScenarioBoolParam, ScenarioChoiceParam, ScenarioGroupedChoiceParam, ScenarioParam
 from footballcoach.ui.sim_clock import SimTimeDelta
 
@@ -98,6 +98,11 @@ class ScenarioParamsUIState:
     open_choice_param: str | None = None  # which ScenarioChoiceParam/ScenarioGroupedChoiceParam dropdown is open
     open_choice_folder: str | None = None  # for a ScenarioGroupedChoiceParam: which group is expanded (None = folder list)
     dropdown_scroll: int = 0  # scroll offset (in items) of whichever list is currently showing
+    wheel_scroll_accum: float = 0.0  # fractional leftover from high-precision/trackpad wheel deltas (see _handle_events)
+    scrollbar_geom: "DropdownScrollbar | None" = None  # geometry of the open list's drag thumb, refreshed every draw
+    scrollbar_dragging: bool = False
+    type_ahead_buffer: str = ""  # in-progress "type to search" text for whichever list is open
+    type_ahead_last_ms: int = 0  # pygame.time.get_ticks() of the last keystroke, for the reset-after-a-pause timeout
 
     def reset_for(self, definition: scenarios.ScenarioDefinition) -> None:
         self.definition = definition
@@ -106,6 +111,20 @@ class ScenarioParamsUIState:
         self.open_choice_param = None
         self.open_choice_folder = None
         self.dropdown_scroll = 0
+        self.wheel_scroll_accum = 0.0
+        self.scrollbar_geom = None
+        self.scrollbar_dragging = False
+        self.type_ahead_buffer = ""
+
+    def close_dropdown_list(self) -> None:
+        """Reset per-list transient state (scroll, drag, search) whenever the
+        currently-displayed list changes -- a new dropdown opens, a group is
+        entered/left, or the dropdown closes. Called from every spot in
+        ``App`` that used to just reset ``dropdown_scroll`` on its own."""
+        self.dropdown_scroll = 0
+        self.wheel_scroll_accum = 0.0
+        self.scrollbar_dragging = False
+        self.type_ahead_buffer = ""
 
     def clear(self) -> None:
         self.definition = None
@@ -326,16 +345,17 @@ class App:
             elif event.type == pygame.VIDEORESIZE:
                 self._handle_resize(event.w, event.h)
             elif event.type == pygame.KEYDOWN:
-                self._handle_keydown(event.key)
+                self._handle_keydown(event.key, event.unicode)
             elif self.screen == Screen.MENU and event.type == pygame.MOUSEBUTTONDOWN:
                 self._handle_menu_click(event.pos)
             elif self.screen == Screen.SCENARIO_PARAMS and event.type == pygame.MOUSEBUTTONDOWN:
                 self._handle_params_click(event.pos)
+            elif self.screen == Screen.SCENARIO_PARAMS and event.type == pygame.MOUSEMOTION and self._scenario_params_ui.scrollbar_dragging:
+                self._scrollbar_drag_to(event.pos[1])
+            elif self.screen == Screen.SCENARIO_PARAMS and event.type == pygame.MOUSEBUTTONUP:
+                self._scenario_params_ui.scrollbar_dragging = False
             elif self.screen == Screen.SCENARIO_PARAMS and event.type == pygame.MOUSEWHEEL:
-                if self._scenario_params_ui.open_choice_param is not None:
-                    self._scenario_params_ui.dropdown_scroll = max(
-                        0, self._scenario_params_ui.dropdown_scroll - event.y
-                    )
+                self._scroll_open_dropdown(event)
             elif self.screen == Screen.MATCH and event.type == pygame.MOUSEBUTTONDOWN and self.help_button_rect.collidepoint(event.pos):
                 self.show_help = not self.show_help
             elif self.screen == Screen.MATCH and not self.show_help and event.type == pygame.MOUSEBUTTONDOWN and self._speed_minus_rect.collidepoint(event.pos):
@@ -349,12 +369,106 @@ class App:
             elif self.screen == Screen.MATCH and not self.show_help:
                 self._handle_match_mouse_event(event)
 
-    def _handle_keydown(self, key: int) -> None:
+    def _scroll_open_dropdown(self, event: pygame.event.Event) -> None:
+        """Mouse-wheel scrolling for whichever SCENARIO_PARAMS dropdown list
+        is open. Uses SDL's high-precision ``precise_y`` when available,
+        falling back to the integer ``y``, and accumulates the fractional
+        remainder across events instead of truncating it per-event.
+
+        This matters because many mice/trackpads with "smooth"/hi-res
+        scrolling report sub-1.0 deltas per wheel event (confirmed:
+        pygame-ce's ``MOUSEWHEEL`` carries a ``precise_y`` field precisely
+        for this). The plain integer ``event.y`` those devices produce can
+        stay at 0 for a long run of real physical scrolling, which is what
+        made the wheel look completely unresponsive -- not a platform/focus
+        issue, an SDL-side rounding-to-zero one.
+        """
+        ui = self._scenario_params_ui
+        if ui.open_choice_param is None:
+            return
+        precise = getattr(event, "precise_y", None)
+        delta = float(precise) if precise else float(event.y)
+        ui.wheel_scroll_accum -= delta
+        step = int(ui.wheel_scroll_accum)  # truncate toward zero -- only commit whole items
+        if step != 0:
+            ui.dropdown_scroll = max(0, ui.dropdown_scroll + step)
+            ui.wheel_scroll_accum -= step
+
+    def _scrollbar_drag_to(self, mouse_y: int) -> None:
+        """Maps a scrollbar drag/click's mouse Y to an absolute scroll
+        offset, using the drag-track geometry captured from the most recent
+        draw (``Renderer.draw_scenario_params``'s ``DropdownScrollbar``
+        return) -- so this never re-derives the layout math independently
+        of what was actually drawn."""
+        ui = self._scenario_params_ui
+        geom = ui.scrollbar_geom
+        if geom is None:
+            return
+        usable = max(1, geom.track_rect.height - geom.thumb_h)
+        frac = (mouse_y - geom.track_rect.y - geom.thumb_h / 2) / usable
+        frac = min(1.0, max(0.0, frac))
+        scroll_range = max(1, geom.total - geom.visible)
+        ui.dropdown_scroll = round(frac * scroll_range)
+
+    def _type_ahead_jump(self) -> None:
+        """Scrolls the currently-open dropdown list so the first item whose
+        label starts with ``ui.type_ahead_buffer`` is visible. Falls back to
+        a "contains" match if no item starts with the buffer (e.g. searching
+        a checkpoint run by a number that isn't at the start of its label).
+        Uses ``scenarios.dropdown_items_for`` -- the same source Renderer
+        draws from -- so this can never disagree with what's on screen."""
+        ui = self._scenario_params_ui
+        if ui.definition is None or ui.open_choice_param is None or not ui.type_ahead_buffer:
+            return
+        all_params = list(ui.definition.params) + scenarios.UNIVERSAL_PARAMS
+        param = next((p for p in all_params if p.name == ui.open_choice_param), None)
+        if param is None:
+            return
+        items = scenarios.dropdown_items_for(param, ui.open_choice_folder)
+        buf = ui.type_ahead_buffer
+        match_idx = next((i for i, (_k, label) in enumerate(items) if label.lower().startswith(buf)), None)
+        if match_idx is None:
+            match_idx = next((i for i, (_k, label) in enumerate(items) if buf in label.lower()), None)
+        if match_idx is not None:
+            ui.dropdown_scroll = match_idx
+
+    def _type_ahead_confirm(self) -> None:
+        """Enter, with a type-ahead match: mirrors clicking that row --
+        drills into a matched group folder, or selects a matched leaf/flat
+        value and closes the dropdown. No-ops if nothing matches."""
+        ui = self._scenario_params_ui
+        if ui.definition is None or ui.open_choice_param is None or not ui.type_ahead_buffer:
+            return
+        all_params = list(ui.definition.params) + scenarios.UNIVERSAL_PARAMS
+        param = next((p for p in all_params if p.name == ui.open_choice_param), None)
+        if param is None:
+            return
+        items = scenarios.dropdown_items_for(param, ui.open_choice_folder)
+        buf = ui.type_ahead_buffer
+        match_key = next((k for k, label in items if label.lower().startswith(buf)), None)
+        if match_key is None:
+            match_key = next((k for k, label in items if buf in label.lower()), None)
+        if match_key is None:
+            return
+        if isinstance(param, ScenarioGroupedChoiceParam) and ui.open_choice_folder is None:
+            ui.open_choice_folder = match_key
+            ui.close_dropdown_list()
+        else:
+            ui.values[param.name] = match_key
+            ui.open_choice_param = None
+            ui.open_choice_folder = None
+            ui.close_dropdown_list()
+
+    def _handle_keydown(self, key: int, unicode: str = "") -> None:
         if key == pygame.K_ESCAPE:
             if self.show_help:
                 self.show_help = False
             elif self.input_controller is not None and self.input_controller.kick_ui_state() is not None:
                 self.input_controller.cancel_kick_ui()
+            elif self.screen == Screen.SCENARIO_PARAMS and self._scenario_params_ui.type_ahead_buffer:
+                # First Escape while typing a search just clears the search,
+                # a second one (buffer already empty) leaves the screen.
+                self._scenario_params_ui.type_ahead_buffer = ""
             elif self.screen == Screen.SCENARIO_PARAMS:
                 self.screen = Screen.MENU
             elif self.input_controller is not None and self.input_controller.order_mode != OrderMode.MOVE:
@@ -392,6 +506,27 @@ class App:
                 return
             if key == pygame.K_PAGEDOWN:
                 ui.dropdown_scroll = ui.dropdown_scroll + 5
+                return
+            # Type-ahead search: typing filters/jumps the currently-shown
+            # list (the folder list at the top level of a grouped dropdown,
+            # or a flat/leaf list otherwise) to the first matching label.
+            # Buffer resets after a short pause so a later, unrelated search
+            # doesn't inherit stale characters.
+            now_ms = pygame.time.get_ticks()
+            if now_ms - ui.type_ahead_last_ms > 1200:
+                ui.type_ahead_buffer = ""
+            if key == pygame.K_BACKSPACE:
+                ui.type_ahead_buffer = ui.type_ahead_buffer[:-1]
+                ui.type_ahead_last_ms = now_ms
+                self._type_ahead_jump()
+                return
+            if key in (pygame.K_RETURN, pygame.K_KP_ENTER) and ui.type_ahead_buffer:
+                self._type_ahead_confirm()
+                return
+            if unicode and unicode.isprintable() and len(unicode) == 1:
+                ui.type_ahead_buffer += unicode.lower()
+                ui.type_ahead_last_ms = now_ms
+                self._type_ahead_jump()
                 return
         if self.show_help or self.match is None or self.input_controller is None:
             return
@@ -481,6 +616,15 @@ class App:
         if ui.definition is None:
             return
 
+        # Scrollbar: clicking anywhere in the track (not just the thumb
+        # itself) jumps there and starts a drag, same as clicking a browser
+        # scrollbar track. Checked ahead of the dropdown-row loop below
+        # since the track can overlap it visually.
+        if ui.scrollbar_geom is not None and ui.scrollbar_geom.track_rect.collidepoint(pos):
+            ui.scrollbar_dragging = True
+            self._scrollbar_drag_to(pos[1])
+            return
+
         # Check dropdown option rects first (they overlay other content when open).
         for key, (r, _) in ui.button_rects.items():
             if "__option__" in key and r.collidepoint(pos):
@@ -488,16 +632,16 @@ class App:
                 ui.values[param_name] = idx_str  # stored as string key
                 ui.open_choice_param = None
                 ui.open_choice_folder = None
-                ui.dropdown_scroll = 0
+                ui.close_dropdown_list()
                 return
             if "__folder__" in key and r.collidepoint(pos):
                 _param_name, _, folder = key.partition("__folder__")
                 ui.open_choice_folder = folder
-                ui.dropdown_scroll = 0
+                ui.close_dropdown_list()
                 return
             if key.endswith("__grpback__") and r.collidepoint(pos):
                 ui.open_choice_folder = None
-                ui.dropdown_scroll = 0
+                ui.close_dropdown_list()
                 return
             if key.endswith("__scrollup__") and r.collidepoint(pos):
                 ui.dropdown_scroll = max(0, ui.dropdown_scroll - 1)
@@ -537,7 +681,7 @@ class App:
                 if minus_rect.collidepoint(pos):
                     ui.open_choice_param = name if ui.open_choice_param != name else None
                     ui.open_choice_folder = None
-                    ui.dropdown_scroll = 0
+                    ui.close_dropdown_list()
                     break
                 elif plus_rect.collidepoint(pos):
                     current = ui.values.get(name, param.default)
@@ -557,7 +701,7 @@ class App:
                     else:
                         ui.open_choice_param = name
                         ui.open_choice_folder = None
-                        ui.dropdown_scroll = 0
+                        ui.close_dropdown_list()
                     break
                 elif plus_rect.collidepoint(pos):
                     flat = param.flat_choices()
@@ -1138,7 +1282,7 @@ class App:
             return
         defn = ui.definition
         all_params = list(defn.params) + scenarios.UNIVERSAL_PARAMS
-        ui.button_rects, ui.dropdown_scroll = self.renderer.draw_scenario_params(
+        ui.button_rects, ui.dropdown_scroll, ui.scrollbar_geom = self.renderer.draw_scenario_params(
             self.surface,
             all_params,
             ui.values,
@@ -1146,6 +1290,7 @@ class App:
             open_choice_param=ui.open_choice_param,
             open_choice_folder=ui.open_choice_folder,
             dropdown_scroll=ui.dropdown_scroll,
+            type_ahead_query=ui.type_ahead_buffer,
         )
 
     def _draw_help_button(self) -> None:

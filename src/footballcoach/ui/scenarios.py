@@ -163,6 +163,45 @@ def load_trainer_for_ui(checkpoint_path: str):
 
 AnyScenarioParam = ScenarioParam | ScenarioChoiceParam | ScenarioGroupedChoiceParam | ScenarioBoolParam
 
+
+def leaf_label(value: str) -> str:
+    """The display label for one leaf value of a ``ScenarioGroupedChoiceParam``
+    (e.g. a checkpoint path like ``"checkpoints/phase1_run12/checkpoint40.pt"``)
+    once its group folder is already shown separately: strips the leading
+    ``"{group}/"`` prefix if present, else returns the value unchanged.
+
+    Shared by ``Renderer.draw_scenario_params`` (what it draws) and
+    ``App``'s dropdown type-ahead search (what it searches), so the two
+    never drift apart -- see ``dropdown_items_for`` below.
+    """
+    _folder, _sep, rest = value.partition("/")
+    return rest if _sep else value
+
+
+def dropdown_items_for(
+    param: AnyScenarioParam, open_folder: str | None,
+) -> list[tuple[str, str]]:
+    """The ``(key, display_label)`` pairs the SCENARIO_PARAMS dropdown would
+    show right now for *param*, given which group folder (if any) is
+    expanded -- ``None`` means "showing the top-level list" (the flat choice
+    list for a ``ScenarioChoiceParam``, or the group list for a
+    ``ScenarioGroupedChoiceParam``).
+
+    This is the single source of truth for "what's in the currently-open
+    list": ``Renderer.draw_scenario_params`` uses it to decide what to draw,
+    and ``App``'s dropdown type-ahead search uses it to decide what to jump
+    to, so the two can never see a different list.
+    """
+    if isinstance(param, ScenarioChoiceParam):
+        return [(c, str(c)) for c in param.choices]
+    if isinstance(param, ScenarioGroupedChoiceParam):
+        if open_folder is None:
+            return [(g, g) for g, _vals in param.groups]
+        group_values = next((vals for g, vals in param.groups if g == open_folder), ())
+        return [(v, leaf_label(v)) for v in group_values]
+    return []
+
+
 # Universal params appended to every scenario's params screen by the UI.
 # They are NOT forwarded to build(); app.py pops them before calling build().
 UNIVERSAL_PARAMS: list[AnyScenarioParam] = [

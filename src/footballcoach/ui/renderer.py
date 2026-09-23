@@ -173,6 +173,18 @@ def corner_arc_world_points(pitch: Pitch, sx: int, sy: int, radius_m: float = 1.
     ]
 
 
+class DropdownScrollbar(NamedTuple):
+    """Screen-space geometry of the draggable scrollbar thumb drawn beside a
+    SCENARIO_PARAMS dropdown list, for one open, actually-scrollable list.
+    ``App`` keeps the latest one (from ``draw_scenario_params``'s return
+    value) so it can convert a drag's mouse Y into a scroll offset without
+    reimplementing this layout math itself."""
+    track_rect: "pygame.Rect"  # the full draggable strip (thumb travels within this)
+    thumb_h: int                # thumb height in px -- proportional to visible/total
+    total: int                  # total items in the list
+    visible: int                # items shown at once (<= total)
+
+
 class _GoalPx(NamedTuple):
     """One goal's integer screen coordinates (see ``Renderer._goal_px``)."""
     line_x: int   # x of the goal line
@@ -2902,6 +2914,43 @@ class Renderer:
 
         return minus_rect, plus_rect
 
+    @staticmethod
+    def _draw_ui_triangle(surface: pygame.Surface, rect: pygame.Rect, direction: str, colour) -> None:
+        """A small filled triangle centred in *rect*, pointing "up", "down",
+        "left" or "right" -- drawn as a vector shape rather than rendered
+        from a ▲/▼/← glyph.
+
+        Verified (not guessed): every one of ▲ ▼ ✓ ← comes back from
+        ``pygame.font.Font(style.FONT_NAME, ...).render()`` at an identical
+        5px width, versus each ASCII character's own distinct width -- the
+        tell for SDL_ttf's fixed-size "missing glyph" box, since
+        ``style.FONT_NAME`` (``None`` = pygame's bundled ``freesansbold.ttf``)
+        doesn't contain those codepoints. Reported by the user as "empty
+        box" icons on the scenario-params dropdown's scrollbar chevrons; the
+        same font is used for the dropdown open/close indicator and the
+        group-back button's arrow, which had the identical bug.
+        """
+        cx, cy = rect.center
+        s = min(rect.width, rect.height) * 0.32
+        if direction == "up":
+            pts = [(cx, cy - s), (cx - s, cy + s * 0.7), (cx + s, cy + s * 0.7)]
+        elif direction == "down":
+            pts = [(cx, cy + s), (cx - s, cy - s * 0.7), (cx + s, cy - s * 0.7)]
+        elif direction == "left":
+            pts = [(cx - s, cy), (cx + s * 0.7, cy - s), (cx + s * 0.7, cy + s)]
+        else:  # "right"
+            pts = [(cx + s, cy), (cx - s * 0.7, cy - s), (cx - s * 0.7, cy + s)]
+        pygame.draw.polygon(surface, colour, pts)
+
+    @staticmethod
+    def _draw_ui_check(surface: pygame.Surface, rect: pygame.Rect, colour) -> None:
+        """A small vector checkmark centred in *rect* -- see
+        ``_draw_ui_triangle``'s docstring for why this isn't a "✓" glyph."""
+        cx, cy = rect.center
+        s = min(rect.width, rect.height) * 0.28
+        pts = [(cx - s, cy), (cx - s * 0.2, cy + s * 0.8), (cx + s, cy - s * 0.6)]
+        pygame.draw.lines(surface, colour, False, pts, 2)
+
     def draw_scenario_params(
         self,
         surface: pygame.Surface,
@@ -2911,10 +2960,13 @@ class Renderer:
         open_choice_param: "str | None" = None,
         open_choice_folder: "str | None" = None,
         dropdown_scroll: int = 0,
-    ) -> tuple[dict[str, tuple[pygame.Rect, pygame.Rect]], int]:
+        type_ahead_query: str = "",
+    ) -> tuple[dict[str, tuple[pygame.Rect, pygame.Rect]], int, "DropdownScrollbar | None"]:
         """Draws the scenario-parameter adjustment screen. Returns
-        ``(button_rects, clamped_dropdown_scroll)`` — ``button_rects`` maps
-        param name → (left_rect, right_rect) for click detection.
+        ``(button_rects, clamped_dropdown_scroll, scrollbar_geom)`` —
+        ``button_rects`` maps param name → (left_rect, right_rect) for click
+        detection; ``scrollbar_geom`` is the draggable-thumb geometry for
+        whichever list is open and actually scrollable, or ``None``.
 
         - ScenarioParam:              [-]  value  [+]
         - ScenarioChoiceParam:        click value area to open a scrollable
@@ -2931,14 +2983,32 @@ class Renderer:
         ``"{name}__option__{value}"``. Grouped-choice group rects are keyed
         as ``"{name}__folder__{group}"``, a back button (shown once a group
         is expanded) as ``"{name}__grpback__"``, and leaf value rects reuse
-        ``"{name}__option__{value}"``.
+        ``"{name}__option__{value}"``. A draggable scrollbar thumb is keyed
+        as ``"{name}__scrollthumb__"``.
+
+        ``type_ahead_query`` (lowercased by the caller) is the in-progress
+        type-to-search buffer for whichever list is open (see
+        ``App._type_ahead_jump``): the first item whose label starts with it
+        is drawn with a distinct outline, purely cosmetic feedback — App
+        itself decides what the buffer does (scrolling it into view, or
+        selecting it on Enter) using the same ``scenarios.dropdown_items_for``
+        this method draws from, so the two never disagree about the match.
         """
-        from footballcoach.ui.scenarios import ScenarioBoolParam, ScenarioChoiceParam, ScenarioGroupedChoiceParam
+        from footballcoach.ui.scenarios import (
+            ScenarioBoolParam, ScenarioChoiceParam, ScenarioGroupedChoiceParam, dropdown_items_for,
+        )
         surface.fill(style.HUD_BG)
         sw, sh = surface.get_size()
 
         title_surf = self.title_font.render(title, True, style.HUD_ACCENT)
         surface.blit(title_surf, ((sw - title_surf.get_width()) // 2, 30))
+
+        if open_choice_param is not None:
+            # Type-ahead feedback: shown whenever a dropdown is open, whether
+            # or not anything has been typed yet, so it doubles as a hint.
+            hint = f"Type to search: {type_ahead_query}" if type_ahead_query else "Type to search…"
+            hint_surf = self.hud_font.render(hint, True, style.HUD_ACCENT if type_ahead_query else (110, 110, 130))
+            surface.blit(hint_surf, (sw - hint_surf.get_width() - 20, 34))
 
         n_rows = len(params)
         available_h = sh - 160  # reserve top (title+padding) + bottom (buttons)
@@ -2978,9 +3048,7 @@ class Renderer:
                 pygame.draw.rect(surface, bg, box_rect, border_radius=4)
                 pygame.draw.rect(surface, style.HUD_ACCENT, box_rect, 1, border_radius=4)
                 if checked:
-                    tick = self.hud_font.render("✓", True, style.HUD_ACCENT)
-                    surface.blit(tick, (box_x + (box_size - tick.get_width()) // 2,
-                                        box_y + (box_size - tick.get_height()) // 2))
+                    self._draw_ui_check(surface, box_rect, style.HUD_ACCENT)
                 # Both rects point to the same box (toggle on either click)
                 button_rects[param.name] = (box_rect, box_rect)
 
@@ -2999,9 +3067,10 @@ class Renderer:
                 choice_str = str(current)
                 if len(choice_str) > 30:
                     choice_str = "…" + choice_str[-29:]
-                arrow_sym = "▲" if is_open else "▼"
-                val_surf = self.hud_font.render(f"{choice_str}  {arrow_sym}", True, style.HUD_ACCENT)
+                val_surf = self.hud_font.render(choice_str, True, style.HUD_ACCENT)
                 surface.blit(val_surf, (val_rect.x + 6, val_rect.y + (btn_h - val_surf.get_height()) // 2))
+                toggle_indicator_rect = pygame.Rect(val_rect.right - 22, val_rect.y, 22, val_rect.height)
+                self._draw_ui_triangle(surface, toggle_indicator_rect, "up" if is_open else "down", style.HUD_ACCENT)
                 # [>] cycle button (still available)
                 hov_arr = arrow_rect.collidepoint(mouse_pos)
                 pygame.draw.rect(surface, (70, 70, 90) if hov_arr else (40, 40, 55), arrow_rect, border_radius=4)
@@ -3026,9 +3095,10 @@ class Renderer:
                 choice_str = str(current)
                 if len(choice_str) > 30:
                     choice_str = "…" + choice_str[-29:]
-                arrow_sym = "▲" if is_open else "▼"
-                val_surf = self.hud_font.render(f"{choice_str}  {arrow_sym}", True, style.HUD_ACCENT)
+                val_surf = self.hud_font.render(choice_str, True, style.HUD_ACCENT)
                 surface.blit(val_surf, (val_rect.x + 6, val_rect.y + (btn_h - val_surf.get_height()) // 2))
+                toggle_indicator_rect = pygame.Rect(val_rect.right - 22, val_rect.y, 22, val_rect.height)
+                self._draw_ui_triangle(surface, toggle_indicator_rect, "up" if is_open else "down", style.HUD_ACCENT)
                 hov_arr = arrow_rect.collidepoint(mouse_pos)
                 pygame.draw.rect(surface, (70, 70, 90) if hov_arr else (40, 40, 55), arrow_rect, border_radius=4)
                 sym = self.hud_font.render(">", True, style.HUD_ACCENT)
@@ -3057,8 +3127,10 @@ class Renderer:
         # persist it (list length can shrink between frames, e.g. switching
         # from a folder list to a shorter value list).
         clamped_scroll = dropdown_scroll
+        scrollbar_geom: "DropdownScrollbar | None" = None
         MAX_VISIBLE_ITEMS = 10
         ITEM_H = 28
+        CHEV_H = 16  # top/bottom click-to-page chevrons; the rest of the column is the drag track
 
         def _draw_dropdown_list(
             items: list[tuple[str, str]],  # (key, display_label)
@@ -3071,11 +3143,14 @@ class Renderer:
         ) -> int:
             """Draws a scrollable list of items and registers their click
             rects under ``f"{key_prefix}{key}"``. When the list is truncated,
-            also draws a click-to-page up/down chevron column (registered as
-            ``f"{scroll_name}__scrollup__"`` / ``"__scrolldown__"``) alongside
-            the mouse-wheel/keyboard scroll paths, since wheel events aren't
-            reliably delivered on every platform/window-manager combo.
-            Returns the clamped scroll offset used for this list."""
+            also draws click-to-page up/down chevrons (registered as
+            ``f"{scroll_name}__scrollup__"`` / ``"__scrolldown__"``) plus a
+            draggable scrollbar thumb (``f"{scroll_name}__scrollthumb__"``,
+            geometry also captured into the enclosing ``scrollbar_geom``) —
+            alongside the mouse-wheel/keyboard scroll paths, since wheel
+            events aren't reliably delivered on every platform/window-manager
+            combo. Returns the clamped scroll offset used for this list."""
+            nonlocal scrollbar_geom
             total = len(items)
             visible = min(total, MAX_VISIBLE_ITEMS)
             scroll = max(0, min(dropdown_scroll, max(0, total - visible)))
@@ -3085,6 +3160,10 @@ class Renderer:
             list_rect = pygame.Rect(anchor_x - 2, anchor_y - 2, list_w + 4, visible * ITEM_H + 4)
             pygame.draw.rect(surface, (25, 25, 38), list_rect, border_radius=4)
             pygame.draw.rect(surface, style.HUD_ACCENT, list_rect, 1, border_radius=4)
+            match_key = next(
+                (key for key, label in items if type_ahead_query and label.lower().startswith(type_ahead_query)),
+                None,
+            )
             for vi in range(visible):
                 ii = scroll + vi
                 key, label = items[ii]
@@ -3093,6 +3172,8 @@ class Renderer:
                 sel = (key == selected_key)
                 item_bg = (60, 90, 60) if sel else ((55, 55, 75) if hov else (30, 30, 45))
                 pygame.draw.rect(surface, item_bg, item_rect)
+                if key == match_key:
+                    pygame.draw.rect(surface, style.HUD_ACCENT, item_rect, 2)
                 label_str = label if len(label) <= 32 else "…" + label[-31:]
                 lsurf = self.hud_font.render(label_str, True, style.HUD_ACCENT if sel else style.HUD_TEXT)
                 surface.blit(lsurf, (item_rect.x + 6, item_rect.y + (ITEM_H - lsurf.get_height()) // 2))
@@ -3100,21 +3181,33 @@ class Renderer:
             if scrollable:
                 track_h = visible * ITEM_H
                 chevron_x = anchor_x + item_w
-                up_h = track_h // 2
-                up_rect = pygame.Rect(chevron_x, anchor_y, chevron_w, up_h)
-                down_rect = pygame.Rect(chevron_x, anchor_y + up_h, chevron_w, track_h - up_h)
-                for rect, symbol, enabled in (
-                    (up_rect, "▲", scroll > 0),
-                    (down_rect, "▼", scroll < total - visible),
+                up_rect = pygame.Rect(chevron_x, anchor_y, chevron_w, CHEV_H)
+                down_rect = pygame.Rect(chevron_x, anchor_y + track_h - CHEV_H, chevron_w, CHEV_H)
+                for rect, direction, enabled in (
+                    (up_rect, "up", scroll > 0),
+                    (down_rect, "down", scroll < total - visible),
                 ):
                     hov = enabled and rect.collidepoint(mouse_pos)
                     pygame.draw.rect(surface, (70, 70, 90) if hov else (40, 40, 55), rect, border_radius=4)
                     colour = style.HUD_ACCENT if enabled else (75, 75, 85)
-                    sym_surf = self.hud_font.render(symbol, True, colour)
-                    surface.blit(sym_surf, (rect.x + (chevron_w - sym_surf.get_width()) // 2,
-                                            rect.y + (rect.height - sym_surf.get_height()) // 2))
+                    self._draw_ui_triangle(surface, rect, direction, colour)
                 button_rects[f"{scroll_name}__scrollup__"] = (up_rect, up_rect)
                 button_rects[f"{scroll_name}__scrolldown__"] = (down_rect, down_rect)
+
+                # Draggable scrollbar thumb, in the strip between the chevrons.
+                track_top = anchor_y + CHEV_H
+                track_height = track_h - 2 * CHEV_H
+                scroll_range = max(1, total - visible)
+                thumb_h = max(14, round(track_height * visible / total))
+                thumb_travel = max(1, track_height - thumb_h)
+                thumb_y = track_top + round(thumb_travel * scroll / scroll_range)
+                track_rect = pygame.Rect(chevron_x, track_top, chevron_w, track_height)
+                thumb_rect = pygame.Rect(chevron_x, thumb_y, chevron_w, thumb_h)
+                pygame.draw.rect(surface, (30, 30, 45), track_rect, border_radius=3)
+                hov_thumb = thumb_rect.collidepoint(mouse_pos)
+                pygame.draw.rect(surface, (150, 170, 200) if hov_thumb else (100, 110, 130), thumb_rect, border_radius=3)
+                button_rects[f"{scroll_name}__scrollthumb__"] = (thumb_rect, thumb_rect)
+                scrollbar_geom = DropdownScrollbar(track_rect=track_rect, thumb_h=thumb_h, total=total, visible=visible)
             return scroll
 
         if open_choice_param is not None:
@@ -3126,7 +3219,7 @@ class Renderer:
 
             if isinstance(open_param, ScenarioChoiceParam):
                 current = values.get(open_param.name, open_param.default)
-                items = [(c, str(c)) for c in open_param.choices]
+                items = dropdown_items_for(open_param, None)
                 clamped_scroll = _draw_dropdown_list(
                     items, current, list_x, open_y, list_w, f"{open_param.name}__option__", open_param.name,
                 )
@@ -3139,28 +3232,23 @@ class Renderer:
                     current_folder = next(
                         (g for g, vals in open_param.groups if current in vals), None,
                     )
-                    items = [(g, g) for g, _vals in open_param.groups]
+                    items = dropdown_items_for(open_param, None)
                     clamped_scroll = _draw_dropdown_list(
                         items, current_folder, list_x, open_y, list_w, f"{open_param.name}__folder__", open_param.name,
                     )
                 else:
                     # Level 2: pick a value within the expanded group, with a
                     # back button above the list to return to group picking.
-                    group_values = next(
-                        (vals for g, vals in open_param.groups if g == open_choice_folder), (),
-                    )
                     back_rect = pygame.Rect(list_x, open_y, list_w, ITEM_H)
                     hov_back = back_rect.collidepoint(mouse_pos)
                     pygame.draw.rect(surface, (55, 55, 75) if hov_back else (35, 35, 50), back_rect, border_radius=4)
-                    back_surf = self.hud_font.render(f"← {open_choice_folder}", True, style.HUD_TEXT)
-                    surface.blit(back_surf, (back_rect.x + 6, back_rect.y + (ITEM_H - back_surf.get_height()) // 2))
+                    back_arrow_rect = pygame.Rect(back_rect.x, back_rect.y, 22, back_rect.height)
+                    self._draw_ui_triangle(surface, back_arrow_rect, "left", style.HUD_TEXT)
+                    back_surf = self.hud_font.render(open_choice_folder, True, style.HUD_TEXT)
+                    surface.blit(back_surf, (back_rect.x + 24, back_rect.y + (ITEM_H - back_surf.get_height()) // 2))
                     button_rects[f"{open_param.name}__grpback__"] = (back_rect, back_rect)
 
-                    def _leaf_label(v: str) -> str:
-                        _folder, _sep, rest = v.partition("/")
-                        return rest if _sep else v
-
-                    items = [(v, _leaf_label(v)) for v in group_values]
+                    items = dropdown_items_for(open_param, open_choice_folder)
                     clamped_scroll = _draw_dropdown_list(
                         items, current, list_x, open_y + ITEM_H + 4, list_w, f"{open_param.name}__option__", open_param.name,
                     )
@@ -3181,4 +3269,4 @@ class Renderer:
                                 rect.y + (rect.height - txt.get_height()) // 2))
         button_rects["__start__"] = (start_rect, start_rect)
         button_rects["__back__"] = (back_rect, back_rect)
-        return button_rects, clamped_scroll
+        return button_rects, clamped_scroll, scrollbar_geom

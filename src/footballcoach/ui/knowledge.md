@@ -1458,10 +1458,10 @@ New `App` state between `MENU` and `MATCH` for parameterized scenarios:
 ### Choice-param dropdowns (`ScenarioChoiceParam` / `ScenarioGroupedChoiceParam`)
 
 Both live in `scenarios.py` alongside `ScenarioParam`/`ScenarioBoolParam` (see
-`AnyScenarioParam`). Both render as a `value ▼` box + `[>]` cycle button and
+`AnyScenarioParam`). Both render as a `value ▲/▼` box + `[>]` cycle button and
 open a dropdown list below the row when clicked; `renderer.draw_scenario_params`
-now returns `(button_rects, clamped_dropdown_scroll)` rather than just
-`button_rects` so state can persist the clamp.
+returns `(button_rects, clamped_dropdown_scroll, scrollbar_geom)` — a
+`DropdownScrollbar | None` third element (see below) alongside the first two.
 
 - **`ScenarioChoiceParam`** — flat list of string options (e.g. the tier
   dropdowns). Dropdown option rects: `f"{name}__option__{value}"`.
@@ -1477,16 +1477,127 @@ now returns `(button_rects, clamped_dropdown_scroll)` rather than just
   key format as the flat variant so `App._handle_params_click`'s selection
   branch is shared). `[>]` still cycles the fully-flattened option space
   (`param.flat_choices()`) without opening the dropdown.
+- What list is "currently shown" for a given `(param, open_choice_folder)` —
+  the group list, or one group's leaves, or a flat choice list — is computed
+  by `scenarios.dropdown_items_for()`, a single source of truth used by both
+  `Renderer` (what it draws) and `App`'s type-ahead search (what it searches
+  and jumps to). `scenarios.leaf_label()` is the matching helper for
+  stripping a grouped value's `"{group}/"` prefix.
 - Both dropdown kinds are **scrollable**: at most 10 items render at once
-  (`MAX_VISIBLE_ITEMS` / `ITEM_H` in `renderer.draw_scenario_params`), with a
-  thumb-style scrollbar drawn when the list is truncated. `ScenarioParamsUIState.dropdown_scroll`
-  (`app.py`) holds the offset, advanced by `pygame.MOUSEWHEEL` while a
-  dropdown is open and reset to 0 whenever a dropdown opens or the expanded
-  group changes; `renderer` re-clamps it every frame against the
-  currently-visible list's length (list length can shrink when switching from
-  a folder list to a shorter value list).
+  (`MAX_VISIBLE_ITEMS` / `ITEM_H` in `renderer.draw_scenario_params`).
+  `ScenarioParamsUIState.dropdown_scroll` (`app.py`) holds the offset, reset
+  (along with the rest of `close_dropdown_list()`'s state, see below)
+  whenever a dropdown opens/closes or the expanded group changes; `renderer`
+  re-clamps it every frame against the currently-visible list's length (list
+  length can shrink when switching from a folder list to a shorter value
+  list).
 - `ScenarioParamsUIState.open_choice_folder` tracks which group is expanded
   for a `ScenarioGroupedChoiceParam` (`None` = showing the group list).
+
+### Dropdown usability: wheel, drag scrollbar, type-ahead search (Phase I)
+
+Prompted by direct feedback on the Phase 1 checkpoint pickers: *"the dropdown
+for checkpoint selection in the phase 1 ui is a pain, I can't move wheel on
+it, and clicking through when I have a lot of runs suck. Let me search
+through the first level of it by typing, enable the mouse wheel, and also
+give me a scroll bar thing I can move."* All three land generically in
+`Renderer.draw_scenario_params`/`App`, so they apply to **every**
+`ScenarioChoiceParam`/`ScenarioGroupedChoiceParam` dropdown automatically —
+there's only one other checkpoint picker in the app (Training mode's `N`
+hotkey, which cycles blind with no visual list at all, not a dropdown — user
+confirmed leaving that as is), so this single generic fix is "the general
+component."
+
+- **Mouse wheel was a real bug, not just an awkward-but-working feature.**
+  The old handler (`ui.dropdown_scroll = max(0, ui.dropdown_scroll -
+  event.y)`) used plain integer `event.y`. Verified (not guessed): many
+  mice/trackpads with "smooth"/hi-res scrolling report **sub-1.0 deltas per
+  physical notch** via pygame-ce's `MOUSEWHEEL.precise_y` field, while `.y`
+  is SDL's rounded integer — a run of real scrolling on such a device can
+  deliver `y == 0` on most events and look completely dead. Fix
+  (`App._scroll_open_dropdown`): read `precise_y` (fall back to `.y` when
+  absent, e.g. older pygame/synthetic events), accumulate the fractional
+  remainder in `ScenarioParamsUIState.wheel_scroll_accum` across events, and
+  only commit a scroll step once the accumulator crosses a whole unit
+  (`int()` truncation, sign-symmetric). A classic whole-notch mouse
+  (`precise_y == float(y)`) scrolls exactly as before — this is a strict
+  generalisation, not a behaviour change for normal mice.
+- **Draggable scrollbar thumb.** `_draw_dropdown_list` now lays out a
+  `DropdownScrollbar(track_rect, thumb_h, total, visible)` in the same
+  right-hand column as the click-to-page chevrons (which stay, now fixed at
+  `CHEV_H=16px` top/bottom instead of splitting the whole column 50/50) —
+  the thumb height is proportional to `visible/total`, its position to
+  `scroll/(total-visible)`. `Renderer.draw_scenario_params` returns the geom
+  for whichever list is open and actually scrollable (`None` when the list
+  fits without scrolling); `App._draw_params_screen` stores it on
+  `ui.scrollbar_geom` every frame. Clicking anywhere in the track (not just
+  the thumb) jumps there and starts a drag (`App._scrollbar_drag_to` maps
+  mouse Y to an absolute scroll offset from that same geometry — never
+  re-derives the pixel layout independently of what was actually drawn);
+  `MOUSEMOTION` continues the drag while `ui.scrollbar_dragging`, released on
+  any `MOUSEBUTTONUP` while on the SCENARIO_PARAMS screen (not just over the
+  thumb, since a real drag's mouse can leave the track).
+- **Type-ahead search.** Typing while a dropdown is open filters *(really:
+  scrolls-to-first-match, not removes items — a true filter would renumber
+  visible rows under the user's cursor mid-type, which felt worse in a
+  first pass)* whichever list is currently shown — the group list at the top
+  level of a grouped dropdown, or a flat/leaf list otherwise —
+  case-insensitively. `App._type_ahead_jump` (buffer →
+  `scenarios.dropdown_items_for` → first `label.lower().startswith(buf)`,
+  falling back to a "contains" match so e.g. typing just a run number that
+  isn't at the label's start still finds it) sets `dropdown_scroll` so the
+  match is visible; `Renderer` independently recomputes the same match (via
+  the same `dropdown_items_for`) to draw a highlight outline around it, so
+  the two can never disagree about which row matched. `Enter`
+  (`App._type_ahead_confirm`) mirrors clicking that row: drills into a
+  matched group folder, or selects a matched leaf/flat value and closes the
+  dropdown. `Backspace` edits the buffer; the buffer auto-clears after a
+  1.2s pause since the last keystroke (`type_ahead_last_ms`) so a later,
+  unrelated search doesn't inherit stale characters; `Escape` clears the
+  buffer first (only falling through to "leave the SCENARIO_PARAMS screen"
+  once the buffer is already empty) so search doesn't fight the screen's
+  existing Escape-to-back behaviour. A "Type to search…" hint (dim when
+  empty, accent-coloured with the buffer once typed) is drawn top-right
+  whenever a dropdown is open, so the feature is discoverable without being
+  told about it.
+- `ScenarioParamsUIState.close_dropdown_list()` is the single place that
+  resets a list's transient state (`dropdown_scroll`, `wheel_scroll_accum`,
+  `scrollbar_dragging`, `type_ahead_buffer`) — called from every spot that
+  used to just reset `dropdown_scroll = 0` on its own (opening/closing a
+  dropdown, entering/leaving a group), so none of the three new features can
+  leak stale state into a list they weren't operating on.
+- **Broken chevron/checkmark/back-arrow icons were a real, separate,
+  verified bug** (also user-reported, mid-fix: *"the icons for what I
+  imagine are supposed to be arrows on the scrollbar aren't displaying
+  properly, they're like an empty box"*). Root cause confirmed (not just
+  patched blind): `style.FONT_NAME = None` uses pygame's bundled
+  `freesansbold.ttf`, which lacks the ▲ ▼ ✓ ← codepoints entirely — SDL_ttf
+  silently substitutes a fixed-size "missing glyph" box instead of erroring.
+  Verified by rendering each character and comparing widths: all four came
+  back at an identical 5px (the tofu-box tell), versus each ASCII
+  character's own distinct width (e.g. `"A"` → 9px). The ellipsis `"…"` used
+  for text truncation elsewhere on this screen was checked too and is fine
+  (12px, a real glyph) — not everything non-ASCII on this screen was broken,
+  only these four. Fixed by drawing them as small vector shapes instead of
+  glyphs (`Renderer._draw_ui_triangle` / `_draw_ui_check`, used for: the
+  dropdown open/close indicator, the scrollbar's own up/down chevrons, the
+  checkbox tick, and the group-back button's arrow) — robust regardless of
+  font/OS, consistent with the rest of the renderer's vector-drawn style.
+  Same systemic font gap likely also affects the "⏳" glinger-notice icon in
+  `draw_game_log` and the match HUD's "⚽"/"🦵" action icons elsewhere in
+  `renderer.py` — not fixed here (out of scope for this ask, not reported),
+  flagged here for whoever next touches those.
+
+Tests: `tests/unit/test_scenario_params_dropdown.py` — pure
+`dropdown_items_for`/`leaf_label` cases; wheel accumulation (whole-notch,
+missing-`precise_y` fallback, fractional-accumulation, never-negative);
+scrollbar drag (extremes, out-of-track clamping, no-geometry no-op);
+type-ahead (prefix match, contains fallback, no-match no-op, empty-buffer/
+closed-dropdown no-op, confirm-into-folder, confirm-selects-leaf,
+confirm-no-match no-op); renderer's `scrollbar_geom` presence/absence and
+`total`/`visible` correctness. All mutation-checked (wheel-truncation
+reverted, drag-clamp removed, contains-fallback removed, folder-drill
+disabled, scrollbar-geom forced `None` — all caught).
 
 ## Phase 1 UI scenario vs. actual PPO training conditions (`_make_phase1_scenario_pair`)
 
