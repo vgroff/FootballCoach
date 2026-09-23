@@ -478,7 +478,7 @@ class Renderer:
         self._turf_bg: pygame.Surface | None = None
         self._turf_bg_key: tuple | None = None
         _cf = gcfg.get("corner_flag", {})
-        self._corner_pole_height_m: float = float(_cf.get("pole_height_m", 4.0))
+        self._corner_pole_height_m: float = float(_cf.get("pole_height_m", 3.4))
         self._corner_pole_width_m: float = float(_cf.get("pole_width_m", 0.06))
         self._corner_flag_width_m: float = float(_cf.get("flag_width_m", 0.55))
         # The cloth's length along the pole is an absolute (apparent) size, so a taller pole
@@ -486,6 +486,21 @@ class Renderer:
         self._corner_flag_length_m: float = float(_cf.get("flag_length_m", 0.32))
         self._corner_shadow_alpha: int = int(_cf.get("shadow_alpha", 75))
         self._corner_shadow_height_m: float = float(_cf.get("shadow_height_m", 1.2))
+        # Corner flag cloth flutter: a single shared world-space wind direction (all 4 flags
+        # stream the same way -- see _flutter_flag_tip), plus per-flag phase/frequency jitter
+        # (_FLAG_FLUTTER_PHASES) so the four don't move in lockstep. See ui/knowledge.md's
+        # "Corner flag flutter" section for the full design rationale.
+        _fl = _cf.get("flutter", {})
+        _wind_rad = math.radians(float(_fl.get("wind_dir_deg", 0.0)))
+        self._flutter_wind_dir: tuple[float, float] = (math.cos(_wind_rad), math.sin(_wind_rad))
+        self._flutter_wind_perp: tuple[float, float] = (-self._flutter_wind_dir[1], self._flutter_wind_dir[0])
+        self._flutter_base_hz: float = float(_fl.get("base_hz", 0.9))
+        self._flutter_billow_hz: float = float(_fl.get("billow_hz", 1.37))
+        self._flutter_gust_hz: float = float(_fl.get("gust_hz", 0.16))
+        self._flutter_side_frac: float = float(_fl.get("side_frac", 0.22))
+        self._flutter_billow_frac: float = float(_fl.get("billow_frac", 0.10))
+        self._flutter_gust_depth: float = float(_fl.get("gust_depth", 0.25))
+        self._flutter_t: float = 0.0
         _gn = gcfg.get("goal_net", {})
         self._goal_net_spacing_m: float = float(_gn.get("spacing_m", 0.35))
         self._goal_net_min_spacing_px: int = max(2, int(_gn.get("min_spacing_px", 8)))
@@ -576,13 +591,21 @@ class Renderer:
         ]
 
     def record_trail(self, ball: Ball) -> None:
-        """Append or trim the ball ghost trail. Call once per physics tick."""
+        """Append or trim the ball ghost trail. Call once per physics tick.
+
+        Growing and shrinking are exact complements (one or the other fires every tick, never
+        neither) -- an earlier version shrank only below `trail_min_speed * 0.5`, leaving a dead
+        zone between that and `trail_min_speed` itself where the trail neither grew nor shrank.
+        Measured on a real decelerating kick (rolling_friction_coefficient's gentle ~0.08g decay):
+        the ball spends over a second drifting through that band, so a full-length trail sat
+        completely frozen -- not following the ball's current position, not fading out either --
+        for well over a second before finally starting to drain. Looked exactly like what it was:
+        a disconnected ghost trail hovering near a ball that had visibly kept moving and slowing."""
         speed = ball.velocity.length_xy()
         if speed >= self._trail_min_speed and ball.possessed_by is None:
             self._ball_trail.append((ball.position.x, ball.position.y, ball.position.z))
-        elif speed < self._trail_min_speed * 0.5 or ball.possessed_by is not None:
-            if self._ball_trail:
-                self._ball_trail.popleft()
+        elif self._ball_trail:
+            self._ball_trail.popleft()
 
     def update_ball_effects(self, ball: Ball, dt_s: float) -> None:
         """Integrate 3D ball orientation from spin + rolling.
@@ -624,6 +647,13 @@ class Renderer:
                 [t*ax*az - s*ay,  t*ay*az + s*ax, t*az*az + c   ],
             ]
             self._ball_orientation = self._mat_mul3(dR, self._ball_orientation)
+
+    def update_flag_flutter(self, dt_s: float) -> None:
+        """Advances the corner flags' wind-flutter animation clock. Call once per rendered frame
+        (only when not paused), same convention as `update_player_animations`/`update_ball_effects`
+        -- `dt_s` is SIMULATION time, so the flutter's frequencies mean what they say regardless of
+        sim speed, and a paused match doesn't keep flapping."""
+        self._flutter_t += dt_s
 
     def update_player_animations(self, players: list[Player], dt_s: float) -> None:
         """Advances each player's stride-gait phase (see player_sprites.py).
@@ -1207,17 +1237,79 @@ class Renderer:
         bar_surf.fill((*colour, style.DEFENDING_SIDE_MARKER_ALPHA))
         surface.blit(bar_surf, (left, top))
 
+    # Per-flag phase/frequency jitter so the 4 corners don't flutter in lockstep -- a fixed,
+    # hand-picked set (not config-driven; the exact values don't matter, only that they differ).
+    # p1/p2/pg are phase offsets (radians) for the side-flap/billow/gust waves; jitter scales all
+    # three frequencies together for that flag, a touch faster or slower than the other three.
+    _FLAG_FLUTTER_PHASES: dict[tuple[int, int], dict[str, float]] = {
+        (1, 1): dict(p1=0.0, p2=1.3, pg=0.0, jitter=1.00),
+        (-1, 1): dict(p1=2.1, p2=4.4, pg=1.7, jitter=1.07),
+        (1, -1): dict(p1=4.5, p2=0.6, pg=3.4, jitter=0.94),
+        (-1, -1): dict(p1=1.0, p2=3.0, pg=5.0, jitter=1.03),
+    }
+
+    def _flutter_flag_tip(self, geo: CornerFlagGeometry, sx: int, sy: int) -> tuple[float, float]:
+        """Where the cloth's free end currently is, animated: streams in the single shared
+        `_flutter_wind_dir` (not each corner's own "toward pitch centre" direction -- a real wind
+        blows every flag the same way, see ui/knowledge.md), with a side-to-side flap
+        (`_flutter_base_hz`) perpendicular to the wind, an in/out billow (`_flutter_billow_hz`)
+        along it, and a slow amplitude swell (`_flutter_gust_hz`) modulating both -- keeps the
+        cloth's configured size (`geo.tip`'s own distance from the attach/top midpoint), just
+        redirected and animated."""
+        top, attach = geo.top, geo.attach
+        mid = ((top[0] + attach[0]) / 2.0, (top[1] + attach[1]) / 2.0)
+        base_len = math.hypot(geo.tip[0] - mid[0], geo.tip[1] - mid[1])
+        ph = self._FLAG_FLUTTER_PHASES[(sx, sy)]
+        t, j = self._flutter_t, ph["jitter"]
+        gust = 1.0 + self._flutter_gust_depth * math.sin(2 * math.pi * self._flutter_gust_hz * t + ph["pg"])
+        side_wave = math.sin(2 * math.pi * self._flutter_base_hz * j * t + ph["p1"])
+        billow_wave = math.sin(2 * math.pi * self._flutter_billow_hz * j * t + ph["p2"])
+        length = base_len * (1.0 + self._flutter_billow_frac * gust * billow_wave)
+        side_off = base_len * self._flutter_side_frac * gust * side_wave
+        wd, wp = self._flutter_wind_dir, self._flutter_wind_perp
+        return mid[0] + wd[0] * length + wp[0] * side_off, mid[1] + wd[1] * length + wp[1] * side_off
+
+    @staticmethod
+    def _cross_z(o: tuple[float, float], a: tuple[float, float], b: tuple[float, float]) -> float:
+        return (a[0] - o[0]) * (b[1] - o[1]) - (a[1] - o[1]) * (b[0] - o[0])
+
+    def _flag_pole_draws_last(self, geo: CornerFlagGeometry, tip: tuple[float, float]) -> bool:
+        """True if the pole (a solid post) should be drawn AFTER the cloth this frame, so it stays
+        visible in front wherever the animated cloth has swung back across the pole's own line --
+        instead of the cloth (drawn last by default) unconditionally covering it. Tested against
+        THIS model's own natural resting side of the pole's full line (base -> top): not the old
+        static per-corner "toward pitch centre" tip (meaningless once the tip is wind-driven), and
+        not the pole's raw lean angle relative to the wind (tried and wrong -- fires on a harmless
+        sign difference with no real visual overlap behind it; a direct point-in-triangle check
+        showed true overlap is rare under normal flutter amplitude, not the ~always/~never that
+        angle-only test gave). Only fires on a genuine crossing, which is why it's normally quiet."""
+        top, attach, base = geo.top, geo.attach, geo.base
+        mid = ((top[0] + attach[0]) / 2.0, (top[1] + attach[1]) / 2.0)
+        base_len = math.hypot(geo.tip[0] - mid[0], geo.tip[1] - mid[1])
+        wd = self._flutter_wind_dir
+        ref_tip = (mid[0] + wd[0] * base_len, mid[1] + wd[1] * base_len)
+        ref_side = self._cross_z(base, top, ref_tip)
+        cur_side = self._cross_z(base, top, tip)
+        return (cur_side < 0) != (ref_side < 0)
+
     def _draw_corner_flags(self, surface: pygame.Surface, pitch: Pitch) -> None:
         """A corner flag at each of the 4 pitch corners, with the same
         parallax as the goal frame: the pole is vertical, so its top is
         displaced *away from the pitch centre* (see ``corner_flag_world_points``)
         -- a short pole visible from the corner out toward the top -- with the
-        cloth attached along the upper part of the pole and streaming sideways off
-        it. The pole's apparent length uses the crossbar's parallax rate
-        (``crossbar_lean_m / goal_height_m`` metres per metre of height), so it
-        scales with that one setting; ``corner_flag`` in graphics.json sets the
-        pole height, cloth size and shadow. Each flag casts a soft shadow from the scene light
-        (`_draw_corner_flag_shadow`), drawn first so the pole and cloth sit on top of it."""
+        cloth attached along the upper part of the pole. The pole's apparent length uses the
+        crossbar's parallax rate (``crossbar_lean_m / goal_height_m`` metres per metre of height),
+        so it scales with that one setting; ``corner_flag`` in graphics.json sets the pole height,
+        cloth size, shadow and flutter. Each flag casts a soft shadow from the scene light
+        (`_draw_corner_flag_shadow`, using the STATIC geometry, not the animated tip -- the shadow
+        doesn't itself flutter, a deliberately simpler secondary effect), drawn first so the pole
+        and cloth sit on top of it.
+
+        The cloth's free end is animated (`_flutter_flag_tip`) -- see there and
+        ui/knowledge.md's "Corner flag flutter" for the wind model. Pole-vs-cloth draw order is
+        decided per flag, per frame (`_flag_pole_draws_last`): normally the pole is drawn first
+        (cloth on top, as before flutter existed at all), but swaps when the cloth has swung back
+        across the pole's own line, so the pole (the solid object) stays visible in front there."""
         cam = self.camera
         # 1px minimum (a 2px pole looked chunky and rectangular at the default zoom),
         # and the ground-contact dot appears only once the pole is 3px+ wide, sized to
@@ -1225,19 +1317,31 @@ class Renderer:
         # and hides it entirely.
         pole_px = max(1, round(self._corner_pole_width_m * cam.pixels_per_metre))
         foot_r = pole_px // 2 + 1 if pole_px >= 3 else 0
+
+        def draw_pole(geo: CornerFlagGeometry) -> None:
+            self._draw_world_polyline(surface, [geo.base, geo.top], pole_px, style.CORNER_FLAG_POLE_COLOUR)
+            if foot_r:
+                foot = cam.world_to_screen(*geo.base)
+                pygame.gfxdraw.filled_circle(surface, foot[0], foot[1], foot_r, style.CORNER_FLAG_POLE_COLOUR)
+                pygame.gfxdraw.aacircle(surface, foot[0], foot[1], foot_r, style.CORNER_FLAG_POLE_COLOUR)
+
+        def draw_cloth(geo: CornerFlagGeometry, tip: tuple[float, float]) -> None:
+            tri = [cam.world_to_screen(*pt) for pt in (geo.top, geo.attach, tip)]
+            pygame.gfxdraw.filled_polygon(surface, tri, style.CORNER_FLAG_COLOUR)
+            pygame.gfxdraw.aapolygon(surface, tri, style.CORNER_FLAG_COLOUR)
+
         for sx in (-1, 1):
             for sy in (-1, 1):
                 geo = self._corner_flag_geometry(pitch, sx, sy)
                 if self._corner_shadow_alpha > 0:
                     self._draw_corner_flag_shadow(surface, geo, self._corner_flag_drop(pitch))
-                self._draw_world_polyline(surface, [geo.base, geo.top], pole_px, style.CORNER_FLAG_POLE_COLOUR)
-                if foot_r:
-                    foot = cam.world_to_screen(*geo.base)
-                    pygame.gfxdraw.filled_circle(surface, foot[0], foot[1], foot_r, style.CORNER_FLAG_POLE_COLOUR)
-                    pygame.gfxdraw.aacircle(surface, foot[0], foot[1], foot_r, style.CORNER_FLAG_POLE_COLOUR)
-                tri = [cam.world_to_screen(*pt) for pt in (geo.top, geo.attach, geo.tip)]
-                pygame.gfxdraw.filled_polygon(surface, tri, style.CORNER_FLAG_COLOUR)
-                pygame.gfxdraw.aapolygon(surface, tri, style.CORNER_FLAG_COLOUR)
+                tip = self._flutter_flag_tip(geo, sx, sy)
+                if self._flag_pole_draws_last(geo, tip):
+                    draw_cloth(geo, tip)
+                    draw_pole(geo)
+                else:
+                    draw_pole(geo)
+                    draw_cloth(geo, tip)
 
     def _corner_flag_drop(self, pitch: Pitch) -> float:
         """Fraction of the pole (from the top) the cloth is attached along: ``flag_length_m`` as a

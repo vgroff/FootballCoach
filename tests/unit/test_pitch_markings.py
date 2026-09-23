@@ -647,10 +647,84 @@ def test_corner_flag_pole_and_cloth_are_drawn():
     lower = ((geo.base[0] + geo.attach[0]) / 2, (geo.base[1] + geo.attach[1]) / 2)
     got = surface.get_at(cam.world_to_screen(*lower))[:3]
     assert all(abs(got[i] - style.CORNER_FLAG_POLE_COLOUR[i]) <= 25 for i in range(3)), got
-    # The cloth's centroid is flag-coloured.
-    cen = tuple(sum(pt[i] for pt in (geo.top, geo.attach, geo.tip)) / 3 for i in (0, 1))
+    # The cloth's centroid is flag-coloured -- the cloth's free end is animated (flutter), so this
+    # reads the renderer's own current tip rather than geo.tip's static (un-fluttered) one.
+    tip = renderer._flutter_flag_tip(geo, -1, 1)
+    cen = tuple(sum(pt[i] for pt in (geo.top, geo.attach, tip)) / 3 for i in (0, 1))
     got = surface.get_at(cam.world_to_screen(*cen))[:3]
     assert all(abs(got[i] - style.CORNER_FLAG_COLOUR[i]) <= 25 for i in range(3)), got
+
+
+# ---------------------------------------------------------------------------
+# Corner flag flutter
+# ---------------------------------------------------------------------------
+
+def test_all_four_flags_stream_in_the_same_wind_direction():
+    """A real wind blows every flag the same way -- not each toward its own corner's view of the
+    pitch centre (the old static rule, which made opposite corners point opposite ways). Checked
+    at zero flutter offset (t=0, all waves at their phase-shifted but otherwise base position) by
+    projecting each corner's (tip - mid) onto the shared wind axis and confirming it's positive and
+    close to the full resting length for all 4 -- i.e. all basically aligned with one direction,
+    not scattered around the compass."""
+    _, _, _, renderer = _drawn_pitch()
+    pitch = Pitch.standard()
+    wd = renderer._flutter_wind_dir
+    for sx in (-1, 1):
+        for sy in (-1, 1):
+            geo = renderer._corner_flag_geometry(pitch, sx, sy)
+            top, attach = geo.top, geo.attach
+            mid = ((top[0] + attach[0]) / 2.0, (top[1] + attach[1]) / 2.0)
+            tip = renderer._flutter_flag_tip(geo, sx, sy)
+            along_wind = (tip[0] - mid[0]) * wd[0] + (tip[1] - mid[1]) * wd[1]
+            base_len = math.hypot(geo.tip[0] - mid[0], geo.tip[1] - mid[1])
+            assert along_wind > 0.5 * base_len, (sx, sy, along_wind, base_len)
+
+
+def test_flag_flutter_advances_only_via_update_flag_flutter():
+    _, _, _, renderer = _drawn_pitch()
+    assert renderer._flutter_t == 0.0
+    renderer.update_flag_flutter(1.5)
+    assert renderer._flutter_t == pytest.approx(1.5)
+    renderer.update_flag_flutter(0.5)
+    assert renderer._flutter_t == pytest.approx(2.0)
+
+
+def test_flag_flutter_tip_actually_changes_as_the_clock_advances():
+    _, _, _, renderer = _drawn_pitch()
+    pitch = Pitch.standard()
+    geo = renderer._corner_flag_geometry(pitch, 1, 1)
+    tip_a = renderer._flutter_flag_tip(geo, 1, 1)
+    renderer.update_flag_flutter(0.3)
+    tip_b = renderer._flutter_flag_tip(geo, 1, 1)
+    assert tip_a != pytest.approx(tip_b, abs=1e-6)
+
+
+def test_the_four_corners_have_different_flutter_phases():
+    """Not a strict requirement on the exact values, just that they differ -- otherwise all 4
+    flags would flap in lockstep, the thing per-flag phases exist to avoid."""
+    from footballcoach.ui.renderer import Renderer
+
+    phases = list(Renderer._FLAG_FLUTTER_PHASES.values())
+    assert len({(p["p1"], p["p2"], p["pg"], p["jitter"]) for p in phases}) == len(phases) == 4
+
+
+def test_pole_draws_last_only_on_a_genuine_crossing():
+    """`_flag_pole_draws_last` should read False when the tip sits on the model's own natural
+    resting side of the pole's line, and True once it's pushed to the opposite side -- a direct,
+    synthetic check of the geometry test itself, independent of the flutter waveform."""
+    _, _, _, renderer = _drawn_pitch()
+    pitch = Pitch.standard()
+    geo = renderer._corner_flag_geometry(pitch, 1, 1)
+    top, attach = geo.top, geo.attach
+    mid = ((top[0] + attach[0]) / 2.0, (top[1] + attach[1]) / 2.0)
+    base_len = math.hypot(geo.tip[0] - mid[0], geo.tip[1] - mid[1])
+    wd = renderer._flutter_wind_dir
+
+    resting_tip = (mid[0] + wd[0] * base_len, mid[1] + wd[1] * base_len)
+    assert renderer._flag_pole_draws_last(geo, resting_tip) is False
+
+    flipped_tip = (mid[0] - wd[0] * base_len, mid[1] - wd[1] * base_len)
+    assert renderer._flag_pole_draws_last(geo, flipped_tip) is True
 
 
 @pytest.mark.parametrize("rise_px, length_px, gap_px", [(22.0, 6.0, 8.0), (88.0, 26.0, 24.0), (110.0, 32.0, 30.0)])
@@ -1311,9 +1385,14 @@ def test_the_pennant_keeps_its_size_however_tall_the_pole_is():
     assert poles[1] > 1.6 * poles[0]
 
 
-def test_default_flag_is_taller_but_not_bigger_than_the_old_one():
+def test_default_flag_pole_height_matches_the_config():
+    """4.0m read as a touch too tall at 1x zoom; shortened 15% to 3.4m."""
     _, _, _, renderer = _drawn_pitch()
-    assert renderer._corner_pole_height_m >= 4.0
+    assert renderer._corner_pole_height_m == pytest.approx(3.4)
+
+
+def test_default_flag_cloth_is_a_little_shorter_than_an_old_design():
+    _, _, _, renderer = _drawn_pitch()
     old_cloth = 0.55 * (0.72 / 2.44 * 2.4)                 # old design: 55% of a 2.4m pole's apparent lean
     assert renderer._corner_flag_length_m < old_cloth       # "a little shorter"
     assert renderer._corner_flag_length_m > 0.6 * old_cloth
@@ -1375,7 +1454,8 @@ def test_the_flag_shadow_is_soft_and_never_covers_the_pole_or_cloth():
     lower = ((geo.base[0] + geo.attach[0]) / 2, (geo.base[1] + geo.attach[1]) / 2)
     got = surface.get_at(cam.world_to_screen(*lower))[:3]
     assert all(abs(got[i] - style.CORNER_FLAG_POLE_COLOUR[i]) <= 25 for i in range(3)), got    # pole colour, not shadowed
-    cen = tuple(sum(pt[i] for pt in (geo.top, geo.attach, geo.tip)) / 3 for i in (0, 1))
+    tip = renderer._flutter_flag_tip(geo, -1, 1)  # the cloth's free end is animated -- see above
+    cen = tuple(sum(pt[i] for pt in (geo.top, geo.attach, tip)) / 3 for i in (0, 1))
     got = surface.get_at(cam.world_to_screen(*cen))[:3]
     assert all(abs(got[i] - style.CORNER_FLAG_COLOUR[i]) <= 25 for i in range(3)), got
     # the shadow's edge is anti-aliased: a range of grass tints, not just grass and one dark level
@@ -1958,3 +2038,80 @@ def test_dot_layer_pad_still_fits_the_dot_at_every_radius():
         opaque = [(x, y) for x in range(layer.get_width()) for y in range(layer.get_height()) if layer.get_at((x, y))[3] > 0]
         assert opaque, radius_px
         assert all(0 < x < layer.get_width() - 1 and 0 < y < layer.get_height() - 1 for x, y in opaque)
+
+
+# ---------------------------------------------------------------------------
+# Ball ghost trail (Renderer.record_trail)
+# ---------------------------------------------------------------------------
+
+def _trail_ball(vx, vy, possessed_by=None, x=0.0, y=0.0):
+    from footballcoach.entities.ball import Ball
+    from footballcoach.mathutils import Vector3
+
+    b = Ball()
+    b.position = Vector3(x, y, 0.11)
+    b.velocity = Vector3(vx, vy, 0.0)
+    b.possessed_by = possessed_by
+    return b
+
+
+def test_trail_grows_while_fast_and_free():
+    _, _, _, renderer = _drawn_pitch()
+    ball = _trail_ball(renderer._trail_min_speed + 1.0, 0.0)
+    for _ in range(3):
+        renderer.record_trail(ball)
+    assert len(renderer._ball_trail) == 3
+
+
+def test_trail_caps_at_the_configured_length():
+    _, _, _, renderer = _drawn_pitch()
+    ball = _trail_ball(renderer._trail_min_speed + 1.0, 0.0)
+    for _ in range(renderer._trail_length + 5):
+        renderer.record_trail(ball)
+    assert len(renderer._ball_trail) == renderer._trail_length
+
+
+def test_trail_shrinks_every_tick_in_what_used_to_be_a_dead_zone():
+    """Regression: shrinking used to require speed < trail_min_speed * 0.5, leaving a dead zone
+    between that and trail_min_speed where the trail neither grew (speed too low) nor shrank
+    (speed too high) -- measured on a real decelerating kick, the ball spent over a second
+    drifting through that band with the trail completely frozen (same contents tick after tick),
+    not following the ball's current position and not fading out either. Growing and shrinking
+    are exact complements now: any speed below trail_min_speed shrinks it, every single tick."""
+    _, _, _, renderer = _drawn_pitch()
+    fast_ball = _trail_ball(renderer._trail_min_speed + 1.0, 0.0)
+    for _ in range(renderer._trail_length):
+        renderer.record_trail(fast_ball)
+    assert len(renderer._ball_trail) == renderer._trail_length
+
+    # the old dead zone: strictly between half of trail_min_speed and trail_min_speed itself
+    dead_zone_speed = renderer._trail_min_speed * 0.75
+    assert renderer._trail_min_speed * 0.5 < dead_zone_speed < renderer._trail_min_speed
+    slow_ball = _trail_ball(dead_zone_speed, 0.0)
+    lengths = []
+    for _ in range(renderer._trail_length + 1):
+        renderer.record_trail(slow_ball)
+        lengths.append(len(renderer._ball_trail))
+    assert lengths == sorted(lengths, reverse=True)          # strictly non-increasing...
+    assert lengths[0] < renderer._trail_length                # ...and it DID shrink on the very first tick
+    assert lengths[-1] == 0                                    # ...all the way to empty, no freeze partway
+
+
+def test_trail_shrinks_immediately_when_the_ball_is_possessed_regardless_of_speed():
+    _, _, _, renderer = _drawn_pitch()
+    fast_ball = _trail_ball(renderer._trail_min_speed + 1.0, 0.0)
+    for _ in range(renderer._trail_length):
+        renderer.record_trail(fast_ball)
+    assert len(renderer._ball_trail) == renderer._trail_length
+
+    fast_ball.possessed_by = "someone"  # fast, but now possessed -- should shrink, not grow
+    renderer.record_trail(fast_ball)
+    assert len(renderer._ball_trail) == renderer._trail_length - 1
+
+
+def test_trail_pop_is_a_noop_once_already_empty():
+    _, _, _, renderer = _drawn_pitch()
+    ball = _trail_ball(0.0, 0.0)
+    for _ in range(5):
+        renderer.record_trail(ball)
+    assert len(renderer._ball_trail) == 0

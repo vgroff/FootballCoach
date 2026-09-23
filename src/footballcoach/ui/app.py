@@ -1008,6 +1008,7 @@ class App:
             sim_dt = self._animation_clock.delta(self.match, self.match.time_s)
             self.renderer.update_player_animations(self.match.players, sim_dt)
             self.renderer.update_ball_effects(self.match.ball, sim_dt)
+            self.renderer.update_flag_flutter(sim_dt)
         # Pitch, then ball, with the goal's crossbar/net drawn over a ball that
         # is inside the goal and under one that is above it. Ball drawn before
         # players (not after) so a player standing over it -- e.g. the carrier

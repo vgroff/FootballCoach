@@ -138,13 +138,23 @@
     "shade_strength": 0.7
   },
   "corner_flag": {
-    "_comment": "Corner flags (ui/renderer.py _draw_corner_flags), drawn with the same top-down parallax as the goal frame: the pole is vertical, so its top is displaced away from the pitch centre by pole_height_m * (crossbar_lean_m / goal_height_m) -- one parallax setting drives both. pole_height_m: APPARENT pole height for the parallax (a real corner pole is ~1.5-1.8m; this is deliberately bold so the leaning pole reads at the default zoom). pole_width_m: pole stroke (min 1px). flag_width_m: how far the cloth's free end streams off the pole (perpendicular to it, toward the pitch's middle along the touchline). flag_length_m: the cloth's length ALONG the pole in apparent metres (an absolute size, so a taller pole doesn't grow the pennant); the rest of the pole below it stays visible. shadow_alpha: 0-255 darkness of the flag's ground shadow (0 = none), cast by the scene light. shadow_height_m: the pole height used for that shadow. NOT the physical height: at a corner the scene light is only ~33 degrees above the horizon, so a 2.4m pole would throw a ~4m shadow (3.4x the drawn 1.2m pole stub); 1.2 gives ~1.9m. Raise it for a longer shadow.",
-    "pole_height_m": 4.0,
+    "_comment": "Corner flags (ui/renderer.py _draw_corner_flags), drawn with the same top-down parallax as the goal frame: the pole is vertical, so its top is displaced away from the pitch centre by pole_height_m * (crossbar_lean_m / goal_height_m) -- one parallax setting drives both. pole_height_m: APPARENT pole height for the parallax (a real corner pole is ~1.5-1.8m; this is deliberately bold so the leaning pole reads at the default zoom). pole_width_m: pole stroke (min 1px). flag_width_m: the cloth's RESTING distance from the pole (its animated free end streams in the shared wind direction -- see flutter below -- this is that streamed distance at zero flutter offset, not a fixed perpendicular-to-pole distance any more). flag_length_m: the cloth's length ALONG the pole in apparent metres (an absolute size, so a taller pole doesn't grow the pennant); the rest of the pole below it stays visible. shadow_alpha: 0-255 darkness of the flag's ground shadow (0 = none), cast by the scene light -- uses the STATIC (un-fluttered) geometry, a deliberately simpler secondary effect. shadow_height_m: the pole height used for that shadow. NOT the physical height: at a corner the scene light is only ~33 degrees above the horizon, so a 2.4m pole would throw a ~4m shadow (3.4x the drawn 1.2m pole stub); 1.2 gives ~1.9m. Raise it for a longer shadow.",
+    "pole_height_m": 3.4,
     "pole_width_m": 0.06,
     "flag_width_m": 0.55,
     "flag_length_m": 0.32,
     "shadow_alpha": 75,
-    "shadow_height_m": 1.2
+    "shadow_height_m": 1.2,
+    "flutter": {
+      "_comment": "The cloth's free end animates: streams in wind_dir_deg (one shared direction, all 4 flags -- a real wind blows every flag the same way; an earlier per-corner 'toward pitch centre' rule made opposite corners point opposite ways, which never made sense once there's wind), with a side-to-side flap (base_hz, perpendicular to the wind) and an in/out billow (billow_hz, along it), both modulated by a slow amplitude swell (gust_hz/gust_depth) so it's not constant-strength flapping. base_hz/billow_hz are deliberately NOT a clean multiple of each other (an earlier 2x version looked metronomic once slowed down) -- each of the 4 flags also gets its own phase offset and a touch of frequency jitter (Renderer._FLAG_FLUTTER_PHASES, not config-driven) so they don't move in lockstep. wind_dir_deg: 0 = along the pitch length, outward past the +x goal end (world convention, ui/knowledge.md's 'Coordinate convention'). side_frac/billow_frac: amplitude of each wave as a fraction of flag_width_m. gust_depth: how much the gust swings the overall amplitude, as a fraction (0.25 = between 0.75x and 1.25x); a first version at 0.45 (0.55x-1.45x) was weakened after review.",
+      "wind_dir_deg": 0.0,
+      "base_hz": 0.9,
+      "billow_hz": 1.37,
+      "gust_hz": 0.16,
+      "side_frac": 0.22,
+      "billow_frac": 0.10,
+      "gust_depth": 0.25
+    }
   },
   "goal_net": {
     "_comment": "Diagonal mesh drawn inside each goal frame. spacing_m: gap between mesh lines in world metres (smaller = denser mesh). min_spacing_px: floor on that gap in screen pixels -- below ~5px the 1px diagonals alias into a checkerboard instead of a diamond lattice (0.35m is only ~3px at the default window), so the gap never drops under this; lower it only if you want the checker back. back_spacing_scale: the back-wall net's mesh spacing as a multiple of the roof's (the steep back-wall lines in the narrow ~6px strip alias into a moire at 1x; 2x reads as clean tall diamonds). sag_m: how far (metres) the middle of the roof net hangs below crossbar height; the mesh bows toward the pitch by that height's parallax (0 = flat). alpha: 0=invisible, 255=fully opaque. color: RGB.",

@@ -403,9 +403,9 @@ same as everything else in that method):
   goal frame. The pole is vertical, so its top is displaced **away from the
   pitch centre**, along the centre->corner line, by `pole_height_m ×
   (crossbar_lean_m / goal_height_m)` — the crossbar's parallax rate, so one
-  setting drives both (with the defaults 4.0 × 0.72/2.44 ≈ 1.18m, ~12px at the
-  default window, ~59px at 5x zoom; it was 2.4m/≈0.71m/~7px until the flags were
-  judged a little too small — see "Flag size" below). The pole is **yellow**
+  setting drives both (with the defaults 3.4 × 0.72/2.44 ≈ 1.00m; it was 2.4m/≈0.71m/~7px
+  until the flags were judged a little too small — see "Flag size" below — then 4.0m,
+  shortened 15% to 3.4m after that read a touch too tall at 1x zoom). The pole is **yellow**
   (`style.CORNER_FLAG_POLE_COLOUR`); the pennant stays orange
   (`CORNER_FLAG_COLOUR`). The pole is at least 1px wide (a 2px minimum was
   tried and looked chunky/rectangular at the default zoom), and the foot dot
@@ -413,14 +413,18 @@ same as everything else in that method):
   (radius `pole_px//2 + 1`): a fixed 2px-radius dot is a 5px blob on the ~6px
   pole at 1x zoom and hid it entirely (compared five foot/pole variants at
   zoom 1/2/4 before choosing). The pennant is attached along the top `flag_length_m` (0.32m apparent) of the pole with
-  the rest bare. **The cloth's free end is aimed perpendicular to
-  the pole** (`flag_width_m` off it, on the side toward the pitch's middle
-  along the touchline). Aiming it along the touchline instead ("inward" — the
-  old design's direction) makes the pennant a needle: the pole leans along the
-  corner diagonal and the cloth's base edge lies along the pole, so the tip
-  ends up only ~30° off that edge and the triangle has almost no width
-  (seen when first tried; reproduced across four parameter sets before
-  changing the geometry). `pole_height_m` is *apparent* (real poles are
+  the rest bare. `corner_flag_world_points`'s own `geo.tip` — perpendicular off the pole,
+  `flag_width_m` away, on the side toward the pitch's middle along the touchline — is the
+  cloth's STRUCTURAL/resting geometry: still what the shadow uses, and still where
+  `flag_width_m`'s configured distance is measured from, but **no longer where the visible
+  cloth is actually drawn** — see "Corner flag flutter" below, which animates the drawn tip
+  to stream in a shared wind direction instead. (Aiming the structural tip along the
+  touchline instead ("inward") makes the pennant a needle: the pole leans along the corner
+  diagonal and the cloth's base edge lies along the pole, so the tip ends up only ~30° off
+  that edge and the triangle has almost no width — seen when first tried; reproduced across
+  four parameter sets before changing the geometry, and still why `geo.tip` itself stays
+  perpendicular rather than along the touchline, even now that it's not the drawn direction.)
+  `pole_height_m` is *apparent* (real poles are
   ~1.5-1.8m) — bolder on purpose so the lean reads at the default zoom.
   **Flag size**: eight variants were compared side by side (taller pole, bigger pennant, both,
   and those plus an outline / white stripe / ground shadow). Chosen: the taller pole
@@ -448,6 +452,57 @@ same as everything else in that method):
   `test_the_pennant_keeps_its_size_however_tall_the_pole_is`,
   `test_a_corner_flag_casts_a_shadow_straight_away_from_the_pitch_centre`,
   `test_flag_shadow_can_be_turned_off_and_shrinks_as_the_light_rises`.
+- **Corner flag flutter** (`Renderer._flutter_flag_tip`/`_flag_pole_draws_last`/
+  `update_flag_flutter`, `graphics.json["corner_flag"]["flutter"]`): the cloth's drawn free end
+  is animated, streaming in ONE shared world-space wind direction (`wind_dir_deg`, 0 = along the
+  pitch length) rather than each corner's own static "toward pitch centre" rule
+  (`corner_flag_world_points`'s `geo.tip`, kept as the structural/shadow reference -- see above --
+  but no longer the drawn direction). An earlier version had each flag point toward its own
+  corner's view of the pitch centre, which meant opposite corners streamed in *opposite*
+  directions — fine for a static pennant, nonsensical once there's wind (the user: "if we're
+  going to have wind, we do need the flags pointing in the same direction").
+  - **Motion**: a side-to-side flap (`base_hz`, perpendicular to the wind) and an in/out billow
+    (`billow_hz`, along it), both scaled by a slow amplitude swell (`gust_hz`/`gust_depth`, ~6s
+    period) so it isn't constant-strength flapping. `base_hz`/`billow_hz` are deliberately NOT a
+    clean multiple of each other — an earlier 2x-harmonic version looked metronomic once slowed
+    down to a natural flap rate (0.9 Hz), since both waves returned to the same relative phase
+    every single primary cycle. Each of the 4 flags also gets its own phase offset and a touch of
+    frequency jitter (`Renderer._FLAG_FLUTTER_PHASES`, not config-driven — a small fixed set, not
+    worth exposing) so they don't move in lockstep. `gust_depth` was tried at 0.45 (swinging
+    between 0.55x-1.45x amplitude) and weakened to 0.25 (0.75x-1.25x) on request.
+  - **Animation clock**: `update_flag_flutter(dt_s)` advances `_flutter_t` by SIMULATION time,
+    called once per rendered frame from `App._draw_match` alongside `update_player_animations`/
+    `update_ball_effects` (same `SimTimeDelta` source) — so the flutter respects sim speed and
+    pausing like every other continuous animation in this file, not wall-clock time.
+  - **Pole-vs-cloth draw order** (`_flag_pole_draws_last`): normally the pole (drawn first) sits
+    under the cloth (drawn last), same as before flutter existed — but swaps per flag, per frame,
+    whenever the animated cloth has swung back across the pole's own line (`base` -> `top`), so
+    the pole (the solid object) stays visible in front there instead of the cloth unconditionally
+    covering it. Getting the actual test right took three attempts, in order:
+    1. Always draw the pole last, unconditionally. Wrong: for the corner whose pole happens to
+       lean roughly WITH the wind, this needlessly hid an otherwise-fine cloth behind its own
+       pole essentially all the time (not just during a real crossing).
+    2. Compare the tip's projection onto the pole's own lean direction against zero. Wrong in the
+       opposite way: this fires (or doesn't) based purely on whether the wind is roughly aligned
+       or opposed to that ONE corner's own radial pole-lean angle, independent of whether the
+       cloth is anywhere near the pole line at all — measured 0%/100% permanent splits across
+       corners, never the occasional crossing a real gust would cause, and a direct
+       point-in-triangle overlap check showed true visual overlap essentially never happens at
+       the positions this test called "crossing".
+    3. **What's implemented**: compare the current tip's side of the pole's full line (`base` ->
+       `top`, via a 2D cross product) against that SAME model's own natural resting side (the
+       zero-oscillation tip, `mid + wind_dir * base_len`) — not the old static per-corner design
+       (meaningless once the tip is wind-driven), and not the pole's raw lean angle (attempt 2).
+       Measured: correctly near-0% under normal amplitude (matching the point-in-triangle ground
+       truth), rising to a genuine occasional double-digit percentage only when amplitude is
+       deliberately exaggerated well past the tuned defaults — i.e. it now only fires on a real
+       crossing, not a permanent per-corner state.
+  - Tests: `tests/unit/test_pitch_markings.py` — all 4 corners' animated tips project mostly
+    along the one shared wind direction; `update_flag_flutter` only advances the clock through
+    itself (not implicitly via drawing); the tip actually changes as the clock advances; the 4
+    corners' phase entries are genuinely distinct; `_flag_pole_draws_last` reads `False` at the
+    model's own resting tip and `True` once flipped to the opposite side (a direct, synthetic
+    check of the z-order test, independent of the flutter waveform itself).
 - **Sideline benches** (`_draw_sideline_benches`): a row of benches (`x`
   positions in `Renderer._BENCH_X_OFFSETS_M`, spread across the middle
   third of the pitch, clear of the boxes/corners regardless of pitch size)
@@ -787,6 +842,32 @@ snap, same as every other coordinate in `_ball_dots_layer` already was. Tests:
 `test_the_spin_dot_radius_formula_itself_is_not_truncated_to_an_int`,
 `test_the_code_level_default_dot_count_is_12_even_if_config_omits_it`,
 `test_dot_layer_pad_still_fits_the_dot_at_every_radius`.
+
+## Ball ghost trail (`Renderer.record_trail`, `graphics.json["ball_trail"]`)
+
+A short fading history of recent ball positions, drawn as shrinking/fading ellipses behind a
+fast-moving ball. `record_trail` must be called once per PHYSICS tick (`App._step_match`, in the
+same loop as `match.step()` — not once per rendered frame), since it's a simple grow/shrink-by-one
+`deque` (`maxlen=trail_length`), not something keyed by elapsed time.
+
+**Grow and shrink are exact complements** — `speed >= trail_min_speed and not possessed` appends
+one point, anything else pops one from the front. This wasn't always true: an earlier version only
+shrank below `trail_min_speed * 0.5`, leaving a dead zone between that and `trail_min_speed` where
+neither branch fired at all. Measured on a real decelerating kick
+(`rolling_friction_coefficient`'s gentle ~0.08g decay): the ball spends **over a second** drifting
+through that band, during which a full-length trail sat completely frozen — identical contents,
+tick after tick — not following the ball's current position and not fading out either. Looked
+exactly like what it was: a disconnected ghost trail hovering near a ball that had visibly kept
+moving and slowing (the user: "when the ball stops producing new trails, the old trail stays as is
+for a while until it disappears, it looks weird"). Fixed by dropping the `* 0.5` threshold — any
+speed below `trail_min_speed` (or possession) shrinks it, every single tick, so the trail is always
+either actively growing or actively draining, never both-branches-false.
+
+This was previously completely untested (`record_trail`/`_ball_trail` had zero references anywhere
+under `tests/`). Tests: `tests/unit/test_pitch_markings.py` — grows while fast and free; caps at
+`trail_length`; the regression itself (drains every tick through the old dead-zone speed, never two
+consecutive identical snapshots); shrinks immediately on possession regardless of speed; popping an
+already-empty trail is a no-op.
 
 ## Player visual indicators (`style.py` / `renderer.draw_player`)
 
