@@ -925,8 +925,11 @@ already-empty trail is a no-op.
   spin/roll (`update_ball_effects`) are advanced by the **simulation** time since
   the last rendered frame — `match.time_s` deltas — NOT by `1 / target_fps`. The sim
   runs `sim_speed` match-seconds per real second (and steps a whole number of
-  physics ticks per frame), so the old fixed step made strides and ball spin play
-  at `1 / sim_speed` of their true rate at any sim speed but 1x (and the ball's
+  physics ticks per frame — see "Sim speed vs. actual tick rate" below for how
+  that's actually achieved; this module just trusts whatever `match.time_s`
+  progression it's handed, so it was never itself wrong), so the old fixed step made
+  strides and ball spin play at `1 / sim_speed` of their true rate at any sim speed
+  but 1x (and the ball's
   spin drifted from its rolling, which was already right because it is derived
   from position deltas). Paused matches don't animate (and, since the clock doesn't
   move, don't bank time); a new match or scenario trial resyncs to a 0 delta; a
@@ -1779,6 +1782,73 @@ state persists across matches/trials (not reset by `_start_match`/
 (`tuple(round(i * 0.25, 2) for i in range(1, 33))`), not the old doubling
 sequence (0.2/0.5/1/2/4/8) — finer control around normal speed, at the
 cost of more `]`/`[`/click steps to reach the extremes.
+
+**Z is deliberately forward-only-with-wraparound**, not a bidirectional
+pair like the sim-speed `[`/`]` hotkeys — already documented above, not an
+oversight. User feedback (*"I feel like the zoom key zooms differently to
+the zoom buttons at the top (faster?)"*) confirmed the STEP SIZE is
+identical either way (measured: `[+]`-click and `Z`-press both move
+`zoom_factor` by exactly one `zoom_step`, e.g. `0.5`) — the only real
+asymmetry is that `Z` can only go forward, and wrapping from `max_zoom`
+straight back to `1.0` (a full-range jump in one press) is what likely
+read as "faster": there's no keyboard zoom-OUT at all, unlike sim-speed's
+`[`/`]` pair. Flagged to the user; not changed without a decision on
+whether a bidirectional zoom hotkey (e.g. `Shift+Z`) is wanted, since the
+forward-only design was a previous deliberate choice, not a bug.
+
+## Sim speed: menu value vs. actual tick rate (Phase I)
+
+**A real, high-impact bug, confirmed numerically** — user-reported: *"the
+simulation speed shown in game doesnt reflect that set in the menu."* Root
+cause (`App._step_match`, now `App._ticks_this_frame`): the number of
+physics ticks to run each rendered frame used to be computed fresh every
+frame with no memory of previous frames —
+`steps = max(1, round(physics_tick_hz * sim_speed / target_fps))` — which
+only tracks `sim_speed` correctly when `physics_tick_hz * sim_speed /
+target_fps` happens to land on (near) an integer. With
+`physics_tick_hz == target_fps` (both `60` by default — `gameplay.json` /
+`graphics.json`), that collapses to exactly `round(sim_speed)`: **every
+non-integer `sim_speed` silently snapped to the nearest whole multiple of
+real-time**, and the `max(1, ...)` floor made anything below `1.0x`
+(real-time) categorically unreachable — even though both the menu's
+`sim_speed` slider (`UNIVERSAL_PARAMS`, `0.1`-`32.0` in `0.5` steps) and the
+in-game `[-]`/`[+]` HUD control (`_SIM_SPEED_OPTIONS`, `0.25` steps) offer
+sub-`1.0` values specifically to allow slow motion. Verified by direct
+simulation before fixing: `sim_speed` `0.1` through `2.9` all produced an
+identical actual rate of exactly `2.0` sim-seconds/real-second — the
+displayed/configured number and the actual behaviour agreed on essentially
+nothing except whole numbers.
+
+`self._physics_acc_s` had already existed (`App.__init__`, reset in
+`_start_match`/`_start_scenario`) but was **dead state** — initialised in
+three places and read by none, evidently a previously-intended accumulator
+that never got wired into the actual stepping code.
+
+**Fix**: standard fixed-timestep-with-accumulator ("fix your timestep").
+`App._ticks_this_frame(dt_s)`: real elapsed frame time, scaled by
+`sim_speed`, accumulates into `self._physics_acc_s`; whole ticks are
+drained off it (`int(acc / tick_dt_s)`), leaving the fractional remainder
+for next frame — so e.g. `sim_speed=1.5` at `physics_tick_hz=60` correctly
+alternates `1, 2, 1, 2, ...` ticks/frame rather than silently rounding
+every single frame the same (wrong) way. `dt_s` is clamped to `0.25s`
+before scaling so a stalled frame (window drag, OS hiccup) can't queue a
+huge catch-up burst on the next one. The accumulator is intentionally
+**not** reset between trials of the same `ScenarioLoop` run (only at a
+genuinely fresh `_start_match`/`_start_scenario`) — it tracks "real time
+not yet converted to ticks," which has no reason to reset just because the
+ball did; resetting it there would introduce a small stutter at every
+trial boundary instead of removing one.
+
+Tests: `tests/unit/test_sim_speed_stepping.py` — long-run tick-total
+convergence to `physics_tick_hz * sim_speed * elapsed_s` for both
+grid-aligned and fractional `sim_speed` values (the core regression test);
+sub-`1.0` speeds actually produce some zero-tick frames (previously
+impossible); the pre-existing default (`2.0`, an exact integer, which is
+why nobody had hit this before) still produces a flat `2` ticks/frame;
+`1.5` alternates `1`/`2` rather than flatlining; a simulated stall doesn't
+burst; a paused match never advances the accumulator. Mutation-checked
+(reverted to the old `round()`-per-frame formula, removed the stall
+clamp — both caught).
 
 ## Coordinate convention — critical pitfall
 

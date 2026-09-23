@@ -899,14 +899,46 @@ class App:
                 self._action_icons.record(player.player_id, player.action_icon, now_s)
                 player.action_icon = None
 
+    def _ticks_this_frame(self, dt_s: float) -> int:
+        """How many physics ticks to run this frame so the match advances
+        `self._sim_speed` match-seconds per real second, at whatever
+        `self._physics_tick_hz` resolution ticks come in.
+
+        Fixed-timestep-with-accumulator (real elapsed time, scaled by
+        `sim_speed`, accumulates in `self._physics_acc_s`; whole ticks are
+        drained off it here) -- NOT the old `round(physics_tick_hz *
+        sim_speed / target_fps)` computed fresh each frame, which only
+        tracked `sim_speed` correctly when that product happened to be (near)
+        an integer. With `physics_tick_hz == target_fps` (both 60 by
+        default, gameplay.json/graphics.json), that collapsed to exactly
+        `round(sim_speed)`: EVERY non-integer `sim_speed` silently snapped to
+        the nearest whole multiple of real-time, and the `max(1, ...)` floor
+        meant nothing below 1.0x (real-time) was ever reachable at all --
+        even though the menu's slider and the in-game HUD control both offer
+        0.1/0.25/0.5-sized steps specifically to support slow motion.
+        Verified numerically (not guessed): every `sim_speed` from 0.1
+        through 2.9 produced an identical actual rate of exactly 2.0
+        sim-seconds/real-second, and none of them matched what the HUD
+        displayed. User-reported: "the simulation speed shown in game
+        doesn't reflect that set in the menu" -- this was the bug.
+
+        `dt_s` is clamped before scaling so a stalled frame (window drag, OS
+        hiccup) can't queue up a huge catch-up burst of ticks on the next
+        one (the standard "fix your timestep" mitigation).
+        """
+        dt_s = min(dt_s, 0.25)
+        tick_dt_s = 1.0 / self._physics_tick_hz
+        self._physics_acc_s += dt_s * self._sim_speed
+        steps = int(self._physics_acc_s / tick_dt_s)
+        self._physics_acc_s -= steps * tick_dt_s
+        return steps
+
     def _step_match(self, dt_s: float) -> None:
         assert self.match is not None
-        # steps/frame = round(physics_tick_hz × sim_speed / target_fps), clamped ≥1.
-        # physics_tick_hz changes dt_s only (resolution); sim_speed controls actual game speed.
         if self.match.paused:
             return
 
-        steps = max(1, round(self._physics_tick_hz * self._sim_speed / self._target_fps))
+        steps = self._ticks_this_frame(dt_s)
 
         if self._scenario_loop is not None:
             loop = self._scenario_loop
