@@ -42,8 +42,9 @@ Current notes:
         - !! large rollouts and smallish epochs at first? high entropy and reset log stds and kick power std and bernoullis
     - !! on checkpointing
         - !!!! in the phase 1 UI, have the value network print value prediction and also give the results
-        - !!!!!! feed sigmas into the value function so that it suffers less from changes
-        - !! Can we have it so that the sigmas from previous move dir affect the next one?
+        - !!!!!! they're kicking the ball at the opponent and then tackling them..... how do we stop this?
+            - can the opponent kick it straight back? do they have time? should they be able to choose whether or not to control it? should we penalise running into a tackle?? or have a short kick inactivity - both slow down and can't tackle briefly?
+        - !! graphics - feet go under the ball
         - !! are the kick params sampled/trained only if a kick actually fired (legally? e.g. while in possession?)
             - same with tackling? and kick boolean?
                 - would need to remove the penalties?       

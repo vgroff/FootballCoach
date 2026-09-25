@@ -33,7 +33,7 @@ import shutil
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 import numpy as np
 import torch
@@ -60,6 +60,7 @@ from footballcoach.ai.action.distributions import (
     MaskedCategorical,
     SquashedNormalHead,
     VonMisesDirectionHead,
+    _von_mises_entropy,
     _von_mises_kl,
     kick_power_from_raw,
 )
@@ -1491,21 +1492,25 @@ class PPOTrainer:
         self.kick_dir_z_log_std_max = float(ppo_cfg.get("kick_dir_z_log_std_max", 2.0))
         self.kick_dir_z_log_std_target = float(ppo_cfg.get("kick_dir_z_log_std_target", self.kick_dir_z_log_std_min))
         self.kick_dir_z_log_std_reg_coef = float(ppo_cfg.get("kick_dir_z_log_std_reg_coef", 0.0))
-        self.ent_dir_weight = float(ppo_cfg.get("ent_dir_weight", 1.0))
         self.ent_kick_power_weight = float(ppo_cfg.get("ent_kick_power_weight", 1.0))
         self.ent_kick_spin_weight = float(ppo_cfg.get("ent_kick_spin_weight", 1.0))
         self.ent_decision_weight = float(ppo_cfg.get("ent_decision_weight", 1.0))
         # Extra multiplier on the kick heads' entropy bonus in the PPO loss only
         # (kick gate + kick_dir + kick_power); 1.0 = today's behaviour exactly.
         self.ent_kick_weight = float(ppo_cfg.get("ent_kick_weight", 1.0))
-        # Extra multiplier on the move_dir entropy bonus in the PPO loss only (on top of ent_dir_weight); 1.0 = today's behaviour exactly.
+        # Extra multiplier on the move_dir entropy bonus in the PPO loss only; 1.0 = today's behaviour exactly.
         # Only reaches move_dir_log_kappa (see _compute_entropy) -- slows the head's sharpening without touching the exec_move gate.
         self.ent_move_dir_weight = float(ppo_cfg.get("ent_move_dir_weight", 1.0))
-        # Same idea as ent_move_dir_weight but for kick_power_log_std / kick_dir_log_kappa+kick_dir_z_log_std specifically: the
-        # kick gate's contribution to their (E[kick]-weighted) entropy bonus is detached, so these boosts only reach the spread
-        # parameter, not kick_logit. See _compute_entropy. 1.0 = today's behaviour exactly for both.
+        # Same idea as ent_move_dir_weight but for kick_power_log_std / kick_dir_log_kappa /
+        # kick_dir_z_log_std specifically: the kick gate's contribution to their (E[kick]-weighted)
+        # entropy bonus is detached, so these boosts only reach the named spread parameter, never
+        # kick_logit. kick_dir's azimuth (kappa) and elevation (z) got their own independent weights
+        # 2026-09-23 -- KickDirectionHead.entropy() sums the two, so a single combined weight here
+        # (the old ent_kick_dir_only_weight) pushed BOTH kappa and z at once, not azimuth alone as
+        # previously documented. See _compute_entropy. 1.0 = today's behaviour exactly for all three.
         self.ent_kick_power_only_weight = float(ppo_cfg.get("ent_kick_power_only_weight", 1.0))
-        self.ent_kick_dir_only_weight = float(ppo_cfg.get("ent_kick_dir_only_weight", 1.0))
+        self.ent_kick_dir_azimuth_only_weight = float(ppo_cfg.get("ent_kick_dir_azimuth_only_weight", 1.0))
+        self.ent_kick_dir_z_only_weight = float(ppo_cfg.get("ent_kick_dir_z_only_weight", 1.0))
         # Lower bound of the executed kick power fraction (0.0 = plain sigmoid).
         self.kick_power_floor = float(ppo_cfg.get("kick_power_floor", 0.0))
         # agent_plans/masked_action_training_plan.md: per-decision "could the action take effect" flags
@@ -1812,6 +1817,25 @@ class PPOTrainer:
         # much of the value loss floor is the agent's own action-sampling
         # noise. Off for real use. Needs the batched collection path.
         self._ppg_rollout_deterministic = bool(bc_cfg.get("ppg_rollout_deterministic", False))
+        # Experiment (untested): one-directional seeding of ppg_value_refit's fresh Adam
+        # optimizer from the LIVE PPO self.optimizer's per-parameter variance estimate
+        # (exp_avg_sq) -- see ppg_value_refit's "Adam seeding" comment for the mechanism
+        # and [[project_kick_power_ppg_kl_investigation]] for the motivating finding (Adam's
+        # own adaptive per-parameter step size was the untested lead hypothesis for why
+        # move_dir's kappa dominates PPG-refit KL, and tripling ppg_kl_coef didn't fix it).
+        # READ-ONLY from self.optimizer.state (cloned tensors) -- can never affect the live
+        # PPO optimizer. Off by default: this is a new, unverified knob, not yet compared
+        # against the existing cold-Adam behavior on a real run.
+        self._ppg_seed_adam_variance = bool(bc_cfg.get("ppg_seed_adam_variance", False))
+        # Interleaved PPG: run bursts of ppg_value_refit() mid-PPO instead of only via the
+        # standalone --ppg-refit-only entry point. See _maybe_run_ppg_interleave() and
+        # ai/knowledge.md "Interleaved PPG". Opt-in, off by default.
+        self._ppg_interleave_enabled = bool(bc_cfg.get("ppg_interleave_enabled", False))
+        self._ppg_interleave_trigger_file = bc_cfg.get("ppg_interleave_trigger_file") or None
+        self._ppg_interleave_cadence_rollouts = max(0, int(bc_cfg.get("ppg_interleave_cadence_rollouts", 0)))
+        self._ppg_interleave_num_rollouts = int(bc_cfg.get("ppg_interleave_num_rollouts", self._ppg_num_rollouts))
+        self._ppg_interleave_n_steps = int(bc_cfg.get("ppg_interleave_n_steps", self._ppg_rollout_steps))
+        self._rollouts_since_ppg_interleave = 0
         # flip_y consistency refit (consistency_refit(); CLI --consistency-refit-only) -- see
         # ai_config.json's _comment_consistency and ai/knowledge.md "flip_y consistency refit".
         self._consistency_epochs = int(bc_cfg.get("consistency_epochs", 5))
@@ -2532,6 +2556,7 @@ class PPOTrainer:
                 if self.rollout_eval_trials > 0:
                     self._eval_vs_rules(env.max_episode_s)
                 self._maybe_run_neural_snapshot_eval(env.max_episode_s)
+                self._maybe_run_ppg_interleave(env, phase_id)
 
         # Always save a final checkpoint so the result of the run is not lost
         # even if total_steps is not an exact multiple of rollout_steps.
@@ -3126,6 +3151,30 @@ class PPOTrainer:
                 if self.rollout_eval_trials > 0:
                     self._eval_vs_rules(max_episode_s)
                 self._maybe_run_neural_snapshot_eval(max_episode_s)
+
+                def _close_main_pools() -> None:
+                    nonlocal workers, eval_workers
+                    close_workers(workers)
+                    if eval_workers is not None:
+                        from footballcoach.ai.eval.eval_worker import close_eval_workers
+                        close_eval_workers(eval_workers)
+                    eval_workers = None
+                    self._persistent_eval_workers = None
+
+                def _respawn_main_pools() -> None:
+                    nonlocal workers, eval_workers
+                    workers = spawn_workers(
+                        phase_id, n_workers, base_seed, self.separate_value_net, self.worker_torch_threads,
+                        progress_value=_progress_value,
+                    )
+                    if self._eval_n_parallel_workers > 1:
+                        from footballcoach.ai.eval.eval_worker import spawn_eval_workers
+                        eval_workers = spawn_eval_workers(
+                            self._eval_n_parallel_workers, self.separate_value_net, self.worker_torch_threads,
+                        )
+                    self._persistent_eval_workers = eval_workers
+
+                self._maybe_run_ppg_interleave(None, phase_id, _close_main_pools, _respawn_main_pools)
         finally:
             close_workers(workers)
             if eval_workers is not None:
@@ -3440,6 +3489,35 @@ class PPOTrainer:
                 if self.rollout_eval_trials > 0:
                     self._eval_vs_rules(max_episode_s)
                 self._maybe_run_neural_snapshot_eval(max_episode_s)
+
+                def _close_main_pools() -> None:
+                    nonlocal workers, eval_workers
+                    close_batched_workers(workers)
+                    if eval_workers is not None:
+                        from footballcoach.ai.eval.eval_worker import close_eval_workers
+                        close_eval_workers(eval_workers)
+                    eval_workers = None
+                    self._persistent_eval_workers = None
+
+                def _respawn_main_pools() -> None:
+                    nonlocal workers, eval_workers
+                    workers = spawn_batched_workers(
+                        phase_id, n_processes, envs_per_process, base_seed,
+                        self.separate_value_net, self.worker_torch_threads,
+                        batch_secondary_players=self.batch_secondary_players,
+                        chunk_steps=self.batched_rollout_chunk_steps or None,
+                    )
+                    if self._eval_n_parallel_workers > 1:
+                        from footballcoach.ai.eval.eval_worker import spawn_eval_workers
+                        eval_workers = spawn_eval_workers(
+                            self._eval_n_parallel_workers, self.separate_value_net, self.worker_torch_threads,
+                        )
+                    self._persistent_eval_workers = eval_workers
+
+                self._maybe_run_ppg_interleave(
+                    None, phase_id, _close_main_pools, _respawn_main_pools,
+                    replay_seeds=replay_seeds_for_next_cycle,
+                )
         finally:
             close_batched_workers(workers)
             if eval_workers is not None:
@@ -3839,6 +3917,110 @@ class PPOTrainer:
             if pool is not None:
                 pool.close()
                 pool.join()
+
+    def _ppg_interleave_trigger_path(self) -> Optional[Path]:
+        """File whose presence (checked once per rollout) manually fires an interleaved PPG
+        burst. bc.ppg_interleave_trigger_file overrides; otherwise
+        '<checkpoint_dir>/ppg_trigger' -- None if there's no checkpoint_dir to put it in
+        (matches _maybe_run_neural_snapshot_eval's own checkpoint_dir requirement)."""
+        if self._ppg_interleave_trigger_file:
+            return Path(self._ppg_interleave_trigger_file)
+        if self.checkpoint_dir is not None:
+            return Path(self.checkpoint_dir) / "ppg_trigger"
+        return None
+
+    def _maybe_run_ppg_interleave(
+        self, env, phase_id: Optional[int],
+        close_main_pools_fn: Optional[Callable[[], None]] = None,
+        respawn_main_pools_fn: Optional[Callable[[], None]] = None,
+        replay_seeds: Optional[list[int]] = None,
+    ) -> None:
+        """Interleaved PPG: run a burst of ppg_value_refit() cycles mid-PPO, then resume
+        normal rollout collection, instead of only via the standalone --ppg-refit-only entry
+        point. Reuses ppg_value_refit() completely unchanged -- this only adds the trigger
+        check. Off by default (bc.ppg_interleave_enabled); see ai/knowledge.md
+        "Interleaved PPG".
+
+        ``replay_seeds``: forwarded as ppg_value_refit's ``first_rollout_replay_seeds`` --
+        the caller's CURRENT ``replay_seeds_for_next_cycle`` (episode-seed replay's queued
+        top-|advantage| seeds, if that feature is enabled and this rollout produced any),
+        so the burst's first cycle sees the same deliberately-hard episodes the main loop's
+        own next rollout is about to use, instead of ordinary on-policy sampling. Purely
+        additive -- this never consumes/mutates the caller's list, so the main loop's next
+        rollout still replays the same seeds independently afterward. None (the default,
+        and the only value the two callers without episode-seed replay wired up ever pass)
+        = no replay, byte-identical to before this parameter existed.
+
+        Two ways to fire, checked once per rollout (same cadence as
+        _maybe_run_neural_snapshot_eval), not mutually exclusive:
+          - Manual: create the file _ppg_interleave_trigger_path() points at (touch it, no
+            content needed) at any time while the run is live. Consumed (deleted) the next
+            time this is checked, so it never fires twice for one touch.
+          - Cadence safety net: bc.ppg_interleave_cadence_rollouts > 0 fires automatically
+            every N rollouts, counted since the last interleave (manual or cadence) fired.
+        Runs the burst and saves an extra checkpoint immediately after, so the refit's effect
+        is captured on disk right away rather than only at the next natural checkpoint.
+
+        ``close_main_pools_fn`` / ``respawn_main_pools_fn`` (both optional, no-ops when the
+        caller passes None -- the single-process train() path has no persistent pool to manage):
+        called immediately before/after the burst to close and respawn the MAIN LOOP's own
+        persistent rollout + eval worker pools around it, so at most ONE pool (the main loop's
+        OR ppg_value_refit()'s own freshly-spawned one, never both) is alive at a time. Added
+        2026-09-23 after a real crash: running the main loop's persistent pool (rollout workers
+        + eval workers) concurrently with ppg_value_refit()'s own freshly-spawned batched pool
+        exhausted this machine's RAM (confirmed: free memory jumped from a few GB to 25GB/32GB
+        the moment the crashed process's tree died, and the crash traceback was a cascade of
+        BrokenPipeError/EOFError from workers -- both rollout AND _eval_worker_main -- losing
+        their pipe to a main process that had just died, consistent with an OOM kill). The
+        earlier version of this comment called the double-pool footprint "accepted" -- it
+        wasn't safe, and the fix (pay a respawn-time cost, never hold both pools at once) is
+        worth it. See project_ppg_interleave_design memory for the original "easy version"
+        design reasoning this replaces the risky half of.
+        """
+        if not self._ppg_interleave_enabled:
+            return
+        self._rollouts_since_ppg_interleave += 1
+        trigger_path = self._ppg_interleave_trigger_path()
+        triggered_by: Optional[str] = None
+        if trigger_path is not None and trigger_path.exists():
+            triggered_by = "manual"
+        elif (
+            self._ppg_interleave_cadence_rollouts > 0
+            and self._rollouts_since_ppg_interleave >= self._ppg_interleave_cadence_rollouts
+        ):
+            triggered_by = "cadence"
+        if triggered_by is None:
+            return
+        if triggered_by == "manual" and trigger_path is not None:
+            try:
+                trigger_path.unlink()
+            except OSError:
+                pass
+        log.info(
+            f"[ppg interleave] triggered ({triggered_by}): running "
+            f"{self._ppg_interleave_num_rollouts} PPG refit cycle(s) mid-PPO "
+            f"({self._ppg_interleave_n_steps:,} steps/cycle)..."
+        )
+        if close_main_pools_fn is not None:
+            log.info("[ppg interleave] closing the main loop's persistent worker pools before the burst...")
+            close_main_pools_fn()
+        try:
+            self.ppg_value_refit(
+                env,
+                n_steps=self._ppg_interleave_n_steps,
+                phase_id=phase_id,
+                num_rollouts=self._ppg_interleave_num_rollouts,
+                first_rollout_replay_seeds=replay_seeds,
+            )
+        finally:
+            if respawn_main_pools_fn is not None:
+                log.info("[ppg interleave] respawning the main loop's persistent worker pools after the burst...")
+                respawn_main_pools_fn()
+        self._rollouts_since_ppg_interleave = 0
+        if self.checkpoint_dir is not None:
+            self._save_checkpoint(self._total_steps)
+        log.info("[ppg interleave] done, resuming normal PPO rollout collection.")
+
     # -----------------------------------------------------------------------
     # Value pre-training
     # -----------------------------------------------------------------------
@@ -5207,7 +5389,7 @@ class PPOTrainer:
     def _collect_value_pretrain_rollout(
         self, env, n_steps: int, phase_id: Optional[int], use_gae: bool = False,
         pool: Optional["_ValuePretrainWorkers"] = None, with_mc_returns: bool = False,
-        deterministic: bool = False,
+        deterministic: bool = False, replay_seeds: Optional[list[int]] = None,
     ) -> tuple[dict, dict]:
         """Collect ``n_steps`` of on-policy experience for value warm-up.
 
@@ -5270,10 +5452,28 @@ class PPOTrainer:
                 this call alone and close it before returning -- exactly
                 the original per-call behaviour (``pretrain_value``,
                 ``pretrain_combined``).
+            replay_seeds: episode seeds to force-replay in this collection,
+                chunked round-robin across worker processes exactly like
+                ``_train_batched_parallel``'s own episode-seed replay (see
+                ``_update_episode_replay``) -- reuses the SAME
+                ``BatchedRolloutWorkerHandle.collect(replay_seeds=...)``
+                wire parameter the main loop already sends. Only takes
+                effect on the batched worker path (``pool.batched``); a
+                non-empty list given with a plain/unbatched pool (or no
+                pool at all, i.e. the single-process branch) is logged and
+                otherwise ignored, since ``rollout_worker.py`` has no
+                seed-injection support. None (default) = no replay, i.e.
+                today's ordinary on-policy sampling.
         """
         _owns_pool = pool is None
         if _owns_pool:
             pool = self._spawn_value_pretrain_workers(phase_id)
+        if replay_seeds and pool is None:
+            log.info(
+                f"  [value pretrain rollout] {len(replay_seeds)} replay seed(s) given but ignored "
+                "-- no parallel worker pool for this call (single-process branch has no "
+                "seed-injection support)"
+            )
         if pool is not None:
             import multiprocessing
             import multiprocessing.connection
@@ -5361,9 +5561,25 @@ class PPOTrainer:
                         "deterministic value-pretrain rollouts need the BATCHED collection path "
                         "(ppo.value_pretrain_batched_rollout=true)"
                     )
-                for w in pool.handles:
+                if replay_seeds and not pool.batched:
+                    log.info(
+                        f"  [value pretrain rollout] {len(replay_seeds)} replay seed(s) given but "
+                        "ignored -- the plain (unbatched) worker pool has no seed-injection support "
+                        "(needs ppo.value_pretrain_batched_rollout=true)"
+                    )
+                # Round-robin chunking, identical to _train_batched_parallel's own
+                # episode-seed replay (_update_episode_replay's caller) -- each
+                # worker gets every len(pool.handles)-th seed.
+                _replay_chunks = (
+                    [c for c in (replay_seeds[i::n_workers] for i in range(n_workers)) if c]
+                    if (replay_seeds and pool.batched) else []
+                )
+                for _wi, w in enumerate(pool.handles):
                     if pool.batched:
-                        w.collect(steps_per_worker, returns=_returns_spec, deterministic=deterministic)
+                        w.collect(
+                            steps_per_worker, returns=_returns_spec, deterministic=deterministic,
+                            replay_seeds=(_replay_chunks[_wi] if _wi < len(_replay_chunks) else None),
+                        )
                     else:
                         w.collect(steps_per_worker, progress=0.0)
                 _agg_progress = ProgressReporter(
@@ -5947,6 +6163,7 @@ class PPOTrainer:
         kl_coef: Optional[float] = None,
         batch_size: Optional[int] = None,
         num_rollouts: Optional[int] = None,
+        first_rollout_replay_seeds: Optional[list[int]] = None,
     ) -> dict:
         """Re-fit the (shared-trunk) value function with FULL, unfrozen
         gradient flow through decision_net/execution_net's trunk, while an
@@ -6023,6 +6240,23 @@ class PPOTrainer:
                 single call.
             num_rollouts: override ``bc.ppg_num_rollouts`` (default 1) --
                 how many collect+fit+restore cycles to run in this call.
+            first_rollout_replay_seeds: episode seeds to force-replay in ONLY
+                the FIRST cycle's rollout collection (cycle 2+ within this
+                same call, if any, sample normally) -- forwarded as-is to
+                ``_collect_value_pretrain_rollout``'s own ``replay_seeds``
+                (see its docstring for chunking/support details, notably
+                that it needs the batched worker path). Intended use:
+                ``_maybe_run_ppg_interleave`` passes the main PPO loop's own
+                ``replay_seeds_for_next_cycle`` (the top-|advantage| episodes
+                queued by episode-seed replay right before the interleave
+                fired) so the refit's value-fitting sees the same
+                deliberately-hard episodes real training was about to use,
+                instead of ordinary on-policy sampling -- purely additive:
+                the main loop's own next rollout still consumes the SAME
+                seed list independently afterward (this never mutates or
+                consumes it). None (default) = no replay, i.e. every cycle
+                samples normally, unchanged from before this parameter
+                existed.
 
         Returns:
             The rollout-stats dict from the LAST cycle's
@@ -6054,6 +6288,45 @@ class PPOTrainer:
         # state, which is fully independent per cycle.
         ppg_params_all = list(self.decision_net.parameters()) + list(self.execution_net.parameters())
         ppg_opt = torch.optim.Adam(ppg_params_all, lr=lr, eps=1e-5)
+        if self._ppg_seed_adam_variance and self.optimizer is not None:
+            # One-directional Adam seeding (bc.ppg_seed_adam_variance, off by default -- see
+            # its config comment). Copies each param's *live* PPO Adam variance estimate
+            # (exp_avg_sq) and step count into this fresh optimizer, so PPG doesn't start
+            # from a cold (all-zero) per-parameter step-size calibration -- the untested lead
+            # hypothesis in [[project_kick_power_ppg_kl_investigation]] for why move_dir's
+            # kappa historically dominates PPG-refit KL. Momentum (exp_avg) is explicitly
+            # zeroed, NOT copied -- self.optimizer's momentum points toward PPO's own
+            # clipped-surrogate objective, which has nothing to do with this refit's pure
+            # value-loss + KL-anchor gradient, so carrying it over would bias PPG's first
+            # steps in a direction unrelated to what it's actually optimizing.
+            #
+            # The step count must travel WITH exp_avg_sq: Adam's bias-correction divides by
+            # (1 - beta2**step), which assumes exp_avg_sq grew from zero over `step` calls.
+            # Seeding a mature exp_avg_sq at step=0 would make that correction factor tiny
+            # (~0.001 at step=1), inflating the "corrected" variance ~1000x and producing
+            # near-frozen effective updates -- copying self.optimizer's own (huge) step count
+            # keeps the correction factor at ~1, so the borrowed variance estimate is used
+            # as-is, which is the whole point.
+            #
+            # Strictly read-only: every value below is a fresh .clone() of a tensor read out
+            # of self.optimizer.state, and self.optimizer itself is never written to -- this
+            # cannot affect the live PPO optimizer no matter how PPG's refit goes.
+            _seeded = _skipped = 0
+            for _p in ppg_params_all:
+                _live_state = self.optimizer.state.get(_p)
+                if not _live_state or "exp_avg_sq" not in _live_state:
+                    _skipped += 1  # e.g. frozen physics-encoder params, never in self.optimizer
+                    continue
+                _step_val = _live_state.get("step", 0)
+                ppg_opt.state[_p]["exp_avg_sq"] = _live_state["exp_avg_sq"].detach().clone()
+                ppg_opt.state[_p]["exp_avg"] = torch.zeros_like(_p)
+                ppg_opt.state[_p]["step"] = _step_val.detach().clone() if torch.is_tensor(_step_val) else _step_val
+                _seeded += 1
+            log.info(
+                f"  [ppg value refit] seeded Adam exp_avg_sq (variance) from live PPO optimizer for "
+                f"{_seeded} param(s) ({_skipped} skipped -- not present in self.optimizer.state); "
+                f"momentum (exp_avg) left at zero, read-only copy (live optimizer untouched)."
+            )
         _non_direction_params = [p for p in ppg_params_all if id(p) not in self.direction_param_ids]
         _direction_params = [p for p in ppg_params_all if id(p) in self.direction_param_ids]
 
@@ -6102,8 +6375,16 @@ class PPOTrainer:
                 # pretrain_value's cold-start-from-BC scenario where MC returns
                 # avoid a real circularity problem GAE would have there.
                 log.info("Doing PPG value refit rollout collection now (reuses pretrain_value()'s rollout collector, hence the '[value pretrain rollout]' label below)...")
+                # first_rollout_replay_seeds only ever applies to cycle 0 -- see
+                # this method's own docstring paragraph for why (deliberately
+                # NOT repeated on every cycle within one call: the queued seeds
+                # are a one-shot snapshot from right before this call started).
+                _cycle_replay_seeds = first_rollout_replay_seeds if _rollout_i == 0 else None
+                if _cycle_replay_seeds:
+                    log.info(f"  [ppg value refit] replaying {len(_cycle_replay_seeds)} queued episode-replay seed(s) in this cycle's rollout")
                 batch, _rollout_stats = self._collect_value_pretrain_rollout(
-                    env, n_steps, phase_id, use_gae=True, pool=_pool, **_mc_kw,
+                    env, n_steps, phase_id, use_gae=True, pool=_pool,
+                    replay_seeds=_cycle_replay_seeds, **_mc_kw,
                 )
 
                 # --- Episode-level 85/15 train/val split (overfit detection) ---
@@ -9222,8 +9503,8 @@ class PPOTrainer:
                 # No dir_l2 penalty needed: direction means are unit-normalized in
                 # forward() so their magnitude is always 1 — penalizing it is a no-op.
 
-                # log_kappa/log_std restoring force: without this, ent_dir_weight *
-                # entropy is a one-directional force that only ever DEFLATES
+                # log_kappa/log_std restoring force: without this, the entropy bonus
+                # is a one-directional force that only ever DEFLATES
                 # move_dir_log_kappa/kick_dir_log_kappa (entropy is monotonic
                 # DECREASING in log_kappa -- the inverse relationship of the old
                 # log_std, where entropy increased with it) and inflates
@@ -10139,10 +10420,11 @@ class PPOTrainer:
                 lp_kkdir_d  = lp_kkdir_d * _kick_mask_d
                 lp_kkpow_d  = lp_kkpow_d * _kick_mask_d
                 lp_kkspin_d = lp_kkspin_d * _kick_mask_d
-                # NOTE: direction heads (move_dir/kick_dir) are NOT scaled by
-                # ent_dir_weight in the REAL training log_prob (see
-                # _compute_log_prob/_recompute_log_prob above — ent_dir_weight
-                # now only scales the entropy bonus, see _compute_entropy).
+                # NOTE: direction heads (move_dir/kick_dir) are NOT scaled by any
+                # entropy-bonus weight in the REAL training log_prob (see
+                # _compute_log_prob/_recompute_log_prob above — the entropy-only
+                # weights, e.g. ent_move_dir_weight, only scale _compute_entropy's
+                # bonus, never the importance ratio's log_prob).
                 # lp_mvdir_w/lp_kkdir_w keep their names for the rest of this
                 # block's plumbing but are now equal to lp_mvdir_d/lp_kkdir_d
                 # unweighted — this mirrors the real training log_prob exactly,
@@ -10423,6 +10705,27 @@ class PPOTrainer:
             f"  [exec continuous log_kappa] move_direction: start={_move_ls_start:.4f} end={_move_ls_end:.4f}"
             f"   kick_direction: start={_kick_ls_start:.4f} end={_kick_ls_end:.4f}"
             f"   kick_direction_z (log_std): start={_kickz_ls_start:.4f} end={_kickz_ls_end:.4f}"
+        )
+        # Approximate, mean-angle/mean-z-held-fixed analytic KL split of kick_dir's azimuth vs
+        # elevation components, from this rollout's start->end kappa/sigma_z snapshot alone (same
+        # _von_mises_kl / Normal-kl_divergence machinery _ppg_kl_penalty uses for its own kick_dir
+        # split, reused here as a cheap diagnostic -- NOT the same quantity as the ratio-based,
+        # per-minibatch, opportunity-weighted "[per-head KL] ... kick_dir=" figure above: this one
+        # isolates ONLY the concentration/spread change (ignoring real mean-angle/mean-z drift,
+        # which the "[exec continuous Δ per opt step]" dmean/Δσ° figures below already cover), so
+        # it is a cleaner "how much did kick_dir's SHARPNESS alone move this rollout" signal, not a
+        # substitute for the real training-relevant combined KL.
+        _kick_azimuth_kl = float(_von_mises_kl(
+            torch.tensor(0.0), torch.tensor(math.exp(_kick_ls_end)),
+            torch.tensor(0.0), torch.tensor(math.exp(_kick_ls_start)),
+        ))
+        _kick_z_kl = float(torch.distributions.kl_divergence(
+            torch.distributions.Normal(torch.tensor(0.0), torch.tensor(math.exp(_kickz_ls_end))),
+            torch.distributions.Normal(torch.tensor(0.0), torch.tensor(math.exp(_kickz_ls_start))),
+        ))
+        log.info(
+            f"  [kick_dir analytic KL split] azimuth(kappa-only)={_kick_azimuth_kl:.4f}"
+            f"  elevation(sigma_z-only)={_kick_z_kl:.4f}  (start->end snapshot, mean-angle/mean-z held fixed)"
         )
         # Build per-step and per-epoch Δ strings, with angular interpretations.
         # dmean is the per-step L2 shift of the unit-vector mean; for unit vectors
@@ -10748,8 +11051,9 @@ class PPOTrainer:
 
         ``return_kick_boost`` returns the extra bonus terms that only enter the PPO loss (never the logged entropy): the
         ``ent_kick_weight`` boost on the kick heads, ``ent_move_dir_weight`` on move_dir, and
-        ``ent_kick_power_only_weight`` / ``ent_kick_dir_only_weight`` on kick_power / kick_dir specifically (detached
-        kick-gate weighting, so unlike ``ent_kick_weight`` these never also push on ``kick_logit``).
+        ``ent_kick_power_only_weight`` / ``ent_kick_dir_azimuth_only_weight`` / ``ent_kick_dir_z_only_weight`` on
+        kick_power / kick_dir's azimuth / kick_dir's elevation specifically (detached kick-gate weighting, so
+        unlike ``ent_kick_weight`` these never also push on ``kick_logit``, and never on each other's parameter).
 
         Args:
             return_breakdown: if True, also return a dict of each head's own
@@ -10806,16 +11110,27 @@ class PPOTrainer:
         p_kick = torch.sigmoid(e_heads.kick_logit).mean()
         h_sprint = p_exec_move * IndependentBernoulli(e_heads.sprint_logit).entropy().mean()
         _h_move_dir_raw = self._move_dir_head(e_heads.move_direction, log_kappa_move).entropy().mean()
-        h_move_dir = p_exec_move * self.ent_dir_weight * _h_move_dir_raw
+        h_move_dir = p_exec_move * _h_move_dir_raw
         # Raw (un-gated) entropy of kick_dir/kick_power, kept UNREDUCED (per-row) here so the
         # opportunity-weighted mean below (masked branch) can be reproduced exactly for the
         # detached-gate boosts further down -- mean(w * x) != mean(w) * mean(x) when w varies per
         # row, so this can't just be a scalar the way _h_move_dir_raw is (move_dir's gate,
         # p_exec_move, is always a plain batch-mean scalar, never per-row).
-        _h_kick_dir_raw = self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick).entropy()
+        _kick_dir_head_obj = self._kick_dir_head(e_heads.kick_direction, log_kappa_kick, log_std_z_kick)
+        _h_kick_dir_raw = _kick_dir_head_obj.entropy()
+        # Diagnostic-only split of the combined kick_dir entropy above into its two constituent
+        # components (azimuth: von Mises on kappa; elevation/z: plain Gaussian on std_z) -- both
+        # global scalar parameters (not state-dependent, see the class comment), so these are
+        # themselves scalar/broadcastable, same shape story as _h_kick_dir_raw itself. Logged
+        # (via _bkdn_tensors below) so azimuth+z sharpening can be told apart in the training log
+        # and future plots, since KickDirectionHead.entropy() only ever returns their SUM.
+        _h_kick_dir_azimuth_raw = _von_mises_entropy(_kick_dir_head_obj.kappa)
+        _h_kick_dir_z_raw = _kick_dir_head_obj.dist_z.entropy()
         _h_kick_power_raw = self._kick_power_head(e_heads.kick_power, log_std_power).entropy()
         if opp_masks is None:
-            h_kick_dir = p_kick * self.ent_dir_weight * _h_kick_dir_raw.mean()
+            h_kick_dir = p_kick * _h_kick_dir_raw.mean()
+            h_kick_dir_azimuth = p_kick * _h_kick_dir_azimuth_raw.mean()
+            h_kick_dir_z = p_kick * _h_kick_dir_z_raw.mean()
             h_kick_power = p_kick * self.ent_kick_power_weight * _h_kick_power_raw.mean()
             # kick_spin is permanently frozen (see agent_plans/spin_implementation_plan.md
             # section 0) -- its entropy term is masked to exactly zero rather than
@@ -10824,14 +11139,18 @@ class PPOTrainer:
                 torch.zeros((), device=self.device) if self._kick_spin_frozen else
                 p_kick * self.ent_kick_spin_weight * self._kick_spin_dist(e_heads.kick_spin, log_std_spin).entropy().sum(dim=-1).mean()
             )
-            # Detached-gate versions for ent_kick_power_only_weight/ent_kick_dir_only_weight below:
-            # p_kick.detach() has the identical forward value, so these still scale correctly by
-            # "how often kicks happen right now", but carry no gradient into kick_logit.
+            # Detached-gate versions for ent_kick_power_only_weight/ent_kick_dir_azimuth_only_weight/
+            # ent_kick_dir_z_only_weight below: p_kick.detach() has the identical forward value, so
+            # these still scale correctly by "how often kicks happen right now", but carry no
+            # gradient into kick_logit.
             _kick_power_only_raw = p_kick.detach() * self.ent_kick_power_weight * _h_kick_power_raw.mean()
-            _kick_dir_only_raw = p_kick.detach() * self.ent_dir_weight * _h_kick_dir_raw.mean()
+            _kick_dir_azimuth_only_raw = p_kick.detach() * _h_kick_dir_azimuth_raw.mean()
+            _kick_dir_z_only_raw = p_kick.detach() * _h_kick_dir_z_raw.mean()
         else:
             _w_kick = opp_masks["kick"] * torch.sigmoid(e_heads.kick_logit).reshape(-1) * opp_masks.get("kick_scale", 1.0)
-            h_kick_dir = (_w_kick * self.ent_dir_weight * _h_kick_dir_raw.reshape(-1)).mean()
+            h_kick_dir = (_w_kick * _h_kick_dir_raw.reshape(-1)).mean()
+            h_kick_dir_azimuth = (_w_kick * _h_kick_dir_azimuth_raw.reshape(-1)).mean()
+            h_kick_dir_z = (_w_kick * _h_kick_dir_z_raw.reshape(-1)).mean()
             h_kick_power = (_w_kick * self.ent_kick_power_weight * _h_kick_power_raw.reshape(-1)).mean()
             h_kick_spin = (
                 torch.zeros((), device=self.device) if self._kick_spin_frozen else
@@ -10841,11 +11160,18 @@ class PPOTrainer:
             # output); only the sigmoid(kick_logit) factor needs detaching.
             _w_kick_detached = opp_masks["kick"] * torch.sigmoid(e_heads.kick_logit).detach().reshape(-1) * opp_masks.get("kick_scale", 1.0)
             _kick_power_only_raw = (_w_kick_detached * self.ent_kick_power_weight * _h_kick_power_raw.reshape(-1)).mean()
-            _kick_dir_only_raw = (_w_kick_detached * self.ent_dir_weight * _h_kick_dir_raw.reshape(-1)).mean()
+            _kick_dir_azimuth_only_raw = (_w_kick_detached * _h_kick_dir_azimuth_raw.reshape(-1)).mean()
+            _kick_dir_z_only_raw = (_w_kick_detached * _h_kick_dir_z_raw.reshape(-1)).mean()
         ent += h_sprint + h_move_dir + h_kick_dir + h_kick_power + h_kick_spin
         _bkdn_tensors["sprint"] = h_sprint
         _bkdn_tensors["move_dir"] = h_move_dir
         _bkdn_tensors["kick_dir"] = h_kick_dir
+        # Diagnostic only (see the comment where these are built above): NOT included in the
+        # `ent` sum above (that already has h_kick_dir, their combined total) -- these two entries
+        # exist purely so the training log / future plots can see kick_dir's azimuth-vs-elevation
+        # split, which kick_dir alone can't show since KickDirectionHead.entropy() sums them.
+        _bkdn_tensors["kick_dir_azimuth"] = h_kick_dir_azimuth
+        _bkdn_tensors["kick_dir_z"] = h_kick_dir_z
         _bkdn_tensors["kick_power"] = h_kick_power
         _bkdn_tensors["kick_spin"] = h_kick_spin
         # ent_kick_weight: extra bonus on the kick gate + kick_dir + kick_power
@@ -10856,14 +11182,23 @@ class PPOTrainer:
         # ent_move_dir_weight: extra bonus on the move_dir entropy, carried in the same separate term (so the logged entropy and
         # breakdown stay unboosted). p_exec_move is detached: the von Mises entropy depends only on kappa, so this boost pulls
         # move_dir_log_kappa down (slower sharpening) without also pushing the exec_move gate toward "stand still".
-        kick_boost = kick_boost + (self.ent_move_dir_weight - 1.0) * p_exec_move.detach() * self.ent_dir_weight * _h_move_dir_raw
-        # ent_kick_power_only_weight / ent_kick_dir_only_weight: same pattern as ent_move_dir_weight, but for the kick heads'
-        # own spread parameters. Unlike ent_kick_weight above (which deliberately also pushes p(kick) itself -- see its
-        # comment -- it was added to stop the kick gate collapsing early), these use the DETACHED kick-gate weighting
-        # (_kick_power_only_raw / _kick_dir_only_raw), so the extra boost reaches only kick_power_log_std, or only
-        # kick_dir_log_kappa/kick_dir_z_log_std, never kick_logit.
+        kick_boost = kick_boost + (self.ent_move_dir_weight - 1.0) * p_exec_move.detach() * _h_move_dir_raw
+        # ent_kick_power_only_weight / ent_kick_dir_azimuth_only_weight / ent_kick_dir_z_only_weight:
+        # same pattern as ent_move_dir_weight, but for the kick heads' own spread parameters. Unlike
+        # ent_kick_weight above (which deliberately also pushes p(kick) itself -- see its comment --
+        # it was added to stop the kick gate collapsing early), these use the DETACHED kick-gate
+        # weighting, so the extra boost reaches only kick_power_log_std, or only kick_dir_log_kappa
+        # (azimuth) / kick_dir_z_log_std (elevation) separately, never kick_logit. The azimuth/z
+        # split (2026-09-23) replaced a single combined ent_kick_dir_only_weight that turned out to
+        # push BOTH kick_dir_log_kappa and kick_dir_z_log_std at once (KickDirectionHead.entropy()
+        # sums them, and _kick_dir_only_raw was built from that sum) -- measured directly (isolated
+        # backward pass on a real checkpoint) to split roughly 2:1 in favor of kick_dir_z_log_std,
+        # NOT azimuth-only as this comment previously (incorrectly) claimed. The two gradients are
+        # mathematically independent (additive branches), so this split changes NOTHING about how
+        # hard azimuth is pushed -- it only stops the accidental extra push into elevation.
         kick_boost = kick_boost + (self.ent_kick_power_only_weight - 1.0) * _kick_power_only_raw
-        kick_boost = kick_boost + (self.ent_kick_dir_only_weight - 1.0) * _kick_dir_only_raw
+        kick_boost = kick_boost + (self.ent_kick_dir_azimuth_only_weight - 1.0) * _kick_dir_azimuth_only_raw
+        kick_boost = kick_boost + (self.ent_kick_dir_z_only_weight - 1.0) * _kick_dir_z_only_raw
         result = [ent]
         if return_breakdown:
             _names = list(_bkdn_tensors.keys())

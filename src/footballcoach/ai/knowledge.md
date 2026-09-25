@@ -1599,10 +1599,9 @@ distribution to a snapshot taken right before the refit starts. Inspired by
 the auxiliary phase of OpenAI's Phasic Policy Gradient (PPG) paper, but
 scoped as a standalone/occasional refit — opt-in via `bc.ppg_enabled` (runs
 once, automatically, right after whatever pretraining path `train.py` took,
-before `checkpoint_pretrained.pt` is saved) or on-demand via `train.py
---ppg-refit-only` against any existing checkpoint — NOT an automatic
-alternating cadence inside the main PPO rollout loop (that's a documented,
-deliberately out-of-scope future extension, not built here).
+before `checkpoint_pretrained.pt` is saved), on-demand via `train.py
+--ppg-refit-only` against any existing checkpoint, or interleaved into a live
+PPO run via `bc.ppg_interleave_enabled` — see "Interleaved PPG" below.
 
 Key implementation points, in case any of this needs revisiting:
 
@@ -1917,6 +1916,90 @@ Key implementation points, in case any of this needs revisiting:
   out rule and 273 (0.9% of all games) carried on with the ball back in play
   -- the only episodes a painted-line rule would cut short.
 
+## Interleaved PPG (`PPOTrainer._maybe_run_ppg_interleave`, 2026-09-23)
+
+Runs bursts of `ppg_value_refit()` mid-PPO instead of only via the standalone
+`--ppg-refit-only` entry point or the once-at-startup `bc.ppg_enabled` path —
+so a refit no longer requires stopping and restarting the training process.
+Opt-in (`bc.ppg_interleave_enabled`, default `false`); checked once per
+rollout at the same point `_maybe_run_neural_snapshot_eval` already is, in
+all three `train()` code paths (single-process, plain multi-process, batched
+multi-process). Reuses `ppg_value_refit()` completely unchanged — this is
+only a trigger, no new refit logic. Design discussion (before any code
+existed) is in memory `project_ppg_interleave_design`.
+
+- **Two ways to fire, not mutually exclusive, checked in this order:**
+  1. **Manual** — create (touch) the file `_ppg_interleave_trigger_path()`
+     points at (`bc.ppg_interleave_trigger_file`, or
+     `<checkpoint_dir>/ppg_trigger` if that's unset) at any time while the
+     run is live. It's deleted the moment it's noticed, so one touch fires
+     exactly one burst — this is the primary intended use ("whenever we need
+     it we get some rounds of PPG"), not automatic plateau detection (no such
+     heuristic was judged reliable enough to build; every PPG call this
+     project has made so far was a human judgment call, e.g. "we just reset
+     kick_power's sigma, let's refit now").
+  2. **Cadence safety net** — `bc.ppg_interleave_cadence_rollouts > 0` also
+     fires automatically every N rollouts, counted via
+     `self._rollouts_since_ppg_interleave` since the last interleave fired
+     (manual or cadence); `0` (default) disables this half entirely.
+- `bc.ppg_interleave_num_rollouts` / `bc.ppg_interleave_n_steps` set the
+  burst's own `num_rollouts`/`n_steps`, independent of
+  `bc.ppg_num_rollouts`/`bc.ppg_rollout_steps` (the standalone
+  `--ppg-refit-only` path's settings) — keep the interleaved burst smaller,
+  since a live run pays for it out of the same wall-clock budget as normal
+  training, unlike the standalone path.
+- An extra checkpoint is saved immediately after the burst (in addition to
+  the normal per-rollout save), so the refit's effect is captured on disk
+  right away instead of only at the next natural checkpoint.
+- **Sequential, not concurrent, with the main loop's own rollout collection**
+  — `_maybe_run_ppg_interleave` is only ever called between one rollout's
+  `_ppo_update` and the next rollout's collection, so `ppg_value_refit()`'s
+  own freshly-spawned worker pool never competes for cores with the main
+  loop's. In the two multi-process `train()` paths, `_maybe_run_ppg_interleave`
+  now takes optional `close_main_pools_fn`/`respawn_main_pools_fn` callbacks
+  (each call site passes closures that close/respawn its own `workers`/
+  `eval_workers` via `nonlocal`, since each path uses a different spawn
+  function — plain `spawn_workers` vs batched `spawn_batched_workers`) so the
+  main loop's persistent pool is CLOSED before the burst and respawned after,
+  rather than sitting idle-but-alive for the burst's duration.
+  **CORRECTION (2026-09-23, same day this feature was built): the original
+  version of this section called the double-pool footprint "a real but
+  accepted" cost — it wasn't safe.** First live end-to-end test (manually
+  triggering a 2-rollout burst against run309) crashed the entire process
+  outright: a cascade of `BrokenPipeError`/`EOFError` from both rollout
+  workers AND `_eval_worker_main` (the persistent eval pool), consistent with
+  an OOM kill (free memory jumped from a few GB to 25GB/32GB the instant the
+  crashed tree died). Running the main loop's full persistent pool (rollout +
+  eval workers) concurrently with `ppg_value_refit()`'s own freshly-spawned
+  batched pool was too much for this machine's RAM once the main loop was
+  already at its live 17-process/12-envs-per-process scale. The close/respawn
+  fix trades a respawn-time cost (a handful of seconds) for never holding two
+  pools at once — accepted as clearly worth it. The `respawn_main_pools_fn`
+  call is wrapped in the SAME `try/finally` as the `ppg_value_refit()` call,
+  so the main loop's pool is always respawned even if the burst itself raises
+  — otherwise a failed refit would silently leave the main loop with no
+  workers at all afterward. The single-process `train()` path (`n_processes
+  <= 1`) has no persistent pool at all, so its call site passes `None, None`
+  for both callbacks (`_maybe_run_ppg_interleave`'s default), a pure no-op.
+- In the two multi-process `train()` paths (`_train_parallel`,
+  `_train_batched_parallel`), `env` is always `None` at the call site (those
+  methods don't receive the original `env` object at all — each worker
+  builds its own from `phase_id`) — matches `ppg_value_refit`'s own
+  documented convention that `env` is ignored whenever `phase_id` drives
+  parallel collection instead.
+- Tests: `tests/ai_unit/test_ppg_interleave.py` — trigger-logic only
+  (`ppg_value_refit` monkeypatched out), covering: disabled is a no-op and
+  never even looks at the trigger file; a manual touch fires exactly once and
+  is consumed; a custom trigger path is honored; the cadence counter fires
+  every N calls and resets on either a manual or cadence fire; `cadence=0`
+  never fires on its own; `close_main_pools_fn`/`respawn_main_pools_fn` fire
+  in the right order (close → refit → respawn) and respawn still runs even
+  when the refit itself raises (`TestMainPoolCloseRespawn`). No
+  multiprocessing, no real rollout in the test suite — the close/respawn
+  fix's actual effect on peak memory was only verified by the live crash-then-
+  recover test described above, not by an automated test (there is no
+  memory-pressure test in this suite for any worker-pool code).
+
 ## Batched rollouts: whole-episode chunks, worker-side finalization, RAM
 
 **Whole-episode flushes (applies to the MAIN PPO loop too, not just value
@@ -2053,7 +2136,9 @@ parameter dropped, nothing else touched; `--checkpoint <reset>.pt --checkpoint-d
   `ent_kick_weight` (so the logged entropy / per-head breakdown stay unboosted), with P(exec_move) detached so the boost reaches ONLY
   move_dir_log_kappa (von Mises entropy depends on kappa alone) -- it slows sharpening without pushing the exec_move gate toward standing
   still (the ordinary move_dir entropy term does pull on exec_move through its P(exec_move) factor). Run 305 uses 8.0 (on top of
-  `ent_dir_weight` 1.5). Tests: tests/ai_unit/test_move_dir_entropy_weight.py (mutation-checked: removing the detach fails it).
+  `ent_dir_weight` 1.5 -- that shared base multiplier was removed 2026-09-23 as redundant overhead once move_dir/kick_dir each had
+  their own fully independent dedicated weight; it was sitting at 1.0/no-op by then, so removing it changed no run's behavior).
+  Tests: tests/ai_unit/test_move_dir_entropy_weight.py (mutation-checked: removing the detach fails it).
 * Run 304's log-kappa growth showed no detectable dependence on ent_coef (0.0047 -> 0.0019), so the entropy lever at weight 1 is weak; the
   value 8 is a first setting, tune from the observed log-kappa growth per checkpoint (~0.011 before).
 * The eval "original" opponent is always the run's own checkpoint1.pt, so `vs neural:original` restarts from the reset policy in run 305.
@@ -2090,7 +2175,8 @@ spread -- entangling two different decisions (whether to kick vs. how precisely)
 **`ppo.ent_kick_power_only_weight` / `ppo.ent_kick_dir_only_weight`** (both default 1.0 = off): same `ent_move_dir_weight` pattern, one
 per kick head. Detach only the `sigmoid(kick_logit)` factor of the (E[kick]-weighted) gating term -- `opp_masks["kick"]` itself already
 carries no gradient (an env-recorded flag, not a network output) so only the sigmoid needs it -- so the boost reaches ONLY
-`kick_power_log_std`, or only `kick_dir_log_kappa`/`kick_dir_z_log_std`, never `kick_logit`. Implementation needed the raw (un-gated,
+`kick_power_log_std`, or **[CORRECTION, 2026-09-23 -- the original claim below was wrong, see the dated note after this section]**
+`kick_dir_log_kappa`/`kick_dir_z_log_std`, never `kick_logit`. Implementation needed the raw (un-gated,
 UNREDUCED per-row) entropy tensors of both heads as new intermediates (`_h_kick_dir_raw`/`_h_kick_power_raw` in `_compute_entropy`)
 because the masked branch's weighting is `mean(_w_kick * entropy_per_row)`, not `mean(_w_kick) * mean(entropy_per_row)` -- those differ
 whenever the per-row gate varies, so the detached-gate boost has to reproduce the exact same per-row-weighted-then-meaned structure, not
@@ -2120,6 +2206,38 @@ a nonzero `kick_logit.weight.grad`).
   reset policy under a KL-anchor before resuming full PPO, without a full pretrain_value() run.
 * `ent_coef` re-based flat again (same reasoning as the 305 -> 306 transition: it was already at its 0.001 floor for run 306's whole back
   half, so `ent_coef_start = ent_coef_end = 0.001` rather than re-deriving a schedule -- there's nothing left to anneal).
+
+**CORRECTION (2026-09-23): `ent_kick_dir_only_weight` was never azimuth-only.** The claim above ("the boost reaches ONLY
+`kick_dir_log_kappa`/`kick_dir_z_log_std`" -- read that as "only these named parameters among ALL execution_net params", true, but
+NOT "only kappa alone") undersold what was actually happening: `KickDirectionHead.entropy()` (`ai/action/distributions.py`) returns
+`_von_mises_entropy(kappa) + dist_z.entropy()`, the azimuth and elevation components summed into one number, and the old
+`ent_kick_dir_only_weight`'s boost term (`_kick_dir_only_raw`) was built straight from that combined sum. So the single weight was
+always pushing BOTH `kick_dir_log_kappa` (azimuth) AND `kick_dir_z_log_std` (elevation) simultaneously, not azimuth alone as every
+comment/report through run 308 claimed. Measured directly (isolated gradient probe, `kick_dir_split_grad_probe.py` in the scratchpad,
+run on a real run308 checkpoint): `d(boost)/d(kick_dir_log_kappa) = -2.48`, `d(boost)/d(kick_dir_z_log_std) = +4.85` -- elevation got
+roughly 2x azimuth's gradient magnitude at that checkpoint's kappa=23/sigma_z=0.52. The two gradients are mathematically independent
+(additive branches -- `d(A+B)/d(kappa)` doesn't depend on B's value), so this was never azimuth "losing out" to elevation in a
+competing/zero-sum sense; azimuth's own gradient was always exactly what it would have been with elevation's term removed. But it
+does mean weight 15.0 was never a clean, surgical "slow kappa's sharpening" lever -- it was simultaneously (and, given elevation's much
+weaker opposing policy-gradient pressure, probably MORE effectively) widening `kick_dir_z_log_std`, which plausibly explains why
+`kick_dir_z`'s sigma grew substantially over run 308 (0.25 -> 0.52, ang std 14 -> 30 degrees, see the kick_curves.py graph's "Kick
+direction (azimuth kappa + elevation sigma) / power sharpness" panel) while kappa kept climbing largely unimpeded. **Fixed for run
+309**: `_compute_entropy` now computes azimuth-only and z-only raw entropy tensors separately (`_h_kick_dir_azimuth_raw` via
+`_von_mises_entropy(kappa)` directly, `_h_kick_dir_z_raw` via `dist_z.entropy()` directly -- both already needed as diagnostic-only
+`_bkdn_tensors["kick_dir_azimuth"]`/`["kick_dir_z"]` entries for the training log's entropy breakdown, see the fractional-lookbacks
+section below for the general pattern of adding diagnostic-only breakdown entries), and `ent_kick_dir_only_weight` was split into
+`ent_kick_dir_azimuth_only_weight` (kept at 15.0 -- the leak fix doesn't change azimuth's own gradient, so there's no new evidence to
+recalibrate the number) and `ent_kick_dir_z_only_weight` (reset to 1.0/off -- z's growth wasn't a clean signal, so run 309 resets the
+value itself too rather than fighting an artificially-inflated one). Regression tests:
+`test_kick_dir_azimuth_only_boost_does_not_reach_z` / `test_kick_dir_z_only_boost_does_not_reach_azimuth` in
+`tests/ai_unit/test_kick_power_dir_only_entropy_weight.py` -- these would have caught the original bug.
+
+Also noticed while investigating: `ent_kick_weight`'s boost (the kick-gate-collapse-prevention lever, separate from the `_only` weights
+above) has the SAME structural issue -- its `_bkdn_tensors["kick"] + h_kick_dir + h_kick_power` term also sums kick_dir's combined
+azimuth+elevation entropy, not azimuth alone. Not split as part of this fix (its design intent -- bundling gate+dir+power together to
+stop early kick-gate collapse -- is different from the `_only` weights' surgical intent, and splitting every possible leak in one pass
+risks conflating multiple experiments) -- flagged here as a known, not-yet-addressed instance of the same pattern, in case `kick_dir_z`
+still grows unexpectedly under run 309's `ent_kick_weight=3.5` alone.
 
 ## Fractional `eval.neural_snapshot_lookbacks` entries (2026-09-22)
 

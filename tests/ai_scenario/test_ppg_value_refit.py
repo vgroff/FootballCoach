@@ -306,6 +306,119 @@ class TestPPGCompareToOriginal:
         assert "[ppg compare" not in "\n".join(r.getMessage() for r in caplog.records)
 
 
+class TestPPGSeedAdamVariance:
+    """bc.ppg_seed_adam_variance (off by default) -- one-directional seeding of
+    ppg_value_refit's fresh Adam from the live PPO self.optimizer's per-parameter
+    exp_avg_sq (variance) and step count, momentum (exp_avg) always zeroed,
+    self.optimizer itself never written to. See its ai_config.json comment and
+    the seeding block right after ppg_opt's construction in ppg_value_refit."""
+
+    def test_off_by_default_no_seeding_and_no_log_line(self, trainer, caplog):
+        import logging
+
+        assert trainer._ppg_seed_adam_variance is False
+        env = _make_env(trainer)
+        with caplog.at_level(logging.INFO, logger="footballcoach.ai.ppo"):
+            trainer.ppg_value_refit(env, n_steps=400, phase_id=None, epochs=1, kl_coef=1.0, lr=1e-4)
+        assert "seeded Adam exp_avg_sq" not in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_seeds_variance_and_step_zeros_momentum_read_only(self, trainer, caplog, monkeypatch):
+        import logging
+
+        trainer._ppg_seed_adam_variance = True
+        # Give the LIVE optimizer distinctive, fake Adam state for one real
+        # trainable param, as if PPO had already trained for a long time --
+        # Adam's state dict is keyed by parameter object identity, not name.
+        p = next(iter(trainer.decision_net.parameters()))
+        fake_exp_avg_sq = torch.full_like(p, 7.0)
+        fake_exp_avg = torch.full_like(p, 3.0)  # must NOT be copied into ppg_opt
+        # Real Adam (this torch version) always stores step as a 0-dim tensor
+        # internally (required by its functional API) -- match that here rather
+        # than a plain python int, which would only be realistic for a version
+        # of torch this repo doesn't use.
+        fake_step = torch.tensor(123456.0)
+        trainer.optimizer.state[p] = {
+            "exp_avg_sq": fake_exp_avg_sq.clone(),
+            "exp_avg": fake_exp_avg.clone(),
+            "step": fake_step,
+        }
+
+        # Capture ppg_opt's per-parameter state for `p` at the moment its FIRST
+        # .step() is called -- i.e. right after ppg_value_refit's seeding block
+        # ran but before any real gradient update decays exp_avg_sq away from
+        # the seeded value (Adam's own update, v = beta2*v_prev + ..., moves it
+        # immediately on step 1, so checking post-hoc after the whole refit
+        # call would be checking an already-decayed number, not what was seeded).
+        created_opts = []
+        pre_step_snapshot = {}
+        _orig_adam = torch.optim.Adam
+
+        def _capturing_adam(*args, **kwargs):
+            opt = _orig_adam(*args, **kwargs)
+            created_opts.append(opt)
+            _orig_step = opt.step
+
+            def _step_and_snapshot(*a, **kw):
+                if not pre_step_snapshot and p in opt.state:
+                    pre_step_snapshot["exp_avg_sq"] = opt.state[p]["exp_avg_sq"].clone()
+                    pre_step_snapshot["exp_avg"] = opt.state[p]["exp_avg"].clone()
+                    pre_step_snapshot["step"] = opt.state[p]["step"].clone()
+                return _orig_step(*a, **kw)
+
+            opt.step = _step_and_snapshot
+            return opt
+
+        monkeypatch.setattr(torch.optim, "Adam", _capturing_adam)
+
+        env = _make_env(trainer)
+        with caplog.at_level(logging.INFO, logger="footballcoach.ai.ppo"):
+            trainer.ppg_value_refit(env, n_steps=400, phase_id=None, epochs=1, kl_coef=1.0, lr=1e-4)
+
+        text = "\n".join(r.getMessage() for r in caplog.records)
+        assert "seeded Adam exp_avg_sq" in text
+
+        assert len(created_opts) == 1, "ppg_value_refit should build exactly one fresh Adam"
+        assert pre_step_snapshot, "ppg_opt.step() was never called -- refit didn't train"
+        assert torch.allclose(pre_step_snapshot["exp_avg_sq"], fake_exp_avg_sq)
+        assert torch.allclose(pre_step_snapshot["exp_avg"], torch.zeros_like(p)), "momentum must NOT be copied"
+        assert pre_step_snapshot["step"].item() == fake_step.item()
+
+
+class TestPPGFirstRolloutReplaySeeds:
+    """ppg_value_refit's first_rollout_replay_seeds (forwarded to
+    _collect_value_pretrain_rollout's replay_seeds) -- lets _maybe_run_ppg_interleave
+    pass the main loop's queued episode-seed-replay seeds into the FIRST cycle's
+    rollout only. phase_id=None (every test fixture here) means the single-process
+    branch, which has no pool to inject seeds into and just logs-and-ignores them --
+    a convenient way to prove the cycle-gating without a real multi-process pool."""
+
+    def test_none_by_default_is_a_noop(self, trainer, caplog):
+        import logging
+
+        env = _make_env(trainer)
+        with caplog.at_level(logging.INFO, logger="footballcoach.ai.ppo"):
+            trainer.ppg_value_refit(env, n_steps=400, phase_id=None, epochs=1, kl_coef=1.0, lr=1e-4)
+        assert "replay seed(s)" not in "\n".join(r.getMessage() for r in caplog.records)
+
+    def test_only_forwarded_to_the_first_cycle_not_later_ones(self, trainer, caplog):
+        """With num_rollouts=2, the ignore-log (single-process branch) must appear
+        exactly once -- proving first_rollout_replay_seeds reaches cycle 1's
+        collection call but NOT cycle 2's (which must see replay_seeds=None)."""
+        import logging
+
+        env = _make_env(trainer)
+        with caplog.at_level(logging.INFO, logger="footballcoach.ai.ppo"):
+            trainer.ppg_value_refit(
+                env, n_steps=400, phase_id=None, epochs=1, kl_coef=1.0, lr=1e-4,
+                num_rollouts=2, first_rollout_replay_seeds=[111, 222, 333],
+            )
+        ignore_lines = [
+            r.getMessage() for r in caplog.records if "replay seed(s) given but ignored" in r.getMessage()
+        ]
+        assert len(ignore_lines) == 1, f"expected exactly one ignore-log (cycle 1 only), got: {ignore_lines}"
+        assert "3 replay seed(s)" in ignore_lines[0]
+
+
 class TestPPGLossDiagnostics:
     def test_breakdown_is_logged_and_per_row_arrays_saved(self, trainer, caplog, tmp_path):
         """Cycle 1 prints the full tagged breakdown (with the original column

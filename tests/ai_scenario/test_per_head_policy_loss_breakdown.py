@@ -362,6 +362,11 @@ class TestRolloutSummaryEntropyDropsInactiveHeads:
         metrics = _run_ppo_update(trainer, buffer, last_obs)
         assert metrics.get("entropy_breakdown"), "fixture produced no entropy_breakdown -- test is vacuous"
         active_keys = [k for k in HEAD_LP_KEYS if k not in inactive]
+        # kick_dir_azimuth/kick_dir_z are diagnostic-only sub-components of kick_dir (not real
+        # HEAD_LP_KEYS entries, never independently frozen) -- see _compute_entropy's comment
+        # where they're added to _bkdn_tensors. They track kick_dir's active/inactive state exactly.
+        if "kick_dir" in active_keys:
+            active_keys = active_keys + ["kick_dir_azimuth", "kick_dir_z"]
 
         with caplog.at_level("INFO"):
             trainer._log_rollout_summary(
