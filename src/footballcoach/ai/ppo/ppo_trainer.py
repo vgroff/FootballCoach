@@ -1817,6 +1817,20 @@ class PPOTrainer:
         # much of the value loss floor is the agent's own action-sampling
         # noise. Off for real use. Needs the batched collection path.
         self._ppg_rollout_deterministic = bool(bc_cfg.get("ppg_rollout_deterministic", False))
+        # ppg_value_refit's OWN rollout-to-rollout episode-seed-replay loop (independent of,
+        # but modeled on, the main PPO loop's episode_replay_enabled/_update_episode_replay).
+        # See _comment_ppg_episode_replay_enabled in ai_config.json for the full mechanism.
+        # Off by default: zero behavior/cost change to ppg_value_refit's existing cycles.
+        self._ppg_episode_replay_enabled = bool(bc_cfg.get("ppg_episode_replay_enabled", False))
+        # User-requested diagnostic (2026-10-01): is the value function actually
+        # improving checkpoint-over-checkpoint, not just within one refit's own
+        # epochs? Defaults True (unlike most opt-in bc.ppg_* flags) because it was
+        # requested as a standing "always do this" behavior -- see ppg_value_refit's
+        # rollout-1 block for the mechanism (evaluates the two most recently SAVED
+        # checkpoint{N}.pt files' value heads, unmodified, on this call's freshly
+        # collected rollout, alongside the current live weights' own epoch-0
+        # baseline -- all three on IDENTICAL data no prior checkpoint trained on).
+        self._ppg_log_prev_checkpoint_value_loss = bool(bc_cfg.get("ppg_log_prev_checkpoint_value_loss", True))
         # Experiment (untested): one-directional seeding of ppg_value_refit's fresh Adam
         # optimizer from the LIVE PPO self.optimizer's per-parameter variance estimate
         # (exp_avg_sq) -- see ppg_value_refit's "Adam seeding" comment for the mechanism
@@ -2831,10 +2845,10 @@ class PPOTrainer:
                     )
 
         _val_diag_str = (
-            f"V={metrics['values_mean']:.2f}\u00b1{metrics['values_std']:.2f}  "
-            f"R={metrics['returns_mean']:.2f}\u00b1{metrics['returns_std']:.2f}  "
-            f"adv={metrics['adv_mean']:.2f}\u00b1{metrics['adv_std']:.2f}"
-            f"  |adv|={metrics.get('adv_abs_mean', float('nan')):.2f}"
+            f"V={metrics['values_mean']:.3f}\u00b1{metrics['values_std']:.3f}  "
+            f"R={metrics['returns_mean']:.3f}\u00b1{metrics['returns_std']:.3f}  "
+            f"adv={metrics['adv_mean']:.3f}\u00b1{metrics['adv_std']:.3f}"
+            f"  |adv|={metrics.get('adv_abs_mean', float('nan')):.3f}"
         )
         # Per-head entropy breakdown + \u0394 from the previous rollout \u2014 shows
         # which heads are actually driving a rising aggregate `entropy=`
@@ -3243,6 +3257,74 @@ class PPOTrainer:
             f"(top {self._episode_replay_top_fraction * 100:.1f}% of {len(all_episode_seed_reward_adv)} episodes by |adv|)"
         )
         return list(self._pending_replay_before.keys())
+
+    def _ppg_update_episode_replay(
+        self, this_cycle_seed_mse: list[tuple[int, float]], pending_before: dict[int, float],
+    ) -> tuple[dict[int, float], Optional[list[int]]]:
+        """``ppg_value_refit``'s own rollout-to-rollout episode-seed-replay
+        bookkeeping -- modeled on ``_update_episode_replay`` (same
+        report-then-reselect shape), but:
+
+        - Call-scoped, not ``self.`` state: ``pending_before`` is passed in
+          and the new value returned, rather than read/written on
+          ``self._pending_replay_before`` -- PPG bursts are independent,
+          self-contained events with no cross-call carry-over (PPO's own
+          queue, by contrast, persists across the whole training loop).
+        - Ranks by value-prediction MSE descending (worst-predicted), not
+          mean(|advantage|) -- the value-fitting analog of PPO's ranking,
+          since this refit's job is fitting the value function, not
+          improving the policy.
+        - Reuses ``self._episode_replay_top_fraction`` (the SAME config
+          value PPO's own mechanism uses) rather than a separate knob.
+
+        Args:
+            this_cycle_seed_mse: ``[(seed, mean_squared_error), ...]`` for
+                every completed episode in the cycle that just ran (see
+                ``_collect_value_pretrain_rollout``'s
+                ``episode_seed_mse``/``collect_episode_replay_stats``).
+            pending_before: ``{seed: mse}`` queued at the end of the
+                PREVIOUS cycle (empty dict if there was none, e.g. this is
+                cycle 1 -- cycle 0 never queues anything here).
+
+        Returns:
+            ``(new_pending_before, next_cycle_replay_seeds)`` --
+            ``next_cycle_replay_seeds`` is ``None`` when
+            ``this_cycle_seed_mse`` was empty (nothing eligible to select,
+            e.g. the batched worker path isn't active).
+        """
+        if pending_before:
+            matched = [
+                (seed, pending_before[seed], mse)
+                for seed, mse in this_cycle_seed_mse
+                if seed in pending_before
+            ]
+            if matched:
+                before_mean = float(np.mean([b for _s, b, _a in matched]))
+                after_mean = float(np.mean([a for _s, _b, a in matched]))
+                log.info(
+                    f"  [ppg episode replay] matched={len(matched)}/{len(pending_before)}  "
+                    f"before_mean_mse={before_mean:.4f}  after_mean_mse={after_mean:.4f}  "
+                    f"delta={after_mean - before_mean:+.4f}"
+                )
+            else:
+                log.info(
+                    f"  [ppg episode replay] 0/{len(pending_before)} queued seeds were "
+                    f"replayed this cycle (not enough episode resets to reach them)"
+                )
+            pending_before = {}
+
+        if not this_cycle_seed_mse:
+            return pending_before, None
+
+        n_top = max(1, math.ceil(self._episode_replay_top_fraction * len(this_cycle_seed_mse)))
+        top_k = sorted(this_cycle_seed_mse, key=lambda t: t[1], reverse=True)[:n_top]
+        pending_before = {seed: mse for seed, mse in top_k}
+        log.info(
+            f"  [ppg episode replay] queued {len(top_k)} seed(s) for next cycle "
+            f"(top {self._episode_replay_top_fraction * 100:.1f}% of "
+            f"{len(this_cycle_seed_mse)} episodes by value-MSE)"
+        )
+        return pending_before, list(pending_before.keys())
 
     def _train_batched_parallel(self, total_steps: int, phase_id: int, max_episode_s: float) -> None:
         """Batched multi-environment rollout collection path
@@ -5390,6 +5472,7 @@ class PPOTrainer:
         self, env, n_steps: int, phase_id: Optional[int], use_gae: bool = False,
         pool: Optional["_ValuePretrainWorkers"] = None, with_mc_returns: bool = False,
         deterministic: bool = False, replay_seeds: Optional[list[int]] = None,
+        collect_episode_replay_stats: bool = False,
     ) -> tuple[dict, dict]:
         """Collect ``n_steps`` of on-policy experience for value warm-up.
 
@@ -5464,6 +5547,20 @@ class PPOTrainer:
                 otherwise ignored, since ``rollout_worker.py`` has no
                 seed-injection support. None (default) = no replay, i.e.
                 today's ordinary on-policy sampling.
+            collect_episode_replay_stats: False (default) = today's exact
+                behaviour, no extra cost. True adds
+                ``stats["episode_seed_mse"]``: a ``[(seed, mean_squared_error), ...]``
+                list, one entry per completed episode with a recorded seed,
+                using each episode's mean ``(values - returns) ** 2`` (the
+                critic's own at-collection-time prediction vs the GAE/MC
+                target) -- computed via ``_episode_abs_adv_means`` (squared
+                errors are already non-negative, so its internal ``abs()``
+                is a no-op here). For ``ppg_value_refit``'s own rollout-to-
+                rollout episode replay (``ppg_episode_replay_enabled``), the
+                value-fitting analog of ``_update_episode_replay``'s
+                top-|advantage| selection. Only populated on the batched
+                worker path; empty list otherwise (matches ``replay_seeds``'
+                own plain-pool limitation).
         """
         _owns_pool = pool is None
         if _owns_pool:
@@ -5508,6 +5605,7 @@ class PPOTrainer:
             outcomes_vs_neural: list[str] = []
             episode_comp_list: list[dict[str, float]] = []
             episode_durations_s: list[float] = []
+            episode_seed_mse: list[tuple[int, float]] = []
             n_dropped_total = 0
             _n_rows_total = 0
 
@@ -5520,6 +5618,19 @@ class PPOTrainer:
 
                     tensors = batch_from_wire(r["batch"]) if r["batch"] is not None else None
                     n_dropped = r["n_dropped"]
+                    if collect_episode_replay_stats and tensors is not None:
+                        # Squared errors are already non-negative, so _episode_abs_adv_means's
+                        # internal abs() is a no-op here -- this reuses it, unmodified, to get
+                        # per-episode mean-squared-error instead of mean-|advantage|. .tolist()
+                        # first, matching _decode_rollout_result's own convention (plain floats,
+                        # not 0-dim tensors, for downstream sort/format/log use).
+                        _sq_err = ((tensors["values"] - tensors["returns"]) ** 2).tolist()
+                        _mse_means = _episode_abs_adv_means(
+                            tensors["track_ids"], tensors["dones"].tolist(), _sq_err,
+                        )
+                        for _seed, _mse in zip(r["stats"].get("episode_seeds", []), _mse_means):
+                            if _seed is not None:
+                                episode_seed_mse.append((_seed, _mse))
                 else:
                     # Legacy shape ({"buffer", ...}): plain workers, or a batched
                     # worker spoken to without a returns spec.
@@ -5640,6 +5751,7 @@ class PPOTrainer:
             episode_comp_accum: dict[str, float] = {}
             episode_comp_list = []
             episode_durations_s = []
+            episode_seed_mse = []  # single-process branch has no seed-injection support
             progress = ProgressReporter(n_steps, prefix="  [value pretrain rollout] ", live=True)
 
             for _step_i in range(n_steps):
@@ -5756,6 +5868,7 @@ class PPOTrainer:
             "outcomes_vs_rules": outcomes_vs_rules,
             "outcomes_vs_immobile": outcomes_vs_immobile,
             "outcomes_vs_neural": outcomes_vs_neural,
+            "episode_seed_mse": episode_seed_mse,
         }
 
     def pretrain_value(
@@ -6256,7 +6369,15 @@ class PPOTrainer:
                 seed list independently afterward (this never mutates or
                 consumes it). None (default) = no replay, i.e. every cycle
                 samples normally, unchanged from before this parameter
-                existed.
+                existed. When ``ppg_episode_replay_enabled`` (a separate,
+                independent config flag), cycles AFTER cycle 0 additionally
+                run their own rollout-to-rollout replay loop -- each cycle
+                selects its own top ``episode_replay_top_fraction`` of
+                episodes by value-prediction MSE (worst-predicted) and
+                force-replays them next cycle, with a
+                ``[ppg episode replay] matched=.../before_mean_mse=.../
+                after_mean_mse=.../delta=...`` report each time. See that
+                flag's ``ai_config.json`` comment for the full mechanism.
 
         Returns:
             The rollout-stats dict from the LAST cycle's
@@ -6357,6 +6478,25 @@ class PPOTrainer:
                 f"({'batched' if _pool.batched else 'plain'}), reused across all {num_rollouts} cycles"
             )
 
+        # PPG's OWN rollout-to-rollout episode-seed replay (ppg_episode_replay_enabled),
+        # modeled on but independent of PPO's self._pending_replay_before -- call-scoped
+        # (local, not self.) since each ppg_value_refit call's cycles are a self-contained
+        # burst with no carry-over to the next call. {seed: mse_when_queued}.
+        _ppg_pending_replay_before: dict[int, float] = {}
+        _ppg_next_cycle_replay_seeds: Optional[list[int]] = None
+
+        # Rotating buffer of this CALL's own most recent cycle-end weights
+        # (cycle number, decision_state_dict, execution_state_dict), most
+        # recent last, capped at 2 -- feeds the rollout-1+ prev-checkpoint
+        # value-loss diagnostic below for a standalone multi-rollout refit
+        # (e.g. --ppg-refit-only num_rollouts>1), where there's no on-disk
+        # checkpoint{N}.pt history to fall back on since this call only ever
+        # writes one fixed checkpoint_pretrained.pt. A live single-rollout
+        # PPO-interleaved call never populates this (num_rollouts=1, no
+        # "previous cycle" within the call), so it falls through to the
+        # on-disk checkpoint{N}.pt path entirely, unchanged from before.
+        _cycle_end_snapshots: list[tuple[int, dict, dict]] = []
+
         try:
             _rollout_stats: dict = {}
             for _rollout_i in range(num_rollouts):
@@ -6375,16 +6515,18 @@ class PPOTrainer:
                 # pretrain_value's cold-start-from-BC scenario where MC returns
                 # avoid a real circularity problem GAE would have there.
                 log.info("Doing PPG value refit rollout collection now (reuses pretrain_value()'s rollout collector, hence the '[value pretrain rollout]' label below)...")
-                # first_rollout_replay_seeds only ever applies to cycle 0 -- see
-                # this method's own docstring paragraph for why (deliberately
-                # NOT repeated on every cycle within one call: the queued seeds
-                # are a one-shot snapshot from right before this call started).
-                _cycle_replay_seeds = first_rollout_replay_seeds if _rollout_i == 0 else None
+                # Cycle 0 uses the main PPO loop's one-shot queued seeds
+                # (first_rollout_replay_seeds -- see this method's own docstring
+                # paragraph). From cycle 1 onward, when ppg_episode_replay_enabled,
+                # PPG runs its OWN version of the same idea using whatever the
+                # PREVIOUS cycle queued (set at the bottom of this loop body).
+                _cycle_replay_seeds = first_rollout_replay_seeds if _rollout_i == 0 else _ppg_next_cycle_replay_seeds
                 if _cycle_replay_seeds:
                     log.info(f"  [ppg value refit] replaying {len(_cycle_replay_seeds)} queued episode-replay seed(s) in this cycle's rollout")
                 batch, _rollout_stats = self._collect_value_pretrain_rollout(
                     env, n_steps, phase_id, use_gae=True, pool=_pool,
-                    replay_seeds=_cycle_replay_seeds, **_mc_kw,
+                    replay_seeds=_cycle_replay_seeds,
+                    collect_episode_replay_stats=self._ppg_episode_replay_enabled, **_mc_kw,
                 )
 
                 # --- Episode-level 85/15 train/val split (overfit detection) ---
@@ -6606,6 +6748,95 @@ class PPOTrainer:
                         f"train_loss={_baseline_train_loss:.4f}  rmse={_baseline_train_rmse:.2f} rmse_{_trim_tag}={_baseline_train_trim:.2f} "
                         f"(returns std={float(ret_std):.1f})"
                     )
+
+                if self._ppg_log_prev_checkpoint_value_loss:
+                    # User-requested (2026-10-01): is the value fn actually improving
+                    # checkpoint-over-checkpoint / cycle-over-cycle, not just within
+                    # this refit's own epochs? Scores up to 2 REFERENCE snapshots'
+                    # frozen value heads (unmodified, as they were at the time)
+                    # against THIS cycle's freshly collected rollout -- data none of
+                    # them ever trained on -- using the exact same GAE-return target
+                    # _baseline_train_loss (the current live weights' own epoch-0
+                    # reading) is scored against, so all numbers are comparable.
+                    # Reference snapshots, most recent first: THIS call's own prior
+                    # cycle-end weights (_cycle_end_snapshots, populated below after
+                    # each cycle -- the only history that exists for a standalone
+                    # multi-rollout --ppg-refit-only call, which never writes
+                    # numbered checkpoint{N}.pt files) first, falling back to
+                    # on-disk checkpoint{N}.pt for any remaining slot (up to 2 total)
+                    # -- the only source for a live single-rollout PPO-interleaved
+                    # call (num_rollouts=1, so _cycle_end_snapshots is always empty
+                    # when this runs), and also fills early cycles of a standalone
+                    # call before 2 in-memory snapshots exist yet. Silently no-ops
+                    # (nothing logged) until at least one reference of either kind
+                    # exists, same "not enough history yet" convention as
+                    # neural_snapshot_lookbacks.
+                    _ref_sources: list[tuple[str, dict, dict]] = [
+                        (f"cycle{_cyc_n}", _dstate, _estate)
+                        for _cyc_n, _dstate, _estate in reversed(_cycle_end_snapshots)
+                    ]
+                    if len(_ref_sources) < 2 and self.checkpoint_dir is not None:
+                        _disk_n = self._checkpoint_count
+                        while len(_ref_sources) < 2 and _disk_n >= 1:
+                            _ckpt_path = self.checkpoint_dir / f"checkpoint{_disk_n}.pt"
+                            if _ckpt_path.exists():
+                                try:
+                                    _snap = self._load_snapshot_dict_from_checkpoint(_ckpt_path)
+                                    _ref_sources.append((f"ckpt{_disk_n}", _snap["decision"], _snap["execution"]))
+                                except Exception as _e:
+                                    log.warning(f"  [ppg prev-checkpoint value loss] failed to load {_ckpt_path}: {_e}")
+                            _disk_n -= 1
+                    _ref_sources = _ref_sources[:2]
+
+                    if _ref_sources:
+                        _prev_losses: dict[str, float] = {}
+                        for _label, _dstate, _estate in _ref_sources:
+                            # _load_state_dict_tolerant, not a plain strict load: decision_net's
+                            # frozen physics-encoder submodules aren't part of a saved checkpoint's
+                            # state dict (they're reloaded separately from their own fixed path at
+                            # construction time, same reason the real best-val restore a few lines
+                            # above uses this exact helper) -- a strict load_state_dict here throws
+                            # "Missing key(s)" for every ball_physics_encoder.*/player_physics_encoder.*
+                            # param, confirmed the hard way (silent process death: this was an
+                            # uncaught RuntimeError whose traceback went to stderr, which the
+                            # launcher wasn't capturing, so it looked like an unexplained crash).
+                            _dnet = copy.deepcopy(self.decision_net)
+                            _load_state_dict_tolerant(_dnet, _dstate, "ppg prev-checkpoint diagnostic (decision_net)")
+                            _dnet.eval()
+                            _enet = copy.deepcopy(self.execution_net)
+                            _load_state_dict_tolerant(_enet, _estate, "ppg prev-checkpoint diagnostic (execution_net)")
+                            _enet.eval()
+                            for _p in list(_dnet.parameters()) + list(_enet.parameters()):
+                                _p.requires_grad_(False)
+                            _sq_sum, _cnt = 0.0, 0
+                            with torch.no_grad():
+                                for _s in range(0, len(returns_t), _batch_size):
+                                    _tgt = returns_t[_s:_s + _batch_size]
+                                    _o = {k: v[_s:_s + _batch_size].to(self.device) for k, v in _train_obs_full.items()}
+                                    _sat, _oat = _ai_types(_o)
+                                    _dh = _dnet(
+                                        _o["self_feat"], _o["other_feat"], _o["exists_mask"],
+                                        _o["ball_feat"], _o["global_feat"], _sat, _oat,
+                                        ball_physics_full=_o.get("ball_physics_full"),
+                                        self_physics_full=_o.get("self_physics_full"),
+                                        other_physics_full=_o.get("other_physics_full"),
+                                    )
+                                    _v = _enet(
+                                        _o["self_feat"], _o["other_feat"], _o["exists_mask"],
+                                        _o["ball_feat"], _o["global_feat"], _dh, _sat, _oat,
+                                        value_only=True,
+                                    ).squeeze(-1)
+                                    _sq_sum += float(((_v - _tgt) ** 2).sum())
+                                    _cnt += len(_tgt)
+                            _prev_losses[_label] = _sq_sum / max(_cnt, 1) / float(ret_std ** 2)
+                            del _dnet, _enet
+                        _parts = [f"current(pre)={_baseline_train_loss:.4f}"] + [
+                            f"{_lbl}={_mse:.4f}" for _lbl, _mse in _prev_losses.items()
+                        ]
+                        log.info(
+                            "  [ppg prev-checkpoint value loss] " + "  ".join(_parts)
+                            + "  (same fresh rollout for all; lower=better)"
+                        )
 
                 if _orig_nets is not None and "mc_returns" in train_batch:
                     # Paired, noise-cancelling check of whether the refit is
@@ -6855,6 +7086,19 @@ class PPOTrainer:
                 _cycle_label = f" (rollout {_rollout_i + 1}/{num_rollouts})" if num_rollouts > 1 else ""
                 log.info(f"PPG value refit{_cycle_label} done ({epochs_done} epoch(s), final train_loss={mean_loss:.4f})")
 
+                if self._ppg_log_prev_checkpoint_value_loss:
+                    # Record THIS cycle's final weights (post best-val-restore) for
+                    # the prev-checkpoint value-loss diagnostic above -- feeds the
+                    # NEXT cycle's reading. Capped at 2 (oldest dropped) since that's
+                    # all the diagnostic ever looks at. State dicts only (not full
+                    # module deepcopies) to keep the memory cost modest.
+                    _cycle_end_snapshots.append((
+                        _rollout_i + 1,
+                        copy.deepcopy(self.decision_net.state_dict()),
+                        copy.deepcopy(self.execution_net.state_dict()),
+                    ))
+                    _cycle_end_snapshots = _cycle_end_snapshots[-2:]
+
                 # Checkpoint after EVERY cycle, not just once at the end -- a
                 # multi-rollout call can run a long time (each rollout alone can
                 # take a while at real ppg_rollout_steps sizes), so this bounds
@@ -6866,6 +7110,17 @@ class PPOTrainer:
                     _ckpt_path = self.checkpoint_dir / "checkpoint_pretrained.pt"
                     self._save_checkpoint_to(_ckpt_path)
                     log.info(f"  [ppg value refit] checkpoint saved to {_ckpt_path}")
+
+                # PPG's own rollout-to-rollout episode-seed replay (see
+                # ppg_episode_replay_enabled's config comment): report this cycle's
+                # before/after on whatever the PREVIOUS cycle queued, then select this
+                # cycle's own worst-value-MSE episodes to queue for the NEXT cycle.
+                # Skipped on the last cycle -- there is no next cycle within this call
+                # to consume a fresh selection, so it would be dead work.
+                if self._ppg_episode_replay_enabled and _rollout_i < num_rollouts - 1:
+                    _ppg_pending_replay_before, _ppg_next_cycle_replay_seeds = self._ppg_update_episode_replay(
+                        _rollout_stats.get("episode_seed_mse", []), _ppg_pending_replay_before,
+                    )
 
                 # Drop this cycle's big tensors NOW. Names bound inside a loop
                 # body live until they're reassigned, so without this the whole

@@ -270,6 +270,20 @@ def main() -> None:
                              "supervises the mean), so it sits at whatever it was initialised/left "
                              "at, producing real per-kick power sampling noise BC's own loss/metrics "
                              "can't see.")
+    parser.add_argument("--reset-kick-power-adam", action="store_true",
+                        help="Drop kick_power_log_std's entry from the main optimizer's Adam state "
+                             "(exp_avg/exp_avg_sq/step) after loading any checkpoint, so its next "
+                             "update starts with fresh per-parameter moment estimates instead of "
+                             "carrying forward history accumulated under the old regime. Same "
+                             "checkpoint-loading call sites/timing as --reset-dir-log-std. History "
+                             "(ent_kick_power_only_weight's own ai_config.json comment): every prior "
+                             "attempt to slow kick_power_log_std's shrink via the entropy weight ALONE "
+                             "(8/24/30 across runs 307-311) gave at best a temporary slowdown before "
+                             "fading back to roughly the unweighted drift rate within a handful of "
+                             "checkpoints -- pairing a weight raise with a fresh Adam state for just "
+                             "this one parameter is the only combination that showed even that much. "
+                             "Usually combined with --reset-kick-power-log-std; independent of it "
+                             "(can be passed alone to only reset Adam state, not the parameter itself).")
     parser.add_argument("--reset-bernoullis", action="store_true",
                         help="Scale the weight AND bias of each of ExecutionNetwork's 4 Bernoulli "
                              "action heads (exec_move_logit, sprint_logit, kick_logit, "
@@ -528,6 +542,19 @@ def main() -> None:
             trainer.execution_net.kick_power_log_std.fill_(kp_init)
         log.info(f"--reset-kick-power-log-std: kick_power_log_std={kp_init}")
 
+    def _reset_kick_power_adam() -> None:
+        # Drops kick_power_log_std's own entry from the main optimizer's Adam
+        # state (keyed by the live nn.Parameter object) -- exp_avg/exp_avg_sq/
+        # step all gone, so its next touched update starts fresh, same as if
+        # this were a brand-new parameter. Every other parameter's state is
+        # untouched. No-op (just a log line) if it has no state yet (e.g. a
+        # fresh pretrained checkpoint that's never taken an Adam step).
+        param = trainer.execution_net.kick_power_log_std
+        had_state = trainer.optimizer is not None and param in trainer.optimizer.state
+        if had_state:
+            del trainer.optimizer.state[param]
+        log.info(f"--reset-kick-power-adam: kick_power_log_std Adam state {'dropped' if had_state else 'was already absent'}")
+
     def _reset_bernoullis() -> None:
         ppo_cfg_r = cfg.get("ppo", {})
         _heads = {
@@ -555,6 +582,8 @@ def main() -> None:
             _reset_dir_log_std()
         if args.reset_kick_power_log_std:
             _reset_kick_power_log_std()
+        if args.reset_kick_power_adam:
+            _reset_kick_power_adam()
         if args.reset_bernoullis:
             _reset_bernoullis()
 
@@ -571,6 +600,8 @@ def main() -> None:
             _reset_dir_log_std()
         if args.reset_kick_power_log_std:
             _reset_kick_power_log_std()
+        if args.reset_kick_power_adam:
+            _reset_kick_power_adam()
         if args.reset_bernoullis:
             _reset_bernoullis()
         if not args.bc_dataset:
@@ -598,6 +629,8 @@ def main() -> None:
             _reset_dir_log_std()
         if args.reset_kick_power_log_std:
             _reset_kick_power_log_std()
+        if args.reset_kick_power_adam:
+            _reset_kick_power_adam()
         if args.reset_bernoullis:
             _reset_bernoullis()
         log.info(f"Loaded pre-trained checkpoint: {pretrained_path} — skipping BC/value pre-training")

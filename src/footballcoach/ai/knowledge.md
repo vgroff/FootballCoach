@@ -1916,6 +1916,40 @@ Key implementation points, in case any of this needs revisiting:
   out rule and 273 (0.9% of all games) carried on with the ball back in play
   -- the only episodes a painted-line rule would cut short.
 
+### PPG's own episode-seed replay (`ppg_episode_replay_enabled`, 2026-09-25)
+
+`ppg_value_refit()`'s `first_rollout_replay_seeds` param only ever seeds
+cycle 0 with whatever the main PPO loop's own `episode_replay_enabled` queue
+had at the moment an interleave fired. Cycles 1..N-1 (of `num_rollouts`)
+otherwise sampled purely fresh, with no continuity of their own. When
+`bc.ppg_episode_replay_enabled` (default `false`), each cycle after cycle 0
+runs its own version of PPO's episode-seed replay loop, scoped to this one
+`ppg_value_refit()` call:
+
+- Every batched-worker rollout result records per-episode
+  `(values - returns) ** 2`, segmented into per-episode means by reusing
+  `_episode_abs_adv_means` unchanged (squared error is already
+  non-negative, so its internal `abs()` is a no-op) — returned as
+  `stats["episode_seed_mse"]` from `_collect_value_pretrain_rollout` when
+  its new `collect_episode_replay_stats` param is set (only
+  `ppg_value_refit` passes it; `pretrain_value()` is unaffected, zero cost
+  when off).
+- After each cycle's fit + checkpoint save, `ppg_value_refit` selects the
+  top `episode_replay_top_fraction` (reuses the SAME main-loop config value
+  — no separate PPG fraction knob) of that cycle's episodes by **value-MSE
+  descending** (worst-predicted — the value-fitting analog of PPO's
+  top-|advantage| ranking) and force-replays those exact seeds in the next
+  cycle, logging `[ppg episode replay] queued N seed(s) for next cycle
+  (top X% of Y episodes by value-MSE)`.
+- The following cycle reports `[ppg episode replay] matched=.../
+  before_mean_mse=.../after_mean_mse=.../delta=...` — same before/after
+  shape as `_update_episode_replay`'s report, but MSE instead of reward,
+  since this refit's job is value-fitting, not policy improvement.
+- Skipped on the last cycle (nothing left to consume a fresh selection).
+  State (`_ppg_pending_replay_before`/`_ppg_next_cycle_replay_seeds`) is
+  local to one `ppg_value_refit` call, not carried to the next burst —
+  each burst is an independent, self-contained event.
+
 ## Interleaved PPG (`PPOTrainer._maybe_run_ppg_interleave`, 2026-09-23)
 
 Runs bursts of `ppg_value_refit()` mid-PPO instead of only via the standalone
