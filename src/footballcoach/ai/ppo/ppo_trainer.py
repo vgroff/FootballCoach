@@ -11618,7 +11618,17 @@ class PPOTrainer:
                     "(network weights still loaded normally)."
                 )
         self._total_steps = ckpt["step"]
-        log.info(f"Loaded checkpoint: {path} (step {self._total_steps})")
+        # Restore the checkpoint{N}.pt / training_log{N}.txt numbering counter too --
+        # without this, resuming a killed/crashed run from a --checkpoint path (as
+        # opposed to never-interrupted continuous training, where this lives in
+        # memory the whole time) silently reset it to 0, so the new process
+        # overwrote checkpoint1.pt, checkpoint2.pt, ... from scratch instead of
+        # continuing at the saved value. Logs were spared actual data loss only
+        # because FileHandler appends rather than truncates; checkpoint{N}.pt files
+        # are plain torch.save() overwrites with no such protection. .get() with the
+        # current value as default for checkpoints saved before this field existed.
+        self._checkpoint_count = ckpt.get("checkpoint_count", self._checkpoint_count)
+        log.info(f"Loaded checkpoint: {path} (step {self._total_steps}, checkpoint_count {self._checkpoint_count})")
         return self._total_steps
 
     @classmethod
