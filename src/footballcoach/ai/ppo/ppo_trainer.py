@@ -11628,7 +11628,45 @@ class PPOTrainer:
         # are plain torch.save() overwrites with no such protection. .get() with the
         # current value as default for checkpoints saved before this field existed.
         self._checkpoint_count = ckpt.get("checkpoint_count", self._checkpoint_count)
+        # Defend against the loaded checkpoint's OWN checkpoint_count being itself
+        # stale/wrong, not just missing -- confirmed to happen in practice: a prior
+        # resume that itself started from a bad count (e.g. the restore above not
+        # existing yet) saves forward from that bad baseline, so its checkpoints'
+        # embedded metadata isn't trustworthy on its own even once this field is
+        # always present. Cross-check against the highest checkpoint{N}.pt actually
+        # on disk in this directory and take whichever is higher, so a resume can
+        # only ever advance past true existing history, never silently restart
+        # inside it and overwrite old files again.
+        if self.checkpoint_dir is not None and self.checkpoint_dir.exists():
+            on_disk_max = 0
+            for p in self.checkpoint_dir.glob("checkpoint*.pt"):
+                _n = p.stem.removeprefix("checkpoint")
+                if _n.isdigit():
+                    on_disk_max = max(on_disk_max, int(_n))
+            if on_disk_max > self._checkpoint_count:
+                log.warning(
+                    f"Loaded checkpoint's own checkpoint_count ({self._checkpoint_count}) "
+                    f"is behind the highest checkpoint{{N}}.pt actually on disk in "
+                    f"{self.checkpoint_dir} (checkpoint{on_disk_max}.pt) -- using "
+                    f"{on_disk_max} instead so this resume can't overwrite existing history."
+                )
+                self._checkpoint_count = on_disk_max
         log.info(f"Loaded checkpoint: {path} (step {self._total_steps}, checkpoint_count {self._checkpoint_count})")
+        # __init__ already called _rotate_log_file() once, before this method ever
+        # runs, using _checkpoint_count's constructor-time value of 0 -- so without
+        # this second call, the just-restored count above only fixes FUTURE
+        # checkpoint{N}.pt filenames (next _save_checkpoint() reads the correct
+        # value); logging would stay pinned to whatever training_log1.txt-equivalent
+        # __init__ already opened and keep appending there for the rest of the
+        # process. Confirmed in practice: this was caught only after the
+        # _checkpoint_count fix above still produced a fresh training_log1.txt on a
+        # real resume, while checkpoint{N}.pt numbering (which only depends on the
+        # NEXT _save_checkpoint() call, with no equivalent early-open step) had
+        # already resumed correctly. Re-rotating here closes that one pre-restore
+        # log file (which only ever got a couple of startup lines) and reopens at
+        # the correct training_log{_checkpoint_count + 1}.txt.
+        if self.checkpoint_dir is not None:
+            self._rotate_log_file()
         return self._total_steps
 
     @classmethod
