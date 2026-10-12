@@ -8,6 +8,51 @@
 > statement at the top of that file. Otherwise documentation goes stale and
 > confusion occurs.
 
+## Status as of 2026-10-12
+
+**Still not started for this plan's actual target — 0% implemented.** No
+`PhysicsFeatureCache` class exists anywhere in the codebase (grepped
+`PhysicsFeatureCache`/`physics_feature_cache`/`per_tick_cache` — no hits
+besides `ai/knowledge.md`'s reference to this plan). No raw-entity-to-physics-input
+reconstruction functions (`ball_entity_to_physics_input`/
+`player_entity_to_physics_input`) exist in `live_encoder_features.py`. §1's
+target invocation bound (at most 2 encoder calls per entity per tick,
+regardless of simultaneously-deciding player count) is not met; the gap
+described in §1 is exactly as it was when this plan was written, and
+`ai/knowledge.md`'s own "Known scaling gap (not yet addressed)" note
+(in the "Frozen physics-dynamics encoders" section) still says so, unchanged.
+
+**One related-but-distinct optimization WAS added since this plan was
+written, worth distinguishing from this plan's actual scope so it isn't
+mistaken for partial progress:** `ppo_trainer.py`'s `_precompute_physics_full`
+(first appears commit `18afdea`, 2026-09-18 — after this plan's 2026-08-30
+write-up) computes the frozen physics-encoder outputs **once per row of an
+already-collected, already-augmented training batch**, then reuses them
+across that batch's repeated epoch/anchor/baseline/val forward passes inside
+one `_ppo_update()` or `ppg_value_refit()` cycle (call sites e.g. L6586,
+L6660-6662, L7243-7245, L9035-9037, L9569-9571). This is a **temporal** cache
+(same row, reused across repeated passes over a fixed, already-collected,
+already-augmented batch) — it does **not** implement this plan's **spatial**
+cache (same physical entity, reused across *different simultaneous
+observations* within one live rollout tick, keyed by `(entity, team-frame)`
+per §2-§3). It runs strictly after `augment_batch()`, so it sidesteps rather
+than solves §3.4's flip_y-latent problem (by never trying to share a cached
+value across augmented copies of a row at all — each post-augmentation row
+gets its own single computed value, reused only across *passes*, not across
+*rows*). `DecisionNetwork.forward()`'s optional `ball_physics_full`/
+`self_physics_full`/`other_physics_full` bypass args (added in the same
+window, commit `cf523f9`, 2026-09-04) are the plumbing this temporal cache
+rides on — and as it happens, those are the SAME optional-arg bypass this
+plan's §3.3 asks for, already built, just currently only ever fed by the
+temporal cache, never by anything resembling the spatial
+`PhysicsFeatureCache` of §3. A future implementation of this plan's actual
+design would reuse that existing bypass rather than needing to add it —
+worth noting as the one piece of §3.3 no longer starting from zero.
+
+Nothing else in this plan (§2's design insight, §3's cache design, §4's open
+questions, §5's file list) needs updating — all of it still accurately
+describes open, undone work.
+
 ## 0. Status
 
 **Not started — planning only.** Follow-up to the physics-encoder
@@ -138,6 +183,20 @@ already-encoded `PlayerFeatures`/`BallFeatures` columns, not raw `Player`/
 Tensor[24]`.
 
 ### 3.3 Consuming the cache — DecisionNetwork's forward() needs a bypass
+
+**PARTIALLY DONE, but for an unrelated reason (see "Status as of 2026-10-12" above) — the exact bypass
+asked for here already exists in current code, just not yet fed by anything resembling §3's
+`PhysicsFeatureCache`.** `DecisionNetwork.forward()` (as of commit `cf523f9`, 2026-09-04 — after this
+plan was written) already accepts optional `ball_physics_full`/`self_physics_full`/`other_physics_full`
+kwargs and skips the internal encoder calls when they're provided (`decision_network.py` lines ~210-249:
+`if ball_physics_full is None: ball_physics_full = self.ball_physics_encoder(...)`, same pattern for the
+player blocks). Today the only caller that ever populates them is `ppo_trainer.py`'s
+`_precompute_physics_full` (a temporal, not spatial, cache — see the status note above); nothing in the
+live rollout/inference path (`_sample_action()`, `rules_ai.py`) passes these yet. So the plumbing this
+paragraph originally asked for is built; only the spatial cache object (§3.1-§3.2) and its wiring into
+`_sample_action()` (not `_ppo_update()`) remain to actually use it for this plan's purpose.
+
+Original plan text (for context — describes what was, at the time, entirely unbuilt):
 
 Today `DecisionNetwork.forward()` always computes the physics blocks
 internally from `ball_feat`/`self_feat`/`other_feat`. To consume a

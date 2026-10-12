@@ -8,6 +8,46 @@
 
 # AI Code Analysis — Critique & Improvement Plan
 
+## Status as of 2026-10-12
+
+This document was written 2026-08-13; roughly 44 commits have landed on
+`src/footballcoach/ai/**` since then (through `0ad0a9a`). A full
+re-verification pass (code read + grep + `git log`, cross-checked against
+`src/footballcoach/ai/knowledge.md`) was done on 2026-10-12. Headline
+results, applied as inline annotations throughout this file below:
+
+- **~40% of concrete claims are now resolved or superseded.** Most of the
+  resolutions are in the "documentation inconsistencies" section (#18–#22):
+  `ai/knowledge.md` and `bc.py`'s own docstring have been brought back in
+  sync with the code (`BC_LABEL_DIM` is now 27 and both docs say so), and
+  the `to_orders.py`/Orders-boundary staleness was already fixed and
+  self-annotated in a prior pass (see §2.5's existing RESOLVED note).
+- **The structural "god object" complaints (#1–#4) are not fixed — they are
+  worse.** `ppo_trainer.py` grew from 4263 to **11,915 lines** (2.8x), not
+  shrunk via the proposed split in §2.1 — none of `action_sampling.py`,
+  `update.py`, `pretrain.py`, `checkpoint_io.py`, `logging_utils.py` exist.
+  `scenario_env.py` grew 920→1317 lines, `bc.py` grew 953→1529 lines. New
+  files (`rollout_buffer.py`, `rollout_worker.py`, `batched_rollout_worker.py`,
+  `schedules.py`, `consistency.py`, `dagger.py`, `eval_worker.py`,
+  `action_opportunity_stats.py`) were added alongside, not carved out of,
+  the god object — so package granularity actually improved at the margin
+  while the core problem file got worse.
+- **A large new module, `ai/physics_pretrain/` (~9000+ lines across
+  `train_ball_dynamics.py` 4329 lines, `train_player_dynamics.py` 2977
+  lines, and several smaller files), was added after this doc was written
+  and is entirely out of its scope.** It is not covered by any finding
+  below and should get its own pass before the "big cleanup."
+- **Most "suspicious/risky logic" items (#13–#17) are still open**, with one
+  confirmed fix: the kick-power-fallback-to-0.85 landmine (#13) was replaced
+  with a fail-loud `ValueError` and is now unit-tested
+  (`tests/ai_unit/test_apply_nn_action.py:317`).
+- **Testing gaps (#27–#30) are mostly still gaps**, except entity-encoder
+  permutation invariance (#30), which now has a dedicated test file —
+  currently sitting uncommitted/untracked in the working tree as of this
+  review (`tests/ai_unit/test_entity_encoder_permutation.py`).
+- One claim flagged as "worth spot-checking" (#23, steering repulsion scope)
+  was verified this pass and **holds up as stated** — see its entry below.
+
 Scope: `src/footballcoach/ai/**`, plus the closely-coupled sibling files
 `orders.py`, `actions.py`, `rules_ai.py`, `steering.py`, and the three
 knowledge docs (`src/footballcoach/knowledge.md`, `src/footballcoach/ai/knowledge.md`,
@@ -19,6 +59,18 @@ not itself change code.
 ## Part 1 — Summary of issues (short form)
 
 ### Structural / size
+
+**STILL OPEN, WORSE (verified 2026-10-12):** the file is now 11,915 lines
+(2.8x the figure below); none of the proposed split-out modules
+(`action_sampling.py`, `update.py`, `pretrain.py`, `checkpoint_io.py`,
+`logging_utils.py`) were created, and `_eval_vs_rules`/`_eval_vs_immobile`/
+`_eval_vs_opponent_type`/`pretrain_combined`/`pretrain_value`/
+`_save_checkpoint(_to)`/`load_checkpoint` all still live inside
+`PPOTrainer` (confirmed via grep for their `def` lines, now at
+`ppo_trainer.py:3615/3628/3738/4110/5874/11499/11530`). The method count
+grew from ~27 to 74. This is the single most actionable item for the
+upcoming cleanup pass.
+
 1. **`ai/ppo/ppo_trainer.py` is 4263 lines** — by far the largest file in the
    repo (3x the next largest, `scenario_env.py` at 920). It mixes: optimizer/
    param-group setup, the full PPO update math, BC pretraining (Phase 0/1/2/3),
@@ -31,16 +83,35 @@ not itself change code.
    step/reset API, reward computation glue, possession-transition state
    machine, observation encoding orchestration, and BC-label wiring into one
    class.
+
+   **STILL OPEN (verified 2026-10-12):** now 1317 lines (+43%). The same
+   responsibilities are still conflated; no split occurred.
+
 3. **`ai/ppo/bc.py` (953 lines)** mixes label schema/packing (`BCLabel`),
    two different loss-computation code paths (`bc_loss_from_tensor` operating
    on pre-decided tensors, and a second near-duplicate path around line 490
    operating on live decision/execution heads), and `phase1_labels()`
    generation logic that reaches into engine internals. These are three
    fairly separable concerns.
+
+   **STILL OPEN (verified 2026-10-12):** now 1529 lines (+60%). The two
+   loss-computation paths (`_floor_bce` at `bc.py:806`, `_bce` at
+   `bc.py:1087`) still exist as independently-declared near-duplicates —
+   see finding #5 below, also still open.
+
 4. Several very small one-purpose files exist alongside a few "does
    everything" files — package granularity is inconsistent (`models/
    value_side_channel.py` is 99 lines and single-purpose; `ppo_trainer.py`
    is everything-purpose). A more even split would improve navigability.
+
+   **PARTIALLY ADDRESSED (verified 2026-10-12):** several new focused files
+   were added to `ai/ppo/` since (`rollout_buffer.py`, `rollout_worker.py`,
+   `batched_rollout_worker.py`, `schedules.py`, `consistency.py`,
+   `dagger.py`) and `ai/eval/eval_worker.py` was added alongside (not
+   replacing) `seeded_eval.py`. So *new* code is being split out reasonably,
+   but the pre-existing `ppo_trainer.py` god-object was not reduced — the
+   granularity problem moved from "inconsistent" to "new code is granular,
+   old code just keeps growing."
 
 ### Duplicate / near-duplicate logic
 5. `bc.py` has two BCE-loss helper functions (`_floor_bce` used inside
@@ -50,11 +121,22 @@ not itself change code.
    silently drift apart (they already differ slightly in signature). Same
    `dec_label_smoothing`/`exec_label_smoothing` calling pattern is duplicated
    across the two.
+
+   **STILL OPEN (verified 2026-10-12):** both closures still exist,
+   unchanged in structure (`_floor_bce` at `bc.py:806`, `_bce` at
+   `bc.py:1087`). Not unified.
+
 6. `apply_nn_action.py::_resolve_target_player` and `opponent_pool.py`
    both catch `(KeyError, AttributeError)` around `match.player_by_id(...)`
    lookups — a `Match.player_by_id_or_none()` convenience method (or a
    shared helper) would remove this repeated try/except boilerplate from at
    least 3 call sites.
+
+   **STILL OPEN, MORE INSTANCES (verified 2026-10-12):** the pattern now
+   appears at 6 call sites, not 3: `apply_nn_action.py:169`,
+   `opponent_pool.py:89`, `scenario_env.py:1171` and `:1183`, `bc.py:274`
+   and `:673`. No shared helper was introduced.
+
 7. `ai/knowledge.md` documents that the trainee and secondary-player reward
    code paths were unified into `_compute_phase1_reward_for_player()` after a
    documented drift bug (see `/memories/repo/rules.md` "Reward parity"
@@ -64,10 +146,22 @@ not itself change code.
    possession_last_step` vs `_sec_had_possession_last_step`). These are
    currently *not* unified into one generic per-player state object — worth
    auditing for the same class of drift risk the reward code already hit.
+
+   **STILL OPEN (verified 2026-10-12):** the exact same dict pairs still
+   exist (`scenario_env.py:185/192/211/213` for declaration, used through
+   at least line 620), now with a comment at line 212 explicitly
+   acknowledging "mirrors `_trainee_pending_loss`" — i.e. the duplication is
+   consciously maintained by hand rather than unified. Still a real drift
+   risk, unchanged from when this was written.
+
 8. `_HEAD_ORDER` (gating.py) and `_HEAD_TO_ACTION` (gating.py) are two
    separate hand-maintained lists/dicts covering the same 7 head names —
    easy to add a head to one and forget the other silently (no runtime
    assertion that their key-sets match).
+
+   **STILL OPEN (verified 2026-10-12):** both structures unchanged
+   (`gating.py:71-73` and `:130-138`), no `assert set(...) == set(...)` or
+   equivalent was added at module import time.
 
 ### Magic numbers / string literals
 9. `pitch_hl = 52.5` / `pitch_hw = 34.0` hardcoded directly inside
@@ -77,6 +171,14 @@ not itself change code.
    feature encoding or `config/` rather than being duplicated inline; if the
    pitch dimensions in `physics.json`/pitch config ever change, this silently
    goes stale with no error.
+
+   **STILL OPEN, WORSE (verified 2026-10-12):** still present, with the
+   same `# TODO: get from obs if pitch varies` comment — but now duplicated
+   in **two** near-identical functions, `_sample_action_from_heads`
+   (`ppo_trainer.py:8009-8010`) and `_sample_action_from_heads_batch`
+   (`ppo_trainer.py:8284-8285`). Whatever split happened to add the batched
+   variant copy-pasted this wart instead of factoring it out.
+
 10. `augment.py` explicitly documents (in its own comment) that `_BC_DIR_X_COL`
     etc. are **hardcoded integers duplicating `bc.py`'s `_I_*` constants**,
     with a comment admitting "If a FUTURE bc.py change ever inserts/reorders
@@ -85,6 +187,17 @@ not itself change code.
     at module level and should simply be imported into `augment.py` instead
     of re-declared. There is no technical reason for the duplication (no
     circular import risk visible — `bc.py` doesn't import from `obs/`).
+
+    **STILL OPEN (verified 2026-10-12):** the file moved to
+    `ai/obs/augment.py` (501 lines) but the landmine is unchanged —
+    `_BC_DIR_X_COL = 7` etc. still hand-duplicated at `augment.py:169` with
+    the same self-aware staleness-risk comment, still not importing `bc.py`'s
+    `_I_*` constants. Given `bc.py`'s BC_LABEL_DIM grew 25→27 in the interim
+    (see finding #18) without this duplication being noticed or needing an
+    update, the risk this flags is real rather than theoretical, even if it
+    hasn't bitten yet (`_I_DIR_X`/`_I_DIR_Y` etc. happen to be among the
+    stable low indices).
+
 11. Magic tuning constants scattered through `ppo_trainer.py`'s physical
     squashing logic — e.g. `mv_size_phys = 1.0 + 3.0 * torch.sigmoid(...)`
     (implicit `[1,4]` metre range) and `mv_speed_phys = ... * 9.5` (implicit
@@ -94,6 +207,13 @@ not itself change code.
     resolves to elsewhere (attribute-derived), so a change to top-speed
     scaling would silently desync this squashing range from the actual
     physical arrival-speed range used elsewhere.
+
+    **STILL OPEN, WORSE (verified 2026-10-12):** same pattern as finding #9
+    — now duplicated across `_sample_action_from_heads`
+    (`ppo_trainer.py:8014-8015`) and `_sample_action_from_heads_batch`
+    (`ppo_trainer.py:8289-8290`), both still inline literals, neither
+    reading from `ai_config.json`.
+
 12. Head name literals (`"shoot"`, `"pass_"`, `"move"`, `"tackle"`,
     `"get_possession"`, `"mark"`, `"hold_position"`) are repeated as raw
     strings across `gating.py`, `ppo_trainer.py` (`decision_probs` dict
@@ -101,6 +221,11 @@ not itself change code.
     single shared tuple constant would remove this repeated stringly-typed
     surface and catch typos at import time instead of silently returning
     `0.0` from `.get(head_name, 0.0)`.
+
+    **STILL OPEN (verified 2026-10-12):** no `DECISION_HEAD_NAMES` constant
+    or equivalent found in `action/schema.py` or `gating.py`; the 7 strings
+    are still independently spelled out in `_HEAD_ORDER`/`_HEAD_TO_ACTION`
+    (`gating.py:71-73`, `:130-138`).
 
 ### Suspicious / risky logic
 13. `apply_nn_action.py::apply_action_to_player` — the kick power fallback:
@@ -121,6 +246,25 @@ not itself change code.
     the policy is still exploring near 0. Worth clamping to `max(eps, x)`
     instead of using the boolean threshold + fixed fallback, or asserting
     the squashing function can never legitimately return 0.
+
+    **RESOLVED (verified 2026-10-12, exact commit not identified but code
+    confirmed changed):** `apply_nn_action.py:111-119` no longer substitutes
+    0.85. It now does exactly what this finding recommended in spirit (fail
+    loud instead of silently distorting physics):
+    ```python
+    power_fraction = float(gating.kick_power_fraction)
+    if not power_fraction > 0.0:
+        raise ValueError(
+            f"kick decided with non-positive/NaN kick_power_fraction={gating.kick_power_fraction!r} "
+            f"(check ppo.kick_power_floor and whatever built this GatingResult)"
+        )
+    ```
+    The accompanying comment states the upstream `ppo.kick_power_floor`
+    config now guarantees `kick_power_fraction > 0`, making this a pure
+    upstream-bug detector rather than an expected runtime branch. This is
+    now unit-tested: `tests/ai_unit/test_apply_nn_action.py:317` asserts
+    `pytest.raises(ValueError, match="kick_power_fraction")`.
+
 14. Same function's kick direction fallback (`direction_3d = Vector3(1.0, 0.0,
     0.0)` labeled "safe fallback, should not occur") — if this ever *does*
     occur (e.g. NaN direction from a numerically unstable policy early in
@@ -131,6 +275,11 @@ not itself change code.
     vectors called out elsewhere), this deserves at minimum a log/counter so
     silent occurrences during training are visible, not just a comment
     asserting it shouldn't happen.
+
+    **STILL OPEN (verified 2026-10-12):** identical code still present at
+    `apply_nn_action.py:107-110`, same comment, same `1e-6` epsilon guard,
+    still no `log.warning`/counter on the fallback firing.
+
 15. `gating.py::select_action`'s docstring/comment says "tie-breaking order:
     shoot > pass > move > tackle > get_possession > mark > hold_position —
     the simplest resolution; adjust if needed" but the actual comparison
@@ -154,6 +303,12 @@ not itself change code.
     isn't (e.g. two heads at literally 0.7000000 vs 0.7000001 due to float
     noise would non-deterministically flip on tiny model differences, not on
     anything semantically about priority).
+
+    **STILL OPEN (verified 2026-10-12):** the comment is unchanged, still at
+    `gating.py:68-70` ("tie-breaking order... adjust if needed"), and
+    `select_action` is still a plain `if p > best_prob` running-max scan
+    (`gating.py:103-107`). Cosmetic-only, low severity as originally noted.
+
 16. `apply_nn_action.py::apply_action_to_player`'s tackle-legality check:
     ```python
     if match.ball_carrier() is None or match.ball_carrier().team == player.team:
@@ -166,12 +321,27 @@ not itself change code.
     diagnostics ever branch on `illegal_reason` strings, this will
     misclassify "own-team-tackle-attempt" events as "no carrier" events. Easy
     win: split into two distinct reason strings.
+
+    **STILL OPEN (verified 2026-10-12):** the same collapsed check is still
+    present, now at `apply_nn_action.py:143-146`, still returning a single
+    `illegal_reason="tackle_no_carrier"` for both "no carrier at all" and
+    "carrier is a teammate." (A third, distinct reason,
+    `"tackle_while_inactive"`, was added for a different condition —
+    `apply_nn_action.py:139-140` — which doesn't address this finding.)
+    `test_apply_nn_action.py:119` (`test_tackle_no_carrier_illegal`) tests
+    the collapsed behaviour as-is rather than locking in a fix.
+
 17. `apply_nn_action.py::encode_slot_player_ids` silently returns a list with
     `None` for any player not present in `other_players` but does not
     validate that `slot_indices` and `other_players` are the same length
     (`zip()` silently truncates to the shorter of the two on a length
     mismatch) — a caller passing mismatched lists gets silently wrong (but
     not crashing) slot mappings rather than an assertion error.
+
+    **STILL OPEN (verified 2026-10-12):** identical `zip(slot_indices,
+    other_players)` loop at `apply_nn_action.py:190`, no length check, not
+    covered by `test_apply_nn_action.py`.
+
 18. `bc.py`'s BC_LABEL_DIM history (documented in `ai/knowledge.md` as
     "15→16→17", but the code comment at the top of `bc.py` says "24" while
     `BC_LABEL_DIM = 25` in the actual code, and adds a further `_I_KICK_DIR_Z
@@ -185,6 +355,16 @@ not itself change code.
     file's own top-of-doc warning says has already happened twice — it's
     now happened a third time and wasn't caught. See Part 2 for exact quotes
     and a proposed fix (single source of truth / auto-generated table).
+
+    **RESOLVED (verified 2026-10-12):** `bc.py`'s own docstring and code are
+    now self-consistent — `bc.py:24` says "27 floats per step", the table
+    runs through index 26 (`heading_cos`, `bc.py:71`) including index 24
+    (`kick_dir_z`, explicitly noted as non-contiguous, `bc.py:65`), and
+    `BC_LABEL_DIM = 27` (`bc.py:95`) matches. Two more fields
+    (`heading_sin`/`heading_cos`, indices 25/26) were added since this
+    finding was written, on top of the fix. `ai/knowledge.md` is also now
+    in sync — see finding #22 below, resolved together with this one.
+
 19. `ScenarioEnv`'s docstring says "For neural players, ScenarioEnv assigns
     NeuralPlayerAI on reset()" but the actual per-tick action application
     goes through `apply_action_to_player` (a free function) called from
@@ -198,6 +378,17 @@ not itself change code.
     the docstring is misleading about "who" drives the player each tick;
     this should be clarified explicitly in the docstring instead of implying
     parity with the rules-AI pattern.
+
+    **RESOLVED/CLARIFIED (verified 2026-10-12):** `NeuralPlayerAI` is not a
+    no-op stub. `rules_ai.py:801-831`'s docstring and constructor confirm
+    `Match.step()` calls `act()` every physics tick, and `act()` actually
+    calls the injected `sample_action_fn` (bound to
+    `trainer._sample_action`) every `decision_interval_ticks` ticks,
+    populating `last_transition` for the rollout buffer — i.e. action
+    selection genuinely happens *through* `NeuralPlayerAI.act()`, not
+    external to it. `ScenarioEnv`'s docstring claim is accurate and not
+    misleading; the original "worth verifying" framing is settled in the
+    docstring's favor.
 
 ### Documentation inconsistencies between the three knowledge docs
 20. `src/footballcoach/knowledge.md` states, in the "Neural network / Orders
@@ -226,6 +417,15 @@ not itself change code.
     reference `ai/action/apply_nn_action.py::apply_action_to_player` and
     describe the direct-physics-field-setting behaviour, not a `MoveOrder`
     wrapper.
+
+    **RESOLVED (already marked resolved in a prior pass on this same doc —
+    see §2.5 below; re-confirmed 2026-10-12):** `src/footballcoach/
+    knowledge.md`'s "Neural network / Orders boundary" section (lines
+    51-71+) now correctly names `apply_nn_action.py::apply_action_to_player`
+    and describes direct field-setting with no `MoveOrder`/`to_orders.py`
+    references remaining. `grep -rn to_orders.py` across the tree returns
+    nothing.
+
 21. Relatedly, `src/footballcoach/knowledge.md`'s "Neural network / Orders
     boundary" section bullet list still says: *"**High-level decision head
     fires** — when the neural network's shoot/pass/tackle/get_possession/
@@ -250,6 +450,14 @@ not itself change code.
     boundary (IMPORTANT)" heading itself and `ai/knowledge.md`'s own
     "!!!! CRITICAL" banner, Orders should ONLY ever be rules-AI/BC-teacher
     constructs for a neural-controlled player.
+
+    **RESOLVED (same prior pass as #20, re-confirmed 2026-10-12):** the
+    "decision heads still issue real Orders" bullet is gone from
+    `knowledge.md`; the section now consistently describes the no-Orders,
+    direct-field-setting design matching `apply_nn_action.py`'s own
+    docstring. No remaining `player.shoot(...)`-style calls driven by
+    gating output were found in `ppo_trainer.py`'s rollout path.
+
 22. `ai/knowledge.md`'s BC label table (index 0-23) does not mention index 24
     (`kick_dir_z`, per `bc.py`'s `_I_KICK_DIR_Z = 24`) at all, and states
     `BC_LABEL_DIM = 24` in prose ("do not let this count drift out of sync,
@@ -262,6 +470,17 @@ not itself change code.
     two independent copies of the same table in two files, or (b) generating
     the table from `_I_*` constants directly (e.g. a small script/test that
     asserts the doc table's ordinal count matches `BC_LABEL_DIM`).
+
+    **RESOLVED (verified 2026-10-12):** `ai/knowledge.md:156-162` now says
+    "BC label vector (BC_LABEL_DIM = 27)" and documents the full history
+    "15→16→17→25→27 (added `heading_sin`/`heading_cos`...)" matching the
+    current code exactly (see finding #18's resolution above). Both
+    knowledge docs and `bc.py`'s own docstring are in agreement as of this
+    review. The recommended tooling fix (a test that asserts the count
+    matches `BC_LABEL_DIM`) was not found to have been added, so the
+    underlying process risk (hand-updating three places) remains even
+    though the current state happens to be consistent — worth keeping
+    recommendation (1) from §2.3 in mind for the cleanup pass.
 23. `steering.py`'s knowledge-doc section (`src/footballcoach/knowledge.md`)
     states repulsion is "Only `MoveOrder` uses repulsion... confirmed out of
     scope" for ChaseTackleOrder/GetPossessionOrder/SaveOrder — this claim is
@@ -272,6 +491,18 @@ not itself change code.
     rather than trusting outright (not a confirmed bug, just a
     "verify-before-trusting" flag per the task's instruction to flag
     unconvincing-even-if-documented claims).
+
+    **VERIFIED ACCURATE (2026-10-12):** spot-checked `engine/match.py` and
+    `orders.py` directly. `compute_repulsion` has exactly one call site
+    (`match.py:585`), reached only from the `MoveOrder` handling branch.
+    Grepping `use_repulsion=` across `orders.py` confirms: the three call
+    sites inside `MoveOrder` (lines ~613/678/695) pass `use_repulsion=True`;
+    `ChaseTackleOrder` (line ~817), `SaveOrder` (line ~919), and `MarkOrder`
+    (line ~1129) explicitly pass `use_repulsion=False`; `GetPossessionOrder`
+    doesn't call `step_player_towards` at all in that range. The claim holds
+    exactly as documented — this is the one spot-check in this review that
+    came back clean rather than finding drift.
+
 24. `ai_trainer_knowledge.md` (repo root) was read as part of this review's
     required background, but this review focused code-reading effort on
     `ai/` itself per the user's request; any reward-shaping/PPO-hyperparameter
@@ -297,6 +528,15 @@ not itself change code.
     silently fail and always fall back to `None`). At minimum a
     `log.debug()` on the except branch during training (not eval, to avoid
     log spam) would make this diagnosable.
+
+    **STILL OPEN, MORE INSTANCES (verified 2026-10-12):** line numbers have
+    moved (files grew) and the count is now 6, not 4:
+    `apply_nn_action.py:169`, `opponent_pool.py:89`, `scenario_env.py:1171`
+    and `:1183`, `bc.py:274` and `:673`. None of the six have any logging on
+    the except branch. (Same underlying locations as finding #6's
+    duplication complaint — the "no shared helper" and "no logging" issues
+    are two facets of the same six call sites.)
+
 26. `ppo_trainer.py:1338` and `train.py:378,526` catch bare `except Exception
     as _e:` — broad catches around what look like diagnostic/logging code
     paths (based on variable naming `_diag_exc`) are probably intentional
@@ -304,6 +544,14 @@ not itself change code.
     minimum log the exception (worth a quick check that `log.exception(...)`
     or similar is actually called in each of these three blocks, not just
     swallowed silently — not verified in this pass).
+
+    **VERIFIED, NOT A BUG (2026-10-12):** the original line numbers moved
+    (file grew to 11,915 lines), but checked every current instance of this
+    pattern in both files — `ppo_trainer.py:3683/3830/3911/3957/3975/6786`
+    and `train.py:752/925` — and all eight call `log.warning(f"...: {_e}")`
+    (or `{_diag_exc}`) on the except branch, including the exception text.
+    None swallow silently. This finding's open question is resolved in the
+    code's favor; no action needed.
 
 ### Testing gaps
 27. `tests/ai_unit/` covers: BC label/tensor loss (`test_bc.py`), dataset
@@ -323,6 +571,19 @@ not itself change code.
     direction/illegal-reason-string edge cases flagged above rather than
     only the happy path, since the file's existence doesn't guarantee those
     specific edge cases are exercised.
+
+    **PARTIALLY RESOLVED (verified 2026-10-12):** `test_apply_nn_action.py`
+    now explicitly covers the kick-power edge case from finding #13
+    (`test_apply_nn_action.py:317`, asserts `ValueError` on non-positive
+    power) and a tackle-legality case (`:119`,
+    `test_tackle_no_carrier_illegal`). It does **not** cover: the
+    kick-direction fallback from finding #14 (no fallback-vector/no-logging
+    assertion found), the distinct-illegal-reason-strings question from
+    finding #16 (moot while #16 itself is unfixed — the test locks in the
+    current collapsed behaviour, consistent with how this finding predicted
+    it would go), or the `encode_slot_player_ids` length-mismatch case from
+    finding #17 (still untested).
+
 28. `ai/curriculum/` (phases.py, envs.py, opponent_pool.py) has **no
     corresponding `tests/ai_unit/test_curriculum*.py` or
     `test_opponent_pool.py`** file visible in the `tests/ai_unit/` listing —
@@ -332,6 +593,18 @@ not itself change code.
     `tests/ai_scenario/test_pretrain_combined_smoke.py`-style
     integration/smoke tests (if those even exercise curriculum selection
     directly).
+
+    **PARTIALLY RESOLVED (verified 2026-10-12):**
+    `tests/ai_unit/test_curriculum_opponent_ratios.py` now exists (140
+    lines, `TestOpponentTypeProbs` + `TestRealConfigRatioProducesExpectedMix`)
+    and covers opponent-type ratio/mix sampling, including the real
+    production ratio and edge cases (all-zero, never-exceeds-one). It does
+    **not** cover `phases.py`'s `PHASES_BY_ID` completeness/uniqueness, nor
+    the `except (KeyError, AttributeError)` branch at `opponent_pool.py:89`
+    (finding #25) — no `test_opponent_pool.py` or
+    `test_curriculum_phases.py` by that name exists. Narrower gap than
+    originally found, not closed.
+
 29. `ai/eval/seeded_eval.py` (286 lines) similarly has no obviously
     corresponding unit test file in either `tests/ai_unit/` or
     `tests/ai_scenario/` listings — seeded-evaluation determinism (a
@@ -339,6 +612,12 @@ not itself change code.
     so that they're always the same!" per the user's own notes) is exactly
     the kind of logic that most benefits from a unit test asserting "same
     seed twice → identical episode outcome", and none appears to exist yet.
+
+    **STILL OPEN (verified 2026-10-12):** the file is now 710 lines (up
+    from 286 — grew 2.5x). No `test_seeded_eval*.py` or equivalent exists
+    anywhere under `tests/ai_unit/` or `tests/ai_scenario/`. Still a real
+    gap, now guarding more logic than before.
+
 30. No test file targets `ai/models/entity_encoder.py`'s permutation-
     invariance property directly at the *encoder* level (only
     `test_ai_type_side_channel.py`'s
@@ -351,11 +630,23 @@ not itself change code.
     valuable, cheap addition and a natural regression guard for any future
     encoder refactor.
 
+    **RESOLVED, UNCOMMITTED (verified 2026-10-12):**
+    `tests/ai_unit/test_entity_encoder_permutation.py` now exists — but as
+    of this review it is an **untracked file in the working tree** (per
+    `git status`), not yet committed. Worth confirming it gets committed as
+    part of whatever work added it; this review did not modify it or check
+    its contents in detail (out of scope: markdown-only task).
+
 ---
 
 ## Part 2 — Detailed discussion, code snippets, and proposed fixes
 
 ### 2.1 `ppo_trainer.py` — the 4263-line god-object
+
+**STILL OPEN, WORSE (verified 2026-10-12) — see Part 1 finding #1's
+resolution above for the numbers (now 11,915 lines, 74 methods, proposed
+split-out modules never created).** The method list below is now a strict
+subset of the current file; nothing in it has moved out.
 
 **Evidence.** A `grep` for top-level method definitions shows `PPOTrainer`
 owns (non-exhaustively): `__init__`, `_value_heads`, `_get_value_pretrain_freeze_params`,
@@ -434,6 +725,10 @@ take the trainer as a plain argument instead of being bound methods).
 
 ### 2.2 `bc.py`'s duplicated BCE-smoothing helpers
 
+**STILL OPEN (verified 2026-10-12) — see Part 1 finding #5's resolution
+above.** `_floor_bce` and `_bce` both still exist, now at `bc.py:806` and
+`bc.py:1087` respectively.
+
 Two structurally similar smoothed-BCE closures exist in the same file:
 
 ```python
@@ -457,6 +752,13 @@ exactly how smoothing is applied (e.g. one gets updated to clamp `eps` to
 `[0, 1]` and the other doesn't).
 
 ### 2.3 The BC_LABEL_DIM / index-24 documentation drift (findings #18, #22)
+
+**RESOLVED (verified 2026-10-12) — see Part 1 findings #18/#22's resolutions
+above.** `bc.py`'s docstring, its `BC_LABEL_DIM` constant, and
+`ai/knowledge.md`'s table are all consistent at 27 fields as of this
+review. The direct quotes below are kept verbatim as a historical record of
+what was wrong and when; do not use the "17"/"24"/"25" figures below as
+current.
 
 Direct quotes for the record:
 
@@ -508,6 +810,16 @@ roughly in order of preference:
    23) and add `_I_KICK_DIR_Z`/index 24 to both docs' tables.
 
 ### 2.4 `apply_nn_action.py` kick-power/kick-direction fallbacks (findings #13, #14)
+
+**MIXED (verified 2026-10-12) — see Part 1 findings #13/#14's resolutions
+above.** The power-fallback half of this section (#13) is **RESOLVED**: the
+code quoted immediately below no longer matches current
+`apply_nn_action.py` — the `0.85` substitution is gone, replaced by a
+fail-loud `ValueError`. The direction-fallback half (#14) is **STILL
+OPEN**: the `Vector3(1.0, 0.0, 0.0)` fallback with no logging is unchanged
+and the code snippet below still accurately describes it. The snippet as a
+whole is now stale for the power line only; kept verbatim below since it's
+illustrative of what was fixed.
 
 ```python
 if gating.kick_this_tick:
@@ -621,6 +933,10 @@ code comments that repeated the same stale filename/mechanism
 
 ### 2.6 `gating.py`'s `_HEAD_ORDER`/`_HEAD_TO_ACTION` duplication (finding #8)
 
+**STILL OPEN (verified 2026-10-12) — see Part 1 finding #8's resolution
+above.** Both structures are unchanged (`gating.py:71-73`/`:130-138`); the
+suggested assert was never added.
+
 ```python
 _HEAD_ORDER: list[str] = [
     "shoot", "pass_", "move", "tackle", "get_possession", "mark", "hold_position"
@@ -655,32 +971,56 @@ cause).
 
 ### 2.7 Test coverage gaps — concrete recommendations
 
+**Status as of 2026-10-12 (see Part 1 findings #27-#30 for full detail):**
+of the five recommendations below, two are now substantially done
+(`apply_nn_action.py`'s power-fallback and one tackle case; entity-encoder
+permutation invariance, though uncommitted), one is partially done
+(curriculum/opponent-pool ratio sampling via
+`test_curriculum_opponent_ratios.py`), and two remain fully open
+(`seeded_eval.py` determinism; the `gating.py` consistency assert/test).
+The bulleted recommendations below are left as originally written as the
+still-relevant remaining to-do list; strikethrough-style annotations are
+inline where a sub-item is done.
+
 - **`apply_nn_action.py`** (finding #13/#14/#16/#17): confirm
   `tests/ai_unit/test_apply_nn_action.py` covers:
   - `kick_power_fraction == 0.0` exactly → asserts NOT silently forced to
     0.85 (or, if the fallback is intentionally kept, at least asserts the
     behaviour explicitly rather than leaving it implicit).
+    **DONE** — `test_apply_nn_action.py:317` asserts `ValueError` is raised.
   - `kick_direction` is `None` / a zero vector → asserts fallback direction
     and (recommended) a logged warning/counter increment.
+    **STILL OPEN** — not found in the current test file.
   - Tackle attempt with `ball_carrier() is None` vs. `ball_carrier().team ==
     player.team` → asserts these produce **distinct** `illegal_reason`
     strings (currently they don't — see finding #16 — so this test would
     currently need to assert the (arguably wrong) shared string, or should
     be written now to lock in the fix once applied).
+    **PARTIALLY DONE, NOT DISTINCT** — `test_apply_nn_action.py:119`
+    (`test_tackle_no_carrier_illegal`) exists but tests the current
+    collapsed (shared-string) behaviour, as this recommendation anticipated
+    it might; #16 itself is still unfixed.
   - `encode_slot_player_ids` with mismatched `slot_indices`/`other_players`
     lengths → should assert either an explicit `ValueError` (recommended new
     behaviour) or explicitly document+test the current silent-truncation
     behaviour.
+    **STILL OPEN** — not found in the current test file.
 - **`ai/curriculum/`**: add `tests/ai_unit/test_curriculum_phases.py`
   (phase construction, `PHASES_BY_ID` completeness/uniqueness) and
   `tests/ai_unit/test_opponent_pool.py` (sampling distribution given a
   config, `apply_rules_based_opponent()` behaviour, the `except (KeyError,
   AttributeError)` branch at opponent_pool.py:83).
+  **PARTIALLY DONE** — `tests/ai_unit/test_curriculum_opponent_ratios.py`
+  (new, 140 lines) covers opponent-type ratio sampling, but not
+  `PHASES_BY_ID` completeness or the except-branch at (now)
+  `opponent_pool.py:89`.
 - **`ai/eval/seeded_eval.py`**: add a determinism test — run the same seed
   twice through the seeded eval path and assert identical outcome
   sequences/rewards. This directly targets an item already called out as an
   open task in the user's own notes ("The evaluation steps should also use
   seeds so that they're always the same!").
+  **STILL OPEN** — no such test exists; the file has since grown to 710
+  lines (from 286), raising the stakes on this gap.
 - **`ai/models/entity_encoder.py`**: add a direct permutation-invariance
   test at the encoder level (permute the "other players" slot order in a
   synthetic batch, assert `entity_encoder(...)`'s pooled output is identical
@@ -688,12 +1028,20 @@ cause).
   indirectly via the value-side-channel wrapper test, not the core encoder
   itself, despite this being one of the most architecturally load-bearing
   properties described repeatedly across the knowledge docs.
+  **DONE, UNCOMMITTED** — `tests/ai_unit/test_entity_encoder_permutation.py`
+  exists but is untracked in the working tree as of this review; confirm it
+  gets committed.
 - **`gating.py`**: add the `_HEAD_ORDER`/`_HEAD_TO_ACTION` consistency
   assertion from 2.6 as an explicit unit test (in addition to, or instead
   of, the module-import-time assert) so a future CI run catches a drift
   immediately with a clear failure message and file location.
+  **STILL OPEN** — no such assertion or test exists.
 
 ### 2.8 Steering/repulsion doc claim worth spot-checking (finding #23)
+
+**RESOLVED/VERIFIED ACCURATE (2026-10-12) — see Part 1 finding #23's
+resolution above.** The spot-check this section called for was done; the
+claim checks out. Text below kept as the original record of the question.
 
 `src/footballcoach/knowledge.md` states plainly: *"**Only `MoveOrder` uses
 repulsion.** ChaseTackleOrder, GetPossessionOrder, SaveOrder, etc. do not —
@@ -709,12 +1057,18 @@ that has otherwise shown a real drift pattern.
 
 ### 2.9 Miscellaneous small items / easy wins
 
+**All four items below are STILL OPEN as of 2026-10-12** — see Part 1
+findings #9/#10/#11/#12's resolutions above for current file:line
+references (all moved; #9 and #11 are now duplicated across two functions
+each, making the fix slightly larger-scoped than when this was written).
+
 - `ppo_trainer.py:2724`'s `pitch_hl = 52.5` / `pitch_hw = 34.0` (finding #9):
   these values almost certainly already exist somewhere in `config/` (pitch
   dimensions are a core physics constant used throughout `engine/`). Easy
   win: thread the actual pitch half-length/half-width through from
   `GlobalFeatures`/config rather than re-hardcoding standard FIFA pitch
   dimensions inline, closing out the file's own `# TODO` comment.
+  **Now at `ppo_trainer.py:8009-8010` AND `:8284-8285` (two copies).**
 - `augment.py`'s `_BC_DIR_X_COL`/etc. (finding #10): straightforward fix —
   `from footballcoach.ai.ppo.bc import _I_DIR_X, _I_DIR_Y, _I_REGION_X,
   _I_REGION_Y, _I_KICK_DIR_X, _I_KICK_DIR_Y, _I_KICK_DIR_Z, _I_KICK_SPIN_X,
@@ -724,6 +1078,7 @@ that has otherwise shown a real drift pattern.
   architectural cost — one of the cheapest, highest-value fixes in this
   whole review given it directly removes a landmine the code's own comment
   admits exists.
+  **File moved to `ai/obs/augment.py:169`; otherwise unchanged.**
 - `mv_size_phys = 1.0 + 3.0 * torch.sigmoid(mv_size_raw)` and `mv_speed_phys
   = ... * 9.5` (finding #11): move the `1.0`/`3.0`/`9.5` (and the pitch
   constants above) into `ai_config.json` alongside every other tunable in
@@ -732,9 +1087,11 @@ that has otherwise shown a real drift pattern.
   without touching code" per `reward.py`'s own module docstring) — right now
   these squashing-range constants are the exception to that rule for no
   apparent reason.
+  **Now at `ppo_trainer.py:8014-8015` AND `:8289-8290` (two copies).**
 - Head-name string literals (finding #12): introduce a single shared
   constant, e.g. `DECISION_HEAD_NAMES: tuple[str, ...] = ("shoot", "pass_",
   "move", "tackle", "get_possession", "mark", "hold_position")` in
   `action/schema.py` (or wherever `DecisionHeadsRaw` already lives), and have
   both `gating.py` and `ppo_trainer.py`'s `decision_probs` dict construction
   reference it instead of independently re-typing the same 7 strings.
+  **Unchanged — no such constant exists anywhere in the tree.**

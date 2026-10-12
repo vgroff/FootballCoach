@@ -10,6 +10,18 @@
 
 ## 0. Status
 
+**Status as of 2026-10-12 (reconciliation pass): fully accurate, no changes
+needed.** Re-verified against current code: `ball_inertia_shell_factor`,
+`_resolve_ground_friction`, and the `remaining_slip` gate (now at
+`engine/ball_physics.py:131/196/336-340`) are all still present exactly as
+described below. §9's proposal is still **not implemented** —
+`ball_dataset.py::compute_resting_targets` (currently
+`src/footballcoach/ai/physics_pretrain/ball_dataset.py:693-752`) still gates
+purely on `horizon_speed < rest_speed_norm`, no slip/spin term. This file is
+a strong **archive candidate**: everything it tracked as "done" is still
+done, and §9 remains a deliberately-deferred proposal rather than an open
+bug — nothing here requires further action before the cleanup pass.
+
 Everything this document originally tracked is **implemented, verified, and
 committed** (commit `bf1b271`, 2026-09-03) — the dt/bounce-threshold coupling
 fix, the spin-coupled bounce model, the `ball_inertia_shell_factor` retune,

@@ -1,5 +1,26 @@
 # Code Analysis — FootballCoach
 
+> **Status as of 2026-10-12 (reconciliation pass):** mostly still accurate
+> and still open — this is a deliberately-curated "what's left" list (per
+> the note below, already-fixed items were removed by prior agents), and
+> re-verification confirms nearly every remaining item is still true today,
+> with current file:line refs refreshed inline. Two items changed:
+> **§7's `tests/ai_scenario/` single-file claim is now stale/resolved**
+> (that directory has grown to 27 test files — see inline note), and
+> **§6's `PlayerAttributes.average` docstring claim is partially stale**
+> (the docstring itself was removed at some point; the method is now
+> undocumented rather than mis-documented, though it's still used in
+> production UI code under a test-sounding name — see inline note). One
+> new confirmed finding: **§7's "N >= 1000" audit request turned up a real
+> inconsistency** — `N_TRIALS` is 200 in `test_pass_balance.py`, 500 in
+> `test_shoot_balance.py`, 2000 in `test_penalty_balance.py`, and at least
+> one deliberate `n_trials=50` for a non-hard-target visual table — see
+> inline note. Everything else (structural/architectural items in §3,
+> magic numbers in §4, doc-drift items in §5, remaining test-coverage gaps
+> in §7, and the UI note in §8) was spot-checked against current code and
+> is still open as described, just with line numbers refreshed where they
+> had drifted.
+
 > **Note for future agents:** Sections 1 and 2 (bugs and duplicate logic) and
 > most of the mechanical items in sections 4, 5, 6, and 8 have already been
 > fixed and removed from this file. What remains is either (a) a genuine
@@ -151,6 +172,15 @@ Line numbers are approximate (code may have shifted slightly since review).
   just tests — contradicting its own docstring. Left as-is: renaming/moving
   it requires deciding what the *intended* production API should be, not
   just a mechanical cleanup.
+  **PARTIALLY STALE (checked 2026-10-12):** the method
+  (`entities/attributes.py:27-29`) no longer has any docstring at all — the
+  "mainly for tests" claim it's accused of contradicting isn't there to
+  contradict anymore. The underlying point still holds though: it's a
+  bare `@staticmethod` with a test-sounding name, still used directly in
+  production (`ui/scenarios.py:450,914-916`). Still worth the same
+  decision (rename vs. accept as production API), just reframe as
+  "undocumented, test-sounding name used in production" rather than
+  "contradicts its own docstring."
 - Several of the same balance-test target percentages (e.g. "precision=0.5
   centre: >95% scored") are written out in prose in **at least four
   independent places** (design docs, `physics.json` comments, the balance
@@ -170,21 +200,45 @@ Line numbers are approximate (code may have shifted slightly since review).
   coverage is meant to eventually mirror the engine's scenario tier, this is
   a visible, significant gap (noted for completeness even though the `ai/`
   package itself was out of scope for deep review).
+  **RESOLVED/SUPERSEDED (checked 2026-10-12):** `tests/ai_scenario/` now
+  contains **27 test files** (e.g. `test_batched_rollout.py`,
+  `test_dual_clip_ppo.py`, `test_masked_action_training.py`,
+  `test_ppg_value_refit.py`, `test_val_episode_split.py`, and more),
+  essentially at parity with `tests/scenario/`'s now-19 files. This gap no
+  longer exists; no further action needed here.
 - No test explicitly named/targeting exact-tangent or grazing-hit edge cases
   for `resolve_ball_block_by_inactive_players`'s ray-circle intersection math
   in [engine/collision.py](src/footballcoach/engine/collision.py) (quadratic
   `discriminant == 0` case) — worth confirming coverage exists somewhere, or
   adding it if not.
+  **Still open (checked 2026-10-12):** grepped the whole `tests/` tree for
+  `resolve_ball_block_by_inactive_players` — zero matches. Not only is the
+  discriminant-==-0 edge case untested, the function has **no test coverage
+  at all** under its own name (it may be exercised indirectly through
+  scenario/balance tests, but nothing targets it specifically). Gap is
+  real, and slightly worse than originally described.
 - `tests/knowledge.md` itself documents a prior incident where a balance
   test saturated near 100% regardless of GK attributes, later tightened —
   a good sign it's been caught once, but there's no confirmation any other
   current balance test has the same "too easy, saturates near 0%/100%"
   problem; worth a follow-up audit given this exact failure mode has already
-  occurred once.
+  occurred once. (Not independently re-audited this pass — out of scope for
+  a documentation-only reconciliation; still an open to-do.)
 - No visible confirmation that all `tests/balance/*.py` files uniformly use
   `N >= 1000` trials as the design docs mandate — worth a quick grep/audit
   to make sure no test regressed to a lower trial count (which could
   reintroduce flakiness).
+  **CONFIRMED STILL TRUE, with specifics (checked 2026-10-12):**
+  `N_TRIALS` is **200** in `tests/balance/test_pass_balance.py:25`, **500**
+  in `tests/balance/test_shoot_balance.py:18`, and **2000** in
+  `tests/balance/test_penalty_balance.py:26` — not uniform, and two of the
+  three are well below 1000. Additionally,
+  `test_pass_balance.py:119` uses a hardcoded `n_trials=50` for
+  `test_pass_success_rate_table_across_precision_and_distance` (explicitly
+  commented as "not a hard-target test," a visual table rather than a
+  pass/fail assertion, so lower N there may be intentional) — but the
+  200/500/2000 spread across the three hard-target files looks like
+  genuine, unexplained drift rather than a documented design choice.
 - `tests/balance/results/` (e.g. `latest_results.json`) is a committed
   build/output artifact in version control — likely intentional per the
   README's "inspect without re-running pytest" rationale, but worth

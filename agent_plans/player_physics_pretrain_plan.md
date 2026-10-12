@@ -28,6 +28,76 @@ entity_mlp`'s input rather than `DecisionNetwork.forward()`'s top-level
 invariant entity slots, not a single global entity like the ball) — that
 sketch is not re-litigated here.
 
+---
+
+### Status as of 2026-10-12 (audit pass, documentation-only)
+
+**Overall: the standalone pipeline described in this plan is essentially
+100% done and unchanged in its fundamentals, BUT the file is now
+substantially out of date on three fronts**, found by direct inspection of
+`src/footballcoach/ai/physics_pretrain/` (read-only; no code touched):
+
+1. **The "explicitly OUT OF SCOPE" live-network integration above has, in
+   fact, since been built — just not under this plan file.**
+   `src/footballcoach/ai/models/physics_encoders.py` (created commit
+   `dd69dc9`, 2026-09-06 — two weeks after this plan's last commit) wires
+   BOTH the frozen `BallDynamicsEncoder` AND the frozen
+   `PlayerDynamicsEncoder` into `DecisionNetwork`/`ExecutionNetwork` as an
+   opt-in feature, documented under `agent_plans/ball_physics_pretrain_
+   plan.md` §8 (not here) and `ai/knowledge.md`'s "Frozen physics-dynamics
+   encoders" section (~line 1200). Config: `network.player_physics_
+   encoder_checkpoint` in `ai_config.json` — **and as of this audit it is
+   NOT null**: the live training config currently points it at
+   `checkpoints/physics_pretrain/player_encoder_50.midtrain_latest_train.pt`
+   (alongside `network.ball_physics_encoder_checkpoint` similarly set) —
+   i.e. this is not just built, it is **actively enabled in the current
+   training run**. This directly contradicts this section's framing as of
+   2026-08-22; the integration DID happen, via the route this plan's §0
+   gestured at ("widening `EntityEncoder.per_entity_mlp`'s input") being
+   superseded in turn by a different mechanism (concatenating the frozen
+   encoder's output onto `self_feat`/`ball_feat` before `self_mlp`/
+   `ball_mlp`/`entity_encoder`, not widening `per_entity_mlp` itself — see
+   `physics_encoders.py` and `decision_network.py` lines ~73-101). See
+   `tests/ai_unit/test_physics_encoder_wiring.py` for its regression
+   coverage. **This plan file itself was never updated to reflect this —
+   recommend either updating §0 or cross-linking to the ball plan's §8
+   explicitly, so a future reader doesn't repeat the "out of scope" claim.**
+
+2. **The player dynamics network grew well past this plan's §7 "deliberate
+   scope cuts" list.** §7 below explicitly says no `crossing_head` was
+   added for the player net ("no ballistic baseline... no cosine LR...
+   no crossing_head"). As of this audit, `player_dynamics_net.py` DOES
+   have a `crossing_head` (`Linear(latent_dim, 4)` → `pos_x, pos_y,
+   crosses_logit, delta_t`), PLUS a `goal_dist_delta_head` and two new
+   `short_horizon_head_0_2s`/`short_horizon_head_1_0s` heads — none of
+   which are mentioned anywhere in this plan. These were added later
+   (`player_dynamics_net.py` last substantively touched 2026-09-03, commit
+   "progress") as part of the same general evolution that also produced
+   `widen_player_checkpoint.py` (network-widening-without-losing-training,
+   mirroring `widen_ball_checkpoint.py`), `event_head_smoothing.py`,
+   `latent_stats.py`, and `live_encoder_features.py` (the module that makes
+   live-observation reconstruction for integration purposes 1 and 3
+   possible) — none of which exist in this plan's §1 file layout. The LR
+   cosine-restart scope-cut in §7 does still appear accurate (grepped
+   `train_player_dynamics.py` for cosine/restart — no matches) — that one
+   line of §7 remains correct, only the crossing_head line is now wrong.
+3. **Test count has grown**: §8 says 31 tests; `tests/ai_unit/test_player_
+   physics_pretrain.py` has 70 test functions as of this audit (plus the
+   separate `tests/ai_unit/test_physics_encoder_wiring.py` for integration
+   point 1, and `tests/ai_unit/test_physics_encoder_horizon_accuracy.py`,
+   neither of which existed when this plan was written).
+
+**Recommendation: do not archive as-is** — the plan accurately describes
+the ORIGINAL standalone pipeline (§1-§6, §8-§9 below are still correct as
+historical record of what was built in that pass), but §0 and §7 actively
+mislead a reader about current scope unless read alongside this note.
+Consider either (a) adding a short "see also agent_plans/ball_physics_
+pretrain_plan.md §8 for the live-integration follow-up that superseded
+this plan's scope boundary" pointer and archiving, or (b) leaving open if
+someone intends to fold the post-2026-08-22 additions (new aux heads,
+widening, integration) into this document properly. Either way the
+original pipeline work this plan set out to do is complete and validated.
+
 ## 1. File layout (as built)
 
 ```
@@ -263,11 +333,30 @@ asked for:
   ball-pipeline additions beyond the original design doc's §7 sketch, not
   part of §11's original follow-up scope or the brief's explicit checklist.
   Flat LR throughout.
+  **PARTIALLY SUPERSEDED (as of 2026-10-12 audit):** the `crossing_head`
+  half of this line is no longer accurate — `player_dynamics_net.py` now
+  HAS a `crossing_head` (`Linear(latent_dim, 4)`, matching the ball's own
+  post-split 4-output layout: `pos_x, pos_y, crosses_logit, delta_t`),
+  added sometime after this plan's last commit (file last substantively
+  touched 2026-09-03). Two more heads were added alongside it that this
+  plan never anticipated at all: `goal_dist_delta_head` and `short_
+  horizon_head_0_2s`/`short_horizon_head_1_0s`. The LR cosine-restart half
+  of this line is still accurate — grepped `train_player_dynamics.py` for
+  cosine/restart schedule code, no matches; flat LR confirmed still in use.
 - **`build_adjacent_pair_data` has no "exclude already-resolved episodes"
   filter** — meaningful only under a freeze-on-event rule (§5.1), which
   this pipeline doesn't have.
 
 ## 8. Testing
+
+**UPDATE (2026-10-12 audit):** test count has grown since this was written
+— `tests/ai_unit/test_player_physics_pretrain.py` now has 70 test
+functions (not 31), reflecting coverage added for the new aux heads (§7
+update) and other post-2026-08-22 additions. Two more files now also cover
+this area that didn't exist at plan-writing time: `tests/ai_unit/test_
+physics_encoder_wiring.py` (the live-integration point, see §0 status note)
+and `tests/ai_unit/test_physics_encoder_horizon_accuracy.py`. Original text
+below is kept for historical record of what existed at the time.
 
 `tests/ai_unit/test_player_physics_pretrain.py` (31 tests) mirrors
 `test_ball_physics_pretrain.py`'s structure: episode-gen shape/determinism,

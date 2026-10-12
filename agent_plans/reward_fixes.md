@@ -99,6 +99,139 @@ section below is written to stand alone if you only want to do one.
 
 ---
 
+## 1.5 Status as of 2026-10-12 (verified against current code)
+
+**Summary: §2's bug catalog (the five already-fixed bugs) is still accurate
+and holds up against current code — in one case (§2.5) the fix described
+here was itself superseded by an even better fix 10 days later. The three
+proposed refactors (§4 Refactor A, §5 Refactor B, §6 Refactor C) are
+entirely UNSTARTED — zero code from any of the three exists in the
+codebase today, almost two months after this document was written.** This
+document remains the right starting point for scoping that work as part of
+the planned "big cleanup" pass, but every file:line reference in §4/§5/§6
+is stale (both files have grown substantially since) — see the per-section
+notes below for current locations.
+
+Verification method: grepped/read current `scenario_env.py`,
+`record_demonstrations.py`, `dataset.py`, `reward.py`, and
+`ai/knowledge.md` directly; ran `git log -S` against the specific
+code/comments this document quotes to find and date the relevant commits.
+No reliance on this document's own claims without an independent check
+against current code.
+
+**Bug catalog (§2): all five still fixed, as claimed —**
+- §2.1 (`sec_box_terminal` gate): confirmed present — `sec_box_terminal`
+  (now `scenario_env.py` line ~820) still calls the shared
+  `can_score_box_terminal()` gate (line 823).
+- §2.2 (`debug_value_network.py` duplicate boundary logic): confirmed fixed
+  — the script now calls `ds.episode_row_ranges()` directly and filters via
+  `trainee_valid_idx` (e.g. lines 143, 2744, 2754 of the current
+  `debug_value_network.py`). **One premise is now stale, though:** the
+  document calls this file "gitignored, not part of the package." It is
+  currently a **tracked** file (`git ls-files` includes it) — `.gitignore`
+  briefly held a `debug_*.py` pattern and it was later removed (see
+  `git log -p -- .gitignore`). Doesn't change anything about the fix itself,
+  just the "why this is out of scope for the refactors" framing.
+- §2.3 (`reward_components` additively merged): confirmed fixed —
+  `self.last_secondary_results` entries carry their own
+  `"reward_components": dict(_sec_comps)` (current `scenario_env.py` line
+  ~900), kept separate from `self.last_reward_components`
+  (trainee-only). The merge loop (`for _k, _v in _sec_comps.items():
+  self.last_reward_components[...] = ...get(...) + _v`) this document
+  quotes no longer exists anywhere in the file (confirmed via grep — zero
+  matches). `scenario_env.py` itself now documents this exact bug/fix
+  inline at the `last_secondary_results.append()` call site, so the fix is
+  self-documenting in the code going forward.
+- §2.4 (stale `n_appended` / row misattribution): confirmed fixed —
+  `record_demonstrations.py`'s timed-sample block still computes absolute
+  `_recorded_row_indices = list(range(n_before, n_before + len(_recorded_ids)))`
+  and backfills via `zip(_recorded_ids, _recorded_row_indices)` (current
+  lines ~656-707), with the same reasoning comment this document describes.
+- §2.5 (`_pending_reward` leak): confirmed fixed as described — **and then
+  superseded by a better fix 10 days later.** Commit `dd69dc9` (2026-08-30,
+  "ai blunder fixed and some bugs fixed too...") **removed the
+  `_pending_reward` mechanism entirely**, after discovering the per-episode
+  reset this document describes as "the fix" still left a genuine
+  double-count: the timed-sample row *already* gets its own player's real
+  reward written unconditionally every call (see §2.4's backfill), so
+  `_pending_reward`'s only remaining job — being drained by a *later*
+  kick/tackle callback as "that callback's own reward" — was paying the
+  same reward a second time onto an orphaned row with an empty component
+  breakdown. Confirmed in real data per the current code's own comment
+  (`record_demonstrations.py` lines ~714-734): a genuine `poss=+1.0` row
+  followed six rows later by a duplicate, un-componentized `+1.0` on the
+  kick-callback row. The fix: callback rows now always record `reward=0.0`
+  — there is no "pending" reward left to drain, because nothing defers
+  reward attribution anymore. **This means §0's bug-count framing ("five
+  bugs, fixed") undersells it slightly — bug #5's first fix was itself
+  buggy, and needed a second, structurally different fix** (remove the
+  mechanism, don't just reset it) — worth remembering as a caution for
+  whoever eventually does Refactor B: the "obvious" fix for a leaking
+  accumulator is not always "reset it," sometimes the accumulator itself
+  shouldn't exist.
+- §2.6 (end-to-end sanity tests): both test files still exist unchanged in
+  kind — `tests/ai_scenario/test_record_demonstrations_reward_sanity.py`
+  and `tests/ai_scenario/test_record_demonstrations_row_alignment.py`.
+
+**Refactors A/B/C (§4/§5/§6): none started.** Grepped for every
+distinctive name this document proposes
+(`DrivenPlayerState`, `driven_player_ids`, `PlayerStepResult`,
+`DemonstrationRecorder`, `episode_id` as a stored dataset column) — zero
+matches anywhere in `src/`. Specifically:
+- Refactor A: `scenario_env.py` still has the two independently-coded
+  paths — the trainee's own block inside `step()` (method starts line 367,
+  `reset()` at line 237) and the secondary-player loop
+  (`for pid, pre in sec_pre.items():`, now at line 772, running to ~901).
+  The file has grown to 1317 lines total (masked-action training,
+  action-opportunity flags, gate-reset support, y-canonical/consistency
+  work landed since per `git log`), so **every specific line number in
+  §4.1 is stale** — treat §4's structural description (two parallel paths,
+  same shape) as still accurate; just re-locate by function/method name
+  (`step`, `reset`, `_possession_transition_step` now at line 1199) rather
+  than trusting old line numbers.
+- Refactor B: `record_demonstrations.py`'s `record_episodes()` is still one
+  free function with closures, now spanning lines 148-984 (~836 lines) —
+  i.e. it has **grown**, not shrunk, since the "~480 lines" this document
+  cites, making the testability case in §5.2 arguably stronger today than
+  when written, not weaker.
+- Refactor C: `dataset.py` still has `_DONE_ROWS_PER_EPISODE_BOUNDARY = 2`
+  (line 201) driving `_full_dataset_episode_row_ranges()` (lines ~213-240),
+  and no stored `episode_id`/`player_id` columns anywhere in the `.npz`
+  schema. **Minor additional finding (untested, flagging as an
+  observation, not a confirmed bug):** `dataset.py` line ~1038
+  (`downsample_trivial_stats`'s rare-event-radius exclusion) independently
+  computes its own throwaway `episode_id = np.concatenate([[0],
+  np.cumsum(self._dones[:-1] > 0.5)])` for grouping rows into episodes for
+  that one local check — a fourth instance of ad hoc episode-boundary
+  derivation beyond the three §6.2 already catalogs (debug script,
+  `_full_dataset_episode_row_ranges()`, `compute_returns()`). It looks
+  benign (membership/grouping only, not counting, so the "2 consecutive
+  dones increments by 2" quirk likely doesn't bite the way it did in
+  §2.2's bug — not independently verified by running it against real
+  data) but is exactly the kind of thing Refactor C's `episode_id` column
+  would make unnecessary to write a fifth time.
+
+**Reward VALUES (not plumbing) have changed materially since this
+document was written — out of scope for this document's own stated
+non-goals (§8: "No reward-design changes"), but relevant context for
+anyone reading this alongside the current `reward.py`:** `reward.py`'s
+module docstring now carries a standing "avoid one-off (event-paid)
+rewards" rule, and `gain_possession_bonus`/`loss_of_possession_penalty`
+("poss"/"lpos" in §2.3's own bug writeup) were measured and disabled
+(coefficient 0.0) on 2026-09-20 — see `ai/knowledge.md`'s "Reward design
+rule: avoid one-off (event-paid) rewards unless terminal" and "Possession
+gain/loss reward: real turnovers only" sections, which also document a
+further, independent fix (the "armed-kick auto-fire possession touch" fix)
+to the possession-transition state machine `_possession_transition_step()`
+that §2's bugs don't mention and that postdates this document. This
+document's own bug catalog is about *attribution/plumbing* correctness
+(right reward to the right row), which is orthogonal to and unaffected by
+later *design* changes to what the reward values themselves are — both
+remain individually valid, just worth not conflating when reading this
+document next to the current reward design.
+
+---
+
 ## 2. Bug catalog (detailed, with exact locations) — read this first
 
 This section is the evidence base the rest of the document argues from.
@@ -491,6 +624,13 @@ noticing."
 ---
 
 ## 4. Refactor A — Unify the trainee/secondary-player code path
+
+**STATUS (2026-10-12): NOT STARTED.** No `DrivenPlayerState`/
+`driven_player_ids`/`PlayerStepResult` anywhere in the codebase; the two
+parallel code paths described below still exist, same shape, just at
+different line numbers (`scenario_env.py` is now 1317 lines; `step()`
+starts at line 367, the secondary-player loop at line 772) — see §1.5 for
+verification detail. Still fully relevant for the planned cleanup pass.
 
 ### 4.1 Current state (exact inventory)
 
@@ -963,6 +1103,17 @@ actual behavior contract this refactor must not break:
 
 ## 5. Refactor B — Class-based recorder for `record_demonstrations.py`
 
+**STATUS (2026-10-12): NOT STARTED.** No `DemonstrationRecorder` class
+anywhere in the codebase; `record_episodes()` is still one free function
+with closures, and has grown to ~836 lines (148-984) — bigger than the
+"~480 lines" cited below, not smaller. The specific bug this section's
+motivating example (§2.5) was about has since been fixed a *second*,
+different way (the `_pending_reward` accumulator was deleted outright on
+2026-08-30, not just correctly scoped) — see §1.5 — which doesn't change
+the case for this refactor, but means §5.4's worked example referencing
+`_pending_reward` specifically is now describing a mechanism that no
+longer exists in the code (the general testability argument still holds).
+
 ### 5.1 Current state (exact inventory)
 
 `src/footballcoach/ai/scripts/record_demonstrations.py`'s `record_episodes()`
@@ -1249,6 +1400,15 @@ cost, making them suitable for a tighter dev-loop / pre-commit check.
 ---
 
 ## 6. Refactor C — Explicit row identity in the dataset format
+
+**STATUS (2026-10-12): NOT STARTED.** No stored `episode_id`/`player_id`
+columns in the `.npz` schema or `DemonstrationDataset`;
+`_DONE_ROWS_PER_EPISODE_BOUNDARY = 2` (now `dataset.py` line 201) still
+drives boundary inference. One additional, minor instance of the pattern
+§6.2 describes was found since: `downsample_trivial_stats()` (line ~1038)
+independently re-derives its own local episode grouping via
+`cumsum(dones)` — untested whether it's actually buggy, but it's a fourth
+case of the same "re-derive boundaries locally" shape. See §1.5.
 
 ### 6.1 Current state (exact inventory)
 

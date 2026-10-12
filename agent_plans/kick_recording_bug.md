@@ -10,6 +10,49 @@
 
 ## 0. Status
 
+**Status as of 2026-10-12 (reconciliation pass): still fully open, re-verified
+against current code — nothing in this file has been fixed.**
+
+- `PassOrder.execute` (now `src/footballcoach/orders.py:744`, was `:744`)
+  still fires `on_kick` inline at line 782 (was 782) without touching
+  `_finish_kick`'s bookkeeping fields.
+- `ShootOrder.execute` (now `:1166`, was `:1166`) still does the same at
+  line 1235 (was 1235), after `kick_ball(...)` at line 1220.
+- `Player._finish_kick` is still the only setter of
+  `kicked_this_tick`/`kick_count`/`last_kick_direction`/
+  `last_kick_power_fraction`/`last_kick_spin`, unchanged at
+  `src/footballcoach/entities/player.py:374-403`.
+- `rules_ai.py`'s 4 `ShootOrder(` call sites are still at lines 628, 638,
+  645, 736 (exact match to this doc's `~628/~638/~645/~736`); still zero
+  `PassOrder(` call sites.
+- `bc.py`'s counterfactual label read of `player.kicked_this_tick` is still
+  at line 516 (was 516-529).
+- `scenario_env.py`'s `kicked_this_tick` reads for `trainee_kicks_this_step`/
+  `sec_kicks_this_step` and the possession-transition check are still
+  present (lines 501-509, 585, 595).
+
+**Important distinction from a DIFFERENT, already-fixed bug family**: this
+is NOT the same issue as the "Orders vs execution-network labels boundary"
+bugs documented in `src/footballcoach/ai/knowledge.md` (~line 14, with 4
+sub-bugs marked "fixed 2026-09"). Those bugs were about the BC-label
+counterfactual sandbox reading REAL already-executed Player state instead
+of the counterfactual snapshot/execute/restore result (a "which state are
+we reading" bug, all inside `phase1_labels()`/`phase1_labels_for_player()`).
+This bug is different in kind: it's an engine-level gap where `PassOrder`/
+`ShootOrder.execute()` themselves never populate the `_finish_kick` fields
+at all, counterfactual or real — so even a perfectly-implemented
+counterfactual sandbox reads correct-but-empty fields for a shot/pass, because
+the fields were simply never set by the physics call in the first place.
+`ai/knowledge.md`'s own current text cross-references this file directly
+(`ui/knowledge.md`'s "Action icons" section, ~line 1105-1106: *"a real
+engine bug, written up in `agent_plans/kick_recording_bug.md`... rather than
+worked around here"*), confirming both docs still agree this is open.
+
+**Still genuinely live, not superseded, not stale.** Original investigation
+text preserved below unchanged.
+
+---
+
 **Found, not fixed.** Discovered 2026-09-23 while building an unrelated UI feature (a
 kick/tackle leg-swing animation) and confirming, by tracing a real `Match`, that a
 `PassOrder`-triggered kick launched the ball correctly but never set

@@ -10,6 +10,34 @@
 
 ## 0. Status
 
+> **Status as of 2026-10-12: fully implemented end-to-end, strong archive
+> candidate.** Everything this document specifies — standalone pipeline
+> (§4-7, §9, §10), live-network integration (§8), and the player-dynamics
+> follow-up (§11, in its own `agent_plans/player_physics_pretrain_plan.md`)
+> — is built and verified directly against current code:
+> `src/footballcoach/ai/physics_pretrain/` has 17 modules (more than this
+> doc names — `identity_shortcut.py`, `latent_stats.py`,
+> `live_encoder_features.py`, `physics_value_net.py`,
+> `widen_ball_checkpoint.py`, `widen_player_checkpoint.py`,
+> `event_head_smoothing.py` are all real, additional-to-plan files);
+> `src/footballcoach/ai/models/physics_encoders.py` plus the
+> `DecisionNetwork.forward()`/`ExecutionNetwork.forward()` wiring described
+> in §8.2 exist and match this document's design almost exactly (confirmed
+> against `ai/knowledge.md`'s "Frozen physics-dynamics encoders" section,
+> which cites this plan by name); `ai_config.json["network"]
+> ["ball_physics_encoder_checkpoint"]`/`["player_physics_encoder_checkpoint"]`
+> exist, default `null` (opt-in, as designed); `tests/ai_unit/
+> test_physics_encoder_wiring.py`, `test_physics_encoder_horizon_accuracy.py`,
+> and `test_ball_physics_pretrain.py` all exist. The only thing not yet
+> done is the **known, already-tracked** cross-observation-caching
+> refinement, which has its own separate plan
+> (`agent_plans/physics_encoder_cross_observation_caching_plan.md`) — not a
+> gap in this document. Nothing found during this review contradicts this
+> file's own §0/§12 status notes; they were already accurate going in.
+> **Recommendation: archive this plan (mark done, do not delete/move) —**
+> it is one of the few plans in this repo whose own as-built section
+> turned out to be fully trustworthy end to end.
+
 **Standalone pipeline implemented and in active use** (episode generation,
 dataset, network, training script, auto-generated HTML report — §4-7, §9,
 §10). **§8 (wiring the frozen encoder into `DecisionNetwork`/

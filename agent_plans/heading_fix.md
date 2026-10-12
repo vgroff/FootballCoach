@@ -10,10 +10,48 @@
 
 ## 0. Status
 
-Not started. Flagged as a follow-up from `agent_plans/ball_physics_pretrain_plan.md`
-§11 (the "live-network blind spot adjacent to" the player-dynamics work),
-pulled out into its own plan since it stands alone and doesn't depend on
-that other work landing first.
+**RESOLVED (commit `dd69dc9`, 2026-08-30): fully implemented end-to-end,
+exactly as proposed below.** Verified against current code:
+
+- `PlayerFeatures` has `heading_sin`/`heading_cos` fields, populated
+  unconditionally from `player.heading_rad`
+  (`src/footballcoach/ai/obs/schema.py:122-123`).
+- `obs/encoder.py` computes them directly from `player.heading_rad` (not
+  derived from velocity) at `src/footballcoach/ai/obs/encoder.py:286-287`,
+  passed through at lines 342-343.
+- Both are registered in the flip/mirror machinery:
+  `heading_cos` in `PLAYER_FLIP_X_IDX`, `heading_sin` in `PLAYER_FLIP_Y_IDX`
+  (`src/footballcoach/ai/obs/augment.py:127,140`) — confirming §2.3's
+  prediction that `canonical.py` needs no separate change (it imports these
+  same index lists).
+- Commit `dd69dc9`'s diff to `schema.py` contains the near-verbatim
+  reasoning this doc gives: *"at speed == 0 velocity collapses to (0,0,0)
+  while heading_rad keeps its last real value — exactly the case a prior
+  version of this comment dismissed as 'irrelevant'"* — i.e. this is
+  unambiguously the same fix, not a coincidental parallel change.
+- `ai/knowledge.md`'s "Heading and previous-decision movement intent
+  (PlayerFeatures)" section (~line 1316) is the current living
+  documentation of this feature; it also notes the field was bundled with
+  a `desired_dir_x`/`desired_dir_y` addition in the same commit (not
+  originally part of this plan, landed alongside it).
+
+The retrain cost described in §3 was paid as part of commit `dd69dc9`/the
+surrounding work (checkpoints from before that commit are incompatible with
+`PLAYER_FEATURE_DIM` as it now stands). Testing in §4 — worth a quick check
+that equivalent tests exist in `tests/ai_unit/test_obs_schema.py` /
+`test_obs_encoder.py` before archiving, but the feature itself is live and
+in production.
+
+**This file is a clear archive candidate** — nothing described below is
+still open. Original text kept below for the historical record/reasoning
+trail.
+
+---
+
+Originally: Not started. Flagged as a follow-up from
+`agent_plans/ball_physics_pretrain_plan.md` §11 (the "live-network blind
+spot adjacent to" the player-dynamics work), pulled out into its own plan
+since it stands alone and doesn't depend on that other work landing first.
 
 ---
 

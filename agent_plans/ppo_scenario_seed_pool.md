@@ -3,6 +3,71 @@
 **Status:** Not yet implemented — planning only. Pick this up by reading this
 file in full, then implementing section 3 in order.
 
+---
+
+## Status as of 2026-10-12 (audit pass, documentation-only)
+
+**Overall: the core feature (a growing finite seed pool that reduces PPO
+training-rollout noise) is still NOT implemented — ~0% of sections 3.3-3.5.**
+A different, narrower feature reusing the same low-level primitive (a `seed`
+kwarg) WAS built, for a different purpose, and should be considered a
+**SUPERSEDED** read of section 3.1/3.2 rather than a completion of this plan.
+See the inline annotations below for the section-by-section breakdown. No
+code was changed during this audit — read-only verification against the
+current tree only.
+
+**What actually happened:** `build_1v1_scenario(seed=...)` and
+`ScenarioEnv.reset(*, seed=...)` DO now exist (added commit `a666d97`,
+2026-09-03, as part of a broader "basically done yo" commit — not one that
+references this plan file at all). But they were built to support
+`src/footballcoach/ai/eval/seeded_eval.py` (created commit `67f0375`,
+2026-08-08; extended through `a83a8b1`, 2026-09-15) — a shared **fixed-seed
+evaluation** helper used by `PPOTrainer`'s periodic `[eval vs rules]` block
+and standalone `evaluate.py`, configured via `ai_config.json`'s `eval.
+eval_n_seeds` (currently 115) / `eval.eval_seed_base` (currently 1100000) /
+`eval.swap_sides` (currently `true`). This satisfies (in spirit) section 6's
+"held-out eval seed range" nice-to-have — but note it was built as a
+STANDALONE eval mechanism, not as the disjoint range sitting alongside a
+seeded TRAINING pool as section 6 envisioned. `seeded_eval.py`'s own
+docstring is explicit: *"PPO's own training rollouts are NOT seeded by this
+module — only evaluation call sites use it."* This is the opposite of what
+sections 3.2-3.5 ask for (training-time seeding); the thing that actually
+got built only touches eval.
+
+**Confirmed still missing, by direct grep of current source (2026-10-12):**
+- No `seed_pool_size` attribute anywhere in `scenario_env.py` (no pool-draw
+  `_seed_pool_rng`, no automatic bounded-pool reset behavior — `reset()`'s
+  `seed` kwarg is an explicit per-call override the CALLER must supply, not
+  an internal pool mechanism).
+- No `seed_pool_size_schedule` / `TrainingSchedules.seed_pool()` in
+  `src/footballcoach/ai/ppo/schedules.py` — that file still only has
+  `rng_reduction_schedule` (section 3.4's "mirror" target), and that target
+  itself is **still unwired**: `ai_config.json`'s own `curriculum` block
+  carries `"_comment_todo": "TODO: implement and wire up: rng_reduction_
+  start/end ... Currently not read by any code."` as of this audit — i.e.
+  the pattern this plan explicitly said it would mirror is itself still
+  dead code five-plus commits and two months later. `TrainingSchedules` IS
+  instantiated in `ppo_trainer.py` (line ~1394) but nothing calls
+  `.rng_reduction(progress)` anywhere in that file.
+- No `curriculum.seed_pool_size_start`/`_end` keys in `ai_config.json`.
+- No `env.seed_pool_size = ...` assignment anywhere in `ppo_trainer.py`'s
+  `train()` loop (grepped for `seed_pool`, zero matches in that file).
+- No tests matching section 4: no `test_seed_pool.py`, no `test_scenario_
+  seeding.py`, no `TestBuild1v1ScenarioSeeding`/`TestScenarioEnvSeedPool`/
+  `TestSeedPoolSchedule` classes anywhere under `tests/`.
+- No mention of this plan, "seed pool", or `seed_pool_size` anywhere in
+  `src/footballcoach/ai/knowledge.md` — this plan appears to have been
+  shelved without a follow-up decision being recorded.
+
+**Recommendation:** do NOT archive. The plan is still an accurate forward
+spec for the untouched noise-reduction feature — only its §3.1/3.2
+"foundation" claims need the SUPERSEDED-read caveat added below (the `seed`
+plumbing exists, but wired to eval, not training). If training noise
+reduction is still wanted, sections 3.3-3.5 (schedule + trainer wiring) are
+the entire remaining scope — section 3.1/3.2's groundwork is effectively
+already done, just needs the training-loop seed draw added on top of it
+(careful: must not reuse `eval`'s seed range, see section 6).
+
 ## 1. Context / decision history
 
 Discussed in an agent session on 2026-08-05 (see `training_runs.log` around
@@ -70,6 +135,20 @@ reasoning, in case it needs to be re-litigated:
 ## 3. Implementation steps (in order)
 
 ### 3.1 `build_1v1_scenario()` — add `seed` kwarg
+
+**SUPERSEDED (commit `a666d97`, 2026-09-03):** a `seed: int | None = None`
+kwarg was added to `build_1v1_scenario()` essentially as sketched below
+(now at line ~1501 of `src/footballcoach/ui/scenarios.py`, the function
+itself now starts at line ~1485 — both have drifted from this plan's
+original line numbers). The docstring added for it, however, describes a
+**different purpose** than this plan's: *"Used by the shared seeded-eval
+helper (ai/eval/seeded_eval.py) to replay a fixed set of scenarios for
+pre-training and every rollout's periodic eval... PPO training itself is
+NOT seeded by this — only evaluation call sites pass a seed."* The
+mechanism (one `rng = random.Random(seed)` instance driving every draw) is
+exactly as this plan specified and does fully determine the scenario as
+predicted — only the calling convention/purpose differs from this plan's
+"PPO seed-pool" framing. See the file-level status note above.
 
 File: `src/footballcoach/ui/scenarios.py`, function starts at (as of this
 writing) line 1105.
@@ -173,6 +252,21 @@ since it's a load-bearing assumption for backward compat.)
 
 ### 3.2 `ScenarioEnv` — add `seed_pool_size` + per-reset seed draw
 
+**PARTIALLY DONE / SUPERSEDED (same commit lineage as 3.1, through
+`a83a8b1`, 2026-09-15):** `ScenarioEnv.reset()` DOES now accept a
+keyword-only `seed: int | None = None` (current signature: `def reset(self,
+*, seed: int | None = None) -> ObservationBatch`, ~line 237 of
+`scenario_env.py`), and forwards it into `build_kwargs["seed"]` exactly as
+sketched below. **But there is no `seed_pool_size` attribute, no `_seed_
+pool_rng`, and no internal pool-draw logic at all** — the caller must pass
+an explicit `seed=` value on every `reset()` call it wants pinned; nothing
+inside `ScenarioEnv` ever draws from a bounded pool itself. The actual
+caller (`ai/eval/seeded_eval.py` / `ppo_trainer.py`'s eval env factories)
+passes a seed taken from a fixed, pre-built list (`default_eval_seeds()`),
+not from a `{1..N}` pool growing over training progress. So: the
+`reset(seed=...)` plumbing this section asked for is done; the actual
+pool-size mechanism (the point of this section) is not.
+
 File: `src/footballcoach/ai/env/scenario_env.py`.
 
 **Add to `__init__`** (near the other simple int/float config attrs, e.g.
@@ -267,6 +361,12 @@ before merging).
 
 ### 3.3 `ai_config.json` — pool-size schedule config
 
+**OPEN — not implemented.** No `seed_pool_size_start`/`_end` keys exist in
+`ai_config.json`'s `curriculum` block as of 2026-10-12. (`rng_reduction_
+start`/`_end`, the pattern this was meant to mirror, are also still absent
+— the `curriculum` block carries an explicit `_comment_todo` admitting
+neither is wired up or read by any code.)
+
 Add next to `rng_reduction_start`/`rng_reduction_end` in the `curriculum`
 section (keeping the two annealing concepts co-located, since they're
 philosophically the same kind of curriculum knob — "how much variety does
@@ -291,6 +391,10 @@ doesn't transfer to eval — see section 6's held-out eval seed range for how
 to actually check this).
 
 ### 3.4 `TrainingSchedules` — new schedule function
+
+**OPEN — not implemented.** `src/footballcoach/ai/ppo/schedules.py` has no
+`seed_pool_size_schedule` function and `TrainingSchedules` has no
+`.seed_pool()` method as of 2026-10-12.
 
 File: `src/footballcoach/ai/ppo/schedules.py`.
 
@@ -324,6 +428,11 @@ def seed_pool(self, progress: float) -> int:
 ```
 
 ### 3.5 `PPOTrainer.train()` — wire the schedule into `env.seed_pool_size`
+
+**OPEN — not implemented.** No occurrence of `seed_pool` anywhere in
+`src/footballcoach/ai/ppo/ppo_trainer.py` as of 2026-10-12 (confirmed via
+grep). PPO rollout collection still calls `env.reset()` with no seed at
+all (fully unseeded per episode, prior/current behaviour unchanged).
 
 File: `src/footballcoach/ai/ppo/ppo_trainer.py`, inside the `while
 self._total_steps < total_steps:` loop in `train()`. The loop already
@@ -377,6 +486,14 @@ flag needed. (A future v2 could add one to override the config defaults per
 run, but is not required for the first cut.)
 
 ## 4. Tests to add
+
+**OPEN — none of these were added.** No `test_seed_pool.py`, `test_
+scenario_seeding.py`, or matching test classes exist anywhere under
+`tests/` as of 2026-10-12 (grepped for `seed_pool` and the specific class
+names across the whole `tests/` tree). Tests DO exist for the
+seeded-eval feature that superseded 3.1/3.2 instead: `tests/ai_scenario/
+test_seeded_eval_thread_cap.py`, `tests/ai_scenario/test_batched_seeded_
+eval.py`.
 
 ### 4.1 Unit test: `build_1v1_scenario(seed=N)` determinism
 
@@ -592,6 +709,15 @@ after implementing, before considering this done.
    `load_checkpoint()` — so no new checkpoint field is needed).
 
 ## 6. Follow-up / nice-to-haves (explicitly NOT required for v1)
+
+**Status update:** the held-out eval seed range below WAS effectively
+built — see the file-level status note at the top. `ai_config.json`'s
+`eval.eval_seed_base` (1,100,000) sits well clear of any small training
+pool range this plan might eventually use, so there's no collision risk if
+sections 3.3-3.5 are implemented later — but note the eval range was built
+as a standalone fixed list, not as "disjoint from a training pool" by
+deliberate design (there was no training pool to be disjoint from at the
+time it was built).
 
 - **Held-out eval seed range.** Reserve a disjoint seed range for
   `--eval`-style scripts (e.g. train pool draws from `{1..N}`, eval always

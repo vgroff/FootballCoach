@@ -8,6 +8,24 @@
 > statement at the top of that file. Otherwise documentation goes stale and
 > confusion occurs.
 
+## Status as of 2026-10-12
+
+**Fully implemented end to end, matching §14's record exactly — candidate for archiving.**
+Verified against current code (no commits touched this feature between the 2026-09-21 landing
+commit `0a5f76d` and today): `src/footballcoach/entities/action_opportunity.py` exists
+(`ActionOpportunity`); `ai/env/scenario_env.py` has `_with_opportunity_flags`; `ai/ppo/ppo_trainer.py`
+has `_mask_total_log_probs` (multiple call sites around L8852/8891/9146/9277/9613/10006) and the
+`mask_untriggered_actions`/`log_action_opportunity_stats` config reads at L1519/1521. Both
+`tests/ai_scenario/test_action_opportunity_flags.py` and `tests/ai_scenario/test_masked_action_training.py`
+exist as described in §8/§14. **Notably, `ai_config.json` currently has `mask_untriggered_actions: true`
+and `log_action_opportunity_stats: true` live in the checked-in config** — this isn't just
+implemented, it's the production setting the current training run uses, one step further than the
+plan's own "default false" framing in §9/§10 (expected — §10's "default off" describes how the
+feature ships, not how it's configured once adopted). `knowledge.md`'s "Action-opportunity flags and
+masked action training" section (~L2089) independently documents the same implementation and matches
+§14 almost verbatim. No open items found beyond what §14 already flags as known limits (§14's
+"Known limits" list, D1/D9/D12 longer-term watch items) — nothing else in this plan is stale.
+
 ## 0. Status
 
 **Phases 1 and 3 implemented (2026-09-21, later the same day); Phase 2 folded into Phase 3; Phase 4 = config change

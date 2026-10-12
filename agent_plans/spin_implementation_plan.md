@@ -1,5 +1,43 @@
 # Spin Implementation Plan — Neural AI Kick Spin
 
+> **Status as of 2026-10-12: core freeze (§0) implemented and unchanged;
+> the real redesign (§2-5, §7.2-7.4) is still entirely open.** Verified
+> directly against current code (no commits touched this plan's scope
+> since `41b451f`, 2026-09-08):
+> - `kick_spin` is still a raw, frozen 3-vector head
+>   (`execution_network.py` still has `self.kick_spin = nn.Linear(trunk_hidden, 3)`,
+>   `ppo_trainer.py`'s `self._kick_spin_frozen: bool = True` is still set
+>   and still gates every log_prob/entropy site §0.3 describes); no
+>   `kick_spin_axis`/`kick_spin_magnitude` symbol exists anywhere in
+>   `src/`. `apply_nn_action.py` still hardcodes
+>   `player.kick_armed_spin = Vector3.zero()` on the neural path. §2's
+>   redesign, §3's config keys, and §4's BC-loss rewrite are **all still
+>   unimplemented** — `bc.py` still computes the old flat 3-vector MSE
+>   (`pred_spin = exec_heads.kick_spin / _SPIN_NN_NORM_RAD_S`), confirming
+>   §7.4's conflation is also still live.
+> - **§6's follow-up DID land**, ahead of the spin redesign itself:
+>   commit `a9cf5c6` (2026-09-23, "PPO: kick_power/kick_dir-only entropy
+>   weights...") gave `kick_power` a real `SquashedNormalHead`
+>   (`PPOTrainer._kick_power_head()`, `execution_network.py`'s
+>   `kick_power_log_std` is now live, sampled, and carries a log_prob/
+>   entropy contribution throughout `ppo_trainer.py`) — exactly the fix
+>   §6 describes, done as its own separate change as §6 recommended. This
+>   plan's §1.3 table and §6 section are now **stale for `kick_power`
+>   specifically** (superseded) even though `kick_spin` itself is
+>   unaffected.
+> - §7.2's divergence is now **worse, not better**: `KickingParams`
+>   dataclass defaults are still `max_spin_base_rad_s=8.0`/
+>   `max_spin_precision_scale=0.2`, but live `physics.json` now reads
+>   `20.0`/`35.0` (was `12.0`/`25.0` when this plan was written) — a ~175x
+>   gap on the precision-scale term, up from 125x. Still only reachable if
+>   `physics.json` is missing the key, so still non-live, but the maintenance
+>   trap flagged in §7.2 has gotten worse with time, not better.
+> - Overall: do not archive this plan. The large §2-§5 redesign (axis+
+>   magnitude heads, per-row `kick_precision` BC plumbing, augmentation
+>   pseudovector handling) is the part that still needs doing; §0's freeze
+>   is holding steady and doesn't need to be touched until someone actually
+>   picks the redesign up.
+
 > **STALE NOTE (post von-Mises migration):** this plan proposes reusing
 > `DirectionHead` (isotropic Gaussian on a raw unit vector) for a new
 > `kick_spin_axis` head. `move_direction`/`kick_direction` no longer use
@@ -1078,6 +1116,19 @@ uv run python -m footballcoach.ai.scripts.train \
 
 ## 6. Follow-up: `kick_power` has the exact same deterministic-sampling bug
 
+**DONE (commit `a9cf5c6`, 2026-09-23 — "PPO: kick_power/kick_dir-only
+entropy weights, fractional eval snapshot lookbacks, eval budget trim,
+vf_coef bump"):** `kick_power` now has a real `SquashedNormalHead`
+(`PPOTrainer._kick_power_head(raw_mean, log_std_param)`, grep
+`ppo_trainer.py` — used at every rollout-collection, `_ppo_update()`
+recomputation, entropy-bonus, and diagnostic site this plan's §2.3/§3
+sketch for `kick_spin_magnitude`). `kick_power_log_std` is a live,
+trained parameter, not an orphan. Implemented independently of (and
+before) the `kick_spin` redesign in §2-§5, exactly as recommended below.
+This plan's own §1.3 table is now stale for the `kick_power` row
+specifically — that row should read "Yes" for both "sampling
+distribution" and "used in ratio/KL", not "Deterministic"/"No".
+
 This plan focused on `kick_spin` because that's what was asked about, but
 §1.3's table shows `kick_power` is in an identical state: a
 `kick_power_log_std` parameter exists
@@ -1178,6 +1229,11 @@ change — just don't let the two uses get re-coupled in a future edit.
 
 ## 8. Summary checklist
 
+**Status as of 2026-10-12**: only the first (pre-existing) item and the
+last (kick_power follow-up, §6) are done; everything else below — the
+entire §2-§5 redesign — is still open, unchanged since this plan was
+written.
+
 - [x] **Immediate**: hardcode `spin=Vector3.zero()` on the neural kick
       path in `apply_nn_action.py` (done as part of this planning pass).
 - [ ] Add `kick_spin_axis` (unit **2**-vector head, coefficients over the
@@ -1226,6 +1282,7 @@ change — just don't let the two uses get re-coupled in a future edit.
 - [ ] Start a **fresh** training run (no `--latest-pretrain`/
       `--from-pretrained`/`--checkpoint` pointing at a pre-change
       checkpoint — the execution network's parameter shapes changed).
-- [ ] Follow-up (separate PR): apply the identical
+- [x] Follow-up (separate PR): apply the identical
       sample/log_prob/entropy fix to `kick_power` (§6) — it has the exact
-      same deterministic-sampling bug today.
+      same deterministic-sampling bug today. **DONE, commit `a9cf5c6`,
+      2026-09-23 — see §6's updated note.**

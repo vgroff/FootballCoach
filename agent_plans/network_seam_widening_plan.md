@@ -8,6 +8,43 @@
 > statement at the top of that file. Otherwise documentation goes stale and
 > confusion occurs.
 
+## Status as of 2026-10-12
+
+**Still not started for this plan's actual target — 0% implemented against
+`DecisionNetwork`/`ExecutionNetwork`.** `git log --since=2026-09-17 -- ai/models/decision_network.py
+ai/models/execution_network.py ai/models/entity_encoder.py` returns no commits: none of §2-§5's
+widening recipe, no `widen_checkpoint.py` script, no `ai_config.json` width changes, no tests from §7.
+§6's open scope questions are still open; nothing below this line needs a DONE/PARTIALLY DONE marker
+because nothing has moved.
+
+**However, the exact Net2WiderNet recipe this plan describes (§2) was already proven out elsewhere in
+this codebase, both before this plan was written and independently of it**: `ai/physics_pretrain/
+widen_ball_checkpoint.py` and `ai/physics_pretrain/widen_player_checkpoint.py` (first committed
+2026-08-20/2026-08-22/2026-08-25, i.e. *before* this plan's 2026-09-17 write-up) implement the identical
+"random-init the producing side, zero-init the consuming side" rule for widening the standalone
+`ai/physics_pretrain/` dynamics autoencoders (`BallDynamicsAutoencoder`/`PlayerDynamicsAutoencoder` —
+a different pair of networks from `DecisionNetwork`/`ExecutionNetwork`, pretrained ball/player physics
+encoders, not the main policy/value nets this plan targets). Their module docstrings describe the same
+incoming-random/outgoing-zero split as this plan's §2, including the same "zeroing the wrong side kills
+the unit via `ReLU'(0)==0`" failure mode this plan calls out. This is useful precedent/validation that
+the general technique works end-to-end in this codebase (and a possible reference implementation to
+borrow structure from for a future `widen_checkpoint.py`), but it does **not** touch
+`decision_network.py`/`execution_network.py`/`entity_encoder.py` and does nothing for this plan's actual
+scope — it should not be read as partial progress on this plan.
+
+**New fact relevant to §3.2's "not an exact fit" discussion, not in this plan's original scope,
+cross-referenced per request:** `decision_network.py`'s `pass_target_logits`/`tackle_target_logits`/
+`mark_target_logits` heads (current lines 130-132: `nn.Linear(trunk_hidden, MAX_OTHER_PLAYERS)`) are a
+**third** category of "not a clean widening target," alongside §3.2's LayerNorm/attention case — see the
+new §3.3 below. This was found and documented (2026-10-xx, uncommitted at the time of this note) in
+`tests/ai_unit/test_entity_encoder_permutation.py`, which formally pins the raw per-slot logits as
+non-invariant under slot permutation, and confirms the non-invariance is currently behaviorally inert
+only because every phase today has at most one unmasked candidate target. It does not block §3.1's
+MLP-widening targets (widening `trunk_hidden` only adds zero-init *input* columns to these heads per §4.2
+step 3, which is still exactly function-preserving regardless of this issue), but it matters directly for
+this plan's eventual motivation (more players per side) and for anyone later widening `MAX_OTHER_PLAYERS`
+itself, which is a structurally different operation these per-slot `Linear` heads are not built for.
+
 ## 0. Status
 
 **Not started — planning only.** Written up on request so the design is
@@ -131,6 +168,55 @@ hidden widths are safe, "v1" widening targets:
 widening is a real, separate, higher-effort project (approximate at best,
 without a more involved LayerNorm-aware or head-count-aware construction)
 and should not block getting value out of the easy, exact cases first.
+
+### 3.3 Added 2026-10-12 — a third non-fit: the per-slot-indexed target heads
+
+**Not part of the original plan text; added during the 2026-10-12 documentation reconciliation pass
+because it bears directly on this plan's scope and motivation.**
+
+`decision_network.py`'s `pass_target_logits`, `tackle_target_logits`, and `mark_target_logits` (currently
+lines 130-132) are plain `nn.Linear(trunk_hidden, MAX_OTHER_PLAYERS)` layers — **not** permutation-invariant,
+unlike every other head in this network. Every other head (including the main `EntityEncoder` attention
+pool and, since its own fix, `ValueAiTypeSideChannel` — see §3.2's sibling fix referenced in
+`ai/models/value_side_channel.py`) computes its output through a shared per-slot MLP + masked attention
+pool, so which physical player occupies which slot index never changes the result. These three heads instead
+give each output slot index its own independently-learned weight row: the raw logit "for whichever player
+is in slot 5" is a different learned number from "for whichever player is in slot 17," regardless of which
+physical player sits in either slot.
+
+**Currently dormant/harmless**, exactly as it is for `ValueAiTypeSideChannel`'s predecessor bug: every phase
+today has at most one valid (unmasked) candidate per decision, and `MaskedCategorical` assigns probability
+1.0 to the one valid slot regardless of its raw logit value (softmax of `[L_valid, -inf, -inf, ...]` = 1.0
+on the valid slot no matter what `L_valid` is) — so sampling/log-prob/entropy are unaffected today. This is
+now a formally pinned regression test, not just an observation: `tests/ai_unit/test_entity_encoder_permutation.py`
+(`TestTargetLogitsKnownNonInvariance`, 5 tests total in the file, passing) asserts both halves — the raw
+logits DO differ by slot, and the resulting masked distribution is nonetheless degenerate/inert in the
+single-candidate case — specifically so a future fix (or regression) doesn't silently go unnoticed.
+
+**Why this belongs in a widening/capacity plan, not just a bug list:** it would become a REAL bug, not just
+a latent asymmetry, the moment a phase has two or more simultaneously-valid targets for `pass_target_logits`/
+`tackle_target_logits`/`mark_target_logits` — i.e. almost immediately once player counts increase beyond 1v1,
+which is this plan's own stated motivation (§1's broader context is "more capacity for continued training,"
+and the capacity need is driven by the planned move to more players per side / more phases). Two consequences
+for anyone later acting on this plan's scope:
+
+1. **Does not block §3.1's v1 MLP-widening targets.** Widening `trunk_hidden`, `self_mlp_hidden`,
+   `ball_mlp_hidden`, `global_mlp_hidden`, or `decision_mlp_hidden` per §2/§4 only ever touches these three
+   heads' *input* columns (new zero-init columns reading the widened trunk, per §4.2 step 3) — never their
+   output axis (`MAX_OTHER_PLAYERS`, unaffected by any width in §3.1's list) or their per-slot-independence
+   structure. The §2 recipe remains exactly function-preserving for these heads under every widening target
+   this plan actually scopes to.
+2. **Does matter the moment anyone widens `MAX_OTHER_PLAYERS` itself** (not currently any part of this
+   plan's §3.1/§3.2 scope, but a near-certain requirement of the "more players per side" work this plan is
+   explicitly meant to prepare for — see the parallel planning doc on that broader extension). Growing
+   `MAX_OTHER_PLAYERS` for these three heads is just "add more independent output rows," which is
+   function-preserving in isolation (new rows start meaningless but don't perturb old ones) — but it does
+   nothing to fix the underlying non-permutation-invariance, and a phase with real multi-candidate targets
+   would then need these heads rebuilt on the `EntityEncoder`-style shared-MLP + attention-pool pattern (the
+   same fix already applied to `ValueAiTypeSideChannel`), which is a different, structurally larger change
+   than anything in this plan's current scope. Not this plan's job to fix — flagging so it isn't mistaken for
+   already covered by §3.1-§3.2's "where this is/isn't an exact fit" analysis, which doesn't mention these
+   heads at all.
 
 ## 4. Implementation complexity specific to this codebase
 
