@@ -803,7 +803,11 @@ def _rules_vs_rules_env_worker_factory(
             description="rules vs rules, trainee AI swappable for tackle-angle experiment",
             build=_b,
         )
-        return ScenarioEnv(definition=defn, trainee_player_id="trainee", phase=1, secondary_player_ids=[])
+        from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+        return ScenarioEnv(
+            definition=defn, trainee_player_id="trainee", phase=1, secondary_player_ids=[],
+            max_episode_s=float(PHASES_BY_ID[1].env_kwargs["max_episode_s"]),
+        )
 
     return _env_factory, None
 

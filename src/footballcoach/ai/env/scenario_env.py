@@ -11,7 +11,7 @@ data for the trainee; ``env.last_secondary_results`` holds the same for
 any secondary neural players.
 
 API:
-    env = ScenarioEnv(definition, trainee_player_id="kicker", phase=1)
+    env = ScenarioEnv(definition, trainee_player_id="kicker", phase=1, max_episode_s=120.0)
     obs = env.reset()
     obs, reward, done, info = env.step()
 """
@@ -81,7 +81,23 @@ class ScenarioEnv:
         trainee_player_id: The player_id of the AI player being trained.
         phase: Curriculum phase (1 or 2) - selects the reward function.
         rng_reduction: Physics randomness level (updated by the trainer).
-        max_episode_s: Maximum episode duration in sim-seconds.
+        max_episode_s: Maximum episode duration in sim-seconds. REQUIRED, no
+            default -- this used to default to 120.0, which silently diverged
+            from the real curriculum value (ai_config.json
+            curriculum.phase1_max_episode_s, 22s as of this writing) at any
+            call site that forgot to pass it explicitly. That exact gap
+            caused two separate, real bugs this session: NeuralPlayerAI
+            instances (rules_ai.py) built with the stale 120.0 default fed a
+            wrong "time remaining" observation feature from tick 0, and a
+            standalone comparison script silently ran 5.4x longer episodes
+            than real training/eval ever does, invalidating its outcome
+            distribution (near-zero timeouts vs a real few-percent rate).
+            Forcing every caller to choose this value explicitly (usually by
+            threading through whatever produced it, e.g. an existing env's
+            own ``max_episode_s``, or curriculum/phases.py's
+            ``_phase1_max_episode_s()``) is the real fix -- not a bigger
+            default, which would just move the silent-mismatch risk
+            elsewhere.
         linger_s: How long to wait after trial ends before resetting.
         rng: Random for obs slot shuffling.
         secondary_player_ids: Additional player IDs to drive with the neural
@@ -94,9 +110,10 @@ class ScenarioEnv:
         self,
         definition: ScenarioDefinition,
         trainee_player_id: str,
+        *,
+        max_episode_s: float,
         phase: int = 1,
         rng_reduction: float = 0.3,
-        max_episode_s: float = 120.0,
         linger_s: float = 0.0,
         rng: Optional[random.Random] = None,
         secondary_player_ids: Optional[list] = None,

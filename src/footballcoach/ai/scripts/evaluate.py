@@ -375,7 +375,11 @@ def _baseline_env_worker_factory(opponent: str = "rules") -> tuple:
             build=_build,
             on_tick=None,
         )
-        return ScenarioEnv(definition=defn, trainee_player_id="trainee", phase=1, secondary_player_ids=[])
+        from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+        return ScenarioEnv(
+            definition=defn, trainee_player_id="trainee", phase=1, secondary_player_ids=[],
+            max_episode_s=float(PHASES_BY_ID[1].env_kwargs["max_episode_s"]),
+        )
 
     return _env_factory, None
 

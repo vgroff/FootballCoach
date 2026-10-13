@@ -17,7 +17,7 @@ Usage:
     from footballcoach.ai.env.scenario_env import ScenarioEnv
     from footballcoach.ui.scenarios import SCENARIOS
 
-    env = ScenarioEnv(SCENARIOS[0], trainee_player_id="kicker", phase=1)
+    env = ScenarioEnv(SCENARIOS[0], trainee_player_id="kicker", phase=1, max_episode_s=120.0)
     trainer = PPOTrainer.from_config()
     trainer.train(env, total_steps=500_000)
 """
