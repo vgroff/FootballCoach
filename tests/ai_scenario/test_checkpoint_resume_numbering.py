@@ -25,9 +25,24 @@ layers:
      earlier resume that started from a bad count before fix (1) existed) --
      restoring that stale value is "correct" per the loaded dict but still
      wrong in absolute terms, and resuming from it again collides with and
-     overwrites real existing checkpoint{N}.pt history. Fixed by cross-
-     checking the restored value against the highest checkpoint{N}.pt
-     actually present in checkpoint_dir and using whichever is higher.
+     overwrites real existing checkpoint{N}.pt history. The first fix for
+     this cross-checked the restored value against the highest
+     checkpoint{N}.pt actually present in checkpoint_dir and took whichever
+     was higher -- but only when ``checkpoint_dir.exists()``.
+  4. That ``.exists()`` guard broke the OPPOSITE, equally real case: starting
+     a genuinely NEW, not-yet-created checkpoint_dir from an OLD checkpoint
+     (e.g. a fresh run318 directory, seeded from run317's final checkpoint,
+     specifically to get clean numbering after run317 had its own earlier
+     resume incident). The new directory doesn't exist yet at the point
+     load_checkpoint() runs, so the cross-check was skipped entirely and the
+     stale embedded count won by default, silently carrying old numbering
+     into a directory that should have started fresh at checkpoint1.pt --
+     breaking every eval.neural_snapshot_lookbacks entry that depends on
+     low-numbered files for the entire length of the new run. Fixed by
+     dropping the embedded value entirely: checkpoint_count is now driven
+     ONLY by the highest checkpoint{N}.pt physically on disk in
+     checkpoint_dir (0 for an empty or nonexistent directory), which is
+     simpler and correct for all three scenarios at once.
 
 See agent_plans/more_players_extension_readiness.md for the original
 incident writeup.
@@ -114,3 +129,33 @@ class TestCheckpointCountRestore:
         # true on-disk max) must survive untouched.
         untouched = torch.load(tmp_path / "checkpoint3.pt", map_location="cpu", weights_only=False)
         assert untouched["step"] == 300
+
+    def test_fresh_directory_resets_count_despite_high_embedded_value(self, tmp_path):
+        """The exact incident this fix addresses: resuming from an OLD
+        checkpoint (high embedded checkpoint_count, e.g. 592 from a prior
+        run) into a BRAND NEW checkpoint_dir that doesn't exist on disk yet.
+        Numbering must reset to 0 (next save = checkpoint1.pt) -- not
+        silently carry the old run's count forward, which would make every
+        low-numbered-checkpoint-dependent eval lookback unreachable for the
+        entire new run."""
+        old_dir = tmp_path / "old_run"
+        trainer = PPOTrainer.from_config(checkpoint_dir=old_dir)
+        for step in range(100, 60000, 100):
+            trainer._save_checkpoint(step=step)
+        assert trainer._checkpoint_count == 599
+        old_final = old_dir / "checkpoint599.pt"
+        assert old_final.exists()
+
+        new_dir = tmp_path / "brand_new_run"
+        assert not new_dir.exists()
+        resumed = PPOTrainer.from_config(checkpoint_dir=new_dir)
+        resumed.load_checkpoint(old_final)
+
+        assert resumed._total_steps == 59900  # weights/step still trusted from the file
+        assert resumed._checkpoint_count == 0  # NOT 599 -- fresh directory, fresh numbering
+        assert resumed._log_file_handler is not None
+        assert resumed._log_file_handler.baseFilename.endswith("training_log1.txt")
+
+        resumed._save_checkpoint(step=60000)
+        assert (new_dir / "checkpoint1.pt").exists()
+        assert not (new_dir / "checkpoint600.pt").exists()

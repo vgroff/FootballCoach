@@ -11618,40 +11618,53 @@ class PPOTrainer:
                     "(network weights still loaded normally)."
                 )
         self._total_steps = ckpt["step"]
-        # Restore the checkpoint{N}.pt / training_log{N}.txt numbering counter too --
-        # without this, resuming a killed/crashed run from a --checkpoint path (as
-        # opposed to never-interrupted continuous training, where this lives in
-        # memory the whole time) silently reset it to 0, so the new process
-        # overwrote checkpoint1.pt, checkpoint2.pt, ... from scratch instead of
-        # continuing at the saved value. Logs were spared actual data loss only
-        # because FileHandler appends rather than truncates; checkpoint{N}.pt files
-        # are plain torch.save() overwrites with no such protection. .get() with the
-        # current value as default for checkpoints saved before this field existed.
-        self._checkpoint_count = ckpt.get("checkpoint_count", self._checkpoint_count)
-        # Defend against the loaded checkpoint's OWN checkpoint_count being itself
-        # stale/wrong, not just missing -- confirmed to happen in practice: a prior
-        # resume that itself started from a bad count (e.g. the restore above not
-        # existing yet) saves forward from that bad baseline, so its checkpoints'
-        # embedded metadata isn't trustworthy on its own even once this field is
-        # always present. Cross-check against the highest checkpoint{N}.pt actually
-        # on disk in this directory and take whichever is higher, so a resume can
-        # only ever advance past true existing history, never silently restart
-        # inside it and overwrite old files again.
+        # checkpoint{N}.pt / training_log{N}.txt numbering is driven ENTIRELY by
+        # what's physically on disk in THIS checkpoint_dir -- never by the loaded
+        # checkpoint's own embedded "checkpoint_count" field. Two real incidents
+        # this session, in order:
+        #   1. load_checkpoint() didn't restore checkpoint_count at all, so
+        #      resuming a killed/crashed run from a --checkpoint path (as opposed
+        #      to never-interrupted continuous training, where this lives in
+        #      memory the whole process lifetime) silently reset it to 0 -- the
+        #      new process overwrote checkpoint1.pt, checkpoint2.pt, ... from
+        #      scratch instead of continuing at the saved value.
+        #   2. The fix for (1) (restoring the embedded value, cross-checked
+        #      against on-disk files ONLY when self.checkpoint_dir.exists())
+        #      still broke the OPPOSITE case: launching a genuinely NEW,
+        #      not-yet-created checkpoint_dir from an OLD checkpoint (e.g.
+        #      starting run318 from run317's final checkpoint592.pt, specifically
+        #      to get a clean numbering restart after run317 had its own earlier
+        #      resume incident). Since the new directory doesn't exist yet at
+        #      this point, ``self.checkpoint_dir.exists()`` was False, so the
+        #      whole cross-check was skipped and the stale embedded value (592)
+        #      won by default -- silently carrying old numbering into a directory
+        #      that should have started fresh at checkpoint1.pt, breaking every
+        #      eval.neural_snapshot_lookbacks entry that depends on low-numbered
+        #      files (_resolve_snapshot_lookback's "original" and large-fraction
+        #      lookbacks) for the entire length of the new run, since those
+        #      checkpoint numbers now point below the directory's actual range
+        #      and will keep doing so until the count grows past where the old
+        #      run left off.
+        # The embedded field is NEVER read now -- on_disk_max alone (0 for an
+        # empty or not-yet-existing directory, matching every "start a genuinely
+        # new run" case the same way an empty tmp_path does in the regression
+        # tests) is both simpler and correct for all three real scenarios: resume
+        # in the SAME directory (on-disk files ARE the true history), a directory
+        # with gaps from a prior cleanup (on-disk files are still the only
+        # trustworthy source), and a brand-new directory (0, correctly resets).
+        on_disk_max = 0
         if self.checkpoint_dir is not None and self.checkpoint_dir.exists():
-            on_disk_max = 0
             for p in self.checkpoint_dir.glob("checkpoint*.pt"):
                 _n = p.stem.removeprefix("checkpoint")
                 if _n.isdigit():
                     on_disk_max = max(on_disk_max, int(_n))
-            if on_disk_max > self._checkpoint_count:
-                log.warning(
-                    f"Loaded checkpoint's own checkpoint_count ({self._checkpoint_count}) "
-                    f"is behind the highest checkpoint{{N}}.pt actually on disk in "
-                    f"{self.checkpoint_dir} (checkpoint{on_disk_max}.pt) -- using "
-                    f"{on_disk_max} instead so this resume can't overwrite existing history."
-                )
-                self._checkpoint_count = on_disk_max
-        log.info(f"Loaded checkpoint: {path} (step {self._total_steps}, checkpoint_count {self._checkpoint_count})")
+        if self.checkpoint_dir is not None:
+            self._checkpoint_count = on_disk_max
+        log.info(
+            f"Loaded checkpoint: {path} (step {self._total_steps}, checkpoint_count "
+            f"{self._checkpoint_count} -- from on-disk state in {self.checkpoint_dir}, "
+            f"not the checkpoint's own embedded value)"
+        )
         # __init__ already called _rotate_log_file() once, before this method ever
         # runs, using _checkpoint_count's constructor-time value of 0 -- so without
         # this second call, the just-restored count above only fixes FUTURE
