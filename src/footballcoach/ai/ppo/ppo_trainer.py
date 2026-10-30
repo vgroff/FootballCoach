@@ -243,27 +243,14 @@ def _scale_decision_heads_grad(d_heads: DecisionHeadsRaw, coef: float) -> Decisi
 # Reward component short-key → display label mapping (order = display order).
 # Used by both the per-rollout log and the pre-training diagnostic in train.py.
 REWARD_COMP_LABELS: list[tuple[str, str]] = [
-    ("appr",  "approach"),
-    ("retr",  "retreat"),
-    ("appr_sq", "approach_speed"),
-    ("hdg",   "heading"),
-    ("poss",  "get_possession"),
-    ("prog",  "progress"),
-    ("lpos",  "lose_possession"),
     ("out",   "ball_out"),
-    ("ill",   "illegal"),
     ("box",   "box_possession"),
     ("spd",   "speed_bonus"),
     ("lterm", "opponent_box"),
     ("tout",  "timeout"),
-    ("prox",  "proximity_bonus"),
-    ("step",  "step_penalty"),
-    ("stam",  "stamina_penalty"),
     ("sprint", "sprint_penalty"),
-    ("tack",  "tackle_armed_penalty"),
-    ("tatt",  "tackle_attempted_bonus"),
-    ("karm",  "kick_armed_penalty"),
-    ("katt",  "kick_attempted_bonus"),
+    ("appr",  "approach"),
+    ("prog",  "progress"),
 ]
 
 # Execution-network head name -> nn.Module attribute name, used for the

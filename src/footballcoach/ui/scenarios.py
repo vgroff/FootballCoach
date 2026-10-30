@@ -2435,28 +2435,6 @@ class ScenarioLoop:
             )
         return outcome
 
-    def _ball_dist_to_box(self, player_id: str) -> float:
-        """2D shortest distance from the ball to *player_id*'s ATTACKING
-        box -- mirrors ScenarioEnv._ball_dist_to_opponent_box()'s formula
-        exactly (same rx_min/rx_max/half_box_w rectangle-distance calc), for
-        the "prox" term in phase1_terminal_reward_only(). Not cached (unlike
-        that method) since this only ever runs once per trial, at the
-        instant its outcome is detected."""
-        try:
-            player = self._match.player_by_id(player_id)
-            ball = self._match.ball.position
-            pitch = self._match.pitch
-            half_box_w = pitch.box_width_m / 2.0
-            if player.team == Team.LEFT:
-                rx_min, rx_max = pitch.half_length - pitch.box_length_m, pitch.half_length
-            else:
-                rx_min, rx_max = -pitch.half_length, -pitch.half_length + pitch.box_length_m
-            dx = max(rx_min - ball.x, 0.0, ball.x - rx_max)
-            dy = max(-half_box_w - ball.y, 0.0, ball.y - half_box_w)
-            return float(math.hypot(dx, dy))
-        except (KeyError, AttributeError):
-            return 9999.0
-
     def _compute_terminal_rewards(self, outcome: str) -> dict[str, float] | None:
         """Terminal-only reward approximation for both named phase-1 roles
         ("trainee" and "opponent" -- see phase1_terminal_reward_only()),
@@ -2467,9 +2445,9 @@ class ScenarioLoop:
         Known limitation: if this scenario's outcome_remap() maps
         box_possession/opponent_box_possession/timeout to something else,
         this can't recognise it and silently falls through to "no terminal
-        component fires" (step/stam/ill only) for that trial -- a safe
-        degradation, not a crash, but see phase1_terminal_reward_only()'s
-        own docstring for why this is an approximation regardless.
+        component fires" for that trial -- a safe degradation, not a crash,
+        but see phase1_terminal_reward_only()'s own docstring for why this
+        is an approximation regardless.
         """
         trainee_id = self.definition.phase1_trainee_player_id
         if trainee_id is None:
@@ -2484,25 +2462,20 @@ class ScenarioLoop:
         out: dict[str, float] = {}
         for role_id in (trainee_id, "opponent"):
             try:
-                player = match.player_by_id(role_id)
+                match.player_by_id(role_id)
             except KeyError:
                 continue
             is_trainee = role_id == trainee_id
             reached_box = outcome == ("box_possession" if is_trainee else "opponent_box_possession")
             opp_reached_box = outcome == ("opponent_box_possession" if is_trainee else "box_possession")
             ball_out = outcome in ("miss", "goal") and toucher_id == role_id
-            last_transition = getattr(player.ai, "last_transition", None)
-            illegal = bool(last_transition and last_transition.get("illegal_action", False))
             total, _comps = phase1_terminal_reward_only(
                 reached_opponent_box_with_possession=reached_box,
                 opponent_reached_trainee_box=opp_reached_box,
                 timed_out=timed_out,
                 ball_went_out_after_touch=ball_out,
-                illegal_action_attempted=illegal,
                 cfg=cfg,
                 time_fraction_remaining=time_frac,
-                ball_dist_to_opponent_box_m=self._ball_dist_to_box(role_id),
-                stamina_used=1.0 - player.stamina,
             )
             out[role_id] = total
         return out

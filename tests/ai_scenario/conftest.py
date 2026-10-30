@@ -91,3 +91,43 @@ def _cap_eval_parallelism_and_shrink_networks():
             net_cfg.pop(k, None)
         else:
             net_cfg[k] = v
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _disable_mask_untriggered_actions_for_generic_trainers():
+    """ppo.mask_untriggered_actions (live config: true) is only implemented
+    for curriculum phases that freeze pass/tackle/mark (PPOTrainer.
+    _opp_head_mask_matrix() raises NotImplementedError otherwise -- see
+    ai_trainer_knowledge.md / the masked-action-training plan). The generic
+    PPOTrainer.from_config() fixtures all over this directory build a trainer
+    with every head trainable (no curriculum phase applied), so picking up
+    the live value here makes any of them that reach _ppo_update() trip that
+    guard -- nothing to do with what they're each actually testing.
+
+    SESSION-scoped (not folded into _cap_eval_parallelism_and_shrink_networks
+    above, which is function-scoped): several test modules in this directory
+    (e.g. test_val_episode_split.py) build their shared PPOTrainer in a
+    scope="module" fixture, and pytest sets up broader-scope fixtures BEFORE
+    narrower-scope ones -- a function-scoped override here would run AFTER
+    that module-scoped trainer already baked in the live config value at
+    construction time, too late to matter. Session scope guarantees this
+    runs before any fixture in this directory, module-scoped or not.
+
+    Dedicated coverage for the masking feature itself
+    (test_masked_action_training.py) sets ``trainer.mask_untriggered_actions``
+    directly on its own trainer instances AFTER freezing the right heads,
+    bypassing this config value entirely, so it's unaffected by the override
+    below.
+    """
+    cfg = load_ai_config()
+    ppo_cfg = cfg.setdefault("ppo", {})
+    had_mask_key = "mask_untriggered_actions" in ppo_cfg
+    original_mask = ppo_cfg.get("mask_untriggered_actions")
+    ppo_cfg["mask_untriggered_actions"] = False
+
+    yield
+
+    if had_mask_key:
+        ppo_cfg["mask_untriggered_actions"] = original_mask
+    else:
+        ppo_cfg.pop("mask_untriggered_actions", None)

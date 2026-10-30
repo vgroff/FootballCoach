@@ -10,11 +10,9 @@ import pytest
 
 from footballcoach.ai.env.reward import (
     EMAFilter,
-    cumulative_clamped_delta,
     phase1_reward,
     phase1_terminal_reward_only,
     phase2_reward,
-    symmetric_clamp,
 )
 
 # Load the actual coefficients from config so the tests stay in sync
@@ -25,164 +23,48 @@ _CFG2 = load_ai_config()["reward"]["phase2"]
 
 
 # ---------------------------------------------------------------------------
-# cumulative_clamped_delta / symmetric_clamp
-# ---------------------------------------------------------------------------
-
-class TestSymmetricClamp:
-
-    def test_none_passthrough(self):
-        assert symmetric_clamp(None) == (None, None)
-
-    def test_returns_max_then_min_order(self):
-        """Must match cumulative_clamped_delta()'s (clamp_max, clamp_min)
-        param order — regression test for a bug where this returned
-        (-clamp, +clamp) i.e. (min, max), which made clamp_max < clamp_min
-        and silently collapsed every clamped term (e.g. 'prog') to 0."""
-        clamp_max, clamp_min = symmetric_clamp(0.5)
-        assert clamp_max == pytest.approx(0.5)
-        assert clamp_min == pytest.approx(-0.5)
-        assert clamp_max > clamp_min
-
-
-class TestCumulativeClampedDelta:
-
-    def test_no_clamp_returns_raw_delta_unchanged(self):
-        payout, cum_after = cumulative_clamped_delta(0.37, 1.0)
-        assert payout == pytest.approx(0.37)
-        assert cum_after == pytest.approx(1.37)
-
-    def test_within_bounds_payout_equals_raw_delta(self):
-        payout, cum_after = cumulative_clamped_delta(0.1, 0.0, clamp_max=1.0, clamp_min=-1.0)
-        assert payout == pytest.approx(0.1)
-        assert cum_after == pytest.approx(0.1)
-
-    def test_saturates_at_upper_bound(self):
-        """Once the running total exceeds clamp_max, further positive
-        deltas pay out only the remaining headroom, then 0 once saturated."""
-        payout1, cum1 = cumulative_clamped_delta(0.6, 0.0, clamp_max=1.0, clamp_min=-1.0)
-        assert payout1 == pytest.approx(0.6)
-        # unclamped running total 0.6 -> 1.2, but clamped total can only move 0.6 -> 1.0
-        payout2, cum2 = cumulative_clamped_delta(0.6, cum1, clamp_max=1.0, clamp_min=-1.0)
-        assert payout2 == pytest.approx(0.4)
-        assert cum2 == pytest.approx(1.2)
-        # now fully saturated -- further positive deltas pay out 0
-        payout3, cum3 = cumulative_clamped_delta(0.6, cum2, clamp_max=1.0, clamp_min=-1.0)
-        assert payout3 == pytest.approx(0.0, abs=1e-9)
-        assert cum3 == pytest.approx(1.8)
-
-    def test_saturates_at_lower_bound(self):
-        payout1, cum1 = cumulative_clamped_delta(-0.6, 0.0, clamp_max=1.0, clamp_min=-1.0)
-        assert payout1 == pytest.approx(-0.6)
-        payout2, cum2 = cumulative_clamped_delta(-0.6, cum1, clamp_max=1.0, clamp_min=-1.0)
-        assert payout2 == pytest.approx(-0.4)
-        assert cum2 == pytest.approx(-1.2)
-        payout3, cum3 = cumulative_clamped_delta(-0.6, cum2, clamp_max=1.0, clamp_min=-1.0)
-        assert payout3 == pytest.approx(0.0, abs=1e-9)
-        assert cum3 == pytest.approx(-1.8)
-
-    def test_reversal_after_saturation_pays_out_again(self):
-        """After saturating at the upper bound, moving back the other way
-        (past the bound) should resume paying out (episode total still
-        bounded)."""
-        _, cum1 = cumulative_clamped_delta(2.0, 0.0, clamp_max=1.0, clamp_min=-1.0)  # unclamped=2.0, clamped total saturated at +1.0
-        # unclamped total moves from 2.0 -> 0.5 (below the +1.0 clamp), so the
-        # clamped total moves from 1.0 -> 0.5 -> payout is the full delta
-        payout2, cum2 = cumulative_clamped_delta(-1.5, cum1, clamp_max=1.0, clamp_min=-1.0)
-        assert payout2 == pytest.approx(-0.5)
-        assert cum2 == pytest.approx(0.5)
-
-    def test_episode_sum_of_payouts_never_exceeds_clamp_max(self):
-        """Many small positive deltas over a long 'episode' must never sum
-        past clamp_max — the exact scenario this primitive exists for."""
-        cum = 0.0
-        total_payout = 0.0
-        for _ in range(1000):
-            payout, cum = cumulative_clamped_delta(0.01, cum, clamp_max=0.5, clamp_min=-0.5)
-            total_payout += payout
-        assert total_payout <= 0.5 + 1e-9
-        assert total_payout == pytest.approx(0.5, rel=1e-3)
-
-    def test_asymmetric_bounds_independent(self):
-        """clamp_max/clamp_min can differ (e.g. appr_sq's independently
-        tunable approach/retreat coefficients)."""
-        cum = 0.0
-        total_payout = 0.0
-        for _ in range(1000):
-            payout, cum = cumulative_clamped_delta(0.01, cum, clamp_max=0.2, clamp_min=-0.9)
-            total_payout += payout
-        assert total_payout == pytest.approx(0.2, rel=1e-3)
-
-        cum = 0.0
-        total_payout = 0.0
-        for _ in range(1000):
-            payout, cum = cumulative_clamped_delta(-0.01, cum, clamp_max=0.2, clamp_min=-0.9)
-            total_payout += payout
-        assert total_payout == pytest.approx(-0.9, rel=1e-3)
-
-    def test_only_clamp_max_set(self):
-        cum = 0.0
-        total_payout = 0.0
-        for _ in range(1000):
-            payout, cum = cumulative_clamped_delta(-0.01, cum, clamp_max=0.2, clamp_min=None)
-            total_payout += payout
-        # No lower bound -> unbounded negative accumulation, all raw deltas pass through
-        assert total_payout == pytest.approx(-10.0, rel=1e-3)
-
-
-# ---------------------------------------------------------------------------
 # phase1_reward
 # ---------------------------------------------------------------------------
 
 class TestPhase1Reward:
     """Tests for phase1_reward(), which returns a (float, dict[str, float]) tuple.
 
-    The float is the total scalar reward; the dict breaks it down by component.
-    Config now uses asymmetric ball-distance shaping: ball_approach_bonus and
-    ball_retreat_penalty (retreat coefficient is larger than approach).
+    The float is the total scalar reward; the dict breaks it down by
+    component. 6 terms survived the 2026-10-14 cleanup (out, box, spd,
+    lterm, tout, sprint) -- a much larger set of debugging-era terms was
+    removed because every one of them was either coefficient 0.0 in the
+    live config or a multiplier/clamp gating a term that was itself 0.0.
+    "appr"/"prog" were re-introduced the same day in a cleaned-up,
+    single-coefficient, provably-telescoping form (still 0.0 in the live
+    config) -- see TestApprAndProgShaping below.
     """
 
     def _call(self, **kwargs) -> tuple[float, dict]:
-        """Call phase1_reward with no-op defaults; kwargs override specific fields.
-
-        Drops the 3rd return value (prog_cumulative_after) so existing
-        callers below can keep unpacking (total, comps) — see
-        cumulative_clamped_delta()/phase1_reward's docstring for why prog
-        clamping is now episode-cumulative, not per-step.
-        """
         defaults = dict(
-            prev_ball_dist=5.0, curr_ball_dist=5.0,
-            has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg={**_CFG1, "step_penalty": 0.0},
+            ball_went_out_after_touch=False,
+            reached_opponent_box_with_possession=False,
+            cfg=_CFG1,
         )
         defaults.update(kwargs)
-        total, comps, _prog_cum_after = phase1_reward(**defaults)
-        return total, comps
+        return phase1_reward(**defaults)
 
     def test_returns_tuple_of_float_and_dict(self):
-        result = self._call()
-        total, comps = result
+        total, comps = self._call()
         assert isinstance(total, float)
         assert isinstance(comps, dict)
 
     def test_components_dict_has_all_keys(self):
         _, comps = self._call()
-        assert set(comps.keys()) == {
-            "appr", "retr", "appr_sq", "hdg", "poss", "prog", "out", "ill",
-            "box", "spd", "lpos", "lterm", "tout", "prox", "stam", "step",
-            "sprint", "tack", "tatt", "karm", "katt",
-        }
+        assert set(comps.keys()) == {"out", "box", "spd", "lterm", "tout", "sprint", "appr", "prog"}
 
     def test_every_component_key_has_a_display_label(self):
         """Regression guard: PPOTrainer.REWARD_COMP_LABELS (used by both the
         per-episode 'component mean/std/min/max' table and the per-step
         'rew/step' table in _log_rollout_summary) is a SEPARATE, hand-
         maintained list from phase1_reward's own comps dict -- adding a new
-        component here (as 'karm'/'katt' were) without also adding it to
-        REWARD_COMP_LABELS means it silently never appears in either
-        diagnostic table, with no error anywhere. This failed for exactly
-        that reason before REWARD_COMP_LABELS was updated."""
+        component here without also adding it to REWARD_COMP_LABELS means
+        it silently never appears in either diagnostic table, with no
+        error anywhere."""
         from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS
         _, comps = self._call()
         labeled_keys = {k for k, _ in REWARD_COMP_LABELS}
@@ -194,11 +76,8 @@ class TestPhase1Reward:
         )
 
     def test_total_always_equals_sum_of_components(self):
-        """Invariant: total == sum(comps.values()) for any input."""
         total, comps = self._call(
-            prev_ball_dist=10.0, curr_ball_dist=5.0,
-            has_possession_now=True, gained_possession_this_step=True,
-            ball_progress_toward_goal_m=2.0,
+            reached_opponent_box_with_possession=True, time_fraction_remaining=0.5,
         )
         assert total == pytest.approx(sum(comps.values()), rel=1e-5)
 
@@ -206,681 +85,254 @@ class TestPhase1Reward:
         total, _ = self._call()
         assert total == pytest.approx(0.0, abs=1e-7)
 
-    def test_closing_distance_gives_approach_reward(self):
-        """appr is driven by ball-distance delta; appr_sq is driven
-        SEPARATELY by the player's own speed toward the ball
-        (player_speed_mps * heading_cos_sim), not by the distance delta —
-        pass a matching player_speed_mps/heading_cos_sim to exercise it.
-        """
-        total, comps = self._call(
-            prev_ball_dist=10.0, curr_ball_dist=5.0,
-            player_speed_mps=5.0, heading_cos_sim=1.0,
-        )
-        expected_appr = _CFG1["ball_approach_bonus"] * 5.0
-        expected_appr_sq = _CFG1.get("ball_approach_speed_bonus", 0.0) * (5.0 ** 2)
-        expected = expected_appr + expected_appr_sq
-        assert total == pytest.approx(expected, rel=1e-5)
-        assert comps["appr"] == pytest.approx(expected_appr, rel=1e-5)
-        assert comps["appr_sq"] == pytest.approx(expected_appr_sq, rel=1e-5)
-        assert comps["retr"] == pytest.approx(0.0, abs=1e-7)
-
-    def test_moving_away_from_ball_positional_retreat(self):
-        # ball_retreat_penalty is 0.0 (positional retreat disabled; heading penalty used instead).
-        total, comps = self._call(prev_ball_dist=5.0, curr_ball_dist=10.0)
-        expected = _CFG1["ball_retreat_penalty"] * (-5.0)
-        assert comps["retr"] == pytest.approx(expected, rel=1e-5)
-        assert comps["appr"] == pytest.approx(0.0, abs=1e-7)
-
-    def test_heading_penalty_fires_when_moving_away_fast(self):
-        """Cosine heading penalty: running directly away (cos_sim=-1) at speed > threshold."""
-        coef = _CFG1.get("heading_penalty_coef", 0.0)
-        exp = _CFG1.get("heading_penalty_exponent", 2.0)
-        if coef == 0.0:
-            pytest.skip("heading_penalty_coef is 0 — penalty disabled")
-        _, comps = self._call(heading_cos_sim=-1.0, player_speed_mps=5.0)
-        expected = -coef * (1.0 - (-1.0)) ** exp  # max penalty
-        assert comps["hdg"] == pytest.approx(expected, rel=1e-5)
-        assert comps["hdg"] < 0.0
-
-    def test_heading_penalty_zero_when_running_toward_ball(self):
-        """No heading penalty when aimed directly at the ball (cos_sim=1)."""
-        _, comps = self._call(heading_cos_sim=1.0, player_speed_mps=5.0)
-        assert comps["hdg"] == pytest.approx(0.0, abs=1e-7)
-
-    def test_heading_penalty_zero_when_stationary(self):
-        """No heading penalty when player speed is below the threshold."""
-        _, comps = self._call(heading_cos_sim=-1.0, player_speed_mps=0.1)
-        assert comps["hdg"] == pytest.approx(0.0, abs=1e-7)
-
-    def test_gaining_possession_bonus(self):
-        """The live config sets gain_possession_bonus to 0.0 (2026-09-20), so
-        exercise the mechanism with an explicit non-zero value."""
-        cfg = {**_CFG1, "step_penalty": 0.0, "gain_possession_bonus": 1.0}
-        total, comps = self._call(
-            has_possession_now=True, gained_possession_this_step=True,
-            prev_ball_dist=1.0, curr_ball_dist=1.0, cfg=cfg,
-        )
-        assert comps["poss"] == pytest.approx(1.0, rel=1e-5)
-        assert total == pytest.approx(1.0, rel=1e-5)
-
-    def test_ball_progress_when_possessed(self):
-        progress_m = 3.0
-        total, comps = self._call(
-            has_possession_now=True, ball_progress_toward_goal_m=progress_m,
-            prev_ball_dist=0.5, curr_ball_dist=0.5,
-        )
-        assert comps["prog"] == pytest.approx(_CFG1["ball_progress_scale"] * progress_m, rel=1e-5)
-        assert total == pytest.approx(_CFG1["ball_progress_scale"] * progress_m, rel=1e-5)
-
-    def test_no_ball_progress_reward_without_possession(self):
-        """ball_progress is only rewarded when has_possession_now is True."""
-        # ball_progress_scale may be 0.0 in the live config; force a nonzero
-        # value locally so this test still exercises the with/without-possession gate.
-        _cfg_prog = {**_CFG1, "ball_progress_scale": 0.1}
-        r_with, _ = self._call(
-            has_possession_now=True, ball_progress_toward_goal_m=5.0,
-            prev_ball_dist=0.5, curr_ball_dist=0.5, cfg=_cfg_prog,
-        )
-        r_without, _ = self._call(
-            has_possession_now=False, ball_progress_toward_goal_m=5.0,
-            prev_ball_dist=0.5, curr_ball_dist=0.5, cfg=_cfg_prog,
-        )
-        assert r_with > r_without
-
     def test_ball_out_penalty(self):
-        total, comps = self._call(ball_went_out_after_touch=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
+        total, comps = self._call(ball_went_out_after_touch=True)
         assert comps["out"] == pytest.approx(_CFG1["ball_out_penalty"], rel=1e-5)
         assert total == pytest.approx(_CFG1["ball_out_penalty"], rel=1e-5)
         assert total < 0.0
 
-    def test_illegal_action_penalty(self):
-        # illegal_action_penalty is 0.0 in the live config (disabled); override
-        # locally so this test still exercises the penalty formula.
-        _cfg_ill = {**_CFG1, "illegal_action_penalty": -0.4, "step_penalty": 0.0}
-        total, comps, _ = phase1_reward(
-            prev_ball_dist=1.0, curr_ball_dist=1.0,
-            has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=True, reached_opponent_box_with_possession=False,
-            cfg=_cfg_ill,
-        )
-        assert comps["ill"] == pytest.approx(_cfg_ill["illegal_action_penalty"], rel=1e-5)
-        assert total == pytest.approx(_cfg_ill["illegal_action_penalty"], rel=1e-5)
-        assert total < 0.0
-
     def test_box_possession_terminal_large_bonus(self):
         total, comps = self._call(
-            has_possession_now=True, reached_opponent_box_with_possession=True,
-            prev_ball_dist=0.5, curr_ball_dist=0.5,
+            reached_opponent_box_with_possession=True, time_fraction_remaining=0.0,
         )
         assert comps["box"] == pytest.approx(_CFG1["box_possession_terminal"], rel=1e-5)
         assert total >= _CFG1["box_possession_terminal"]
 
-    def test_all_penalties_stack(self):
-        """ball_out + illegal action together should be worse than either alone."""
-        # illegal_action_penalty is 0.0 in the live config (disabled); override
-        # locally so illegal-action alone is distinguishable from "both".
-        _cfg_ill = {**_CFG1, "illegal_action_penalty": -0.4}
-
-        def _call_ill(**kwargs) -> tuple[float, dict]:
-            defaults = dict(
-                prev_ball_dist=5.0, curr_ball_dist=5.0,
-                has_possession_now=False, gained_possession_this_step=False,
-                ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-                illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-                cfg=_cfg_ill,
-            )
-            defaults.update(kwargs)
-            total, comps, _ = phase1_reward(**defaults)
-            return total, comps
-
-        r_both, _ = _call_ill(
-            ball_went_out_after_touch=True, illegal_action_attempted=True,
-            prev_ball_dist=1.0, curr_ball_dist=1.0,
+    def test_speed_bonus_scales_with_time_remaining(self):
+        _cfg = {**_CFG1, "speed_bonus_scale": 0.2}
+        total_fast, comps_fast = self._call(
+            reached_opponent_box_with_possession=True, time_fraction_remaining=1.0, cfg=_cfg,
         )
-        r_out, _ = _call_ill(ball_went_out_after_touch=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
-        r_ill, _ = _call_ill(illegal_action_attempted=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
-        assert r_both < r_out
-        assert r_both < r_ill
+        total_slow, comps_slow = self._call(
+            reached_opponent_box_with_possession=True, time_fraction_remaining=0.0, cfg=_cfg,
+        )
+        assert comps_fast["spd"] == pytest.approx(0.2)
+        assert comps_slow["spd"] == pytest.approx(0.0)
+        assert total_fast > total_slow
 
-    def test_loss_of_possession_penalty(self):
-        """The live config sets loss_of_possession_penalty to 0.0 (2026-09-20),
-        so exercise the mechanism with an explicit non-zero value."""
-        cfg = {**_CFG1, "step_penalty": 0.0, "loss_of_possession_penalty": -0.9}
-        total, comps = self._call(lost_possession_this_step=True, prev_ball_dist=1.0, curr_ball_dist=1.0, cfg=cfg)
-        assert comps["lpos"] == pytest.approx(-0.9, rel=1e-5)
-        assert total < 0.0
+    def test_no_speed_bonus_without_box_terminal(self):
+        _cfg = {**_CFG1, "speed_bonus_scale": 0.2}
+        _, comps = self._call(
+            reached_opponent_box_with_possession=False, time_fraction_remaining=1.0, cfg=_cfg,
+        )
+        assert comps["spd"] == pytest.approx(0.0)
 
     def test_opponent_reached_box_loss_terminal(self):
-        total, comps = self._call(opponent_reached_trainee_box=True, prev_ball_dist=1.0, curr_ball_dist=1.0)
+        total, comps = self._call(opponent_reached_trainee_box=True)
         assert comps["lterm"] == pytest.approx(_CFG1.get("loss_terminal", 0.0), rel=1e-5)
         assert total < 0.0
 
-    def test_timeout_penalty_no_proximity(self):
-        """Ball far from box on timeout: only the timeout penalty fires, prox=0."""
-        total, comps = self._call(timed_out=True, ball_dist_to_opponent_box_m=9999.0,
-                                  prev_ball_dist=1.0, curr_ball_dist=1.0)
+    def test_timeout_penalty(self):
+        total, comps = self._call(timed_out=True)
         assert comps["tout"] == pytest.approx(_CFG1.get("timeout_penalty", 0.0), rel=1e-5)
-        assert comps["prox"] == pytest.approx(0.0, abs=1e-7)
         assert total < 0.0
 
-    def test_proximity_bonus_on_timeout_increases_with_closeness(self):
-        """Ball near the box on timeout earns a larger prox bonus than ball far away.
+    def test_no_timeout_penalty_when_not_timed_out(self):
+        _, comps = self._call(timed_out=False)
+        assert comps["tout"] == pytest.approx(0.0, abs=1e-7)
 
-        prox uses a FIXED 40m pitch-scale reference (no initial-state
-        dependency, see reward.py's module invariant), so "near" (dist=1.0)
-        and "far" (dist=9999.0) are meaningfully different without needing any
-        extra episode-start parameter. proximity_bonus_scale is 0.0 in the
-        live config (disabled), so this test overrides it locally to a
-        non-zero value to exercise the formula.
-        """
-        _cfg_prox = {**_CFG1, "proximity_bonus_scale": 0.65}
-        _, comps_near, _ = phase1_reward(
-            prev_ball_dist=1.0, curr_ball_dist=1.0,
-            has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_cfg_prox, timed_out=True, ball_dist_to_opponent_box_m=1.0,
+    def test_all_penalties_stack(self):
+        """ball_out + loss terminal together should be worse than either alone."""
+        r_both, _ = self._call(ball_went_out_after_touch=True, opponent_reached_trainee_box=True)
+        r_out, _ = self._call(ball_went_out_after_touch=True)
+        r_lterm, _ = self._call(opponent_reached_trainee_box=True)
+        assert r_both < r_out
+        assert r_both < r_lterm
+
+    def test_sprint_penalty_fires_only_when_sprinting_and_coef_nonzero(self):
+        _cfg = {**_CFG1, "sprint_penalty_per_s": 0.1}
+        _, comps_sprinting = self._call(is_sprinting=True, decision_interval_s=0.5, cfg=_cfg)
+        _, comps_not = self._call(is_sprinting=False, decision_interval_s=0.5, cfg=_cfg)
+        assert comps_sprinting["sprint"] == pytest.approx(-0.1 * 0.5)
+        assert comps_not["sprint"] == pytest.approx(0.0, abs=1e-7)
+
+    def test_sprint_penalty_zero_when_coef_disabled(self):
+        _cfg = {**_CFG1, "sprint_penalty_per_s": 0.0}
+        _, comps = self._call(is_sprinting=True, decision_interval_s=1.0, cfg=_cfg)
+        assert comps["sprint"] == pytest.approx(0.0, abs=1e-7)
+
+    def test_sprint_penalty_scales_with_decision_interval(self):
+        _cfg = {**_CFG1, "sprint_penalty_per_s": 0.2}
+        _, comps = self._call(is_sprinting=True, decision_interval_s=0.3, cfg=_cfg)
+        assert comps["sprint"] == pytest.approx(-0.2 * 0.3)
+
+
+class TestApprAndProgShaping:
+    """'appr' (ball-approach) and 'prog' (ball-progress) -- re-introduced
+    2026-10-14 as pure, single-coefficient potential-based shaping
+    (Phi(s) = -coef * distance(s), F = Phi(s) - Phi(s') each step, gamma=1),
+    re-gated 2026-10-15 onto ball.last_touched_by_player_id (see reward.py's
+    'last toucher' gating note) instead of live possession. Live config
+    (_CFG1): both 0.005 -- every test here still overrides the coefficient
+    locally so the arithmetic checks stay independent of whatever the
+    live-tuned value happens to be.
+
+    phase1_reward() itself takes the ALREADY per-tick-accumulated,
+    ALREADY last-toucher-gated delta as a single scalar
+    (player_ball_approach_delta_m / ball_progress_toward_goal_m) -- the
+    gating itself is ScenarioEnv's responsibility (see its accumulator-init
+    comment in step()), not tested here. What IS tested here: given a
+    sequence of such already-gated per-step deltas, the formula (a) always
+    telescopes to exactly coef*(sum of deltas) regardless of path, and (b)
+    can never be farmed by shuttling back and forth, since any closed round
+    trip must then net EXACTLY zero. TestApprRoundTripNetsZero /
+    TestProgRoundTripNetsZero assert (b) directly rather than trusting the
+    arithmetic by eye.
+    """
+
+    def _call(self, **kwargs) -> tuple[float, dict]:
+        defaults = dict(
+            ball_went_out_after_touch=False,
+            reached_opponent_box_with_possession=False,
+            cfg=_CFG1,
         )
-        _, comps_far, _ = phase1_reward(
-            prev_ball_dist=1.0, curr_ball_dist=1.0,
-            has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_cfg_prox, timed_out=True, ball_dist_to_opponent_box_m=9999.0,
-        )
-        assert comps_near["prox"] > comps_far["prox"]
+        defaults.update(kwargs)
+        return phase1_reward(**defaults)
 
-    def test_reward_is_additive(self):
-        """Total matches sum of components and matches expected arithmetic.
+    # -- appr: basic arithmetic / disabled-by-default --------------------
 
-        appr_sq is driven by the player's own speed toward the ball
-        (player_speed_mps * heading_cos_sim), independent of the ball-gap
-        delta — pass player_speed_mps=5.0, heading_cos_sim=1.0 to exercise it
-        with the same 5.0 magnitude the old _delta-based test used.
-        """
-        _cfg_additive = {**_CFG1, "step_penalty": 0.0}
-        total, comps, _ = phase1_reward(
-            prev_ball_dist=10.0, curr_ball_dist=5.0,
-            has_possession_now=True, gained_possession_this_step=True,
-            ball_progress_toward_goal_m=2.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_cfg_additive, player_speed_mps=5.0, heading_cos_sim=1.0,
-        )
-        assert total == pytest.approx(sum(comps.values()), rel=1e-5)
-        expected = (
-            _CFG1["ball_approach_bonus"] * 5.0
-            + _CFG1.get("ball_approach_speed_bonus", 0.0) * (5.0 ** 2)
-            + _CFG1["gain_possession_bonus"]
-            + _CFG1["ball_progress_scale"] * 2.0
-        )
-        assert total == pytest.approx(expected, rel=1e-5)
+    def test_appr_zero_when_coef_disabled(self):
+        _cfg = {**_CFG1, "ball_approach_bonus": 0.0}
+        _, comps = self._call(player_ball_approach_delta_m=5.0, cfg=_cfg)
+        assert comps["appr"] == pytest.approx(0.0, abs=1e-7)
 
-    def test_prog_reward_clamp_bounds_episode_total(self):
-        """Regression test: prog_reward_clamp must actually bound the
-        episode-cumulative 'prog' payout over many steps, and must NOT
-        collapse it to 0 (see symmetric_clamp() param-order bug)."""
-        cum_state: dict = {}
-        total_prog_payout = 0.0
-        for _ in range(500):
-            _, comps, cum_state = phase1_reward(
-                prev_ball_dist=1.0, curr_ball_dist=1.0,
-                has_possession_now=True, gained_possession_this_step=False,
-                ball_progress_toward_goal_m=1.0, ball_went_out_after_touch=False,
-                illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-                cfg={**_CFG1, "ball_progress_scale": 1.0},
-                prog_reward_clamp=0.5,
-                cumulative_state=cum_state,
-            )
-            total_prog_payout += comps["prog"]
-        assert total_prog_payout > 0.0, "prog reward clamp must not zero out the reward entirely"
-        assert total_prog_payout <= 0.5 + 1e-6
-        assert total_prog_payout == pytest.approx(0.5, rel=1e-3)
+    def test_appr_positive_when_closing_distance(self):
+        _cfg = {**_CFG1, "ball_approach_bonus": 0.1}
+        _, comps = self._call(player_ball_approach_delta_m=3.0, cfg=_cfg)
+        assert comps["appr"] == pytest.approx(0.1 * 3.0)
 
-    def test_appr_sq_clamps_bound_episode_total_independently(self):
-        """appr_sq_approach_reward_clamp/appr_sq_retreat_reward_clamp bound
-        the positive/negative cumulative appr_sq totals independently."""
-        cum_state: dict = {}
-        total_approach_payout = 0.0
-        for _ in range(500):
-            _, comps, cum_state = phase1_reward(
-                prev_ball_dist=1.0, curr_ball_dist=1.0,
-                has_possession_now=False, gained_possession_this_step=False,
-                ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-                illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-                cfg={**_CFG1, "ball_approach_speed_bonus": 1.0},
-                player_speed_mps=1.0, heading_cos_sim=1.0,
-                appr_sq_approach_reward_clamp=0.3,
-                cumulative_state=cum_state,
-            )
-            total_approach_payout += comps["appr_sq"]
-        assert total_approach_payout > 0.0
-        assert total_approach_payout <= 0.3 + 1e-6
-        assert total_approach_payout == pytest.approx(0.3, rel=1e-3)
+    def test_appr_negative_when_opening_distance(self):
+        """Opening the gap by the SAME amount as closing it must produce the
+        exact negative of the closing case -- i.e. one coefficient, not an
+        independently-tunable 'retreat' rate (that asymmetry is exactly what
+        broke telescoping in the pre-removal version -- see reward.py's
+        2026-10-14 re-introduction note)."""
+        _cfg = {**_CFG1, "ball_approach_bonus": 0.1}
+        _, comps_close = self._call(player_ball_approach_delta_m=3.0, cfg=_cfg)
+        _, comps_open = self._call(player_ball_approach_delta_m=-3.0, cfg=_cfg)
+        assert comps_open["appr"] == pytest.approx(-comps_close["appr"])
 
-        cum_state = {}
-        total_retreat_payout = 0.0
-        for _ in range(500):
-            _, comps, cum_state = phase1_reward(
-                prev_ball_dist=1.0, curr_ball_dist=1.0,
-                has_possession_now=False, gained_possession_this_step=False,
-                ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-                illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-                cfg={**_CFG1, "ball_retreat_speed_penalty": 1.0},
-                player_speed_mps=1.0, heading_cos_sim=-1.0,
-                appr_sq_retreat_reward_clamp=0.3,
-                cumulative_state=cum_state,
-            )
-            total_retreat_payout += comps["appr_sq"]
-        assert total_retreat_payout < 0.0
-        assert total_retreat_payout >= -0.3 - 1e-6
-        assert total_retreat_payout == pytest.approx(-0.3, rel=1e-3)
+    def test_appr_zero_when_distance_unchanged(self):
+        _cfg = {**_CFG1, "ball_approach_bonus": 0.1}
+        _, comps = self._call(player_ball_approach_delta_m=0.0, cfg=_cfg)
+        assert comps["appr"] == pytest.approx(0.0, abs=1e-7)
 
-    def test_step_penalty_fires_every_step(self):
-        """step_penalty is subtracted on every call including no-op steps."""
-        _cfg_step = {**_CFG1, "step_penalty": 0.05}
-        total, comps, _ = phase1_reward(
-            prev_ball_dist=5.0, curr_ball_dist=5.0,
-            has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_cfg_step,
-        )
-        assert comps["step"] == pytest.approx(-0.05, rel=1e-5)
-        assert total == pytest.approx(-0.05, rel=1e-5)
+    def test_appr_has_no_separate_retreat_coefficient(self):
+        """ball_retreat_penalty must not exist as a distinct knob any more --
+        setting it has no effect on 'appr' (only ball_approach_bonus does)."""
+        _cfg = {**_CFG1, "ball_approach_bonus": 0.1, "ball_retreat_penalty": 999.0}
+        _, comps = self._call(player_ball_approach_delta_m=-3.0, cfg=_cfg)
+        assert comps["appr"] == pytest.approx(0.1 * -3.0)
 
-    def test_step_penalty_zero_when_disabled(self):
-        _cfg_no_step = {**_CFG1, "step_penalty": 0.0}
-        _, comps, _ = phase1_reward(
-            prev_ball_dist=5.0, curr_ball_dist=5.0,
-            has_possession_now=False, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_cfg_no_step,
-        )
-        assert comps["step"] == pytest.approx(0.0, abs=1e-9)
+    # -- appr: telescoping / non-exploitability ---------------------------
 
-    def test_step_penalty_accumulates_over_episode(self):
-        """Over N steps the sum of step payouts equals -step_penalty * N."""
-        _cfg_step = {**_CFG1, "step_penalty": 0.01}
-        total_step = 0.0
-        cum_state: dict = {}
-        for _ in range(50):
-            _, comps, cum_state = phase1_reward(
-                prev_ball_dist=5.0, curr_ball_dist=5.0,
-                has_possession_now=False, gained_possession_this_step=False,
-                ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-                illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-                cfg=_cfg_step, cumulative_state=cum_state,
-            )
-            total_step += comps["step"]
-        assert total_step == pytest.approx(-0.5, rel=1e-5)
+    def test_appr_telescopes_over_a_monotonic_trajectory(self):
+        """Sum of per-step 'appr' over N steps of CONTINUOUS one-directional
+        closing must equal coef*(dist_start - dist_end) exactly, regardless
+        of how many steps or how uneven the per-step deltas are."""
+        _cfg = {**_CFG1, "ball_approach_bonus": 0.37}
+        dists = [20.0, 17.0, 17.0, 12.5, 9.0, 9.0, 9.0, 3.0]  # uneven steps, some flat
+        total_appr = 0.0
+        for prev_d, curr_d in zip(dists[:-1], dists[1:]):
+            _, comps = self._call(player_ball_approach_delta_m=(prev_d - curr_d), cfg=_cfg)
+            total_appr += comps["appr"]
+        assert total_appr == pytest.approx(0.37 * (dists[0] - dists[-1]), rel=1e-9)
 
-    def test_cumulative_state_missing_keys_default_to_zero(self):
-        """Passing an empty/partial cumulative_state dict must not crash and
-        must treat missing terms as starting from 0.0."""
-        total, comps, cum_after = phase1_reward(
-            prev_ball_dist=1.0, curr_ball_dist=1.0,
-            has_possession_now=True, gained_possession_this_step=False,
-            ball_progress_toward_goal_m=1.0, ball_went_out_after_touch=False,
-            illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-            cfg=_CFG1, cumulative_state={},
-        )
-        assert isinstance(cum_after, dict)
-        assert "prog" in cum_after
-        assert "appr_sq" in cum_after
+    def test_appr_round_trip_nets_exactly_zero(self):
+        """The core non-exploitability guarantee: closing distance and then
+        opening it back up to the SAME starting distance (any path, any
+        number of steps) must net to exactly 0 -- this is what makes 'appr'
+        impossible to farm by shuttling back and forth near the ball."""
+        _cfg = {**_CFG1, "ball_approach_bonus": 1.25}
+        # A wandering round trip: 20 -> 12 -> 18 -> 4 -> 20 (ends where it started)
+        dists = [20.0, 12.0, 18.0, 4.0, 20.0]
+        total_appr = 0.0
+        for prev_d, curr_d in zip(dists[:-1], dists[1:]):
+            _, comps = self._call(player_ball_approach_delta_m=(prev_d - curr_d), cfg=_cfg)
+            total_appr += comps["appr"]
+        assert total_appr == pytest.approx(0.0, abs=1e-9)
 
+    def test_appr_asymmetric_coefficients_WOULD_break_round_trip(self):
+        """Negative control: prove the round-trip-nets-zero property is NOT
+        trivially true for any shaping scheme -- an asymmetric approach/
+        retreat split (the pre-removal design) does NOT net zero on the same
+        round trip, which is exactly why that version was abuseable and why
+        this re-introduction deliberately uses one coefficient."""
+        approach_coef, retreat_coef = 0.1, 0.9  # retreat penalized harder (old design)
+        total = 0.0
+        for prev_d, curr_d in [(20.0, 12.0), (12.0, 18.0), (18.0, 4.0), (4.0, 20.0)]:
+            delta = prev_d - curr_d
+            total += approach_coef * delta if delta >= 0 else retreat_coef * delta
+        assert total != pytest.approx(0.0, abs=1e-9)
 
-class TestTackleArmedPenalty:
-    """'tack' -- tackle_armed_penalty_per_second * decision_interval_s
-    whenever tackle_armed is set this step, further multiplied by
-    tackle_armed_while_possessing_multiplier when also in possession. Uses
-    its own explicit cfg overrides (not the live ai_config.json values)
-    since this is testing the arithmetic, not the currently-tuned magnitude."""
+    # -- prog: basic arithmetic / disabled-by-default --------------------
 
-    _BASE_KWARGS = dict(
-        prev_ball_dist=5.0, curr_ball_dist=5.0,
-        gained_possession_this_step=False,
-        ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-        illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-    )
+    def test_prog_zero_when_coef_disabled(self):
+        _cfg = {**_CFG1, "ball_progress_scale": 0.0}
+        _, comps = self._call(ball_progress_toward_goal_m=5.0, cfg=_cfg)
+        assert comps["prog"] == pytest.approx(0.0, abs=1e-7)
 
-    def _call(self, *, tackle_armed, has_possession_now, decision_interval_s, cfg_overrides):
-        cfg = {**_CFG1, "step_penalty": 0.0, **cfg_overrides}
-        total, comps, _ = phase1_reward(
-            **self._BASE_KWARGS,
-            has_possession_now=has_possession_now,
-            tackle_armed=tackle_armed,
-            decision_interval_s=decision_interval_s,
-            cfg=cfg,
-        )
-        return total, comps
+    def test_prog_linear_in_progress(self):
+        _cfg = {**_CFG1, "ball_progress_scale": 0.2}
+        _, comps = self._call(ball_progress_toward_goal_m=3.0, cfg=_cfg)
+        assert comps["prog"] == pytest.approx(0.2 * 3.0)
 
-    def test_zero_when_not_armed_regardless_of_coef(self):
-        _, comps = self._call(
-            tackle_armed=False, has_possession_now=False, decision_interval_s=1.0,
-            cfg_overrides={"tackle_armed_penalty_per_second": -0.1},
-        )
-        assert comps["tack"] == pytest.approx(0.0)
+    def test_prog_negative_when_pushed_backward(self):
+        _cfg = {**_CFG1, "ball_progress_scale": 0.2}
+        _, comps = self._call(ball_progress_toward_goal_m=-3.0, cfg=_cfg)
+        assert comps["prog"] == pytest.approx(0.2 * -3.0)
 
-    def test_zero_when_coef_disabled(self):
-        _, comps = self._call(
-            tackle_armed=True, has_possession_now=False, decision_interval_s=1.0,
-            cfg_overrides={"tackle_armed_penalty_per_second": 0.0},
-        )
-        assert comps["tack"] == pytest.approx(0.0)
+    def test_prog_not_double_gated_on_possession(self):
+        """2026-10-14 fix: the caller (ScenarioEnv) already gates
+        ball_progress_toward_goal_m per-TICK on possession before accumulating
+        it for the decision interval (see reward.py's 'prog' docstring) --
+        phase1_reward itself must NOT apply a second, interval-level
+        possession gate on top of that, since the old version's extra gate
+        silently zeroed out real progress whenever the interval ended with a
+        mid-interval loss of possession, breaking telescoping. There is no
+        has_possession_now parameter any more; passing a nonzero
+        ball_progress_toward_goal_m must always count."""
+        _cfg = {**_CFG1, "ball_progress_scale": 0.5}
+        _, comps = self._call(ball_progress_toward_goal_m=2.0, cfg=_cfg)
+        assert comps["prog"] == pytest.approx(1.0)
 
-    def test_per_second_cost_scales_with_decision_interval(self):
-        _, comps = self._call(
-            tackle_armed=True, has_possession_now=False, decision_interval_s=0.2,
-            cfg_overrides={"tackle_armed_penalty_per_second": -0.1},
-        )
-        assert comps["tack"] == pytest.approx(-0.1 * 0.2)
+    # -- prog: telescoping / non-exploitability ---------------------------
 
-    def test_multiplier_applied_only_when_possessing(self):
-        cfg_overrides = {
-            "tackle_armed_penalty_per_second": -0.1,
-            "tackle_armed_while_possessing_multiplier": 3.0,
-        }
-        _, comps_not_possessing = self._call(
-            tackle_armed=True, has_possession_now=False, decision_interval_s=1.0,
-            cfg_overrides=cfg_overrides,
-        )
-        _, comps_possessing = self._call(
-            tackle_armed=True, has_possession_now=True, decision_interval_s=1.0,
-            cfg_overrides=cfg_overrides,
-        )
-        assert comps_not_possessing["tack"] == pytest.approx(-0.1)
-        assert comps_possessing["tack"] == pytest.approx(-0.1 * 3.0)
+    def test_prog_telescopes_over_a_possession_spell(self):
+        """Sum of per-decision-step 'prog' over a possession spell must equal
+        coef*(box_dist_at_gain - box_dist_at_loss), matching how
+        ScenarioEnv's trainee_prog_accum/sec_prog_accum already accumulate
+        PRE-tick-possession-gated box-distance deltas internally -- this
+        test exercises phase1_reward's own side of that contract with the
+        already-accumulated per-decision-step deltas a caller would pass."""
+        _cfg = {**_CFG1, "ball_progress_scale": 0.6}
+        box_dists = [30.0, 25.0, 25.0, 18.0, 10.0]  # closing on the box while possessing
+        total_prog = 0.0
+        for prev_d, curr_d in zip(box_dists[:-1], box_dists[1:]):
+            _, comps = self._call(ball_progress_toward_goal_m=(prev_d - curr_d), cfg=_cfg)
+            total_prog += comps["prog"]
+        assert total_prog == pytest.approx(0.6 * (box_dists[0] - box_dists[-1]), rel=1e-9)
 
-    def test_multiplier_defaults_to_one_when_unset(self):
-        # Deliberately NOT spreading _CFG1 (the live config already sets
-        # tackle_armed_while_possessing_multiplier) -- this checks the
-        # function's OWN fallback when the key is absent from cfg entirely.
-        cfg = {**_CFG1, "step_penalty": 0.0, "tackle_armed_penalty_per_second": -0.1}
-        del cfg["tackle_armed_while_possessing_multiplier"]
-        total, comps, _ = phase1_reward(
-            **self._BASE_KWARGS,
-            has_possession_now=True,
-            tackle_armed=True,
-            decision_interval_s=1.0,
-            cfg=cfg,
-        )
-        assert comps["tack"] == pytest.approx(-0.1)
+    def test_prog_round_trip_nets_exactly_zero(self):
+        """Dribbling the ball away from the box and back to the SAME
+        box-distance (without ever losing possession) must net exactly 0."""
+        _cfg = {**_CFG1, "ball_progress_scale": 2.0}
+        box_dists = [30.0, 22.0, 28.0, 12.0, 30.0]  # ends where it started
+        total_prog = 0.0
+        for prev_d, curr_d in zip(box_dists[:-1], box_dists[1:]):
+            _, comps = self._call(ball_progress_toward_goal_m=(prev_d - curr_d), cfg=_cfg)
+            total_prog += comps["prog"]
+        assert total_prog == pytest.approx(0.0, abs=1e-9)
 
-    def test_tatt_zero_when_not_attempted(self):
-        """Sanity check that this class's own tests (which never pass
-        tackle_attempted_this_step) don't accidentally leak a nonzero 'tatt'
-        into 'tack' assertions -- see TestTackleAttemptedBonus for 'tatt'
-        itself."""
-        _, comps = self._call(
-            tackle_armed=True, has_possession_now=False, decision_interval_s=1.0,
-            cfg_overrides={"tackle_armed_penalty_per_second": -0.1},
-        )
-        assert comps["tatt"] == pytest.approx(0.0)
+    # -- appr/prog: additive with the rest of the terms -------------------
 
-    def test_tack_included_in_total(self):
+    def test_appr_and_prog_included_in_total(self):
+        _cfg = {**_CFG1, "ball_approach_bonus": 0.3, "ball_progress_scale": 0.4}
         total, comps = self._call(
-            tackle_armed=True, has_possession_now=False, decision_interval_s=1.0,
-            cfg_overrides={"tackle_armed_penalty_per_second": -0.1},
+            player_ball_approach_delta_m=4.0, ball_progress_toward_goal_m=2.0, cfg=_cfg,
         )
-        assert total == pytest.approx(comps["tack"])
-
-
-class TestTackleAttemptedBonus:
-    """'tatt' -- same shape as 'tack' but positive: when
-    tackle_attempted_this_step is true, abs(tackle_armed_penalty_per_second)
-    * decision_interval_s * tackle_attempt_bonus_multiplier. Deliberately
-    reuses tackle_armed_penalty_per_second's OWN magnitude rather than an
-    independent coefficient -- see reward.py's 'tatt' docstring."""
-
-    _BASE_KWARGS = dict(
-        prev_ball_dist=5.0, curr_ball_dist=5.0,
-        gained_possession_this_step=False,
-        ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-        illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-        has_possession_now=False,
-    )
-
-    def _call(self, *, tackle_attempted_this_step, decision_interval_s, cfg_overrides):
-        cfg = {**_CFG1, "step_penalty": 0.0, **cfg_overrides}
-        total, comps, _ = phase1_reward(
-            **self._BASE_KWARGS,
-            tackle_attempted_this_step=tackle_attempted_this_step,
-            decision_interval_s=decision_interval_s,
-            cfg=cfg,
-        )
-        return total, comps
-
-    def test_zero_when_not_attempted_regardless_of_coef(self):
-        _, comps = self._call(
-            tackle_attempted_this_step=False, decision_interval_s=1.0,
-            cfg_overrides={"tackle_armed_penalty_per_second": -0.1, "tackle_attempt_bonus_multiplier": 2.0},
-        )
-        assert comps["tatt"] == pytest.approx(0.0)
-
-    def test_zero_when_base_rate_disabled(self):
-        """Base rate is tackle_armed_penalty_per_second itself (shared with
-        'tack') -- disabling that disables 'tatt' too, not a separate knob."""
-        _, comps = self._call(
-            tackle_attempted_this_step=True, decision_interval_s=1.0,
-            cfg_overrides={"tackle_armed_penalty_per_second": 0.0, "tackle_attempt_bonus_multiplier": 2.0},
-        )
-        assert comps["tatt"] == pytest.approx(0.0)
-
-    def test_reuses_armed_penalty_magnitude_flipped_positive(self):
-        _, comps = self._call(
-            tackle_attempted_this_step=True, decision_interval_s=1.0,
-            cfg_overrides={"tackle_armed_penalty_per_second": -0.1, "tackle_attempt_bonus_multiplier": 1.0},
-        )
-        assert comps["tatt"] == pytest.approx(0.1)
-
-    def test_scales_with_decision_interval_and_multiplier(self):
-        _, comps = self._call(
-            tackle_attempted_this_step=True, decision_interval_s=0.5,
-            cfg_overrides={"tackle_armed_penalty_per_second": -0.1, "tackle_attempt_bonus_multiplier": 4.0},
-        )
-        assert comps["tatt"] == pytest.approx(0.1 * 0.5 * 4.0)
-
-    def test_multiplier_defaults_to_one_when_unset(self):
-        cfg = {**_CFG1, "step_penalty": 0.0, "tackle_armed_penalty_per_second": -0.1}
-        cfg.pop("tackle_attempt_bonus_multiplier", None)
-        total, comps, _ = phase1_reward(
-            **self._BASE_KWARGS,
-            tackle_attempted_this_step=True,
-            decision_interval_s=1.0,
-            cfg=cfg,
-        )
-        assert comps["tatt"] == pytest.approx(0.1)
-
-    def test_disabled_by_zero_multiplier(self):
-        _, comps = self._call(
-            tackle_attempted_this_step=True, decision_interval_s=1.0,
-            cfg_overrides={"tackle_armed_penalty_per_second": -0.1, "tackle_attempt_bonus_multiplier": 0.0},
-        )
-        assert comps["tatt"] == pytest.approx(0.0)
-
-    def test_tack_zero_when_only_attempted_not_armed(self):
-        """tackle_armed and tackle_attempted_this_step are independent flags
-        in this function's signature -- an attempt resolving doesn't imply
-        tackle_armed is still true (the arming already happened on a
-        previous tick of the chase); 'tack' must not fire off of 'tatt'
-        alone."""
-        _, comps = self._call(
-            tackle_attempted_this_step=True, decision_interval_s=1.0,
-            cfg_overrides={"tackle_armed_penalty_per_second": -0.1},
-        )
-        assert comps["tack"] == pytest.approx(0.0)
-
-
-class TestKickArmedPenalty:
-    """'karm' -- kick_armed_penalty_per_second * decision_interval_s
-    whenever kick_armed is set this step. Same shape as 'tack', but no
-    possessing-multiplier: kick_armed can never be true while ALSO
-    possessing (apply_nn_action.py's if/else is exclusive -- see reward.py's
-    'karm' docstring), so that extra-bad case tackle guards against doesn't
-    apply here. Uses explicit cfg overrides, not the live ai_config.json
-    value (which defaults to 0.0/disabled)."""
-
-    _BASE_KWARGS = dict(
-        prev_ball_dist=5.0, curr_ball_dist=5.0,
-        gained_possession_this_step=False,
-        ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-        illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-        has_possession_now=False,
-    )
-
-    def _call(self, *, kick_armed, decision_interval_s, cfg_overrides):
-        cfg = {**_CFG1, "step_penalty": 0.0, **cfg_overrides}
-        total, comps, _ = phase1_reward(
-            **self._BASE_KWARGS,
-            kick_armed=kick_armed,
-            decision_interval_s=decision_interval_s,
-            cfg=cfg,
-        )
-        return total, comps
-
-    def test_zero_when_not_armed_regardless_of_coef(self):
-        _, comps = self._call(
-            kick_armed=False, decision_interval_s=1.0,
-            cfg_overrides={"kick_armed_penalty_per_second": -0.1},
-        )
-        assert comps["karm"] == pytest.approx(0.0)
-
-    def test_zero_when_coef_disabled(self):
-        _, comps = self._call(
-            kick_armed=True, decision_interval_s=1.0,
-            cfg_overrides={"kick_armed_penalty_per_second": 0.0},
-        )
-        assert comps["karm"] == pytest.approx(0.0)
-
-    def test_per_second_cost_scales_with_decision_interval(self):
-        _, comps = self._call(
-            kick_armed=True, decision_interval_s=0.2,
-            cfg_overrides={"kick_armed_penalty_per_second": -0.1},
-        )
-        assert comps["karm"] == pytest.approx(-0.1 * 0.2)
-
-    def test_katt_zero_when_not_attempted(self):
-        """Sanity check that this class's own tests (which never pass
-        kick_attempted_this_step) don't accidentally leak a nonzero 'katt'
-        into 'karm' assertions -- see TestKickAttemptedBonus for 'katt'
-        itself."""
-        _, comps = self._call(
-            kick_armed=True, decision_interval_s=1.0,
-            cfg_overrides={"kick_armed_penalty_per_second": -0.1},
-        )
-        assert comps["katt"] == pytest.approx(0.0)
-
-    def test_karm_included_in_total(self):
-        total, comps = self._call(
-            kick_armed=True, decision_interval_s=1.0,
-            cfg_overrides={"kick_armed_penalty_per_second": -0.1},
-        )
-        assert total == pytest.approx(comps["karm"])
-
-
-class TestKickAttemptedBonus:
-    """'katt' -- same flat shape as 'tatt': when kick_attempted_this_step is
-    true, abs(kick_armed_penalty_per_second) * decision_interval_s *
-    kick_attempt_bonus_multiplier, NOT scaled by how long (if at all) it was
-    armed for first. UNLIKE 'tatt', also gated on
-    kick_attempt_was_armed_this_step -- an ordinary kick while already
-    possessing never paid any 'karm' cost, so it must not also collect
-    'katt' (see reward.py's 'katt' docstring for why this diverges from the
-    tackle analogy)."""
-
-    _BASE_KWARGS = dict(
-        prev_ball_dist=5.0, curr_ball_dist=5.0,
-        gained_possession_this_step=False,
-        ball_progress_toward_goal_m=0.0, ball_went_out_after_touch=False,
-        illegal_action_attempted=False, reached_opponent_box_with_possession=False,
-        has_possession_now=False,
-    )
-
-    def _call(self, *, kick_attempted_this_step, kick_attempt_was_armed_this_step, decision_interval_s, cfg_overrides):
-        cfg = {**_CFG1, "step_penalty": 0.0, **cfg_overrides}
-        total, comps, _ = phase1_reward(
-            **self._BASE_KWARGS,
-            kick_attempted_this_step=kick_attempted_this_step,
-            kick_attempt_was_armed_this_step=kick_attempt_was_armed_this_step,
-            decision_interval_s=decision_interval_s,
-            cfg=cfg,
-        )
-        return total, comps
-
-    def test_zero_when_not_attempted_regardless_of_coef(self):
-        _, comps = self._call(
-            kick_attempted_this_step=False, kick_attempt_was_armed_this_step=False, decision_interval_s=1.0,
-            cfg_overrides={"kick_armed_penalty_per_second": -0.1, "kick_attempt_bonus_multiplier": 2.0},
-        )
-        assert comps["katt"] == pytest.approx(0.0)
-
-    def test_zero_when_attempted_but_not_armed(self):
-        """The core behavior this feature was built for: an ordinary kick
-        while already in possession (kick_attempted_this_step=True,
-        kick_attempt_was_armed_this_step=False, since kick_armed is never
-        set on that path) must NOT collect 'katt' -- it never paid any
-        'karm' cost to offset."""
-        _, comps = self._call(
-            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=False, decision_interval_s=1.0,
-            cfg_overrides={"kick_armed_penalty_per_second": -0.1, "kick_attempt_bonus_multiplier": 2.0},
-        )
-        assert comps["katt"] == pytest.approx(0.0)
-
-    def test_nonzero_when_attempted_and_armed(self):
-        _, comps = self._call(
-            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True, decision_interval_s=1.0,
-            cfg_overrides={"kick_armed_penalty_per_second": -0.1, "kick_attempt_bonus_multiplier": 1.0},
-        )
-        assert comps["katt"] == pytest.approx(0.1)
-
-    def test_zero_when_base_rate_disabled(self):
-        _, comps = self._call(
-            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True, decision_interval_s=1.0,
-            cfg_overrides={"kick_armed_penalty_per_second": 0.0, "kick_attempt_bonus_multiplier": 2.0},
-        )
-        assert comps["katt"] == pytest.approx(0.0)
-
-    def test_scales_with_decision_interval_and_multiplier_not_arm_duration(self):
-        """Flat payout regardless of decision_interval_s/multiplier combo --
-        there is no 'how long was it armed' input to this formula at all,
-        by design (matching 'tatt' paying the same for an instant vs. long
-        tackle chase)."""
-        _, comps = self._call(
-            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True, decision_interval_s=0.5,
-            cfg_overrides={"kick_armed_penalty_per_second": -0.1, "kick_attempt_bonus_multiplier": 4.0},
-        )
-        assert comps["katt"] == pytest.approx(0.1 * 0.5 * 4.0)
-
-    def test_multiplier_defaults_to_one_when_unset(self):
-        cfg = {**_CFG1, "step_penalty": 0.0, "kick_armed_penalty_per_second": -0.1}
-        cfg.pop("kick_attempt_bonus_multiplier", None)
-        total, comps, _ = phase1_reward(
-            **self._BASE_KWARGS,
-            kick_attempted_this_step=True,
-            kick_attempt_was_armed_this_step=True,
-            decision_interval_s=1.0,
-            cfg=cfg,
-        )
-        assert comps["katt"] == pytest.approx(0.1)
-
-    def test_disabled_by_zero_multiplier(self):
-        _, comps = self._call(
-            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True, decision_interval_s=1.0,
-            cfg_overrides={"kick_armed_penalty_per_second": -0.1, "kick_attempt_bonus_multiplier": 0.0},
-        )
-        assert comps["katt"] == pytest.approx(0.0)
-
-    def test_karm_zero_when_only_attempted_not_armed(self):
-        """kick_armed and kick_attempted_this_step are independent flags in
-        this function's signature -- 'karm' must not fire off of
-        kick_attempted_this_step/kick_attempt_was_armed_this_step alone."""
-        _, comps = self._call(
-            kick_attempted_this_step=True, kick_attempt_was_armed_this_step=True, decision_interval_s=1.0,
-            cfg_overrides={"kick_armed_penalty_per_second": -0.1},
-        )
-        assert comps["karm"] == pytest.approx(0.0)
+        assert total == pytest.approx(sum(comps.values()), rel=1e-9)
+        assert total == pytest.approx(0.3 * 4.0 + 0.4 * 2.0, rel=1e-9)
 
 
 # ---------------------------------------------------------------------------
@@ -1081,14 +533,13 @@ class TestPhase1TerminalRewardOnly:
     reward approximation (see ScenarioLoop._compute_terminal_rewards). Must
     agree EXACTLY with phase1_reward() itself for the terminal components
     (it's a thin wrapper, not a reimplementation), and must always zero out
-    every per-tick shaping term regardless of what the terminal flags are."""
+    the "sprint" shaping term regardless of what the terminal flags are."""
 
     _NEUTRAL = dict(
         reached_opponent_box_with_possession=False,
         opponent_reached_trainee_box=False,
         timed_out=False,
         ball_went_out_after_touch=False,
-        illegal_action_attempted=False,
         cfg=_CFG1,
     )
 
@@ -1097,54 +548,39 @@ class TestPhase1TerminalRewardOnly:
             **{**self._NEUTRAL, "reached_opponent_box_with_possession": True},
             time_fraction_remaining=0.4,
         )
-        total_full, comps_full, _ = phase1_reward(
-            prev_ball_dist=0.0, curr_ball_dist=0.0, has_possession_now=False,
-            gained_possession_this_step=0, ball_progress_toward_goal_m=0.0,
-            ball_went_out_after_touch=False, illegal_action_attempted=False,
+        total_full, comps_full = phase1_reward(
+            ball_went_out_after_touch=False,
             reached_opponent_box_with_possession=True, cfg=_CFG1,
-            time_fraction_remaining=0.4, episode_done=True,
+            time_fraction_remaining=0.4,
         )
         assert total_only == pytest.approx(total_full)
         assert comps_only["box"] == pytest.approx(comps_full["box"])
         assert comps_only["spd"] == pytest.approx(comps_full["spd"])
 
-    def test_no_terminal_flags_leaves_only_step_and_stam(self):
-        total, comps = phase1_terminal_reward_only(**self._NEUTRAL, stamina_used=0.3)
-        for key in ("appr", "retr", "appr_sq", "hdg", "poss", "prog", "out", "ill",
-                    "box", "spd", "lpos", "lterm", "tout", "prox", "sprint",
-                    "tack", "tatt", "karm", "katt"):
+    def test_no_terminal_flags_leaves_everything_zero(self):
+        total, comps = phase1_terminal_reward_only(**self._NEUTRAL)
+        for key in ("out", "box", "spd", "lterm", "tout", "sprint", "appr", "prog"):
             assert comps[key] == pytest.approx(0.0), key
-        # step/stam are the only always-on components.
-        assert total == pytest.approx(comps["step"] + comps["stam"])
+        assert total == pytest.approx(0.0)
 
     def test_loss_terminal_fires_on_opponent_reached_trainee_box(self):
-        cfg = {**_CFG1, "loss_terminal": -1.0, "step_penalty": 0.0}
+        cfg = {**_CFG1, "loss_terminal": -1.0}
         _total, comps = phase1_terminal_reward_only(
             **{**self._NEUTRAL, "cfg": cfg, "opponent_reached_trainee_box": True},
         )
         assert comps["lterm"] == pytest.approx(-1.0)
         assert comps["box"] == pytest.approx(0.0)
 
-    def test_timeout_and_proximity_use_given_box_distance(self):
-        cfg = {**_CFG1, "timeout_penalty": -0.5, "proximity_bonus_scale": 1.0, "step_penalty": 0.0}
+    def test_timeout_penalty(self):
+        cfg = {**_CFG1, "timeout_penalty": -0.5}
         _total, comps = phase1_terminal_reward_only(
             **{**self._NEUTRAL, "cfg": cfg, "timed_out": True},
-            ball_dist_to_opponent_box_m=20.0,
         )
         assert comps["tout"] == pytest.approx(-0.5)
-        assert comps["prox"] == pytest.approx(1.0 * (1.0 - 20.0 / 40.0))
 
     def test_ball_out_fires_independently_of_other_flags(self):
-        cfg = {**_CFG1, "ball_out_penalty": -0.2, "step_penalty": 0.0}
+        cfg = {**_CFG1, "ball_out_penalty": -0.2}
         _total, comps = phase1_terminal_reward_only(
             **{**self._NEUTRAL, "cfg": cfg, "ball_went_out_after_touch": True},
         )
         assert comps["out"] == pytest.approx(-0.2)
-
-    def test_stamina_used_only_matters_via_configured_coefficient(self):
-        cfg = {**_CFG1, "stamina_sprint_penalty": 0.4, "step_penalty": 0.0}
-        _total, comps = phase1_terminal_reward_only(
-            **{**self._NEUTRAL, "cfg": cfg}, stamina_used=0.25,
-        )
-        assert comps["stam"] == pytest.approx(-0.4 * 0.25)
-        assert ema.alpha_post_goal < ema.alpha_normal  # faster after goal

@@ -374,7 +374,21 @@ def main() -> None:
     # this a checkpoint dir alone can't tell you what hyperparameters
     # actually produced it later.
     from footballcoach.ai.config import config_path
-    shutil.copy2(config_path(), checkpoint_dir / "ai_config.json")
+    _ai_config_snapshot = checkpoint_dir / "ai_config.json"
+    shutil.copy2(config_path(), _ai_config_snapshot)
+    # Pin this run (main process AND every worker it ever spawns, including
+    # every later PPG-interleave-triggered pool respawn -- see
+    # ppo_trainer.py's _maybe_run_ppg_interleave) to the snapshot just taken,
+    # not the live source-tree ai_config.json. Workers use multiprocessing's
+    # "spawn" context (the only one on Windows), which inherits the parent's
+    # environment at Process()-creation time -- set BEFORE any worker spawns
+    # (and before the curriculum.phases import below, whose module-level code
+    # reads config at import time) so nothing in this process ever reads the
+    # live file again. See _resolve_config_path()'s docstring for why this
+    # exists: a live mid-run edit was confirmed to leak into an
+    # already-running process this way on 2026-10-18.
+    import os
+    os.environ["FOOTBALLCOACH_AI_CONFIG_PATH"] = str(_ai_config_snapshot)
 
     from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
     from footballcoach.ai.curriculum.phases import PHASES_BY_ID

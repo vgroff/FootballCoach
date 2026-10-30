@@ -64,6 +64,14 @@ def _make_envs(trainer, n: int, max_episode_s: float | None = None):
     env_kwargs = dict(_PHASE.env_kwargs)
     if max_episode_s is not None:
         env_kwargs["max_episode_s"] = max_episode_s
+    # Force deterministic episode length regardless of the live
+    # curriculum.phase1_max_episode_s_variability value -- _PHASE.env_kwargs
+    # is captured once at curriculum.phases import time (same as max_episode_s
+    # itself, see this function's own max_episode_s override above), so a
+    # live config bump here is NOT something a per-test fixture override can
+    # fix after the fact. These orchestration/exact-match tests need
+    # bit-identical episode lengths across the two paths being compared.
+    env_kwargs["max_episode_s_variability_s"] = 0.0
     for _ in range(n):
         defn = ScenarioDefinition(
             key="phase1_1v1_test", label="Phase 1: 1v1 (test, rules-based opponent)",

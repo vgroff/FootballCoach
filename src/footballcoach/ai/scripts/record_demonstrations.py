@@ -122,25 +122,6 @@ def _log_action_stats_summary(
             )
 
 
-def _log_poss_reward_summary(episode_poss_reward: list[dict[str, float]], label: str = "whole run") -> None:
-    """Log per-episode mean/std/median and grand totals for the get_possession
-    ("poss")/lose_possession ("lpos") reward components -- env-level
-    (trainee+opponent combined, same convention as the reward-breakdown log
-    line above), tracked per-episode for the same reason as
-    _log_action_stats_summary."""
-    if not episode_poss_reward:
-        return
-    n_eps = len(episode_poss_reward)
-    log.info(f"get_possession/lose_possession reward summary over {n_eps} episode(s) ({label}, trainee+opponent):")
-    for k, name in (("poss", "get_possession"), ("lpos", "lose_possession")):
-        vals = np.array([ep[k] for ep in episode_poss_reward], dtype=np.float64)
-        log.info(
-            f"  {name:16s} total={vals.sum():+8.2f}  per-ep: mean={vals.mean():+6.3f}  "
-            f"std={vals.std():6.3f}  median={np.median(vals):+6.3f}  "
-            f"min={vals.min():+.3f}  max={vals.max():+.3f}"
-        )
-
-
 # ---------------------------------------------------------------------------
 # Recording logic
 # ---------------------------------------------------------------------------
@@ -360,16 +341,6 @@ def record_episodes(
     # Since-last-periodic-log accumulator (mirrors _comp_acc's reset pattern).
     _ep_counts_since_log: list[dict[str, dict[str, int]]] = []
 
-    # Per-episode cumulative get_possession/lose_possession reward (env-level,
-    # i.e. trainee+opponent combined -- same convention as _comp_acc/rewards
-    # above, there's no separate per-player reward signal at this
-    # granularity). Tracked per-episode (not just since-last-log) so the
-    # final summary can report mean/std/median across the whole run,
-    # matching the action-count summary's level of detail.
-    episode_poss_reward: list[dict[str, float]] = []
-    _ep_poss_reward: dict[str, float] = {"poss": 0.0, "lpos": 0.0}
-    _poss_reward_since_log: list[dict[str, float]] = []
-
     if total_episodes is None:
         total_episodes = n_episodes
 
@@ -554,8 +525,6 @@ def record_episodes(
         for role in _ROLES:
             for k in _ep_counts[role]:
                 _ep_counts[role][k] = 0
-        for k in _ep_poss_reward:
-            _ep_poss_reward[k] = 0.0
         # Drive trainee with rules-based AI (or a neural checkpoint, when
         # driver_trainer is given -- env.reset() just above already assigned
         # NeuralPlayerAI to it via env.sample_action_fn, so don't override
@@ -736,16 +705,13 @@ def record_episodes(
             # train.py's "_comp_acc" diagnostic for the analogous pattern).
             # This periodic run-wide SUMMARY is deliberately env-level (all
             # players' components summed) -- there's no per-player breakdown
-            # at this granularity (see _ep_poss_reward's own docstring
-            # above) -- so explicitly sum every _comp_by_pid dict here,
-            # now that env.last_reward_components alone no longer includes
-            # the secondary players' own contribution (see the backfill
-            # above).
+            # at this granularity -- so explicitly sum every _comp_by_pid
+            # dict here, now that env.last_reward_components alone no longer
+            # includes the secondary players' own contribution (see the
+            # backfill above).
             for _pid_comps in _comp_by_pid.values():
                 for _k, _v in _pid_comps.items():
                     _comp_acc[_k] = _comp_acc.get(_k, 0.0) + _v
-            _ep_poss_reward["poss"] += sum(c.get("poss", 0.0) for c in _comp_by_pid.values())
-            _ep_poss_reward["lpos"] += sum(c.get("lpos", 0.0) for c in _comp_by_pid.values())
 
         # `while not done` has just exited, so done=True and env.last_terminal_match
         # holds the trial's real final tick (see ScenarioLoop.last_completed_trial_match).
@@ -765,8 +731,6 @@ def record_episodes(
             )
 
         _comp_acc_episodes += 1
-        episode_poss_reward.append(dict(_ep_poss_reward))
-        _poss_reward_since_log.append(dict(_ep_poss_reward))
         _ep_counts_snapshot = {role: dict(_ep_counts[role]) for role in _ROLES}
         episode_action_counts.append(_ep_counts_snapshot)
         _ep_counts_since_log.append(_ep_counts_snapshot)
@@ -812,13 +776,11 @@ def record_episodes(
                     f"  (totals: kicks={_kick_count_total}  tackles={_tackle_count_total})"
                 )
                 _log_action_stats_summary(_ep_counts_since_log, label="since last log")
-                _log_poss_reward_summary(_poss_reward_since_log, label="since last log")
             _comp_acc.clear()
             _comp_acc_episodes = 0
             _kick_count_since_log = 0
             _tackle_count_since_log = 0
             _ep_counts_since_log.clear()
-            _poss_reward_since_log.clear()
 
     env.definition.on_tick = _orig_on_tick  # restore original
 
@@ -848,9 +810,6 @@ def record_episodes(
         # column order -- per-role dicts can't round-trip through .npz directly.
         "meta_episode_action_count_keys": np.array(
             [f"{role}.{k}" for role in _ROLES for k in _ACTION_COUNT_KEYS]
-        ),
-        "meta_episode_poss_reward": np.array(
-            [[ep["poss"], ep["lpos"]] for ep in episode_poss_reward], dtype=np.float32
         ),
         # Ground-truth per-episode outcome strings (see episode_outcomes
         # comment above) -- one entry per complete episode, same order as
@@ -923,7 +882,6 @@ def _run_recording_job(job: dict) -> dict:
     total_steps = 0
     n_files_written = 0
     all_episode_action_counts: list[dict[str, int]] = []
-    all_episode_poss_reward: list[dict[str, float]] = []
 
     while remaining > 0:
         batch = min(eps_per_file, remaining)
@@ -955,8 +913,6 @@ def _run_recording_job(job: dict) -> dict:
                 role, _, k = str(flat_k).partition(".")
                 _ep_dict.setdefault(role, {})[k] = v
             all_episode_action_counts.append(_ep_dict)
-        for poss, lpos in data["meta_episode_poss_reward"]:
-            all_episode_poss_reward.append({"poss": float(poss), "lpos": float(lpos)})
 
         fname = Path(job["output_dir"]) / f"phase{job['phase_id']}_{file_idx:04d}.npz"
         np.savez_compressed(fname, **data)
@@ -973,7 +929,6 @@ def _run_recording_job(job: dict) -> dict:
 
     if job.get("verbose_stats", False):
         _log_action_stats_summary(all_episode_action_counts)
-        _log_poss_reward_summary(all_episode_poss_reward)
 
     return {"total_steps": total_steps, "n_files": n_files_written}
 

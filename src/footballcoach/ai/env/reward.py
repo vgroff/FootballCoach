@@ -30,17 +30,15 @@ ticks within one decision interval and returned as one scalar per step.
 !!     not need to normalise manually; doing so fights the baseline.    !!
 !!                                                                      !!
 !! If a large spawn distance produces "too much free reward", the fix   !!
-!! is to tighten the spawn distribution, add episode-cumulative clamps  !!
-!! (see cumulative_clamped_delta()), or tune the coefficient — NOT to   !!
-!! divide by an unobservable initial quantity.                          !!
+!! is to tighten the spawn distribution, add an episode-cumulative      !!
+!! running-total clamp, or tune the coefficient — NOT to divide by an   !!
+!! unobservable initial quantity.                                       !!
 !!                                                                      !!
-!! Every term below is written against this invariant: appr/appr_sq use !!
-!! raw per-step deltas, prog uses raw ball_progress_toward_goal_m, prox  !!
-!! uses a FIXED 40m pitch-scale reference (not a per-episode start       !!
-!! distance), spd is speed_scale * time_remaining_fraction only, and     !!
-!! stam uses (1 - final_stamina), never (start_stamina - final_stamina). !!
-!! When adding a new term or reviewing a PR, check it against this list  !!
-!! — do not reintroduce a start_*_m / start_stamina style parameter.     !!
+!! Every term below is written against this invariant: "spd" is         !!
+!! speed_scale * time_remaining_fraction only (no start-of-episode      !!
+!! reference at all). When adding a new term or reviewing a PR, check   !!
+!! it against this list — do not reintroduce a start_*_m / start_stamina!!
+!! style parameter.                                                      !!
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
@@ -67,88 +65,32 @@ ticks within one decision interval and returned as one scalar per step.
 !!  fell from ~0.46 to ~0.07 (it was mostly possession-event noise).     !!
 !!                                                                      !!
 !! Rules:                                                                !!
-!!  * Terminal one-offs are fine (box, lterm, tout, out, prox): the      !!
-!!    episode ends, there is no future for the return to drop into, and  !!
-!!    they ARE the objective.                                            !!
+!!  * Terminal one-offs are fine (box, lterm, tout, out): the episode    !!
+!!    ends, there is no future for the return to drop into, and they     !!
+!!    ARE the objective.                                                 !!
 !!  * Otherwise prefer a bounded PER-STEP term, or POTENTIAL-BASED       !!
-!!    shaping F = gamma*Phi(s') - Phi(s) with Phi(terminal) = 0 (appr is  !!
-!!    the model: it telescopes and keeps the optimal policy). A          !!
-!!    potential term still shifts the value by -Phi(s), but that offset  !!
-!!    is an observable function of state, not of future event timing.    !!
+!!    shaping F = gamma*Phi(s') - Phi(s) with Phi(terminal) = 0 (it      !!
+!!    telescopes and keeps the optimal policy). A potential term still   !!
+!!    shifts the value by -Phi(s), but that offset is an observable      !!
+!!    function of state, not of future event timing.                    !!
 !!  * Any per-step term must be bounded over the maximum episode length: !!
 !!    per_step * max_steps must stay well below the terminal win reward, !!
-!!    or holding/dawdling beats winning (use cumulative_clamped_delta).  !!
+!!    or holding/dawdling beats winning (bound it with an episode-       !!
+!!    cumulative running-total clamp).                                   !!
 !!  * Never pair a bonus with a near-equal offsetting penalty that nets  !!
 !!    non-zero.                                                          !!
 !!  * If you must add a non-terminal event term: justify it, default it  !!
 !!    to 0.0, and measure its effect first (recompute MC returns with    !!
 !!    and without it: return variance, value R2, per-outcome loss).      !!
-!!  * Still event-paid and non-terminal -- review before enabling or     !!
-!!    retuning: ill (illegal_action_penalty, currently 0.0) and the      !!
-!!    tatt / katt attempt bonuses.                                       !!
 !!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!
 
 phase1_reward() returns a (float, dict[str, float]) tuple where the dict
 breaks the total down by source key:
-  appr  — linear ball approach bonus (potential-based; telescopes over an
-          episode to net distance closed, NOT sensitive to how fast — see
-          appr_sq below for a term that actually rewards speed). Raw
-          per-step distance delta, no initial-state normalisation (see
-          module invariant above).
-  retr  — linear ball retreat penalty (symmetric formula to appr). Also raw,
-          also not normalized — a penalty's absolute weight should be
-          scenario-independent regardless of spawn distance.
-  appr_sq — squared bonus/penalty for the PLAYER's own speed toward/away
-          from the ball (asymmetric coefficients: ball_approach_speed_bonus /
-          ball_retreat_speed_penalty). Uses player_speed_mps * heading_cos_sim
-          (the scalar projection of the player's own velocity onto the
-          direction-to-ball axis) — NOT prev_ball_dist - curr_ball_dist (the
-          gap-closing rate), which is contaminated by the ball's own motion
-          (e.g. a hard clearance kick moves the ball away fast independent of
-          anything the player did, producing large uncontrollable swings that
-          have nothing to do with player skill). Unlike appr/retr, this is
-          NOT a linear potential-based term, so it does NOT telescope:
-          closing the same net distance in fewer/faster steps yields
-          strictly more total reward than doing it slowly, because
-          sum(x_i^2) >= (sum(x_i))^2 / n with equality only when every step
-          closes the same amount. Use this (not appr) when you want to
-          reward genuine speed rather than just final position. Raw
-          player_speed_toward_ball^2, no initial-state normalisation.
-          appr_sq_approach_reward_clamp/appr_sq_retreat_reward_clamp (both
-          null = uncapped) independently bound the EPISODE-CUMULATIVE total
-          of each side via cumulative_clamped_delta() -- two separate bounds
-          (not one symmetric clamp) to match the independently-tunable
-          bonus/penalty coefficients above.
-  hdg   — heading penalty (moving away from the ball)
-  poss  — gain possession bonus (gain_possession_bonus). DISABLED (0.0) since
-          2026-09-20: a one-off event payment -- see STANDING GUIDELINE above.
-  prog  — ball progress toward the opponent BOX while in possession (delta
-          of _ball_dist_to_opponent_box(), i.e. box-distance closed this
-          step — NOT raw goal-line x movement, so lateral movement into the
-          box counts). Raw ball_progress_toward_goal_m (m/step), no
-          initial-state normalisation; NOT split into an asymmetric
-          forward/backward pair like appr/retr, since progress is a single
-          signed quantity with one coefficient, not two.
-          prog_reward_clamp (when set) bounds the EPISODE-CUMULATIVE total
-          of this term to +/-prog_reward_clamp via cumulative_clamped_delta()
-          — NOT each step independently, since that alone wouldn't stop many
-          small steps from summing past the clamp over a long/wandering
-          episode. Caller must track and pass back prog_cumulative_before/
-          prog_cumulative_after across steps for the same player/episode.
   out   — ball out of bounds penalty
-  ill   — illegal action penalty
   box   — box possession terminal
   spd   — speed bonus (fast finish). speed_scale * time_remaining_fraction only.
-  lpos  — loss of possession penalty (loss_of_possession_penalty). DISABLED
-          (0.0) since 2026-09-20, same reason as poss.
   lterm — loss terminal (opponent reaches trainee box)
   tout  — timeout penalty
-  prox  — proximity bonus on timeout. Uses a FIXED 40m pitch-scale reference
-          (scale * max(0, 1 - dist_to_box / 40m)), NOT a per-episode start
-          distance — see module invariant above.
-  step  — flat per-step penalty (encourages finishing faster; every step incl. terminal)
-  stam  — stamina usage penalty (episode-end only). (1 - final_stamina), never
-          (start_stamina - final_stamina) — see module invariant above.
   sprint — sprint penalty. -sprint_penalty_per_s * decision_interval_s
           whenever the player was sprinting this step, 0 otherwise. Applied
           every DECISION step (this function's own per-call granularity --
@@ -156,276 +98,103 @@ breaks the total down by source key:
           decision interval's real duration in seconds (not a flat
           per-step cost) so the total per-second cost of sprinting stays
           the same regardless of decision_interval_s tuning.
-  tack  — tackle-armed cost. tackle_armed_penalty_per_second * decision_interval_s
-          whenever tackle_armed was set this step, 0 otherwise -- same
-          per-second/decision-interval convention as "sprint" above (read at
-          the decision boundary, not integrated tick-by-tick within the
-          interval). Further multiplied by
-          tackle_armed_while_possessing_multiplier when the player was ALSO
-          in possession of the ball while arming it (multiplies rather than
-          adds so retuning the base rate scales the possession case
-          proportionally). Deliberately independent of "ill"
-          (illegal_action_attempted) -- a dedicated knob rather than folded
-          into the illegal-action penalty, which already covers several
-          unrelated invalid-action cases (see apply_nn_action.py's
-          tackle_no_carrier/tackle_while_inactive) and would make either
-          number harder to reason about on its own.
-  tatt  — tackle-attempted bonus. Same shape as "tack" but positive: when
-          tackle_attempted_this_step is true this decision step,
-          abs(tackle_armed_penalty_per_second) * decision_interval_s *
-          tackle_attempt_bonus_multiplier. Deliberately reuses "tack"'s OWN
-          per-second rate as its base (flipped positive) rather than an
-          independent coefficient, so retuning the armed-cost rate keeps
-          the two proportionally coupled unless tackle_attempt_bonus_multiplier
-          is also retuned -- that multiplier is the one exposed knob for
-          sizing the bonus relative to the cost it's meant to offset.
-          Fires on a real, INTENTIONAL tackle resolving contact (engine's
-          on_tackle callback, set only from the armed path in
-          Match._check_armed_tackles / _attempt_tackle_contact), regardless
-          of win or lose -- deliberately NOT scaled by outcome, since a win
-          already earns "poss" separately and this term exists purely to
-          offset "tack"'s ongoing per-tick cost for a genuine, uncertain
-          chase that might still fail, not to re-reward winning. Does NOT
-          fire for the collision-based auto-tackle fallback
-          (Match._check_head_on_tackles, on_auto_tackle_result) -- that path
-          never touches tackle_armed and isn't an intentional action this
-          reward is trying to shape.
-  karm  — kick-armed cost. Same shape as "tack": kick_armed_penalty_per_second
-          * decision_interval_s whenever kick_armed was set this step, 0
-          otherwise. kick_armed (Player, entities/player.py) is set while
-          chasing a loose ball with a committed kick direction/power
-          (apply_nn_action.py's kick-handling branch, only reached when the
-          player does NOT yet have the ball) -- structurally identical
-          "commit now, resolve on contact" pattern as tackle_armed, engine
-          auto-fires on first touch (Match._update_loose_ball_pickup). No
-          possessing-multiplier equivalent to tackle's own: kick_armed can
-          never be true while ALSO possessing (apply_nn_action.py's
-          if/else is exclusive -- already possessing takes the immediate-
-          kick branch instead, which never touches kick_armed), so that
-          extra-bad case tackle guards against doesn't apply here.
-  katt  — kick-attempted bonus. Same flat shape as "tatt":
-          abs(kick_armed_penalty_per_second) * decision_interval_s *
-          kick_attempt_bonus_multiplier when kick_attempted_this_step is
-          true this decision step, same regardless of how long (if at all)
-          it was armed for first -- not scaled by chase length, exactly
-          matching "tatt" paying the same whether a tackle resolved
-          instantly or after a long chase. UNLIKE "tatt", this is gated on
-          kick_attempt_was_armed_this_step (0 unless the SPECIFIC kick that
-          fired this step came from the armed path, i.e. Player.kick_armed
-          was still true the instant it fired -- see
-          ScenarioEnv._compute_phase1_reward_for_player's kick-scan
-          comment) -- an ordinary kick while already in possession never
-          paid any "karm" cost in the first place, so paying "katt" for it
-          too would be a pure, uncommitted freebie rather than offsetting a
-          genuine risky chase the way "tatt" offsets "tack" for tackle.
-          Deliberately keeps this asymmetry from tackle rather than trying
-          to force a 1:1 analogy: kicking has a real zero-cost, zero-
-          commitment path (already possessing) that tackling structurally
-          does not.
+  appr  — ball-approach shaping: ball_approach_bonus * player_ball_approach_delta_m,
+          i.e. a potential Phi(s) = -ball_approach_bonus * player_to_ball_dist(s),
+          with F = Phi(s) - Phi(s') (gamma=1) per tick, gated on
+          ball.last_touched_by_player_id != this player (see 2026-10-15 note
+          below) -- active while chasing a ball someone ELSE last touched,
+          frozen while this player is the one who last touched it (including
+          the flight of their OWN kick). Deliberately a SINGLE coefficient
+          for both closing and opening the gap (no separate "retreat" rate)
+          -- see 2026-10-14 re-introduction note below for why that matters.
+  prog  — ball-progress shaping: ball_progress_scale * ball_progress_toward_goal_m,
+          i.e. the same potential shape as "appr" but
+          Phi(s) = -ball_progress_scale * ball_dist_to_opponent_box(s), gated
+          on ball.last_touched_by_player_id == this player (see 2026-10-15
+          note below) -- active while possessing AND during the flight of
+          this player's own kick (a kick clears ball.possessed_by but never
+          touches last_touched_by_player_id -- see Ball's own docstring), so
+          a deliberate forward kick correctly earns progress credit for the
+          ground it covers. Phi is constant (contributes nothing) while
+          last_touched_by_player_id is someone else's, so no reward is paid
+          or charged purely for gaining/losing the ball itself; see the
+          STANDING GUIDELINE above re one-off event payments.
+          player_ball_approach_delta_m / ball_progress_toward_goal_m are the
+          caller's ALREADY per-tick-accumulated, PRE-tick-last_touched_by-
+          gated deltas for this decision interval (ScenarioEnv's
+          trainee_appr_accum/trainee_prog_accum and their sec_* equivalents)
+          -- phase1_reward itself applies no further gate on top of that.
+
+2026-10-14 re-introduction note ("appr"/"prog", after being 0.0 since
+2026-09 and removed entirely alongside a larger dead-knob cleanup earlier
+the same day): the ORIGINAL pre-removal version of "appr" used TWO
+independently-tunable coefficients (ball_approach_bonus for closing,
+ball_retreat_penalty for opening, with retreat penalized more) -- that is
+NOT a potential-based term. A true potential Phi(s) = -c*dist(s) requires
+ONE c for both directions; using c1 going one way and c2 the other breaks
+the telescoping identity itself (a closed round-trip no longer nets exactly
+zero -- it nets (c2-c1)*(detour distance), which IS farmable by shuttling
+back and forth, and the episode total depends on PATH, not just start/end
+state). This re-introduction is deliberately back to a single coefficient
+for exactly that reason -- see TestApprTelescopes/TestApprRoundTripNetsZero
+in test_reward.py, which assert the telescoping identity and the zero-net
+round-trip directly rather than trusting the arithmetic by eye. The squared
+"appr_sq" speed-reward variant from the same removed generation is NOT
+reintroduced -- it was explicitly non-telescoping by design (rewards
+concentrating the same net distance into fewer/faster steps), which is
+exactly the property being guarded against here.
+
+2026-10-15 "last toucher" gating note: the first cut of this
+re-introduction gated "prog" on live possession and left "appr" totally
+unconditional. That reintroduced the EXACT problem the OLD (pre-removal)
+"appr_sq" design doc already warned about for raw ball-distance deltas --
+contamination by the ball's OWN motion, independent of player skill -- just
+via a more direct path: a player's own kick ALWAYS separates them from the
+ball (at least momentarily, often for many ticks on a hard kick), so
+unconditional "appr" charged a self-inflicted penalty for the mere act of
+kicking, not recoverable within the episode if the player (or anyone) never
+closed the gap again before episode end. Separately, gating "prog" on LIVE
+possession meant a deliberate forward kick -- often the fastest way to make
+real progress -- earned ZERO progress credit for the ball's flight, since
+kicking immediately clears ball.possessed_by. Both are fixed by gating on
+ball.last_touched_by_player_id instead of live possession/distance: that
+field is written ONLY by Match._set_possession (a genuine gain), NEVER by a
+kick itself, so it already means exactly "whose play should this ball
+movement be attributed to" -- surviving through a player's own kick's
+flight until someone else actually takes the ball over. Both terms keep
+telescoping exactly within an unbroken "last touched by the same
+player_id" stretch (same proof as before, just a better-chosen gate), and
+remain non-exploitable for the same reason: a round trip that never changes
+who last touched the ball nets exactly zero.
 """
 from __future__ import annotations
 
 
-def cumulative_clamped_delta(
-    raw_delta: float,
-    cumulative_before: float,
-    clamp_max: float | None = None,
-    clamp_min: float | None = None,
-) -> tuple[float, float]:
-    """Clamp a running EPISODE TOTAL to [clamp_min, clamp_max], returning this
-    step's payout.
-
-    Clamping each step's raw value independently only bounds that one step —
-    many small steps under the per-step clamp can still sum to an unbounded
-    episode total (e.g. a wandering trajectory). This instead tracks the
-    UNCLAMPED running sum, clamps it to [clamp_min, clamp_max], and returns
-    the marginal change vs the previous step's clamped value as the actual
-    payout — so the episode-wide sum of payouts can never exceed those
-    bounds, regardless of how many steps it takes. Once the running total
-    saturates at a bound, further movement in the same direction pays 0
-    until the total reverses back inside the bound.
-
-    clamp_max/clamp_min are independent so asymmetric terms (e.g. appr_sq's
-    separately-tunable approach/retreat coefficients) can bound each side by
-    a different amount. Use symmetric_clamp() for the common single-bound
-    case (e.g. "prog").
-
-    Args:
-        raw_delta: This step's unclamped contribution (e.g. a reward term
-            before clamping).
-        cumulative_before: The running UNCLAMPED sum from all previous steps
-            this episode (0.0 at episode start).
-        clamp_max: Upper bound on the cumulative CLAMPED total. None = no
-            upper bound.
-        clamp_min: Lower bound on the cumulative CLAMPED total. None = no
-            lower bound.
-
-    Returns:
-        (payout, cumulative_after) — payout is this step's actual (possibly
-        clamped) contribution; cumulative_after is the new unclamped running
-        sum to pass back in as cumulative_before on the next step.
-    """
-    cumulative_after = cumulative_before + raw_delta
-    if clamp_max is None and clamp_min is None:
-        return raw_delta, cumulative_after
-    lo = clamp_min if clamp_min is not None else float("-inf")
-    hi = clamp_max if clamp_max is not None else float("inf")
-    clamped_before = max(lo, min(hi, cumulative_before))
-    clamped_after = max(lo, min(hi, cumulative_after))
-    return clamped_after - clamped_before, cumulative_after
-
-
-def symmetric_clamp(clamp: float | None) -> tuple[float | None, float | None]:
-    """Convenience for the common single-bound case: clamp -> (clamp_max, clamp_min)
-    i.e. (+clamp, -clamp), matching cumulative_clamped_delta()'s param order."""
-    if clamp is None:
-        return None, None
-    return clamp, -clamp
-
-
 def phase1_reward(
-    prev_ball_dist: float,
-    curr_ball_dist: float,
-    has_possession_now: bool,
-    gained_possession_this_step: bool | int,
-    ball_progress_toward_goal_m: float,
     ball_went_out_after_touch: bool,
-    illegal_action_attempted: bool,
     reached_opponent_box_with_possession: bool,
     cfg: dict,
     time_fraction_remaining: float = 0.0,
     opponent_reached_trainee_box: bool = False,
-    lost_possession_this_step: bool | int = False,
     timed_out: bool = False,
-    ball_dist_to_opponent_box_m: float = 9999.0,
-    heading_cos_sim: float = 1.0,
-    player_speed_mps: float = 0.0,
-    stamina_used: float = 0.0,
     is_sprinting: bool = False,
-    tackle_armed: bool = False,
-    tackle_attempted_this_step: bool | int = False,
-    kick_armed: bool = False,
-    kick_attempted_this_step: bool | int = False,
-    kick_attempt_was_armed_this_step: bool | int = False,
     decision_interval_s: float = 0.0,
-    episode_done: bool = False,
-    prog_reward_clamp: float | None = None,
-    appr_sq_approach_reward_clamp: float | None = None,
-    appr_sq_retreat_reward_clamp: float | None = None,
-    cumulative_state: dict[str, float] | None = None,
-) -> tuple[float, dict[str, float], dict[str, float]]:
+    player_ball_approach_delta_m: float = 0.0,
+    ball_progress_toward_goal_m: float = 0.0,
+) -> tuple[float, dict[str, float]]:
     """GetPossession/Move experiment reward (curriculum phase 1).
 
-    Returns a (total_reward, components, cumulative_state_after) tuple where
-    components maps short source keys to their individual contributions for
-    this step, and cumulative_state_after maps term name (e.g. "prog",
-    "appr_sq") to that term's running UNCLAMPED sum for this episode -- pass
-    it back in as cumulative_state on the next call for the SAME
-    player/episode (see cumulative_clamped_delta() and the "prog"/"appr_sq"
-    entries in the module docstring). Missing keys in cumulative_state
-    default to 0.0, so adding a newly-clamped term never requires updating
-    existing callers' dict contents.
+    Returns a (total_reward, components) tuple where components maps short
+    source keys to their individual contributions for this step.
 
     See ai_design_doc.md section 10.1.
     """
     r = 0.0
     comps: dict[str, float] = {}
-    cumulative_state = cumulative_state or {}
-    cumulative_state_after: dict[str, float] = {}
-
-    _delta = prev_ball_dist - curr_ball_dist  # positive = closing, negative = retreating
-    if _delta >= 0:
-        appr_r = cfg.get("ball_approach_bonus", cfg.get("ball_distance_shaping", 0.002)) * _delta
-        retr_r = 0.0
-    else:
-        appr_r = 0.0
-        retr_r = cfg.get("ball_retreat_penalty", cfg.get("ball_distance_shaping", 0.002)) * _delta
-    r += appr_r + retr_r
-    comps["appr"] = appr_r
-    comps["retr"] = retr_r
-
-    # Squared closing-speed bonus/penalty: rewards CLOSING FAST, penalises
-    # RETREATING FAST — symmetric in shape but with independently tunable
-    # coefficients (mirrors the appr/retr asymmetric-coefficient pattern
-    # above). Unlike appr/retr (linear in _delta, potential-based, telescopes
-    # over an episode to coef * (start_dist - end_dist) — a player who
-    # closes 10m in 2 fast steps and one who closes the same 10m in 20 slow
-    # steps earn IDENTICAL total appr/retr reward), squaring breaks that
-    # telescoping: concentrating the same net distance into fewer/faster
-    # steps yields strictly more total reward
-    # (sum(x_i^2) >= (sum(x_i))^2/n, equality only when every step is equal).
-    #
-    # IMPORTANT: uses the PLAYER's own speed toward the ball
-    # (player_speed_mps * heading_cos_sim — the scalar projection of the
-    # player's velocity onto the direction-to-ball axis), NOT _delta
-    # (prev_ball_dist - curr_ball_dist). _delta measures the closing rate of
-    # the GAP, i.e. the *relative* velocity between player and ball, and is
-    # contaminated by the ball's own motion (e.g. a hard clearance kick moves
-    # the ball away fast independent of anything the player did, producing
-    # large uncontrollable _delta swings — and once squared, huge outlier
-    # penalties — that have nothing to do with player skill).
-    # player_speed_mps * heading_cos_sim depends only on the player's own
-    # velocity, so ball motion no longer affects this term. Coefficients 0.0
-    # (default) disable each side independently.
-    _player_speed_toward_ball = player_speed_mps * heading_cos_sim
-    _appr_sq_coef = float(cfg.get("ball_approach_speed_bonus", 0.0))
-    _retr_sq_coef = float(cfg.get("ball_retreat_speed_penalty", _appr_sq_coef))
-    if _player_speed_toward_ball > 0.0:
-        _appr_sq_raw = _appr_sq_coef * (_player_speed_toward_ball ** 2)
-    elif _player_speed_toward_ball < 0.0:
-        _appr_sq_raw = -_retr_sq_coef * (_player_speed_toward_ball ** 2)
-    else:
-        _appr_sq_raw = 0.0
-    # Independent per-side clamps (not symmetric_clamp()) since approach/
-    # retreat already have independently tunable coefficients above.
-    appr_sq_r, cumulative_state_after["appr_sq"] = cumulative_clamped_delta(
-        _appr_sq_raw,
-        cumulative_state.get("appr_sq", 0.0),
-        clamp_max=appr_sq_approach_reward_clamp,
-        clamp_min=-appr_sq_retreat_reward_clamp if appr_sq_retreat_reward_clamp is not None else None,
-    )
-    r += appr_sq_r
-    comps["appr_sq"] = appr_sq_r
-
-    # Cosine heading penalty: penalise moving away from the ball based on velocity direction.
-    # Only fires when the player is actually moving (speed > threshold).
-    # Formula: -coef * max(0, 1 - cos_sim) ** exp
-    #   cos_sim = 1  (toward ball): penalty = 0
-    #   cos_sim = 0  (perpendicular): penalty = -coef
-    #   cos_sim = -1 (directly away): penalty = -coef * 2^exp
-    # Set heading_penalty_coef=0.0 (default) to disable entirely.
-    _hdg_coef = float(cfg.get("heading_penalty_coef", 0.0))
-    hdg_r = 0.0
-    if _hdg_coef > 0.0 and player_speed_mps > float(cfg.get("heading_penalty_min_speed_mps", 0.5)):
-        _exp = float(cfg.get("heading_penalty_exponent", 2.0))
-        hdg_r = -_hdg_coef * max(0.0, 1.0 - heading_cos_sim) ** _exp
-    r += hdg_r
-    comps["hdg"] = hdg_r
-
-    # gained_possession_this_step may be an int count (>1 if possession was
-    # gained more than once within a single decision interval, e.g. gain ->
-    # lose -> regain via tackles mid-tick-loop) -- multiply, don't just gate.
-    poss_r = cfg["gain_possession_bonus"] * gained_possession_this_step
-    r += poss_r
-    comps["poss"] = poss_r
-
-    # Ball progress toward box while in possession. prog_reward_clamp bounds
-    # the EPISODE-CUMULATIVE total — a per-step clamp alone doesn't stop many
-    # small steps summing past the clamp over a long/wandering episode.
-    _prog_raw = cfg["ball_progress_scale"] * ball_progress_toward_goal_m if has_possession_now else 0.0
-    prog_r, cumulative_state_after["prog"] = cumulative_clamped_delta(
-        _prog_raw, cumulative_state.get("prog", 0.0), *symmetric_clamp(prog_reward_clamp)
-    )
-    r += prog_r
-    comps["prog"] = prog_r
 
     out_r = cfg["ball_out_penalty"] if ball_went_out_after_touch else 0.0
     r += out_r
     comps["out"] = out_r
-
-    ill_r = cfg["illegal_action_penalty"] if illegal_action_attempted else 0.0
-    r += ill_r
-    comps["ill"] = ill_r
 
     box_r = 0.0
     spd_r = 0.0
@@ -439,43 +208,13 @@ def phase1_reward(
     comps["box"] = box_r
     comps["spd"] = spd_r
 
-    # Same rationale as gained_possession_this_step above -- multiply by count.
-    lpos_r = cfg.get("loss_of_possession_penalty", 0.0) * lost_possession_this_step
-    r += lpos_r
-    comps["lpos"] = lpos_r
-
     lterm_r = cfg.get("loss_terminal", 0.0) if opponent_reached_trainee_box else 0.0
     r += lterm_r
     comps["lterm"] = lterm_r
 
-    tout_r = 0.0
-    prox_r = 0.0
-    if timed_out:
-        tout_r = cfg.get("timeout_penalty", 0.0)
-        # Proximity bonus on timeout: consolation for how close the ball is
-        # to the opponent box. Uses a fixed 40m pitch-scale reference so the
-        # formula is fully observable (no initial-state dependency).
-        # scale * max(0, 1 - dist_to_box / 40m) → 0 at 40m+, scale at box edge.
-        prox_scale = float(cfg.get("proximity_bonus_scale", 0.0))
-        if prox_scale > 0.0:
-            prox = max(0.0, 1.0 - ball_dist_to_opponent_box_m / 40.0)
-            prox_r = prox_scale * prox
-    r += tout_r + prox_r
+    tout_r = cfg.get("timeout_penalty", 0.0) if timed_out else 0.0
+    r += tout_r
     comps["tout"] = tout_r
-    comps["prox"] = prox_r
-
-    # Flat per-step penalty to discourage dawdling. Applied every step (including
-    # terminal steps). Equivalent to a time limit that "costs" something.
-    step_r = -float(cfg.get("step_penalty", 0.0))
-    r += step_r
-    comps["step"] = step_r
-
-    # Stamina penalty — only at episode end. stamina_used = 1 - final_stamina
-    # (0.0 on non-terminal steps), so -coef * (1 - full) penalises exhaustion.
-    _stam_coef = float(cfg.get("stamina_sprint_penalty", 0.0))
-    stam_r = -_stam_coef * stamina_used if (episode_done and _stam_coef > 0.0) else 0.0
-    r += stam_r
-    comps["stam"] = stam_r
 
     # Sprint penalty — every DECISION step (this function's own call
     # granularity, not every raw engine tick), scaled by the real elapsed
@@ -486,57 +225,30 @@ def phase1_reward(
     r += sprint_r
     comps["sprint"] = sprint_r
 
-    # Tackle-armed cost -- see "tack" in the module docstring for the full
-    # rationale (independent of "ill"/illegal_action_attempted by design).
-    _tack_coef = float(cfg.get("tackle_armed_penalty_per_second", 0.0))
-    tack_r = 0.0
-    if tackle_armed and _tack_coef != 0.0:
-        tack_r = _tack_coef * decision_interval_s
-        if has_possession_now:
-            tack_r *= float(cfg.get("tackle_armed_while_possessing_multiplier", 1.0))
-    r += tack_r
-    comps["tack"] = tack_r
+    # Ball-approach shaping -- pure potential Phi(s) = -ball_approach_bonus *
+    # player_to_ball_dist(s), ONE coefficient for both closing and opening
+    # the gap (see module docstring's 2026-10-14 re-introduction note for why
+    # a second, asymmetric "retreat" coefficient is deliberately NOT exposed
+    # here -- it would break the telescoping/no-exploit guarantee). The
+    # caller's player_ball_approach_delta_m is ALREADY gated per-tick on
+    # last_touched_by_player_id != this player (see module docstring) -- no
+    # further gate here.
+    _appr_coef = float(cfg.get("ball_approach_bonus", 0.0))
+    appr_r = _appr_coef * player_ball_approach_delta_m
+    r += appr_r
+    comps["appr"] = appr_r
 
-    # Tackle-attempted bonus -- see "tatt" in the module docstring. Same
-    # shape as "tack" above but positive: reuses tackle_armed_penalty_per_second's
-    # own magnitude as its base rate (flipped positive) rather than an
-    # independent coefficient, scaled by the exposed
-    # tackle_attempt_bonus_multiplier. Deliberately NOT outcome-scaled -- a
-    # win already earns "poss" separately.
-    _tatt_base = abs(float(cfg.get("tackle_armed_penalty_per_second", 0.0)))
-    tatt_r = 0.0
-    if tackle_attempted_this_step and _tatt_base != 0.0:
-        _tatt_mult = float(cfg.get("tackle_attempt_bonus_multiplier", 1.0))
-        tatt_r = _tatt_base * decision_interval_s * _tatt_mult
-    r += tatt_r
-    comps["tatt"] = tatt_r
+    # Ball-progress shaping -- same pure-potential shape, Phi(s) =
+    # -ball_progress_scale * ball_dist_to_opponent_box(s). The caller's
+    # ball_progress_toward_goal_m is ALREADY gated per-tick on
+    # last_touched_by_player_id == this player (see module docstring) -- no
+    # further gate here.
+    _prog_coef = float(cfg.get("ball_progress_scale", 0.0))
+    prog_r = _prog_coef * ball_progress_toward_goal_m
+    r += prog_r
+    comps["prog"] = prog_r
 
-    # Kick-armed cost -- see "karm" in the module docstring. Same shape as
-    # "tack" above, no possessing-multiplier equivalent (kick_armed can
-    # never be true while possessing -- see that docstring entry).
-    _karm_coef = float(cfg.get("kick_armed_penalty_per_second", 0.0))
-    karm_r = 0.0
-    if kick_armed and _karm_coef != 0.0:
-        karm_r = _karm_coef * decision_interval_s
-    r += karm_r
-    comps["karm"] = karm_r
-
-    # Kick-attempted bonus -- see "katt" in the module docstring. Same flat
-    # shape as "tatt" (reuses kick_armed_penalty_per_second's own magnitude
-    # as its base rate, flipped positive, scaled by
-    # kick_attempt_bonus_multiplier), but ALSO gated on
-    # kick_attempt_was_armed_this_step -- unlike tackle, kicking has a
-    # zero-cost/zero-commitment path (already possessing) that never paid
-    # any "karm" cost, so it must not also collect "katt".
-    _katt_base = abs(float(cfg.get("kick_armed_penalty_per_second", 0.0)))
-    katt_r = 0.0
-    if kick_attempted_this_step and kick_attempt_was_armed_this_step and _katt_base != 0.0:
-        _katt_mult = float(cfg.get("kick_attempt_bonus_multiplier", 1.0))
-        katt_r = _katt_base * decision_interval_s * _katt_mult
-    r += katt_r
-    comps["katt"] = katt_r
-
-    return r, comps, cumulative_state_after
+    return r, comps
 
 
 def phase1_terminal_reward_only(
@@ -545,21 +257,16 @@ def phase1_terminal_reward_only(
     opponent_reached_trainee_box: bool,
     timed_out: bool,
     ball_went_out_after_touch: bool,
-    illegal_action_attempted: bool,
     cfg: dict,
     time_fraction_remaining: float = 0.0,
-    ball_dist_to_opponent_box_m: float = 9999.0,
-    stamina_used: float = 0.0,
 ) -> tuple[float, dict[str, float]]:
     """Approximate a phase-1 episode's reward using ONLY phase1_reward()'s
-    TERMINAL-gated components (box/spd, lterm, tout/prox, out) plus the
-    always-on step/stam/ill point-reads -- for callers that only have the
-    final-tick state and none of the continuous per-tick running state
-    (prev_ball_dist deltas, cumulative_state, possession-transition counts,
-    kick/tackle-armed flags, ...) the OTHER components need. Every per-tick
-    shaping term (appr/retr/appr_sq/hdg/poss/prog/sprint/tack/tatt/karm/katt)
-    is fed a neutral input below so it always contributes exactly 0 --
-    NOT computed and subtracted out, simply never triggered.
+    TERMINAL-gated components (box/spd, lterm, tout, out) -- for callers
+    that only have the final-tick state, not the continuous per-tick
+    running state (is_sprinting, decision_interval_s,
+    player_ball_approach_delta_m, ball_progress_toward_goal_m, ...) the
+    "sprint"/"appr"/"prog" terms need. Those are fed neutral inputs below so
+    they always contribute exactly 0.
 
     Intended for the UI's live scenario view (``ScenarioLoop``, which never
     routes through ``ScenarioEnv`` and so never tracks that per-tick state --
@@ -570,27 +277,16 @@ def phase1_terminal_reward_only(
     snapshot's contribution, useful for sanity-checking the terminal/outcome
     coefficients by eye, not for comparing against training logs.
     """
-    total, comps, _ = phase1_reward(
-        prev_ball_dist=0.0, curr_ball_dist=0.0,
-        has_possession_now=False, gained_possession_this_step=0,
-        ball_progress_toward_goal_m=0.0,
+    return phase1_reward(
         ball_went_out_after_touch=ball_went_out_after_touch,
-        illegal_action_attempted=illegal_action_attempted,
         reached_opponent_box_with_possession=reached_opponent_box_with_possession,
         cfg=cfg,
         time_fraction_remaining=time_fraction_remaining,
         opponent_reached_trainee_box=opponent_reached_trainee_box,
-        lost_possession_this_step=0,
         timed_out=timed_out,
-        ball_dist_to_opponent_box_m=ball_dist_to_opponent_box_m,
-        heading_cos_sim=1.0, player_speed_mps=0.0,
-        stamina_used=stamina_used, is_sprinting=False,
-        tackle_armed=False, tackle_attempted_this_step=False,
-        kick_armed=False, kick_attempted_this_step=False,
-        kick_attempt_was_armed_this_step=False,
-        decision_interval_s=0.0, episode_done=True,
+        is_sprinting=False,
+        decision_interval_s=0.0,
     )
-    return total, comps
 
 
 def phase2_reward(

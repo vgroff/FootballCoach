@@ -160,6 +160,22 @@ def test_kick_callback_row_does_not_duplicate_prior_reward(monkeypatch):
     env = build_env(phase)
     label_fn = bc_label_fn_for_phase(1)
     env.always_compute_secondary_reward = True
+    # This test's own patch only overrides the TRAINEE-facing env.step()
+    # return value -- the opponent's reward (recorded via
+    # env.last_secondary_results, computed by the real, un-patched
+    # _compute_phase1_reward_for_player()) is genuinely live. With
+    # ball_approach_bonus/ball_progress_scale nonzero, an opponent who never
+    # touches the ball has its "appr" gate permanently open (last_touched_by
+    # is never them), so it legitimately earns/pays tiny real reward for the
+    # ball's movement every tick -- real signal, not the duplication bug
+    # this test guards against. Zero both so every row this test doesn't
+    # explicitly expect a value on is actually exactly 0.0, independent of
+    # whatever these coefficients are live-tuned to.
+    env._reward_cfg["phase1"] = {
+        **env._reward_cfg["phase1"],
+        "ball_approach_bonus": 0.0,
+        "ball_progress_scale": 0.0,
+    }
 
     orig_step = scenario_env_mod.ScenarioEnv.step
     state = {"ticks": 0}
