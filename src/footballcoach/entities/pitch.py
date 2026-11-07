@@ -4,6 +4,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 
 from footballcoach.config import PitchConfig
+from footballcoach.entities.player import Team
 from footballcoach.mathutils import Vector3
 
 
@@ -78,15 +79,15 @@ class Pitch:
     def is_in_either_box(self, position: Vector3) -> bool:
         return self.is_in_box(position, left=True) or self.is_in_box(position, left=False)
 
-    def is_goal(self, position: Vector3) -> str | None:
-        """Returns 'left' or 'right' if position is within that goal mouth, else None."""
+    def is_goal(self, position: Vector3) -> Team | None:
+        """The team defending the goal mouth that position is within, else None."""
         half_goal_w = self.goal_width_m / 2.0
         if abs(position.y) > half_goal_w or position.z > self.goal_height_m:
             return None
         if position.x <= -self.half_length:
-            return "left"
+            return Team.LEFT
         if position.x >= self.half_length:
-            return "right"
+            return Team.RIGHT
         return None
 
     def is_in_bounds(self, position: Vector3) -> bool:

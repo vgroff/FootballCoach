@@ -193,9 +193,8 @@ def _secondary_neural_candidates(env) -> list[tuple]:
     BatchedEnvGroup instance."""
     out = []
     for pid in env.secondary_player_ids:
-        try:
-            sec_player = env.match.player_by_id(pid)
-        except KeyError:
+        sec_player = env.match.player_by_id_or_none(pid)
+        if sec_player is None:
             continue
         sec_ai = sec_player.ai
         if not hasattr(sec_ai, "is_due_for_decision"):

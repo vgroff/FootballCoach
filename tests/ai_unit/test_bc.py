@@ -616,3 +616,52 @@ class TestPhase1Labels:
 
         label = phase1_labels(_FakeEnv(), "trainee")
         assert not label.valid
+
+
+class TestLabelLayout:
+    """The _I_* columns are imported by obs/augment.py and obs/canonical.py."""
+
+    @staticmethod
+    def _columns() -> dict[str, int]:
+        import footballcoach.ai.ppo.bc as bc
+        return {k: v for k, v in vars(bc).items() if k.startswith("_I_") and isinstance(v, int)}
+
+    def test_columns_are_exactly_zero_to_label_dim_with_no_gaps_or_duplicates(self):
+        assert sorted(self._columns().values()) == list(range(BC_LABEL_DIM))
+
+    def test_to_array_fills_each_column_from_its_named_field(self):
+        import footballcoach.ai.ppo.bc as bc
+        arr = BCLabel(
+            move_direction=np.array([0.11, 0.12]),
+            move_region_center_m=np.array([0.13, 0.14]),
+            kick_direction=np.array([0.15, 0.16, 0.17]),
+            kick_spin=np.array([0.18, 0.19, 0.21]),
+        ).to_array()
+        expected = {
+            bc._I_DIR_X: 0.11, bc._I_DIR_Y: 0.12, bc._I_REGION_X: 0.13, bc._I_REGION_Y: 0.14,
+            bc._I_KICK_DIR_X: 0.15, bc._I_KICK_DIR_Y: 0.16, bc._I_KICK_DIR_Z: 0.17,
+            bc._I_KICK_SPIN_X: 0.18, bc._I_KICK_SPIN_Y: 0.19, bc._I_KICK_SPIN_Z: 0.21,
+        }
+        for col, value in expected.items():
+            assert arr[col] == pytest.approx(value)
+
+
+class TestSmoothTarget:
+    def test_moves_hard_targets_towards_one_half(self):
+        from footballcoach.ai.ppo.bc import _smooth_target
+        result = _smooth_target(torch.tensor([0.0, 1.0, 0.5]), 0.1)
+        assert result.tolist() == pytest.approx([0.05, 0.95, 0.5])
+
+    def test_zero_smoothing_is_the_identity(self):
+        from footballcoach.ai.ppo.bc import _smooth_target
+        target = torch.tensor([0.0, 0.25, 1.0])
+        assert torch.equal(_smooth_target(target, 0.0), target)
+
+    def test_loss_at_the_smoothed_target_equals_the_analytic_floor(self):
+        """The floor only means anything if both paths smooth the same way."""
+        import torch.nn.functional as F
+        from footballcoach.ai.ppo.bc import _smooth_target
+        smoothed = _smooth_target(torch.tensor([0.0, 1.0]), 0.2)
+        at_optimum = F.binary_cross_entropy_with_logits(torch.logit(smoothed), smoothed, reduction="none")
+        floor = -(smoothed * torch.log(smoothed) + (1.0 - smoothed) * torch.log(1.0 - smoothed))
+        assert at_optimum.tolist() == pytest.approx(floor.tolist(), abs=1e-6)

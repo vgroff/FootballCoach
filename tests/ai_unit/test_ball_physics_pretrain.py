@@ -33,6 +33,7 @@ from footballcoach.ai.physics_pretrain.ball_dynamics_net import (
 )
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.pitch import Pitch
+from footballcoach.entities.player import Team
 from footballcoach.mathutils import Vector3
 
 
@@ -235,7 +236,7 @@ def test_freeze_on_goal():
         velocity=Vector3.zero(),
         spin=Vector3.zero(),
     )
-    assert pitch.is_goal(ball.position) == "right"
+    assert pitch.is_goal(ball.position) is Team.RIGHT
 
     from footballcoach.engine.ball_physics import BallPhysicsParams, resolve_goal_boundary, step_ball
     from footballcoach.engine.scoring import check_goal

@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from footballcoach.config import load_physics_config, require_section
+from footballcoach.config import load_attributes_config, load_physics_config, require_section
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
@@ -47,7 +47,7 @@ class ControlTimeParams:
     def from_config() -> "ControlTimeParams":
         cfg = load_physics_config()
         d = require_section(cfg, "control_time")
-        player_cfg = require_section(cfg, "player")
+        body_cfg = require_section(load_attributes_config(), "body", file_name="attributes.json")
         gk = require_section(d, "goalkeeper", file_name="physics.json:control_time")
         return ControlTimeParams(
             t_base_s=d["t_base_s"],
@@ -61,9 +61,9 @@ class ControlTimeParams:
             k2_own_velocity_s_per_mps=d["k2_own_velocity_s_per_mps"],
             ball_control_alpha=d["ball_control_alpha"],
             noise_sigma_fraction=d["noise_sigma_fraction"],
-            knee_height_m=player_cfg["knee_height_m"],
-            waist_height_m=player_cfg["waist_height_m"],
-            player_height_m=player_cfg["height_m"],
+            knee_height_m=body_cfg["knee_height_m"],
+            waist_height_m=body_cfg["waist_height_m"],
+            player_height_m=body_cfg["height_m"],
             gk_t_base_s=gk["t_base_s"],
             gk_height_factor_scale=gk["height_factor_scale"],
             gk_ball_control_alpha=gk["ball_control_alpha"],

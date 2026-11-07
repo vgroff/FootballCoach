@@ -266,3 +266,68 @@ class TestIntegrationWithEncoder:
         sf_c, _, _, x_sign = canonicalize_obs(sf, torch.from_numpy(obs.other_feat), torch.from_numpy(obs.ball_feat))
         assert x_sign == 1.0
         assert torch.allclose(sf_c, sf)
+
+
+class TestBcLabelMirrorByFieldName:
+    """Built through BCLabel so a column mix-up can't be hidden by shared constants."""
+
+    @staticmethod
+    def _labels():
+        from footballcoach.ai.ppo.bc import BCLabel
+        return torch.from_numpy(BCLabel(
+            move_direction=np.array([0.1, 0.2]),
+            move_region_center_m=np.array([3.0, 4.0]),
+            kick_direction=np.array([0.5, 0.6, 0.7]),
+            kick_power_fraction=0.8,
+            kick_spin=np.array([9.0, 10.0, 11.0]),
+        ).to_array()).unsqueeze(0)
+
+    def test_x_mirror_negates_exactly_the_x_odd_fields(self):
+        import footballcoach.ai.ppo.bc as bc
+        from footballcoach.ai.obs.canonical import canonicalize_bc_labels
+        before = self._labels()
+        after = canonicalize_bc_labels(before, -1.0)
+        negated = {bc._I_DIR_X, bc._I_REGION_X, bc._I_KICK_DIR_X, bc._I_KICK_SPIN_Y, bc._I_KICK_SPIN_Z}
+        for col in range(before.shape[1]):
+            sign = -1.0 if col in negated else 1.0
+            assert after[0, col] == pytest.approx(sign * before[0, col])
+
+
+class TestAugmentObsBcLabelFlipsByFieldName:
+    @staticmethod
+    def _flip(monkeypatch, flip_x, flip_y):
+        import random
+        from footballcoach.ai.obs import augment
+        from footballcoach.ai.obs.schema import BALL_FEATURE_DIM, PLAYER_FEATURE_DIM
+        monkeypatch.setattr(augment, "_FLIP_VARIANTS", [(flip_x, flip_y)])
+        before = TestBcLabelMirrorByFieldName._labels()
+        obs = {
+            "self_feat": torch.zeros(1, PLAYER_FEATURE_DIM),
+            "other_feat": torch.zeros(1, 2, PLAYER_FEATURE_DIM),
+            "exists_mask": torch.ones(1, 2),
+            "ball_feat": torch.zeros(1, BALL_FEATURE_DIM),
+            "global_feat": torch.zeros(1, 3),
+        }
+        _, after = augment.augment_obs_bc(obs, before, 1, random.Random(0))
+        return before, after
+
+    def test_flip_x_negates_exactly_the_x_odd_fields(self, monkeypatch):
+        import footballcoach.ai.ppo.bc as bc
+        before, after = self._flip(monkeypatch, True, False)
+        negated = {bc._I_DIR_X, bc._I_REGION_X, bc._I_KICK_DIR_X, bc._I_KICK_SPIN_Y, bc._I_KICK_SPIN_Z}
+        for col in range(before.shape[1]):
+            assert after[0, col] == pytest.approx((-1.0 if col in negated else 1.0) * before[0, col])
+
+    def test_flip_y_negates_exactly_the_y_odd_fields(self, monkeypatch):
+        import footballcoach.ai.ppo.bc as bc
+        before, after = self._flip(monkeypatch, False, True)
+        negated = {bc._I_DIR_Y, bc._I_REGION_Y, bc._I_KICK_DIR_Y, bc._I_KICK_SPIN_X, bc._I_KICK_SPIN_Z}
+        for col in range(before.shape[1]):
+            assert after[0, col] == pytest.approx((-1.0 if col in negated else 1.0) * before[0, col])
+
+
+def test_trainer_pitch_extents_match_the_real_pitch():
+    from footballcoach.ai.ppo.ppo_trainer import _pitch_half_extents_m
+    from footballcoach.entities.pitch import Pitch
+    pitch = Pitch.standard()
+    assert _pitch_half_extents_m() == (pitch.half_length, pitch.half_width) == (52.5, 34.0)

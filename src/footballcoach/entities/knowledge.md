@@ -20,7 +20,7 @@ A player's position/velocity/heading/stamina/state, plus a reference to its
 attributes and a `current_order` (see `orders.py` at the package root - kept
 as `object | None` here to avoid a circular import between `entities` and
 `orders`). `Player.create(...)` is the normal constructor - it pulls
-`radius_m`/`height_m` from `physics.json` so they stay in sync with the rest
+`radius_m`/`height_m` from `attributes.json["body"]` so they stay in sync with the rest
 of the engine.
 
 ### Direct-physics methods for the neural network

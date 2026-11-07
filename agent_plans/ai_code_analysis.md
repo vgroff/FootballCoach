@@ -8,6 +8,36 @@
 
 # AI Code Analysis — Critique & Improvement Plan
 
+## Status update 2026-10-30
+
+These findings are now closed. Where they conflict with the annotations
+below, this section wins.
+
+- **#8, #12, #15 (gating head tables):** `_HEAD_ORDER` is gone.
+  `_HEAD_TO_ACTION` is the single table and its order is the tie-break order,
+  pinned by `tests/ai_unit/test_gating.py`. The wider "one shared constant
+  across `ppo_trainer.py`" part of #12 is still open.
+- **#10 (`augment.py` columns):** imported from `bc.py`'s `_I_*` constants.
+  Label flips are tested by field name in `tests/ai_unit/test_canonical.py`.
+- **#14 (kick direction fallback):** an unusable direction now raises
+  `ValueError`, matching #13. NaN used to reach the +x fallback silently.
+- **#16 (tackle reasons):** `tackle_no_carrier` and `tackle_own_team_carrier`
+  are distinct.
+- **#17 (`encode_slot_player_ids`):** it and `_resolve_target_player` had no
+  callers, so both were deleted rather than validated. That also removes one
+  of the six `except (KeyError, AttributeError)` sites in #6/#25.
+- **#18/#22 follow-up:** the recommended `_I_*`/`BC_LABEL_DIM` consistency
+  test now exists (`tests/ai_unit/test_bc.py::TestLabelLayout`).
+- **#30:** `test_entity_encoder_permutation.py` is committed.
+- **#9 (pitch constants):** both copies now read `physics.json`.
+- **#11 (narrowed):** `mv_size_phys`/`mv_speed_phys` are still inline, but
+  `decision_physical` has no production reader: `apply_action_to_player`
+  ignores it. Only tests read those keys, so the right fix is probably
+  removing the chain rather than moving `1.0`/`3.0`/`9.5` to config.
+- **#6/#25 (partly closed):** `Match.player_by_id_or_none` exists and covers
+  the pure single-lookup sites. The remaining `(KeyError, AttributeError)`
+  sites also guard a `None` match or a malformed env, so they stay.
+
 ## Status as of 2026-10-12
 
 This document was written 2026-08-13; roughly 44 commits have landed on

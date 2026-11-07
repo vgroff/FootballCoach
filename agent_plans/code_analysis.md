@@ -47,17 +47,13 @@ Line numbers are approximate (code may have shifted slightly since review).
 
 ## 3. Structural / architectural criticisms
 
-- **`ball.possessed_by` is a player-id string, not a player reference** —
-  flagged directly in [Idea2.md] by the user, and confirmed as a real,
-  pervasive cost: every site needing the actual carrier must call
-  `Match.player_by_id(...)`, a linear O(n) scan over `self.players`, done
-  many times per tick from `possession.py`, `match.py`, `orders.py`, and
-  `tackling.py`. It also requires scattered `try/except KeyError` guards for
-  stale ids (e.g. `MarkOrder.execute`'s `except KeyError: return True # target
-  gone`). This will get worse as player counts grow toward full 11v11. If the
-  string-id-as-source-of-truth is kept for serialization/observation-encoding
-  reasons, at minimum add a per-tick `dict[str, Player]` cache in `Match`
-  rather than repeated linear scans. Developer Note: We tried fixing this before and it's a pain because circular references, does it seem easy actually? I agree that it should be done
+- **`ball.possessed_by` is a player-id string, not a player reference.**
+  The cost is resolved: `Match.player_by_id` is now a dict lookup, built once
+  at construction, and `Match.player_by_id_or_none` covers the plain
+  single-lookup sites. The id stays a string, which avoids the circular
+  reference. The other `try/except` sites around it remain because they also
+  guard a `None` match or a malformed env, so swapping them would change
+  behaviour.
 
 - **`engine/match.py` is a "does everything" file** — tick loop, order
   processing, possession syncing, ball pickup, head-on-tackle detection, GK
@@ -66,34 +62,6 @@ Line numbers are approximate (code may have shifted slightly since review).
   possibly the GK-box/immunity logic into its own module, since
   `goalkeeping.py` already exists as a natural home for GK-specific logic. 
   Developer Note: Sounds good. Anything else that could be split out from match without too much hassle?
-
-- **Anthropometric constants live in `physics.json["player"]`** rather than
-  `attributes.json` — `knee_height_m`, `waist_height_m`, `height_m`,
-  `radius_m` describe body shape, which is arguably closer to
-  "attributes/generation" in spirit than "physics," even though these
-  particular values are universal rather than per-player. At minimum, a
-  comment in `attributes.json` cross-referencing where body-shape constants
-  actually live would help. Developer Note: yeah, better in attributes
-
-- **`Scoreboard.score_for()` / `Pitch.is_goal()` use raw `"left"`/`"right"`
-  strings** rather than the `Team` enum that already exists elsewhere in the
-  codebase — this stringly-typed convention flows from `Pitch.is_goal()`
-  through `check_goal()` to `Scoreboard.score_for()`, and exists purely to
-  justify a runtime `ValueError(f"unknown goal side: {side}")` guard that a
-  real enum would make unnecessary (caught statically instead). Developer Note: fix it
-
-- **`Player.current_order: object | None` and `desired_speed_mode: object |
-  None` are untyped** to dodge circular imports with `orders.py` — a
-  `TYPE_CHECKING`-guarded type alias (the codebase already does this for
-  `Match` elsewhere) would restore type-checking value cheaply. Developer Note: do it
-
-- **`Ball`'s `position`/`velocity`/`spin` use `= None  # type:
-  ignore[assignment]` plus a `__post_init__`** to work around dataclass
-  mutable-default issues, whereas `Player` (in the same codebase) already
-  uses the more idiomatic `field(default_factory=Vector3.zero)` for the same
-  purpose. Inconsistent pattern between two entity classes for the exact same
-  problem — worth aligning `Ball` to `Player`'s approach and dropping the
-  `type: ignore`. Developer Note: sounds like a straightforward fix?
 
 - **No single canonical epsilon constant** — `1e-6`, `1e-9`, `1e-12` all
   appear scattered across modules (e.g. `Pitch.is_goal()`,

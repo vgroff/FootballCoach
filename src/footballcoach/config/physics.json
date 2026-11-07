@@ -13,12 +13,6 @@
     "penalty_spot_distance_m": 11.0,
     "centre_circle_radius_m": 9.15
   },
-  "player": {
-    "radius_m": 0.3,
-    "height_m": 1.8,
-    "knee_height_m": 0.49,
-    "waist_height_m": 0.95
-  },
   "ball": {
     "radius_m": 0.11,
     "mass_kg": 0.43

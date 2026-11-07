@@ -65,12 +65,17 @@ class GatingResult:
     tackle_attempt: bool = False
 
 
-# Head names and their sigmoid probabilities, in priority order for tie-breaking
-# (tie-breaking order: shoot > pass > move > tackle > get_possession > mark >
-# hold_position - the simplest resolution; adjust if needed).
-_HEAD_ORDER: list[str] = [
-    "shoot", "pass_", "move", "tackle", "get_possession", "mark", "hold_position"
-]
+# The single table of decision heads. select_action() scans it in this order
+# with a strict `>`, so an exact tie goes to the head listed first.
+_HEAD_TO_ACTION: dict[str, SelectedAction] = {
+    "shoot": SelectedAction.SHOOT,
+    "pass_": SelectedAction.PASS,
+    "move": SelectedAction.MOVE,
+    "tackle": SelectedAction.TACKLE,
+    "get_possession": SelectedAction.GET_POSSESSION,
+    "mark": SelectedAction.MARK,
+    "hold_position": SelectedAction.HOLD_POSITION,
+}
 
 
 @torch.no_grad()
@@ -100,7 +105,7 @@ def select_action(
     best_head = None
     best_prob = 0.5  # strictly > 0.5 required to fire
 
-    for head_name in _HEAD_ORDER:
+    for head_name in _HEAD_TO_ACTION:
         p = decision_probs.get(head_name, 0.0)
         if p > best_prob:
             best_prob = p
@@ -125,14 +130,3 @@ def select_action(
         kick_spin=execution_physical.get("kick_spin"),
         tackle_attempt=execution_physical.get("tackle_attempt", False),
     )
-
-
-_HEAD_TO_ACTION: dict[str, SelectedAction] = {
-    "shoot": SelectedAction.SHOOT,
-    "pass_": SelectedAction.PASS,
-    "move": SelectedAction.MOVE,
-    "tackle": SelectedAction.TACKLE,
-    "get_possession": SelectedAction.GET_POSSESSION,
-    "mark": SelectedAction.MARK,
-    "hold_position": SelectedAction.HOLD_POSITION,
-}

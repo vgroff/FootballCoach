@@ -1241,4 +1241,4 @@ class ShootOrder:
         return True
 
 
-Order = MoveOrder | KickOrder | ShootOrder | PassOrder | ChaseTackleOrder | SaveOrder | StopOrder | GetPossessionOrder | MarkOrder
+Order = MoveOrder | KickOrder | ShootOrder | PassOrder | ChaseTackleOrder | SaveOrder | StopOrder | JogOrder | GetPossessionOrder | MarkOrder

@@ -6,13 +6,15 @@ from dataclasses import dataclass, field
 from enum import Enum, auto
 from typing import TYPE_CHECKING
 
-from footballcoach.config import load_physics_config
+from footballcoach.config import load_attributes_config, load_physics_config
 from footballcoach.entities.action_opportunity import ActionOpportunity
 from footballcoach.entities.attributes import PlayerAttributes
 from footballcoach.mathutils import Vector3
 
 if TYPE_CHECKING:
     from footballcoach.engine.match import Match
+    from footballcoach.engine.movement import SpeedMode
+    from footballcoach.orders import Order
 
 
 class PlayerAI:
@@ -107,6 +109,10 @@ class Team(Enum):
     LEFT = auto()
     RIGHT = auto()
 
+    @property
+    def opponent(self) -> "Team":
+        return Team.RIGHT if self is Team.LEFT else Team.LEFT
+
 
 class PlayerState(Enum):
     """High-level state machine for a player, used to gate actions."""
@@ -129,10 +135,8 @@ class Player:
     state: PlayerState = PlayerState.ACTIVE
     state_timer_s: float = 0.0  # remaining time in current transient state
 
-    # Order handling (move/kick/tackle) is layered on via orders.py; this
-    # holds a reference to the current order object (typed loosely here to
-    # avoid a circular import - see orders.py for the concrete types).
-    current_order: object | None = None
+    # Order handling (move/kick/tackle) is layered on via orders.py.
+    current_order: Order | None = None
 
     # Optional AI controller. If set, Match.step() calls ai.act(player, match, tick)
     # once per physics tick before processing orders.  None = purely order-driven.
@@ -252,7 +256,7 @@ class Player:
     # Backing field for the `desired_direction` property below (enforces unit-or-zero) —
     # assign via `player.desired_direction = ...`, never this private name directly.
     _desired_direction: Vector3 = field(default_factory=Vector3.zero, repr=False, compare=False)
-    desired_speed_mode: object | None = field(default=None, repr=False, compare=False)  # SpeedMode at runtime
+    desired_speed_mode: SpeedMode | None = field(default=None, repr=False, compare=False)
 
     # Mirrors desired_speed_mode but is NEVER reset to None by
     # match._apply_movement() -- it always holds whichever SpeedMode was most
@@ -262,7 +266,7 @@ class Player:
     # asking for" as an observation input (desired_speed_mode itself is
     # unusable for that -- see match._apply_movement()). Never read by any
     # engine/order logic, only by the AI observation layer.
-    last_desired_speed_mode: object | None = field(default=None, repr=False, compare=False)  # SpeedMode at runtime
+    last_desired_speed_mode: SpeedMode | None = field(default=None, repr=False, compare=False)
 
     radius_m: float = 0.3
     height_m: float = 1.8
@@ -275,7 +279,7 @@ class Player:
         position: Vector3 | None = None,
         is_goalkeeper: bool = False,
     ) -> "Player":
-        cfg = load_physics_config()["player"]
+        cfg = load_attributes_config()["body"]
         return Player(
             player_id=player_id,
             team=team,

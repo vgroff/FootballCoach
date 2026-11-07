@@ -178,3 +178,35 @@ def test_execution_outputs_passed_through_for_none():
     result = _select({})
     assert result.move_direction is not None
     assert result.sprint is True  # from _EXEC_PHYSICAL
+
+
+# ---------------------------------------------------------------------------
+# Head table: the single source of head names and tie-break order
+# ---------------------------------------------------------------------------
+
+def test_head_table_order_is_the_tie_break_priority():
+    from footballcoach.ai.action.gating import _HEAD_TO_ACTION
+    assert list(_HEAD_TO_ACTION) == [
+        "shoot", "pass_", "move", "tackle", "get_possession", "mark", "hold_position",
+    ]
+
+
+def test_every_selected_action_except_none_has_exactly_one_head():
+    from footballcoach.ai.action.gating import _HEAD_TO_ACTION
+    actions = list(_HEAD_TO_ACTION.values())
+    assert len(set(actions)) == len(actions)
+    assert set(actions) == set(SelectedAction) - {SelectedAction.NONE}
+
+
+@pytest.mark.parametrize("winner,loser", [
+    ("shoot", "pass_"), ("pass_", "move"), ("move", "tackle"), ("tackle", "get_possession"),
+    ("get_possession", "mark"), ("mark", "hold_position"),
+])
+def test_exact_tie_goes_to_the_head_listed_first(winner, loser):
+    from footballcoach.ai.action.gating import _HEAD_TO_ACTION
+    result = _select({winner: 0.7, loser: 0.7})
+    assert result.selected == _HEAD_TO_ACTION[winner]
+
+
+def test_later_head_wins_when_strictly_higher():
+    assert _select({"shoot": 0.7, "hold_position": 0.71}).selected == SelectedAction.HOLD_POSITION

@@ -224,6 +224,11 @@ class BCLabel:
         return BCLabel(valid=False)
 
 
+def _smooth_target(target: torch.Tensor, smoothing: float) -> torch.Tensor:
+    """Pull a Bernoulli target towards 0.5. Shared by the BCE loss and its analytic floor."""
+    return target * (1.0 - smoothing) + 0.5 * smoothing
+
+
 # ---------------------------------------------------------------------------
 # Rules-based label generators
 # ---------------------------------------------------------------------------
@@ -807,7 +812,7 @@ def compute_bc_loss_floor_components(
         y = labels[:, col]
         if smoothing <= 0.0:
             return torch.zeros_like(y)
-        y_prime = y * (1.0 - smoothing) + 0.5 * smoothing
+        y_prime = _smooth_target(y, smoothing)
         eps = 1e-12
         h = -(
             y_prime * torch.log(y_prime.clamp_min(eps))
@@ -1086,7 +1091,7 @@ def bc_loss_from_tensor(
     # --- Bernoulli decision heads (BCE from logits) ---
     def _bce(logit: torch.Tensor, col: int, pos_weight: float = 1.0, smoothing: float = 0.0) -> torch.Tensor:
         target = labels[:, col]
-        smoothed_target = target * (1.0 - smoothing) + 0.5 * smoothing if smoothing > 0.0 else target
+        smoothed_target = _smooth_target(target, smoothing) if smoothing > 0.0 else target
         loss = F.binary_cross_entropy_with_logits(
             logit.squeeze(-1), smoothed_target, reduction="none"
         )

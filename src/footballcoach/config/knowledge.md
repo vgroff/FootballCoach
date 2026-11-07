@@ -5,14 +5,15 @@ cached loader.
 
 ## Files
 
-- `physics.json` - world/pitch/player/ball geometry, movement, kicking,
+- `physics.json` - world/pitch/ball geometry, movement, kicking,
   tackling, ball physics, control-time, and collision constants. Organised
   into sections matching the engine modules that consume them (e.g.
   `physics.json["movement"]` → `engine/movement.py`). Pure engine physics
   only — no AI, UI, or game-rule constants live here.
 - `attributes.json` - player attribute generation: the base Gaussian
   distribution, inter-attribute correlations, and per-league "tier" presets
-  (mean/sigma overrides) used by `generation/attributes.py`.
+  (mean/sigma overrides) used by `generation/attributes.py`. Also `body`, the
+  shape shared by every player (radius, height, knee and waist height).
 - `gameplay.json` - game rules and UI timing: `offside` toggle,
   `ui.scenario_linger_s`, `ui.goal_linger_s`. Read via `load_gameplay_config()`.
 - `graphics.json` - all visual display constants: player/ball rendering,

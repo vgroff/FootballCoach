@@ -4,9 +4,23 @@ from __future__ import annotations
 import functools
 import json
 import os
+import shutil
 from pathlib import Path
 
 _DEFAULT_CONFIG_PATH = Path(__file__).parent / "ai_config.json"
+_CONFIG_PATH_ENV_VAR = "FOOTBALLCOACH_AI_CONFIG_PATH"
+
+
+def pin_ai_config_to_run_dir(run_dir: Path) -> Path:
+    """Copy the current config into ``run_dir`` and make this process, and every
+    worker it spawns from now on, read that copy instead. Returns the copy's path."""
+    snapshot = (Path(run_dir) / "ai_config.json").resolve()
+    source = config_path()
+    if source.resolve() != snapshot:
+        shutil.copy2(source, snapshot)
+    os.environ[_CONFIG_PATH_ENV_VAR] = str(snapshot)
+    clear_ai_config_cache()
+    return snapshot
 
 
 def _resolve_config_path() -> Path:
@@ -31,7 +45,7 @@ def _resolve_config_path() -> Path:
     config is fixed for a process's lifetime. This override exists so a run
     launched after it can't be affected the same way. Unset (the default) =
     byte-identical to before this existed."""
-    override = os.environ.get("FOOTBALLCOACH_AI_CONFIG_PATH")
+    override = os.environ.get(_CONFIG_PATH_ENV_VAR)
     return Path(override) if override else _DEFAULT_CONFIG_PATH
 
 

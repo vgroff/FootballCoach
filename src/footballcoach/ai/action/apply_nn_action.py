@@ -12,10 +12,6 @@ physical targets for imitation.
 Tackle intent is communicated via player.tackle_armed — the engine resolves
 it on contact in _check_armed_tackles, firing on_tackle for BC recording.
 
-Slot-index -> player_id mapping: the ``slot_player_ids`` list (produced by
-the obs encoder during the same tick - same random shuffle) maps the
-categorical target slot index back to a concrete player_id.
-
 Gating's ``move_direction``/``kick_direction`` here are already in raw
 world/engine-frame coordinates by the time this module sees them — any
 canonical-AI-frame de-mirroring happens earlier, at the network-forward
@@ -47,6 +43,14 @@ class OrderTranslationResult:
     illegal_reason: str = ""
 
 
+def _kick_direction_vector(kick_dir) -> Vector3:
+    """A kick decision must carry a real direction; anything else is an upstream bug."""
+    # Finiteness is checked first: a NaN norm fails every threshold comparison.
+    if kick_dir is None or not np.all(np.isfinite(kick_dir)) or not np.linalg.norm(kick_dir) > 1e-6:
+        raise ValueError(f"kick decided with unusable kick_direction={kick_dir!r}")
+    return Vector3(float(kick_dir[0]), float(kick_dir[1]), float(kick_dir[2]) if len(kick_dir) > 2 else 0.0)
+
+
 def apply_action_to_player(
     gating: GatingResult,
     player: Player,
@@ -58,7 +62,7 @@ def apply_action_to_player(
     """Apply execution-network outputs DIRECTLY to the player — no Orders.
 
     Movement: set player.desired_direction and player.desired_speed_mode.
-    Kick: call player.kick_direct() if kick_this_tick is True.
+    Kick: call player.kick_with_direction(), or arm it, if kick_this_tick is True.
     Tackle: set player.tackle_armed if tackle_attempt is True.
 
     The decision network heads (shoot/pass/move/etc.) are INPUTS to the
@@ -103,11 +107,7 @@ def apply_action_to_player(
     # automatically by kick_with_direction when the player is in
     # CONTROLLING_BALL state (kick fired with the ball already in hand).
     if gating.kick_this_tick:
-        kick_dir = gating.kick_direction
-        if kick_dir is not None and np.linalg.norm(kick_dir) > 1e-6:
-            direction_3d = Vector3(float(kick_dir[0]), float(kick_dir[1]), float(kick_dir[2]) if len(kick_dir) > 2 else 0.0)
-        else:
-            direction_3d = Vector3(1.0, 0.0, 0.0)  # safe fallback, should not occur
+        direction_3d = _kick_direction_vector(gating.kick_direction)
         # A kick decision must carry a real power. The head's ppo.kick_power_floor
         # keeps it > 0; a 0/negative/NaN here is a bug upstream, so fail loudly
         # instead of silently substituting a (previously full-ish, 0.85) power.
@@ -140,53 +140,12 @@ def apply_action_to_player(
             return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_while_inactive")
         if arm_tackle_without_carrier is None:
             arm_tackle_without_carrier = action_flag("arm_tackle_without_carrier")
-        if not arm_tackle_without_carrier and (
-            match.ball_carrier() is None or match.ball_carrier().team == player.team
-        ):
-            return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_no_carrier")
+        if not arm_tackle_without_carrier:
+            carrier = match.ball_carrier()
+            if carrier is None:
+                return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_no_carrier")
+            if carrier.team == player.team:
+                return OrderTranslationResult(illegal_action=True, illegal_reason="tackle_own_team_carrier")
         player.tackle_armed = True
 
     return OrderTranslationResult()
-
-
-# ---------------------------------------------------------------------------
-# Utility
-# ---------------------------------------------------------------------------
-
-def _resolve_target_player(
-    slot: Optional[int],
-    slot_player_ids: list[Optional[str]],
-    match: Match,
-) -> Optional[Player]:
-    """Look up the Player object for a categorical target slot index."""
-    if slot is None or slot < 0 or slot >= len(slot_player_ids):
-        return None
-    pid = slot_player_ids[slot]
-    if pid is None:
-        return None
-    try:
-        return match.player_by_id(pid)
-    except (KeyError, AttributeError):
-        return None
-
-
-def encode_slot_player_ids(
-    match: Match,
-    player_id: str,
-    slot_indices: list[int],
-    other_players: list[Player],
-) -> list[Optional[str]]:
-    """Build the slot_player_ids list that matches the slot assignment used
-    during obs encoding.
-
-    Call with the SAME ``slot_indices`` and ``other_players`` order that the
-    obs encoder used so that slot_player_ids[i] always corresponds to
-    other_feat[i] for any given observation.
-
-    Returns a list of MAX_OTHER_PLAYERS entries, None for padded slots.
-    """
-    from footballcoach.ai.obs.encoder import MAX_OTHER_PLAYERS
-    result: list[Optional[str]] = [None] * MAX_OTHER_PLAYERS
-    for slot_idx, op in zip(slot_indices, other_players):
-        result[slot_idx] = op.player_id
-    return result

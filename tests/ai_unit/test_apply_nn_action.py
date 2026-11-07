@@ -5,7 +5,7 @@ player.desired_speed_mode, and sets player.tackle_armed.
 
 These tests verify:
   - Movement sets desired_direction and desired_speed_mode directly (no Orders).
-  - Kick calls player.kick_direct() when player has possession; illegal otherwise.
+  - Kick calls player.kick_with_direction() when player has possession, arms it otherwise.
   - Tackle sets player.tackle_armed when an opposing carrier exists; illegal otherwise.
   - Decision head selections (SHOOT/PASS/MOVE/etc.) do NOT cause Orders.
 """
@@ -135,7 +135,7 @@ class TestTackle:
             match, "p1", arm_tackle_without_carrier=False,
         )
         assert result.illegal_action
-        assert "carrier" in result.illegal_reason
+        assert result.illegal_reason == "tackle_no_carrier"
         assert not match.player_by_id("p1").tackle_armed
 
     def test_tackle_own_team_carrier_illegal(self, standard_pitch):
@@ -158,7 +158,7 @@ class TestTackle:
             match, "p1", arm_tackle_without_carrier=False,
         )
         assert result.illegal_action
-        assert "carrier" in result.illegal_reason
+        assert result.illegal_reason == "tackle_own_team_carrier"
         assert not match.player_by_id("p1").tackle_armed
 
 
@@ -307,6 +307,53 @@ class TestMove:
         player = solo_match.player_by_id("p1")
         _apply(_gating(SelectedAction.NONE, exec_move=True, move_dir=np.array([1.0, 0.0]), sprint=True), solo_match, "p1")
         assert player.desired_speed_mode == SpeedMode.SPRINT
+
+
+class TestKickDirectionValidation:
+    """A kick decision must carry a real direction; the old silent +x fallback is gone."""
+
+    BAD_DIRECTIONS = [
+        np.zeros(3),
+        np.array([float("nan"), 0.0, 0.0]),
+        np.array([1.0, float("nan"), 0.0]),
+        np.array([float("inf"), 0.0, 0.0]),
+    ]
+
+    @pytest.mark.parametrize("bad_dir", BAD_DIRECTIONS)
+    def test_unusable_direction_raises_when_kicking(self, duel_match, bad_dir):
+        p1 = duel_match.player_by_id("p1")
+        with pytest.raises(ValueError, match="kick_direction"):
+            _apply(_gating(SelectedAction.NONE, kick=True, kick_dir=bad_dir), duel_match, "p1")
+        assert not p1.kicked_this_tick
+
+    @pytest.mark.parametrize("bad_dir", BAD_DIRECTIONS)
+    def test_unusable_direction_raises_instead_of_arming(self, duel_match, bad_dir):
+        p2 = duel_match.player_by_id("p2")
+        with pytest.raises(ValueError, match="kick_direction"):
+            _apply(_gating(SelectedAction.NONE, kick=True, kick_dir=bad_dir), duel_match, "p2")
+        assert not p2.kick_armed
+
+    def test_missing_direction_raises(self, duel_match):
+        gating = _gating(SelectedAction.NONE, kick=True)
+        gating.kick_direction = None
+        with pytest.raises(ValueError, match="kick_direction"):
+            _apply(gating, duel_match, "p1")
+
+    def test_unusable_direction_is_ignored_without_a_kick_decision(self, duel_match):
+        gating = _gating(SelectedAction.NONE, kick=False)
+        gating.kick_direction = None
+        assert not _apply(gating, duel_match, "p1").illegal_action
+
+    def test_armed_kick_keeps_the_given_direction(self, duel_match):
+        p2 = duel_match.player_by_id("p2")
+        _apply(_gating(SelectedAction.NONE, kick=True, kick_dir=np.array([0.0, -1.0, 0.25])), duel_match, "p2")
+        assert p2.kick_armed
+        assert (p2.kick_armed_direction.x, p2.kick_armed_direction.y, p2.kick_armed_direction.z) == (0.0, -1.0, 0.25)
+
+    def test_two_component_direction_gets_zero_z(self, duel_match):
+        p2 = duel_match.player_by_id("p2")
+        _apply(_gating(SelectedAction.NONE, kick=True, kick_dir=np.array([0.0, 1.0])), duel_match, "p2")
+        assert p2.kick_armed_direction.z == 0.0
 
 
 class TestKickPowerValidation:

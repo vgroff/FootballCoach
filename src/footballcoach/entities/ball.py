@@ -1,7 +1,7 @@
 """The ball entity: position, velocity, spin, and possession state."""
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 from footballcoach.config import load_physics_config
 from footballcoach.mathutils import Vector3
@@ -9,9 +9,9 @@ from footballcoach.mathutils import Vector3
 
 @dataclass
 class Ball:
-    position: Vector3 = None  # type: ignore[assignment]
-    velocity: Vector3 = None  # type: ignore[assignment]
-    spin: Vector3 = None  # type: ignore[assignment]
+    position: Vector3 = field(default_factory=Vector3.zero)
+    velocity: Vector3 = field(default_factory=Vector3.zero)
+    spin: Vector3 = field(default_factory=Vector3.zero)
     radius_m: float = 0.11
     mass_kg: float = 0.43
 
@@ -45,14 +45,6 @@ class Ball:
     # Decayed by dt each tick in ball_physics.step_ball. Used by the renderer
     # to show a visual "just bounced" indicator. Zero when not recently bounced.
     just_bounced_timer_s: float = 0.0
-
-    def __post_init__(self) -> None:
-        if self.position is None:
-            self.position = Vector3.zero()
-        if self.velocity is None:
-            self.velocity = Vector3.zero()
-        if self.spin is None:
-            self.spin = Vector3.zero()
 
     @staticmethod
     def at_rest(position: Vector3 | None = None) -> "Ball":

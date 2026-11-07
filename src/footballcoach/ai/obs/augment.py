@@ -99,6 +99,17 @@ from dataclasses import fields
 import torch
 
 from footballcoach.ai.obs.schema import BallFeatures, PlayerFeatures
+from footballcoach.ai.ppo.bc import (
+    _I_DIR_X as _BC_DIR_X_COL,
+    _I_DIR_Y as _BC_DIR_Y_COL,
+    _I_KICK_DIR_X as _BC_KICK_DIR_X_COL,
+    _I_KICK_DIR_Y as _BC_KICK_DIR_Y_COL,
+    _I_KICK_SPIN_X as _BC_KICK_SPIN_X_COL,
+    _I_KICK_SPIN_Y as _BC_KICK_SPIN_Y_COL,
+    _I_KICK_SPIN_Z as _BC_KICK_SPIN_Z_COL,
+    _I_REGION_X as _BC_REGION_X_COL,
+    _I_REGION_Y as _BC_REGION_Y_COL,
+)
 
 
 # ---------------------------------------------------------------------------
@@ -158,28 +169,10 @@ BALL_FLIP_Y_IDX: list[int] = [
     _field_index(BallFeatures, "spin_z"),  # pseudovector flip_y: -ω_z
 ]
 
-# BC label column layout (see bc.py::BCLabel.to_array())
-# NOTE: these are hardcoded magic numbers, NOT derived from bc.py's `_I_*`
-# index constants. They happen to still be correct today because every
-# bc.py layout change so far has only appended new fields after `valid`
-# (currently the last-but-one field). If a FUTURE bc.py change ever
-# inserts/reorders fields at or before index 11, these constants will
-# silently go stale — cross-check them against `_I_DIR_X`/`_I_DIR_Y`/
-# `_I_REGION_X`/`_I_REGION_Y` in bc.py whenever BC_LABEL_DIM's layout changes.
-_BC_DIR_X_COL: int = 7   # move_direction x component
-_BC_DIR_Y_COL: int = 8   # move_direction y component
-_BC_REGION_X_COL: int = 10  # move_region_center x (absolute pitch metres — negate on flip_x)
-_BC_REGION_Y_COL: int = 11  # move_region_center y (absolute pitch metres — negate on flip_y)
-_BC_KICK_DIR_X_COL: int = 18  # kick_direction x component
-_BC_KICK_DIR_Y_COL: int = 19  # kick_direction y component
-_BC_KICK_DIR_Z_COL: int = 24  # kick_direction z component (non-contiguous with x/y; unaffected by x/y pitch flips)
-# kick_spin (indices 21-23) is a pseudovector, same transform rules as
-# BALL_FLIP_X_IDX/BALL_FLIP_Y_IDX above: flip_x negates spin_y/spin_z,
-# flip_y negates spin_x/spin_z. kick_power (index 20) is a scalar and is
-# invariant under both flips.
-_BC_KICK_SPIN_X_COL: int = 21
-_BC_KICK_SPIN_Y_COL: int = 22
-_BC_KICK_SPIN_Z_COL: int = 23
+# BC label columns come from bc.py's _I_* constants (imported above). kick_spin
+# is a pseudovector, same transform rules as BALL_FLIP_X_IDX/BALL_FLIP_Y_IDX
+# above: flip_x negates spin_y/spin_z, flip_y negates spin_x/spin_z. kick_power
+# and kick_direction's z are invariant under both flips.
 
 # Action dict keys that are 2D direction/position vectors and need flipping.
 # All other action keys are Bernoulli (0/1) or scalar — they are invariant.

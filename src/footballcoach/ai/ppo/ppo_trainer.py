@@ -67,6 +67,7 @@ from footballcoach.ai.action.distributions import (
 from footballcoach.ai.action.gating import select_action
 from footballcoach.ai.action.schema import DecisionAction, DecisionHeadsRaw, ExecutionAction
 from footballcoach.ai.config import load_ai_config
+from footballcoach.config import load_physics_config
 from footballcoach.ai.eval.seeded_eval import (
     _capped_thread_env_for_pool_spawn,
     default_eval_seeds,
@@ -96,6 +97,12 @@ from footballcoach.ai.ppo.schedules import TrainingSchedules
 from footballcoach.entities.action_opportunity import OPP_ACTION_KEYS
 
 log = logging.getLogger("footballcoach.ai.ppo")
+
+
+def _pitch_half_extents_m() -> tuple[float, float]:
+    pitch = load_physics_config()["pitch"]
+    return pitch["length_m"] / 2.0, pitch["width_m"] / 2.0
+
 
 # DecisionHeadsRaw's field set is fixed at class-definition time -- caching this
 # once avoids a dataclasses.fields() reflection call every PPO/pretrain minibatch
@@ -639,9 +646,8 @@ def _build_neural_vs_neural_env_factory(max_episode_s: float, opponent_sample_ac
             obs = super().reset(seed=seed)
             from footballcoach.rules_ai import NeuralPlayerAI
             match = self._loop.match
-            try:
-                opponent = match.player_by_id("opponent")
-            except KeyError:
+            opponent = match.player_by_id_or_none("opponent")
+            if opponent is None:
                 return obs
             opponent.ai = NeuralPlayerAI(
                 opponent_sample_action_fn,
@@ -7993,8 +7999,7 @@ class PPOTrainer:
         }
 
         # Physical continuous outputs (after squashing)
-        pitch_hl = 52.5  # standard half-length; TODO: get from obs if pitch varies
-        pitch_hw = 34.0
+        pitch_hl, pitch_hw = _pitch_half_extents_m()
         mv_center_phys = (
             torch.tanh(mv_center_raw) * torch.tensor([[pitch_hl, pitch_hw]], device=dev)
         )
@@ -8268,8 +8273,7 @@ class PPOTrainer:
         hold_prob = torch.sigmoid(d_heads.hold_position_logit)
 
         # Physical continuous outputs (after squashing)
-        pitch_hl = 52.5  # standard half-length; TODO: get from obs if pitch varies
-        pitch_hw = 34.0
+        pitch_hl, pitch_hw = _pitch_half_extents_m()
         mv_center_phys = (
             torch.tanh(mv_center_raw) * torch.tensor([[pitch_hl, pitch_hw]], device=dev)
         )
@@ -8660,7 +8664,8 @@ class PPOTrainer:
             "d_heads": _field_report(d_heads, "d_heads"),
             "e_heads": _field_report(e_heads, "e_heads"),
         }
-        out_path = f"nan_diagnostic_{int(time.time())}.json"
+        out_path = Path(self.checkpoint_dir or ".") / f"nan_diagnostic_{int(time.time())}.json"
+        out_path.parent.mkdir(parents=True, exist_ok=True)
         with open(out_path, "w") as fh:
             json.dump(report, fh, indent=2)
         log.error(
@@ -8668,7 +8673,7 @@ class PPOTrainer:
             f"secondary_rows={n_secondary}/{n_total} ({report['secondary_fraction']:.1%}) "
             f"-- full report written to {out_path}"
         )
-        raise PPOTrainer._NaNReproFound(out_path)
+        raise PPOTrainer._NaNReproFound(str(out_path))
 
     # -----------------------------------------------------------------------
     # Held-out validation episodes (diagnostic only, see __init__'s

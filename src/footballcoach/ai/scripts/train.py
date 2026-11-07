@@ -12,7 +12,6 @@ from __future__ import annotations
 import argparse
 import logging
 import random
-import shutil
 from pathlib import Path
 
 logging.basicConfig(
@@ -373,9 +372,7 @@ def main() -> None:
     # direction_max_grad_norm/ent_decision_weight/etc. shows), so without
     # this a checkpoint dir alone can't tell you what hyperparameters
     # actually produced it later.
-    from footballcoach.ai.config import config_path
-    _ai_config_snapshot = checkpoint_dir / "ai_config.json"
-    shutil.copy2(config_path(), _ai_config_snapshot)
+    #
     # Pin this run (main process AND every worker it ever spawns, including
     # every later PPG-interleave-triggered pool respawn -- see
     # ppo_trainer.py's _maybe_run_ppg_interleave) to the snapshot just taken,
@@ -387,8 +384,8 @@ def main() -> None:
     # live file again. See _resolve_config_path()'s docstring for why this
     # exists: a live mid-run edit was confirmed to leak into an
     # already-running process this way on 2026-10-18.
-    import os
-    os.environ["FOOTBALLCOACH_AI_CONFIG_PATH"] = str(_ai_config_snapshot)
+    from footballcoach.ai.config import pin_ai_config_to_run_dir
+    pin_ai_config_to_run_dir(checkpoint_dir)
 
     from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
     from footballcoach.ai.curriculum.phases import PHASES_BY_ID

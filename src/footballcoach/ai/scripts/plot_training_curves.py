@@ -60,7 +60,6 @@ LABELS = {"rules": "vs rules", "original": "vs neural:original", "1_back": "vs n
           "0.5_back": "vs neural:0.5_back", "baseline": "baseline rules-vs-rules"}
 eval_data = {t: [] for t in TYPES}
 rows = []
-ppg_count = 0
 
 for f in files:
     n = int(re.search(r"(\d+)\.txt", f.name).group(1))
@@ -68,7 +67,6 @@ for f in files:
         text = f.read_text(encoding="utf-8", errors="ignore")
     except Exception:
         continue
-    ppg_count += len(R_PPG.findall(text))
 
     rules_step = None
     m = R_EVAL_RULES.search(text)
@@ -85,7 +83,7 @@ for f in files:
     step_m = R_STEP.search(text)
     if not step_m:
         continue
-    row = {"log": n, "step": int(step_m.group(1).replace(",", ""))}
+    row = {"log": n, "step": int(step_m.group(1).replace(",", "")), "ppg_rounds": len(R_PPG.findall(text))}
     m = R_VALUE.search(text)
     if m:
         row["V"], row["V_std"], row["R"], row["R_std"] = (
@@ -137,7 +135,8 @@ for t in TYPES:
     eval_data[t] = sorted([p for p in eval_data[t] if p[0] >= max_step - WINDOW], key=lambda p: p[0])
 
 print(f"{len(rows_w)} iterations (last 300M steps), log {rows_w[0]['log']}..{rows_w[-1]['log']}, "
-      f"steps {rows_w[0]['step']/1e6:.1f}M..{rows_w[-1]['step']/1e6:.1f}M; {ppg_count} PPG interleave round(s) in window")
+      f"steps {rows_w[0]['step']/1e6:.1f}M..{rows_w[-1]['step']/1e6:.1f}M; "
+      f"{sum(r['ppg_rounds'] for r in rows_w)} PPG interleave round(s) in window")
 
 
 def smooth(y, k=5):

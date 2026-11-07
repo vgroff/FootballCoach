@@ -2283,3 +2283,20 @@ checkpoint sitting at the run's current halfway point -- a target that moves for
 `ppo_trainer.py` (a pure, directly-testable helper extracted from `_maybe_run_neural_snapshot_eval`) and
 `tests/ai_unit/test_neural_snapshot_lookback.py`. The label in logs/graphs keeps the CONFIGURED fraction (`"0.5_back"`), not the drifting
 computed distance, so it groups consistently across a whole run despite the underlying checkpoint number changing every time.
+
+## Run config pinning and run tooling
+
+`train.py` calls `pin_ai_config_to_run_dir(checkpoint_dir)` before importing
+anything that spawns workers. That copies the live `ai_config.json` into the
+run's checkpoint dir and sets `FOOTBALLCOACH_AI_CONFIG_PATH` to the copy, so the
+main process and every worker, including the pools respawned around each PPG
+interleave burst, read that one frozen file. Editing the live file never affects
+a run started this way. Runs started before 2026-10-30 had no such pin, and a
+live edit reached their spawned workers at the next respawn.
+
+`python -m footballcoach.ai.scripts.plot_training_curves RUN_DIR OUT_PREFIX`
+writes the four standard graphs (eval, value, kick, entropy/KL) for the last
+300M steps of a run.
+
+`_dump_nan_diagnostic` writes `nan_diagnostic_<time>.json` into the checkpoint
+dir, or the working dir when the trainer has none, then stops training.

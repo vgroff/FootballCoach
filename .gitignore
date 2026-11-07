@@ -4,6 +4,7 @@ checkpoints/
 results/
 demonstrations/
 physics_pretrain_data/
+nan_diagnostic_*.json
 /tmp/
 *.py[oc]
 build/

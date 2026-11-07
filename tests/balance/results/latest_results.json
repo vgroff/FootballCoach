@@ -165,34 +165,34 @@
     "oscillation_risk": "LOW"
   },
   "shoot_run_forward_cos1.0": {
-    "n_trials": 300,
-    "scored": 254,
-    "score_rate_pct": 84.67,
+    "n_trials": 1000,
+    "scored": 838,
+    "score_rate_pct": 83.8,
     "run_cos_sim": 1.0
   },
   "shoot_run_square_cos0.0": {
-    "n_trials": 300,
-    "scored": 246,
-    "score_rate_pct": 82.0,
+    "n_trials": 1000,
+    "scored": 813,
+    "score_rate_pct": 81.3,
     "run_cos_sim": 0.0
   },
   "shoot_run_backward_cos-1.0": {
-    "n_trials": 300,
-    "scored": 223,
-    "score_rate_pct": 74.33,
+    "n_trials": 1000,
+    "scored": 748,
+    "score_rate_pct": 74.8,
     "run_cos_sim": -1.0
   },
   "shoot_stationary_no_penalty": {
-    "n_trials": 300,
-    "scored": 300,
+    "n_trials": 1000,
+    "scored": 1000,
     "score_rate_pct": 100.0
   },
   "pass_run_forward": {
-    "n_trials": 300,
-    "success_rate_pct": 92.33
+    "n_trials": 1000,
+    "success_rate_pct": 91.6
   },
   "pass_run_backward": {
-    "n_trials": 300,
+    "n_trials": 1000,
     "success_rate_pct": 0.0
   },
   "save_far_post_fast_vs_slow_gk": {
@@ -236,29 +236,29 @@
     "bad_gk_save_rate_pct": 85.0
   },
   "shoot_low_attrs_random_in_box": {
-    "n_trials": 500,
-    "scored": 480,
-    "score_rate_pct": 96.0
+    "n_trials": 1000,
+    "scored": 964,
+    "score_rate_pct": 96.4
   },
   "shoot_mid_attrs_random_in_box": {
-    "n_trials": 500,
-    "scored": 500,
-    "score_rate_pct": 100.0
+    "n_trials": 1000,
+    "scored": 996,
+    "score_rate_pct": 99.6
   },
   "shoot_high_attrs_random_in_box": {
-    "n_trials": 500,
-    "scored": 500,
-    "score_rate_pct": 100.0
+    "n_trials": 1000,
+    "scored": 999,
+    "score_rate_pct": 99.9
   },
   "pass_60m_precision_0.9": {
-    "n_trials": 200,
-    "succeeded": 54,
-    "success_rate_pct": 27.0
+    "n_trials": 1000,
+    "succeeded": 291,
+    "success_rate_pct": 29.1
   },
   "pass_65m_precision_0.9": {
-    "n_trials": 200,
-    "succeeded": 49,
-    "success_rate_pct": 24.5
+    "n_trials": 1000,
+    "succeeded": 218,
+    "success_rate_pct": 21.8
   },
   "sprint_100m_bottom_attrs_no_ball_seconds": {
     "time_s": 17.23
@@ -441,34 +441,34 @@
     "diff_pct": 0.0
   },
   "pass_10m_precision_0.5": {
-    "n_trials": 200,
-    "succeeded": 195,
-    "success_rate_pct": 97.5
+    "n_trials": 1000,
+    "succeeded": 973,
+    "success_rate_pct": 97.3
   },
   "pass_10m_precision_0.15": {
-    "n_trials": 200,
-    "succeeded": 169,
-    "success_rate_pct": 84.5
+    "n_trials": 1000,
+    "succeeded": 854,
+    "success_rate_pct": 85.4
   },
   "pass_10m_precision_0.9": {
-    "n_trials": 200,
-    "succeeded": 200,
+    "n_trials": 1000,
+    "succeeded": 1000,
     "success_rate_pct": 100.0
   },
   "pass_25m_precision_0.5": {
-    "n_trials": 200,
-    "succeeded": 104,
-    "success_rate_pct": 52.0
+    "n_trials": 1000,
+    "succeeded": 537,
+    "success_rate_pct": 53.7
   },
   "pass_25m_precision_0.1": {
-    "n_trials": 200,
-    "succeeded": 71,
-    "success_rate_pct": 35.5
+    "n_trials": 1000,
+    "succeeded": 350,
+    "success_rate_pct": 35.0
   },
   "pass_25m_precision_0.9": {
-    "n_trials": 200,
-    "succeeded": 182,
-    "success_rate_pct": 91.0
+    "n_trials": 1000,
+    "succeeded": 943,
+    "success_rate_pct": 94.3
   },
   "pass_success_rate_grid_pct": {
     "precision=0.1_distance=5.0m": 100.0,
@@ -498,9 +498,9 @@
     "precision=0.9_distance=30.0m": 82.0
   },
   "pass_40m_precision_0.5": {
-    "n_trials": 200,
-    "succeeded": 39,
-    "success_rate_pct": 19.5
+    "n_trials": 1000,
+    "succeeded": 204,
+    "success_rate_pct": 20.4
   },
   "shoot_scoring_rate_grid_pct": {
     "precision=0.2_penalty_spot": 100.0,
@@ -520,9 +520,9 @@
     "time_s": 10.17
   },
   "pass_40m_precision_0.9": {
-    "n_trials": 200,
-    "succeeded": 112,
-    "success_rate_pct": 56.0
+    "n_trials": 1000,
+    "succeeded": 533,
+    "success_rate_pct": 53.3
   },
   "pass_random_scenarios_good_vs_bad": {
     "n_scenarios": 150,

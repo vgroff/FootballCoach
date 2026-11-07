@@ -908,10 +908,10 @@ balance on the ground rather than bumping into them like a solid obstacle.
 
 ## `scoring.py` - goals
 
-Thin wrapper: `check_goal(ball, pitch)` returns `"left"`/`"right"`/`None`
-based on `Pitch.is_goal()`; `Scoreboard.score_for(side)` increments the
-*opposing* team's tally (a ball entering the left goal is a goal *for* the
-right-side team, matching real football's goal-naming convention). `Match`
+Thin wrapper: `check_goal(ball, pitch)` returns the `Team` defending the goal
+the ball entered, or `None`, based on `Pitch.is_goal()`;
+`Scoreboard.record_goal_against(team)` increments the *opposing* team's tally
+(a ball entering the left goal is a goal *for* the right-side team). `Match`
 calls this every tick and resets the ball to the centre spot on a goal
 (no kickoff-formation/whistle logic yet - see "Known gaps").
 
@@ -1013,7 +1013,7 @@ is fully preserved. The UI sets this from `physics.json["ui"]["goal_linger_s"]`
 (default 3.0 s) when constructing a match.
 
 When a goal is detected by `_check_goal`:
-1. `scoreboard.score_for(side)` is called immediately (score updates on the
+1. `scoreboard.record_goal_against(team)` is called immediately (score updates on the
    detection tick, not when the linger expires).
 2. `Match._goal_linger_remaining_s` is set to `goal_linger_s`; `_reset_after_goal`
    is **deferred**.
@@ -1098,8 +1098,10 @@ Order-based path):
 
 - **Tackle**: `apply_action_to_player()` explicitly flags
   `illegal_action=True` for `tackle_while_inactive` (player not
-  `is_available_to_tackle()`) and `tackle_no_carrier` (no opposition ball
-  carrier to tackle) before ever setting `player.tackle_armed`. This is the
+  `is_available_to_tackle()`), `tackle_no_carrier` (nobody has the ball) and
+  `tackle_own_team_carrier` (a teammate has it) before ever setting
+  `player.tackle_armed`. The last two only apply with
+  `action.arm_tackle_without_carrier` off. This is the
   only case currently wired into the reward function's
   `illegal_action_penalty` (see `ai/env/reward.py`).
 - **Kick**: `player.kick_with_direction()` silently no-ops if

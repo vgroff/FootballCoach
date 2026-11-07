@@ -22,7 +22,7 @@ from footballcoach.rules_ai import StopWhenIdleAI
 from tests.conftest import make_player
 
 RNG_REDUCTION = 0.3
-N_TRIALS = 200
+N_TRIALS = 1000
 MAX_TICKS = 400
 
 

@@ -189,7 +189,11 @@ class Match:
     # so training/tests incur zero cost when logging is not needed.
     match_logger: MatchLogger | None = field(default=None, repr=False)
 
+    _players_by_id: dict[str, Player] = field(default_factory=dict, init=False, repr=False, compare=False)
+
     def __post_init__(self) -> None:
+        # reversed(): with a duplicate id the first player in the list wins.
+        self._players_by_id = {p.player_id: p for p in reversed(self.players)}
         self.pickup_radius_m = self.ball_pickup_params.pickup_radius_m
         self._validate_heading_velocity_alignment()
 
@@ -235,10 +239,13 @@ class Match:
                 )
 
     def player_by_id(self, player_id: str) -> Player:
-        for p in self.players:
-            if p.player_id == player_id:
-                return p
-        raise KeyError(f"no player with id {player_id}")
+        player = self._players_by_id.get(player_id)
+        if player is None:
+            raise KeyError(f"no player with id {player_id}")
+        return player
+
+    def player_by_id_or_none(self, player_id: str) -> Player | None:
+        return self._players_by_id.get(player_id)
 
     def ball_carrier(self) -> Player | None:
         if self.ball.possessed_by is None:
@@ -1372,12 +1379,13 @@ class Match:
                 target.on_tackle_result(target, result.tackler_won, False)
 
     def _check_goal(self) -> None:
-        side = check_goal(self.ball, self.pitch)
-        if side is not None:
-            self.scoreboard.score_for(side)
-            self._log_info(f"GOAL for {'LEFT' if side == 'left' else 'RIGHT'} — score {self.scoreboard.left_goals}:{self.scoreboard.right_goals}")
+        conceding_team = check_goal(self.ball, self.pitch)
+        if conceding_team is not None:
+            self.scoreboard.record_goal_against(conceding_team)
+            scoring_team = conceding_team.opponent
+            self._log_info(f"GOAL for {scoring_team.name} — score {self.scoreboard.left_goals}:{self.scoreboard.right_goals}")
             if self.match_logger is not None:
-                self.match_logger.notify_goal(self.time_s, self.ball.position, side)
+                self.match_logger.notify_goal(self.time_s, self.ball.position, scoring_team.name.lower())
             if self.goal_linger_s > 0.0:
                 self._goal_linger_remaining_s = self.goal_linger_s
             else:

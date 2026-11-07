@@ -29,7 +29,6 @@ from footballcoach.ai.action.gating import select_action
 from footballcoach.ai.action.apply_nn_action import (
     OrderTranslationResult,
     apply_action_to_player,
-    encode_slot_player_ids,
 )
 from footballcoach.ai.config import load_ai_config
 from footballcoach.ai.env.outcome import (
@@ -500,10 +499,9 @@ class ScenarioEnv:
         # lookup's defensive try/except in this file) is simply skipped.
         sec_players: dict = {}
         for pid in sec_pre:
-            try:
-                sec_players[pid] = match.player_by_id(pid)
-            except KeyError:
-                pass
+            sec_player = match.player_by_id_or_none(pid)
+            if sec_player is not None:
+                sec_players[pid] = sec_player
         sec_kicks_this_step = {pid: 0 for pid in sec_pre}
         sec_armed_kicks_this_step = {pid: 0 for pid in sec_pre}
 
@@ -823,9 +821,8 @@ class ScenarioEnv:
         # --- Collect secondary player transitions from their NeuralPlayerAI ---
         self.last_secondary_results = []
         for pid, pre in sec_pre.items():
-            try:
-                sec_player = match.player_by_id(pid)
-            except KeyError:
+            sec_player = match.player_by_id_or_none(pid)
+            if sec_player is None:
                 continue
             _sec_has_transition = (
                 hasattr(sec_player, "ai") and sec_player.ai is not None
