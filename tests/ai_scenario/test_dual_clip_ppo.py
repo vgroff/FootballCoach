@@ -67,11 +67,10 @@ class TestApplyDualClipDisabled:
         out = trainer._apply_dual_clip(min_surr, adv)
         assert torch.equal(out, min_surr)
 
-    def test_default_config_value_is_disabled(self, trainer):
-        # Regression guard on the DEFAULT, not a claim about any specific
-        # value -- from_config() picks up whatever ai_config.json's live
-        # dual_clip_c currently is; it must stay off (0/falsy) by default
-        # so vanilla PPO is the out-of-the-box behavior.
+    def test_code_level_default_is_disabled(self, trainer, monkeypatch):
+        # Vanilla PPO must be the out-of-the-box behaviour when dual_clip_c is
+        # absent. The key is removed because the live ai_config.json enables it.
+        monkeypatch.delitem(load_ai_config()["ppo"], "dual_clip_c", raising=False)
         default_trainer = PPOTrainer.from_config()
         assert default_trainer.dual_clip_c <= 0
 
@@ -214,14 +213,26 @@ def _build_batch_with_forced_ratio_blowup(trainer: PPOTrainer, log_prob_offset: 
 
 
 class TestDualClipIntegration:
+    """Both halves of each test run the SAME network (a deepcopy taken before
+    the first update), so the forced row's ratio is exactly exp(offset). An
+    independently initialised second trainer adds a random log-prob gap of
+    tens of nats, which made these tests measure noise rather than dual-clip."""
+
+    @pytest.fixture(autouse=True)
+    def _nan_dumps_go_to_tmp(self, tmp_path, monkeypatch):
+        # A non-finite loss or gradient trips _dump_nan_diagnostic, which writes
+        # to the working dir when the trainer has no checkpoint dir.
+        monkeypatch.chdir(tmp_path)
+
     def test_bounds_a_large_finite_ratio_blowup(self, trainer):
-        """A ~45-nat old_log_prob deficit gives ratio ~= exp(45) ~= 3.5e19
-        -- large but still finite in float32. Disabled: this single row's
-        raw contribution (ratio*|adv| ~ 1.7e20) dominates the minibatch
-        mean. Enabled (c=3): bounded at 3*5=15 regardless of how large the
-        ratio actually got."""
+        """A 30-nat old_log_prob deficit gives ratio ~= exp(30) ~= 1e13: huge,
+        yet far from float32 overflow in both the loss and its gradient (45
+        nats sat on the gradient-norm overflow edge and tripped the NaN guard
+        intermittently). Disabled: the row dominates the minibatch mean.
+        Enabled (c=3): bounded at 3*5=15 however large the ratio got."""
         fast_trainer = _make_fast_trainer(n_epochs=1, minibatch_size=_ROLLOUT_STEPS + 5)
-        batch = _build_batch_with_forced_ratio_blowup(fast_trainer, log_prob_offset=45.0)
+        batch = _build_batch_with_forced_ratio_blowup(fast_trainer, log_prob_offset=30.0)
+        same_weights = copy.deepcopy(fast_trainer)
 
         fast_trainer.dual_clip_c = 0.0
         metrics_off = fast_trainer._ppo_update(copy.deepcopy(batch), progress=0.0)
@@ -230,9 +241,8 @@ class TestDualClipIntegration:
             f"blowup row, got policy_loss={metrics_off['policy_loss']}"
         )
 
-        fast_trainer2 = _make_fast_trainer(n_epochs=1, minibatch_size=_ROLLOUT_STEPS + 5)
-        fast_trainer2.dual_clip_c = 3.0
-        metrics_on = fast_trainer2._ppo_update(copy.deepcopy(batch), progress=0.0)
+        same_weights.dual_clip_c = 3.0
+        metrics_on = same_weights._ppo_update(copy.deepcopy(batch), progress=0.0)
         assert math.isfinite(metrics_on["policy_loss"])
         # Bounded by dual_clip_c*|adv| for the worst row, divided out over
         # the rest of the (small, otherwise-ordinary) minibatch -- generous
@@ -242,24 +252,22 @@ class TestDualClipIntegration:
         )
 
     def test_recovers_from_float32_overflow_to_inf(self, trainer):
-        """A ~300-nat old_log_prob deficit guarantees ratio overflows to
-        literal inf in float32 (exp(x) overflows past x~88.7). Disabled:
-        the aggregate metric goes non-finite. Enabled: still finite and
-        bounded, since torch.max(-inf, dual_clip_c*adv) recovers the floor."""
+        """A 300-nat old_log_prob deficit overflows the ratio to literal inf in
+        float32 (exp(x) overflows past x~88.7). Disabled: the loss goes
+        non-finite and the NaN guard halts training. Enabled: dual-clip bounds
+        the loss VALUE, but autograd still multiplies the unselected branch's
+        zero gradient by the infinite ratio (0 * inf = NaN), so this currently
+        fails -- a real limitation of _apply_dual_clip, not of this test."""
         fast_trainer = _make_fast_trainer(n_epochs=1, minibatch_size=_ROLLOUT_STEPS + 5)
         batch = _build_batch_with_forced_ratio_blowup(fast_trainer, log_prob_offset=300.0)
+        same_weights = copy.deepcopy(fast_trainer)
 
         fast_trainer.dual_clip_c = 0.0
-        metrics_off = fast_trainer._ppo_update(copy.deepcopy(batch), progress=0.0)
-        assert not math.isfinite(metrics_off["policy_loss"]), (
-            f"expected inf/nan from float32 overflow with dual-clip disabled, "
-            f"got a finite policy_loss={metrics_off['policy_loss']} -- test's "
-            f"premise (guaranteed overflow) may not hold on this build/hardware"
-        )
+        with pytest.raises(PPOTrainer._NaNReproFound):
+            fast_trainer._ppo_update(copy.deepcopy(batch), progress=0.0)
 
-        fast_trainer2 = _make_fast_trainer(n_epochs=1, minibatch_size=_ROLLOUT_STEPS + 5)
-        fast_trainer2.dual_clip_c = 3.0
-        metrics_on = fast_trainer2._ppo_update(copy.deepcopy(batch), progress=0.0)
+        same_weights.dual_clip_c = 3.0
+        metrics_on = same_weights._ppo_update(copy.deepcopy(batch), progress=0.0)
         assert math.isfinite(metrics_on["policy_loss"]), (
             "dual-clip should recover a finite value even from literal "
             "-inf inputs (torch.max(-inf, floor) == floor)"

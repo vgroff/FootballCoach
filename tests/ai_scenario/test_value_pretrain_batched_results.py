@@ -270,14 +270,25 @@ class _FakeHandle:
         self.collect_calls: list = []
         self.returns_specs: list = []
         self.deterministic_flags: list = []
+        self.replay_seed_calls: list = []
+        # Mirror the real handle class's collect() exactly, so a signature
+        # change there fails here (see TestFakeHandleMatchesRealHandles).
+        self.collect = self._collect_batched if batched else self._collect_plain
 
     def set_weights(self, dec, exec_, val):
         self.weights_calls += 1
 
-    def collect(self, n_steps, progress=None, returns=None, deterministic=False):
-        self.collect_calls.append(n_steps)
+    def _collect_batched(self, n_steps, replay_seeds=None, returns=None, deterministic=False):
+        self.replay_seed_calls.append(replay_seeds)
         self.returns_specs.append(returns)
         self.deterministic_flags.append(deterministic)
+        self._start(n_steps)
+
+    def _collect_plain(self, n_steps, progress):
+        self._start(n_steps)
+
+    def _start(self, n_steps):
+        self.collect_calls.append(n_steps)
 
         def _send():
             for m in self._messages:
@@ -654,3 +665,63 @@ class TestDeterministicRolloutFlag:
         assert child.recv()["deterministic"] is True
         h.collect(100)
         assert child.recv()["deterministic"] is False
+
+
+class TestFakeHandleMatchesRealHandles:
+    """The consumption-loop tests above are only meaningful while the fake speaks
+    the same collect() interface as the real handles. These went stale once
+    already, when replay_seeds was added (e94c3bd)."""
+
+    @staticmethod
+    def _params(fn) -> list[tuple[str, object]]:
+        import inspect
+        return [(p.name, p.default) for p in inspect.signature(fn).parameters.values() if p.name != "self"]
+
+    def test_batched_fake_collect_matches_the_real_batched_handle(self):
+        from footballcoach.ai.ppo.batched_rollout_worker import BatchedRolloutWorkerHandle
+        assert self._params(_FakeHandle([], batched=True).collect) == self._params(BatchedRolloutWorkerHandle.collect)
+
+    def test_plain_fake_collect_matches_the_real_plain_handle(self):
+        from footballcoach.ai.ppo.rollout_worker import RolloutWorkerHandle
+        assert self._params(_FakeHandle([], batched=False).collect) == self._params(RolloutWorkerHandle.collect)
+
+
+class TestReplaySeedsReachWorkers:
+    def _pool(self, handles, batched: bool):
+        return _ValuePretrainWorkers(
+            handles=handles, batched=batched, progress_value=multiprocessing.Value("l", 0),
+            n_processes=len(handles), envs_per_process=2,
+        )
+
+    def _run(self, trainer, monkeypatch, handles, batched, replay_seeds):
+        monkeypatch.setattr(trainer, "_close_value_pretrain_workers", lambda p: None)
+        trainer._collect_value_pretrain_rollout(
+            env=None, n_steps=200 * len(handles), phase_id=1, use_gae=True,
+            pool=self._pool(handles, batched), replay_seeds=replay_seeds,
+        )
+
+    def test_seeds_are_split_round_robin_across_batched_workers(self, trainer, monkeypatch):
+        results = _collect_results(trainer, n_envs=2, n_steps=200)
+        handles = [_FakeHandle([{"chunk": copy.deepcopy(results)}, {"done": True}], batched=True) for _ in range(2)]
+        self._run(trainer, monkeypatch, handles, True, [11, 22, 33])
+        assert [h.replay_seed_calls for h in handles] == [[[11, 33]], [[22]]]
+
+    def test_fewer_seeds_than_workers_leaves_the_rest_with_none(self, trainer, monkeypatch):
+        results = _collect_results(trainer, n_envs=2, n_steps=200)
+        handles = [_FakeHandle([{"chunk": copy.deepcopy(results)}, {"done": True}], batched=True) for _ in range(2)]
+        self._run(trainer, monkeypatch, handles, True, [11])
+        assert [h.replay_seed_calls for h in handles] == [[[11]], [None]]
+
+    def test_no_seeds_sends_none(self, trainer, monkeypatch):
+        results = _collect_results(trainer, n_envs=2, n_steps=200)
+        handles = [_FakeHandle([{"chunk": copy.deepcopy(results)}, {"done": True}], batched=True)]
+        self._run(trainer, monkeypatch, handles, True, None)
+        assert handles[0].replay_seed_calls == [None]
+
+    def test_plain_workers_are_never_sent_seeds(self, trainer, monkeypatch, caplog):
+        results = [r for r in _collect_results(trainer, n_envs=1, n_steps=100)]
+        handles = [_FakeHandle([r], batched=False) for r in results]
+        with caplog.at_level("INFO", logger="footballcoach.ai.ppo"):
+            self._run(trainer, monkeypatch, handles, False, [11, 22])
+        assert handles[0].collect_calls == [200]
+        assert "replay seed(s) given but ignored" in caplog.text

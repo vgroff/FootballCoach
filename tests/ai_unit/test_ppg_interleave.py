@@ -48,14 +48,16 @@ def trainer(tmp_path):
 
 
 class TestConfigDefaults:
-    def test_code_level_default_is_off(self):
-        # Opt-in convention: __init__ falls back to False when the key is absent from config
-        # (ppo_trainer.py: `bool(bc_cfg.get("ppg_interleave_enabled", False))`). NOT asserted
-        # against the live ai_config.json's ppg_interleave_enabled value here -- it's
-        # deliberately True there while this feature is being live-tested (same reasoning
-        # test_move_dir_entropy_weight.py etc. give for isolating against live non-default
-        # config values rather than asserting on them directly).
+    def test_code_level_default_is_off(self, monkeypatch):
+        # Opt-in convention: __init__ falls back to off when the keys are absent from
+        # config. The keys are removed here because the live ai_config.json turns the
+        # feature on; asserting on the live values would test the config, not the code.
+        from footballcoach.ai.config import load_ai_config
+        bc_cfg = load_ai_config()["bc"]
+        for key in ("ppg_interleave_enabled", "ppg_interleave_cadence_rollouts", "ppg_interleave_trigger_file"):
+            monkeypatch.delitem(bc_cfg, key, raising=False)
         t = PPOTrainer.from_config(device=torch.device("cpu"), separate_value_net=False)
+        assert t._ppg_interleave_enabled is False
         assert t._ppg_interleave_cadence_rollouts == 0
         assert t._ppg_interleave_trigger_file is None
 

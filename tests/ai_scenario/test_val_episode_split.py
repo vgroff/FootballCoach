@@ -44,7 +44,7 @@ from footballcoach.ai.config import load_ai_config
 from footballcoach.ai.env.scenario_env import ScenarioEnv
 from footballcoach.ai.models.decision_network import DecisionNetwork
 from footballcoach.ai.models.execution_network import ExecutionNetwork
-from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _action_to_numpy, _trimmed_mean_p10_p90
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _action_to_numpy, _ai_types, _trimmed_mean_p10_p90
 from footballcoach.ai.ppo.rollout_buffer import HEAD_LP_KEYS, RolloutBuffer
 from footballcoach.ui.scenarios import ScenarioDefinition, build_1v1_scenario
 
@@ -107,6 +107,9 @@ def trainer() -> PPOTrainer:
     # more than once.
     cfg["ppo"]["n_epochs"] = 3
     cfg["ppo"]["minibatch_size"] = 8
+    # The tests below switch the epoch-0 baseline on themselves and restore it
+    # to False; the live config may have it on, which made results order-dependent.
+    cfg["ppo"]["log_epoch_zero_baseline"] = False
     return PPOTrainer(
         decision_net=DecisionNetwork.from_config(),
         execution_net=ExecutionNetwork.from_config(),
@@ -286,6 +289,25 @@ class TestEvalNeverTrains:
             assert torch.equal(b, a), "held-out validation eval must never change any parameter"
 
 
+def _with_old_lp_at_eval_chunking(trainer: PPOTrainer, batch: dict) -> dict:
+    """Copy of ``batch`` whose log_probs are recomputed under the current weights in
+    the same sequential minibatch_size chunks as _eval_val_episode_losses."""
+    assert trainer._opp_head_mask_matrix(batch) is None, "masked old_lp would need head_log_probs too"
+    n = len(batch["log_probs"])
+    chunks = []
+    with torch.no_grad():
+        for start in range(0, n, trainer.minibatch_size):
+            idx = torch.arange(start, min(start + trainer.minibatch_size, n))
+            obs = {k.replace("obs/", ""): batch[k][idx].to(trainer.device) for k in batch if k.startswith("obs/")}
+            sat, oat = _ai_types(obs)
+            args = (obs["self_feat"], obs["other_feat"], obs["exists_mask"], obs["ball_feat"], obs["global_feat"])
+            d_heads = trainer.decision_net(*args, sat, oat)
+            e_heads = trainer.execution_net(*args, d_heads, sat, oat)
+            actions = {k.replace("action/", ""): batch[k][idx].to(trainer.device) for k in batch if k.startswith("action/")}
+            chunks.append(trainer._recompute_log_prob(d_heads, e_heads, actions, obs["exists_mask"]).cpu())
+    return {**batch, "log_probs": torch.cat(chunks)}
+
+
 class TestEndToEnd:
     def test_ppo_update_reports_val_losses_and_still_trains(self, trainer, multi_track_batch):
         trainer.val_episode_fraction = 0.5
@@ -332,6 +354,26 @@ class TestEndToEnd:
             assert all(math.isfinite(v) for v in values)
             assert values == sorted(values), f"percentiles not monotonic: {values}"
 
+    def test_epoch_zero_baseline_adds_exactly_one_percentile_line(self, trainer, multi_track_batch, caplog):
+        def count_lines(baseline: bool) -> int:
+            caplog.clear()
+            trainer.log_epoch_zero_baseline = baseline
+            try:
+                with caplog.at_level("INFO"):
+                    trainer._ppo_update(copy.deepcopy(multi_track_batch), progress=0.0)
+            finally:
+                trainer.log_epoch_zero_baseline = False
+            return sum(r.message.strip().startswith("[held-out policy percentiles") for r in caplog.records)
+
+        trainer.val_episode_fraction = 0.5
+        trainer.target_kl, saved_target_kl = float("inf"), trainer.target_kl
+        try:
+            without, with_baseline = count_lines(False), count_lines(True)
+        finally:
+            trainer.target_kl = saved_target_kl
+        assert without == trainer.n_epochs
+        assert with_baseline == without + 1
+
     def test_policy_loss_and_kl_are_exactly_zero_at_ratio_one_before_any_training(self, trainer, multi_track_batch):
         """Ground truth for why val_episode_policy_loss/val_episode_kl
         aren't generalization diagnostics: at ratio=1 (i.e. before any
@@ -352,6 +394,11 @@ class TestEndToEnd:
             for k, v in train_batch.items()
         }
         clip = trainer.schedules.clip(0.0)
+        # Stored log_probs come from batch-of-1 rollout forwards; a batch-of-N
+        # forward differs by float non-associativity (up to ~6e-5 nats here),
+        # so the ratio is only EXACTLY 1 when old_lp uses the eval's own chunking.
+        val_batch = _with_old_lp_at_eval_chunking(trainer, val_batch)
+        train_sample = _with_old_lp_at_eval_chunking(trainer, train_sample)
 
         (
             val_pol_loss, _, val_kl, val_per_sample_pol, _, _, _, _,
@@ -363,17 +410,17 @@ class TestEndToEnd:
         ) = trainer._eval_val_episode_losses(train_sample, clip)
         assert val_pol_loss == pytest.approx(0.0, abs=1e-5)
         assert train_pol_loss == pytest.approx(0.0, abs=1e-5)
-        assert val_kl == pytest.approx(0.0, abs=1e-5)
-        # (r-1)*A is IDENTICALLY 0 per-row at ratio=1 (not just ~0 via a
-        # normalized-mean-zero cancellation the way -mean(A) is) -- an even
-        # cleaner degenerate case than policy_loss's own.
-        assert val_surr_mean == pytest.approx(0.0, abs=1e-6)
-        assert train_surr_mean == pytest.approx(0.0, abs=1e-6)
-        assert val_surr_trimmed == pytest.approx(0.0, abs=1e-6)
-        assert train_surr_trimmed == pytest.approx(0.0, abs=1e-6)
-        assert val_surr_trimmed2 == pytest.approx(0.0, abs=1e-6)
-        assert train_surr_trimmed2 == pytest.approx(0.0, abs=1e-6)
-        assert train_kl == pytest.approx(0.0, abs=1e-5)
+        # With old_lp computed at the eval's own chunking, ratio == 1 exactly, so
+        # KL and (r-1)*A are exactly 0 per row (unlike policy_loss, which is only
+        # ~0 through the normalized-advantage mean cancelling).
+        assert val_kl == 0.0
+        assert train_kl == 0.0
+        assert val_surr_mean == 0.0
+        assert train_surr_mean == 0.0
+        assert val_surr_trimmed == 0.0
+        assert train_surr_trimmed == 0.0
+        assert val_surr_trimmed2 == 0.0
+        assert train_surr_trimmed2 == 0.0
 
         # The MEAN is exactly 0, but individual rows are NOT -- at ratio=1,
         # surr1=surr2=adv_normalized exactly, so per_sample_policy_loss_i =
@@ -732,7 +779,13 @@ class TestEpochZeroBaseline:
     TestPolicyLossZeroAtRatioOne-style tests elsewhere in this file rely
     on), which is expected, not something these tests need to re-litigate."""
 
-    def test_disabled_by_default_no_epoch_zero_line(self, trainer, multi_track_batch, caplog):
+    def test_code_level_default_is_off(self):
+        cfg = copy.deepcopy(load_ai_config())
+        cfg["ppo"].pop("log_epoch_zero_baseline", None)
+        t = PPOTrainer(decision_net=DecisionNetwork.from_config(), execution_net=ExecutionNetwork.from_config(), cfg=cfg)
+        assert t.log_epoch_zero_baseline is False
+
+    def test_disabled_no_epoch_zero_line(self, trainer, multi_track_batch, caplog):
         assert trainer.log_epoch_zero_baseline is False
         with caplog.at_level("INFO"):
             trainer._ppo_update(multi_track_batch, progress=0.0)

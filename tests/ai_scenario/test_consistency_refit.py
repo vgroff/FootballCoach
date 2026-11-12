@@ -39,7 +39,9 @@ def _make_env(trainer) -> ScenarioEnv:
 @pytest.fixture()
 def trainer():
     torch.manual_seed(0)
-    t = PPOTrainer.from_config(device=torch.device("cpu"), separate_value_net=False)
+    # y_canonical makes the policy exactly flip_y-equivariant by construction, so there
+    # would be nothing for the refit to improve; it is on in the live config.
+    t = PPOTrainer.from_config(device=torch.device("cpu"), separate_value_net=False, y_canonical=False)
     if _PHASE.frozen_heads:
         t.set_frozen_heads(_PHASE.frozen_heads)
     return t

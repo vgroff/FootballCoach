@@ -57,7 +57,10 @@ def test_boost_is_w_minus_one_times_the_three_kick_terms(trainer):
     finally:
         trainer.ent_kick_weight = 1.0
     assert float(boost.detach()) == pytest.approx(9.0 * (bk10["kick"] + bk10["kick_dir"] + bk10["kick_power"]), rel=1e-5)
-    assert float(boost.detach()) > 0.0
+    # Not "> 0": kick_dir/kick_power are continuous heads whose differential entropy
+    # is negative when sharp (the configured init is), so the boost can be negative.
+    # Nonzero is what keeps the equality above from passing trivially as 0 == 0.
+    assert abs(float(boost.detach())) > 0.1
     assert float(ent10.detach()) == pytest.approx(float(ent1.detach()), rel=1e-6)          # logged entropy is unboosted
     assert bk10 == pytest.approx(bk1)                                    # so is every per-head entry
 
@@ -106,3 +109,19 @@ def test_kick_power_frac_stats_no_kicks_and_single_kick():
     assert empty["n"] == 0 and empty["mean"] != empty["mean"]            # NaN
     one = _kick_power_frac_stats({"action/kick": torch.tensor([[1.0], [0.0]]), "action/kick_power_raw": torch.tensor([[0.0], [3.0]])})
     assert one["n"] == 1 and one["mean"] == pytest.approx(0.5) and one["std"] == 0.0
+
+
+def test_boost_widens_the_continuous_kick_heads_even_when_it_is_negative(trainer):
+    """Maximising the boost must lower kick_dir's concentration and raise kick_power's
+    spread, whatever the boost's sign."""
+    d, e, ex = _heads(trainer)
+    trainer.ent_kick_weight = 10.0
+    try:
+        _, _, boost = trainer._compute_entropy(d, e, ex, return_breakdown=True, return_kick_boost=True)
+    finally:
+        trainer.ent_kick_weight = 1.0
+    params = {n.split(".")[-1]: p for n, p in trainer.execution_net.named_parameters()
+              if n.split(".")[-1] in ("kick_dir_log_kappa", "kick_power_log_std")}
+    grad_kappa, grad_power = torch.autograd.grad(boost, [params["kick_dir_log_kappa"], params["kick_power_log_std"]])
+    assert float(grad_kappa.sum()) < 0.0
+    assert float(grad_power.sum()) > 0.0

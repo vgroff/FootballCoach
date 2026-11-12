@@ -36,11 +36,11 @@ def _trainer(top_fraction: float = 0.25) -> PPOTrainer:
 
 
 class TestConfigDefault:
-    def test_code_level_default_is_off(self):
+    def test_code_level_default_is_off(self, monkeypatch):
         # Opt-in convention: __init__ falls back to False when the key is absent from
-        # config. NOT asserted against the live ai_config.json value (may be true there
-        # while this feature is being live-tested) -- same reasoning test_ppg_interleave.py's
-        # TestConfigDefaults gives.
+        # config. The key is removed because the live ai_config.json turns it on.
+        from footballcoach.ai.config import load_ai_config
+        monkeypatch.delitem(load_ai_config()["bc"], "ppg_episode_replay_enabled", raising=False)
         t = PPOTrainer.from_config(device=torch.device("cpu"), separate_value_net=False)
         assert t._ppg_episode_replay_enabled is False
 

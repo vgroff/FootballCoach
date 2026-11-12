@@ -292,7 +292,13 @@ def test_1v2_move_order_completes_with_stationary_obstacle():
 
 def test_1v2_controller_issues_shoot_after_move():
     """After the attacker's MoveOrder finishes, BallCarrierAttackerAI (via
-    player.ai) must issue a ShootOrder within a handful of ticks."""
+    player.ai) must issue a ShootOrder within a handful of ticks.
+
+    KNOWN FAILING (2026-11-07), left failing on purpose as a reminder: the
+    defender now tackles the attacker at tick 44, 0.95 m short of the move
+    target (arrival tolerance 0.3 m), so the MoveOrder never finishes and the
+    shoot logic never runs. A gameplay question (should this defender win the
+    ball first?), not a bug in this test or in BallCarrierAttackerAI."""
     from footballcoach.orders import GetPossessionOrder, ShootOrder
     from footballcoach.rules_ai import BallCarrierAttackerAI, Phase1RulesAI, StagedGoalkeeperAI
 

@@ -185,6 +185,8 @@ def test_average_player_succeeds_over_20_percent_at_40m(balance_recorder):
 
 
 def test_good_player_succeeds_over_60_percent_at_40m(balance_recorder):
+    """KNOWN FAILING (2026-11-07), left failing on purpose until a passing
+    retune: 53.3% at N_TRIALS=1000, against the 60% target."""
     pitch = Pitch.standard()
     stats = _run_long_pass_batch(pitch, precision=0.9, distance=40.0, n_trials=N_TRIALS, seed_offset=11)
     balance_recorder.report("pass_40m_precision_0.9", stats)
@@ -200,7 +202,10 @@ def test_good_player_succeeds_over_30_percent_at_60m(balance_recorder):
     more speed also means more angular sigma (kick_sigma_rad's power
     coupling), so past a point it stops helping. 33.5% was the best
     achieved via speed-only compensation; 30% keeps a comfortable margin
-    below that. See agent_plans/physics_update.md section 8."""
+    below that. See agent_plans/physics_update.md section 8.
+
+    KNOWN FAILING (2026-11-07), left failing on purpose until a passing
+    retune: 29.1% at N_TRIALS=1000, just under even the lowered 30%."""
     pitch = Pitch.standard()
     stats = _run_long_pass_batch(pitch, precision=0.9, distance=60.0, n_trials=N_TRIALS, seed_offset=12)
     balance_recorder.report("pass_60m_precision_0.9", stats)

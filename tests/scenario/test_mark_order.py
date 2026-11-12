@@ -307,20 +307,18 @@ def test_mark_order_never_completes_after_winning_ball():
 
 
 # ---------------------------------------------------------------------------
-# Missing target graceful handling
+# Missing target
 # ---------------------------------------------------------------------------
 
-def test_mark_completes_gracefully_if_target_missing():
-    """If the target player_id does not exist in the match, MarkOrder
-    should complete gracefully (not raise KeyError)."""
+def test_mark_fails_loudly_if_target_missing():
+    """Players are never removed mid-match, so a missing mark target is an
+    order-assignment bug; since 5bb41d7 MarkOrder raises instead of silently
+    cancelling (the behaviour this test originally expected)."""
     ball = Ball.at_rest(Vector3(5, 0, 0))
     marker = make_player("marker", Team.LEFT, position=Vector3(0, 0, 0))
 
     match = _make_match([marker], ball)
     marker.current_order = MarkOrder(target_player_id="nonexistent")
 
-    match.step()
-
-    assert marker.current_order is None, (
-        "MarkOrder against a nonexistent target should complete gracefully"
-    )
+    with pytest.raises(AssertionError, match="MarkOrder target 'nonexistent' no longer exists"):
+        match.step()
