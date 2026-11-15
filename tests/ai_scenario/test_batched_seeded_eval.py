@@ -48,11 +48,8 @@ import torch
 from footballcoach.ai.eval.seeded_eval import (
     run_seeded_evaluation_batched,
 )
-from footballcoach.ai.ppo.ppo_trainer import (
-    PPOTrainer,
-    _build_eval_env_factory,
-    _build_neural_vs_neural_env_factory,
-)
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+from footballcoach.ai.ppo.trainer_eval import _build_eval_env_factory, _build_neural_vs_neural_env_factory
 
 _SEEDS = list(range(5_300_000, 5_300_006))  # 6 seeds, deliberately far from real eval_seed_base
 

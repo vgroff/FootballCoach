@@ -6,7 +6,7 @@ as the run progresses, unlike a fixed lookback.
 """
 import pytest
 
-from footballcoach.ai.ppo.ppo_trainer import _resolve_snapshot_lookback
+from footballcoach.ai.ppo.trainer_eval import _resolve_snapshot_lookback
 
 
 def test_int_lookback_unchanged_behaviour():

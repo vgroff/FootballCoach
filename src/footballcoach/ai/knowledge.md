@@ -2280,7 +2280,7 @@ number of rollouts back: target checkpoint = `current_count - round(k * current_
 checkpoint sitting at the run's current halfway point -- a target that moves forward as the run progresses, unlike a fixed lookback
 (`1`, `5`, ...) whose usefulness as a *signal* fades once the run is much longer than that fixed distance. Whole-number entries (`1`,
 `5`, or even a whole-number float like `2.0`) keep the exact original fixed-lookback behaviour. See `_resolve_snapshot_lookback()` in
-`ppo_trainer.py` (a pure, directly-testable helper extracted from `_maybe_run_neural_snapshot_eval`) and
+`trainer_eval.py` (a pure, directly-testable helper extracted from `_maybe_run_neural_snapshot_eval`) and
 `tests/ai_unit/test_neural_snapshot_lookback.py`. The label in logs/graphs keeps the CONFIGURED fraction (`"0.5_back"`), not the drifting
 computed distance, so it groups consistently across a whole run despite the underlying checkpoint number changing every time.
 

@@ -597,7 +597,7 @@ def _dagger_pool_worker_init(
     # worker_torch_threads=1 default, same rationale.
     _torch.set_num_threads(1)
     global _worker_trainer
-    from footballcoach.ai.ppo.ppo_trainer import rebuild_inference_trainer
+    from footballcoach.ai.ppo.trainer_eval import rebuild_inference_trainer
 
     _worker_trainer = rebuild_inference_trainer(decision_state, execution_state, separate_value_net, value_state)
 

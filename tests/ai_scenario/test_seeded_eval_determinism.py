@@ -13,7 +13,8 @@ import pytest
 import torch
 
 from footballcoach.ai.eval.seeded_eval import run_seeded_evaluation
-from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _build_eval_env_factory
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+from footballcoach.ai.ppo.trainer_eval import _build_eval_env_factory
 
 _SEEDS = list(range(5_400_000, 5_400_006))
 _OTHER_SEEDS = list(range(5_500_000, 5_500_006))

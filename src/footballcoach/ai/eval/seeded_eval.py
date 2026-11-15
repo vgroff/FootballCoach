@@ -560,7 +560,7 @@ def run_seeded_evaluation_parallel_batched(
     ``run_seeded_evaluation_batched``) instead of running them one at a
     time. ``worker_factory`` must return ``(env_factory, trainer,
     secondary_trainer)`` -- see ``_eval_worker_factory_batched``/
-    ``_eval_worker_factory_neural_snapshot_batched`` in ppo_trainer.py.
+    ``_eval_worker_factory_neural_snapshot_batched`` in ai/ppo/trainer_eval.py.
 
     ``pool``: an already-created ``multiprocessing.Pool`` (spawn context) to
     dispatch onto instead of creating (and closing) a fresh one -- pass this

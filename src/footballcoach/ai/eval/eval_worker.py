@@ -39,7 +39,7 @@ def _eval_worker_main(conn, separate_value_net: bool, worker_torch_threads: int 
     import torch
 
     from footballcoach.ai.eval.seeded_eval import run_seeded_evaluation, run_seeded_evaluation_batched
-    from footballcoach.ai.ppo.ppo_trainer import _build_eval_env_factory, rebuild_inference_trainer
+    from footballcoach.ai.ppo.trainer_eval import _build_eval_env_factory, rebuild_inference_trainer
 
     torch.set_num_threads(max(1, worker_torch_threads))
 

@@ -846,7 +846,7 @@ def main() -> None:
         )
         rules_stats = _run_evaluation(trainer, rules_env, _pre_ppo_n_seeds, checkpoint_path=_eval_ckpt_path)
         from footballcoach.ai.ppo.ppo_trainer import REWARD_COMP_LABELS as _CL
-        from footballcoach.ai.ppo.ppo_trainer import format_outcomes_with_pct
+        from footballcoach.ai.ppo.trainer_eval import format_outcomes_with_pct
         _cl_map = dict(_CL)
         _comp_str = "  ".join(
             f"{_cl_map.get(k, k)}={v:+.2f}" for k, v in sorted(
@@ -927,7 +927,7 @@ def main() -> None:
         # log line -- skipping it changes nothing else.
         try:
             from footballcoach.ai.scripts.evaluate import _run_baseline_evaluation
-            from footballcoach.ai.ppo.ppo_trainer import format_outcomes_with_pct as _fmt_oc
+            from footballcoach.ai.ppo.trainer_eval import format_outcomes_with_pct as _fmt_oc
             baseline_stats = _run_baseline_evaluation(env, n_trials=12)
             log.info(
                 f"Baseline (rules vs rules, 12 trials): trainee_win={baseline_stats['win_rate_pct']:.1f}%  "

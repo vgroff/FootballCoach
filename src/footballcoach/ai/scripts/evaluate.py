@@ -432,7 +432,7 @@ def _run_baseline_evaluation(
 
 
 def _print_combined_stats(combined: dict) -> None:
-    from footballcoach.ai.ppo.ppo_trainer import format_outcomes_with_pct as _fmt_oc
+    from footballcoach.ai.ppo.trainer_eval import format_outcomes_with_pct as _fmt_oc
 
     log.info("=" * 60)
     log.info("EVALUATION RESULTS")
