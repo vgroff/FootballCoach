@@ -1518,15 +1518,6 @@ def _label_to_env_action(label: BCLabel, env) -> dict:
             "kick_spin":         np.zeros(3, dtype=np.float32),
             "tackle_attempt":    False,
         },
-        "decision_physical": {
-            "move_region_center_m":   (
-                label.move_region_center_m
-                if label.move_region_center_m is not None
-                else np.zeros(2, dtype=np.float32)
-            ),
-            "move_region_size_m":     2.0,
-            "move_arrival_speed_mps": 7.0,
-        },
         "target_slots": {"pass_": 0, "tackle": 0, "mark": 0},
         "slot_player_ids": [None] * 21,
         "decision": None,

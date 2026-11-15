@@ -317,7 +317,7 @@ def test_kick_validity_is_one_predicate_shared_by_both_executors_and_the_account
         g = GatingResult(selected=None, target_slot=None, exec_move=False, move_direction=None, sprint=False,
                          kick_this_tick=True, kick_direction=np.array([1.0, 0.0, 0.0]), kick_power_fraction=0.5,
                          kick_spin=None, tackle_attempt=False)
-        apply_action_to_player(g, tr, m, [None] * 21, {})
+        apply_action_to_player(g, tr, m, [None] * 21)
         assert (tr.kick_count > before) == can and tr.kick_armed == (not can)
         # accounting
         tr.opportunity.begin_interval(m.tick_index, tr.kick_count, tr.tackle_fire_count)

@@ -1086,11 +1086,15 @@ a rules-based `PlayerAI`, or a scripted test can all call
 `issue_order`/`set_decision_override` on the same `HybridPlayerAI` instance,
 which is what makes this pattern reusable beyond the training-mode UI.
 
-### `_sample_action(obs_dict)` still returns an 8-tuple internally:
+### `_sample_action(obs_dict)` returns an 8-tuple:
 ```
 (action, log_prob, value, decision_probs, execution_physical,
- decision_physical, target_slots, raw_exec_samples)
+ target_slots, raw_exec_samples, head_log_probs)
 ```
+`NeuralPlayerAI.apply` unpacks it by position; `test_smoke.py::test_sample_action_returns_finite_log_prob`
+pins the layout. (Until 2026-11-15 there was a `decision_physical` dict between
+`execution_physical` and `target_slots`, holding the world-frame move region; nothing read it, so it
+was removed.)
 `raw_exec_samples` must be forwarded to `_action_to_numpy(action, raw_exec_samples)`
 so the rollout buffer holds the correct values for the PPO importance ratio.
 

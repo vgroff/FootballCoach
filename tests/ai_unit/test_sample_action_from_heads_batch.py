@@ -164,9 +164,9 @@ class TestGatingMatrixMatchesReference:
 
         for i in range(K):
             (ref_action, ref_lp, ref_value, ref_probs, ref_exec,
-             ref_dec, ref_tgt, ref_raw, ref_hlp) = reference[i]
+             ref_tgt, ref_raw, ref_hlp) = reference[i]
             (bat_action, bat_lp, bat_value, bat_probs, bat_exec,
-             bat_dec, bat_tgt, bat_raw, bat_hlp) = batched[i]
+             bat_tgt, bat_raw, bat_hlp) = batched[i]
 
             # Sanity: confirm the forced gating actually landed where intended,
             # so this test can't pass vacuously on a row that never exercised
@@ -183,8 +183,6 @@ class TestGatingMatrixMatchesReference:
                 )
             for k in ref_exec:
                 _assert_field_close(ref_exec[k], bat_exec[k], f"row {i} execution_physical[{k}]")
-            for k in ref_dec:
-                _assert_field_close(ref_dec[k], bat_dec[k], f"row {i} decision_physical[{k}]")
             for k in ref_raw:
                 np.testing.assert_allclose(ref_raw[k], bat_raw[k], atol=_ATOL, err_msg=f"row {i} raw_exec[{k}]")
 
@@ -200,7 +198,7 @@ class TestGatingMatrixMatchesReference:
             d_heads, e_heads, value_b, x_sign_b, em, deterministic_decision=True,
         )
         for i in range(K):
-            hlp = batched[i][8]
+            hlp = batched[i][7]
             assert hlp[_IDX_SPRINT] == 0.0, f"row {i} sprint should be exactly 0 (exec_move=False)"
             assert hlp[_IDX_MOVE_DIR] == 0.0, f"row {i} move_dir should be exactly 0 (exec_move=False)"
             assert hlp[_IDX_KICK_DIR] == 0.0, f"row {i} kick_dir should be exactly 0 (kick=False)"
@@ -218,7 +216,7 @@ class TestGatingMatrixMatchesReference:
         batched = trainer._sample_action_from_heads_batch(
             d_heads, e_heads, value_b, x_sign_b, em, deterministic_decision=True,
         )
-        hlp = batched[0][8]
+        hlp = batched[0][7]
         assert hlp[_IDX_SPRINT] != 0.0
         assert hlp[_IDX_MOVE_DIR] != 0.0
         assert hlp[_IDX_KICK_DIR] != 0.0
@@ -243,13 +241,13 @@ class TestFrozenHeadsMasking:
                 trainer, d_heads, e_heads, value_b, x_sign_b, em, deterministic=True,
             )
             for i in range(K):
-                hlp = batched[i][8]
+                hlp = batched[i][7]
                 assert hlp[_IDX_SHOOT] == 0.0, f"row {i} shoot should be masked to 0 (frozen)"
                 assert hlp[_IDX_MARK] == 0.0, f"row {i} mark should be masked to 0 (frozen)"
                 assert batched[i][1] == pytest.approx(reference[i][1], abs=_ATOL), (
                     f"row {i} total log_prob vs per-row reference under frozen heads"
                 )
-                np.testing.assert_allclose(reference[i][8], hlp, atol=_ATOL, err_msg=f"row {i} head_log_probs")
+                np.testing.assert_allclose(reference[i][7], hlp, atol=_ATOL, err_msg=f"row {i} head_log_probs")
         finally:
             # Un-freeze so this doesn't leak into other tests sharing `trainer`.
             for name in ("shoot_logit", "mark_logit"):
@@ -282,10 +280,6 @@ class TestPerRowDecanonicalization:
         np.testing.assert_allclose(exec0["kick_direction"][0], -exec1["kick_direction"][0], atol=1e-5)
         np.testing.assert_allclose(exec0["kick_direction"][1:], exec1["kick_direction"][1:], atol=1e-5)
 
-        dec0, dec1 = batched[0][5], batched[1][5]
-        np.testing.assert_allclose(dec0["move_region_center_m"][0], -dec1["move_region_center_m"][0], atol=1e-5)
-        np.testing.assert_allclose(dec0["move_region_center_m"][1], dec1["move_region_center_m"][1], atol=1e-5)
-
         # And they must match the per-row reference exactly, not just be
         # mutually consistent with each other.
         reference = _reference_rows(trainer, d_heads, e_heads, value_b, x_sign_b, em, deterministic=True)
@@ -293,10 +287,6 @@ class TestPerRowDecanonicalization:
             np.testing.assert_allclose(
                 reference[i][4]["move_direction"], batched[i][4]["move_direction"], atol=_ATOL,
                 err_msg=f"row {i} move_direction vs reference",
-            )
-            np.testing.assert_allclose(
-                reference[i][5]["move_region_center_m"], batched[i][5]["move_region_center_m"], atol=_ATOL,
-                err_msg=f"row {i} move_region_center_m vs reference",
             )
 
 
@@ -322,7 +312,7 @@ class TestStochasticLogProbSelfConsistency:
         batched = trainer._sample_action_from_heads_batch(d_heads, e_heads, value_b, x_sign_b, em)
 
         for i in range(K):
-            action, lp, value, probs, exec_phys, dec_phys, tgt, raw, hlp = batched[i]
+            action, lp, value, probs, exec_phys, tgt, raw, hlp = batched[i]
             samples = {
                 "shoot": torch.tensor([[action.shoot]]), "pass_": torch.tensor([[action.pass_]]),
                 "move": torch.tensor([[action.move]]), "tackle": torch.tensor([[action.tackle]]),
@@ -373,5 +363,5 @@ class TestRandomizedFuzz:
         for i in range(K):
             assert reference[i][1] == pytest.approx(batched[i][1], abs=_ATOL), f"seed {seed} row {i} log_prob"
             np.testing.assert_allclose(
-                reference[i][8], batched[i][8], atol=_ATOL, err_msg=f"seed {seed} row {i} head_log_probs",
+                reference[i][7], batched[i][7], atol=_ATOL, err_msg=f"seed {seed} row {i} head_log_probs",
             )

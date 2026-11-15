@@ -6,14 +6,9 @@ import numpy as np
 import torch
 from footballcoach.ai.action.distributions import IndependentBernoulli, KickDirectionHead, MaskedCategorical, SquashedNormalHead, VonMisesDirectionHead, _von_mises_entropy
 from footballcoach.ai.action.schema import DecisionAction
-from footballcoach.config import load_physics_config
 from footballcoach.ai.models.decision_network import derive_get_possession_prob
 from footballcoach.ai.obs.canonical import mirror_x, x_sign_of
 
-
-def _pitch_half_extents_m() -> tuple[float, float]:
-    pitch = load_physics_config()["pitch"]
-    return pitch["length_m"] / 2.0, pitch["width_m"] / 2.0
 
 # _LP_HEAD_NAMES (decision_net attribute names, as returned by
 # PPOTrainer._ppo_lp_masked_heads) -> their short HEAD_LP_KEYS-style name
@@ -201,16 +196,14 @@ class ActionSamplingMixin:
         Python/PyTorch dispatch overhead on tiny batch-of-1 calls); a direct
         benchmark measured 6 separate batch=1 CPU calls at 51.2s vs 1 batch=6
         CPU call at 10.5s for this exact 3-network combination (~4.88x).
-        ALL per-row sampling/log_prob/decanonicalization logic stays in
-        ``_sample_action_from_heads`` below, completely unchanged -- both the
-        single-row path (``_sample_action``) and the batched path
-        (``_sample_action_batch``) call that same method, so there is only
-        ever one implementation of the sampling/log_prob math to keep
-        correct, never a second parallel one that could silently drift.
+        The sampling/log_prob/decanonicalization tail is
+        ``_sample_action_from_heads_batch``; both ``_sample_action`` (a
+        batch of 1) and ``_sample_action_batch`` go through it, so production
+        has exactly one implementation of that math.
 
         Returns ``(d_heads, e_heads, value_batch, x_sign_batch, em)`` -- all
         still batch-shaped ``(K, ...)``. ``em`` (exists_mask) is returned too
-        since ``_sample_action_from_heads`` needs it again for the masked
+        since the sampling tail needs it again for the masked
         categorical target distributions (pass/tackle/mark target) -- it's
         part of the original observation, not something the network forward
         pass produces.
@@ -225,8 +218,8 @@ class ActionSamplingMixin:
         oat = obs_dict_batch["other_ai_type"].to(dev) if "other_ai_type" in obs_dict_batch else None
 
         # Canonical AI frame: mirror world-frame obs so self always attacks
-        # +x (see ai/obs/canonical.py). Reused per-row below (via
-        # _sample_action_from_heads) to decanonicalize move_direction/
+        # +x (see ai/obs/canonical.py). Reused by the sampling tail
+        # to decanonicalize move_direction/
         # kick_direction before they're returned to the caller.
         # (decision_net/execution_net wrap-canonicalize sf/of/bf automatically —
         # see CanonicalNetworkWrapper — so only x_sign itself is needed here.)
@@ -261,16 +254,23 @@ class ActionSamplingMixin:
         deterministic_decision: bool = False,
         deterministic_direction: bool = False,
     ) -> tuple:
-        """Per-row sampling + log_prob + decanonicalization, given
-        already-computed batch-of-1 network output for ONE row (``d_heads``/
-        ``e_heads``/``value``/``x_sign``/``em`` -- see
-        ``_sample_action_networks``, which also returns the batch-of-1
-        ``exists_mask`` slice needed again here for the masked categorical
-        target distributions). This is ``_sample_action``'s entire original
-        body, byte-for-byte unchanged, minus the network forward passes
-        themselves (now the caller's job) -- both ``_sample_action``
-        (batch=1) and ``_sample_action_batch`` (batch=K, calling this once
-        per row) route through this exact same code.
+        """TEST REFERENCE ONLY -- not called by any production code path.
+
+        Per-row sampling + log_prob + decanonicalization for ONE row of
+        already-computed batch-of-1 network output. This is the original
+        scalar implementation (``_sample_action``'s body before batching),
+        kept as an independent oracle: production uses
+        ``_sample_action_from_heads_batch`` for every call (``_sample_action``
+        is a batch of 1 through it), and
+        tests/ai_unit/test_sample_action_from_heads_batch.py checks that
+        vectorized tail row by row against this function. Its gating is
+        written as Python ``if``s and ``_compute_log_prob``, independently of
+        the tensor masks in ``_recompute_log_prob``/``_per_head_new_log_probs``,
+        which is what makes it a useful cross-check. Do not delete it as a
+        "duplicate" without moving that check elsewhere. The comparison runs
+        with ``deterministic=True``: stochastic draws differ by construction
+        because a batched ``.sample()`` consumes the RNG in a different order
+        than K per-row calls.
 
         Args:
             deterministic: if True, use each head's mode/mean instead of a
@@ -289,11 +289,17 @@ class ActionSamplingMixin:
 
         Returns:
             (decision_action, log_prob, value, decision_probs,
-             execution_physical, decision_physical, target_slots)
+             execution_physical, target_slots, raw_exec_samples,
+             head_log_probs)
+
+            There is no decanonicalized move-region entry: the old
+            ``decision_physical`` dict (world-frame move_region_center_m,
+            size_m, arrival_speed_mps) was removed on 2026-11-15 because
+            ``apply_action_to_player`` never read it. The raw
+            move_region_* values are still in ``decision_action``.
         """
         det_decision = deterministic or deterministic_decision
         det_direction = deterministic or deterministic_direction
-        dev = self.device
 
         # Sample from each decision head
         shoot_dist = IndependentBernoulli(d_heads.shoot_logit)
@@ -342,23 +348,6 @@ class ActionSamplingMixin:
             "pass_": int(pass_tgt),
             "tackle": int(tackle_tgt),
             "mark": int(mark_tgt),
-        }
-
-        # Physical continuous outputs (after squashing)
-        pitch_hl, pitch_hw = _pitch_half_extents_m()
-        mv_center_phys = (
-            torch.tanh(mv_center_raw) * torch.tensor([[pitch_hl, pitch_hw]], device=dev)
-        )
-        mv_size_phys = 1.0 + 3.0 * torch.sigmoid(mv_size_raw)  # [1, 4] m
-        mv_speed_phys = float(torch.sigmoid(mv_speed_raw) * 9.5)  # [0, v_top]
-
-        # Decanonicalize: move_region_center is a world-frame physical target.
-        mv_center_world = mirror_x(mv_center_phys.squeeze(0), x_sign)
-
-        decision_physical = {
-            "move_region_center_m": mv_center_world.cpu().numpy(),
-            "move_region_size_m": float(mv_size_phys),
-            "move_arrival_speed_mps": mv_speed_phys,
         }
 
         # Sample execution heads
@@ -519,7 +508,6 @@ class ActionSamplingMixin:
             value,
             decision_probs,
             execution_physical,
-            decision_physical,
             target_slots,
             raw_exec_samples,
             head_log_probs,
@@ -538,12 +526,12 @@ class ActionSamplingMixin:
         deterministic_direction: bool = False,
     ) -> list:
         """Vectorized tail: sampling + log_prob + decanonicalization for ALL
-        K rows in ONE pass, replacing a Python loop of K individual
-        ``_sample_action_from_heads`` calls (that loop -- still used by
-        ``_sample_action_from_heads`` itself as the single-row reference,
-        and by this method's own tests -- is ~53% of rollout decision time
-        despite the network forward pass already being batched, since every
-        distribution/log_prob/masking call it makes is batch=1). Returns a
+        K rows in ONE pass. This is the only production implementation;
+        it replaced a Python loop of K individual
+        ``_sample_action_from_heads`` calls (that loop was ~53% of rollout
+        decision time despite the network forward pass already being batched,
+        since every distribution/log_prob/masking call it made was batch=1;
+        ``_sample_action_from_heads`` survives as the test reference). Returns a
         list of K tuples, each identical in shape/semantics to what
         ``_sample_action_from_heads`` returns for that row (see its
         docstring) -- this is a drop-in replacement for
@@ -576,7 +564,6 @@ class ActionSamplingMixin:
         """
         det_decision = deterministic or deterministic_decision
         det_direction = deterministic or deterministic_direction
-        dev = self.device
         K = int(value_batch.shape[0])
 
         # Decision heads (Bernoulli)
@@ -617,17 +604,6 @@ class ActionSamplingMixin:
         move_prob = torch.sigmoid(d_heads.move_logit)
         mark_prob = torch.sigmoid(d_heads.mark_logit)
         hold_prob = torch.sigmoid(d_heads.hold_position_logit)
-
-        # Physical continuous outputs (after squashing)
-        pitch_hl, pitch_hw = _pitch_half_extents_m()
-        mv_center_phys = (
-            torch.tanh(mv_center_raw) * torch.tensor([[pitch_hl, pitch_hw]], device=dev)
-        )
-        mv_size_phys = 1.0 + 3.0 * torch.sigmoid(mv_size_raw)  # (K, 1), [1, 4] m
-        mv_speed_phys = torch.sigmoid(mv_speed_raw) * 9.5       # (K, 1), [0, v_top]
-
-        # Decanonicalize: move_region_center is a world-frame physical target.
-        mv_center_world = mirror_x(mv_center_phys, x_sign_batch)  # (K, 2)
 
         # Sample execution heads
         exec_move_dist = IndependentBernoulli(e_heads.exec_move_logit)
@@ -724,11 +700,6 @@ class ActionSamplingMixin:
                 "tackle": int(tackle_tgt[i]),
                 "mark": int(mark_tgt[i]),
             }
-            decision_physical = {
-                "move_region_center_m": mv_center_world[i].cpu().numpy(),
-                "move_region_size_m": float(mv_size_phys[i]),
-                "move_arrival_speed_mps": float(mv_speed_phys[i]),
-            }
             execution_physical = {
                 "exec_move": bool(exec_move[i].item() > 0.5),
                 "move_direction": move_dir_world[i].cpu().numpy(),
@@ -755,7 +726,6 @@ class ActionSamplingMixin:
                 float(value_batch[i]),
                 decision_probs,
                 execution_physical,
-                decision_physical,
                 target_slots,
                 raw_exec_samples,
                 head_log_probs_batch[i].cpu().numpy(),
@@ -774,7 +744,7 @@ class ActionSamplingMixin:
 
         Thin wrapper: builds a batch of 1 and routes through
         ``_sample_action_batch`` (see its docstring, and
-        ``_sample_action_networks``/``_sample_action_from_heads``) so the
+        ``_sample_action_networks``/``_sample_action_from_heads_batch``) so the
         single-row path can never diverge from the batched path -- it IS the
         batched path, called with batch_size=1.
 

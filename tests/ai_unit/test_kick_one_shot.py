@@ -31,7 +31,7 @@ def _kick_sampler(kick: bool = True, tackle: bool = False):
             "kick_this_tick": kick, "kick_direction": np.array([1.0, 0.0, 0.0]), "kick_power_fraction": 0.5,
             "kick_spin": np.zeros(3), "tackle_attempt": tackle,
         }
-        return ({}, 0.0, 0.0, {}, exec_phys, {}, {}, {}, {})
+        return ({}, 0.0, 0.0, {}, exec_phys, {}, {}, {})
     return sample
 
 
@@ -158,8 +158,8 @@ class TestKickCount:
         assert p1.kick_count == 0
         gating = GatingResult(selected=SelectedAction.NONE, kick_this_tick=True, kick_direction=np.array([1.0, 0.0, 0.0]),
                               kick_power_fraction=0.5, kick_spin=np.zeros(3))
-        apply_action_to_player(gating, p1, match, [None] * 21, {})
+        apply_action_to_player(gating, p1, match, [None] * 21)
         assert p1.kick_count == 1
         # Ball released -> a second attempt only ARMS; no physical kick, no count.
-        apply_action_to_player(gating, p1, match, [None] * 21, {})
+        apply_action_to_player(gating, p1, match, [None] * 21)
         assert p1.kick_count == 1 and p1.kick_armed

@@ -923,7 +923,6 @@ class NeuralPlayerAI(PlayerAI):
             player=player,
             match=match,
             slot_player_ids=[None] * 21,
-            decision_physical={},
         )
 
     def is_due_for_decision(self) -> bool:
@@ -1031,7 +1030,7 @@ class NeuralPlayerAI(PlayerAI):
         from footballcoach.ai.obs.encoder import MAX_OTHER_PLAYERS
 
         (action, log_prob, value, decision_probs, exec_phys,
-         dec_phys, target_slots, raw_exec, head_log_probs) = result
+         target_slots, raw_exec, head_log_probs) = result
 
         slot_player_ids = [None] * MAX_OTHER_PLAYERS  # safe default; NeuralPlayerAI does not need target resolution
         gating = select_action(decision_probs, exec_phys, target_slots)
@@ -1047,7 +1046,6 @@ class NeuralPlayerAI(PlayerAI):
             player=player,
             match=match,
             slot_player_ids=slot_player_ids,
-            decision_physical=dec_phys,
         )
         self._drop_fired_kick(player)
 
@@ -1357,7 +1355,7 @@ class HybridPlayerAI(NeuralPlayerAI):
 
         result = self.sample_action_fn(obs_dict)
         (action, log_prob, value, decision_probs, exec_phys,
-         dec_phys, target_slots, raw_exec, head_log_probs) = result
+         target_slots, raw_exec, head_log_probs) = result
 
         decision_probs = dict(decision_probs)
         decision_probs.update(self._decision_overrides)
@@ -1371,7 +1369,6 @@ class HybridPlayerAI(NeuralPlayerAI):
             player=player,
             match=match,
             slot_player_ids=slot_player_ids,
-            decision_physical=dec_phys,
         )
         self._drop_fired_kick(player)
 

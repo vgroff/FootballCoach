@@ -56,7 +56,7 @@ def apply_action_to_player(
     player: Player,
     match: Match,
     slot_player_ids: list[Optional[str]],
-    decision_physical: dict,
+    *,
     arm_tackle_without_carrier: Optional[bool] = None,
 ) -> OrderTranslationResult:
     """Apply execution-network outputs DIRECTLY to the player — no Orders.

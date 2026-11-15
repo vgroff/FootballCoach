@@ -134,9 +134,9 @@ class TestBatchMatchesIndividualDeterministic:
         assert len(batched) == K
         for i in range(K):
             (ind_action, ind_lp, ind_value, ind_probs, ind_exec,
-             ind_dec, ind_tgt, ind_raw, ind_hlp) = individual[i]
+             ind_tgt, ind_raw, ind_hlp) = individual[i]
             (bat_action, bat_lp, bat_value, bat_probs, bat_exec,
-             bat_dec, bat_tgt, bat_raw, bat_hlp) = batched[i]
+             bat_tgt, bat_raw, bat_hlp) = batched[i]
 
             for f in dataclasses.fields(ind_action):
                 _assert_field_close(
@@ -151,8 +151,6 @@ class TestBatchMatchesIndividualDeterministic:
                 assert ind_tgt[k] == bat_tgt[k], f"row {i} target_slots[{k}]"
             for k in ind_exec:
                 _assert_field_close(ind_exec[k], bat_exec[k], f"row {i} execution_physical[{k}]")
-            for k in ind_dec:
-                _assert_field_close(ind_dec[k], bat_dec[k], f"row {i} decision_physical[{k}]")
             for k in ind_raw:
                 np.testing.assert_allclose(ind_raw[k], bat_raw[k], atol=_ATOL, err_msg=f"row {i} raw_exec[{k}]")
             np.testing.assert_allclose(ind_hlp, bat_hlp, atol=_ATOL, err_msg=f"row {i} head_log_probs")
@@ -232,7 +230,7 @@ class TestBatchStochasticMode:
         obs_list = [_make_obs_dict(seed=300 + i) for i in range(K)]
         batched = trainer._sample_action_batch(_stack_obs(obs_list))
         for i, result in enumerate(batched):
-            _, log_prob, value, _, exec_phys, dec_phys, _, raw_exec, head_lp = result
+            _, log_prob, value, _, exec_phys, _, raw_exec, head_lp = result
             assert math.isfinite(log_prob), f"row {i} log_prob"
             assert math.isfinite(value), f"row {i} value"
             assert np.all(np.isfinite(head_lp)), f"row {i} head_log_probs"

@@ -114,9 +114,11 @@ def _slice_dataclass_row(obj, i: int):
     """Return a NEW instance of ``obj``'s dataclass type with every tensor
     field sliced to row ``i``, keeping the batch dim (shape ``(1, ...)``).
 
-    Used by ``PPOTrainer._sample_action_batch`` to run
-    ``_sample_action_from_heads``'s unchanged per-row logic on one row of an
-    already-batched ``DecisionHeadsRaw``/``ExecutionHeadsRaw``. Reflective
+    Test helper (no production caller since the sampling tail was
+    vectorized): tests/ai_unit/test_sample_action_from_heads_batch.py uses it
+    to feed one row of an already-batched ``DecisionHeadsRaw``/
+    ``ExecutionHeadsRaw`` to the per-row reference
+    ``_sample_action_from_heads``. Reflective
     (uses ``dataclasses.fields()``) rather than hardcoding field names, so it
     can't silently miss a field if either schema gains/loses one later;
     ``None`` fields (e.g. the physics-encoder passthrough fields, absent

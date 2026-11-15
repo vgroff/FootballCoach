@@ -116,8 +116,14 @@ def test_sample_action_returns_finite_log_prob():
     trainer = PPOTrainer.from_config()
     obs = env.reset()
     result = trainer._sample_action(obs.to_torch_dict())
-    assert len(result) == 9, "Expected 9-tuple from _sample_action"
-    _action, log_prob, value, *_ = result
+    assert len(result) == 8, "Expected 8-tuple from _sample_action"
+    _action, log_prob, value, probs, exec_phys, target_slots, raw_exec, head_lp = result
+    # Positional layout (NeuralPlayerAI.apply unpacks by position, so a shift must fail here).
+    assert set(probs) == {"shoot", "pass_", "move", "tackle", "get_possession", "mark", "hold_position"}
+    assert "move_direction" in exec_phys and "kick_this_tick" in exec_phys
+    assert set(target_slots) == {"pass_", "tackle", "mark"}
+    assert "move_dir_raw" in raw_exec and "kick_power_raw" in raw_exec
+    assert head_lp.shape == (15,)
     assert math.isfinite(log_prob), f"log_prob={log_prob} is not finite"
     assert math.isfinite(value), f"value={value} is not finite"
 
@@ -226,7 +232,7 @@ def _removed_test_bc_pretrain_then_score():
     for _ in range(100):
         label = phase1_labels(env)
         result = trainer._sample_action(obs.to_torch_dict())
-        action, _, _, decision_probs, exec_phys, dec_phys, _, _, _ = result
+        action, _, _, decision_probs, exec_phys, _, _, _ = result
         if label.valid:
             n_valid += 1
             if (action.move > 0.5) == (label.move > 0.5):

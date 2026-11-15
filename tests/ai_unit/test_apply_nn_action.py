@@ -49,14 +49,13 @@ def _gating(selected: SelectedAction, target_slot: int | None = None,
     )
 
 
-def _apply(gating, match, player_id, slot_player_ids=None, decision_physical=None, **kwargs):
+def _apply(gating, match, player_id, slot_player_ids=None, **kwargs):
     player = match.player_by_id(player_id)
     return apply_action_to_player(
         gating=gating,
         player=player,
         match=match,
         slot_player_ids=slot_player_ids or [None] * 21,
-        decision_physical=decision_physical or {},
         **kwargs,
     )
 

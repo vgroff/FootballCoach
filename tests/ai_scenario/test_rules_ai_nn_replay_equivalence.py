@@ -380,7 +380,7 @@ class _ReplayAI(PlayerAI):
             kick_spin=np.zeros(3, dtype=np.float64),
             tackle_attempt=rec["tackle_attempt"],
         )
-        apply_action_to_player(gating, player, match, slot_player_ids=[], decision_physical={})
+        apply_action_to_player(gating, player, match, slot_player_ids=[])
 
 
 def _snapshot(match) -> dict:

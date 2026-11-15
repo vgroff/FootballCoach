@@ -207,7 +207,7 @@ def test_mirrored_match_evolves_identically_state_and_network_io(tmp_path, mirro
         assert torch.allclose(la["d"].other_physics_full, lb["d"].other_physics_full, atol=1e-4)
         assert torch.allclose(la["value"], lb["value"], atol=1e-4)
         # the chosen (deterministic) action, in each match's world frame
-        (_, _, va, pa, xa, dpa, _, _, _), (_, _, vb, pb, xb, dpb, _, _, _) = la["result"], lb["result"]
+        (_, _, va, pa, xa, _, _, _), (_, _, vb, pb, xb, _, _, _) = la["result"], lb["result"]
         sx, sy = (-1.0 if r.mx else 1.0), (-1.0 if r.my else 1.0)
         assert abs(va - vb) < 1e-4
         assert all(abs(pa[k2] - pb[k2]) < 1e-5 for k2 in pa)
@@ -215,7 +215,6 @@ def test_mirrored_match_evolves_identically_state_and_network_io(tmp_path, mirro
             assert xa[flag] == xb[flag]
         assert np.allclose(np.asarray(xb["move_direction"]), np.asarray(xa["move_direction"]) * [sx, sy], atol=1e-5)
         assert np.allclose(np.asarray(xb["kick_direction"])[:2], np.asarray(xa["kick_direction"])[:2] * [sx, sy], atol=1e-5)
-        assert np.allclose(np.asarray(dpb["move_region_center_m"]), np.asarray(dpa["move_region_center_m"]) * [sx, sy], atol=1e-4)
 
 
 def test_x_mirrored_simulation_also_holds_with_x_canonicalisation_alone(tmp_path):

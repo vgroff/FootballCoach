@@ -324,10 +324,3 @@ class TestAugmentObsBcLabelFlipsByFieldName:
         negated = {bc._I_DIR_Y, bc._I_REGION_Y, bc._I_KICK_DIR_Y, bc._I_KICK_SPIN_X, bc._I_KICK_SPIN_Z}
         for col in range(before.shape[1]):
             assert after[0, col] == pytest.approx((-1.0 if col in negated else 1.0) * before[0, col])
-
-
-def test_trainer_pitch_extents_match_the_real_pitch():
-    from footballcoach.ai.ppo.action_sampling import _pitch_half_extents_m
-    from footballcoach.entities.pitch import Pitch
-    pitch = Pitch.standard()
-    assert _pitch_half_extents_m() == (pitch.half_length, pitch.half_width) == (52.5, 34.0)

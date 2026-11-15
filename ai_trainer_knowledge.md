@@ -1159,8 +1159,10 @@ The PPO log_prob for get_possession is on `gp_raw` (raw Bernoulli), not on
 As of the bug-fix commit (2026-07-29), `_sample_action` returns:
 ```
 (action, log_prob, value, decision_probs, execution_physical,
- decision_physical, target_slots, raw_exec_samples)
+ target_slots, raw_exec_samples, head_log_probs)
 ```
+(Updated 2026-11-15: `head_log_probs` was appended later, and the unused
+`decision_physical` dict was removed; see src/footballcoach/ai/knowledge.md.)
 `raw_exec_samples` is a dict of numpy arrays (`sprint`, `kick`,
 `tackle_attempt`, `move_dir_raw`, `kick_dir_raw`) that must be passed to
 `_action_to_numpy(action, raw_exec_samples)` so the rollout buffer stores

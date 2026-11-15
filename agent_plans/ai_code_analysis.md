@@ -30,10 +30,20 @@ below, this section wins.
   test now exists (`tests/ai_unit/test_bc.py::TestLabelLayout`).
 - **#30:** `test_entity_encoder_permutation.py` is committed.
 - **#9 (pitch constants):** both copies now read `physics.json`.
-- **#11 (narrowed):** `mv_size_phys`/`mv_speed_phys` are still inline, but
-  `decision_physical` has no production reader: `apply_action_to_player`
-  ignores it. Only tests read those keys, so the right fix is probably
-  removing the chain rather than moving `1.0`/`3.0`/`9.5` to config.
+- **#11 (closed 2026-11-15):** the `decision_physical` chain had no
+  production reader, so it was removed along with its inline
+  `1.0`/`3.0`/`9.5` constants and the now-unused `_pitch_half_extents_m`.
+  `_sample_action` returns 8 entries, and `apply_action_to_player` no
+  longer takes `decision_physical`. Its `arm_tackle_without_carrier` is
+  keyword-only, so a stale positional call fails instead of silently
+  binding. Checked with the golden snapshot: bit-identical apart from the
+  removed field.
+- **Sampling-function "merge" (closed 2026-11-15, nothing to merge):**
+  production already has one implementation. `_sample_action` is a batch
+  of 1 through `_sample_action_from_heads_batch`, and
+  `_sample_action_from_heads` survives only as the independent per-row
+  oracle for `test_sample_action_from_heads_batch.py`. Its docstrings now
+  say so.
 - **#1 / §2.1 (`ppo_trainer.py` god object):** split into seven mixin
   modules (see `ai/knowledge.md`, "PPOTrainer module layout"), pure moves
   checked bit-identical with `scripts/golden_snapshot.py`. `ppo_trainer.py` is
