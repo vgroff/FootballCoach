@@ -2319,3 +2319,33 @@ Below the cap the loss and gradient are bit-identical to the uncapped formula
 dual-clip off, `_loss_ratio` is plain `exp()`, so vanilla PPO is unchanged,
 overflow crash included. The raw ratio is still what the ratio-spike,
 clip-fraction and ratio-histogram diagnostics report.
+
+## PPOTrainer module layout
+
+`PPOTrainer` (`ppo/ppo_trainer.py`) keeps construction (`__init__`), the
+training loops (`train`, `_train_parallel`, `_train_batched_parallel`) and
+head freezing. Everything else is inherited from mixins, each in its own
+module, moved verbatim in November 2026 with no behaviour change:
+
+| Module | Mixin | Contents |
+|---|---|---|
+| `checkpoint_io.py` | `CheckpointIOMixin` | save/load checkpoints, `from_config`, `load_for_inference`, log rotation |
+| `rollout_logging.py` | `RolloutLoggingMixin` | the per-rollout `[PPO]` summary block |
+| `trainer_eval.py` | `TrainerEvalMixin` | periodic evals (rules, immobile, opponent types, neural snapshots) and their worker factories |
+| `action_sampling.py` | `ActionSamplingMixin` | action sampling, log-probs, entropy, value lookups |
+| `pretraining.py` | `PretrainingMixin` | `pretrain_combined`, `pretrain_value`, value-pretrain rollouts and workers |
+| `ppg.py` | `PPGMixin` | PPG value refit (standalone and interleaved), its KL anchor, `consistency_refit` |
+| `ppo_update.py` | `PPOUpdateMixin` | `_ppo_update`, held-out validation episodes, dual-clip and the ratio cap, the NaN guard |
+
+Module-level helpers live in the one module that uses them; helpers used by
+several live in `trainer_common.py`, which also defines the shared
+`footballcoach.ai.ppo` logger. Mixins reach each other only through `self`.
+Helpers that construct a `PPOTrainer` (e.g. `trainer_eval.rebuild_inference_trainer`)
+import it lazily inside the function, since `ppo_trainer.py` imports their
+module.
+
+For further moves, `scripts/split_module.py` does the AST-based move and
+`scripts/fix_moved_imports.py` repoints importers. `scripts/golden_snapshot.py`
+records every number, weight hash and log line from a fixed-seed run through
+these methods; run it before and after a refactor and require identical
+output.

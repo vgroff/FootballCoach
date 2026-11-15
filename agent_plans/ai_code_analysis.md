@@ -34,6 +34,11 @@ below, this section wins.
   `decision_physical` has no production reader: `apply_action_to_player`
   ignores it. Only tests read those keys, so the right fix is probably
   removing the chain rather than moving `1.0`/`3.0`/`9.5` to config.
+- **#1 / §2.1 (`ppo_trainer.py` god object):** split into seven mixin
+  modules (see `ai/knowledge.md`, "PPOTrainer module layout"), pure moves
+  checked bit-identical with `scripts/golden_snapshot.py`. `ppo_trainer.py` is
+  2,080 lines, down from 11,982. `_ppo_update` itself (about 2,000 lines) is
+  still one method; splitting it would be a real rewrite, not a move.
 - **#6/#25 (partly closed):** `Match.player_by_id_or_none` exists and covers
   the pure single-lookup sites. The remaining `(KeyError, AttributeError)`
   sites also guard a `None` match or a malformed env, so they stay.
