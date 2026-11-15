@@ -927,6 +927,27 @@ lets a UI freeze the simulation while still allowing orders to be queued
 paused won't execute until `paused=False` and `step()` is called again;
 there's no "single order resolution while otherwise paused" mode yet).
 
+**Module layout (split 2026-11-15, pure code move):** `Match` is declared in
+`match.py` as `class Match(MatchTacklesMixin, MatchGetPossessionMixin)`.
+- `match.py`: the dataclass fields, `step()` and the tick order, movement,
+  order processing, possession syncing, loose-ball pickup, goals.
+- `match_tackles.py` (`MatchTacklesMixin`): armed tackles
+  (`_check_armed_tackles`, `_attempt_tackle_contact`), the head-on
+  collision fallback (`_check_head_on_tackles`), contact checks,
+  goalkeeper tackle immunity, `_effective_dribbling`, and tackle-result
+  logging.
+- `match_get_possession.py` (`MatchGetPossessionMixin`):
+  `_run_get_possession_behaviour` (chasing a loose ball or a carrier),
+  `_intercept_target`, `_leading_pass_target`.
+
+The mixins hold no state. Every field stays on the `Match` dataclass, and
+the methods were moved verbatim. Checked with `scripts/engine_trace_snapshot.py`
+(every UI scenario, 900 ticks, full per-tick state hash), which shows 0
+differences and catches a 1e-4 change to `_effective_dribbling` or a 1 mm
+change to `_intercept_target`. Module-level names the moved methods use (for
+example `attempt_tackle`) are now imported in the mixin module, so patch
+them there, not in `footballcoach.engine.match`.
+
 ## Known gaps / explicitly deferred (not oversights - flagging for future work)
 
 - `PassOrder` now exists distinct from a generic `KickOrder` (see

@@ -55,13 +55,16 @@ Line numbers are approximate (code may have shifted slightly since review).
   guard a `None` match or a malformed env, so swapping them would change
   behaviour.
 
-- **`engine/match.py` is a "does everything" file** — tick loop, order
-  processing, possession syncing, ball pickup, head-on-tackle detection, GK
-  immunity/box logic, pass leading, and interception math all live in one
-  `Match` class. Worth splitting interception math out (see above) and
-  possibly the GK-box/immunity logic into its own module, since
-  `goalkeeping.py` already exists as a natural home for GK-specific logic. 
-  Developer Note: Sounds good. Anything else that could be split out from match without too much hassle?
+- **`engine/match.py` split (done 2026-11-15):** 1,412 -> ~660 lines. Tackle
+  resolution and GK tackle immunity moved to `match_tackles.py`, and the
+  get-possession behaviour plus intercept/lead-pass math to
+  `match_get_possession.py`, as stateless mixins (see engine/knowledge.md,
+  "Module layout"). The GK-immunity helpers went with the tackles, not
+  `goalkeeping.py`, because they are only ever called from tackle
+  resolution and `goalkeeping.py` holds pure functions, not `Match`
+  methods. Still in `match.py`: `_process_orders` and
+  `_update_loose_ball_pickup` (about 120 lines each), which are tick-order
+  glue.
 
 - **No single canonical epsilon constant** — `1e-6`, `1e-9`, `1e-12` all
   appear scattered across modules (e.g. `Pitch.is_goal()`,
