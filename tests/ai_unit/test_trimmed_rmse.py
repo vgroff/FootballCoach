@@ -8,7 +8,7 @@ import math
 import pytest
 import torch
 
-from footballcoach.ai.ppo.ppo_trainer import _trimmed_rmse
+from footballcoach.ai.ppo.ppg import _trimmed_rmse
 
 
 def _plain_rmse(sq: torch.Tensor) -> float:

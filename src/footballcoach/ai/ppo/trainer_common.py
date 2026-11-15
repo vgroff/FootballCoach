@@ -533,3 +533,13 @@ def _split_batch_releasing(
                 val[key] = v[val_idx]
         del v
     return train, val
+
+
+def _lr_warmup_scale(step_idx: int, warmup_steps: int) -> float:
+    """Linear LR-warmup multiplier for the ``step_idx``-th (0-based) optimizer
+    step of a cycle: ``(step_idx + 1) / warmup_steps`` capped at 1.0, so the
+    first step runs at ``1/warmup_steps`` of the base lr and step
+    ``warmup_steps - 1`` onward at the full lr. ``warmup_steps <= 0`` = off."""
+    if warmup_steps <= 0:
+        return 1.0
+    return min(1.0, (step_idx + 1) / warmup_steps)

@@ -65,7 +65,8 @@ def _worker_main(
 
     from footballcoach.ai.curriculum.envs import build_env, bc_label_fn_for_phase_player
     from footballcoach.ai.curriculum.phases import PHASES_BY_ID
-    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _load_state_dict_tolerant
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+    from footballcoach.ai.ppo.trainer_common import _load_state_dict_tolerant
     from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
     from footballcoach.ai.progress import ProgressReporter
 

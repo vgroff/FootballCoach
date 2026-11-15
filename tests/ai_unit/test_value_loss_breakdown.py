@@ -4,7 +4,7 @@ the pure-numpy value-error breakdown behind ppg_value_refit's opt-in
 import numpy as np
 import pytest
 
-from footballcoach.ai.ppo.ppo_trainer import _episode_phase_fraction, _value_loss_breakdown
+from footballcoach.ai.ppo.ppg import _episode_phase_fraction, _value_loss_breakdown
 
 
 class TestEpisodePhaseFraction:

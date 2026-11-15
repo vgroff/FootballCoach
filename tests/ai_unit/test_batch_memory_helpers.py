@@ -13,7 +13,8 @@ import numpy as np
 import pytest
 import torch
 
-from footballcoach.ai.ppo.ppo_trainer import _merge_worker_batches, _split_batch_releasing
+from footballcoach.ai.ppo.ppo_trainer import _merge_worker_batches
+from footballcoach.ai.ppo.trainer_common import _split_batch_releasing
 
 
 def _make_batch(n: int, offset: float = 0.0) -> dict:

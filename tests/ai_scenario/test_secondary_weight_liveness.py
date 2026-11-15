@@ -30,7 +30,8 @@ import pytest
 import torch
 
 from footballcoach.ai.env.scenario_env import ScenarioEnv
-from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _load_state_dict_tolerant
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+from footballcoach.ai.ppo.trainer_common import _load_state_dict_tolerant
 from footballcoach.ui.scenarios import ScenarioDefinition, build_1v1_scenario
 
 _SEED = 777
