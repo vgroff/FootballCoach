@@ -132,7 +132,7 @@ class TestAsTensorsAppliesBackfill:
         is the exact live-reported symptom
         ("unknown=...(n=21118)" dwarfing every real bucket)."""
         import torch
-        from footballcoach.ai.ppo.ppo_trainer import value_mse_by_outcome
+        from footballcoach.ai.ppo.trainer_common import value_mse_by_outcome
 
         buf = _make_buffer_with_outcomes(
             rewards=[0.0] * 9 + [1.0] + [0.0] * 4 + [1.0],
@@ -215,7 +215,7 @@ class TestMultiTrackSecondaryStepOutcome:
     def test_value_mse_by_outcome_has_no_unknown_bucket_with_the_fix(self):
         import torch
 
-        from footballcoach.ai.ppo.ppo_trainer import value_mse_by_outcome
+        from footballcoach.ai.ppo.trainer_common import value_mse_by_outcome
 
         buf = self._build_interleaved(secondary_step_outcome="box_possession")
         advantages, returns = buf.compute_gae(gamma=0.99, lam=0.95, last_value=0.0)

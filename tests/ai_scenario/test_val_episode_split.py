@@ -44,7 +44,9 @@ from footballcoach.ai.config import load_ai_config
 from footballcoach.ai.env.scenario_env import ScenarioEnv
 from footballcoach.ai.models.decision_network import DecisionNetwork
 from footballcoach.ai.models.execution_network import ExecutionNetwork
-from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _action_to_numpy, _ai_types, _trimmed_mean_p10_p90
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _action_to_numpy
+from footballcoach.ai.ppo.trainer_common import _ai_types
+from footballcoach.ai.ppo.ppo_update import _trimmed_mean_p10_p90
 from footballcoach.ai.ppo.rollout_buffer import HEAD_LP_KEYS, RolloutBuffer
 from footballcoach.ui.scenarios import ScenarioDefinition, build_1v1_scenario
 

@@ -3,7 +3,7 @@ shared by ``ppg_value_refit`` (bc.ppg_warmup_steps) and ``_ppo_update``
 (ppo.lr_warmup_steps)."""
 import pytest
 
-from footballcoach.ai.ppo.ppo_trainer import _lr_warmup_scale
+from footballcoach.ai.ppo.trainer_common import _lr_warmup_scale
 
 
 class TestLRWarmupScale:

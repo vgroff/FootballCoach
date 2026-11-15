@@ -298,7 +298,7 @@ class TestLossRatioCap:
         return per_row.detach(), grad
 
     def test_identical_to_the_uncapped_formula_wherever_exp_is_finite(self):
-        from footballcoach.ai.ppo.ppo_trainer import _MAX_LOG_RATIO
+        from footballcoach.ai.ppo.ppo_update import _MAX_LOG_RATIO
         host = self._host(3.0)
         gaps = torch.cat([torch.linspace(-60.0, 88.0, 297), torch.tensor([_MAX_LOG_RATIO, 88.5])])
         for a in (-5.0, -0.1, 0.1, 5.0):

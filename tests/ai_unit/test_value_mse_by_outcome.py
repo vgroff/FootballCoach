@@ -19,7 +19,7 @@ import math
 import pytest
 import torch
 
-from footballcoach.ai.ppo.ppo_trainer import format_outcome_rmse_breakdown, value_mse_by_outcome
+from footballcoach.ai.ppo.trainer_common import format_outcome_rmse_breakdown, value_mse_by_outcome
 
 
 class TestValueMseByOutcome:

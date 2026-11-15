@@ -32,7 +32,8 @@ import torch
 
 from footballcoach.ai.curriculum.phases import PHASES_BY_ID
 from footballcoach.ai.env.scenario_env import ScenarioEnv
-from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _ai_types
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+from footballcoach.ai.ppo.trainer_common import _ai_types
 from footballcoach.ui.scenarios import ScenarioDefinition, build_1v1_scenario, phase1_training_on_tick
 
 _PHASE = PHASES_BY_ID[1]

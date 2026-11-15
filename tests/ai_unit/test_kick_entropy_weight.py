@@ -6,7 +6,8 @@ exactly (w - 1) x the three kick terms, and it must only carry gradient into the
 import pytest
 import torch
 
-from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _kick_power_frac_stats
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+from footballcoach.ai.ppo.ppo_update import _kick_power_frac_stats
 
 
 @pytest.fixture(scope="module")

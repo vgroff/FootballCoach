@@ -32,11 +32,8 @@ import torch
 
 from footballcoach.ai.action.schema import DecisionHeadsRaw
 from footballcoach.ai.env.scenario_env import ScenarioEnv
-from footballcoach.ai.ppo.ppo_trainer import (
-    PPOTrainer,
-    _action_to_numpy,
-    _scale_decision_heads_grad,
-)
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _action_to_numpy
+from footballcoach.ai.ppo.ppo_update import _scale_decision_heads_grad
 from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
 from footballcoach.ui.scenarios import ScenarioDefinition, build_1v1_scenario
 

@@ -64,7 +64,7 @@ def test_capture_pairs_rows_and_does_not_change_the_recomputed_log_probs(trainer
     assert torch.equal(lp_plain, lp_cap) and torch.equal(hl_plain, hl_cap)
     assert len(pair["id"]["move_direction"]) == n and len(pair["flip"]["move_direction"]) == n
     # the flip block really is the flip_y copy: an independent forward pass over just those rows agrees
-    from footballcoach.ai.ppo.ppo_trainer import _ai_types
+    from footballcoach.ai.ppo.trainer_common import _ai_types
     idx = torch.arange(n, 2 * n)[:64]
     mb = {k.replace("obs/", ""): aug[k][idx] for k in aug if k.startswith("obs/")}
     sat, oat = _ai_types(mb)

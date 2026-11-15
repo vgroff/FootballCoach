@@ -239,7 +239,7 @@ def train_bc_epochs(
         direction_magnitude_reg,
     )
     from footballcoach.ai.obs.canonical import canonicalize_bc_labels, x_sign_of
-    from footballcoach.ai.ppo.ppo_trainer import EXEC_HEAD_MODULES, _ai_types
+    from footballcoach.ai.ppo.trainer_common import EXEC_HEAD_MODULES, _ai_types
     from footballcoach.ai.ppo.pretraining import _binary_confusion_counts, _precision_recall_f1, _measure_exec_head_grad_norms_and_maybe_log_spike
     from footballcoach.ai.progress import ProgressReporter
 

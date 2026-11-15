@@ -24,7 +24,8 @@ from footballcoach.ai.action.distributions import IndependentBernoulli
 from footballcoach.ai.curriculum.phases import PHASES_BY_ID
 from footballcoach.ai.env.scenario_env import ScenarioEnv
 from footballcoach.ai.ppo.action_opportunity_stats import opportunity_masks, opportunity_stats
-from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _action_to_numpy, _ai_types
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _action_to_numpy
+from footballcoach.ai.ppo.trainer_common import _ai_types
 from footballcoach.ai.ppo.rollout_buffer import HEAD_LP_KEYS, RolloutBuffer
 from footballcoach.mathutils import Vector3
 from footballcoach.ui.scenarios import ScenarioDefinition, build_1v1_scenario, phase1_training_on_tick

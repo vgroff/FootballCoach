@@ -6,7 +6,8 @@ import torch
 
 from footballcoach.ai.action.distributions import configured_kick_power_floor, kick_power_from_raw
 from footballcoach.ai.ppo import bc
-from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _kick_power_frac_stats
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+from footballcoach.ai.ppo.ppo_update import _kick_power_frac_stats
 
 
 @pytest.fixture(scope="module")

@@ -148,7 +148,7 @@ def test_pretrain_combined_populates_ai_type_side_channel(shared_dataset):
     a call site that stops threading sat/oat) fails here instead of only
     showing up as a silent accuracy regression during real training.
     """
-    from footballcoach.ai.ppo.ppo_trainer import _ai_types
+    from footballcoach.ai.ppo.trainer_common import _ai_types
 
     dataset = shared_dataset
 

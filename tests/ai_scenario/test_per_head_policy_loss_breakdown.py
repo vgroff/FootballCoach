@@ -188,7 +188,7 @@ class TestPerHeadPolicyLossBreakdown:
                       for k in batch if k.startswith("action/")}
         sf, of, em = mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"]
         bf, gf = mb_obs["ball_feat"], mb_obs["global_feat"]
-        from footballcoach.ai.ppo.ppo_trainer import _ai_types
+        from footballcoach.ai.ppo.trainer_common import _ai_types
         sat, oat = _ai_types(mb_obs)
         with torch.no_grad():
             d_heads = trainer.decision_net(sf, of, em, bf, gf, sat, oat)
