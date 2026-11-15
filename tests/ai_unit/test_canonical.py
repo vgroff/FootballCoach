@@ -327,7 +327,7 @@ class TestAugmentObsBcLabelFlipsByFieldName:
 
 
 def test_trainer_pitch_extents_match_the_real_pitch():
-    from footballcoach.ai.ppo.ppo_trainer import _pitch_half_extents_m
+    from footballcoach.ai.ppo.action_sampling import _pitch_half_extents_m
     from footballcoach.entities.pitch import Pitch
     pitch = Pitch.standard()
     assert _pitch_half_extents_m() == (pitch.half_length, pitch.half_width) == (52.5, 34.0)

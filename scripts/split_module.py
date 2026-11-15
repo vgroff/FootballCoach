@@ -81,6 +81,24 @@ def import_lines(imports: list[ast.stmt], needed: set[str]) -> list[str]:
     return out
 
 
+def merge_into_existing(path: Path, generated: str) -> str:
+    """Append a generated helpers-only module to an existing one: new import
+    lines go after the existing imports, helper code at the end."""
+    existing, _ = read_text(path)
+    ex_tree = ast.parse(existing)
+    gen_tree = ast.parse(generated)
+    have = {ast.unparse(n) for n in ex_tree.body if isinstance(n, (ast.Import, ast.ImportFrom))}
+    new_imports = [ast.unparse(n) for n in gen_tree.body
+                   if isinstance(n, (ast.Import, ast.ImportFrom)) and n.module != "__future__" and ast.unparse(n) not in have]
+    gen_lines = generated.split(LF)
+    first_code = min(n.lineno for n in gen_tree.body if not isinstance(n, (ast.Import, ast.ImportFrom, ast.Expr)))
+    code = LF.join(gen_lines[first_code - 1:]).rstrip()
+    ex_lines = existing.rstrip().split(LF)
+    last_import = max(n.end_lineno for n in ex_tree.body if isinstance(n, (ast.Import, ast.ImportFrom)))
+    ex_lines[last_import:last_import] = new_imports
+    return LF.join(ex_lines) + LF + LF + LF + code + LF
+
+
 def main() -> None:
     plan = json.loads(Path(sys.argv[1]).read_text(encoding="utf-8"))
     dry = "--dry-run" in sys.argv
@@ -112,9 +130,13 @@ def main() -> None:
                 sys.exit(f"{m} planned twice")
             home_of_method[m] = mod
 
+    def locally_imported(node: ast.AST) -> set[str]:
+        return {(a.asname or a.name.split(".")[0]) for n in ast.walk(node)
+                if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
+
     problems = []
     for m, mod in home_of_method.items():
-        used = loads(methods[m])
+        used = loads(methods[m]) - locally_imported(methods[m])
         for bad in (plan["class"], *[n.name for n in tree.body if isinstance(n, ast.ClassDef)]):
             if bad in used and bad not in helper_of:
                 problems.append(f"{m} -> {mod} refers to {bad}")
@@ -175,10 +197,6 @@ def main() -> None:
     staying_classes = {n.name for n in tree.body if isinstance(n, ast.ClassDef)} - {
         name for name in helper_of if home.get(name) not in (None, src_mod)
     }
-    def locally_imported(node: ast.AST) -> set[str]:
-        return {(a.asname or a.name.split(".")[0]) for n in ast.walk(node)
-                if isinstance(n, (ast.Import, ast.ImportFrom)) for a in n.names}
-
     for name, node in helper_of.items():
         if home[name] != src_mod:
             for bad in loads(node) & staying_classes - locally_imported(node):
@@ -305,8 +323,7 @@ def main() -> None:
         if path.exists() and mod != common:
             sys.exit(f"{path} already exists")
         if path.exists():
-            existing, _ = read_text(path)
-            sys.exit(f"{path} already exists; merge needed")
+            body = merge_into_existing(path, body)
         write_text(path, body, crlf)
     write_text(src_path, final_text, crlf)
     moved_report = {name: home[name] for name in sorted(moved_names)}
