@@ -110,9 +110,10 @@ row share per phase is what to tune against.
 ### Starting from a checkpoint
 Load into a fresh run directory. The phase-2 task-ID column and the
 `is_goalkeeper` column were always 0 in phase 1, so their first-layer
-weights never got a gradient and are still at random init (to verify on a
-real checkpoint before acting). Opt-in: zero those input columns on load.
-Value refit (PPG) before PPO to recalibrate the value head.
+weights never got a gradient and are still at random init (verified in stage
+4). Opt-in `--init-new-phase-inputs`: copy the phase-1 task-ID column into
+phase 2's and zero `is_goalkeeper` (stage 4 changed this from zeroing).
+The PPG value refit only sees the primary phase (see Open follow-ups).
 
 ## Stages
 
@@ -158,5 +159,24 @@ Value refit (PPG) before PPO to recalibrate the value head.
   with scripts/batched_rollout_trace_snapshot.py (differences = only the two
   new, empty stats keys; a replay-order mutation is caught). Not mixed yet:
   PPG refit / value pre-training (primary phase only) and evals (stage 3).
-- [ ] Stage 3
-- [ ] Stage 4
+- [x] Stage 3 (2026-11-16): CurriculumPhase.eval_specs, ai/eval/role_phase_eval.py,
+  PPOTrainer._eval_role_phases() after the phase-1 evals in the batched loop
+  (phase-2 specs: rules_baseline, attacker_vs_rules, defender_vs_rules;
+  rules-only specs cached).
+- [x] Stage 4 (2026-11-16): measured the unused-input claim on phase1_run321
+  (confirmed; see ai/knowledge.md). The remedy changed from the plan's
+  "zero the task-id column" to COPYING the source phase's task-id column,
+  because the measurement showed the trained task_id_0 column carries a large
+  weight that phase-2 rows would otherwise lose (zeroing task_id_1 alone would
+  still have shifted outputs). `train.py --init-new-phase-inputs`. Run recipe
+  in ai/knowledge.md; nothing trained.
+
+## Open follow-ups
+
+- PPG value refit and value pre-training are primary-phase only; a phase-2
+  value warm-up would need them to take a phase mix.
+- A phase with several attackers needs detect_trial_outcome to stop ending a
+  trial on a teammate's reception ("saved"); see Findings.
+- Unfreezing tackle / pass / mark heads for a phase needs per-row head masks.
+- The UI cannot yet show role-based terminal payouts (ScenarioLoop's payout
+  display is phase-1 only).

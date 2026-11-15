@@ -1491,9 +1491,38 @@ refit and the periodic evals. Rules:
   unchanged.
 
 Not yet mixed: the PPG value refit and value pre-training collect only
-`--phase`'s envs, and the periodic evals are phase-1 evals (stage 3 of
-`agent_plans/phase2_1v2_plan.md`). Phase-2 rows reuse phase 1's
-`secondary_weight` and land on the `trainee` track like phase 1's.
+`--phase`'s envs. Phase-2 rows reuse phase 1's `secondary_weight` and land on
+the `trainee` track like phase 1's.
+
+**Per-phase evals.** Each role-based phase lists `eval_specs` (name + pinned
+controller per role); `PPOTrainer._eval_role_phases()` runs every spec of
+every role-based phase in the mix after the phase-1 evals, on the fixed seeds
+`curriculum.<key>.eval_seed_offset .. + eval_episodes - 1`, one line each
+(`[eval phase2_1v2/attacker_vs_rules] ...`). Rules-only specs are cached
+(they never change). `ai/eval/role_phase_eval.py`.
+
+**Starting from a phase-1 checkpoint: `--init-new-phase-inputs`.** An input
+that was always 0 in training never gets a gradient, so its first-layer
+weights stay at random init. Measured on phase1_run321 (checkpoint1 vs 763,
+bit-identical columns): `task_id_1` and `is_goalkeeper` columns at random-init
+norm, while the trained `task_id_0` column has norm 3.65 in `global_mlp`.
+Relabelling the same 1v1 states from phase 1 to phase 2 shifted checkpoint
+763's outputs by mean |move_logit| 2.36, |kick_logit| 4.62, |value| 0.42;
+after the fix, exactly 0 (equal up to float rounding). The keeper's random
+`is_goalkeeper` weights moved its own kick logit by 5.2. The fix
+(`ai/ppo/new_phase_inputs.py`) copies the source phase's task-id column into
+each new phase's and zeroes `is_goalkeeper`, in the explicitly named input
+layers of every network (not by shape: `execution_net.value_head.1` has the
+same width as `self_mlp.0`). Use once, when a run first adds a phase. The
+physics encoders never read the task ids.
+
+Recipe (not yet run): set `curriculum.phase2.controllers` to attacker and
+defender `{"neural": 1}`, goalkeeper `{"rules": 1}`, then
+`uv run python -m footballcoach.ai.scripts.train --phase 1 --phase-mix 1:3,2:1
+--checkpoint checkpoints/phase1_run321/checkpoint763.pt --init-new-phase-inputs`
+(writes to a fresh `phase1_run{next}` dir). Expect phase-2 value error to be
+high for the first rollouts: the value head has never seen phase-2 outcomes
+and the PPG refit only sees phase 1.
 
 Verification: `scripts/batched_rollout_trace_snapshot.py` (seeded in-process
 phase-1 collections with replay; identical before and after this change apart

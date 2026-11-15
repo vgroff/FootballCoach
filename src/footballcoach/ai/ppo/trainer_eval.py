@@ -262,6 +262,29 @@ class TrainerEvalMixin:
         self._eval_vs_immobile(max_episode_s)
         self._eval_vs_opponent_type(max_episode_s, use_rules_ai=True)
 
+    def _eval_role_phases(self) -> None:
+        """Seeded evals of every role-based phase in the training mix, one log
+        line per eval spec (ai/eval/role_phase_eval.py). Rules-only specs give
+        the same result every time, so each runs once and is cached. No-op
+        without a phase mix, so a phase-1-only run is unchanged."""
+        if not self.phase_mix:
+            return
+        from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+        from footballcoach.ai.eval.role_phase_eval import run_role_phase_eval
+        for pid in sorted(self.phase_mix):
+            phase = PHASES_BY_ID[pid]
+            if not phase.is_role_based:
+                continue
+            for spec in phase.eval_specs:
+                rules_only = all(c == "rules" for c in spec["controllers"].values())
+                key = (phase.name, spec["name"])
+                result = self._role_eval_cache.get(key) if rules_only else None
+                if result is None:
+                    result = run_role_phase_eval(phase, spec, self._sample_action)
+                    if rules_only:
+                        self._role_eval_cache[key] = result
+                log.info(f"  [eval {phase.name}/{spec['name']}] {result.summary()}")
+
     def _eval_vs_immobile(self, max_episode_s: float) -> None:
         """Seeded eval vs a standing-still opponent -- see _eval_vs_rules()."""
         self._eval_vs_opponent_type(max_episode_s, use_rules_ai=False)

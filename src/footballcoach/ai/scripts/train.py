@@ -91,6 +91,12 @@ def main() -> None:
                              "still drives pre-training, the PPG value refit and the periodic evals. "
                              "Default: ai_config.json curriculum.training_phase_mix if set, else --phase "
                              "alone. Needs ppo.batched_rollout.")
+    parser.add_argument("--init-new-phase-inputs", action="store_true",
+                        help="With --phase-mix and a checkpoint trained on --phase only: copy --phase's task-id "
+                             "input column into every other mixed phase's column, and zero the is_goalkeeper "
+                             "input column if a mixed phase has a goalkeeper role. Those columns were always 0 in "
+                             "training, so they still hold random init weights (see ai/ppo/new_phase_inputs.py). "
+                             "Use once, when a run first adds a phase; not when resuming a mixed run.")
     parser.add_argument("--total-steps", type=int, default=500_000,
                         help="PPO decision-steps to train for, excluding pre-training (default: 500000)")
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -956,9 +962,21 @@ def main() -> None:
         if args.phase not in _mix:
             log.error(f"--phase {args.phase} must be part of the phase mix {_mix}")
             return
-        validate_training_mix(_mix)
+        _mix_phases = validate_training_mix(_mix)
         trainer.phase_mix = _mix
         log.info(f"Phase mix (shares of rollout env slots): {_mix}")
+        if args.init_new_phase_inputs:
+            from footballcoach.ai.ppo.new_phase_inputs import init_new_phase_inputs
+            _zero = ["is_goalkeeper"] if any("goalkeeper" in p.roles.values() for p in _mix_phases) else []
+            for _row in init_new_phase_inputs(
+                trainer, from_phase=args.phase, to_phases=[p for p in _mix if p != args.phase],
+                zero_player_features=_zero,
+            ):
+                log.info(f"  [new phase inputs] {_row['network']}.{_row['layer']} {_row['column']}: "
+                         f"{_row['action']} (norm {_row['norm_before']:.3f} -> {_row['norm_after']:.3f})")
+    elif args.init_new_phase_inputs:
+        log.error("--init-new-phase-inputs needs a phase mix (--phase-mix or curriculum.training_phase_mix)")
+        return
 
     if args.ppg_refit_only:
         # Ad-hoc "starting from a decent checkpoint" use case -- reuses every

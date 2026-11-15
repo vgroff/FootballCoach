@@ -226,6 +226,9 @@
     "phase2": {
       "_comment": "Phase 2 (1v2) env settings, read by curriculum/envs.py's role-based env builder. controllers: per role, unnormalised weights over 'rules' / 'neural', rolled independently per role at every reset. All-rules episodes have no neural player, so they work for playthroughs and evals but produce no training rows; training needs at least one role able to roll neural (the plan: attacker + defender neural, goalkeeper rules; goalkeeper neural later).",
       "max_episode_s": 15.0,
+      "eval_episodes": 40,
+      "eval_seed_offset": 1000000,
+      "_comment_eval": "Periodic phase-2 evals (PHASE_2_1V2.eval_specs, ai/eval/role_phase_eval.py): every spec runs seeds eval_seed_offset .. eval_seed_offset + eval_episodes - 1, one episode each, whenever ppo.rollout_eval_trials > 0 and phase 2 is in the training mix.",
       "controllers": {
         "attacker":   {"rules": 1, "neural": 0},
         "defender":   {"rules": 1, "neural": 0},

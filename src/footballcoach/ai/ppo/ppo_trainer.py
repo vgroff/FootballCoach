@@ -507,6 +507,8 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
         # curriculum.training_phase_mix). None = only train()'s phase_id.
         # A mix of more than that one phase needs the batched rollout path.
         self.phase_mix: Optional[dict[int, float]] = None
+        # (phase name, eval spec name) -> cached result of a rules-only role-phase eval.
+        self._role_eval_cache: dict = {}
         # Opt-in, only meaningful alongside batched_rollout=True: also
         # batches every secondary/opponent neural player's decision (e.g.
         # phase 1's self-play "neural remainder" opponent -- see
@@ -1878,6 +1880,7 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
 
                 if self.rollout_eval_trials > 0:
                     self._eval_vs_rules(max_episode_s)
+                    self._eval_role_phases()
                 self._maybe_run_neural_snapshot_eval(max_episode_s)
 
                 def _close_main_pools() -> None:

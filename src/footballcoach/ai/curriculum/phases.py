@@ -41,6 +41,10 @@ class CurriculumPhase:
             ``terminal`` table) for a role-based phase.
         outcome_kind: which outcome vocabulary / classifier a role-based
             phase uses (curriculum/envs.py OUTCOME_KINDS).
+        eval_specs: role-based phases only: the periodic seeded evals, each
+            {"name": ..., "controllers": {role: "rules" | "neural"}} pinning
+            every role (ai/eval/role_phase_eval.py). A spec with no neural
+            role is a rules baseline.
     """
     name: str
     phase_id: int
@@ -52,6 +56,7 @@ class CurriculumPhase:
     roles: dict[str, str] = field(default_factory=dict)
     config_key: str = ""
     outcome_kind: str = ""
+    eval_specs: list[dict] = field(default_factory=list)
 
     @property
     def is_role_based(self) -> bool:
@@ -124,6 +129,11 @@ PHASE_2_1V2 = CurriculumPhase(
     roles={"attacker": "attacker", "defender": "defender", "keeper": "goalkeeper"},
     config_key="phase2",
     outcome_kind="attack_defence",
+    eval_specs=[
+        {"name": "rules_baseline", "controllers": {"attacker": "rules", "defender": "rules", "goalkeeper": "rules"}},
+        {"name": "attacker_vs_rules", "controllers": {"attacker": "neural", "defender": "rules", "goalkeeper": "rules"}},
+        {"name": "defender_vs_rules", "controllers": {"attacker": "rules", "defender": "neural", "goalkeeper": "rules"}},
+    ],
 )
 
 # Future phases (stubs for reference, not yet implemented):
