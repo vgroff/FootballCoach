@@ -502,6 +502,11 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
         # 1, so n_processes alone is both the process count and total envs).
         self.batched_rollout = bool(ppo_cfg.get("batched_rollout", False))
         self.envs_per_process = int(ppo_cfg.get("envs_per_process", 1))
+        # {phase_id: weight} to train several curriculum phases in one run
+        # (curriculum/mix.py; set by train.py from --phase-mix or
+        # curriculum.training_phase_mix). None = only train()'s phase_id.
+        # A mix of more than that one phase needs the batched rollout path.
+        self.phase_mix: Optional[dict[int, float]] = None
         # Opt-in, only meaningful alongside batched_rollout=True: also
         # batches every secondary/opponent neural player's decision (e.g.
         # phase 1's self-play "neural remainder" opponent -- see
@@ -1060,6 +1065,12 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 own env from this id via ``curriculum.envs.build_env``). See
                 ai/ppo/rollout_worker.py.
         """
+        _mixed = self.phase_mix is not None and set(self.phase_mix) != {phase_id}
+        if _mixed and not (self.n_processes > 1 and self.batched_rollout):
+            raise NotImplementedError(
+                f"training a phase mix ({self.phase_mix}) needs the batched rollout path "
+                "(ppo.n_processes > 1 and ppo.batched_rollout)"
+            )
         if self.n_processes > 1:
             if phase_id is None:
                 raise ValueError(
@@ -1654,8 +1665,19 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
             f"~{steps_per_worker} steps/worker/rollout, "
             f"steps_so_far={self._total_steps:,}  target={self._total_steps + total_steps:,}"
         )
+        # One phase per env slot for a phase mix (curriculum/mix.py); a single
+        # phase is passed as before.
+        if self.phase_mix is not None and set(self.phase_mix) != {phase_id}:
+            from footballcoach.ai.curriculum.mix import assign_env_phases
+            _env_phases = assign_env_phases(self.phase_mix, total_envs)
+            log.info(
+                "  phase mix " + "  ".join(
+                    f"phase{p}={_env_phases.count(p)}/{total_envs} env slots" for p in sorted(set(_env_phases)))
+            )
+        else:
+            _env_phases = phase_id
         workers = spawn_batched_workers(
-            phase_id, n_processes, envs_per_process, base_seed,
+            _env_phases, n_processes, envs_per_process, base_seed,
             self.separate_value_net, self.worker_torch_threads,
             batch_secondary_players=self.batch_secondary_players,
             chunk_steps=self.batched_rollout_chunk_steps or None,
@@ -1721,6 +1743,8 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 episode_durations_s: list[float] = []
                 episode_kick_counts: list[int] = []
                 episode_armed_kick_counts: list[int] = []
+                episode_outcomes_by_tag: dict[str, list[str]] = {}
+                episode_rewards_by_tag: dict[str, list[float]] = {}
                 rollout_components: dict[str, float] = {}
                 # (seed, reward, mean_abs_advantage) for every completed
                 # trainee episode this rollout with a recorded seed -- only
@@ -1746,6 +1770,10 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                     episode_durations_s.extend(stats["episode_durations_s"])
                     episode_kick_counts.extend(stats.get("episode_kick_counts", []))
                     episode_armed_kick_counts.extend(stats.get("episode_armed_kick_counts", []))
+                    for _tag, _outs in stats.get("episode_outcomes_by_tag", {}).items():
+                        episode_outcomes_by_tag.setdefault(_tag, []).extend(_outs)
+                    for _tag, _rews in stats.get("episode_rewards_by_tag", {}).items():
+                        episode_rewards_by_tag.setdefault(_tag, []).extend(_rews)
                     for ep in stats["episode_comp_list"]:
                         for _k, _v in ep.items():
                             rollout_components[_k] = rollout_components.get(_k, 0.0) + _v
@@ -1841,6 +1869,8 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                     n_reward_comp_steps=len(_rcomp_raw),
                     episode_kick_counts=episode_kick_counts,
                     episode_armed_kick_counts=episode_armed_kick_counts,
+                    episode_outcomes_by_tag=episode_outcomes_by_tag,
+                    episode_rewards_by_tag=episode_rewards_by_tag,
                 )
 
                 if self.checkpoint_dir is not None:
@@ -1862,7 +1892,7 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 def _respawn_main_pools() -> None:
                     nonlocal workers, eval_workers
                     workers = spawn_batched_workers(
-                        phase_id, n_processes, envs_per_process, base_seed,
+                        _env_phases, n_processes, envs_per_process, base_seed,
                         self.separate_value_net, self.worker_torch_threads,
                         batch_secondary_players=self.batch_secondary_players,
                         chunk_steps=self.batched_rollout_chunk_steps or None,
@@ -1874,9 +1904,14 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                         )
                     self._persistent_eval_workers = eval_workers
 
+                # The PPG refit collects in phase_id's envs only, so it gets
+                # only that phase's replay seeds, untagged (curriculum/mix.py);
+                # for a phase-1-only run this is the same list.
+                from footballcoach.ai.curriculum.mix import untag_seed
                 self._maybe_run_ppg_interleave(
                     None, phase_id, _close_main_pools, _respawn_main_pools,
-                    replay_seeds=replay_seeds_for_next_cycle,
+                    replay_seeds=[untag_seed(_s)[0] for _s in replay_seeds_for_next_cycle
+                                  if untag_seed(_s)[1] == phase_id],
                 )
         finally:
             close_batched_workers(workers)

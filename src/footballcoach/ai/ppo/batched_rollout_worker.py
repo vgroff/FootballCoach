@@ -171,6 +171,8 @@ from typing import Optional
 
 import torch
 
+from footballcoach.ai.curriculum.mix import tag_seed, untag_seed
+
 log = logging.getLogger("footballcoach.ai.ppo.batched_rollout_worker")
 
 
@@ -258,6 +260,10 @@ def _new_episode_stats() -> dict:
         "episode_durations_s": [],
         "episode_kick_counts": [],
         "episode_armed_kick_counts": [],
+        # Role-based phases (StepInfo.episode_tag set): outcome and trainee
+        # episode reward per tag, instead of the phase-1 vs_* lists.
+        "episode_outcomes_by_tag": {},
+        "episode_rewards_by_tag": {},
     }
 
 
@@ -449,8 +455,14 @@ class BatchedEnvGroup:
         episode_armed_kick_accum = [0] * n
         _replay_queue: list[int] = list(replay_seeds) if replay_seeds else []
 
-        def _next_episode_seed() -> int:
-            return _replay_queue.pop(0) if _replay_queue else _random.randint(0, 2**31 - 1)
+        def _next_episode_seed(phase_id: int) -> int:
+            """A phase-tagged seed (curriculum/mix.py tag_seed): the first queued
+            replay seed of this env's phase, else a fresh one. Phase-1 seeds are
+            their plain values, so a phase-1-only run is unchanged."""
+            for k, tagged in enumerate(_replay_queue):
+                if untag_seed(tagged)[1] == phase_id:
+                    return _replay_queue.pop(k)
+            return tag_seed(_random.randint(0, 2**31 - 1), phase_id)
 
         collected = 0
         _last_flush_at = 0  # only meaningful when chunk_steps is set
@@ -542,9 +554,9 @@ class BatchedEnvGroup:
                         stats[i]["episode_outcome_labels"].append(
                             info.trial_outcome if (info is not None and info.trial_outcome is not None) else "unknown"
                         )
-                        _seed = _next_episode_seed()
+                        _seed = _next_episode_seed(env.phase)
                         self._current_episode_seed[i] = _seed
-                        self._last_obs[i] = env.reset(seed=_seed)
+                        self._last_obs[i] = env.reset(seed=untag_seed(_seed)[0])
                     else:
                         self._last_obs[i] = next_obs
                     continue
@@ -610,7 +622,11 @@ class BatchedEnvGroup:
                         stats[i]["episode_comp_list"].append(dict(episode_comp_accum[i]))
                     episode_comp_accum[i] = {}
                     if info is not None and info.trial_outcome is not None:
-                        if info.is_rules_episode:
+                        if info.episode_tag:
+                            stats[i]["episode_outcomes_by_tag"].setdefault(info.episode_tag, []).append(info.trial_outcome)
+                            stats[i]["episode_rewards_by_tag"].setdefault(info.episode_tag, []).append(
+                                stats[i]["episode_rewards"][-1])
+                        elif info.is_rules_episode:
                             stats[i]["episode_outcomes_vs_rules"].append(info.trial_outcome)
                         elif info.is_immobile_episode:
                             stats[i]["episode_outcomes_vs_immobile"].append(info.trial_outcome)
@@ -618,9 +634,9 @@ class BatchedEnvGroup:
                             stats[i]["episode_outcomes_vs_neural"].append(info.trial_outcome)
                     if info is not None:
                         stats[i]["episode_durations_s"].append(info.ticks_elapsed * env._dt_s)
-                    _seed = _next_episode_seed()
+                    _seed = _next_episode_seed(env.phase)
                     self._current_episode_seed[i] = _seed
-                    self._last_obs[i] = env.reset(seed=_seed)
+                    self._last_obs[i] = env.reset(seed=untag_seed(_seed)[0])
                 else:
                     self._last_obs[i] = next_obs
 
@@ -741,50 +757,76 @@ def finalize_result_for_wire(r: dict, returns_spec: dict) -> dict:
     }
 
 
-def _batched_worker_main(
-    conn, phase_id: int, base_seed: int, worker_idx: int, envs_per_process: int,
-    separate_value_net: bool = False, worker_torch_threads: int = 1,
-    batch_secondary_players: bool = False, chunk_steps: Optional[int] = None,
-    progress_value=None,
-) -> None:
-    """Entry point run inside each persistent batched-worker process. Must
-    stay picklable/top-level (mirrors rollout_worker.py's ``_worker_main``,
-    including the critical BLAS-threading env-var ordering)."""
-    import os
-    _t = str(max(1, worker_torch_threads))
-    for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
-               "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
-        os.environ[_v] = _t
-
+def build_worker_envs(env_phase_ids: list[int], trainer, base_seed: int) -> list:
+    """One training env per entry of ``env_phase_ids`` (curriculum/envs.py
+    build_env), wired to ``trainer``'s sampler and its own phase's BC label
+    function. Role-based envs get ``require_neural_player`` (every training
+    episode needs a neural trainee). All phases must share one frozen-head set.
+    Seeds torch/random per env from ``base_seed`` exactly as the worker always
+    has, so a single-phase worker builds the same envs as before."""
     import random
 
     import torch as _torch
 
     from footballcoach.ai.curriculum.envs import build_env, bc_label_fn_for_phase_player
     from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+
+    frozen = {tuple(sorted(PHASES_BY_ID[p].frozen_heads)) for p in env_phase_ids}
+    if len(frozen) > 1:
+        raise ValueError(f"phases {sorted(set(env_phase_ids))} do not share frozen_heads")
+    envs = []
+    for j, pid in enumerate(env_phase_ids):
+        seed = base_seed + j
+        _torch.manual_seed(seed)
+        random.seed(seed)
+        env_phase = PHASES_BY_ID[pid]
+        env = build_env(env_phase)
+        env.sample_action_fn = trainer._sample_action
+        env.bc_label_fn = bc_label_fn_for_phase_player(env_phase.phase_id)
+        if env_phase.is_role_based:
+            env.require_neural_player = True
+        envs.append(env)
+    return envs
+
+
+def _batched_worker_main(
+    conn, phase_id, base_seed: int, worker_idx: int, envs_per_process: int,
+    separate_value_net: bool = False, worker_torch_threads: int = 1,
+    batch_secondary_players: bool = False, chunk_steps: Optional[int] = None,
+    progress_value=None,
+) -> None:
+    """Entry point run inside each persistent batched-worker process. Must
+    stay picklable/top-level (mirrors rollout_worker.py's ``_worker_main``,
+    including the critical BLAS-threading env-var ordering).
+
+    ``phase_id``: one phase for every env, or a list with one phase id per env
+    (mixed-phase training, see curriculum/mix.py). Every phase must share one
+    frozen-head set."""
+    import os
+    _t = str(max(1, worker_torch_threads))
+    for _v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
+               "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS"):
+        os.environ[_v] = _t
+
+    import torch as _torch
+
+    from footballcoach.ai.curriculum.phases import PHASES_BY_ID
     from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
     from footballcoach.ai.ppo.trainer_common import _load_state_dict_tolerant
 
     _torch.set_num_threads(max(1, worker_torch_threads))
 
-    phase = PHASES_BY_ID[phase_id]
-    bc_label_fn = bc_label_fn_for_phase_player(phase_id)
+    env_phase_ids = [phase_id] * envs_per_process if isinstance(phase_id, int) else list(phase_id)
+    if len(env_phase_ids) != envs_per_process:
+        raise ValueError(f"{len(env_phase_ids)} phase ids for {envs_per_process} envs")
+    phase = PHASES_BY_ID[env_phase_ids[0]]
 
     trainer = PPOTrainer.from_config(
         device=_torch.device("cpu"), inference_only=True, separate_value_net=separate_value_net,
     )
     if phase.frozen_heads:
         trainer.set_frozen_heads(phase.frozen_heads)
-
-    envs = []
-    for j in range(envs_per_process):
-        seed = base_seed + j
-        _torch.manual_seed(seed)
-        random.seed(seed)
-        env = build_env(phase)
-        env.sample_action_fn = trainer._sample_action
-        env.bc_label_fn = bc_label_fn
-        envs.append(env)
+    envs = build_worker_envs(env_phase_ids, trainer, base_seed)
 
     group = BatchedEnvGroup(
         envs, trainer,
@@ -897,7 +939,7 @@ class BatchedRolloutWorkerHandle:
 
 
 def spawn_batched_workers(
-    phase_id: int, n_processes: int, envs_per_process: int, base_seed: int,
+    phase_id, n_processes: int, envs_per_process: int, base_seed: int,
     separate_value_net: bool = False, worker_torch_threads: int = 1,
     batch_secondary_players: bool = False, chunk_steps: Optional[int] = None,
     progress_value=None,
@@ -919,15 +961,25 @@ def spawn_batched_workers(
     time -- a raw ``Synchronized`` value can't be sent to an already-running
     worker afterwards. The caller resets it to 0 before each collect.
     ``None`` (default) = no effect (the main PPO loop never passes it).
+
+    ``phase_id``: one phase for all envs, or a list of
+    ``n_processes * envs_per_process`` phase ids, one per env slot (worker i
+    gets slots ``[i * envs_per_process, (i + 1) * envs_per_process)``).
     """
+    if not isinstance(phase_id, int) and len(phase_id) != n_processes * envs_per_process:
+        raise ValueError(f"{len(phase_id)} env phase ids for {n_processes} x {envs_per_process} envs")
     ctx = mp.get_context("spawn")
     handles: list[BatchedRolloutWorkerHandle] = []
     for i in range(n_processes):
         parent_conn, child_conn = ctx.Pipe()
+        _worker_phases = (
+            phase_id if isinstance(phase_id, int)
+            else list(phase_id[i * envs_per_process:(i + 1) * envs_per_process])
+        )
         proc = ctx.Process(
             target=_batched_worker_main,
             args=(
-                child_conn, phase_id, base_seed + i * envs_per_process, i, envs_per_process,
+                child_conn, _worker_phases, base_seed + i * envs_per_process, i, envs_per_process,
                 separate_value_net, worker_torch_threads, batch_secondary_players, chunk_steps,
                 progress_value,
             ),

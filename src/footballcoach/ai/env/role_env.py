@@ -108,6 +108,11 @@ class RoleScenarioEnv(ScenarioEnv):
         # role -> controller, pinning those roles instead of rolling them
         # (evals); roles not listed are still rolled.
         self.controller_overrides: dict[str, str] = {}
+        # Training needs a neural trainee in every episode (the batched rollout
+        # worker batches the trainee's decisions). When set, rolls with no
+        # neural player are redrawn, i.e. controllers follow the configured
+        # weights CONDITIONED on at least one neural player.
+        self.require_neural_player: bool = False
         # This episode's player_id -> controller, and a stable text label of it.
         self.episode_controllers: dict[str, str] = {}
         self.episode_tag: str = ""
@@ -157,14 +162,7 @@ class RoleScenarioEnv(ScenarioEnv):
             match.player_by_id(pid)   # every role must exist in the built match
 
         roll_rng = random.Random(f"controllers:{seed}") if seed is not None else self.rng
-        self.episode_controllers = {}
-        for pid, role in self.roles.items():
-            ctrl = self.controller_overrides.get(role)
-            if ctrl is None:
-                ctrl = roll_controller(self.controller_weights[role], roll_rng)
-            elif ctrl not in CONTROLLERS:
-                raise ValueError(f"controller override {ctrl!r} for role {role!r}; known: {CONTROLLERS}")
-            self.episode_controllers[pid] = ctrl
+        self.episode_controllers = self._roll_controllers(roll_rng)
         neural = [pid for pid, c in self.episode_controllers.items() if c == "neural"]
         if neural and self.sample_action_fn is None:
             raise ValueError(f"{self.phase_name}: roles rolled neural ({neural}) but no sample_action_fn is set")
@@ -198,6 +196,28 @@ class RoleScenarioEnv(ScenarioEnv):
         match.match_logger = self._match_logger
         self._match_logger.record_start(match)
         return self._get_obs()
+
+    def _roll_controllers(self, rng: random.Random) -> dict[str, str]:
+        """player_id -> controller for one episode (overrides pinned, the rest
+        rolled), redrawn while require_neural_player is set and nothing is
+        neural."""
+        for role, ctrl in self.controller_overrides.items():
+            if ctrl not in CONTROLLERS:
+                raise ValueError(f"controller override {ctrl!r} for role {role!r}; known: {CONTROLLERS}")
+
+        def _can_be_neural(role: str) -> bool:
+            pinned = self.controller_overrides.get(role)
+            return pinned == "neural" if pinned is not None else float(self.controller_weights[role].get("neural", 0)) > 0
+
+        if self.require_neural_player and not any(_can_be_neural(r) for r in self.roles.values()):
+            raise ValueError(f"{self.phase_name}: require_neural_player is set but no role can be neural")
+        while True:
+            out = {}
+            for pid, role in self.roles.items():
+                ctrl = self.controller_overrides.get(role)
+                out[pid] = ctrl if ctrl is not None else roll_controller(self.controller_weights[role], rng)
+            if not self.require_neural_player or "neural" in out.values():
+                return out
 
     def step(self, *, timers_already_advanced: bool = False) -> tuple[ObservationBatch, float, bool, StepInfo]:
         """Advance one decision interval; pay terminal rewards when the trial ends."""

@@ -27,6 +27,8 @@ class RolloutLoggingMixin:
         n_reward_comp_steps: int,
         episode_kick_counts: Optional[list[int]] = None,
         episode_armed_kick_counts: Optional[list[int]] = None,
+        episode_outcomes_by_tag: Optional[dict[str, list[str]]] = None,
+        episode_rewards_by_tag: Optional[dict[str, list[float]]] = None,
     ) -> None:
         """Emit the full multi-line per-rollout summary (reward breakdown,
         per-episode reward stats, per-component GAE/TD stats, direction
@@ -362,6 +364,14 @@ class RolloutLoggingMixin:
                 _lines.append(f"           {'  '.join(_act_parts[_mid:])}")
         if outcome_str:
             _lines.append(f"  vs       {outcome_str.strip()}")
+        # Role-based phases (phase 2+): one line per phase/controller-mix tag
+        # (StepInfo.episode_tag), outcomes in the phase's own vocabulary order,
+        # plus the trainee's mean terminal reward (the trainee is the tag's
+        # first neural role). Absent when no such episode ran, so phase-1-only
+        # summaries are unchanged.
+        for _tag in sorted(episode_outcomes_by_tag or {}):
+            _lines.append("  " + format_tag_outcomes(
+                _tag, episode_outcomes_by_tag[_tag], (episode_rewards_by_tag or {}).get(_tag, [])))
         if episode_durations_s:
             _dur_arr = np.array(episode_durations_s)
             _lines.append(
@@ -420,3 +430,14 @@ class RolloutLoggingMixin:
         )
         _lines.append("\u2500" * 70)
         log.info("\n".join(_lines))
+
+
+def format_tag_outcomes(tag: str, outcomes: list[str], trainee_rewards: list[float]) -> str:
+    """"<tag>(n): goal=40.0% saved=...  trainee_rew=+1.234" for one episode tag."""
+    from footballcoach.ai.curriculum.envs import outcome_keys_for_tag
+    n = len(outcomes)
+    keys = list(outcome_keys_for_tag(tag)) or sorted(set(outcomes))
+    keys += sorted(set(outcomes) - set(keys))
+    parts = " ".join(f"{k}={100.0 * outcomes.count(k) / n:.1f}%" for k in keys) if n else "n/a"
+    rew = f"  trainee_rew={float(np.mean(trainee_rewards)):+.3f}" if trainee_rewards else ""
+    return f"{tag}({n}): {parts}{rew}"

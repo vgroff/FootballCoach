@@ -1,0 +1,74 @@
+"""End-to-end plumbing smoke test for mixed-phase training: one real
+PPOTrainer.train() cycle through the batched multi-process path with a 1:1
+phase-1/phase-2 mix. Spawned workers read ai_config.json from disk, so this
+points FOOTBALLCOACH_AI_CONFIG_PATH at a temporary copy (phase 2 attacker and
+defender neural, tiny rollout) taken from this process's live config dict, and
+applies the same overrides to that dict with monkeypatch for the main process.
+
+It must NOT clear the config cache: tests/ai_scenario/conftest.py mutates the
+cached dict for the whole session (e.g. switching action masking off), and a
+cache clear silently drops those mutations for every later test in this
+pytest worker (it did: five unrelated tests failed in the full run).
+
+A wiring check, not training: one ~1k-step rollout, one PPO epoch, no
+checkpoint written.
+"""
+from __future__ import annotations
+
+import json
+import logging
+
+import pytest
+import torch
+
+from footballcoach.ai.config import load_ai_config
+
+
+_OVERRIDES = {
+    ("curriculum", "phase2", "controllers"): {
+        "attacker": {"neural": 1}, "defender": {"neural": 1}, "goalkeeper": {"rules": 1},
+    },
+    ("network", "ball_physics_encoder_checkpoint"): None,
+    ("network", "player_physics_encoder_checkpoint"): None,
+    **{("ppo", k): v for k, v in {
+        "n_processes": 2, "envs_per_process": 4, "batched_rollout": True, "rollout_steps": 1200,
+        "n_epochs": 1, "minibatch_size": 512, "rollout_eval_trials": 0, "worker_torch_threads": 1,
+    }.items()},
+}
+
+
+@pytest.fixture
+def mixed_config(tmp_path, monkeypatch):
+    live = load_ai_config()
+    for path, value in _OVERRIDES.items():
+        node = live
+        for key in path[:-1]:
+            node = node[key]
+        monkeypatch.setitem(node, path[-1], value)
+    cfg_path = tmp_path / "ai_config.json"
+    cfg_path.write_text(json.dumps(live))
+    monkeypatch.setenv("FOOTBALLCOACH_AI_CONFIG_PATH", str(cfg_path))
+    yield live
+
+
+def test_one_mixed_cycle_collects_both_phases_and_logs_them(mixed_config, caplog):
+    from footballcoach.ai.curriculum.mix import validate_training_mix
+    from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+
+    assert load_ai_config()["ppo"]["n_processes"] == 2   # the temporary config is live here
+    mix = {1: 1.0, 2: 1.0}
+    validate_training_mix(mix)
+    torch.manual_seed(0)
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    trainer.set_frozen_heads(PHASES_BY_ID[1].frozen_heads)
+    trainer.phase_mix = mix
+    trainer._ppg_interleave_enabled = False
+    trainer._eval_n_parallel_workers = 1
+    trainer.checkpoint_dir = None
+    with caplog.at_level(logging.INFO, logger="footballcoach"):
+        trainer.train(None, total_steps=500, phase_id=1)
+    text = caplog.text
+    assert "phase mix phase1=4/8 env slots  phase2=4/8 env slots" in text
+    assert "phase2_1v2[attacker=neural,defender=neural,goalkeeper=rules](" in text
+    assert trainer._total_steps >= 500

@@ -41,6 +41,17 @@ OUTCOME_KINDS: dict[str, Callable] = {
 }
 
 
+def outcome_keys_for_tag(episode_tag: str) -> tuple[str, ...]:
+    """The outcome vocabulary of the role-based phase an episode tag names
+    (tags look like "phase2_1v2[attacker=neural,...]"); () if unknown."""
+    from footballcoach.ai.curriculum.phases import ALL_PHASES
+    name = episode_tag.split("[", 1)[0]
+    for phase in ALL_PHASES:
+        if phase.name == name and phase.outcome_kind in OUTCOME_KINDS:
+            return tuple(OUTCOME_KINDS[phase.outcome_kind]()[0])
+    return ()
+
+
 def build_role_env(phase: CurriculumPhase, *, controller_weights: Optional[dict] = None):
     """RoleScenarioEnv for a role-based *phase*: scenario from
     ``phase.scenario_key`` (ui/scenarios.py SCENARIOS), env settings from

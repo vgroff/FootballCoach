@@ -1459,6 +1459,50 @@ mix (e.g. `phase2_1v2[attacker=neural,defender=neural,goalkeeper=rules]`).
 role on its rules AI through the real env and prints the outcome mix and each
 role's mean terminal reward. Tests: `tests/ai_scenario/test_phase2_role_env.py`.
 
+## Training several phases in one run (`curriculum/mix.py`, 2026-11-15)
+
+`train.py --phase 1 --phase-mix 1:3,2:1` (or `ai_config.json
+curriculum.training_phase_mix`, absent by default) trains phases together.
+`--phase` must be in the mix and still drives pre-training, the PPG value
+refit and the periodic evals. Rules:
+
+- **Batched rollout only.** `PPOTrainer.train()` raises for a mix on the
+  single-process or one-env-per-worker paths.
+- **Weights are shares of env slots**, assigned once per run
+  (`assign_env_phases`, interleaved so each worker's block gets a similar
+  mix). Rows per phase then follow each phase's episode rate; read the
+  per-tag lines in the rollout summary to tune.
+- **Shared frozen heads.** One PPO update applies one head mask, so every
+  phase in a mix must have the same `frozen_heads` (`validate_training_mix`).
+- **Every training episode needs a neural trainee.** Workers set
+  `RoleScenarioEnv.require_neural_player`, which redraws controller rolls with
+  no neural player (so controllers follow the configured weights conditioned
+  on at least one neural role); a phase whose roles can never be neural is
+  rejected.
+- **Episode-seed replay is phase-tagged.** Seeds recorded and replayed are
+  `tag_seed(seed, phase)` = `seed + (phase - 1) * 2**31`, so phase-1 seeds are
+  unchanged; each worker hands a replayed seed only to an env of its phase.
+  The PPG refit (primary phase only) gets only its phase's seeds.
+- **Logging.** Role-based episodes are tallied per `StepInfo.episode_tag`
+  (`episode_outcomes_by_tag` / `episode_rewards_by_tag` in the worker stats)
+  and printed one line per tag in the rollout summary, in the phase's outcome
+  order, with the trainee's mean terminal reward. Phase-1 episodes keep the
+  `vs_rules` / `vs_immobile` / `vs_neural` lists, so a phase-1-only summary is
+  unchanged.
+
+Not yet mixed: the PPG value refit and value pre-training collect only
+`--phase`'s envs, and the periodic evals are phase-1 evals (stage 3 of
+`agent_plans/phase2_1v2_plan.md`). Phase-2 rows reuse phase 1's
+`secondary_weight` and land on the `trainee` track like phase 1's.
+
+Verification: `scripts/batched_rollout_trace_snapshot.py` (seeded in-process
+phase-1 collections with replay; identical before and after this change apart
+from the two new, empty stats keys, and it catches a change to the replay
+order). Tests: `tests/ai_unit/test_phase_mix.py`,
+`tests/ai_scenario/test_mixed_phase_rollout.py`,
+`tests/ai_scenario/test_mixed_phase_training_smoke.py` (one real batched
+multi-process cycle through a temporary config).
+
 ## Episode-seed replay's advantage ranking now includes self-play secondary rows
 
 `_episode_abs_adv_means()` (`ai/ppo/ppo_trainer.py`, formerly

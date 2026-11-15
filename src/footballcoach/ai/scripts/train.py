@@ -85,6 +85,12 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Train the football AI with PPO")
     parser.add_argument("--phase", type=int, default=1, choices=[1, 2, 3, 4],
                         help="Curriculum phase to train (default: 1)")
+    parser.add_argument("--phase-mix", type=str, default=None,
+                        help="Train several phases in one run, e.g. '1:3,2:1' (weights are shares of "
+                             "rollout env slots; see ai/curriculum/mix.py). Must include --phase, which "
+                             "still drives pre-training, the PPG value refit and the periodic evals. "
+                             "Default: ai_config.json curriculum.training_phase_mix if set, else --phase "
+                             "alone. Needs ppo.batched_rollout.")
     parser.add_argument("--total-steps", type=int, default=500_000,
                         help="PPO decision-steps to train for, excluding pre-training (default: 500000)")
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -939,6 +945,20 @@ def main() -> None:
     # Apply curriculum head freezing (after pre-training, before PPO)
     if not args.no_head_freeze and phase.frozen_heads:
         trainer.set_frozen_heads(phase.frozen_heads)
+
+    # Phase mix (ai/curriculum/mix.py): several curriculum phases in one run.
+    _mix_spec = args.phase_mix
+    if _mix_spec is None:
+        _mix_spec = load_ai_config().get("curriculum", {}).get("training_phase_mix")
+    if _mix_spec is not None:
+        from footballcoach.ai.curriculum.mix import parse_phase_mix, validate_training_mix
+        _mix = parse_phase_mix(_mix_spec)
+        if args.phase not in _mix:
+            log.error(f"--phase {args.phase} must be part of the phase mix {_mix}")
+            return
+        validate_training_mix(_mix)
+        trainer.phase_mix = _mix
+        log.info(f"Phase mix (shares of rollout env slots): {_mix}")
 
     if args.ppg_refit_only:
         # Ad-hoc "starting from a decent checkpoint" use case -- reuses every

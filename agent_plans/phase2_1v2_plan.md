@@ -150,6 +150,13 @@ Value refit (PPG) before PPO to recalibrate the value head.
   playthrough. Phase 1 verified unchanged: env trace identical apart from
   the new, always-empty StepInfo.episode_tag; engine trace and golden
   identical.
-- [ ] Stage 2
+- [x] Stage 2 (2026-11-15): curriculum/mix.py (parse/validate, env-slot
+  assignment, phase-tagged replay seeds), per-env phases in the batched
+  workers (build_worker_envs), RoleScenarioEnv.require_neural_player,
+  per-tag outcome/reward tallies and summary lines, train.py --phase-mix,
+  non-batched paths refuse a mix. Phase-1 batched rollouts verified unchanged
+  with scripts/batched_rollout_trace_snapshot.py (differences = only the two
+  new, empty stats keys; a replay-order mutation is caught). Not mixed yet:
+  PPG refit / value pre-training (primary phase only) and evals (stage 3).
 - [ ] Stage 3
 - [ ] Stage 4
