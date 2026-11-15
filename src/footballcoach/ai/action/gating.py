@@ -77,6 +77,15 @@ _HEAD_TO_ACTION: dict[str, SelectedAction] = {
     "hold_position": SelectedAction.HOLD_POSITION,
 }
 
+# The decision-head names, in tie-break order: the keys of every
+# ``decision_probs`` dict (built by PPOTrainer's action sampling, read by
+# select_action) and the names HybridPlayerAI.set_decision_override accepts.
+# The other spellings of the same seven heads (network attributes such as
+# "pass_logit", the short HEAD_LP_KEYS such as "gp_extra", and the
+# DecisionAction fields) are tied to this one by
+# tests/ai_unit/test_decision_head_names.py.
+DECISION_HEAD_NAMES: tuple[str, ...] = tuple(_HEAD_TO_ACTION)
+
 
 @torch.no_grad()
 def select_action(

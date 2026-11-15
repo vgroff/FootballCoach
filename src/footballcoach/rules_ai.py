@@ -1284,7 +1284,17 @@ class HybridPlayerAI(NeuralPlayerAI):
     def set_decision_override(self, head_name: str, value: float | None) -> None:
         """Force decision head *head_name*'s probability to *value* (e.g. 1.0
         to guarantee it fires, 0.0 to suppress it) on the next decision tick.
-        Pass ``value=None`` to clear the override for that head."""
+        Pass ``value=None`` to clear the override for that head.
+
+        Raises ``ValueError`` for a name that is not a decision head (see
+        gating.DECISION_HEAD_NAMES). Before 2026-11-15 an unknown name,
+        e.g. ``"pass"`` for ``"pass_"``, was stored and then silently ignored
+        by select_action."""
+        from footballcoach.ai.action.gating import DECISION_HEAD_NAMES
+        if head_name not in DECISION_HEAD_NAMES:
+            raise ValueError(
+                f"unknown decision head {head_name!r}; expected one of {DECISION_HEAD_NAMES}"
+            )
         if value is None:
             self._decision_overrides.pop(head_name, None)
         else:

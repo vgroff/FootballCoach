@@ -38,6 +38,15 @@ below, this section wins.
   keyword-only, so a stale positional call fails instead of silently
   binding. Checked with the golden snapshot: bit-identical apart from the
   removed field.
+- **#8/#12 (closed 2026-11-15):** gating has one head table, and
+  `gating.DECISION_HEAD_NAMES` is the public list of `decision_probs`
+  keys. `HybridPlayerAI.set_decision_override` now raises on an unknown
+  name instead of storing an override nothing reads. The other three
+  spellings of the heads (network attribute, `HEAD_LP_KEYS`,
+  `DecisionAction` field) stay as they are, since they are separate
+  namespaces. `tests/ai_unit/test_decision_head_names.py` writes the
+  correspondence down once and checks every table against it, including
+  that each probability moves only with its own head's logit.
 - **#7 (closed 2026-11-15, by deletion):** the paired trainee/secondary
   state was almost all write-only: the possession gain/loss scan, start
   stamina, tackle-attempt counters and secondary kick counters. All of it

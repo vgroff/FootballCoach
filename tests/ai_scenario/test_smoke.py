@@ -119,7 +119,8 @@ def test_sample_action_returns_finite_log_prob():
     assert len(result) == 8, "Expected 8-tuple from _sample_action"
     _action, log_prob, value, probs, exec_phys, target_slots, raw_exec, head_lp = result
     # Positional layout (NeuralPlayerAI.apply unpacks by position, so a shift must fail here).
-    assert set(probs) == {"shoot", "pass_", "move", "tackle", "get_possession", "mark", "hold_position"}
+    from footballcoach.ai.action.gating import DECISION_HEAD_NAMES
+    assert set(probs) == set(DECISION_HEAD_NAMES)
     assert "move_direction" in exec_phys and "kick_this_tick" in exec_phys
     assert set(target_slots) == {"pass_", "tackle", "mark"}
     assert "move_dir_raw" in raw_exec and "kick_power_raw" in raw_exec
