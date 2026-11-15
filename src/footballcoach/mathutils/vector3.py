@@ -1,4 +1,12 @@
-"""A tiny, fast 3D vector wrapper around numpy for the football engine.
+"""An immutable 3D vector of plain Python floats for the football engine.
+
+The arithmetic is plain float maths, not numpy: numpy only appears in the
+``from_array``/``as_array`` conversion helpers. That is the faster choice for
+3-element vectors used one at a time, because numpy's per-call overhead
+dominates. Measured 2026-11-15 (ns per op, Vector3 vs numpy array): add
+366 vs 310, scalar multiply 363 vs 500, length 115 vs 927 (np.linalg.norm),
+dot 93 vs 347. Batching many vectors into one array is where numpy would win,
+and that would mean restructuring the engine, not swapping this class.
 
 Convention: x = pitch length axis (goal-to-goal), y = pitch width axis,
 z = height above ground. All units are metres / metres-per-second /
