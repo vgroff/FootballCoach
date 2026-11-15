@@ -1,237 +1,120 @@
-# Code Analysis — FootballCoach
+> **Documentation must stay in sync with code.** Any significant change, and
+> any change that conflicts with existing documentation, must be followed by
+> additions or edits to the relevant documentation (this file, other
+> knowledge.md files, design docs, plans). When writing plans, design
+> documents, prompts, or other work-related files, always include this same
+> statement at the top of that file. Otherwise documentation goes stale and
+> confusion occurs.
 
-> **Status as of 2026-10-12 (reconciliation pass):** mostly still accurate
-> and still open — this is a deliberately-curated "what's left" list (per
-> the note below, already-fixed items were removed by prior agents), and
-> re-verification confirms nearly every remaining item is still true today,
-> with current file:line refs refreshed inline. Two items changed:
-> **§7's `tests/ai_scenario/` single-file claim is now stale/resolved**
-> (that directory has grown to 27 test files — see inline note), and
-> **§6's `PlayerAttributes.average` docstring claim is partially stale**
-> (the docstring itself was removed at some point; the method is now
-> undocumented rather than mis-documented, though it's still used in
-> production UI code under a test-sounding name — see inline note). One
-> new confirmed finding: **§7's "N >= 1000" audit request turned up a real
-> inconsistency** — `N_TRIALS` is 200 in `test_pass_balance.py`, 500 in
-> `test_shoot_balance.py`, 2000 in `test_penalty_balance.py`, and at least
-> one deliberate `n_trials=50` for a non-hard-target visual table — see
-> inline note. Everything else (structural/architectural items in §3,
-> magic numbers in §4, doc-drift items in §5, remaining test-coverage gaps
-> in §7, and the UI note in §8) was spot-checked against current code and
-> is still open as described, just with line numbers refreshed where they
-> had drifted.
+# Code Analysis — FootballCoach (non-AI code)
 
-> **Note for future agents:** Sections 1 and 2 (bugs and duplicate logic) and
-> most of the mechanical items in sections 4, 5, 6, and 8 have already been
-> fixed and removed from this file. What remains is either (a) a genuine
-> structural/design decision that needs a human call before touching (see
-> the `Developer Note`s in section 3), or (b) an item intentionally left
-> alone because fixing it requires a design/behavioral judgment call, not
-> just a mechanical refactor (each such item has a short note explaining
-> why). When picking up further items from this list: do the mechanical/
-> low-risk fixes without asking, flag anything that changes behavior or
-> needs a judgment call, run the full test suite
-> (`uv run pytest tests/unit tests/scenario tests/balance -q`) after each
-> change, and remove completed items from this file as you go.
+Scope: engine, entities, orders, actions, steering, rules_ai, ui, mathutils,
+generation, config, tests and scripts. `src/footballcoach/ai/` is covered by
+`ai_code_analysis.md`.
 
-Automated read-through of the non-AI parts of the codebase (engine, entities,
-orders, actions, steering, rules_ai, ui, mathutils, generation, config,
-tests, top-level debug scripts, and `scripts/`). The `src/footballcoach/ai/`
-package itself was intentionally **not** reviewed here (per request), except
-`rules_ai.py` which lives at the top level.
+**Last reconciled 2026-11-15** against the code. Everything still listed under
+"Open" was re-checked that day. Closed items are kept as one line each; the
+long-form history of every finding is in git (this file before commit
+`64b2644` and earlier).
 
-Findings are grouped by module. File paths are relative to the repo root.
-Line numbers are approximate (code may have shifted slightly since review).
+**For future agents:** do mechanical, behaviour-neutral fixes without asking;
+flag anything that changes behaviour or needs a judgment call. Verify engine
+changes with `scripts/engine_trace_snapshot.py` and `scripts/golden_snapshot.py`
+(compare against a run of the previous commit; a pure refactor gives 0
+differences). Move items from Open to Closed as you go.
 
 ---
 
-## 3. Structural / architectural criticisms
+## Open
 
-- **`ball.possessed_by` is a player-id string, not a player reference.**
-  The cost is resolved: `Match.player_by_id` is now a dict lookup, built once
-  at construction, and `Match.player_by_id_or_none` covers the plain
-  single-lookup sites. The id stays a string, which avoids the circular
-  reference. The other `try/except` sites around it remain because they also
-  guard a `None` match or a malformed env, so swapping them would change
-  behaviour.
+All of these were looked at on 2026-11-15 and deliberately deferred by the
+user ("ignore for now"). None is a bug.
 
-- **`engine/match.py` split (done 2026-11-15):** 1,412 -> ~660 lines. Tackle
-  resolution and GK tackle immunity moved to `match_tackles.py`, and the
-  get-possession behaviour plus intercept/lead-pass math to
-  `match_get_possession.py`, as stateless mixins (see engine/knowledge.md,
-  "Module layout"). The GK-immunity helpers went with the tackles, not
-  `goalkeeping.py`, because they are only ever called from tackle
-  resolution and `goalkeeping.py` holds pure functions, not `Match`
-  methods. Still in `match.py`: `_process_orders` and
-  `_update_loose_ball_pickup` (about 120 lines each), which are tick-order
-  glue.
+### Documentation drift risk
+- **Worked numeric examples are written out in several places.**
+  `kicking.py`'s `kick_sigma_rad` docstring, `possession.py`'s control-time
+  docstrings, `tackling.py`'s `attempt_tackle` docstring and
+  `match_tackles.py`'s `_effective_dribbling` docstring each repeat numbers
+  that also appear in `physics.json` comments. After a retune, treat every
+  docstring number as suspect until checked against `physics.json`. Fix would
+  be picking one canonical place and pointing the other at it.
+- **Balance target percentages are restated in about four places** (design
+  docs, `physics.json` comments, the balance test assertions,
+  `scripts/grid_search_kick_params.py`'s docstring). Same fix: make the test
+  the source of truth and reference it.
+- **The tick-order "ordering subtlety" comment in `engine/match.py` is
+  duplicated near-verbatim in `engine/knowledge.md`.**
 
-- **Epsilon constants (partly done 2026-11-15):** a single canonical epsilon
-  would change behaviour, because the existing values are not interchangeable:
-  1e-6 and 1e-9 are both used for "length is zero", and 1e-12 is used both on
-  a length (`Vector3.normalized`) and on squared lengths. What was done:
-  `mathutils/tolerances.py` defines `GEOM_ZERO_EPS = 1e-9`, and the 40
-  zero-length/zero-speed guards in engine/, entities/, orders.py and
-  steering.py that used `1e-9` now use it (same value; engine trace, env trace
-  and golden are identical). `tests/unit/test_tolerances.py` pins the value
-  and rejects new bare `1e-9` literals there. The 1e-6/1e-12 sites are left
-  as they are on purpose.
+### Unvalidated approximations and close calls
+- **`goalkeeping.predict_goal_line_crossing` ignores drag/Magnus** (same
+  simplification as `kicking.solve_launch_pitch_rad`). No balance test
+  measures how wrong this gets for heavily spun or curved shots.
+- **Some balance bands sit right at the pass/fail edge** (e.g. precision 0.5
+  corner aim 79.95% against a 50–80% band). A dedicated tuning pass, not a
+  mechanical fix.
+- **Saturation audit not done.** `tests/knowledge.md` records one balance
+  test that saturated near 100% regardless of GK attributes. Nobody has
+  checked whether any other balance test has the same "too easy" problem.
 
-- **`Vector3`'s module docstring calls it "a tiny, fast 3D vector wrapper
-  around numpy,"** but internally all arithmetic is plain Python floats;
-  numpy is only used by the rarely-called `from_array`/`as_array` conversion
-  helpers. The docstring's framing overstates numpy's role and could mislead
-  readers about performance characteristics. Developer Note: why isn't it numpy? 
-  Could it be changed easily for better performance?
+### Naming
+- **`PlayerAttributes.average(value=0.5)`** (`entities/attributes.py`) has a
+  test-sounding name and no docstring but is used in production
+  (`ui/scenarios.py`). Rename it, or accept it as the production API and
+  document it.
 
----
+### UI
+- **No tests for `ui/renderer.py` or `ui/camera.py`.** The emoji-font
+  detection (probing render height) is platform-fragile and unchecked under
+  `SDL_VIDEODRIVER=dummy`. Needs a decision on where UI tests live
+  (`tests/ui/` does not exist).
 
-## 4. Magic numbers / literals that should be config-driven
-
-- `orders.py`'s `MoveOrder.arrival_tolerance_m = 0.3` and
-  `overshoot_timeout_s = 0.5` are dataclass field defaults rather than
-  config values, inconsistent with the project's stated "everything tunable
-  lives in JSON" convention. Left as-is: these are dataclass field defaults
-  (not local constants), so making them config-driven means deciding
-  whether every `MoveOrder` construction site should look up a JSON default
-  or whether the field defaults stay as fallbacks with JSON only overriding
-  them — a small design choice rather than a pure mechanical move.
-
----
-
-## 5. Documentation that seems stale, unconvincing, or drift-prone
-
-- **The same tuned numeric worked-examples appear in multiple places** and
-  will silently drift out of sync: `kicking.py`'s `kick_sigma_rad` docstring
-  gives a specific numeric example ("a 25m auto-pass at eff_power≈0.20 gets
-  barely any extra error, multiplier ≈ 1.01"); `possession.py`'s control-time
-  model has similarly narrated worked examples; `tackling.py`'s
-  `attempt_tackle` docstring re-explains logic that's *also* fully
-  re-explained in `physics.json`'s `_comment_speed` key; and
-  `match.py`'s `_effective_dribbling` docstring math is likewise duplicated
-  in a `physics.json` comment. Each of these is "explained" in two or more
-  places, and since the underlying constants have clearly been retuned
-  repeatedly (per project history), there's no guarantee prose and code have
-  stayed in sync. I'd treat every such docstring number as suspect until
-  cross-checked against the current `physics.json` values. (Left as-is:
-  picking one canonical location and rewriting the other to reference it is
-  a documentation-structure decision, not a pure mechanical fix.)
-- **`match.py`'s big "ordering subtlety" tick-order comment is duplicated
-  near-verbatim in `engine/knowledge.md`.** Same drift risk — a future
-  tick-order change is likely to update one copy and forget the other.
-- **`goalkeeping.py`'s `predict_goal_line_crossing` explicitly ignores
-  drag/Magnus effects**, self-described as the same simplification used in
-  `kicking.solve_launch_pitch_rad`. This is an honest, self-aware
-  approximation — but there is no balance test that measures *how wrong*
-  this becomes for heavily-spun/curved shots. The explanation is plausible
-  but its magnitude is untested, so I'd flag it as "explained but not
-  validated" rather than settled.
-- **Balance-test target bands documented as being right at the edge of
-  pass/fail** — the project's own plan-doc history notes cases like
-  "precision=0.5 corner aim: 79.95% vs 50-80% target" and "precision=0.8
-  corner: 94.95% vs 85-95% target," both essentially touching the boundary.
-  These are self-flagged as close calls in the project's own notes but
-  don't appear to have been revisited since. A tiny incidental change to
-  `angle_error_scale_rad` could flip either test from pass to fail without
-  the underlying game feel actually changing — this reads as under-tuned
-  rather than solid, despite being "documented." (This is a balance/tuning
-  decision, not a mechanical fix — leave for a dedicated tuning pass.)
+### Known-failing tests (tracked as strict xfail since 2026-11-15)
+Four tests fail on purpose until a retune or a gameplay decision. They are
+marked `xfail(strict=True)`, so the suite stays green, they stay visible as
+`x`, and they turn into a failure the moment one starts passing:
+`test_pass_balance.py::test_good_player_succeeds_over_60_percent_at_40m`
+(53.3% vs 60%), `::test_good_player_succeeds_over_30_percent_at_60m`
+(29.1% vs 30%), `test_control_time_balance.py::test_goalkeeper_in_box_control_time_faster_for_high_balls`,
+and `test_scenario_bugs.py::test_1v2_controller_issues_shoot_after_move`
+(the defender tackles before the MoveOrder finishes). When one starts
+passing, remove its marker.
 
 ---
 
-## 6. Easy wins
+## Closed
 
-- `PlayerAttributes.average(value: float = 0.5)` in
-  [entities/attributes.py](src/footballcoach/entities/attributes.py) is documented as
-  "mainly for tests" but is actually used directly in production UI code
-  ([ui/scenarios.py](src/footballcoach/ui/scenarios.py)) and sandbox scripts, not
-  just tests — contradicting its own docstring. Left as-is: renaming/moving
-  it requires deciding what the *intended* production API should be, not
-  just a mechanical cleanup.
-  **PARTIALLY STALE (checked 2026-10-12):** the method
-  (`entities/attributes.py:27-29`) no longer has any docstring at all — the
-  "mainly for tests" claim it's accused of contradicting isn't there to
-  contradict anymore. The underlying point still holds though: it's a
-  bare `@staticmethod` with a test-sounding name, still used directly in
-  production (`ui/scenarios.py:450,914-916`). Still worth the same
-  decision (rename vs. accept as production API), just reframe as
-  "undocumented, test-sounding name used in production" rather than
-  "contradicts its own docstring."
-- Several of the same balance-test target percentages (e.g. "precision=0.5
-  centre: >95% scored") are written out in prose in **at least four
-  independent places** (design docs, `physics.json` comments, the balance
-  test assertions themselves, and `scripts/grid_search_kick_params.py`'s
-  docstring) — any future retune has four places to remember to update, and
-  will likely miss some. Consider a single source of truth (e.g. the test
-  file itself, with docs/scripts referencing it rather than re-stating
-  numbers). (Left as-is: picking the canonical location is a documentation-
-  structure decision.)
-
----
-
-## 7. Test coverage gaps
-
-- **`tests/ai_scenario/` contains only `test_smoke.py`**, a single file,
-  versus `tests/scenario/`'s 10 files for the engine. If AI scenario-level
-  coverage is meant to eventually mirror the engine's scenario tier, this is
-  a visible, significant gap (noted for completeness even though the `ai/`
-  package itself was out of scope for deep review).
-  **RESOLVED/SUPERSEDED (checked 2026-10-12):** `tests/ai_scenario/` now
-  contains **27 test files** (e.g. `test_batched_rollout.py`,
-  `test_dual_clip_ppo.py`, `test_masked_action_training.py`,
-  `test_ppg_value_refit.py`, `test_val_episode_split.py`, and more),
-  essentially at parity with `tests/scenario/`'s now-19 files. This gap no
-  longer exists; no further action needed here.
-- No test explicitly named/targeting exact-tangent or grazing-hit edge cases
-  for `resolve_ball_block_by_inactive_players`'s ray-circle intersection math
-  in [engine/collision.py](src/footballcoach/engine/collision.py) (quadratic
-  `discriminant == 0` case) — worth confirming coverage exists somewhere, or
-  adding it if not.
-  **Still open (checked 2026-10-12):** grepped the whole `tests/` tree for
-  `resolve_ball_block_by_inactive_players` — zero matches. Not only is the
-  discriminant-==-0 edge case untested, the function has **no test coverage
-  at all** under its own name (it may be exercised indirectly through
-  scenario/balance tests, but nothing targets it specifically). Gap is
-  real, and slightly worse than originally described.
-- `tests/knowledge.md` itself documents a prior incident where a balance
-  test saturated near 100% regardless of GK attributes, later tightened —
-  a good sign it's been caught once, but there's no confirmation any other
-  current balance test has the same "too easy, saturates near 0%/100%"
-  problem; worth a follow-up audit given this exact failure mode has already
-  occurred once. (Not independently re-audited this pass — out of scope for
-  a documentation-only reconciliation; still an open to-do.)
-- No visible confirmation that all `tests/balance/*.py` files uniformly use
-  `N >= 1000` trials as the design docs mandate — worth a quick grep/audit
-  to make sure no test regressed to a lower trial count (which could
-  reintroduce flakiness).
-  **CONFIRMED STILL TRUE, with specifics (checked 2026-10-12):**
-  `N_TRIALS` is **200** in `tests/balance/test_pass_balance.py:25`, **500**
-  in `tests/balance/test_shoot_balance.py:18`, and **2000** in
-  `tests/balance/test_penalty_balance.py:26` — not uniform, and two of the
-  three are well below 1000. Additionally,
-  `test_pass_balance.py:119` uses a hardcoded `n_trials=50` for
-  `test_pass_success_rate_table_across_precision_and_distance` (explicitly
-  commented as "not a hard-target test," a visual table rather than a
-  pass/fail assertion, so lower N there may be intentional) — but the
-  200/500/2000 spread across the three hard-target files looks like
-  genuine, unexplained drift rather than a documented design choice.
-- `tests/balance/results/` (e.g. `latest_results.json`) is a committed
-  build/output artifact in version control — likely intentional per the
-  README's "inspect without re-running pytest" rationale, but worth
-  confirming it's not accidentally accumulating diff noise on every
-  balance-test run.
-
----
-
-## 8. UI-specific notes (non-blocking)
-
-- `Renderer`'s emoji-font detection in
-  [ui/renderer.py](src/footballcoach/ui/renderer.py) (probing render height to
-  detect bitmap emoji fonts) is inherently platform-fragile and has no test
-  coverage confirming a font is actually found under a headless
-  (`SDL_VIDEODRIVER=dummy`) CI environment. Not added yet: there is currently
-  no test file/home for `ui/renderer.py` or `ui/camera.py` at all (no
-  `tests/ui/` directory exists), so adding this smoke test means first
-  deciding where UI tests should live — a small structural decision rather
-  than a pure mechanical addition.
-
+- **`engine/match.py` split (2026-11-15):** 1,412 → about 660 lines. Tackle
+  resolution and GK tackle immunity moved to `match_tackles.py`;
+  get-possession behaviour and intercept/lead-pass maths to
+  `match_get_possession.py`, as stateless mixins (see `engine/knowledge.md`,
+  "Module layout"). `_process_orders` and `_update_loose_ball_pickup` (about
+  120 lines each) stay in `match.py` as tick-order glue.
+- **Epsilon constants (2026-11-15, rename only):** `mathutils/tolerances.py`
+  defines `GEOM_ZERO_EPS = 1e-9`, used by the 40 zero-length guards in
+  engine/, entities/, orders.py and steering.py; `tests/unit/test_tolerances.py`
+  rejects new bare `1e-9` literals there. A single canonical epsilon would
+  change behaviour (1e-6 and 1e-9 both mean "zero length" at different sites;
+  1e-12 is used on both lengths and squared lengths), so the 1e-6/1e-12 sites
+  stay as they are on purpose.
+- **`Vector3` docstring (2026-11-15):** no longer claims to wrap numpy. It is
+  plain floats, which measured faster than numpy for single 3-vectors (add
+  366 vs 310 ns, scale 363 vs 500, length 115 vs 927, dot 93 vs 347). The
+  numbers are in the docstring.
+- **`MoveOrder` defaults (2026-11-15):** `arrival_tolerance_m` (0.3) and
+  `overshoot_timeout_s` (0.5) now come from `orders.json["move_order"]`, read
+  at construction; explicit arguments still win and a missing key raises.
+  Values unchanged; engine trace and golden identical.
+  `tests/unit/test_move_order_config.py`.
+- **`ball.possessed_by` is a player-id string:** kept as a string (avoids a
+  circular reference). The cost was the lookup, now a dict built once at
+  construction (`Match.player_by_id`), plus `Match.player_by_id_or_none`.
+- **`resolve_ball_block_by_inactive_players` untested:** it now has
+  `tests/unit/test_ball_block_by_inactive_players.py`.
+- **Balance `N_TRIALS` drift:** every hard-target balance file now uses at
+  least 1000 trials (1000–5000). The only lower count is the deliberate
+  `n_trials=50` visual table in `test_pass_balance.py`, which asserts nothing.
+- **`tests/ai_scenario/` single file:** it now has 30+ test files.
+- **`tests/balance/results/latest_results.json` diff noise:** it is rewritten
+  on every balance run, but the runs are seeded, so the file only changes
+  when a balance number really changes. That diff is a useful signal, not
+  noise.
