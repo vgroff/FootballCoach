@@ -540,11 +540,18 @@ def _try_push_kick(
     return direction_3d, adjusted_power
 
 
+def _move_order_default(key: str) -> float:
+    """MoveOrder's default for *key*, from orders.json["move_order"] (no fallback:
+    a missing key raises rather than silently using a hardcoded value)."""
+    return float(require_section(load_orders_config(), "move_order", "orders.json")[key])
+
+
 @dataclass
 class MoveOrder:
     target_position: Vector3
     sprint: bool = True
-    arrival_tolerance_m: float = 0.3
+    # Default from orders.json["move_order"], read at construction time.
+    arrival_tolerance_m: float = field(default_factory=lambda: _move_order_default("arrival_tolerance_m"))
     # Controls how fast the player is moving when the order completes.
     # None  -> resolved to jog speed at execution time (smooth, natural stop).
     # 0.0   -> full standstill (the order does not complete until speed < 0.05
@@ -554,7 +561,8 @@ class MoveOrder:
     # If the player overshoots (crosses the target point), this countdown
     # starts. When it reaches 0 the order completes (player brakes to stop).
     # None = no overshoot detected yet.
-    overshoot_timeout_s: float = 0.5
+    # Default from orders.json["move_order"], read at construction time.
+    overshoot_timeout_s: float = field(default_factory=lambda: _move_order_default("overshoot_timeout_s"))
     # Set to True the first tick the player is within arrival_tolerance_m.
     # Once True, if the player drifts back outside that radius the overshoot
     # countdown starts.

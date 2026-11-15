@@ -84,5 +84,13 @@
     "_comment_clearance": "ETA safety margin: if any opponent's ETA to landing spot < carrier's ETA x clearance_margin, skip the kick. 0.95 = 5% margin.",
     "max_heading_error_deg": 15.0,
     "_comment_heading": "Don't push-kick if the player's current heading differs from the kick direction by more than this many degrees. Prevents kicking sideways or backwards."
+  },
+
+  "move_order": {
+    "_comment": "Defaults for MoveOrder's arrival fields, read when a MoveOrder is constructed without an explicit value (an explicit constructor argument still wins).",
+    "arrival_tolerance_m": 0.3,
+    "_comment_arrival_tolerance": "The order counts as arrived once the player is within this distance of target_position (1.5x wider when the requested arrival speed is below 0.1 m/s).",
+    "overshoot_timeout_s": 0.5,
+    "_comment_overshoot_timeout": "If the player reaches the target and then drifts back outside arrival_tolerance_m, the order completes after this many seconds."
   }
 }
