@@ -40,6 +40,14 @@
     "height_tolerance_frac": 0.85
   },
 
+  "goalkeeper_ai": {
+    "_comment": "StagedGoalkeeperAI (the rules keeper) closing down a ball carrier; see that class's docstring. close_down_carrier_in_box: master switch (false = the old keeper, which ignored a ball carrier and could be dribbled past into the net). It commits (GetPossessionOrder: the rules defender's carrier chase and tackle) when an opponent has the ball within close_down_entry_dist_m of goal centre and no outfield teammate is nearer the goal than the carrier; stays committed while an opponent holds the ball, or the ball is loose, within close_down_exit_dist_m; returns to goalkeeping at once on a shot or when its side wins the ball; then cannot commit again for close_down_cooldown_s. Entry distance chosen 2026-11-16 by a sweep: anywhere in the box made the keeper concede more against the shooting rules attacker (182 of 2000 saves became goals); within 4-11 m the rules attacker's outcomes were unchanged.",
+    "close_down_carrier_in_box": true,
+    "close_down_entry_dist_m": 6.0,
+    "close_down_exit_dist_m": 12.0,
+    "close_down_cooldown_s": 1.0
+  },
+
   "marking": {
     "_comment": "MarkOrder AI behaviour: marker stands between a target opposition player and the ball, and switches to GetPossession-style chase/tackle when the target has the ball or the ball comes within mark_intercept_radius_m. mark_standoff_m: distance from the target (toward the ball) the marker tries to hold.",
     "mark_intercept_radius_m": 4.0,

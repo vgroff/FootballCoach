@@ -143,6 +143,12 @@ The PPG value refit only sees the primary phase (see Open follow-ups).
   2v2 scenario ends all 49 traced trials as "saved". The 1v2 classifier raises
   on that case; a phase with several attackers must fix it first.
 
+- (2026-11-16) The phase-1 checkpoint never shoots in 1v2: all its goals
+  were dribbles into the net past a rules keeper that ignored ball carriers.
+  The rules keeper now closes down a carrier within 6 m (see ai/knowledge.md);
+  a kick-only BC prior for the attacker (rules-attacker labels, phase-2 rows
+  only) is the planned next step, not yet built.
+
 ## Status
 
 - [x] Stage 1 (2026-11-15): builder seed/sim_dt_s, ScenarioLoop.last_outcome

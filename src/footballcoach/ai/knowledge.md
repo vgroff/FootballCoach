@@ -1455,6 +1455,21 @@ and evals only. `env.controller_overrides` pins roles (evals);
 `env.episode_tag` / `StepInfo.episode_tag` names the phase and controller
 mix (e.g. `phase2_1v2[attacker=neural,defender=neural,goalkeeper=rules]`).
 
+**The rules keeper closes down a dribbler (2026-11-16).** Measured with
+phase1_run321 checkpoint 763 as the phase-2 attacker: it never shot; every
+goal (18/60) was the ball dribbled into the net at sprint speed, because
+`StagedGoalkeeperAI` only reacted to loose balls. It now commits to winning
+the ball when an opponent has it within 6 m of goal centre and the keeper is
+the last line, stays committed out to 12 m, switches straight to SaveOrder on
+a shot, and has a 1 s cooldown (orders.json `goalkeeper_ai`, class
+docstring). Closing down anywhere in the box made it concede more against the
+shooting rules attacker (182/2000 saves became goals); at 6 m the
+rules-vs-rules outcomes are identical to before (2000 seeds), and against the
+checkpoint attacker goals fell 18.2% -> 11.8% and saves rose 4.0% -> 36.5%
+(400 seeds). All remaining goals came after the keeper had committed and lost
+the duel within 3.2 m of the ball (engine tackle / possession balance, not
+the heuristic). Tests: `tests/unit/test_goalkeeper_close_down.py`.
+
 `scripts/phase2_rules_playthrough.py` plays a role-based phase with every
 role on its rules AI through the real env and prints the outcome mix and each
 role's mean terminal reward. Tests: `tests/ai_scenario/test_phase2_role_env.py`.

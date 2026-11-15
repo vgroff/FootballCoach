@@ -26,6 +26,7 @@ from __future__ import annotations
 import math
 import random
 
+from footballcoach.config import load_orders_config, require_section
 from footballcoach.entities.player import Player, PlayerAI, PlayerState, Team
 from footballcoach.engine.match import Match
 from footballcoach.engine.movement import effective_acceleration, effective_top_speed, sprint_eta
@@ -448,11 +449,30 @@ class StagedGoalkeeperAI(_RulesBasedAI):
     back to goal centre.  Once parked at goal centre it faces outfield (see
     ``_outfield_heading``) rather than whatever heading the final approach
     step happened to leave it at.
+
+    Closing down (orders.json goalkeeper_ai, added 2026-11-16): a keeper that
+    only reacts to loose balls can be dribbled past into the net. It commits
+    to winning the ball (GetPossessionOrder, the rules defender's carrier
+    chase and tackle) when an opponent has the ball within
+    close_down_entry_dist_m of goal centre and no outfield teammate is nearer
+    the goal than the carrier. Once committed it stays committed while an
+    opponent holds the ball, or the ball is loose, within the larger
+    close_down_exit_dist_m (the last-line check is not re-tested), so it does
+    not flip back and forth. It returns to goalkeeping at once when the ball
+    is loose and heading for goal (a shot: SaveOrder), or when it or a
+    teammate wins the ball; after leaving it waits close_down_cooldown_s
+    before it can commit again. The entry distance is deliberately short:
+    measured on 2000 rules-vs-rules 1v2 seeds, closing down anywhere in the
+    box turned 182 saves into goals (the rules attacker shoots, and an
+    off-line keeper is out of position), while within ~6 m the rules
+    attacker's outcomes are unchanged and a dribbling attacker is stopped.
     """
 
     def __init__(self, jog_to_centre: bool = True, decision_interval_ticks: int | None = None) -> None:
         super().__init__(decision_interval_ticks=decision_interval_ticks)
         self._jog_to_centre = jog_to_centre  # kept for API compat; behaviour unchanged
+        self._closing_down = False
+        self._close_down_ended_s = float("-inf")
 
     def _goal_centre(self, player: Player, match: Match) -> Vector3:
         from footballcoach.entities.player import Team
@@ -510,8 +530,71 @@ class StagedGoalkeeperAI(_RulesBasedAI):
         if dist <= _GK_PARKED_TOLERANCE_M and player.speed_mps < 0.05:
             player.heading_rad = self._outfield_heading(player)
 
+    def _close_down_cfg(self) -> dict:
+        return require_section(load_orders_config(), "goalkeeper_ai", "orders.json")
+
+    def _opponent_carrier(self, player: Player, match: Match) -> Player | None:
+        holder = match.ball.possessed_by
+        if holder is None or holder == player.player_id:
+            return None
+        carrier = match.player_by_id_or_none(holder)
+        return carrier if carrier is not None and carrier.team != player.team else None
+
+    def _should_start_closing_down(self, player: Player, match: Match) -> bool:
+        """Entry test (see the class docstring): enabled, out of cooldown, an
+        opponent has the ball within the entry distance of goal centre, and no
+        outfield teammate is nearer the goal than the carrier."""
+        cfg = self._close_down_cfg()
+        if not cfg["close_down_carrier_in_box"]:
+            return False
+        if match.time_s - self._close_down_ended_s < float(cfg["close_down_cooldown_s"]):
+            return False
+        carrier = self._opponent_carrier(player, match)
+        if carrier is None:
+            return False
+        goal = self._goal_centre(player, match).xy()
+        carrier_dist = carrier.position.xy().distance_to(goal)
+        if carrier_dist > float(cfg["close_down_entry_dist_m"]):
+            return False
+        return not any(
+            p.team == player.team and not p.is_goalkeeper and p.player_id != player.player_id
+            and p.position.xy().distance_to(goal) < carrier_dist
+            for p in match.players
+        )
+
+    def _should_keep_closing_down(self, player: Player, match: Match) -> bool:
+        """Stay committed while an opponent holds the ball, or the ball is loose
+        but not heading for goal, within the exit distance of goal centre."""
+        ball = match.ball
+        exit_dist = float(self._close_down_cfg()["close_down_exit_dist_m"])
+        goal = self._goal_centre(player, match).xy()
+        if ball.possessed_by is not None:
+            carrier = self._opponent_carrier(player, match)
+            return carrier is not None and carrier.position.xy().distance_to(goal) <= exit_dist
+        if self._ball_aimed_at_goal(player, match):
+            return False
+        return ball.position.xy().distance_to(goal) <= exit_dist
+
     def decide(self, player: Player, match: Match, trial_tick: int) -> None:
         ball = match.ball
+
+        if self._closing_down:
+            if self._should_keep_closing_down(player, match):
+                if not isinstance(player.current_order, GetPossessionOrder):
+                    player.current_order = GetPossessionOrder()
+                return
+            # Back to goalkeeping: drop the chase and let the branches below
+            # pick SaveOrder (a shot) or the walk back to goal centre.
+            self._closing_down = False
+            self._close_down_ended_s = match.time_s
+            if isinstance(player.current_order, GetPossessionOrder):
+                player.current_order = None
+            match._log_debug(f"[AI] {player.player_id}: stop closing down")
+        elif self._should_start_closing_down(player, match):
+            self._closing_down = True
+            player.current_order = GetPossessionOrder()
+            match._log_debug(f"[AI] {player.player_id}: closing down {ball.possessed_by}")
+            return
 
         # Ball is held by anyone → cease SaveOrder and jog back to goal centre.
         if ball.possessed_by is not None:
