@@ -104,6 +104,15 @@ def _pitch_half_extents_m() -> tuple[float, float]:
     return pitch["length_m"] / 2.0, pitch["width_m"] / 2.0
 
 
+# exp() overflows float32 past ~88.7. Under dual-clip an overflowed (inf)
+# ratio still poisons the gradient: dual-clip selects the finite floor, but
+# autograd multiplies the unselected branch's zero gradient by d(exp)/dx = inf,
+# giving 0 * inf = NaN. Capping the log-ratio at 80 (exp(80) ~= 5.5e34) keeps
+# the ratio finite; a ratio that large is already on dual-clip's zero-gradient
+# floor, so only the NaN changes. Below the cap the result is bit-identical.
+_MAX_LOG_RATIO = 80.0
+
+
 # DecisionHeadsRaw's field set is fixed at class-definition time -- caching this
 # once avoids a dataclasses.fields() reflection call every PPO/pretrain minibatch
 # (see the detach-for-separate-value-net call sites below).
@@ -8751,6 +8760,15 @@ class PPOTrainer:
         )
         return train_batch, val_batch
 
+    def _loss_ratio(self, log_ratio: torch.Tensor) -> torch.Tensor:
+        """PPO importance ratio for a loss term. With dual-clip on, the
+        log-ratio is capped at _MAX_LOG_RATIO so an overflowing ratio can't turn
+        the gradient into NaN. Off, it is plain exp(): vanilla PPO stays
+        byte-identical, overflow included (the NaN guard then halts the run)."""
+        if self.dual_clip_c <= 0:
+            return torch.exp(log_ratio)
+        return torch.exp(log_ratio.clamp(max=_MAX_LOG_RATIO))
+
     def _apply_dual_clip(self, min_surr: torch.Tensor, adv: torch.Tensor) -> torch.Tensor:
         """Dual-clip PPO's negative-advantage floor (see __init__'s
         dual_clip_c comment for the full rationale): ``max(min_surr,
@@ -8888,7 +8906,7 @@ class PPOTrainer:
                 mb_adv = val_adv[idx].to(self.device)
                 mb_ret = val_returns[idx].to(self.device)
                 mb_old_lp = val_old_lp[idx].to(self.device)
-                ratio = torch.exp(new_log_probs - mb_old_lp)
+                ratio = self._loss_ratio(new_log_probs - mb_old_lp)
                 surr1 = ratio * mb_adv
                 surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * mb_adv
                 _mb_min_surr = self._apply_dual_clip(torch.min(surr1, surr2), mb_adv)
@@ -8917,7 +8935,7 @@ class PPOTrainer:
                 if "head_log_probs" in val_batch:
                     mb_old_head_lp = val_batch["head_log_probs"][idx].to(self.device)
                     mb_new_head_lp = self._per_head_new_log_probs(d_heads, e_heads, mb_actions, em)
-                    head_ratio = torch.exp(mb_new_head_lp - mb_old_head_lp)
+                    head_ratio = self._loss_ratio(mb_new_head_lp - mb_old_head_lp)
                     head_adv = mb_adv.unsqueeze(-1)
                     head_surr1 = head_ratio * head_adv
                     head_surr2 = torch.clamp(head_ratio, 1.0 - clip, 1.0 + clip) * head_adv
@@ -9684,8 +9702,11 @@ class PPOTrainer:
                 # below, alongside tackle_prob/kick_prob/bc_loss_val -- same
                 # value, one CPU<->GPU round trip instead of four.
                 ratio_clipped_frac_t = ((ratio < 1.0 - clip) | (ratio > 1.0 + clip)).float().mean()
-                surr1 = ratio * mb_adv
-                surr2 = torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * mb_adv
+                # The diagnostics above keep the raw ratio (inf stays visible);
+                # the loss uses the capped one -- see _MAX_LOG_RATIO.
+                loss_ratio = self._loss_ratio(new_log_probs - mb_old_lp)
+                surr1 = loss_ratio * mb_adv
+                surr2 = torch.clamp(loss_ratio, 1.0 - clip, 1.0 + clip) * mb_adv
                 _min_surr = self._apply_dual_clip(torch.min(surr1, surr2), mb_adv)
                 _per_sample_policy_loss = -(_min_surr * mb_w)
                 policy_loss = _per_sample_policy_loss.mean()
@@ -9711,7 +9732,7 @@ class PPOTrainer:
                     with torch.no_grad():
                         _mb_old_head_lp = batch["head_log_probs"][mb_idx].to(self.device)
                         _mb_new_head_lp = self._per_head_new_log_probs(d_heads, e_heads, mb_actions, em)
-                        _head_ratio = torch.exp(_mb_new_head_lp - _mb_old_head_lp)  # (batch, 15)
+                        _head_ratio = self._loss_ratio(_mb_new_head_lp - _mb_old_head_lp)  # (batch, 15)
                         _head_adv = mb_adv.unsqueeze(-1)
                         _head_w = mb_w.unsqueeze(-1)
                         _head_surr1 = _head_ratio * _head_adv

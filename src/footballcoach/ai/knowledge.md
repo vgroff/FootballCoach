@@ -2300,3 +2300,22 @@ writes the four standard graphs (eval, value, kick, entropy/KL) for the last
 
 `_dump_nan_diagnostic` writes `nan_diagnostic_<time>.json` into the checkpoint
 dir, or the working dir when the trainer has none, then stops training.
+
+## Dual-clip and ratio overflow
+
+With `ppo.dual_clip_c > 0`, every PPO loss term builds its ratio through
+`PPOTrainer._loss_ratio`, which caps the log-ratio at `_MAX_LOG_RATIO` (80)
+before `exp()`. Without the cap, a log-ratio past about 88.7 overflows float32
+to `inf`. Dual-clip still picks the finite floor in the forward pass, but
+autograd multiplies the unselected branch's zero gradient by `inf`, so the
+gradient becomes NaN and the NaN guard stops the run. Both real NaN crashes on
+2026-09-18 (`nan_diagnostic_1789683811.json`, `..._1789721773.json`) fit this
+signature: dual-clip on, every loss and head output finite, gradient
+non-finite. That is consistent with this mechanism, not proven, because the
+dumps don't record the ratio.
+
+Below the cap the loss and gradient are bit-identical to the uncapped formula
+(pinned by `tests/ai_scenario/test_dual_clip_ppo.py::TestLossRatioCap`). With
+dual-clip off, `_loss_ratio` is plain `exp()`, so vanilla PPO is unchanged,
+overflow crash included. The raw ratio is still what the ratio-spike,
+clip-fraction and ratio-histogram diagnostics report.

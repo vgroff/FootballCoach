@@ -273,3 +273,58 @@ class TestDualClipIntegration:
             "-inf inputs (torch.max(-inf, floor) == floor)"
         )
         assert abs(metrics_on["policy_loss"]) < 50.0
+
+
+class TestLossRatioCap:
+    """PPOTrainer._loss_ratio: under dual-clip the log-ratio is capped at
+    _MAX_LOG_RATIO so an overflowing ratio can't make the gradient NaN. These
+    pin that it changes nothing else, against the uncapped formula."""
+
+    @staticmethod
+    def _host(c: float):
+        from types import SimpleNamespace
+        host = SimpleNamespace(dual_clip_c=c)
+        host._loss_ratio = PPOTrainer._loss_ratio.__get__(host)
+        host._apply_dual_clip = PPOTrainer._apply_dual_clip.__get__(host)
+        return host
+
+    @staticmethod
+    def _loss_and_grad(host, gaps: torch.Tensor, adv: torch.Tensor, capped: bool, clip: float = 0.2):
+        new_lp = gaps.clone().requires_grad_(True)
+        ratio = host._loss_ratio(new_lp) if capped else torch.exp(new_lp)
+        surr1, surr2 = ratio * adv, torch.clamp(ratio, 1.0 - clip, 1.0 + clip) * adv
+        per_row = -host._apply_dual_clip(torch.min(surr1, surr2), adv)
+        (grad,) = torch.autograd.grad(per_row.sum(), new_lp)
+        return per_row.detach(), grad
+
+    def test_identical_to_the_uncapped_formula_wherever_exp_is_finite(self):
+        from footballcoach.ai.ppo.ppo_trainer import _MAX_LOG_RATIO
+        host = self._host(3.0)
+        gaps = torch.cat([torch.linspace(-60.0, 88.0, 297), torch.tensor([_MAX_LOG_RATIO, 88.5])])
+        for a in (-5.0, -0.1, 0.1, 5.0):
+            adv = torch.full_like(gaps, a)
+            old_loss, old_grad = self._loss_and_grad(host, gaps, adv, capped=False)
+            new_loss, new_grad = self._loss_and_grad(host, gaps, adv, capped=True)
+            assert torch.isfinite(old_loss).all() and torch.isfinite(old_grad).all()
+            assert torch.equal(new_loss, old_loss), a
+            assert torch.equal(new_grad, old_grad), a
+
+    def test_overflowing_ratio_gives_the_floor_and_a_finite_gradient(self):
+        host = self._host(3.0)
+        gaps, adv = torch.tensor([300.0, 0.0]), torch.tensor([-5.0, 1.0])
+        old_loss, old_grad = self._loss_and_grad(host, gaps, adv, capped=False)
+        assert torch.isnan(old_grad[0]), "premise: the uncapped formula gives a NaN gradient here"
+        new_loss, new_grad = self._loss_and_grad(host, gaps, adv, capped=True)
+        assert new_loss[0] == pytest.approx(15.0) and new_grad[0] == 0.0
+        assert torch.equal(new_loss[1:], old_loss[1:]) and torch.equal(new_grad[1:], old_grad[1:])
+
+    def test_positive_advantage_overflow_is_also_finite(self):
+        host = self._host(3.0)
+        loss, grad = self._loss_and_grad(host, torch.tensor([300.0]), torch.tensor([5.0]), capped=True)
+        assert torch.isfinite(loss).all() and grad.item() == 0.0
+
+    def test_disabled_is_plain_exp_including_overflow(self):
+        host = self._host(0.0)
+        gaps = torch.tensor([-3.0, 0.0, 50.0, 85.0, 300.0])
+        assert torch.equal(host._loss_ratio(gaps), torch.exp(gaps))
+        assert torch.isinf(host._loss_ratio(torch.tensor([300.0]))).all()
