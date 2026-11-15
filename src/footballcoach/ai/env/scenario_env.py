@@ -59,8 +59,7 @@ class StepInfo:
     # scanned every physics tick of this decision interval inside step()'s own
     # loop -- NOT read off the player once after the whole interval elapses,
     # since kicked_this_tick resets every physics tick and one step() call
-    # spans self._ticks_per_decision (>1) of them. Same rationale as the
-    # trainee_gained_count/trainee_lost_count possession scan below.
+    # spans self._ticks_per_decision (>1) of them.
     trainee_kicks_this_step: int = 0
     # Subset of trainee_kicks_this_step that fired via the armed path (no ball at
     # decision time, kick executed at pickup -- the "first touch" kicks).
@@ -203,7 +202,6 @@ class ScenarioEnv:
 
         self._ema = EMAFilter.from_config()
         self._loop: Optional[ScenarioLoop] = None
-        self._trial_done: bool = False
         self._episode_ticks: int = 0
         # Cache of per-team attacking-box bounds (rx_min, rx_max, half_box_w) for
         # _ball_dist_to_opponent_box() -- these depend only on pitch dims + team,
@@ -219,30 +217,16 @@ class ScenarioEnv:
         # it correctly-ordered, i.e. AFTER each match.step(), including the
         # trial-ending tick; this env used to keep its own separate, less
         # correctly-ordered copy, now removed).
+        # Whether the trainee held the ball at the end of the last engine tick
+        # processed, carried across step() calls. Read by step()'s early exit
+        # (trainee already holding the ball in the opponent box). Until
+        # 2026-11-15 this was the poss_prev output of a per-tick possession
+        # gain/loss state machine whose counts no longer fed any reward; at
+        # the end of each tick that machine always left poss_prev equal to
+        # (possessed_by == trainee), which is what is stored here now.
         self._trainee_had_possession_last_step: bool = False
-        # True while the ball is loose after the trainee lost it and no OTHER
-        # player has taken possession yet (e.g. a push-kick dribble touch, or
-        # a knock-loose the trainee immediately re-collects). The eventual
-        # lost/gained counting is deferred until this resolves — see
-        # _possession_transition_step() and ai/knowledge.md "Possession
-        # gain/loss reward: real turnovers only" note.
-        self._trainee_pending_loss: bool = False
-        # Last player who actually settled possession of the ball (ignores
-        # momentary loose-ball gaps, e.g. a player kicking the ball to
-        # themselves). Used to distinguish a real turnover/steal (possession
-        # resolves to a DIFFERENT player) from a harmless self-pass (ball goes
-        # loose then comes back to the same player who kicked it) — see
-        # ai/knowledge.md "Possession gain/loss reward" note.
-        self._last_settled_ball_owner: Optional[str] = None
-        self._prev_goal_count: tuple[int, int] = (0, 0)
-        self._trainee_start_stamina: float = 1.0
-
-        # Per-secondary-player state
-        self._sec_start_stamina: dict = {}
+        # Per-secondary-player attack/defence EMA (the trainee's is self._ema).
         self._sec_ema: dict = {}
-        self._sec_had_possession_last_step: dict = {}
-        # Per-secondary-player pending-loss state, mirrors _trainee_pending_loss.
-        self._sec_pending_loss: dict = {}
         # Populated after each step(); drained by PPOTrainer for the rollout buffer.
         # last_trainee_transition: dict with obs/action/log_prob/value/bc_label/raw_exec/illegal_action
         # last_secondary_results: list of same dicts for secondary neural players
@@ -313,36 +297,9 @@ class ScenarioEnv:
 
         self._ema.reset()
         self._episode_ticks = 0
-        self._trial_done = False
         self._box_bounds_cache = {}
-        self._prev_goal_count = (
-            self._loop.match.scoreboard.left_goals,
-            self._loop.match.scoreboard.right_goals,
-        )
         self._max_episode_ticks = max(1, int(self.max_episode_s / self._dt_s))
         self._trainee_had_possession_last_step = False
-        self._trainee_pending_loss = False
-        self._sec_had_possession_last_step = {pid: False for pid in self.secondary_player_ids}
-        self._sec_pending_loss = {pid: False for pid in self.secondary_player_ids}
-        self._last_settled_ball_owner = None
-        # Record stamina at episode start for end-of-episode stamina penalty.
-        # Also recorded per-secondary-player below (same treatment — see
-        # _compute_phase1_reward_for_player()).
-        # Per-decision-step tackle-attempt counter (see "tatt" in reward.py's
-        # module docstring) -- Match.on_tackle fires synchronously inside
-        # Match.step() (called from self._loop.step() in the tick loop
-        # below), so this must be a persistent instance attribute the
-        # callback can mutate, not a local var -- reset at the top of step()
-        # itself (mirrors trainee_kicks_this_step's per-step reset, just as
-        # an instance attribute since that one polls player.kicked_this_tick
-        # directly instead of needing a callback).
-        self._trainee_tackle_attempt_count = 0
-        try:
-            _trainee = self._loop.match.player_by_id(self.trainee_player_id)
-            self._trainee_start_stamina = _trainee.stamina
-            _trainee.on_tackle = self._on_trainee_tackle
-        except KeyError:
-            self._trainee_start_stamina = 1.0
         self.last_trainee_transition = None
         self.last_secondary_results = []
         self.last_terminal_match = None
@@ -378,20 +335,10 @@ class ScenarioEnv:
                 )
 
         # Initialise per-secondary-player state
-        self._sec_tackle_attempt_count: dict[str, int] = {pid: 0 for pid in self.secondary_player_ids}
         for pid in self.secondary_player_ids:
             if pid not in self._sec_ema:
                 self._sec_ema[pid] = EMAFilter.from_config()
             self._sec_ema[pid].reset()
-            # Record stamina at episode start for THIS secondary player, same
-            # treatment as the trainee above — see
-            # _compute_phase1_reward_for_player().
-            try:
-                _sec_player = self._loop.match.player_by_id(pid)
-                self._sec_start_stamina[pid] = _sec_player.stamina
-                _sec_player.on_tackle = self._make_on_sec_tackle(pid)
-            except KeyError:
-                self._sec_start_stamina[pid] = 1.0
         # Attach fresh logger to the match and record initial state.
         self._episode_index += 1
         self._match_logger.reset()
@@ -436,15 +383,11 @@ class ScenarioEnv:
         sec_pre: dict = {}
         for pid in self.secondary_player_ids:
             sec_pre[pid] = {
-                "prev_ball_x": match.ball.position.x,
                 "prev_box_dist": self._ball_dist_to_opponent_box(pid),
             }
 
         # --- Snapshot state before ticking ---
-        prev_ball_x = match.ball.position.x
         prev_box_dist = self._ball_dist_to_opponent_box(self.trainee_player_id)
-        prev_goal_count = self._prev_goal_count
-        initial_scoreboard = (match.scoreboard.left_goals, match.scoreboard.right_goals)
 
         # --- Advance simulation for DECISION_INTERVAL_S ---
         trial_ended_this_step = False
@@ -454,15 +397,7 @@ class ScenarioEnv:
         goal_scored = False
         possession_lost_to_keeper = False
 
-        # Per-tick possession-transition counters. Comparing only the state
-        # before vs. after the whole decision interval misses events that
-        # happen and reverse within the same interval (e.g. gain via tackle,
-        # then immediately lose it again to the opponent before the next
-        # decision tick) — scan every engine tick instead.
         _trainee_poss_prev = self._trainee_had_possession_last_step
-        _trainee_pending_loss = self._trainee_pending_loss
-        trainee_gained_count = 0
-        trainee_lost_count = 0
         # Per-tick kick scan -- see StepInfo.trainee_kicks_this_step's own
         # comment for why a single post-loop read would silently miss kicks
         # that land on any tick but the last one of this decision interval.
@@ -478,32 +413,6 @@ class ScenarioEnv:
         # paid any "karm" cost in the first place -- doesn't also collect
         # the bonus meant to offset that cost for a genuine, uncertain chase.
         trainee_armed_kicks_this_step = 0
-        # Reset the tackle-attempt counters THIS on_tackle callback(s)
-        # mutate synchronously inside the tick loop below (see
-        # _on_trainee_tackle/_make_on_sec_tackle) -- instance attributes, not
-        # locals, since the callback runs inside Match.step() with no direct
-        # access to this method's stack.
-        self._trainee_tackle_attempt_count = 0
-        for pid in sec_pre:
-            self._sec_tackle_attempt_count[pid] = 0
-        _sec_poss_prev = {pid: self._sec_had_possession_last_step.get(pid, False) for pid in sec_pre}
-        _sec_pending_loss = {pid: self._sec_pending_loss.get(pid, False) for pid in sec_pre}
-        sec_gained_count = {pid: 0 for pid in sec_pre}
-        sec_lost_count = {pid: 0 for pid in sec_pre}
-        # Secondary-player kick scan -- same rationale/shape as the
-        # trainee's own trainee_kicks_this_step/trainee_armed_kicks_this_step
-        # above, just per-pid. Player objects fetched once here (not inside
-        # the tick loop) to avoid a repeated match.player_by_id() lookup
-        # every physics tick; a pid whose player has since left the match
-        # (shouldn't happen mid-episode, but mirrors every other secondary
-        # lookup's defensive try/except in this file) is simply skipped.
-        sec_players: dict = {}
-        for pid in sec_pre:
-            sec_player = match.player_by_id_or_none(pid)
-            if sec_player is not None:
-                sec_players[pid] = sec_player
-        sec_kicks_this_step = {pid: 0 for pid in sec_pre}
-        sec_armed_kicks_this_step = {pid: 0 for pid in sec_pre}
 
         # Per-tick box-distance progress accumulators, and player<->ball
         # approach accumulators (2026-10-15 redesign). Both are gated on
@@ -560,11 +469,6 @@ class ScenarioEnv:
                 trainee_kicks_this_step += 1
                 if player.kick_armed:
                     trainee_armed_kicks_this_step += 1
-            for _pid, _sec_p in sec_players.items():
-                if _sec_p.kicked_this_tick:
-                    sec_kicks_this_step[_pid] += 1
-                    if _sec_p.kick_armed:
-                        sec_armed_kicks_this_step[_pid] += 1
 
             if tick_done:
                 # Break BEFORE reading any match state. When linger_s=0
@@ -627,75 +531,12 @@ class ScenarioEnv:
                 _sec_box_dist_prev[pid] = _curr_sec_box_dist
                 _sec_ball_dist_prev[pid] = _curr_sec_ball_dist
             # Refresh for the NEXT tick's gating -- AFTER this tick's
-            # accumulation used the pre-tick value above. Single shared read
-            # (not a per-player derived flag like _trainee_poss_prev), since
-            # last_touched_by_player_id is one ball-level field every
-            # player_id is just compared against.
+            # accumulation used the pre-tick value above. Single shared
+            # ball-level read, since last_touched_by_player_id is one field
+            # every player_id is just compared against.
             _last_toucher_prev = match.ball.last_touched_by_player_id
-
-            # An armed-kick auto-fire (Match._update_loose_ball_pickup)
-            # grants possession then immediately kicks it away again WITHIN
-            # this same tick (see Player.kick_armed_direction's docstring) --
-            # a real, if momentary, possession event that the single
-            # end-of-tick possessed_by sample below can never observe on its
-            # own (it reads None both before and after this tick). Detected
-            # via the same kicked_this_tick+kick_armed combination
-            # trainee_armed_kicks_this_step already checks above:
-            # _finish_kick never touches kick_armed, so it still reads True
-            # here iff THIS tick's kick came from the armed path (never true
-            # for an already-possessing instant kick, since
-            # apply_nn_action.py's kick branch is exclusive -- that case
-            # needs no special handling, since poss_prev was already True
-            # from an earlier tick and the real end-of-tick sample below
-            # correctly sees the release). Feeds a synthetic
-            # "possessed_by=this player" sample through
-            # _possession_transition_step FIRST (registering the gain),
-            # before the real end-of-tick sample below (registering the
-            # subsequent loss/pending-loss) -- reuses the state machine
-            # completely unchanged, just calls it one extra time for the
-            # tick a touch happened that the final poll would otherwise miss.
-            if player.kicked_this_tick and player.kick_armed:
-                (
-                    _trainee_poss_prev, _trainee_pending_loss,
-                    trainee_gained_count, trainee_lost_count,
-                ) = self._possession_transition_step(
-                    self.trainee_player_id, self.trainee_player_id, _trainee_poss_prev,
-                    _trainee_pending_loss, trainee_gained_count, trainee_lost_count,
-                )
-            for pid in sec_pre:
-                _sec_p = sec_players.get(pid)
-                if _sec_p is not None and _sec_p.kicked_this_tick and _sec_p.kick_armed:
-                    (
-                        _sec_poss_prev[pid], _sec_pending_loss[pid],
-                        sec_gained_count[pid], sec_lost_count[pid],
-                    ) = self._possession_transition_step(
-                        pid, pid, _sec_poss_prev[pid],
-                        _sec_pending_loss[pid], sec_gained_count[pid], sec_lost_count[pid],
-                    )
-
-            # Update possession transitions AFTER progress, so gain-tick
-            # motion counts on the NEXT tick, not the tick possession is taken.
-            _possessed_by = match.ball.possessed_by
-            (
-                _trainee_poss_prev,
-                _trainee_pending_loss,
-                trainee_gained_count,
-                trainee_lost_count,
-            ) = self._possession_transition_step(
-                self.trainee_player_id, _possessed_by, _trainee_poss_prev,
-                _trainee_pending_loss, trainee_gained_count, trainee_lost_count,
-            )
-
-            for pid in sec_pre:
-                (
-                    _sec_poss_prev[pid],
-                    _sec_pending_loss[pid],
-                    sec_gained_count[pid],
-                    sec_lost_count[pid],
-                ) = self._possession_transition_step(
-                    pid, _possessed_by, _sec_poss_prev[pid],
-                    _sec_pending_loss[pid], sec_gained_count[pid], sec_lost_count[pid],
-                )
+            # Possession as of the end of this tick, for the next tick's early exit.
+            _trainee_poss_prev = match.ball.possessed_by == self.trainee_player_id
 
         # Update EMA with the trainee's attack/defence output (from NeuralPlayerAI transition)
         if self.last_trainee_transition is not None:
@@ -705,9 +546,6 @@ class ScenarioEnv:
             info.illegal_action = self.last_trainee_transition.get("illegal_action", False)
 
         # --- Compute reward ---
-        new_goal_count = (match.scoreboard.left_goals, match.scoreboard.right_goals)
-        self._prev_goal_count = new_goal_count
-
         # Ball went out and the trainee was the last player to touch it
         # (possession or kick) — only the last toucher is ever penalised.
         # self._loop.last_completed_trial_toucher_id is correctly-ordered
@@ -744,15 +582,7 @@ class ScenarioEnv:
         _phase1_terminal = detect_phase1_box_terminal(match, trainee_player_id=self.trainee_player_id)
         box_terminal = _phase1_terminal == "box_possession"
         opponent_box_terminal = _phase1_terminal == "opponent_box_possession"
-        # Use the per-tick scan (trainee_gained_count/trainee_lost_count) instead
-        # of a simple before/after comparison, so gain/lose transitions that
-        # both happen within this single decision interval (e.g. tackle then
-        # immediately re-tackled) are not silently dropped from the reward.
-        trainee_has_possession_now = _trainee_poss_prev  # final state after the tick loop
-        gained_possession = trainee_gained_count  # int count, not just bool
-        lost_possession = trainee_lost_count
-        self._trainee_had_possession_last_step = trainee_has_possession_now
-        self._trainee_pending_loss = _trainee_pending_loss
+        self._trainee_had_possession_last_step = _trainee_poss_prev
 
         timeout = self._episode_ticks >= int(self.max_episode_s / self._dt_s)
         if self.phase == 1:
@@ -845,13 +675,6 @@ class ScenarioEnv:
                 and outcome_this_step == "miss"
                 and self._loop.last_completed_trial_toucher_id == pid
             )
-            # Per-tick scan (sec_gained_count/sec_lost_count) instead of a
-            # simple before/after comparison — see trainee note above.
-            sec_has_poss_now = _sec_poss_prev[pid]  # final state after the tick loop
-            sec_gained_poss = sec_gained_count[pid]  # int count
-            sec_lost_poss = sec_lost_count[pid]
-            self._sec_had_possession_last_step[pid] = sec_has_poss_now
-            self._sec_pending_loss[pid] = _sec_pending_loss[pid]
             sec_in_atk_box = match.pitch.is_in_box(
                 match.ball.position,
                 left=(sec_player.team == Team.RIGHT),
@@ -1137,52 +960,6 @@ class ScenarioEnv:
             phase=self.phase,
         )
 
-    @staticmethod
-    def _possession_transition_step(
-        pid: str,
-        possessed_by: Optional[str],
-        poss_prev: bool,
-        pending_loss: bool,
-        gained_count: int,
-        lost_count: int,
-    ) -> tuple[bool, bool, int, int]:
-        """Advance one engine tick of possession-transition tracking for *pid*.
-
-        Distinguishes a "real" turnover (possession is confirmed settled onto
-        a DIFFERENT player) from a harmless momentary loose ball (e.g. a
-        push-kick dribble touch, or *pid* knocking the ball loose and
-        immediately re-collecting it themselves) — see ai/knowledge.md
-        "Possession gain/loss reward: real turnovers only".
-
-        Returns (poss_prev, pending_loss, gained_count, lost_count) updated
-        for this tick.
-        """
-        now = possessed_by == pid
-        if now:
-            if pending_loss:
-                # Regained directly with no OTHER player ever taking it in
-                # between -> the ball was never really lost; cancel silently.
-                pending_loss = False
-            elif not poss_prev:
-                gained_count += 1
-            poss_prev = True
-        else:
-            if poss_prev:
-                # Just lost it this tick.
-                if possessed_by is not None:
-                    # Someone else already holds it this very tick -> confirmed turnover.
-                    lost_count += 1
-                    pending_loss = False
-                else:
-                    # Ball is loose; defer counting until it's resolved.
-                    pending_loss = True
-                poss_prev = False
-            elif pending_loss and possessed_by is not None:
-                # Ball was loose and has now settled onto someone else -> confirmed turnover.
-                lost_count += 1
-                pending_loss = False
-        return poss_prev, pending_loss, gained_count, lost_count
-
     def _find_trainee(self, match: Match):
         return match.player_by_id(self.trainee_player_id)
 
@@ -1216,24 +993,6 @@ class ScenarioEnv:
         out = dict(transition)
         out["raw_exec"] = raw_exec
         return out
-
-    def _on_trainee_tackle(self, player) -> None:  # noqa: ANN001
-        """Player.on_tackle callback -- fires synchronously inside
-        Match.step() the instant an INTENTIONAL (armed) tackle resolves
-        contact, before the win/lose result is known (see
-        Match._attempt_tackle_contact). Never fires for the collision-based
-        auto-tackle fallback (Match._check_head_on_tackles uses
-        on_auto_tackle_result instead) -- see reward.py's "tatt" docstring."""
-        self._trainee_tackle_attempt_count += 1
-
-    def _make_on_sec_tackle(self, pid: str):
-        """Same as _on_trainee_tackle, for a secondary player -- a closure
-        per pid since Player.on_tackle takes no player_id argument of its
-        own (the callback IS bound to one specific Player object already,
-        but this env tracks counts per pid in a shared dict)."""
-        def _cb(player) -> None:  # noqa: ANN001
-            self._sec_tackle_attempt_count[pid] = self._sec_tackle_attempt_count.get(pid, 0) + 1
-        return _cb
 
     def _latest_outcome(self) -> Optional[str]:
         if self._loop is None:

@@ -38,6 +38,14 @@ below, this section wins.
   keyword-only, so a stale positional call fails instead of silently
   binding. Checked with the golden snapshot: bit-identical apart from the
   removed field.
+- **#7 (closed 2026-11-15, by deletion):** the paired trainee/secondary
+  state was almost all write-only: the possession gain/loss scan, start
+  stamina, tackle-attempt counters and secondary kick counters. All of it
+  was removed rather than unified. The one live piece, the trainee's
+  previous-tick possession flag for the box early exit, is now a plain
+  bool and is pinned by `tests/ai_unit/test_scenario_env_early_exit.py`.
+  Only the EMA pair (`_ema`/`_sec_ema`) remains paired. Verified with
+  `scripts/env_trace_snapshot.py` (0 differences) plus the golden snapshot.
 - **Sampling-function "merge" (closed 2026-11-15, nothing to merge):**
   production already has one implementation. `_sample_action` is a batch
   of 1 through `_sample_action_from_heads_batch`, and

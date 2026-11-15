@@ -649,61 +649,35 @@ loss). Still event-paid and non-terminal, so review before enabling/retuning:
 `ill` (`illegal_action_penalty`, currently 0.0) and the `tatt`/`katt` attempt
 bonuses.
 
-### Possession gain/loss reward: real turnovers only
+### Possession gain/loss reward: removed, including the transition scan
 
-**Both rewards are DISABLED as of 2026-09-20** (`gain_possession_bonus` and
-`loss_of_possession_penalty` = 0.0 -- see the rule above). The transition
-counting below is still computed and still correct; it just no longer pays.
+The gain/loss rewards were disabled on 2026-09-20 (see the rule above about
+one-off event rewards) and their parameters deleted on 2026-10-14. The
+per-tick possession-transition scan that counted them
+(`ScenarioEnv._possession_transition_step`, a small state machine per
+tracked player that counted a loss only once possession settled on a
+DIFFERENT player, including a synthetic sample for armed-kick auto-fires
+that gain and release the ball within one tick) kept running with nothing
+reading its counts. It was removed on 2026-11-15, together with the other
+write-only env state: `start_stamina`, the per-step tackle-attempt counters
+and their `on_tackle` callbacks, the secondary kick counters,
+`_last_settled_ball_owner`, `_prev_goal_count` and `_trial_done`. Checked
+with `scripts/env_trace_snapshot.py` (self-play, rules and immobile
+opponents, `always_compute_secondary_reward` on and off): 0 differences.
+If a possession signal is ever wanted again, recover the state machine
+and its tests (`tests/ai_unit/test_possession_transition_step.py`) from
+git history (commit before 2026-11-15).
 
-`ScenarioEnv.step()` scans every engine tick within a decision interval (not
-just before/after the whole interval) to count possession transitions, via
-the shared `_possession_transition_step()` static method — this catches
-gain+loss pairs that both happen inside one interval (e.g. tackle then
-immediately re-tackled), which a simple before/after bool comparison would
-miss. `reward.py`'s `phase1_reward()` takes `gained_possession_this_step` /
-`lost_possession_this_step` as `bool | int` COUNTS and multiplies the reward
-coefficient by the count rather than gating on truthiness.
-
-Critically, a tick-level "loss" is only counted as a **real turnover** if
-possession actually settles onto a DIFFERENT player — not simply because
-`ball.possessed_by` transiently reads `None` (loose ball in flight, e.g.
-during a push-kick dribble touch) or because the SAME player re-collects it
-themselves. `_possession_transition_step()` implements this as a small state
-machine per tracked player (trainee, and each secondary player):
-- `poss_prev` — do I currently have the ball?
-- `pending_loss` — I just lost it, but no one else has grabbed it YET (ball
-  loose/in-flight); counting is deferred.
-- Only transitions `pending_loss` → a counted loss once a DIFFERENT player
-  (not me, not `None`) is confirmed to hold the ball. If I re-gain it directly
-  out of `pending_loss` with nobody else ever touching it, the pending loss is
-  cancelled silently — no lost-count AND no fresh gained-count (the trainee
-  never really lost it in the adversarial sense).
-State (`_trainee_pending_loss` / `_sec_pending_loss` dicts) persists across
-`step()` calls, not just within one, mirroring `_trainee_had_possession_last_step`
-/ `_sec_had_possession_last_step`.
-
-**Armed-kick auto-fire possession touch (fixed -- was previously invisible)**:
-`Match._update_loose_ball_pickup`'s armed-kick branch grants possession
-(`self._set_possession(player.player_id)`) then immediately fires the kick,
-whose `_release_kick` sets `ball.possessed_by = None` again -- BOTH within
-the same physics tick. `ScenarioEnv.step()`'s possession-transition scan
-only sampled `match.ball.possessed_by` once per tick (after the tick fully
-resolved), so this real, if momentary, touch was completely invisible --
-not "cancelled via pending_loss" like a genuine same-tick regrab, just
-never observed at all (`possessed_by` read `None` both before and after
-that tick). Fixed by detecting the armed auto-fire via the SAME
-`kicked_this_tick and kick_armed` combination `trainee_armed_kicks_this_step`/
-`sec_armed_kicks_this_step` already check (`kick_armed` is never touched by
-`_finish_kick`, so it still reads True at this point iff this tick's kick
-came from the armed path -- never true for an already-possessing instant
-kick, since `apply_nn_action.py`'s kick branch is exclusive) and feeding a
-synthetic `possessed_by=this player` sample through
-`_possession_transition_step` FIRST (registering the gain) before the real
-end-of-tick sample (registering the subsequent loss/pending-loss) --
-`_possession_transition_step` itself is unchanged, this just calls it one
-extra time for the tick a touch happened. See
-`tests/ai_unit/test_possession_transition_step.py`'s
-`TestArmedKickAutoFireWithinOneTick`.
+The one live output was the trainee's "had the ball at the end of the
+previous tick" flag, read by `step()`'s early exit (trainee holding the
+ball in the opponent box). It is now a plain
+`possessed_by == trainee` read at the end of each tick, which is exactly
+what the state machine left in `poss_prev`. It still carries across steps
+in `_trainee_had_possession_last_step` and is cleared by `reset()`.
+`tests/ai_unit/test_scenario_env_early_exit.py` pins the timing: the
+first step after reset exits on tick 2, and a carried-over flag exits on
+tick 1. The tests pass on the old and new code and fail if the exit is
+disabled or reads current-tick possession.
 
 **Augmentation log_prob approximation (fixed -- was a real, uncontrolled
 noise source)**: `ai/obs/augment.py`'s `augment_batch()` tiles `log_probs`/
