@@ -28,6 +28,15 @@ as you go.
 
 ## Open
 
+- **BC-only continuation never runs once aux_coeff reaches 0 (found
+  2026-11-15, not fixed).** `bc.bc_only_continuation_coeff`'s config comment
+  says a fixed value keeps the BC-only loop going after `aux_coeff` has
+  annealed to 0, but `_ppo_update` gates that loop on `has_bc`, which requires
+  one of the annealed in-epoch coefficients to be > 0. Measured: with
+  coefficient 0.7 and valid labels, the loop runs at aux 1e-9 and is skipped
+  at aux 0.0. No effect on current runs (`bc_only_continuation_epochs` is 0).
+  Fix would gate the continuation on `"bc_labels" in batch` and its own
+  coefficient; that changes training whenever the feature is enabled.
 - **`ai/physics_pretrain/` has never been reviewed.** About 9,000 lines,
   including `train_ball_dynamics.py` (4,329) and `train_player_dynamics.py`
   (2,977), added after the original review. Deferred by the user
