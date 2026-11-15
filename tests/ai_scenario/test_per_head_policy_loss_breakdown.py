@@ -2,8 +2,9 @@
 at tracking down WHY pol_mean stays positive instead of trending negative:
 
 1. The per-head COUNTERFACTUAL policy_loss breakdown -- the "[per-head
-   policy_loss (counterfactual, ...)]" log line. See all_head_policy_loss's
-   own comment in ppo_trainer.py for the exact semantics: for each head,
+   policy_loss (counterfactual, ...)]" log line. See
+   _ppo_head_counterfactual_policy_loss's docstring in ppo_update.py for the
+   exact semantics: for each head,
    ratio_h = exp(new_head_lp - old_head_lp) is computed as if every OTHER
    head stayed at ratio=1 (unchanged from the rollout-collection policy),
    then run through the same clipped-surrogate formula as the real scalar

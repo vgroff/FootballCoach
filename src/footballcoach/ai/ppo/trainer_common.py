@@ -377,7 +377,7 @@ def value_mse_by_outcome(
     raw moments for this group, in the same "per-call mean, multiply by n to
     re-accumulate a sum across chunks" convention ``mse`` already uses --
     callers accumulating this across multiple calls (e.g.
-    ``_accum_value_by_outcome`` below) should do the same
+    ``_UpdateStats.accum_value_by_outcome`` in ppo_update.py) should do the same
     ``value * n``-then-divide-by-total-n dance for these two fields that
     they already do for ``mse``, then derive
     ``std = sqrt(max(target_mean_sq - target_mean**2, 0))`` once at the

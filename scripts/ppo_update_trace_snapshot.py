@@ -14,6 +14,9 @@ Usage (from the repo root):
     python scripts/ppo_update_trace_snapshot.py OUT.json
     python scripts/ppo_update_trace_snapshot.py --compare A.json B.json
 
+Set PPO_TRACE_ONLY=name1,name2 to run only some variants (e.g. for quick
+mutation checks; compare such a file only against one made the same way).
+
 Each variant also lists which log tags it produced ("coverage"), so it is
 visible which branches a "0 differences" result actually exercised.
 """
@@ -242,7 +245,10 @@ def _run_variant(name, cfg_over, attr_over, sched_over, drop_keys, separate, n_u
 
 def run() -> dict:
     record = {}
+    only = [v for v in os.environ.get("PPO_TRACE_ONLY", "").split(",") if v]
     for name, spec in _VARIANTS.items():
+        if only and name not in only:
+            continue
         levels = [("debug", logging.DEBUG)] + ([("info", logging.INFO)] if name in _INFO_ONLY else [])
         for lname, level in levels:
             key = f"{name}@{lname}"

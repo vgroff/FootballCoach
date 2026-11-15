@@ -600,8 +600,7 @@ class TestTrainSideMeansTrimmed:
     squared-error terms so >= 0). Distinct from "[held-out policy]"/
     "[held-out value]"'s own p10_p90=/p25_p75= (the HELD-OUT set's trimmed
     losses -- "val" is overloaded in this file between "value head" and
-    "held-out validation set", see _epoch_sample_value_loss's own comment
-    in ppo_trainer.py -- hence neither TRAIN-side line uses "val" as its
+    "held-out validation set", see _UpdateStats' docstring in ppo_update.py -- hence neither TRAIN-side line uses "val" as its
     tag at all)."""
 
     def test_logged_every_epoch_finite(self, trainer, multi_track_batch, caplog):

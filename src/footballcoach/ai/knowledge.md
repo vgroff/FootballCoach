@@ -2313,7 +2313,8 @@ module, moved verbatim in November 2026 with no behaviour change:
 | `action_sampling.py` | `ActionSamplingMixin` | action sampling, log-probs, entropy, value lookups |
 | `pretraining.py` | `PretrainingMixin` | `pretrain_combined`, `pretrain_value`, value-pretrain rollouts and workers |
 | `ppg.py` | `PPGMixin` | PPG value refit (standalone and interleaved), its KL anchor, `consistency_refit` |
-| `ppo_update.py` | `PPOUpdateMixin` | `_ppo_update`, held-out validation episodes, dual-clip and the ratio cap, the NaN guard |
+| `ppo_update.py` | `PPOUpdateMixin` | `_ppo_update` and its stages, held-out validation episodes, dual-clip and the ratio cap, the NaN guard |
+| `ppo_update_diagnostics.py` | `PPOUpdateDiagnosticsMixin` (base of `PPOUpdateMixin`) | the PPO update's logging-only lines: per-epoch summary, epoch-0 baseline, KL diagnostic block, end-of-update summary |
 
 Module-level helpers live in the one module that uses them; helpers used by
 several live in `trainer_common.py`, which also defines the shared
@@ -2321,6 +2322,23 @@ several live in `trainer_common.py`, which also defines the shared
 Helpers that construct a `PPOTrainer` (e.g. `trainer_eval.rebuild_inference_trainer`)
 import it lazily inside the function, since `ppo_trainer.py` imports their
 module.
+
+`_ppo_update` itself (restructured 2026-11-15, previously one ~2,000-line
+method) is a short orchestrator over named stages: `_ppo_prepare_batch`
+(held-out split, augmentation, cached physics features, exact old
+log-probs), `_ppo_update_context` (schedules, normalised advantages,
+opportunity masks; returns an `_UpdateContext`), `_ppo_pre_update_value_loss`,
+`_ppo_run_epochs` -> `_ppo_minibatch_step` (forward, `_ppo_policy_loss`,
+`_ppo_head_counterfactual_policy_loss`, `_ppo_value_loss`, `_dir_spread_reg`,
+`_ppo_bc_aux_loss`, `_ppo_backward_and_step`, `_ppo_after_step`), the
+value-only and BC-only continuations, then the diagnostics and
+`_ppo_update_metrics`. Everything accumulated for logs and metrics lives in
+one `_UpdateStats`. The pieces are unit-tested in
+`tests/ai_unit/test_ppo_update_parts.py`. For any change to this method, run
+`scripts/ppo_update_trace_snapshot.py` before and after: it runs the update
+under variants that reach every branch (including value dropout, which
+makes the order of network calls visible through the RNG) and must report 0
+differences for a pure refactor.
 
 For further moves, `scripts/split_module.py` does the AST-based move and
 `scripts/fix_moved_imports.py` repoints importers. `scripts/golden_snapshot.py`

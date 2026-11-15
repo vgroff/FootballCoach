@@ -32,9 +32,6 @@ as you go.
   including `train_ball_dynamics.py` (4,329) and `train_player_dynamics.py`
   (2,977), added after the original review. Deferred by the user
   (2026-11-15): give it its own pass before refactoring it.
-- **#1 `_ppo_update` is one ~2,000-line method** (`ppo/ppo_update.py`). The
-  rest of the old `ppo_trainer.py` god object is split (see Closed). Splitting
-  this method is in progress as of 2026-11-15.
 - **#2/#3 Large mixed-purpose modules.** `env/scenario_env.py` (about 1,020
   lines) still combines the step/reset API, reward glue, observation
   orchestration and BC-label wiring; `ppo/bc.py` (about 1,480 lines) combines
@@ -56,8 +53,15 @@ as you go.
 ### Structure
 - **#1 `ppo_trainer.py` god object:** split into mixin modules (see
   `ai/knowledge.md`, "PPOTrainer module layout"), checked bit-identical with
-  the golden snapshot. 11,982 → about 2,080 lines. Only `_ppo_update` is left
-  (see Open).
+  the golden snapshot. 11,982 → about 2,080 lines.
+- **#1 `_ppo_update` as one ~2,000-line method (2026-11-15):** now a short
+  orchestrator over named stages, with an `_UpdateContext`/`_UpdateStats`
+  pair instead of ~60 locals, and the logging-only diagnostics moved to
+  `ppo_update_diagnostics.py`. Verified bit-identical with
+  `scripts/ppo_update_trace_snapshot.py` (0 differences over 15 variant runs;
+  8 injected mutations all detected, including a reordered network call caught
+  only through value dropout's RNG use) and the golden snapshot. Pieces
+  unit-tested in `tests/ai_unit/test_ppo_update_parts.py`.
 - **#4 Inconsistent package granularity:** new code has been added as
   focused modules, and the trainer split removed the main outlier.
 - **#7 Hand-copied trainee/secondary state in `scenario_env.py`
