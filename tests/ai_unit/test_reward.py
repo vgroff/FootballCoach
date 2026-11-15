@@ -12,14 +12,15 @@ from footballcoach.ai.env.reward import (
     EMAFilter,
     phase1_reward,
     phase1_terminal_reward_only,
-    phase2_reward,
+    terminal_outcome_reward,
+    validate_terminal_reward_table,
 )
 
 # Load the actual coefficients from config so the tests stay in sync
 from footballcoach.ai.config import load_ai_config
 
 _CFG1 = load_ai_config()["reward"]["phase1"]
-_CFG2 = load_ai_config()["reward"]["phase2"]
+_PHASE2_TABLE = load_ai_config()["reward"]["phase2"]["terminal"]
 
 
 # ---------------------------------------------------------------------------
@@ -336,111 +337,6 @@ class TestApprAndProgShaping:
 
 
 # ---------------------------------------------------------------------------
-# phase2_reward
-# ---------------------------------------------------------------------------
-
-class TestPhase2Reward:
-
-    def test_zero_when_nothing_happens(self):
-        r = phase2_reward(
-            shot_taken_this_step=False, ticks_since_episode_start=0,
-            max_episode_ticks=1000, shot_on_target=False,
-            goal_scored=False, illegal_action_attempted=False,
-            possession_lost_to_keeper=False, cfg=_CFG2,
-        )
-        assert r == pytest.approx(0.0, abs=1e-7)
-
-    def test_shot_taken_gives_positive_reward(self):
-        r = phase2_reward(
-            shot_taken_this_step=True, ticks_since_episode_start=0,
-            max_episode_ticks=1000, shot_on_target=False,
-            goal_scored=False, illegal_action_attempted=False,
-            possession_lost_to_keeper=False, cfg=_CFG2,
-        )
-        assert r > 0.0
-
-    def test_faster_shot_rewarded_more(self):
-        r_fast = phase2_reward(
-            shot_taken_this_step=True, ticks_since_episode_start=0,
-            max_episode_ticks=1000, shot_on_target=False,
-            goal_scored=False, illegal_action_attempted=False,
-            possession_lost_to_keeper=False, cfg=_CFG2,
-        )
-        r_slow = phase2_reward(
-            shot_taken_this_step=True, ticks_since_episode_start=500,
-            max_episode_ticks=1000, shot_on_target=False,
-            goal_scored=False, illegal_action_attempted=False,
-            possession_lost_to_keeper=False, cfg=_CFG2,
-        )
-        assert r_fast > r_slow
-
-    def test_shot_on_target_extra_bonus(self):
-        r_off = phase2_reward(
-            shot_taken_this_step=True, ticks_since_episode_start=0,
-            max_episode_ticks=1000, shot_on_target=False,
-            goal_scored=False, illegal_action_attempted=False,
-            possession_lost_to_keeper=False, cfg=_CFG2,
-        )
-        r_on = phase2_reward(
-            shot_taken_this_step=True, ticks_since_episode_start=0,
-            max_episode_ticks=1000, shot_on_target=True,
-            goal_scored=False, illegal_action_attempted=False,
-            possession_lost_to_keeper=False, cfg=_CFG2,
-        )
-        assert r_on > r_off
-        assert (r_on - r_off) == pytest.approx(_CFG2["shot_on_target_bonus"], rel=1e-5)
-
-    def test_goal_gives_max_reward(self):
-        r = phase2_reward(
-            shot_taken_this_step=True, ticks_since_episode_start=0,
-            max_episode_ticks=1000, shot_on_target=True,
-            goal_scored=True, illegal_action_attempted=False,
-            possession_lost_to_keeper=False, cfg=_CFG2,
-        )
-        assert r >= _CFG2["goal_terminal"]
-
-    def test_no_shot_no_shot_bonus(self):
-        """Without shot_taken=True, shot-related bonuses must not appear."""
-        r_goal_no_shot = phase2_reward(
-            shot_taken_this_step=False, ticks_since_episode_start=0,
-            max_episode_ticks=1000, shot_on_target=True,
-            goal_scored=True, illegal_action_attempted=False,
-            possession_lost_to_keeper=False, cfg=_CFG2,
-        )
-        assert r_goal_no_shot == pytest.approx(0.0, abs=1e-7)
-
-    def test_illegal_action_penalty(self):
-        r = phase2_reward(
-            shot_taken_this_step=False, ticks_since_episode_start=0,
-            max_episode_ticks=1000, shot_on_target=False,
-            goal_scored=False, illegal_action_attempted=True,
-            possession_lost_to_keeper=False, cfg=_CFG2,
-        )
-        assert r == pytest.approx(_CFG2["illegal_action_penalty"], rel=1e-5)
-
-    def test_possession_lost_penalty(self):
-        r = phase2_reward(
-            shot_taken_this_step=False, ticks_since_episode_start=0,
-            max_episode_ticks=1000, shot_on_target=False,
-            goal_scored=False, illegal_action_attempted=False,
-            possession_lost_to_keeper=True, cfg=_CFG2,
-        )
-        assert r == pytest.approx(_CFG2["possession_lost_to_keeper_penalty"], rel=1e-5)
-
-    def test_very_late_shot_minimal_speed_bonus(self):
-        """Shot at the last tick: time bonus should be ≈ 0 (capped at 0)."""
-        r = phase2_reward(
-            shot_taken_this_step=True, ticks_since_episode_start=999,
-            max_episode_ticks=1000, shot_on_target=False,
-            goal_scored=False, illegal_action_attempted=False,
-            possession_lost_to_keeper=False, cfg=_CFG2,
-        )
-        # Only shot_on_target bonus is absent; time bonus ≈ 0
-        # But should still be >= 0 (max(0, ...) in formula)
-        assert r >= 0.0
-
-
-# ---------------------------------------------------------------------------
 # EMAFilter (attack/defence smoothing)
 # ---------------------------------------------------------------------------
 
@@ -584,3 +480,33 @@ class TestPhase1TerminalRewardOnly:
             **{**self._NEUTRAL, "cfg": cfg, "ball_went_out_after_touch": True},
         )
         assert comps["out"] == pytest.approx(-0.2)
+
+
+# ---------------------------------------------------------------------------
+# terminal_outcome_reward (role-based phases)
+# ---------------------------------------------------------------------------
+
+class TestTerminalOutcomeReward:
+
+    def test_reads_the_role_and_outcome_entry(self):
+        table = {"attacker": {"goal": 4.0}, "defender": {"goal": -4.0}}
+        assert terminal_outcome_reward(table, "attacker", "goal") == (4.0, {"terminal": 4.0})
+        assert terminal_outcome_reward(table, "defender", "goal") == (-4.0, {"terminal": -4.0})
+
+    @pytest.mark.parametrize("role,outcome", [("keeper", "goal"), ("attacker", "corner")])
+    def test_missing_entry_raises(self, role, outcome):
+        with pytest.raises(KeyError, match=repr(outcome) if role == "attacker" else repr(role)):
+            terminal_outcome_reward({"attacker": {"goal": 4.0}}, role, outcome)
+
+    def test_validate_rejects_missing_and_unknown_outcomes(self):
+        validate_terminal_reward_table({"a": {"goal": 1, "_comment": "x"}}, ["a"], ["goal"])
+        with pytest.raises(ValueError, match="missing"):
+            validate_terminal_reward_table({"a": {}}, ["a"], ["goal"])
+        with pytest.raises(ValueError, match="unknown"):
+            validate_terminal_reward_table({"a": {"goal": 1, "gaol": 2}}, ["a"], ["goal"])
+        with pytest.raises(ValueError, match="no role"):
+            validate_terminal_reward_table({}, ["a"], ["goal"])
+
+    def test_the_configured_phase2_table_is_complete(self):
+        from footballcoach.ai.env.outcome import ATTACK_DEFENCE_OUTCOME_KEYS
+        validate_terminal_reward_table(_PHASE2_TABLE, ["attacker", "defender", "goalkeeper"], ATTACK_DEFENCE_OUTCOME_KEYS)

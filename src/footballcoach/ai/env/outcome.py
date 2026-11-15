@@ -263,3 +263,74 @@ def remap_phase1_outcome(
     if outcome == "miss" and last_ball_toucher_id is None:
         return "invalid"
     return outcome
+
+
+# ---------------------------------------------------------------------------
+# Attack-vs-defence phases (phase 2: 1v2, and any later N-vs-M variant)
+# ---------------------------------------------------------------------------
+
+# Every outcome classify_attack_defence_outcome() can return, in display order.
+# Reward tables (ai_config.json reward.<phase>.terminal[role]) must list each.
+ATTACK_DEFENCE_OUTCOME_KEYS: tuple[str, ...] = (
+    "goal",
+    "saved",
+    "defence_possession",
+    "shot_off_target",
+    "attacker_out",
+    "timeout",
+)
+
+# The raw detect_trial_outcome() keys that end an attack-vs-defence trial
+# (ScenarioLoop.terminal_outcomes); timeout is the env's own.
+ATTACK_DEFENCE_TERMINAL_RAW_OUTCOMES: frozenset = frozenset({"goal", "saved", "dispossessed", "miss"})
+
+
+def classify_attack_defence_outcome(raw_outcome: str, final_match: Match, *, attacking_team: Team) -> str:
+    """Map a trial's raw outcome and its final tick to the attack-vs-defence
+    vocabulary (ATTACK_DEFENCE_OUTCOME_KEYS). Team-based, not id-based, so it
+    holds for any number of attackers and defenders.
+
+    - "goal": the scoreboard changed.
+    - "saved" / "defence_possession": a defending goalkeeper / outfield player
+      has the ball. A clearance always starts with the defender taking
+      possession, so it lands here before the ball can go out.
+    - Ball out: if a defender was the last to possess it, the same split as
+      above. Otherwise the attacking side put it out: "shot_off_target" when
+      the ball is loose and over the goal line being attacked, "attacker_out"
+      for anything else (dribbled out, kicked over a touchline).
+    - "timeout" is passed through (the env's own clock).
+
+    "Last to possess" is Ball.last_touched_by_player_id, which only possession
+    writes; a deflection off a grounded player does not change it, so such a
+    ball going out is attributed to whoever last had it.
+
+    Raises ValueError for a raw outcome this vocabulary has no answer for, and
+    for an attacking-team player holding the ball at a "saved"/"dispossessed"
+    end: detect_trial_outcome() reports a teammate's reception as "saved", so
+    a phase with several attackers must first stop that from ending a trial.
+    """
+    if raw_outcome in ("goal", "timeout"):
+        return raw_outcome
+    ball = final_match.ball
+    if raw_outcome in ("saved", "dispossessed"):
+        holder = final_match.player_by_id_or_none(ball.possessed_by)
+        if holder is None or holder.team == attacking_team:
+            raise ValueError(
+                f"raw outcome {raw_outcome!r} with the ball held by {ball.possessed_by!r}, "
+                "not a defending player"
+            )
+        return "saved" if holder.is_goalkeeper else "defence_possession"
+    if raw_outcome == "miss":
+        toucher = final_match.player_by_id_or_none(ball.last_touched_by_player_id)
+        if toucher is None:
+            raise ValueError("ball went out but nobody has possessed it this trial")
+        if toucher.team != attacking_team:
+            return "saved" if toucher.is_goalkeeper else "defence_possession"
+        half_length = final_match.pitch.half_length
+        over_attacked_goal_line = (
+            ball.position.x > half_length if attacking_team == Team.LEFT else ball.position.x < -half_length
+        )
+        if over_attacked_goal_line and ball.possessed_by is None:
+            return "shot_off_target"
+        return "attacker_out"
+    raise ValueError(f"no attack/defence outcome for raw outcome {raw_outcome!r}")

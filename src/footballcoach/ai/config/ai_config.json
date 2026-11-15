@@ -223,6 +223,15 @@
     "_comment_ent_kick_dir_z_only_weight": "Same pattern, for kick_dir_z_log_std (the elevation component) specifically -- see ent_kick_dir_azimuth_only_weight's comment for the split's full backstory. 1.0 (off) for run 309: kick_dir_z_log_std's sigma grew substantially over run 308 (0.25 -> 0.52, ang std 14 -> 30 degrees) partly under the old combined weight's accidental push, so that growth isn't a clean signal of what z 'should' do -- rather than immediately fighting it with a new deliberate z-directed weight, run 309 resets the value (see kick_dir_z_value_reset.py in the scratchpad, target ang std ~20 degrees / log_std~=-1.05, picked by the user as 'not too low either' -- a middle point, not all the way back to the from-scratch init's ~18 degrees) and Adam state, then watches z's UNBOOSTED, honestly-accounted behavior before deciding whether it needs its own pressure at all."
   },
   "curriculum": {
+    "phase2": {
+      "_comment": "Phase 2 (1v2) env settings, read by curriculum/envs.py's role-based env builder. controllers: per role, unnormalised weights over 'rules' / 'neural', rolled independently per role at every reset. All-rules episodes have no neural player, so they work for playthroughs and evals but produce no training rows; training needs at least one role able to roll neural (the plan: attacker + defender neural, goalkeeper rules; goalkeeper neural later).",
+      "max_episode_s": 15.0,
+      "controllers": {
+        "attacker":   {"rules": 1, "neural": 0},
+        "defender":   {"rules": 1, "neural": 0},
+        "goalkeeper": {"rules": 1, "neural": 0}
+      }
+    },
     "phase1_max_episode_s": 22,
     "phase1_max_episode_s_variability": 10.0,
     "_comment_phase1_max_episode_s_variability": "Extra seconds, uniformly sampled in [0, this], ADDED to phase1_max_episode_s EACH EPISODE (see ScenarioEnv.max_episode_s_variability_s) -- never subtracted, so episodes are never shorter than phase1_max_episode_s. Added 2026-10-14, set to 10.0 2026-10-15 (user's call, picking the upper end of the 5-10s range discussed): episodes now range 22-32s (up to ~45% longer at the ceiling, ~23% longer on average) -- never shorter, so a losing player can't reliably time a 'retreat and force a timeout' strategy against a fixed, known episode length. Does not hide the live clock mid-episode (time_remaining is still an exact, real-time-computed observation feature every tick, see obs/encoder.py) -- the main effect is preventing the value/policy from learning an overly crisp, memorized-constant horizon across episodes, not blinding the agent during play. 0.0 = every episode gets exactly phase1_max_episode_s, bit-identical to before this knob existed.",
@@ -408,11 +417,12 @@
       "_note_removed_2026_10_14": "A large set of debugging-era reward knobs (ball_retreat_penalty, ball_approach_speed_bonus/ball_retreat_speed_penalty + their reward clamps, heading_penalty_coef/exponent/min_speed_mps, stamina_sprint_penalty, gain_possession_bonus, ball_progress_scale's old reward clamp, illegal_action_penalty, tackle_armed_penalty_per_second + its possessing multiplier + tackle_attempt_bonus_multiplier, kick_armed_penalty_per_second + kick_attempt_bonus_multiplier, loss_of_possession_penalty, proximity_bonus_scale, step_penalty) were removed entirely -- every one of them was either coefficient 0.0 (no effect) or a multiplier/clamp gating a term that was itself 0.0 (no effect either way). ball_approach_bonus/ball_progress_scale themselves were re-introduced the same day in a cleaned-up, single-coefficient, provably-telescoping form -- see the comments above and reward.py."
     },
     "phase2": {
-      "shot_speed_bonus_max": 1.0,
-      "shot_on_target_bonus": 2.0,
-      "goal_terminal": 10.0,
-      "illegal_action_penalty": -0.2,
-      "possession_lost_to_keeper_penalty": -0.5
+      "_comment": "Phase 2 (1v2: attacker vs defender + goalkeeper) pays ONLY terminal rewards, one table per role, keyed by the outcome from ai/env/outcome.py's classify_attack_defence_outcome (goal / saved / defence_possession / shot_off_target / attacker_out / timeout). Every role must list every outcome (a missing entry raises). Placeholder values (2026-11-15): the defending-team entries follow the user's first sketch, with defence_possession paid most to the defender and saved most to the goalkeeper; attacker_out (dribbling or kicking the ball out anywhere other than over the attacked goal line) is the heavy attacker failure.",
+      "terminal": {
+        "attacker":   {"goal": 4.0,  "saved": 1.0, "defence_possession": -2.0, "shot_off_target": -2.0, "attacker_out": -4.0, "timeout": -1.0},
+        "defender":   {"goal": -4.0, "saved": 1.0, "defence_possession": 3.0,  "shot_off_target": 2.0,  "attacker_out": 2.0,  "timeout": 1.0},
+        "goalkeeper": {"goal": -4.0, "saved": 2.0, "defence_possession": 1.0,  "shot_off_target": 2.0,  "attacker_out": 2.0,  "timeout": 1.0}
+      }
     }
   },
   "phase1_scenario": {

@@ -26,9 +26,21 @@ class CurriculumPhase:
             max_episode_s, etc.).
         frozen_heads: List of decision-network head names to freeze during
             this phase (weights not updated).  Empty list = all heads unfrozen.
-        reward_phase: Which reward function to use (1 or 2, matching
-            env/reward.py's phase1_reward / phase2_reward).
+        reward_phase: Which reward function to use. Phase 1 uses
+            env/reward.py's phase1_reward; role-based phases ignore it.
         description: Narrative description for logging/debugging.
+        roles: player_id -> role (e.g. "attacker", "defender",
+            "goalkeeper"). Non-empty makes this a ROLE-BASED phase, built by
+            curriculum/envs.py's build_role_env as an ai/env/role_env.py
+            RoleScenarioEnv: controllers rolled per role, terminal-only
+            rewards from a per-role table. Phase 1 leaves it empty and keeps
+            its own builder. The order is the order the episode's trainee is
+            chosen in (first neural player).
+        config_key: section name under ai_config.json ``curriculum`` (env
+            settings: max_episode_s, controllers) and ``reward`` (the
+            ``terminal`` table) for a role-based phase.
+        outcome_kind: which outcome vocabulary / classifier a role-based
+            phase uses (curriculum/envs.py OUTCOME_KINDS).
     """
     name: str
     phase_id: int
@@ -37,6 +49,13 @@ class CurriculumPhase:
     frozen_heads: list[str] = field(default_factory=list)
     reward_phase: int = 1
     description: str = ""
+    roles: dict[str, str] = field(default_factory=dict)
+    config_key: str = ""
+    outcome_kind: str = ""
+
+    @property
+    def is_role_based(self) -> bool:
+        return bool(self.roles)
 
 
 # ---------------------------------------------------------------------------
@@ -83,19 +102,28 @@ PHASE_1_GET_POSSESSION = CurriculumPhase(
     ),
 )
 
-PHASE_2_SHOOT = CurriculumPhase(
-    name="phase2_shoot",
+def _role_phase_max_episode_s(config_key: str) -> float:
+    return float(load_ai_config()["curriculum"][config_key]["max_episode_s"])
+
+
+PHASE_2_1V2 = CurriculumPhase(
+    name="phase2_1v2",
     phase_id=2,
-    scenario_key="penalty",
-    env_kwargs={
-        "max_episode_s": 60.0,
-    },
-    frozen_heads=[],  # All heads active; shoot-probability head specifically rewarded
+    scenario_key="1v2",
+    env_kwargs={"max_episode_s": _role_phase_max_episode_s("phase2")},
+    # Same frozen heads as phase 1 (shooting uses the execution kick head), so
+    # phases 1 and 2 can share one PPO update's head mask when trained together.
+    frozen_heads=list(PHASE_1_GET_POSSESSION.frozen_heads),
     reward_phase=2,
     description=(
-        "Shooting scenarios (empty goal, GK, static defender): learn to shoot "
-        "quickly and accurately.  GK remains rules-based."
+        "1v2: an attacker on the ball against a defender and a goalkeeper. "
+        "Terminal-only rewards per role (ai_config.json reward.phase2.terminal); "
+        "each role's controller (rules / neural) is rolled per episode from "
+        "curriculum.phase2.controllers."
     ),
+    roles={"attacker": "attacker", "defender": "defender", "keeper": "goalkeeper"},
+    config_key="phase2",
+    outcome_kind="attack_defence",
 )
 
 # Future phases (stubs for reference, not yet implemented):
@@ -117,7 +145,7 @@ PHASE_4_TACKLING = CurriculumPhase(
 
 ALL_PHASES: list[CurriculumPhase] = [
     PHASE_1_GET_POSSESSION,
-    PHASE_2_SHOOT,
+    PHASE_2_1V2,
     PHASE_3_PASSING,
     PHASE_4_TACKLING,
 ]

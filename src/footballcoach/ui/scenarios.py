@@ -873,9 +873,16 @@ def build_1v2_scenario(
     gk_start_jitter_m: float = 1.0,
     move_fraction_min: float = 0.25,
     move_fraction_max: float = 0.50,
+    sim_dt_s: float = 1.0 / 30.0,
+    seed: int | None = None,
 ) -> Match:
-    """1v2: elite attacker vs. average defender + GK."""
-    rng = random.Random()
+    """1v2: elite attacker vs. average defender + GK.
+
+    ``seed``: when given, positions, the move target and every later physics
+    draw from the Match's own rng are deterministic for that seed (training
+    replay and seeded evals). ``None`` (default, the UI) draws an unseeded rng,
+    as before. ``sim_dt_s`` is the physics tick, as for build_1v1_scenario."""
+    rng = random.Random(seed)
     pitch = Pitch.standard()
     min_gap = 2.0 * 0.3 + 0.5
     goal_centre = pitch.right_goal_centre
@@ -930,6 +937,7 @@ def build_1v2_scenario(
         pitch=pitch, players=[attacker, defender, gk],
         ball=ball, rng_reduction=rng_reduction, rng=rng,
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
+        dt_s=sim_dt_s,
     )
 
     attacker.current_order = MoveOrder(target_position=move_target, sprint=True)
@@ -2403,6 +2411,10 @@ class ScenarioLoop:
     # None for non-phase-1 scenarios. Read by the UI during linger; see
     # ai/env/reward.py's phase1_terminal_reward_only().
     _pending_terminal_rewards: dict[str, float] | None = field(default=None, init=False, repr=False)
+    last_outcome: str | None = field(default=None, init=False)
+    """The outcome key (after outcome_remap) of the most recently completed
+    trial; None before any trial has completed. Set at the same moment
+    ``outcomes`` is incremented, so it is valid as soon as step() returns True."""
 
     def __post_init__(self) -> None:
         # Pre-seed every raw outcome key at 0 so consumers (app.py's HUD
@@ -2552,6 +2564,7 @@ class ScenarioLoop:
             self._linger_remaining_s -= self._match.dt_s
             if self._linger_remaining_s <= 0.0:
                 self.outcomes[self._pending_outcome] = self.outcomes.get(self._pending_outcome, 0) + 1
+                self.last_outcome = self._pending_outcome
                 self._trial_count += 1
                 self._last_completed_trial_match = self._match
                 if not self.complete:
@@ -2592,6 +2605,7 @@ class ScenarioLoop:
                 self._linger_remaining_s = linger
                 return False
             self.outcomes[outcome] = self.outcomes.get(outcome, 0) + 1
+            self.last_outcome = outcome
             self._trial_count += 1
             self._last_completed_trial_match = self._match
             if not self.complete:

@@ -289,45 +289,33 @@ def phase1_terminal_reward_only(
     )
 
 
-def phase2_reward(
-    shot_taken_this_step: bool,
-    ticks_since_episode_start: int,
-    max_episode_ticks: int,
-    shot_on_target: bool,
-    goal_scored: bool,
-    illegal_action_attempted: bool,
-    possession_lost_to_keeper: bool,
-    cfg: dict,
-) -> float:
-    """Shoot experiment reward (curriculum phase 2).
+def terminal_outcome_reward(table: dict, role: str, outcome: str) -> tuple[float, dict[str, float]]:
+    """Terminal-only reward for role-based phases (phase 2+): the entry for
+    (role, outcome) in ``table`` (ai_config.json ``reward.<phase>.terminal``),
+    as ``(reward, {"terminal": reward})``. A missing role or outcome raises
+    KeyError, so a new outcome cannot silently pay 0."""
+    try:
+        value = float(table[role][outcome])
+    except KeyError:
+        raise KeyError(f"terminal reward table has no entry for role {role!r}, outcome {outcome!r}") from None
+    return value, {"terminal": value}
 
-    See ai_design_doc.md section 10.2.
 
-    Args:
-        shot_taken_this_step: Player kicked toward goal this step.
-        ticks_since_episode_start: Engine ticks elapsed since episode start
-            (used for the "faster shot = better" decay).
-        max_episode_ticks: Total episode length in ticks.
-        shot_on_target: Shot would reach the goal (not blocked/wide).
-        goal_scored: Ball crossed the goal line this step.
-        illegal_action_attempted: Illegal action flag from apply_nn_action.py.
-        possession_lost_to_keeper: Keeper caught/saved the ball.
-        cfg: The 'reward.phase2' section of ai_config.json.
-    """
-    r = 0.0
-    if shot_taken_this_step:
-        # Faster shots rewarded more - linearly decaying bonus
-        time_fraction = ticks_since_episode_start / max(max_episode_ticks, 1)
-        r += cfg["shot_speed_bonus_max"] * max(0.0, 1.0 - time_fraction)
-        if shot_on_target:
-            r += cfg["shot_on_target_bonus"]
-        if goal_scored:
-            r += cfg["goal_terminal"]
-    if illegal_action_attempted:
-        r += cfg["illegal_action_penalty"]
-    if possession_lost_to_keeper:
-        r += cfg["possession_lost_to_keeper_penalty"]
-    return r
+def validate_terminal_reward_table(table: dict, roles, outcomes) -> None:
+    """Raise ValueError unless ``table`` has a numeric entry for every
+    (role, outcome) pair, and nothing else (a typo'd outcome would otherwise
+    sit there unused)."""
+    for role in roles:
+        if role not in table:
+            raise ValueError(f"terminal reward table has no role {role!r}")
+        keys = {k for k in table[role] if not k.startswith("_")}
+        missing, extra = set(outcomes) - keys, keys - set(outcomes)
+        if missing or extra:
+            raise ValueError(
+                f"terminal reward table for role {role!r}: missing {sorted(missing)}, unknown {sorted(extra)}"
+            )
+        for k in outcomes:
+            float(table[role][k])
 
 
 class EMAFilter:

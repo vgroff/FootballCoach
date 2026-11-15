@@ -1402,24 +1402,62 @@ phase 1 → index 0) via `ScenarioEnv._get_obs()`/`_encode_obs_for_player()`,
 which pass `self.phase` through automatically. `phase=None` or an
 out-of-range value yields an all-zero one-hot (no error).
 
-There is currently **no mixed-multi-phase training loop** that would ever
-populate this with more than one non-zero pattern within a single training
-run — treat any gradient signal through it as currently uninformative
-(constant within a run). Wiring real multi-phase rollout mixing is a
-separate, larger workstream, not yet planned in detail.
+Until phases are mixed within one run (planned:
+`agent_plans/phase2_1v2_plan.md`, stage 2) every row of a run has the same
+pattern, so any gradient through it is uninformative. Role-based envs pass
+their own phase id, so phase 2 rows set `task_id_1`.
 
-## Curriculum phases (MVP)
+## Curriculum phases
 
-- **Phase 1** (`--phase 1`): 1v1 get-possession/move.  Rewards: closing
-  ball distance, gaining possession, progressing toward opponent box.
-  Episode ends when trainee reaches opponent box with ball, or 2-minute timeout.
-- **Phase 2** (`--phase 2`): Shooting (penalty / keeper / static defender).
-  Rewards: time-to-shoot decay, on-target bonus, goal terminal (+10).
-  GK remains rules-based throughout.
+- **Phase 1** (`--phase 1`, `PHASE_1_GET_POSSESSION`): 1v1 get-possession and
+  carry toward the opponent box, built by `curriculum/envs.py`'s
+  `_build_phase1_env` as a plain `ScenarioEnv`. Rewards: `phase1_reward`
+  (box terminal, loss, timeout, ball out, potential-based approach/progress
+  shaping). A goal counts as the ball going out.
+- **Phase 2** (`--phase 2`, `PHASE_2_1V2`, 2026-11-15): the UI's 1v2 (attacker
+  on the ball vs defender + goalkeeper). A **role-based phase**, see below.
+  Plan and status: `agent_plans/phase2_1v2_plan.md`.
 
-Both use existing `ui/scenarios.py` scenario builders - no separate
-training-only scenario code.  Add new training scenarios directly to
-`ui/scenarios.py` so they're also available in the UI for visual inspection.
+Scenario builders live in `ui/scenarios.py` (no training-only scenario code),
+so every training scenario can be watched in the UI. Note the tick length:
+training envs run at `observation.sim_dt_s` (0.04 s), the UI at 1/30 s, so
+outcome rates differ between the two (1v2 with rules AIs: about 40% goals in
+training vs 34% in the UI, same seeds; an independent 0.04 s loop reproduces
+the env trial for trial).
+
+## Role-based phases (phase 2 onward)
+
+A `CurriculumPhase` with non-empty `roles` (player_id -> role) is built by
+`curriculum/envs.py`'s `build_role_env` as an `ai/env/role_env.py`
+`RoleScenarioEnv`. Everything that varies is data:
+
+- `scenario_key`: the `ui/scenarios.py` SCENARIOS entry. Its builder must
+  accept `seed` and `sim_dt_s` and start with a player on the ball (that
+  player's team is the attacking team).
+- `config_key`: `ai_config.json curriculum[<key>]` holds `max_episode_s` and
+  `controllers` (per role, weights over `rules` / `neural`, rolled at every
+  reset; seeded resets seed the roll too). `reward[<key>].terminal` holds one
+  terminal-reward table per role, which must list every outcome.
+- `outcome_kind`: an `envs.OUTCOME_KINDS` entry giving the outcome vocabulary,
+  the classifier and the raw outcomes that end a trial. `attack_defence`
+  (`outcome.classify_attack_defence_outcome`): goal / saved /
+  defence_possession / shot_off_target / attacker_out / timeout. It is
+  team-based, so it also fits N-vs-M. It raises when an attacking-team
+  player holds the ball at a "saved" end: `detect_trial_outcome` reports a
+  teammate's reception as "saved" (the UI's 2v2 ends every trial that way),
+  which must be fixed before a phase with several attackers.
+
+Rewards are terminal only. Trainer contract: the episode's trainee is its
+first neural player in role order and the other neural players are
+secondaries (both re-chosen each reset), so the training loops need no
+role-specific code. An all-rules episode has no neural player: playthroughs
+and evals only. `env.controller_overrides` pins roles (evals);
+`env.episode_tag` / `StepInfo.episode_tag` names the phase and controller
+mix (e.g. `phase2_1v2[attacker=neural,defender=neural,goalkeeper=rules]`).
+
+`scripts/phase2_rules_playthrough.py` plays a role-based phase with every
+role on its rules AI through the real env and prints the outcome mix and each
+role's mean terminal reward. Tests: `tests/ai_scenario/test_phase2_role_env.py`.
 
 ## Episode-seed replay's advantage ranking now includes self-play secondary rows
 

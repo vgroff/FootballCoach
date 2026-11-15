@@ -4,7 +4,10 @@ Single source of truth for all phase → ScenarioEnv mappings. Used by both
 the training script (train.py) and the demonstration recorder
 (record_demonstrations.py), so there is no duplication between them.
 
-Add a new elif branch here when adding a new phase.
+A role-based phase (CurriculumPhase.roles non-empty: phase 2 onward) needs no
+code here: build_role_env reads its scenario, controllers, reward table and
+outcome vocabulary from the phase definition and ai_config.json. A new
+outcome vocabulary is one OUTCOME_KINDS entry.
 """
 from __future__ import annotations
 
@@ -14,13 +17,62 @@ from footballcoach.ai.curriculum.phases import CurriculumPhase
 
 
 def build_env(phase: CurriculumPhase):
-    """Build a ScenarioEnv for *phase*."""
+    """Build the training env for *phase*: phase 1's ScenarioEnv, or a
+    RoleScenarioEnv for any role-based phase."""
+    if phase.is_role_based:
+        return build_role_env(phase)
     if phase.phase_id == 1:
         return _build_phase1_env(phase)
-    elif phase.phase_id == 2:
-        return _build_phase2_env(phase)
-    else:
-        raise NotImplementedError(f"Phase {phase.phase_id} not yet implemented")
+    raise NotImplementedError(f"Phase {phase.phase_id} not yet implemented")
+
+
+def _attack_defence_outcomes():
+    from footballcoach.ai.env.outcome import (
+        ATTACK_DEFENCE_OUTCOME_KEYS,
+        ATTACK_DEFENCE_TERMINAL_RAW_OUTCOMES,
+        classify_attack_defence_outcome,
+    )
+    return ATTACK_DEFENCE_OUTCOME_KEYS, classify_attack_defence_outcome, ATTACK_DEFENCE_TERMINAL_RAW_OUTCOMES
+
+
+# outcome_kind -> () -> (outcome keys incl. "timeout", classifier, raw outcomes that end a trial)
+OUTCOME_KINDS: dict[str, Callable] = {
+    "attack_defence": _attack_defence_outcomes,
+}
+
+
+def build_role_env(phase: CurriculumPhase, *, controller_weights: Optional[dict] = None):
+    """RoleScenarioEnv for a role-based *phase*: scenario from
+    ``phase.scenario_key`` (ui/scenarios.py SCENARIOS), env settings from
+    ``ai_config.json curriculum[phase.config_key]``, the terminal reward table
+    from ``reward[phase.config_key].terminal``. ``controller_weights``
+    replaces the configured per-role weights (e.g. for a playthrough)."""
+    from footballcoach.ai.config import load_ai_config
+    from footballcoach.ai.env.role_env import RoleScenarioEnv
+    from footballcoach.ui.scenarios import SCENARIOS
+
+    if not phase.is_role_based:
+        raise ValueError(f"{phase.name} is not a role-based phase")
+    if phase.outcome_kind not in OUTCOME_KINDS:
+        raise ValueError(f"{phase.name}: unknown outcome_kind {phase.outcome_kind!r}; known: {sorted(OUTCOME_KINDS)}")
+    by_key = {d.key: d for d in SCENARIOS}
+    if phase.scenario_key not in by_key:
+        raise ValueError(f"{phase.name}: no scenario {phase.scenario_key!r} in ui/scenarios.py SCENARIOS")
+    cfg = load_ai_config()
+    env_cfg = cfg["curriculum"][phase.config_key]
+    outcome_keys, classify, terminal_raw = OUTCOME_KINDS[phase.outcome_kind]()
+    return RoleScenarioEnv(
+        definition=by_key[phase.scenario_key],
+        roles=phase.roles,
+        controller_weights=controller_weights if controller_weights is not None else env_cfg["controllers"],
+        reward_table=cfg["reward"][phase.config_key]["terminal"],
+        outcome_keys=outcome_keys,
+        classify_outcome=classify,
+        terminal_raw_outcomes=terminal_raw,
+        phase=phase.phase_id,
+        phase_name=phase.name,
+        **phase.env_kwargs,
+    )
 
 
 def bc_label_fn_for_phase(phase_id: int) -> Optional[Callable]:
@@ -145,23 +197,5 @@ def _build_phase1_env(phase: CurriculumPhase):
         trainee_player_id="trainee",
         phase=1,
         secondary_player_ids=["opponent"],
-        **phase.env_kwargs,
-    )
-
-
-def _build_phase2_env(phase: CurriculumPhase):
-    from footballcoach.ai.env.scenario_env import ScenarioEnv
-    from footballcoach.ui.scenarios import build_penalty_scenario, ScenarioDefinition
-
-    defn = ScenarioDefinition(
-        key="phase2_penalty",
-        label="Phase 2: Shoot",
-        description="Penalty scenario for curriculum phase 2",
-        build=build_penalty_scenario,
-    )
-    return ScenarioEnv(
-        definition=defn,
-        trainee_player_id="kicker",
-        phase=2,
         **phase.env_kwargs,
     )

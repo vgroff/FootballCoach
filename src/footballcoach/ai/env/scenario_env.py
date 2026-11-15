@@ -36,7 +36,7 @@ from footballcoach.ai.env.outcome import (
     detect_phase1_box_terminal,
     remap_phase1_outcome,
 )
-from footballcoach.ai.env.reward import EMAFilter, phase1_reward, phase2_reward
+from footballcoach.ai.env.reward import EMAFilter, phase1_reward
 from footballcoach.ai.obs.encoder import MAX_OTHER_PLAYERS, encode_observation
 from footballcoach.ai.obs.schema import ObservationBatch
 from footballcoach.engine.match import Match
@@ -64,6 +64,9 @@ class StepInfo:
     # Subset of trainee_kicks_this_step that fired via the armed path (no ball at
     # decision time, kick executed at pickup -- the "first touch" kicks).
     trainee_armed_kicks_this_step: int = 0
+    # Which phase and controller mix produced this episode, for per-tag outcome
+    # tallies (set by RoleScenarioEnv, e.g. "phase2_1v2[attacker=neural,...]").
+    episode_tag: str = ""
 
 
 class ScenarioEnv:
@@ -599,15 +602,12 @@ class ScenarioEnv:
                 ball_progress_toward_goal_m=ball_progress,
             )
         else:
-            reward = phase2_reward(
-                shot_taken_this_step=shot_taken,
-                ticks_since_episode_start=self._episode_ticks,
-                max_episode_ticks=int(self.max_episode_s * 30),
-                shot_on_target=shot_on_target,
-                goal_scored=goal_scored,
-                illegal_action_attempted=info.illegal_action,
-                possession_lost_to_keeper=possession_lost_to_keeper,
-                cfg=self._reward_cfg["phase2"],
+            # Role-based phases (phase 2+) run in RoleScenarioEnv
+            # (ai/env/role_env.py), which overrides step(); this class's own
+            # step() implements phase 1 only.
+            raise NotImplementedError(
+                f"ScenarioEnv.step() implements phase 1 only (got phase={self.phase}); "
+                "role-based phases use ai/env/role_env.py's RoleScenarioEnv"
             )
 
         # --- Done? ---
@@ -995,12 +995,16 @@ class ScenarioEnv:
         return out
 
     def _latest_outcome(self) -> Optional[str]:
+        """The outcome of the trial that just ended (ScenarioLoop.last_outcome).
+
+        Until 2026-11-15 this returned the outcome with the HIGHEST cumulative
+        count, not the most recent one. That never mattered for phase 1: only
+        "miss" and "goal" can end a phase-1 trial and step() treats both as a
+        miss. It would have mislabelled most trials of any phase with more
+        outcomes."""
         if self._loop is None:
             return None
-        outcomes = self._loop.outcomes
-        # The most recent outcome is whichever count just incremented
-        # (ScenarioLoop stores cumulative counts)
-        return max(outcomes, key=outcomes.get) if any(outcomes.values()) else None
+        return self._loop.last_outcome
 
     def _detect_shot_this_tick(self, match: Match, player) -> bool:
         """Rough heuristic: player just kicked the ball (it's now loose and
