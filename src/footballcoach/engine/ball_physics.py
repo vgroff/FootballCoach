@@ -14,6 +14,7 @@ from footballcoach.mathutils import Vector3
 # dependency at module load time (entities.pitch → config → nothing that
 # imports ball_physics, but keeping it lazy is defensive).
 from typing import TYPE_CHECKING
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 if TYPE_CHECKING:
     from footballcoach.entities.pitch import Pitch
 
@@ -134,7 +135,7 @@ def _apply_ground_friction_impulse(
     slip_y = velocity.y + r * spin.x
     slip_speed = math.hypot(slip_x, slip_y)
 
-    if slip_speed < 1e-9:
+    if slip_speed < GEOM_ZERO_EPS:
         # Already rolling without slipping -- no friction impulse needed or
         # possible (e.g. the extreme "topspin, minimal loss" bounce case).
         return velocity, spin
@@ -247,7 +248,7 @@ def step_ball(ball: Ball, dt_s: float, params: BallPhysicsParams | None = None) 
 
     # Aerodynamic drag: F = -0.5 * rho * Cd * A * |v| * v
     speed = ball.velocity.length()
-    if speed > 1e-9:
+    if speed > GEOM_ZERO_EPS:
         drag_mag = 0.5 * params.air_density_kgpm3 * params.drag_coefficient * area * speed
         drag_force = ball.velocity.normalized() * (-drag_mag * speed)
     else:
@@ -337,7 +338,7 @@ def step_ball(ball: Ball, dt_s: float, params: BallPhysicsParams | None = None) 
             new_velocity.x - r * new_spin.y, new_velocity.y + r * new_spin.x
         )
         horiz_speed = new_velocity.length_xy()
-        if remaining_slip < 1e-3 and horiz_speed > 1e-9:
+        if remaining_slip < 1e-3 and horiz_speed > GEOM_ZERO_EPS:
             friction_decel = params.rolling_friction_coefficient * params.gravity_mps2
             reduced_speed = max(0.0, horiz_speed - friction_decel * dt_s)
             scale = reduced_speed / horiz_speed

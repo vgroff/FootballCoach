@@ -8,6 +8,7 @@ from footballcoach.engine.movement import SpeedMode, angle_diff, effective_accel
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
 from footballcoach.steering import compute_repulsion
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 
 
 
@@ -88,11 +89,11 @@ class MatchGetPossessionMixin:
             # back. Once the angle is good enough, repulsion switches off
             # and we close in on the same intercept point directly.
             dribbler_dir = carrier.velocity.xy()
-            if dribbler_dir.length() < 1e-9:
+            if dribbler_dir.length() < GEOM_ZERO_EPS:
                 dribbler_dir = Vector3.from_angle_xy(carrier.heading_rad, 1.0).xy()
             d_to_t = (player.position - carrier.position).xy()
             d_to_t_len = d_to_t.length()
-            cos_angle = dribbler_dir.normalized().dot(d_to_t.normalized()) if d_to_t_len > 1e-9 else 1.0
+            cos_angle = dribbler_dir.normalized().dot(d_to_t.normalized()) if d_to_t_len > GEOM_ZERO_EPS else 1.0
 
             if cos_angle < tap.good_angle_cos_threshold:
                 adj_dir, speed_mult = compute_repulsion(
@@ -104,7 +105,7 @@ class MatchGetPossessionMixin:
                 # with how every other order treats a heavy push.
                 if sm is SpeedMode.SPRINT and speed_mult < 0.75:
                     sm = SpeedMode.JOG
-                adj_dir = adj_dir.xy().normalized() if adj_dir.length_xy() > 1e-9 else Vector3.zero()
+                adj_dir = adj_dir.xy().normalized() if adj_dir.length_xy() > GEOM_ZERO_EPS else Vector3.zero()
                 # Brake-to-turn: _compute_movement_intent applies this for
                 # every other movement path (see its own use_brake_to_turn
                 # docstring); this branch bypasses that helper entirely
@@ -117,7 +118,7 @@ class MatchGetPossessionMixin:
                 # accel/speed (engine/movement.py's max_turn_rate_rad_s), so
                 # at full speed it just carves a slow, wide arc instead.
                 op = self.order_params
-                if (sm is not SpeedMode.STANDSTILL and adj_dir.length() > 1e-9
+                if (sm is not SpeedMode.STANDSTILL and adj_dir.length() > GEOM_ZERO_EPS
                         and player.speed_mps > op.brake_min_speed_mps):
                     heading_error = abs(angle_diff(player.heading_rad, adj_dir.angle_xy()))
                     if heading_error > op.brake_turn_angle_rad:

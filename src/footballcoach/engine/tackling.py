@@ -14,6 +14,7 @@ from footballcoach.entities.player import Player, PlayerState
 from footballcoach.mathutils import Vector3
 from footballcoach.mathutils.interp import piecewise_lerp3
 from footballcoach.mathutils.rng import skill_roll
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 
 
 @dataclass(frozen=True)
@@ -85,7 +86,7 @@ def tackle_angle_modifier(
     dribbler_dir = Vector3.from_angle_xy(dribbler_heading_rad, 1.0)
     d_to_t = (tackler_pos - dribbler_pos).xy()
     d_to_t_len = d_to_t.length()
-    if d_to_t_len < 1e-9:
+    if d_to_t_len < GEOM_ZERO_EPS:
         return 0.0
     d_to_t_normalized = d_to_t / d_to_t_len
     cos_angle = float(dribbler_dir.dot(d_to_t_normalized))
@@ -235,7 +236,7 @@ def attempt_tackle(
         # Near-zero margin → slowed by up to dribble_beaten_max_penalty.
         threshold = params.dribble_beaten_speed_threshold
         max_penalty = params.dribble_beaten_max_penalty
-        relative_margin = (d_roll - t_roll) / t_roll if t_roll > 1e-9 else 1.0
+        relative_margin = (d_roll - t_roll) / t_roll if t_roll > GEOM_ZERO_EPS else 1.0
         if relative_margin >= threshold:
             dribbler_mult = 1.0
         else:

@@ -3,6 +3,7 @@ from __future__ import annotations
 
 from footballcoach.engine.tackling import apply_tackle_result, attempt_tackle, tackle_angle_modifier
 from footballcoach.entities.player import Player, PlayerState, Team
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 
 
 
@@ -84,7 +85,7 @@ class MatchTacklesMixin:
             # Direction from carrier to other player.
             delta = other.position.xy() - carrier.position.xy()
             dist = delta.length()
-            if dist < 1e-9:
+            if dist < GEOM_ZERO_EPS:
                 continue
 
             # Trigger only on serious overlap (beyond mere touching).

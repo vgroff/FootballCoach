@@ -20,6 +20,7 @@ from footballcoach.config import load_orders_config, require_section
 from footballcoach.entities.pitch import Pitch
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 
 log = logging.getLogger("footballcoach.steering")
 
@@ -109,7 +110,7 @@ def compute_repulsion(
     # Normalised desired direction — used for the final blend AND for the
     # ahead/behind gate below (desired_dir need not be pre-normalised).
     desired_len = (desired_dir.x * desired_dir.x + desired_dir.y * desired_dir.y) ** 0.5
-    if desired_len < 1e-9:
+    if desired_len < GEOM_ZERO_EPS:
         # Nowhere to go — nothing to blend into, no direction to gate against.
         return Vector3.zero(), 1.0
     dd_x = desired_dir.x / desired_len
@@ -131,7 +132,7 @@ def compute_repulsion(
         dx = player.position.x - other.position.x
         dy = player.position.y - other.position.y
         dist = (dx * dx + dy * dy) ** 0.5
-        if dist < 1e-9 or dist >= params.radius_m:
+        if dist < GEOM_ZERO_EPS or dist >= params.radius_m:
             continue
 
         # Ahead/behind gate: project the obstacle's *predicted* position
@@ -168,7 +169,7 @@ def compute_repulsion(
         rvx = player.velocity.x - other.velocity.x
         rvy = player.velocity.y - other.velocity.y
         rv_len = (rvx * rvx + rvy * rvy) ** 0.5
-        dot = (rvx * radial_x + rvy * radial_y) / rv_len if rv_len > 1e-9 else -1.0
+        dot = (rvx * radial_x + rvy * radial_y) / rv_len if rv_len > GEOM_ZERO_EPS else -1.0
 
         # Scale magnitude by closing velocity: full push while closing
         # head-on, tapering linearly to ZERO once we're moving away from
@@ -196,9 +197,9 @@ def compute_repulsion(
         # boundary. Applies individually to EVERY obstacle in range, not
         # just whichever one happens to be nearest.
         rx, ry = radial_x, radial_y
-        if params.max_tangent_deg > 0.0 and rv_len > 1e-9:
+        if params.max_tangent_deg > 0.0 and rv_len > GEOM_ZERO_EPS:
             span = params.alignment_dot_threshold - (-1.0)
-            t = (params.alignment_dot_threshold - dot) / span if span > 1e-9 else (
+            t = (params.alignment_dot_threshold - dot) / span if span > GEOM_ZERO_EPS else (
                 1.0 if dot < params.alignment_dot_threshold else 0.0
             )
             t = 0.0 if t < 0.0 else (1.0 if t > 1.0 else t)
@@ -280,7 +281,7 @@ def compute_repulsion(
     final_x = dd_x + net_rep_x
     final_y = dd_y + net_rep_y
     final_len = (final_x * final_x + final_y * final_y) ** 0.5
-    if final_len < 1e-9:
+    if final_len < GEOM_ZERO_EPS:
         # Vectors cancelled completely — fall back to original desired dir.
         return Vector3(dd_x, dd_y, 0.0), speed_multiplier
 
@@ -309,7 +310,7 @@ def compute_repulsion(
             side_x = fn_x - fwd_dot * dd_x
             side_y = fn_y - fwd_dot * dd_y
             side_len = (side_x * side_x + side_y * side_y) ** 0.5
-            if side_len > 1e-9:
+            if side_len > GEOM_ZERO_EPS:
                 sin_max = _math.sin(_math.radians(params.max_deflection_deg))
                 fn_x = min_cos * dd_x + sin_max * (side_x / side_len)
                 fn_y = min_cos * dd_y + sin_max * (side_y / side_len)

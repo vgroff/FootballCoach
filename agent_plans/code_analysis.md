@@ -66,11 +66,16 @@ Line numbers are approximate (code may have shifted slightly since review).
   `_update_loose_ball_pickup` (about 120 lines each), which are tick-order
   glue.
 
-- **No single canonical epsilon constant** — `1e-6`, `1e-9`, `1e-12` all
-  appear scattered across modules (e.g. `Pitch.is_goal()`,
-  `Ball.is_grounded()`) for conceptually similar "avoid divide-by-zero /
-  treat as touching" checks, with no shared name explaining which tolerance
-  to use where. Developer note: yeah fix that, make it a constant somewhere
+- **Epsilon constants (partly done 2026-11-15):** a single canonical epsilon
+  would change behaviour, because the existing values are not interchangeable:
+  1e-6 and 1e-9 are both used for "length is zero", and 1e-12 is used both on
+  a length (`Vector3.normalized`) and on squared lengths. What was done:
+  `mathutils/tolerances.py` defines `GEOM_ZERO_EPS = 1e-9`, and the 40
+  zero-length/zero-speed guards in engine/, entities/, orders.py and
+  steering.py that used `1e-9` now use it (same value; engine trace, env trace
+  and golden are identical). `tests/unit/test_tolerances.py` pins the value
+  and rejects new bare `1e-9` literals there. The 1e-6/1e-12 sites are left
+  as they are on purpose.
 
 - **`Vector3`'s module docstring calls it "a tiny, fast 3D vector wrapper
   around numpy,"** but internally all arithmetic is plain Python floats;

@@ -13,6 +13,7 @@ from enum import Enum, auto
 from footballcoach.config import load_physics_config, require_section
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 
 log = logging.getLogger("footballcoach.movement")
 
@@ -390,7 +391,7 @@ def step_player_towards(
         # feels snappier than accelerating (1.5× by default, config-tunable).
         a_max *= params.standstill_decel_multiplier
 
-    if desired_dir.length() < 1e-9:
+    if desired_dir.length() < GEOM_ZERO_EPS:
         # No target direction: decelerate to a stop, keeping current heading.
         desired_dir = player.velocity.xy().normalized()
         desired_speed = 0.0
@@ -403,7 +404,7 @@ def step_player_towards(
     # turn used isn't also available for forward acceleration -- they draw
     # from one shared force budget, not two independent ones.
     current_heading = player.heading_rad
-    desired_heading = desired_dir.angle_xy() if desired_dir.length() > 1e-9 else current_heading
+    desired_heading = desired_dir.angle_xy() if desired_dir.length() > GEOM_ZERO_EPS else current_heading
     lateral_peak = lateral_accel_capability(
         params, attrs.acceleration, has_ball, attrs.ball_control, player.is_goalkeeper, attrs.dribbling
     )
@@ -413,7 +414,7 @@ def step_player_towards(
     max_turn_this_tick = omega_max * dt_s
     if abs(heading_diff) <= max_turn_this_tick:
         new_heading = desired_heading
-        omega_actual = heading_diff / dt_s if dt_s > 1e-9 else 0.0
+        omega_actual = heading_diff / dt_s if dt_s > GEOM_ZERO_EPS else 0.0
     else:
         new_heading = current_heading + math.copysign(max_turn_this_tick, heading_diff)
         omega_actual = math.copysign(omega_max, heading_diff)
@@ -421,7 +422,7 @@ def step_player_towards(
     # Speed change is limited by acceleration, and further reduced the more
     # the player is turning (large heading changes cost more speed), per the
     # design requirement.
-    turn_fraction = min(abs(heading_diff) / math.pi, 1.0) if desired_dir.length() > 1e-9 else 0.0
+    turn_fraction = min(abs(heading_diff) / math.pi, 1.0) if desired_dir.length() > GEOM_ZERO_EPS else 0.0
     turn_speed_penalty = 1.0 - params.turn_speed_penalty_max * turn_fraction
     target_speed = desired_speed * turn_speed_penalty
 
@@ -451,7 +452,7 @@ def step_player_towards(
         # ellipse turned out to compound badly with orders.json's boundary
         # steering (a continuously-curving path kept the multiplier pinned
         # near zero tick after tick, see test_boundary_carry_steering.py).
-        if lateral_peak > 1e-9:
+        if lateral_peak > GEOM_ZERO_EPS:
             lat_fraction = min(abs(current_speed * omega_actual) / lateral_peak, 1.0)
             ellipse_mult = math.sqrt(max(0.0, 1.0 - lat_fraction * lat_fraction))
             a_max *= max(ellipse_mult, params.accel_taper_min_fraction)

@@ -29,6 +29,7 @@ from footballcoach.config import load_physics_config, require_section
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 
 log = logging.getLogger("footballcoach.collision")
 
@@ -71,7 +72,7 @@ def _damp_overlap_velocity(
     if distance >= min_distance:
         return  # not overlapping, nothing to damp
 
-    if distance < 1e-9:
+    if distance < GEOM_ZERO_EPS:
         direction = Vector3(1.0, 0.0, 0.0)
     else:
         direction = delta / distance  # unit vector from a toward b (xy, z=0)
@@ -106,7 +107,7 @@ def resolve_player_overlap(player_a: Player, player_b: Player) -> bool:
     if distance >= min_distance:
         return False
 
-    if distance < 1e-9:
+    if distance < GEOM_ZERO_EPS:
         # Degenerate case: identical positions, push apart along an arbitrary axis.
         direction = Vector3(1.0, 0.0, 0.0)
         distance = 0.0
@@ -123,7 +124,7 @@ def resolve_player_overlap(player_a: Player, player_b: Player) -> bool:
     speed_b_towards_a = max(0.0, -player_b.velocity.xy().dot(direction))
     total_speed = speed_a_towards_b + speed_b_towards_a
 
-    if total_speed < 1e-9:
+    if total_speed < GEOM_ZERO_EPS:
         # Neither is moving into the other (e.g. both stationary) - split evenly.
         weight_a = 0.5
     else:
@@ -261,7 +262,7 @@ def resolve_ball_block_by_inactive_players(
     end = ball.position.xy()
     segment = end - start
     segment_len = segment.length()
-    if segment_len < 1e-9:
+    if segment_len < GEOM_ZERO_EPS:
         return
     direction = segment / segment_len
 
@@ -297,7 +298,7 @@ def resolve_ball_block_by_inactive_players(
         entry_point_xy = start + direction * t_entry
         normal = (entry_point_xy - centre)
         normal_len = normal.length()
-        normal = normal / normal_len if normal_len > 1e-9 else direction * -1.0
+        normal = normal / normal_len if normal_len > GEOM_ZERO_EPS else direction * -1.0
 
         velocity_xy = ball.velocity.xy()
         reflected_xy = velocity_xy - normal * (2.0 * velocity_xy.dot(normal))

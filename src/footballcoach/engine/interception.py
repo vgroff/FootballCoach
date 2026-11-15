@@ -86,7 +86,7 @@ def _solve_min_time_decel(d, direction, speed: float, decel: float, vc_sq: float
     eventual stopping point at all; bisection finds it directly.
     """
     d_sq = d.dot(d)
-    if d_sq < 1e-9:
+    if d_sq < 1e-9:  # squared length; see mathutils/tolerances.py
         return 0.0
 
     def g(t: float) -> float:

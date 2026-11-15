@@ -13,6 +13,7 @@ from footballcoach.config import load_attributes_config, load_physics_config, re
 from footballcoach.entities.ball import Ball
 from footballcoach.entities.player import Player
 from footballcoach.mathutils import Vector3
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 
 
 @dataclass(frozen=True)
@@ -183,7 +184,7 @@ def can_pick_up_ball(
         # means the two were closing on each other at some point during
         # the sweep, even if they are diverging again by the tick's end.
         return True
-    if distance <= 1e-9:
+    if distance <= GEOM_ZERO_EPS:
         return True  # already coincident; direction of closing is undefined
     # Closing iff the relative velocity has a component reducing the
     # separation, i.e. pointing from the ball toward the player.

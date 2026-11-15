@@ -25,6 +25,7 @@ import math
 
 from footballcoach.config import load_orders_config, require_section
 from footballcoach.mathutils import Vector3
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 
 if TYPE_CHECKING:
     from footballcoach.engine.match import Match
@@ -245,7 +246,7 @@ def _compute_movement_intent(
         speed_mode = SpeedMode.SPRINT if sprint else SpeedMode.JOG
 
     # ── Repulsion ────────────────────────────────────────────────────────────
-    if use_repulsion and target_direction.length_xy() > 1e-9:
+    if use_repulsion and target_direction.length_xy() > GEOM_ZERO_EPS:
         adj_dir, speed_mult = compute_repulsion(
             player, target_direction, match.players,
             match.ball.possessed_by, match.repulsion_params, match.pitch,
@@ -261,13 +262,13 @@ def _compute_movement_intent(
     if (arrival_dist is not None and arrival_dist <= op.close_prox_radius_m
             and player.speed_mps > op.brake_min_speed_mps):
         vel_xy = player.velocity.xy()
-        if vel_xy.length() > 1e-9 and adj_dir.length() > 1e-9:
+        if vel_xy.length() > GEOM_ZERO_EPS and adj_dir.length() > GEOM_ZERO_EPS:
             if vel_xy.normalized().dot(adj_dir.normalized()) < op.close_prox_cos_threshold:
                 speed_mode = SpeedMode.STANDSTILL
 
     # ── Brake-to-turn ────────────────────────────────────────────────────────
     if (use_brake_to_turn and speed_mode is not SpeedMode.STANDSTILL
-            and adj_dir.length() > 1e-9 and player.speed_mps > op.brake_min_speed_mps):
+            and adj_dir.length() > GEOM_ZERO_EPS and player.speed_mps > op.brake_min_speed_mps):
         desired_heading = adj_dir.angle_xy()
         heading_error = abs(angle_diff(player.heading_rad, desired_heading))
         if heading_error > op.brake_turn_angle_rad:
@@ -970,7 +971,7 @@ class JogOrder:
 
         self.status = OrderStatus.IN_PROGRESS
         dir_xy = self.direction.xy()
-        player.desired_direction = dir_xy.normalized() if dir_xy.length() > 1e-9 else Vector3.zero()
+        player.desired_direction = dir_xy.normalized() if dir_xy.length() > GEOM_ZERO_EPS else Vector3.zero()
         player.desired_speed_mode = SpeedMode.JOG
         return False
 
@@ -1188,7 +1189,7 @@ class ShootOrder:
                 and match.rng.random() < self.chance_of_pausing):
             aim_dir = (self.aim_point - player.position).xy()
             aim_len = aim_dir.length_xy()
-            if aim_len > 1e-9:
+            if aim_len > GEOM_ZERO_EPS:
                 step_dir = aim_dir / aim_len
                 raw_target = player.position.xy() + step_dir * SHOT_PAUSE_ADVANCE_M
                 clamped_target = Vector3(

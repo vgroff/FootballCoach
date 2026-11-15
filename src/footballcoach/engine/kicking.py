@@ -13,6 +13,7 @@ from footballcoach.config import load_physics_config, require_section
 from footballcoach.entities.ball import Ball
 from footballcoach.mathutils import Vector3
 from footballcoach.mathutils.interp import piecewise_lerp3
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 
 log = logging.getLogger("footballcoach.kicking")
 
@@ -164,7 +165,7 @@ def _run_direction_geometry(kicker_velocity: Vector3, aim_direction: Vector3) ->
     """
     run_speed = kicker_velocity.length_xy()
     aim_len = aim_direction.length_xy()
-    if run_speed < 1e-6 or aim_len < 1e-9:
+    if run_speed < 1e-6 or aim_len < GEOM_ZERO_EPS:
         return None
     cos_sim = (kicker_velocity.xy() / run_speed).dot(aim_direction.xy() / aim_len)
     return run_speed, cos_sim
@@ -411,7 +412,7 @@ def _launch_ball(
     launch_position = kicker_position.with_z(ball.position.z)
     delta = aim_point - launch_position
     horizontal_distance = delta.xy().length()
-    yaw = delta.xy().angle_xy() if horizontal_distance > 1e-9 else 0.0
+    yaw = delta.xy().angle_xy() if horizontal_distance > GEOM_ZERO_EPS else 0.0
     pitch = solve_launch_pitch_rad(horizontal_distance, delta.z, speed, gravity_mps2)
     _release_kick(ball, kicker_position, yaw, pitch, speed, sigma, spin, rng)
 
@@ -437,7 +438,7 @@ def _log_kick_debug(
     kicker_speed_xy = kicker_velocity.length_xy()
     cos_sim = (
         (kicker_velocity.xy() / kicker_speed_xy).dot(aim_dir.xy().normalized())
-        if kicker_speed_xy > 1e-6 and aim_dir.length_xy() > 1e-9
+        if kicker_speed_xy > 1e-6 and aim_dir.length_xy() > GEOM_ZERO_EPS
         else float('nan')
     )
     base_power_str = "" if base_power_fraction is None else f"base_power_frac={base_power_fraction:.3f} "
@@ -625,8 +626,8 @@ def kick_ball_from_direction(
     speed = max_kick_speed_mps(params, kick_power_attr) * max(0.0, min(1.0, power_fraction)) * run_mult
 
     horiz_len = direction_unit3.xy().length()
-    yaw = direction_unit3.xy().angle_xy() if horiz_len > 1e-9 else 0.0
-    pitch = math.atan2(direction_unit3.z, max(horiz_len, 1e-9))
+    yaw = direction_unit3.xy().angle_xy() if horiz_len > GEOM_ZERO_EPS else 0.0
+    pitch = math.atan2(direction_unit3.z, max(horiz_len, GEOM_ZERO_EPS))
 
     _release_kick(ball, kicker_position, yaw, pitch, speed, sigma, spin, r)
 

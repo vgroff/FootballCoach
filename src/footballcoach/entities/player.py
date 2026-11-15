@@ -10,6 +10,7 @@ from footballcoach.config import load_attributes_config, load_physics_config
 from footballcoach.entities.action_opportunity import ActionOpportunity
 from footballcoach.entities.attributes import PlayerAttributes
 from footballcoach.mathutils import Vector3
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 
 if TYPE_CHECKING:
     from footballcoach.engine.match import Match
@@ -334,7 +335,7 @@ class Player:
         # small ||raw||~1e-4 before it starts rejecting genuinely-degenerate
         # near-zero raw vectors (also a real thing worth catching).
         length = value.length_xy()
-        if length > 1e-9 and abs(length - 1.0) > 1e-2:
+        if length > GEOM_ZERO_EPS and abs(length - 1.0) > 1e-2:
             raise ValueError(
                 f"Player.desired_direction must be a unit xy-vector or exactly zero "
                 f"(zero = stop) -- got {value!r} with length_xy()={length!r}. "
