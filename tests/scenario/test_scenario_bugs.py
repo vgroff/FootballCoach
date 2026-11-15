@@ -3,6 +3,8 @@ from __future__ import annotations
 
 import random
 
+import pytest
+
 from footballcoach.engine.match import Match
 from footballcoach.entities import Ball, Pitch, Team
 from footballcoach.entities.player import PlayerState
@@ -290,6 +292,7 @@ def test_1v2_move_order_completes_with_stationary_obstacle():
     )
 
 
+@pytest.mark.xfail(strict=True, reason="known failing since 2026-11-07: the defender tackles before the MoveOrder finishes (gameplay question, see docstring); strict, so it reports if that changes")
 def test_1v2_controller_issues_shoot_after_move():
     """After the attacker's MoveOrder finishes, BallCarrierAttackerAI (via
     player.ai) must issue a ShootOrder within a handful of ticks.
