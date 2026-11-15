@@ -249,6 +249,11 @@ attribution*.
 
 ## 6. Other stubbed/dead code relevant to opponent scaling
 
+**Deleted 2026-11-15.** `opponent_pool.py` was removed as dead code; the
+text below is kept as the record. Recover it from git history (before
+that date) if a checkpoint-pool curriculum is ever built, and audit it
+first.
+
 `src/footballcoach/ai/curriculum/opponent_pool.py`'s `OpponentPool` class
 and `apply_rules_based_opponent()` function are confirmed **dead code** —
 the module's own docstring says so explicitly ("neither `OpponentPool` nor

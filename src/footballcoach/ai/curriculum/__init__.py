@@ -1,1 +1,1 @@
-"""Training curriculum: phase definitions and opponent pool management."""
+"""Training curriculum: phase definitions and environment builders."""

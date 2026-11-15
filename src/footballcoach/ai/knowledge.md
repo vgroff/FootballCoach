@@ -144,7 +144,6 @@ ai/
     phases.py          # CurriculumPhase dataclasses + PHASES_BY_ID dict
     envs.py            # build_env(phase) + bc_label_fn_for_phase(id) — ONE source of truth,
                        # imported by both train.py and record_demonstrations.py
-    opponent_pool.py   # OpponentPool + apply_rules_based_opponent()
   scripts/
     train.py           # CLI: uv run python -m footballcoach.ai.scripts.train --phase 1
                        #   --bc-dataset demonstrations/phase1/  (offline BC pre-training)

@@ -41,10 +41,6 @@ as you go.
   file, so its "current status" claims should be checked against
   `ai_config.json` and recent `training_runs.md` entries before being
   trusted.
-- **`curriculum/opponent_pool.py` is dead code.** Its own docstring says
-  neither `OpponentPool` nor `apply_rules_based_opponent()` is used anywhere
-  (confirmed by grep 2026-11-15). Candidate for deletion; it still has the
-  last silent `except (KeyError, AttributeError)` lookup in `ai/`.
 
 ---
 
@@ -87,8 +83,9 @@ as you go.
   and BC labels. A counting probe over the env trace and the full AI test
   suite found no caller that ever hit the fallbacks, so behaviour is
   unchanged (env trace 0 differences, golden identical).
-  `tests/ai_unit/test_fail_loud_lookups.py`. Only the dead `opponent_pool.py`
-  keeps one (see Open).
+  `tests/ai_unit/test_fail_loud_lookups.py`. The last one was in the dead
+  `curriculum/opponent_pool.py`, deleted 2026-11-15 (nothing imported it;
+  `OpponentPool` and `apply_rules_based_opponent` had no callers).
 - **#8/#12/#15 Head-name tables:** gating has one table (`_HEAD_TO_ACTION`,
   whose order is the tie-break order), `gating.DECISION_HEAD_NAMES` is the
   public list of `decision_probs` keys, and `set_decision_override` rejects
