@@ -729,7 +729,7 @@ def finalize_result_for_wire(r: dict, returns_spec: dict) -> dict:
     e.g. an env's final flush that is only its unfinished tail): its rows are
     all counted in ``n_dropped`` and the receiver must skip the batch (its
     ``stats`` are still valid and must still be folded in)."""
-    from footballcoach.ai.ppo.ppo_trainer import _finalize_value_pretrain_result
+    from footballcoach.ai.ppo.pretraining import _finalize_value_pretrain_result
 
     tensors, n_dropped = _finalize_value_pretrain_result(
         r, float(returns_spec["gamma"]), float(returns_spec["lam"]), returns_spec["mode"] == "gae",

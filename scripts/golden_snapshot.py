@@ -186,7 +186,7 @@ def _():
     try:
         from footballcoach.ai.ppo.trainer_eval import _build_eval_env_factory
     except ImportError:
-        from footballcoach.ai.ppo.ppo_trainer import _build_eval_env_factory
+        from footballcoach.ai.ppo.trainer_eval import _build_eval_env_factory
     det = functools.partial(trainer._sample_action, deterministic=True, deterministic_decision=True, deterministic_direction=True)
     r = run_seeded_evaluation(_build_eval_env_factory(use_rules_ai=True, max_episode_s=4.0), det, [7, 8, 9], repeats_per_seed=1)
     return {"rewards": r.rewards, "outcomes": r.outcomes_list, "lengths": r.episode_lengths_s}

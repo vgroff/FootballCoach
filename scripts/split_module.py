@@ -88,8 +88,11 @@ def merge_into_existing(path: Path, generated: str) -> str:
     ex_tree = ast.parse(existing)
     gen_tree = ast.parse(generated)
     have = {ast.unparse(n) for n in ex_tree.body if isinstance(n, (ast.Import, ast.ImportFrom))}
+    own_module = path.stem
     new_imports = [ast.unparse(n) for n in gen_tree.body
-                   if isinstance(n, (ast.Import, ast.ImportFrom)) and n.module != "__future__" and ast.unparse(n) not in have]
+                   if isinstance(n, (ast.Import, ast.ImportFrom)) and getattr(n, "module", None) != "__future__"
+                   and not (getattr(n, "module", None) or "").endswith(f".{own_module}")
+                   and ast.unparse(n) not in have]
     gen_lines = generated.split(LF)
     first_code = min(n.lineno for n in gen_tree.body if not isinstance(n, (ast.Import, ast.ImportFrom, ast.Expr)))
     code = LF.join(gen_lines[first_code - 1:]).rstrip()
@@ -318,12 +321,17 @@ def main() -> None:
     print(f"{src_path.name}: {len(lines)} -> {final_text.count(LF) + 1} lines")
     if dry:
         return
+    # Build every output before writing any, so a failure leaves nothing half-done.
+    outputs: dict[Path, str] = {}
     for mod, body in new_files.items():
         path = src_path.with_name(f"{mod}.py")
         if path.exists() and mod != common:
             sys.exit(f"{path} already exists")
-        if path.exists():
-            body = merge_into_existing(path, body)
+        outputs[path] = merge_into_existing(path, body) if path.exists() else body
+    for path, body in outputs.items():
+        ast.parse(body)
+    ast.parse(final_text)
+    for path, body in outputs.items():
         write_text(path, body, crlf)
     write_text(src_path, final_text, crlf)
     moved_report = {name: home[name] for name in sorted(moved_names)}

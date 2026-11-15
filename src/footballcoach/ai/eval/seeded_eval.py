@@ -251,7 +251,7 @@ def run_seeded_evaluation(
             doubles total episode count. See ai_config.json's
             eval.swap_sides.
     """
-    from footballcoach.ai.ppo.ppo_trainer import outcome_breakdown  # local: avoid import cycle
+    from footballcoach.ai.ppo.trainer_common import outcome_breakdown  # local: avoid import cycle
 
     rewards: list[float] = []
     outcomes: dict[str, int] = {}
@@ -406,7 +406,7 @@ def run_seeded_evaluation_batched(
             RNG-free comparison (e.g. tests checking this against
             ``run_seeded_evaluation``'s output on the same seeds).
     """
-    from footballcoach.ai.ppo.ppo_trainer import outcome_breakdown  # local: avoid import cycle
+    from footballcoach.ai.ppo.trainer_common import outcome_breakdown  # local: avoid import cycle
     from footballcoach.ai.ppo.batched_rollout_worker import _batch_due_decisions, _secondary_neural_candidates
 
     _sides = (False, True) if swap_sides else (False,)
@@ -599,7 +599,7 @@ def run_seeded_evaluation_parallel_batched(
 
 
 def merge_eval_results(results: list[SeededEvalResult], repeats_per_seed: int) -> SeededEvalResult:
-    from footballcoach.ai.ppo.ppo_trainer import outcome_breakdown
+    from footballcoach.ai.ppo.trainer_common import outcome_breakdown
 
     rewards: list[float] = []
     outcomes_list: list[str] = []

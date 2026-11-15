@@ -239,10 +239,8 @@ def train_bc_epochs(
         direction_magnitude_reg,
     )
     from footballcoach.ai.obs.canonical import canonicalize_bc_labels, x_sign_of
-    from footballcoach.ai.ppo.ppo_trainer import (
-        EXEC_HEAD_MODULES, _ai_types, _binary_confusion_counts, _precision_recall_f1,
-        _measure_exec_head_grad_norms_and_maybe_log_spike,
-    )
+    from footballcoach.ai.ppo.ppo_trainer import EXEC_HEAD_MODULES, _ai_types
+    from footballcoach.ai.ppo.pretraining import _binary_confusion_counts, _precision_recall_f1, _measure_exec_head_grad_norms_and_maybe_log_spike
     from footballcoach.ai.progress import ProgressReporter
 
     if len(train_idx) == 0:
@@ -780,7 +778,7 @@ def run_dagger_phase(
 
         import numpy as np
 
-        from footballcoach.ai.ppo.ppo_trainer import _PHASE1_OUTCOME_LEGEND, outcome_breakdown
+        from footballcoach.ai.ppo.trainer_common import _PHASE1_OUTCOME_LEGEND, outcome_breakdown
 
         summaries = [summary for _seed, (_buf, summary) in results]
         rewards = [s["total_reward"] for s in summaries]

@@ -1233,7 +1233,7 @@ class App:
                 win_key = loop.definition.win_outcome
                 if win_key is not None:
                     # Same order as ppo_trainer._PHASE1_OUTCOME_KEYS / outcome_breakdown()
-                    from footballcoach.ai.ppo.ppo_trainer import _PHASE1_OUTCOME_KEYS
+                    from footballcoach.ai.ppo.trainer_common import _PHASE1_OUTCOME_KEYS
                     known = {k for k, _ in _PHASE1_OUTCOME_KEYS}
                     parts = [f"{lbl}: {o.get(k, 0)}" for k, lbl in _PHASE1_OUTCOME_KEYS]
                     other = sum(v for k, v in o.items() if k not in known)

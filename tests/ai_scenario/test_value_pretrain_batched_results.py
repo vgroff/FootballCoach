@@ -40,13 +40,8 @@ from footballcoach.ai.ppo.batched_rollout_worker import (
     batch_from_wire,
     finalize_result_for_wire,
 )
-from footballcoach.ai.ppo.ppo_trainer import (
-    PPOTrainer,
-    _ValuePretrainWorkers,
-    _decode_rollout_result,
-    _finalize_value_pretrain_result,
-    _merge_worker_batches,
-)
+from footballcoach.ai.ppo.ppo_trainer import PPOTrainer, _decode_rollout_result, _merge_worker_batches
+from footballcoach.ai.ppo.pretraining import _ValuePretrainWorkers, _finalize_value_pretrain_result
 from footballcoach.ui.scenarios import ScenarioDefinition, build_1v1_scenario, phase1_training_on_tick
 
 _PHASE = PHASES_BY_ID[1]
