@@ -265,19 +265,16 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     phase1_labels_for_player()'s own docstring for why this matters and
     NeuralPlayerAI's bc_label_fn mechanism, which computes the label
     DURING act(), at the same instant as the observation, specifically to
-    avoid this). Raises no exception on a malformed env -- returns
-    BCLabel.invalid() instead, matching the previous behaviour of this
-    function before the phase1_labels_for_player() split.
+    avoid this). Returns BCLabel.invalid() when ``env.match`` is None; an
+    unknown player id raises KeyError (it used to return an invalid label
+    silently, which no caller relied on -- checked 2026-11-15).
     """
-    try:
-        match = env.match
-        if player_id is None:
-            player_id = env.trainee_player_id
-        if match is None:
-            return BCLabel.invalid()
-        player = match.player_by_id(player_id)
-    except (KeyError, AttributeError):
+    match = env.match
+    if player_id is None:
+        player_id = env.trainee_player_id
+    if match is None:
         return BCLabel.invalid()
+    player = match.player_by_id(player_id)
     return phase1_labels_for_player(player, match)
 
 
@@ -668,15 +665,12 @@ def phase1_labels_from_teacher(env, teacher_trainer, player_id: str = None) -> B
     """
     from footballcoach.ai.obs.canonical import x_sign_of, mirror_x
 
-    try:
-        match = env.match
-        if player_id is None:
-            player_id = env.trainee_player_id
-        if match is None:
-            return BCLabel.invalid()
-        player = match.player_by_id(player_id)
-    except (KeyError, AttributeError):
+    match = env.match
+    if player_id is None:
+        player_id = env.trainee_player_id
+    if match is None:
         return BCLabel.invalid()
+    player = match.player_by_id(player_id)
 
     ai_type = _ai_type_of(player.ai)
     opponent_ai_type = AI_TYPE_IMMOBILE

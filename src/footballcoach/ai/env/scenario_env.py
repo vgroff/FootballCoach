@@ -909,44 +909,44 @@ class ScenarioEnv:
 
         Always pass `match` explicitly inside step() — self._loop.match is
         replaced by the next episode before step() returns on terminal ticks.
+
+        An unknown player id raises KeyError. This used to return 1.0, which would
+        have fed a silently wrong progress reward; no caller hit it (checked
+        2026-11-15 over the env trace and the AI test suite).
         """
-        try:
-            m = match if match is not None else self._loop.match
-            ball = m.ball.position
-            player = m.player_by_id(player_id if player_id is not None else self.trainee_player_id)
-            bounds = self._box_bounds_cache.get(player.team)
-            if bounds is None:
-                # Depends only on pitch dims + team, both fixed for this episode's
-                # Match -- computed once per team per episode, not once per call.
-                pitch = m.pitch
-                half_box_w = pitch.box_width_m / 2.0
-                if player.team == Team.LEFT:
-                    rx_min = pitch.half_length - pitch.box_length_m
-                    rx_max = pitch.half_length
-                else:
-                    rx_min = -pitch.half_length
-                    rx_max = -pitch.half_length + pitch.box_length_m
-                bounds = (rx_min, rx_max, half_box_w)
-                self._box_bounds_cache[player.team] = bounds
-            rx_min, rx_max, half_box_w = bounds
-            # Shortest distance from ball to axis-aligned rectangle.
-            dx = max(rx_min - ball.x, 0.0, ball.x - rx_max)
-            dy = max(-half_box_w - ball.y, 0.0, ball.y - half_box_w)
-            return float(math.hypot(dx, dy))
-        except (KeyError, AttributeError):
-            return 1.0
+        m = match if match is not None else self._loop.match
+        ball = m.ball.position
+        player = m.player_by_id(player_id if player_id is not None else self.trainee_player_id)
+        bounds = self._box_bounds_cache.get(player.team)
+        if bounds is None:
+            # Depends only on pitch dims + team, both fixed for this episode's
+            # Match -- computed once per team per episode, not once per call.
+            pitch = m.pitch
+            half_box_w = pitch.box_width_m / 2.0
+            if player.team == Team.LEFT:
+                rx_min = pitch.half_length - pitch.box_length_m
+                rx_max = pitch.half_length
+            else:
+                rx_min = -pitch.half_length
+                rx_max = -pitch.half_length + pitch.box_length_m
+            bounds = (rx_min, rx_max, half_box_w)
+            self._box_bounds_cache[player.team] = bounds
+        rx_min, rx_max, half_box_w = bounds
+        # Shortest distance from ball to axis-aligned rectangle.
+        dx = max(rx_min - ball.x, 0.0, ball.x - rx_max)
+        dy = max(-half_box_w - ball.y, 0.0, ball.y - half_box_w)
+        return float(math.hypot(dx, dy))
 
     def _ball_dist_for_player(self, player_id: str, match=None) -> float:
-        try:
-            m = match if match is not None else self._loop.match
-            player = m.player_by_id(player_id)
-            ball = m.ball
-            return math.hypot(
-                ball.position.x - player.position.x,
-                ball.position.y - player.position.y,
-            )
-        except (KeyError, AttributeError):
-            return 0.0
+        """2D distance from *player_id* to the ball. An unknown id raises KeyError
+        (it used to return 0.0; see _ball_dist_to_opponent_box)."""
+        m = match if match is not None else self._loop.match
+        player = m.player_by_id(player_id)
+        ball = m.ball
+        return math.hypot(
+            ball.position.x - player.position.x,
+            ball.position.y - player.position.y,
+        )
 
     def _encode_obs_for_player(self, player_id: str) -> "ObservationBatch":
         time_remaining = max(0.0, self.max_episode_s - self._episode_ticks * self._dt_s)
