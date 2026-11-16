@@ -195,11 +195,11 @@ The PPG value refit only sees the primary phase (see Open follow-ups).
 - Unfreezing tackle / pass / mark heads for a phase needs per-row head masks.
 - The UI cannot yet show role-based terminal payouts (ScenarioLoop's payout
   display is phase-1 only).
-- The UI's own neural players (ui/app.py, the UI checkpoint-picker scenario)
-  pass no task_phase, so with task ids on they play at "all task ids 0"
-  while training uses the phase's id.
-- Untested side finding: NeuralPlayerAI's time_remaining uses
-  `_episode_ticks / 30.0` while the env uses `_episode_ticks * dt` (0.04 s
-  in training), so the rows' time-remaining input and the bootstrap's
-  disagree. Rows and evals agree with each other, so behaviour is consistent;
-  only the boundary bootstrap differs.
+- (Done 2026-11-16) The UI's neural players now follow the task-id switch
+  (curriculum.envs.ui_task_phase), and the time-remaining input is now the
+  true clock, with a one-off weight remap for older checkpoints
+  (ai/knowledge.md "Time remaining").
+- Planned: a critic-only elapsed-fraction input in the value head's side
+  channel (the speed bonus depends on the fraction of the episode left, which
+  the critic cannot know without the episode length; kept out of the policy
+  so it never learns the episode length).

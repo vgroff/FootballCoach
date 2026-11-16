@@ -98,6 +98,13 @@ def main() -> None:
                              "is_goalkeeper column if a phase has a goalkeeper role, so the checkpoint plays exactly "
                              "as before while those inputs can still learn (see ai/ppo/new_phase_inputs.py). Needed "
                              "before training with ai_config observation.task_id_in_rollouts on. Not when resuming.")
+    parser.add_argument("--remap-time-input", action="store_true",
+                        help="Once, when starting from a checkpoint trained on the old time-remaining input "
+                             "(every checkpoint before 2026-11-16): fold ai_config observation.legacy_time_remap "
+                             "into its weights so it plays as closely as possible to before on the true input "
+                             "(ai/ppo/time_input_remap.py); training refuses such a checkpoint otherwise. "
+                             "scripts/migrate_checkpoint_inputs.py does this (and the task-id init) into a new "
+                             "file instead. Not when resuming.")
     parser.add_argument("--total-steps", type=int, default=500_000,
                         help="PPO decision-steps to train for, excluding pre-training (default: 500000)")
     parser.add_argument("--checkpoint", type=str, default=None,
@@ -966,6 +973,12 @@ def main() -> None:
         _mix_phases = validate_training_mix(_mix)
         trainer.phase_mix = _mix
         log.info(f"Phase mix (shares of rollout env slots): {_mix}")
+    if args.remap_time_input:
+        from footballcoach.ai.ppo.time_input_remap import remap_time_remaining_input
+        _remap = load_ai_config()["observation"]["legacy_time_remap"]
+        for _row in remap_time_remaining_input(trainer, a=float(_remap["a"]), b=float(_remap["b"])):
+            log.info(f"  [time input remap] {_row['network']}.{_row['layer']} ({_row['input']}): "
+                     f"f_old = {_remap['a']} + {_remap['b']} * f_new")
     if args.init_new_phase_inputs:
         from footballcoach.ai.curriculum.phases import PHASES_BY_ID
         from footballcoach.ai.ppo.new_phase_inputs import init_new_phase_inputs

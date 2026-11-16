@@ -16,6 +16,11 @@ from typing import Callable, Optional
 from footballcoach.ai.curriculum.phases import CurriculumPhase
 
 
+def is_buildable(phase: CurriculumPhase) -> bool:
+    """Whether build_env can build *phase* (the others are stubs)."""
+    return phase.is_role_based or phase.phase_id == 1
+
+
 def build_env(phase: CurriculumPhase):
     """Build the training env for *phase*: phase 1's ScenarioEnv, or a
     RoleScenarioEnv for any role-based phase."""
@@ -24,6 +29,18 @@ def build_env(phase: CurriculumPhase):
     if phase.phase_id == 1:
         return _build_phase1_env(phase)
     raise NotImplementedError(f"Phase {phase.phase_id} not yet implemented")
+
+
+def ui_task_phase(scenario_key: Optional[str]) -> Optional[int]:
+    """The task phase a neural player in the UI's *scenario_key* scenario
+    encodes: that of the first buildable curriculum phase played in that
+    scenario, passed through obs.encoder.rollout_task_phase, so the UI follows
+    ai_config observation.task_id_in_rollouts exactly as training does. None
+    for scenarios no trained phase uses (their task-id weights never trained)."""
+    from footballcoach.ai.curriculum.phases import ALL_PHASES
+    from footballcoach.ai.obs.encoder import rollout_task_phase
+    phase = next((p for p in ALL_PHASES if p.scenario_key == scenario_key and is_buildable(p)), None)
+    return rollout_task_phase(phase.phase_id) if phase is not None else None
 
 
 def _attack_defence_outcomes():

@@ -513,6 +513,11 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
         # init_new_phase_inputs (ai/ppo/new_phase_inputs.py) or trained with task
         # ids on carry it. See _check_task_id_inputs.
         self.task_id_inputs_ready: bool = True
+        # Whether these weights expect the true time-remaining input (fresh
+        # weights, trained since 2026-11-16, or remapped once by
+        # ai/ppo/time_input_remap.py) rather than the old, wrong one. Set from
+        # the checkpoint by load_checkpoint; training refuses False.
+        self.true_time_input_ready: bool = True
         # (phase name, eval spec name) -> cached result of a rules-only role-phase eval.
         self._role_eval_cache: dict = {}
         # Opt-in, only meaningful alongside batched_rollout=True: also
@@ -1045,11 +1050,19 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
     # -----------------------------------------------------------------------
 
     def _check_task_id_inputs(self) -> None:
-        """Refuse to train on task-id rows with weights that were trained
-        without them: their task-id columns are not neutral (see
-        ai/ppo/new_phase_inputs.py), so switching the ids on would silently
-        change how the checkpoint plays."""
+        """Refuse to train weights on inputs they were not prepared for:
+        weights trained on the old time-remaining input (see
+        ai/ppo/time_input_remap.py), and, with observation.task_id_in_rollouts
+        on, weights trained without task ids (their task-id columns are not
+        neutral, see ai/ppo/new_phase_inputs.py). Either would silently change
+        how the checkpoint plays."""
         from footballcoach.ai.config import load_ai_config
+        if not self.true_time_input_ready:
+            raise RuntimeError(
+                "these weights were trained on the old time-remaining input; remap them once first "
+                "(train.py --remap-time-input or scripts/migrate_checkpoint_inputs.py, "
+                "ai/ppo/time_input_remap.py)"
+            )
         if not load_ai_config()["observation"].get("task_id_in_rollouts", False):
             # Training on all-zero task ids from here on: the weights' task-id
             # columns stop being neutral, and the checkpoints saved say so.

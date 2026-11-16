@@ -1422,8 +1422,59 @@ input weights zeroed (`--init-new-phase-inputs`, below) so it plays exactly
 as before; checkpoints record `task_id_inputs_ready`, and
 `PPOTrainer._check_task_id_inputs` refuses to train unprepared weights with
 the switch on (training with it off marks the weights unprepared again). The
-UI's own neural players (ui/app.py, the checkpoint-picker scenario) still
-encode no task id; see the phase-2 plan's open follow-ups.
+UI's neural players follow the same switch: `curriculum.envs.ui_task_phase`
+maps the running UI scenario to the first buildable phase played in it
+("1v1" -> 1, "1v2" -> 2; stub phases and other scenarios -> no task id) and
+`ui/app.py` (neural opponent, training-mode trainee) and the UI's
+checkpoint-picker scenario pass it on.
+
+## Time remaining: the true clock (replaced 2026-11-16)
+
+**The bug.** `NeuralPlayerAI` computed its time-remaining input as
+`max_episode_s - ticks / 30` while training ticks are `sim_dt_s` (0.04 s),
+and its tick count already includes the current tick. So the training rows'
+clock ran at 0.83x and one tick late: at the true end of a 27 s episode it
+still read ~4.5 s (it is `T/6 + 0.83 * true_left`), so the network never saw
+the last seconds. The env's own observation (value bootstrap, pre-training)
+used the true clock, so the critic was bootstrapped on inputs it never
+trained on. (In the UI, at 1/30 s ticks, only the one-tick offset applied.)
+
+**Now** the input is always the true seconds left,
+`max_episode_s - (ticks - 1) * match.dt_s`, identical to the env's observation
+(`NeuralPlayerAI._time_remaining_s`); the old clock is gone. A checkpoint
+trained on it (every one before 2026-11-16) must be remapped once
+(`train.py --remap-time-input`, or `scripts/migrate_checkpoint_inputs.py`
+into a new file); checkpoints carry `true_time_input_ready` and training
+refuses unremapped weights (`PPOTrainer._check_task_id_inputs`). Old
+checkpoints loaded in the UI or evals just see the true clock unremapped.
+
+There is one time input, `GlobalFeatures.time_remaining_norm` =
+log1p(seconds left) / log1p(7200). The value head's `elapsed_norm` side input
+is `1 - time_remaining_norm`: a flipped copy, NOT elapsed time (it reads ~0.62
+at the start of an episode), and the networks are never given the episode
+length, so elapsed time cannot be derived from it.
+
+**The remap.** Every network reads the feature linearly (first global layers
+`global_mlp.0` and `entity_encoder.global_query_proj`, and value_head's first
+Linear through `elapsed_norm`, all with biases), so `f_old = a + b * f_new`
+folds exactly into those weights and biases (tested to 1e-5). No (a, b) is
+exact, though: the old value depends on each episode's length, which the
+network is not given, and the log compression turns a linear change in seconds
+into a curve. `scripts/time_input_remap_fit.py` fits candidates by weighted
+least squares over every tick of every episode length of phases 1 and 2 and
+evaluates them counterfactually: real states from the checkpoint's episodes,
+each placed at points across the clock, original on the old clock vs remapped
+on the true one (natural rows near the end are ~1 in 40, so this is what
+measures the end of an episode). A first fit over the visited rows only was
+dominated by mid-episode rows and extrapolated badly at the end. Chosen
+(`observation.legacy_time_remap`, half the weight on the last 8 s):
+`f_old = 0.1278 + 0.6026 f_new`. On checkpoint 763, 300 states, mean
+probability changes: under 2 s left move 0.016 / kick 0.020 / value 0.49
+(no remap: 0.074 / 0.086 / 0.98); 4-8 s kick 0.006 / value 0.09 (0.042 /
+0.75); 16 s or more move 0.004 / kick 0.005 (0.001 / 0.001). The remaining
+end-of-episode value change is the information the old clock never carried.
+(The pre-training-only physics value net inverts the feature non-linearly
+but is not part of the live networks.)
 
 ## Phase-1 step early exit and stale transitions (fixed 2026-11-16)
 
@@ -1587,7 +1638,7 @@ Recipe (not yet run): set `observation.task_id_in_rollouts` to true and
 `curriculum.phase2.controllers` to attacker and defender `{"neural": 1}`,
 goalkeeper `{"rules": 1}`, then
 `uv run python -m footballcoach.ai.scripts.train --phase 1 --phase-mix 1:3,2:1
---checkpoint checkpoints/phase1_run321/checkpoint763.pt --init-new-phase-inputs`
+--checkpoint checkpoints/phase1_run321/checkpoint763.pt --init-new-phase-inputs --remap-time-input`
 (writes to a fresh `phase1_run{next}` dir). Expect phase-2 value error to be
 high for the first rollouts: the value head has never seen phase-2 outcomes
 and the PPG refit only sees phase 1.

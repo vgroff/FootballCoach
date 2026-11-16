@@ -981,6 +981,15 @@ class NeuralPlayerAI(PlayerAI):
         self._precomputed_result = None
         self._pending_result = None
 
+    def _time_remaining_s(self, match: "Match") -> float:
+        """The time-remaining input for this tick's observation: the true
+        seconds left, matching the env's own observation (_episode_ticks
+        already counts this tick, so the elapsed time is one tick less). Until
+        2026-11-16 this was max_episode_s - _episode_ticks / 30, i.e. ticks
+        counted as 1/30 s whatever the match tick (0.04 s in training): see
+        ai/ppo/time_input_remap.py for how older checkpoints are adapted."""
+        return max(0.0, self.max_episode_s - (self._episode_ticks - 1) * match.dt_s)
+
     def _drop_fired_kick(self, player: "Player") -> None:
         """kick_one_shot: once the kick this decision asked for has executed
         (possession kick on the decision tick, or an armed kick auto-firing on
@@ -1032,7 +1041,9 @@ class NeuralPlayerAI(PlayerAI):
         guaranteed -- ``ScenarioEnv.step()`` has at least one legitimate
         early-exit (trainee already in the opponent box with possession)
         that can end a decision interval several ticks short, leaving the
-        NEXT ``env.step()`` call's trainee not-yet-due partway through it.
+        NEXT ``env.step()`` call's trainee not-yet-due partway through it
+        (since 2026-11-16 only when that step also ends the episode, so in
+        practice no longer; see batched_rollout_worker.py's top docstring).
         Before this method existed, that case hit an ``assert`` in
         ``collect()`` and crashed real training -- see that method's
         docstring for the graceful (batch this env's decision only when it's
@@ -1073,7 +1084,7 @@ class NeuralPlayerAI(PlayerAI):
         self.last_transition = None
         self._ticks_since_decision = 0
 
-        time_remaining = max(0.0, self.max_episode_s - self._episode_ticks / 30.0)
+        time_remaining = self._time_remaining_s(match)
         obs = encode_observation(
             match=match,
             player_id=player.player_id,
@@ -1445,7 +1456,7 @@ class HybridPlayerAI(NeuralPlayerAI):
         self.last_transition = None
         self._ticks_since_decision = 0
 
-        time_remaining = max(0.0, self.max_episode_s - self._episode_ticks / 30.0)
+        time_remaining = self._time_remaining_s(match)
         obs = encode_observation(
             match=match,
             player_id=player.player_id,

@@ -671,6 +671,12 @@ from footballcoach.rules_ai import (
 )
 
 
+def _picker_task_phase():
+    """The checkpoint-picker scenario plays phase 1's 1v1 (build_1v1_scenario)."""
+    from footballcoach.ai.curriculum.envs import ui_task_phase
+    return ui_task_phase("1v1")
+
+
 class _IdleFallbackAI(PlayerAI):
     """Wraps another ``PlayerAI`` and, after delegating to it each tick,
     re-issues a ``StopOrder`` if the wrapped AI left ``current_order`` as
@@ -1402,6 +1408,7 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
                     trainee_trainer._sample_action,
                     decision_interval_ticks=decision_interval_ticks,
                     max_episode_s=PHASE1_MAX_EPISODE_S,
+                    task_phase=_picker_task_phase(),
                 )
             else:
                 _trainee = match.player_by_id("trainee")
@@ -1421,6 +1428,7 @@ def _make_phase1_scenario_pair(checkpoint_dir: str = "checkpoints/phase1_run1"):
                     opponent_trainer._sample_action,
                     decision_interval_ticks=decision_interval_ticks,
                     max_episode_s=PHASE1_MAX_EPISODE_S,
+                    task_phase=_picker_task_phase(),
                 )
             else:
                 _opponent = match.player_by_id("opponent")

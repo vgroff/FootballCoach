@@ -117,6 +117,7 @@ class CheckpointIOMixin:
             "decision_net": self.decision_net.state_dict(),
             "execution_net": self.execution_net.state_dict(),
             "task_id_inputs_ready": bool(getattr(self, "task_id_inputs_ready", True)),
+            "true_time_input_ready": bool(getattr(self, "true_time_input_ready", True)),
             "optimizer": self.optimizer.state_dict(),
         }
         if self.value_net is not None:
@@ -154,6 +155,7 @@ class CheckpointIOMixin:
             "decision_net": self.decision_net.state_dict(),
             "execution_net": self.execution_net.state_dict(),
             "task_id_inputs_ready": bool(getattr(self, "task_id_inputs_ready", True)),
+            "true_time_input_ready": bool(getattr(self, "true_time_input_ready", True)),
         }
         if self.optimizer is not None:
             ckpt["optimizer"] = self.optimizer.state_dict()
@@ -233,6 +235,9 @@ class CheckpointIOMixin:
         # those weights were trained at "all task ids 0". See
         # ai/ppo/new_phase_inputs.py and PPOTrainer._check_task_id_inputs.
         self.task_id_inputs_ready = bool(ckpt.get("task_id_inputs_ready", False))
+        # Absent = trained on the old time-remaining input (see
+        # ai/ppo/time_input_remap.py).
+        self.true_time_input_ready = bool(ckpt.get("true_time_input_ready", False))
         # checkpoint{N}.pt / training_log{N}.txt numbering is driven ENTIRELY by
         # what's physically on disk in THIS checkpoint_dir -- never by the loaded
         # checkpoint's own embedded "checkpoint_count" field. Two real incidents

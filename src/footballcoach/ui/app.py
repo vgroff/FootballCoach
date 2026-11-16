@@ -886,7 +886,8 @@ class App:
         from footballcoach.rules_ai import maybe_assign_neural_opponent
         trainer = self._opponent_trainer_for_scenario()
         if trainer is not None:
-            maybe_assign_neural_opponent(match, "opponent", trainer._sample_action, max_episode_s=1e9)
+            maybe_assign_neural_opponent(match, "opponent", trainer._sample_action, max_episode_s=1e9,
+                                         task_phase=self._ui_task_phase())
 
     def _poll_action_icons(self, match: Match) -> None:
         """After each physics step, harvest `player.action_icon` signals set by
@@ -1028,8 +1029,15 @@ class App:
             self._training_trainer_cache[ckpt_path] = trainer
 
         from footballcoach.rules_ai import HybridPlayerAI
-        player.ai = HybridPlayerAI(trainer._sample_action, max_episode_s=1e9)
+        player.ai = HybridPlayerAI(trainer._sample_action, max_episode_s=1e9, task_phase=self._ui_task_phase())
         self._log(LogLevel.INFO, f"Training mode: trainee -> neural ({Path(ckpt_path).name})")
+
+    def _ui_task_phase(self):
+        """Task phase for the running scenario's neural players (see
+        curriculum.envs.ui_task_phase); None outside a scenario."""
+        from footballcoach.ai.curriculum.envs import ui_task_phase
+        loop = getattr(self, "_scenario_loop", None)
+        return ui_task_phase(loop.definition.key if loop is not None else None)
 
     def _opponent_trainer_for_scenario(self):
         """Trainer to drive a "neural" opponent roll in a balance scenario
