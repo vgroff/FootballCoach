@@ -1571,7 +1571,27 @@ default). Example, kick BC for the phase-2 attacker only:
   "kick now" (99 of 150 episodes have at least one), 54% move, 2% hold. Since
   763 never shoots, once the rules attacker would shoot it keeps saying so at
   every decision: a strong, steady pull towards shooting, no positive-label
-  weighting needed.
+  weighting needed. Every "kick now" label is a shot at power 0.90, while 763
+  kicks on ~2% of rows at power ~0.04 (dribble touches, kick_power sigma 0.1).
+- **Schedules** take an optional `hold_fraction` (coefficient held at
+  `coeff_start` until then, the anneal running from there to
+  `anneal_fraction`); unknown schedule keys are refused.
+- **Too strong breaks the policy in one update (phase2_run2, 2026-11-16).**
+  Attacker kick BC x1.0 with `ppo.target_kl` 2.0: the BC gradient was ~4x the
+  main clip limit (pre-clip norm ~97 vs 25, the kick head alone ~75) on every
+  step, 24 minibatches ran to KL 2.29 (kick_power KL ~74: a sigma-0.1 head
+  pulled from 0.04 to 0.9), the shared trunk moved and the narrow move_dir
+  (kappa ~1000) followed (KL 1.3); the eval goal rate fell 9% -> 4% after that
+  single update. Restarted at 0.25 -> 0.02 with target_kl 0.3.
+- **Diagnostics** (rollout log, below the loss lines):
+  `bc agree [<source>]` = the policy vs its expert on the kick group
+  (`ppo_update._kick_agreement`: the expert's kick-now share, P(kick) on
+  kick-now rows and on the rest, |power error| and kick-direction error on
+  kick-now rows); `bc pull` = how hard BC pulls (`_measure_bc_pull`, first
+  minibatch of each epoch, two extra backward passes): the weighted BC
+  gradient norm vs everything else's (PPO, value, entropy, regularisers) and
+  their cosine, for the main and direction clip groups. A ratio well above 1
+  means BC is steering the update; a negative cosine means it pulls against PPO.
 
 With BC off, every trace is identical apart from the new per-row
 `bc_sources` (all 0) and an empty `bc_by_source` metric.

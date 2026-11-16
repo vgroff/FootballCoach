@@ -58,10 +58,27 @@ class RolloutLoggingMixin:
         )
         # Per-phase / per-role BC (ai/ppo/bc_sources.py): its coefficients and
         # its (other, kick, tackle) group losses, one entry per source.
+        bc_lines = []
         for _src, _v in (metrics.get("bc_by_source") or {}).items():
             _c, _l = _v["coeff"], _v["loss"]
             bc_str += (f"  bc[{_src}]=" + "/".join(
                 f"{g} {l:.3f}x{c:.2f}" for g, c, l in zip(("other", "kick", "tackle"), _c, _l) if c > 0.0))
+            _a = _v.get("agree")
+            if _a:
+                # The policy vs its expert on the kick group (ppo_update._kick_agreement).
+                bc_lines.append(
+                    f"  bc agree [{_src}] expert kick-now={100 * _a['label_kick_rate']:.0f}% of rows  "
+                    f"P(kick)|kick-now={_a['p_kick_label_kick']:.3f}  P(kick)|else={_a['p_kick_label_no_kick']:.3f}  "
+                    f"|power err|={_a['power_err']:.3f}  kick_dir err={_a['kick_dir_err_deg']:.1f}deg")
+        _p = metrics.get("bc_pull") or {}
+        if _p:
+            # How hard BC pulls on the shared weights (ppo_update._measure_bc_pull):
+            # its weighted gradient vs everything else's, and their alignment.
+            bc_lines.append(
+                f"  bc pull  main |g_bc|={_p['bc_main']:.2f} |g_rest|={_p['rest_main']:.2f} "
+                f"(ratio {_p['bc_main'] / max(_p['rest_main'], 1e-12):.2f}, cos {_p['cos_main']:+.2f})  "
+                f"dir |g_bc|={_p['bc_dir']:.2f} |g_rest|={_p['rest_dir']:.2f} "
+                f"(ratio {_p['bc_dir'] / max(_p['rest_dir'], 1e-12):.2f}, cos {_p['cos_dir']:+.2f})")
         # Phase-1 outcome breakdown over this rollout's episodes, split by
         # opponent type -- win/loss/timeout/miss(+other), see
         # outcome_breakdown() for the win%/loss%/tout%/miss% format.
@@ -334,7 +351,7 @@ class RolloutLoggingMixin:
             f"  kl={metrics['approx_kl']:.4f}"
             + (f"  {bc_str.strip()}" if bc_str else ""),
             f"  value    {_val_diag_str}",
-        ]
+        ] + bc_lines
         _fc = metrics.get("flip_consistency")
         if _fc:
             _m = _fc["metrics"]

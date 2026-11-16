@@ -154,3 +154,5 @@ def test_one_mixed_cycle_with_attacker_kick_bc(mixed_config, monkeypatch, tmp_pa
     with caplog.at_level(logging.INFO, logger="footballcoach"):
         trainer.train(None, total_steps=500, phase_id=1)
     assert "bc[phase2_1v2/attacker]=kick " in caplog.text
+    assert "bc agree [phase2_1v2/attacker] expert kick-now=" in caplog.text
+    assert "bc pull  main |g_bc|=" in caplog.text

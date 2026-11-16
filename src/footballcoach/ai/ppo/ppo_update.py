@@ -10,6 +10,7 @@ import dataclasses
 import logging
 import math
 import time
+import warnings
 from pathlib import Path
 from typing import Optional
 import numpy as np
@@ -38,6 +39,45 @@ from footballcoach.ai.ppo.ppo_update_diagnostics import (  # noqa: F401  (trimme
 # the ratio finite; a ratio that large is already on dual-clip's zero-gradient
 # floor, so only the NaN changes. Below the cap the result is bit-identical.
 _MAX_LOG_RATIO = 80.0
+
+# _kick_agreement's fields, in order.
+_AGREE_KEYS = ("label_kick_rate", "p_kick_label_kick", "p_kick_label_no_kick", "power_err", "kick_dir_err_deg")
+
+
+def _kick_agreement(labels: torch.Tensor, e_heads, rows: torch.Tensor) -> list:
+    """How close the policy is to its BC expert on the kick group, over the
+    boolean ``rows`` of ``labels`` (no grad): the share of rows the expert
+    labels "kick now"; the policy's mean P(kick) on those rows and on the
+    others; on the "kick now" rows, the mean |power fraction error| and the mean
+    angle (deg) between the policy's kick-direction mean and the label's. NaN
+    for a field with no rows."""
+    from footballcoach.ai.ppo.bc import (
+        _I_KICK_DIR_X, _I_KICK_DIR_Y, _I_KICK_DIR_Z, _I_KICK_POWER, _I_KICK_THIS_TICK, _kick_power_physical,
+    )
+    nan = float("nan")
+    with torch.no_grad():
+        lab = labels[rows]
+        if lab.shape[0] == 0:
+            return [nan] * len(_AGREE_KEYS)
+        kick = lab[:, _I_KICK_THIS_TICK] > 0.5
+        p_kick = torch.sigmoid(e_heads.kick_logit[rows].reshape(-1))
+        out = [float(kick.float().mean()),
+               float(p_kick[kick].mean()) if kick.any() else nan,
+               float(p_kick[~kick].mean()) if (~kick).any() else nan]
+        if kick.any():
+            pred_power = _kick_power_physical(e_heads.kick_power[rows].reshape(-1))[kick]
+            out.append(float((pred_power - lab[kick, _I_KICK_POWER]).abs().mean()))
+            target = torch.stack([lab[kick, _I_KICK_DIR_X], lab[kick, _I_KICK_DIR_Y], lab[kick, _I_KICK_DIR_Z]], dim=-1)
+            has_dir = target.norm(dim=-1) > 1e-6
+            if has_dir.any():
+                pred = F.normalize(e_heads.kick_direction[rows][kick][has_dir], dim=-1)
+                cos = (pred * F.normalize(target[has_dir], dim=-1)).sum(dim=-1).clamp(-1.0, 1.0)
+                out.append(float(torch.rad2deg(torch.acos(cos)).mean()))
+            else:
+                out.append(nan)
+        else:
+            out += [nan, nan]
+        return out
 
 def _scale_decision_heads_grad(d_heads: DecisionHeadsRaw, coef: float) -> DecisionHeadsRaw:
     """Like _detach_decision_heads, but instead of cutting the graph, clone
@@ -138,6 +178,13 @@ class _UpdateStats:
     # BC source id -> [(other, kick, tackle) mean group loss over its valid
     # rows, per minibatch] (per-phase / per-role BC only).
     bc_by_source: dict = dataclasses.field(default_factory=dict)
+    # BC source id -> per-minibatch kick agreement with the expert
+    # (_kick_agreement: label kick rate, P(kick | label kick), P(kick | label
+    # no kick), |power error|, kick-direction error deg), NaN where no rows.
+    bc_agree_by_source: dict = dataclasses.field(default_factory=dict)
+    # How hard BC pulls (_measure_bc_pull, first minibatch of each epoch):
+    # [|g_bc| main, |g_rest| main, cos main, |g_bc| dir, |g_rest| dir, cos dir].
+    bc_pull: list = dataclasses.field(default_factory=list)
     epoch_sample_policy_loss: list = dataclasses.field(default_factory=list)
     epoch_sample_value_loss: list = dataclasses.field(default_factory=list)
     epoch_sample_surrogate: list = dataclasses.field(default_factory=list)  # unclipped (r-1)*A per row
@@ -1130,6 +1177,7 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
                     if s:
                         m = valid & (src == s)
                         stats.bc_by_source.setdefault(int(s), []).append(rows[m].mean(dim=0).tolist())
+                        stats.bc_agree_by_source.setdefault(int(s), []).append(_kick_agreement(mb_bc, e_heads, m))
             return bc_loss_val, weighted
         weighted = (
             ctx.bc_coeff * _bsplit["other_group_loss"]
@@ -1149,7 +1197,50 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
         for s, vals in sorted(stats.bc_by_source.items()):
             out[describe(s)] = {"coeff": ctx.bc_coeff_table[s].tolist(),
                                 "loss": np.mean(np.asarray(vals), axis=0).tolist()}
+            agree = stats.bc_agree_by_source.get(s)
+            if agree:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN columns
+                    out[describe(s)]["agree"] = dict(zip(_AGREE_KEYS, np.nanmean(np.asarray(agree), axis=0).tolist()))
         return out
+
+    @staticmethod
+    def _bc_pull_metrics(stats: _UpdateStats) -> dict:
+        """Mean of _measure_bc_pull's samples over this update ({} if none)."""
+        if not stats.bc_pull:
+            return {}
+        keys = ("bc_main", "rest_main", "cos_main", "bc_dir", "rest_dir", "cos_dir")
+        return dict(zip(keys, np.mean(np.asarray(stats.bc_pull), axis=0).tolist()))
+
+    def _measure_bc_pull(self, stats: _UpdateStats, rest_loss: torch.Tensor, bc_aux: torch.Tensor) -> None:
+        """How hard the (coefficient-weighted) BC term pulls on the shared
+        weights compared with everything else in the loss (PPO surrogate,
+        value, entropy, regularisers): the gradient norm of each, and the cosine
+        between them, over the non-direction ("main") and direction parameter
+        groups the optimizer clips separately. Two extra backward passes on this
+        minibatch's graph; measurement only, the step is unchanged."""
+        main, direction = self._main_and_direction_params()
+        groups = [[p for p in main if p.requires_grad], [p for p in direction if p.requires_grad]]
+        params = groups[0] + groups[1]
+        if not params:
+            return
+        g_bc = torch.autograd.grad(bc_aux, params, retain_graph=True, allow_unused=True)
+        g_rest = torch.autograd.grad(rest_loss, params, retain_graph=True, allow_unused=True)
+        out, i = [], 0
+        for grp in groups:
+            bb = rr = br = torch.zeros((), device=self.device)
+            for _ in grp:
+                b, r = g_bc[i], g_rest[i]
+                i += 1
+                if b is not None:
+                    bb = bb + (b * b).sum()
+                if r is not None:
+                    rr = rr + (r * r).sum()
+                if b is not None and r is not None:
+                    br = br + (b * r).sum()
+            nb, nr = bb.sqrt(), rr.sqrt()
+            out += [nb, nr, br / (nb * nr).clamp(min=1e-12)]
+        stats.bc_pull.append(torch.stack(out).tolist())
 
     def _ppo_pre_update_value_loss(self, ctx: _UpdateContext) -> float:
         """Value loss on the full batch with the weights as they are BEFORE this
@@ -1275,6 +1366,8 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
         bc_loss_val = torch.zeros(1, device=self.device)
         if ctx.has_bc:
             bc_loss_val, bc_aux = self._ppo_bc_aux_loss(ctx, stats, mb_idx, d_heads, e_heads)
+            if mb_i == 0:
+                self._measure_bc_pull(stats, total_loss, bc_aux)
             total_loss = total_loss + bc_aux
         with torch.no_grad():
             tackle_prob_t = torch.sigmoid(e_heads.tackle_attempt_logit).mean()
@@ -1729,6 +1822,7 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
             "bc_kick_coeff": ctx.bc_kick_coeff,
             "bc_tackle_coeff": ctx.bc_tackle_coeff,
             "bc_by_source": self._bc_by_source_metrics(ctx, stats),
+            "bc_pull": self._bc_pull_metrics(stats),
             "epoch_time_ms": float(np.mean(stats.epoch_times)) if stats.epoch_times else 0.0,
             "move_log_std": self.execution_net.move_dir_log_kappa.data.tolist(),
             "kick_log_std": self.execution_net.kick_dir_log_kappa.data.tolist(),

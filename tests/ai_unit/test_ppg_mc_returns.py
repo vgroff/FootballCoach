@@ -34,6 +34,11 @@ def test_refit_targets_follow_the_flag(trainer, monkeypatch, mc, want_gae):
     assert seen["use_gae"] is want_gae
 
 
-def test_flag_is_off_by_default():
+def test_flag_is_off_when_not_configured(monkeypatch):
+    """Opt-in: a config without the key gives GAE targets. (The repo config
+    itself may switch it on for a run, so this does not read its value.)"""
     from footballcoach.ai.config import load_ai_config
-    assert load_ai_config()["bc"]["ppg_mc_returns"] is False
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+    bc_cfg = load_ai_config()["bc"]
+    monkeypatch.delitem(bc_cfg, "ppg_mc_returns", raising=False)
+    assert PPOTrainer.from_config(device=torch.device("cpu"))._ppg_mc_returns is False

@@ -46,7 +46,9 @@ def test_worker_envs_follow_their_phase(trainer, neural_phase2):
     assert all(isinstance(e, RoleScenarioEnv) and e.require_neural_player for e in envs[1:])
 
 
-def test_role_env_without_a_neural_role_cannot_be_built_for_training(trainer):
+def test_role_env_without_a_neural_role_cannot_be_built_for_training(trainer, monkeypatch):
+    monkeypatch.setitem(load_ai_config()["curriculum"]["phase2"], "controllers",
+                        {r: {"rules": 1, "neural": 0} for r in ("attacker", "defender", "goalkeeper")})
     envs = build_worker_envs([2], trainer, base_seed=1)
     with pytest.raises(ValueError, match="no role can be neural"):
         envs[0].reset(seed=0)
