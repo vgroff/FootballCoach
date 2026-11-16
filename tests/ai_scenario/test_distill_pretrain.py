@@ -111,6 +111,14 @@ def test_each_row_gets_its_target_teachers_output(trainer, tmp_path):
     assert torch.allclose(acts["kick"].reshape(-1), torch.sigmoid(anchor["kick_logit"]).reshape(-1))
 
 
+def test_warmup_lr():
+    assert dp.warmup_lr(1e-4, 0, 0) == 1e-4
+    assert dp.warmup_lr(1e-4, 0, 100) == pytest.approx(1e-6)
+    assert dp.warmup_lr(1e-4, 49, 100) == pytest.approx(5e-5)
+    assert dp.warmup_lr(1e-4, 99, 100) == pytest.approx(1e-4)
+    assert dp.warmup_lr(1e-4, 5000, 100) == pytest.approx(1e-4)
+
+
 def test_label_smoothing_caps_the_bernoulli_targets():
     import math
     anchor = {"kick_logit": torch.tensor([[-20.0], [0.0], [3.0], [25.0]]), "move_direction": torch.ones(4, 2)}

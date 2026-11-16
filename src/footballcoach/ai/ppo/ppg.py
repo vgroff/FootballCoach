@@ -1677,6 +1677,7 @@ class PPGMixin:
         row_weights: Optional[torch.Tensor] = None,
         detach_spread: bool = False,
         soft_action_weights: bool = False,
+        forward_kl: bool = False,
     ) -> tuple:
         """Analytic per-head KL(current policy || anchor snapshot), for
         ``ppg_value_refit()``'s KL-anchor loss term.
@@ -1720,6 +1721,14 @@ class PPGMixin:
         used as float weights as given (e.g. the TEACHER's probabilities, for
         distillation: power / aim are then matched where the teacher would
         kick) instead of thresholding sampled actions at 0.5.
+        ``forward_kl``: the discrete heads (Bernoulli, target categoricals) use
+        KL(anchor || current), i.e. cross-entropy to the anchor's soft
+        targets, whose gradient is p_current - p_anchor. The default reverse
+        KL(current || anchor) suits an anchor the student starts at (PPG); for
+        DISTILLATION towards a teacher it fails where the student is
+        saturated: its gradient sigma'(a)(a - b) vanishes (a kick logit of -20
+        gets ~1e-8 against a teacher that kicks). The continuous heads are
+        compared means-only at equal spreads there, where the KL is symmetric.
         """
         device = self.device
         bsz = exists_mask.shape[0]
@@ -1744,12 +1753,20 @@ class PPGMixin:
         _BERNOULLI_LOGIT_CLAMP = 12.0
 
         def _bern_kl(new_logit, anchor_logit):
-            new_c = new_logit.clamp(-_BERNOULLI_LOGIT_CLAMP, _BERNOULLI_LOGIT_CLAMP)
-            anchor_c = anchor_logit.clamp(-_BERNOULLI_LOGIT_CLAMP, _BERNOULLI_LOGIT_CLAMP)
-            return torch.distributions.kl_divergence(
-                torch.distributions.Bernoulli(logits=new_c),
-                torch.distributions.Bernoulli(logits=anchor_c),
-            ).squeeze(-1)
+            # KL(Bernoulli(a) || Bernoulli(b)) in log-sigmoid form: exact and
+            # overflow-free at any logit, so the CURRENT side is not clamped.
+            # (It used to be clamped to +-12 too, which zeroed the gradient
+            # wherever the student's logit was beyond the clamp: a student
+            # kick logit of -20 could never be pulled up towards a teacher
+            # that kicks -- found in multi-teacher distillation, 2026-11-16.)
+            # The anchor side keeps the clamp (a fixed target).
+            a = new_logit
+            b = anchor_logit.clamp(-_BERNOULLI_LOGIT_CLAMP, _BERNOULLI_LOGIT_CLAMP)
+            if forward_kl:
+                a, b = b, a        # KL(anchor || current)
+            p = torch.sigmoid(a)
+            kl = p * (F.logsigmoid(a) - F.logsigmoid(b)) + (1.0 - p) * (F.logsigmoid(-a) - F.logsigmoid(-b))
+            return kl.squeeze(-1)
 
         def _cat_kl(new_logits, anchor_logits):
             # KL(new || anchor) over the existing slots, computed directly:
@@ -1763,6 +1780,8 @@ class PPGMixin:
             fill = -1e9
             lp_new = torch.log_softmax(new_logits.masked_fill(invalid, fill), dim=-1)
             lp_anc = torch.log_softmax(anchor_logits.masked_fill(invalid, fill), dim=-1)
+            if forward_kl:
+                lp_new, lp_anc = lp_anc, lp_new      # KL(anchor || current)
             return (lp_new.exp() * (lp_new - lp_anc)).masked_fill(invalid, 0.0).sum(dim=-1)
 
         kl_shoot = zero if "shoot" in inactive else _bern_kl(d_heads.shoot_logit, anchor["shoot_logit"])

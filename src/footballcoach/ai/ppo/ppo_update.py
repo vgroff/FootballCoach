@@ -1273,7 +1273,7 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
             anchor_globals = {k: getattr(spread_src, k).detach().to(self.device) for k in spread_keys}
             kl, per_head = self._ppg_kl_penalty(
                 d_heads, e_heads, anchor, anchor_globals, mb_actions, em,
-                row_weights=rows.float(), detach_spread=term["means_only"],
+                row_weights=rows.float(), detach_spread=term["means_only"], forward_kl=True,
             )
             total = total + term["coeff"] * kl
             with torch.no_grad():

@@ -1655,6 +1655,20 @@ Teacher Bernoulli targets are label-smoothed (`label_smoothing`, 1e-5: p' =
 (1-eps) p + eps/2, target logits capped at ~+-11.5) so saturated teacher heads
 (763's kick logits ~-20) do not leave the student with heads PPO cannot move.
 
+**KL direction (found in the first run, 2026-11-16).** `_ppg_kl_penalty`
+is the reverse KL(student || anchor), right for PPG's anchor (the student
+starts there) but wrong for distilling towards a teacher: its Bernoulli
+gradient is sigma'(a)(a - b), ~1e-8 at a student kick logit of -20, so the
+phase-2 kick gate went 0.005 -> 0.001 against a teacher at 0.108 while power
+and aim (continuous, symmetric) were learned. Distillation (pretrain and the
+PPO teacher term) now uses `forward_kl=True` for the discrete heads:
+KL(teacher || student), gradient p_student - p_teacher. Also removed: a +-12
+clamp on the student logit in `_bern_kl` (zero gradient beyond it); now
+computed in log-sigmoid form, exact at any logit. The same first cycle also
+showed phase-1 rows regressing (KL 0.03 -> 1.4: power diff 0.02 -> 0.24,
+move 0.2 -> 2.1 deg) while the much larger phase-2 KL dominated: watch the
+per-group lines.
+
 **Fixed with it: NaN gradient in `_ppg_kl_penalty`'s target-categorical KL.**
 torch's Categorical KL on -inf-masked logits (absent player slots) is right in
 the forward pass but NaN in the backward (0 x inf). Never hit before because

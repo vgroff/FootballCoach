@@ -49,8 +49,17 @@ _SPREAD_KEYS = ("move_dir_log_kappa", "kick_dir_log_kappa", "kick_dir_z_log_std"
 
 
 DEFAULTS = {"counterfactual": True, "counterfactual_weight": 1.0, "kl_coef": 5.0, "value_coef": 1.0,
-            "label_smoothing": 0.0, "epochs": 6, "lr": 1e-4, "batch_size": 8000, "rollout_steps": 540000,
-            "num_rollouts": 4}
+            "label_smoothing": 0.0, "epochs": 6, "lr": 1e-4, "lr_warmup_steps": 0, "batch_size": 8000,
+            "rollout_steps": 540000, "num_rollouts": 4}
+
+
+def warmup_lr(base_lr: float, step: int, warmup_steps: int) -> float:
+    """Linear warmup from ~0 to ``base_lr`` over the first ``warmup_steps``
+    optimiser steps of the whole run (once, not per cycle: Adam's state
+    carries over between cycles, only its start is cold)."""
+    if warmup_steps <= 0:
+        return base_lr
+    return base_lr * min(1.0, (step + 1) / warmup_steps)
 
 
 def load_config() -> dict:
@@ -170,7 +179,7 @@ def minibatch_loss(trainer, mb: dict, ret_std: float, kl_coef: float, value_coef
     globals_ = {k: getattr(trainer.execution_net, k).detach() for k in _SPREAD_KEYS}
     kl, _ = trainer._ppg_kl_penalty(
         d, e, mb["anchor"], globals_, mb["actions"], mb["obs"]["exists_mask"],
-        row_weights=mb["kl_w"], detach_spread=True, soft_action_weights=True,
+        row_weights=mb["kl_w"], detach_spread=True, soft_action_weights=True, forward_kl=True,
     )
     vw = mb["value_w"]
     sq = (e.value.squeeze(-1) - mb["returns"]) ** 2
@@ -210,7 +219,7 @@ def group_report(trainer, data: dict, batch_size: int, max_rows: int = 40000) ->
                     d, e = _student_forward(trainer, mb["obs"])
                     globals_ = {k: getattr(trainer.execution_net, k).detach() for k in _SPREAD_KEYS}
                     kl, _ = trainer._ppg_kl_penalty(d, e, mb["anchor"], globals_, mb["actions"], mb["obs"]["exists_mask"],
-                                                    detach_spread=True, soft_action_weights=True)
+                                                    detach_spread=True, soft_action_weights=True, forward_kl=True)
                     kls.append(float(kl) * len(idx))
                     agrees.append(_distill_agreement(e, mb["anchor"], torch.ones(len(idx), dtype=torch.bool,
                                                                                 device=trainer.device), mb["actions"]))
@@ -265,9 +274,11 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
     opt = torch.optim.Adam(params, lr=float(cfg["lr"]), eps=1e-5)
     log.info(f"Distill pretrain: teachers {cfg['teachers']}, label_smoothing={cfg['label_smoothing']}, counterfactual={cfg['counterfactual']} "
              f"(weight {cfg['counterfactual_weight']}), kl_coef={cfg['kl_coef']}, value_coef={cfg['value_coef']}, "
-             f"{cfg['num_rollouts']} cycle(s) x {cfg['rollout_steps']} steps x {cfg['epochs']} epoch(s), lr={cfg['lr']}")
+             f"{cfg['num_rollouts']} cycle(s) x {cfg['rollout_steps']} steps x {cfg['epochs']} epoch(s), lr={cfg['lr']} "
+             f"(linear warmup over {cfg['lr_warmup_steps']} steps)")
     pool = trainer._spawn_value_pretrain_workers(phase_id)
     report: dict = {}
+    step = 0
     try:
         for cycle in range(int(cfg["num_rollouts"])):
             log.info(f"=== Distill pretrain: cycle {cycle + 1}/{cfg['num_rollouts']} ===")
@@ -294,10 +305,13 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
                 for s in range(0, n, bs):
                     mb = _slice(data, perm[s:s + bs], trainer.device)
                     loss, vloss, kl = minibatch_loss(trainer, mb, ret_std, float(cfg["kl_coef"]), float(cfg["value_coef"]))
+                    for g in opt.param_groups:
+                        g["lr"] = warmup_lr(float(cfg["lr"]), step, int(cfg["lr_warmup_steps"]))
                     opt.zero_grad()
                     loss.backward()
                     torch.nn.utils.clip_grad_norm_(params, trainer.max_grad_norm)
                     opt.step()
+                    step += 1
                     vals.append(float(vloss.detach()))
                     kls.append(float(kl.detach()))
                 log.info(f"  [distill pretrain] epoch {epoch + 1}/{cfg['epochs']}: kl={np.mean(kls):.4f}  "
