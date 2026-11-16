@@ -235,6 +235,9 @@ def augment_batch(
     n_slots: int = batch["obs/other_feat"].shape[1]
     has_bc: bool = "bc_labels" in batch
     has_ai_type: bool = "obs/self_ai_type" in batch and "obs/other_ai_type" in batch
+    # Value-only side features (schema.VALUE_SIDE_DIM): not geometric, no slot
+    # content -- passed through unchanged, like self_ai_type.
+    has_value_side: bool = "obs/value_side_feat" in batch
     has_head_log_probs: bool = "head_log_probs" in batch
     has_reward_comps: bool = "reward_comps_raw" in batch
     has_step_outcomes: bool = "step_outcomes" in batch
@@ -367,6 +370,8 @@ def augment_batch(
                 # feature vector (see ai/knowledge.md).
                 part["obs/self_ai_type"] = sat
                 part["obs/other_ai_type"] = oat_base[:, perm, :]
+            if has_value_side:
+                part["obs/value_side_feat"] = batch["obs/value_side_feat"]
             part.update(remapped_actions)
             if bc_labels_flipped is not None:
                 part["bc_labels"] = bc_labels_flipped
@@ -425,6 +430,7 @@ def augment_obs_bc(
     n_slot_shuffles = max(1, n_slot_shuffles)
     n_slots: int = obs_dict["other_feat"].shape[1]
     has_ai_type: bool = "self_ai_type" in obs_dict and "other_ai_type" in obs_dict
+    has_value_side: bool = "value_side_feat" in obs_dict
 
     _px = torch.tensor(PLAYER_FLIP_X_IDX, dtype=torch.long)
     _py = torch.tensor(PLAYER_FLIP_Y_IDX, dtype=torch.long)
@@ -432,7 +438,7 @@ def augment_obs_bc(
     _by = torch.tensor(BALL_FLIP_Y_IDX,   dtype=torch.long)
 
     sf_parts, of_parts, em_parts, bf_parts, gf_parts, bc_parts = [], [], [], [], [], []
-    sat_parts, oat_parts = [], []
+    sat_parts, oat_parts, side_parts = [], [], []
 
     for flip_x, flip_y in _FLIP_VARIANTS:
         sf = obs_dict["self_feat"].clone()
@@ -479,6 +485,8 @@ def augment_obs_bc(
                 # SAME slot permutation as other_feat (see ai/knowledge.md).
                 sat_parts.append(sat)
                 oat_parts.append(oat_base[:, perm, :])
+            if has_value_side:
+                side_parts.append(obs_dict["value_side_feat"])
 
     aug_obs = {
         "self_feat":   torch.cat(sf_parts, dim=0),
@@ -490,5 +498,7 @@ def augment_obs_bc(
     if has_ai_type:
         aug_obs["self_ai_type"] = torch.cat(sat_parts, dim=0)
         aug_obs["other_ai_type"] = torch.cat(oat_parts, dim=0)
+    if has_value_side:
+        aug_obs["value_side_feat"] = torch.cat(side_parts, dim=0)
     aug_bc = torch.cat(bc_parts, dim=0)
     return aug_obs, aug_bc

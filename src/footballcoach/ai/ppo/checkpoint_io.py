@@ -11,6 +11,35 @@ from footballcoach.ai.models.execution_network import ExecutionNetwork
 from footballcoach.ai.ppo.trainer_common import _load_state_dict_tolerant, log
 
 
+def pad_value_side_columns(state_dict: dict, module: torch.nn.Module, label: str) -> bool:
+    """In place: give a checkpoint saved before the value-only side features
+    (obs value_side_feat, schema.VALUE_SIDE_DIM, 2026-11-16) their value_head
+    input columns, as ZEROS, so the critic computes exactly what it did.
+
+    value_head's first Linear reads [h, value_extra, side features,
+    elapsed_norm]; an old one reads [h, value_extra, elapsed_norm], so the
+    zero columns go just before the last. Without this the tolerant loader
+    would skip the shape-mismatched weight and leave the whole first value
+    layer at random init. Returns whether anything was padded (the
+    optimizer's Adam moments for that weight then no longer fit)."""
+    from footballcoach.ai.obs.schema import VALUE_SIDE_DIM
+    own = module.state_dict()
+    padded = False
+    for k in list(state_dict):
+        if not k.endswith("value_head.1.weight") or k not in own:
+            continue
+        v, want = state_dict[k], own[k].shape
+        if v.shape == want:
+            continue
+        if v.dim() == 2 and v.shape[0] == want[0] and v.shape[1] + VALUE_SIDE_DIM == want[1]:
+            zeros = torch.zeros(v.shape[0], VALUE_SIDE_DIM, dtype=v.dtype, device=v.device)
+            state_dict[k] = torch.cat([v[:, :-1], zeros, v[:, -1:]], dim=1)
+            padded = True
+            log.info(f"{label}: {k} saved before the value side features; inserted "
+                     f"{VALUE_SIDE_DIM} zero column(s) before elapsed_norm")
+    return padded
+
+
 def _migrate_direction_log_std_to_kappa(state_dict: dict) -> dict:
     """Backward-compat shim for the move_dir_log_std/kick_dir_log_std ->
     move_dir_log_kappa/kick_dir_log_kappa/kick_dir_z_log_std rename (see
@@ -193,6 +222,7 @@ class CheckpointIOMixin:
         # correctly populated from its own physics_pretrain checkpoint path.
         _load_state_dict_tolerant(self.decision_net, ckpt["decision_net"], "decision_net")
         _execution_sd = _migrate_direction_log_std_to_kappa(ckpt["execution_net"])
+        _padded_value_side = pad_value_side_columns(_execution_sd, self.execution_net, "execution_net")
         _load_state_dict_tolerant(self.execution_net, _execution_sd, "execution_net")
         if self.value_net is not None:
             if "value_net" in ckpt:
@@ -202,8 +232,11 @@ class CheckpointIOMixin:
                 # checkpoint -- migrate here too, purely for a clean load
                 # (these params are never actually used by the critic).
                 _value_sd = _migrate_direction_log_std_to_kappa(ckpt["value_net"])
+                _value_padded = pad_value_side_columns(_value_sd, self.value_net, "value_net")
+                _padded_value_side = _padded_value_side or _value_padded
                 _load_state_dict_tolerant(self.value_net, _value_sd, "value_net")
-                if not reset_optimizer and self.value_net_optimizer is not None and "value_net_optimizer" in ckpt:
+                if (not reset_optimizer and not _value_padded and self.value_net_optimizer is not None
+                        and "value_net_optimizer" in ckpt):
                     self.value_net_optimizer.load_state_dict(ckpt["value_net_optimizer"])
             else:
                 log.warning(
@@ -213,6 +246,9 @@ class CheckpointIOMixin:
                 )
         if reset_optimizer:
             log.info(f"--reset-optimizer: skipping optimizer state restore for {path} (network weights still loaded normally)")
+        elif _padded_value_side and self.optimizer is not None and "optimizer" in ckpt:
+            log.warning(f"{path} predates the value side features (value_head widened): skipping optimizer "
+                        "state restore, whose Adam moments have the old shape (weights loaded normally)")
         elif self.optimizer is not None and "optimizer" in ckpt:
             saved_n_groups = len(ckpt["optimizer"].get("param_groups", []))
             current_n_groups = len(self.optimizer.param_groups)

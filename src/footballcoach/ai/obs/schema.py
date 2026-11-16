@@ -292,6 +292,13 @@ MAX_OTHER_PLAYERS: int = 21  # full 11v11 minus self
 #: constants in ai/ppo/bc.py (kept in sync manually - this is a small, fixed
 #: constant, not derived from bc.py to avoid a schema.py -> ppo.bc import).
 AI_TYPE_ONE_HOT_DIM: int = 3
+# Value-only side features (ObservationBatch.value_side_feat), fed straight
+# into the critic's value_head and never to any policy head:
+#   [0] episode_elapsed_frac = elapsed / episode length, in [0, 1].
+# The policy is never given the episode length (an elapsed signal plus the
+# time remaining would reveal it); the critic needs the fraction because the
+# phase-1 speed bonus is proportional to the fraction of the episode left.
+VALUE_SIDE_DIM: int = 1
 
 
 @dataclass
@@ -322,8 +329,13 @@ class ObservationBatch:
     global_feat: np.ndarray
     self_ai_type: np.ndarray = None
     other_ai_type: np.ndarray = None
+    # (VALUE_SIDE_DIM,) value-only side features, see VALUE_SIDE_DIM. Zeros
+    # when unset.
+    value_side_feat: np.ndarray = None
 
     def __post_init__(self) -> None:
+        if self.value_side_feat is None:
+            self.value_side_feat = np.zeros(VALUE_SIDE_DIM, dtype=np.float32)
         if self.self_ai_type is None:
             self.self_ai_type = np.zeros(AI_TYPE_ONE_HOT_DIM, dtype=np.float32)
         if self.other_ai_type is None:
@@ -345,4 +357,5 @@ class ObservationBatch:
             "global_feat": torch.from_numpy(self.global_feat),
             "self_ai_type": torch.from_numpy(self.self_ai_type),
             "other_ai_type": torch.from_numpy(self.other_ai_type),
+            "value_side_feat": torch.from_numpy(self.value_side_feat),
         }

@@ -1092,6 +1092,7 @@ class NeuralPlayerAI(PlayerAI):
             attack_defence_smoothed=self.ema_smoothed,
             rng=self._rng,
             phase=self.task_phase,
+            episode_length_s=self.max_episode_s,
         )
         obs_dict = obs.to_torch_dict()
 
@@ -1464,6 +1465,7 @@ class HybridPlayerAI(NeuralPlayerAI):
             attack_defence_smoothed=self.ema_smoothed,
             rng=self._rng,
             phase=self.task_phase,
+            episode_length_s=self.max_episode_s,
         )
         obs_dict = obs.to_torch_dict()
 

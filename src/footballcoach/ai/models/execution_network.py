@@ -29,13 +29,14 @@ import torch.nn as nn
 
 from footballcoach.ai.action.schema import DecisionHeadsRaw, ExecutionHeadsRaw
 from footballcoach.ai.models.entity_encoder import EntityEncoder
-from footballcoach.ai.models.value_side_channel import ValueAiTypeSideChannel
+from footballcoach.ai.models.value_side_channel import ValueAiTypeSideChannel, split_value_side
 from footballcoach.ai.obs.schema import (
     AI_TYPE_ONE_HOT_DIM,
     BALL_FEATURE_DIM,
     GLOBAL_FEATURE_DIM,
     MAX_OTHER_PLAYERS,
     PLAYER_FEATURE_DIM,
+    VALUE_SIDE_DIM,
 )
 
 
@@ -222,7 +223,11 @@ class ExecutionNetwork(nn.Module):
         # (episode progress), mirroring value_ai_type_channel's pattern of
         # giving the critic a dedicated, trunk-bypassing view of something
         # that matters disproportionately to it.
-        value_in_dim = trunk_hidden + value_extra_hidden + 1
+        # [h, value_extra, value side features (schema.VALUE_SIDE_DIM), elapsed_norm]:
+        # elapsed_norm stays LAST (ai/ppo/time_input_remap.py relies on it) and
+        # the side features sit just before it (checkpoint_io pads a zero
+        # column there for checkpoints saved before they existed).
+        value_in_dim = trunk_hidden + value_extra_hidden + VALUE_SIDE_DIM + 1
         if value_hidden_dim > 0:
             self.value_head = nn.Sequential(
                 nn.Dropout(value_dropout),
@@ -324,6 +329,7 @@ class ExecutionNetwork(nn.Module):
         h = self.trunk(h)
 
         batch_size = h.shape[0]
+        self_ai_type, value_side = split_value_side(self_ai_type, batch_size, h)
         if self_ai_type is None:
             self_ai_type = torch.zeros(batch_size, AI_TYPE_ONE_HOT_DIM, device=h.device, dtype=h.dtype)
         if other_ai_type is None:
@@ -334,8 +340,11 @@ class ExecutionNetwork(nn.Module):
             self_ai_type, other_ai_type, exists_mask,
             self_embed=self_embed_raw.detach(), other_embed=other_embed_raw.detach(),
         )
+        # NOT elapsed time: a flipped copy of the log-compressed time remaining
+        # (it reads ~0.62 at the start of an episode). The true elapsed
+        # fraction is value_side[:, 0] (critic-only, see schema.VALUE_SIDE_DIM).
         elapsed_norm = 1.0 - global_feat[:, 1:2]
-        value_input = torch.cat([h, value_extra, elapsed_norm], dim=-1)
+        value_input = torch.cat([h, value_extra, value_side.to(h.dtype), elapsed_norm], dim=-1)
 
         if value_only:
             return self.value_head(value_input)

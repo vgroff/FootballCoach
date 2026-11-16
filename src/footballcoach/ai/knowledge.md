@@ -1476,6 +1476,37 @@ end-of-episode value change is the information the old clock never carried.
 (The pre-training-only physics value net inverts the feature non-linearly
 but is not part of the live networks.)
 
+## Critic-only episode-elapsed fraction (value side features, 2026-11-16)
+
+Phase 1's speed bonus is `speed_bonus_scale * time_remaining / episode_length`,
+but no network is given the episode length (22-32 s, drawn per episode), so
+from the time remaining alone the critic cannot know the bonus still
+available. Any elapsed signal plus the time remaining would reveal the
+episode length, which the policy should not know, so it goes to the critic
+only: `ObservationBatch.value_side_feat` = [elapsed / episode length]
+(`schema.VALUE_SIDE_DIM` = 1), set by `encode_observation(...,
+episode_length_s=env.max_episode_s)` for both the training rows and the env
+observation.
+
+Plumbing: `trainer_common._ai_types` appends it to the networks'
+`self_ai_type` argument (every call site already passes that), and
+`models/value_side_channel.split_value_side` splits it off again in both
+networks before the ai-type side channel; only `ExecutionNetwork`'s
+value_head reads it (`value_input = [h, value_extra, value_side,
+elapsed_norm]`, elapsed_norm stays last). The decision network's own value
+head does not. Action sampling and the BC training loops go through
+`_ai_types` too, and augmentation passes the key through. Tested: no policy
+output changes when it changes, the sampled (GAE) value uses it, its column
+gets a gradient (`tests/ai_scenario/test_value_side_elapsed.py`; a leak into
+the policy trunk and a missing load-time pad are both caught).
+
+**Old checkpoints** (value_head's first Linear one column narrower) get a zero
+column inserted before elapsed_norm on load (`checkpoint_io.
+pad_value_side_columns`, also applied to neural-snapshot checkpoint files), so
+their critic is unchanged exactly; the optimizer state is then not restored
+(its Adam moments have the old shape). Without it the tolerant loader would
+silently have left that whole layer at random init.
+
 ## Phase-1 step early exit and stale transitions (fixed 2026-11-16)
 
 `ScenarioEnv.step()` (phase 1) used to stop a step early when "the trainee

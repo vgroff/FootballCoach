@@ -866,6 +866,7 @@ class ScenarioEnv:
             attack_defence_smoothed=self._ema.smoothed,
             rng=self.rng,
             phase=self.phase,
+            episode_length_s=self.max_episode_s,
         )
 
     def _ball_dist_to_trainee(self, match=None) -> float:
@@ -975,6 +976,7 @@ class ScenarioEnv:
             attack_defence_smoothed=sec_ema.smoothed,
             rng=self.rng,
             phase=self.phase,
+            episode_length_s=self.max_episode_s,
         )
 
     def _find_trainee(self, match: Match):

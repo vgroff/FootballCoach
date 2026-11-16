@@ -8,6 +8,7 @@ from footballcoach.ai.action.distributions import IndependentBernoulli, KickDire
 from footballcoach.ai.action.schema import DecisionAction
 from footballcoach.ai.models.decision_network import derive_get_possession_prob
 from footballcoach.ai.obs.canonical import mirror_x, x_sign_of
+from footballcoach.ai.ppo.trainer_common import _ai_types
 
 
 # _LP_HEAD_NAMES (decision_net attribute names, as returned by
@@ -214,8 +215,9 @@ class ActionSamplingMixin:
         em = obs_dict_batch["exists_mask"].to(dev)
         bf = obs_dict_batch["ball_feat"].to(dev)
         gf = obs_dict_batch["global_feat"].to(dev)
-        sat = obs_dict_batch["self_ai_type"].to(dev) if "self_ai_type" in obs_dict_batch else None
-        oat = obs_dict_batch["other_ai_type"].to(dev) if "other_ai_type" in obs_dict_batch else None
+        sat, oat = _ai_types(obs_dict_batch)
+        sat = sat.to(dev) if sat is not None else None
+        oat = oat.to(dev) if oat is not None else None
 
         # Canonical AI frame: mirror world-frame obs so self always attacks
         # +x (see ai/obs/canonical.py). Reused by the sampling tail
@@ -792,8 +794,9 @@ class ActionSamplingMixin:
         em = obs_dict["exists_mask"].to(self.device)
         bf = obs_dict["ball_feat"].to(self.device)
         gf = obs_dict["global_feat"].to(self.device)
-        sat = obs_dict["self_ai_type"].to(self.device) if "self_ai_type" in obs_dict else None
-        oat = obs_dict["other_ai_type"].to(self.device) if "other_ai_type" in obs_dict else None
+        sat, oat = _ai_types(obs_dict)
+        sat = sat.to(self.device) if sat is not None else None
+        oat = oat.to(self.device) if oat is not None else None
         d_heads = self.decision_net(sf, of, em, bf, gf, sat, oat)
         _value = self._value_heads(sf, of, em, bf, gf, d_heads, sat, oat)
         return float(_value.mean())  # single critic (execution_net, or self.value_net)

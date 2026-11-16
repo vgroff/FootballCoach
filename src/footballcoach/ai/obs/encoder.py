@@ -86,8 +86,14 @@ def encode_observation(
     attack_defence_smoothed: float = 0.5,
     rng: Optional[random.Random] = None,
     phase: Optional[int] = None,
+    episode_length_s: Optional[float] = None,
 ) -> ObservationBatch:
     """Build the observation for a single player at the current match state.
+
+    ``episode_length_s``: this episode's length (the env's max_episode_s),
+    for the critic-only value side feature episode_elapsed_frac
+    (schema.VALUE_SIDE_DIM) = 1 - time_remaining_s / episode_length_s. None
+    (or non-positive) leaves it 0. It never enters the policy's inputs.
 
     Args:
         match: The running Match instance.
@@ -192,7 +198,14 @@ def encode_observation(
         global_feat=global_feat,
         self_ai_type=self_ai_type,
         other_ai_type=other_ai_type,
+        value_side_feat=np.array([_elapsed_frac(time_remaining_s, episode_length_s)], dtype=np.float32),
     )
+
+
+def _elapsed_frac(time_remaining_s: float, episode_length_s: Optional[float]) -> float:
+    if episode_length_s is None or episode_length_s <= 0.0:
+        return 0.0
+    return min(1.0, max(0.0, 1.0 - max(time_remaining_s, 0.0) / episode_length_s))
 
 
 # ---------------------------------------------------------------------------

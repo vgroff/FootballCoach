@@ -29,7 +29,7 @@ import torch.nn as nn
 from footballcoach.ai.action.schema import DecisionHeadsRaw
 from footballcoach.ai.models.entity_encoder import EntityEncoder
 from footballcoach.ai.models.physics_encoders import BallPhysicsFeatureBlock, PlayerPhysicsFeatureBlock
-from footballcoach.ai.models.value_side_channel import ValueAiTypeSideChannel
+from footballcoach.ai.models.value_side_channel import ValueAiTypeSideChannel, split_value_side
 from footballcoach.ai.obs.schema import (
     AI_TYPE_ONE_HOT_DIM,
     BALL_FEATURE_DIM,
@@ -264,6 +264,9 @@ class DecisionNetwork(nn.Module):
         # --- Value-only ai-type side channel (bypasses h/trunk entirely for
         # every head except value_head) ---
         batch_size = h.shape[0]
+        # Its own (unused-by-the-trainer) value head does not read the value
+        # side features; only the execution/value networks' value_head does.
+        self_ai_type, _value_side = split_value_side(self_ai_type, batch_size, h)
         if self_ai_type is None:
             self_ai_type = torch.zeros(batch_size, AI_TYPE_ONE_HOT_DIM, device=h.device, dtype=h.dtype)
         if other_ai_type is None:

@@ -294,6 +294,10 @@ class PPGMixin:
         checkpoint N" is the checkpoint file itself, not a separate
         in-memory copy."""
         ckpt = torch.load(path, map_location="cpu", weights_only=False)
+        from footballcoach.ai.ppo.checkpoint_io import pad_value_side_columns
+        pad_value_side_columns(ckpt["execution_net"], self.execution_net, "snapshot execution_net")
+        if self.separate_value_net and ckpt.get("value_net") is not None:
+            pad_value_side_columns(ckpt["value_net"], self.value_net, "snapshot value_net")
         return {
             "step": ckpt.get("step", 0),
             "decision": ckpt["decision_net"],

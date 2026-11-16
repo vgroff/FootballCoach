@@ -199,7 +199,7 @@ The PPG value refit only sees the primary phase (see Open follow-ups).
   (curriculum.envs.ui_task_phase), and the time-remaining input is now the
   true clock, with a one-off weight remap for older checkpoints
   (ai/knowledge.md "Time remaining").
-- Planned: a critic-only elapsed-fraction input in the value head's side
+- (Done 2026-11-16) A critic-only elapsed-fraction input in the value head's side
   channel (the speed bonus depends on the fraction of the episode left, which
   the critic cannot know without the episode length; kept out of the policy
   so it never learns the episode length).

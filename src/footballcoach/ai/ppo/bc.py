@@ -1358,7 +1358,8 @@ class BCPretrainer:
                 batch_size=batch_size, shuffle=True, device=self.device, valid_only=True
             ):
                 self.optimizer.zero_grad()
-                _sat, _oat = obs_dict.get("self_ai_type"), obs_dict.get("other_ai_type")
+                from footballcoach.ai.ppo.trainer_common import _ai_types
+                _sat, _oat = _ai_types(obs_dict)
                 d_heads = self.decision_net(
                     obs_dict["self_feat"], obs_dict["other_feat"],
                     obs_dict["exists_mask"], obs_dict["ball_feat"], obs_dict["global_feat"],
@@ -1430,7 +1431,8 @@ class BCPretrainer:
                 label_t = torch.stack(batch_labels, dim=0)
 
                 self.optimizer.zero_grad()
-                _sat, _oat = stacked.get("self_ai_type"), stacked.get("other_ai_type")
+                from footballcoach.ai.ppo.trainer_common import _ai_types
+                _sat, _oat = _ai_types(stacked)
                 d_heads = self.decision_net(
                     stacked["self_feat"], stacked["other_feat"],
                     stacked["exists_mask"], stacked["ball_feat"], stacked["global_feat"],

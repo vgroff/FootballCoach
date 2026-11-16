@@ -31,6 +31,24 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 
+from footballcoach.ai.obs.schema import AI_TYPE_ONE_HOT_DIM, VALUE_SIDE_DIM
+
+
+def split_value_side(self_ai_type, batch_size: int, ref: torch.Tensor):
+    """The networks' ``self_ai_type`` argument carries the value-only side
+    features (obs ``value_side_feat``, see schema.VALUE_SIDE_DIM) appended
+    after the ai-type one-hot, by trainer_common._ai_types, so they reach the
+    networks through the same argument every call site already passes.
+    Returns (ai-type one-hot or None, side features (batch, VALUE_SIDE_DIM));
+    the side features are zeros when the argument is a bare one-hot or None."""
+    zeros = torch.zeros(batch_size, VALUE_SIDE_DIM, device=ref.device, dtype=ref.dtype)
+    if self_ai_type is None or self_ai_type.shape[-1] == AI_TYPE_ONE_HOT_DIM:
+        return self_ai_type, zeros
+    if self_ai_type.shape[-1] != AI_TYPE_ONE_HOT_DIM + VALUE_SIDE_DIM:
+        raise ValueError(f"self_ai_type has width {self_ai_type.shape[-1]}; expected {AI_TYPE_ONE_HOT_DIM} "
+                         f"or {AI_TYPE_ONE_HOT_DIM + VALUE_SIDE_DIM}")
+    return self_ai_type[..., :AI_TYPE_ONE_HOT_DIM], self_ai_type[..., AI_TYPE_ONE_HOT_DIM:]
+
 
 class ValueAiTypeSideChannel(nn.Module):
     """Shared per-slot MLP + dedicated attention pool over opponent-ai-type

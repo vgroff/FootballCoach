@@ -205,8 +205,9 @@ def test_observation_batch_to_torch_dict_keys():
     d = obs.to_torch_dict()
     assert set(d.keys()) == {
         "self_feat", "other_feat", "exists_mask", "ball_feat", "global_feat",
-        "self_ai_type", "other_ai_type",
+        "self_ai_type", "other_ai_type", "value_side_feat",
     }
+    assert d["value_side_feat"].shape == (1,) and float(d["value_side_feat"][0]) == 0.0   # unset = 0
 
 
 def test_observation_batch_to_torch_dict_shapes():

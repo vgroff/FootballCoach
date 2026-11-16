@@ -283,7 +283,16 @@ def _ai_types(obs_dict: dict) -> tuple:
     the identical fallback behaviour. See ai/knowledge.md "Opponent-AI-type
     (value-only)".
     """
-    return obs_dict.get("self_ai_type"), obs_dict.get("other_ai_type")
+    sat, oat = obs_dict.get("self_ai_type"), obs_dict.get("other_ai_type")
+    side = obs_dict.get("value_side_feat")
+    if side is not None:
+        # The value-only side features ride in after the one-hot (see
+        # models/value_side_channel.split_value_side).
+        if sat is None:
+            from footballcoach.ai.obs.schema import AI_TYPE_ONE_HOT_DIM
+            sat = torch.zeros(*side.shape[:-1], AI_TYPE_ONE_HOT_DIM, dtype=side.dtype, device=side.device)
+        sat = torch.cat([sat, side.to(device=sat.device, dtype=sat.dtype)], dim=-1)
+    return sat, oat
 
 def _episode_abs_adv_means(
     track_ids: list, dones, advantages,
