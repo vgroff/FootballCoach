@@ -1819,6 +1819,14 @@ eval pool (`eval_worker`'s `role_eval` command, weights pushed once per
 call), one line each (`[eval phase2_1v2/attacker_vs_rules] step=... ...`).
 `ai/eval/role_phase_eval.py`.
 
+**Phase-1 evals use phase 1's episode length (fixed 2026-11-16).** A
+multi-process run passes the TRAINING phase's `max_episode_s` to the rollout
+evals, so a `--phase 2` run with phase 1 in the mix evaluated the 1v1 at
+phase 2's 15 s instead of 22 s: ~18% timeouts instead of ~4%, wins ~10 pts
+lower (rules-vs-rules baseline 40% instead of 46%). In-run phase-1 numbers of
+phase2_run6 .. phase2_run15 are at 15 s: comparable within a run, not with
+offline (22 s) evals. `_run_rollout_evals` now uses phase 1's own length.
+
 **Starting from an existing checkpoint: `--init-new-phase-inputs`.**
 Zeroes, on every network, the first-layer weight columns reading the task id
 of every phase the run trains (`--phase`, or the whole phase mix) and, if a

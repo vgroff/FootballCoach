@@ -132,6 +132,26 @@ def test_rollout_evals_cover_exactly_the_trained_phases(trainer, monkeypatch):
     assert _dispatch(trainer, monkeypatch, None, None) == ["phase1_vs_rules", "phase1_snapshots", ("role", ())]
 
 
+def test_phase1_evals_use_phase1_episode_length(trainer, monkeypatch):
+    """A --phase 2 run with phase 1 in the mix passes phase 2's episode length
+    to the rollout evals; the phase-1 evals must still use phase 1's."""
+    p1 = float(PHASES_BY_ID[1].env_kwargs["max_episode_s"])
+    seen = []
+    monkeypatch.setattr(trainer, "rollout_eval_trials", 1)
+    monkeypatch.setattr(trainer, "phase_mix", {1: 0.8, 2: 0.2})
+    monkeypatch.setattr(trainer, "_train_phase_id", 2)
+    monkeypatch.setattr(trainer, "_eval_vs_rules", lambda s: seen.append(("rules", s)))
+    monkeypatch.setattr(trainer, "_maybe_run_neural_snapshot_eval", lambda s: seen.append(("snapshots", s)))
+    monkeypatch.setattr(trainer, "_eval_role_phases", lambda: None)
+    trainer._run_rollout_evals(15.0)
+    assert seen == [("rules", p1), ("snapshots", p1)]
+    seen.clear()
+    monkeypatch.setattr(trainer, "phase_mix", None)
+    monkeypatch.setattr(trainer, "_train_phase_id", 1)
+    trainer._run_rollout_evals(33.0)                        # a phase-1 run: its own value, unchanged
+    assert seen == [("rules", 33.0), ("snapshots", 33.0)]
+
+
 def test_a_phase2_only_run_without_a_mix_runs_the_role_evals(trainer, monkeypatch, caplog, controllers):
     controllers(NEURAL_ATTACKER)
     real = rpe.run_role_phase_eval

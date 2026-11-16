@@ -279,6 +279,12 @@ class TrainerEvalMixin:
         single-process train() without phase_id) is a phase-1 run, as before."""
         phases = self._trained_phase_ids()
         if not phases or 1 in phases:
+            # Phase 1's own episode length: ``max_episode_s`` is the TRAINING
+            # phase's (e.g. phase 2's 15 s in a --phase 2 run with phase 1 in
+            # the mix), which made phase-1 evals time out far more often.
+            if phases and phases != [1]:
+                from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+                max_episode_s = float(PHASES_BY_ID[1].env_kwargs.get("max_episode_s", max_episode_s))
             if self.rollout_eval_trials > 0:
                 self._eval_vs_rules(max_episode_s)
             self._maybe_run_neural_snapshot_eval(max_episode_s)
