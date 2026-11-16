@@ -418,7 +418,16 @@ WOULD kick without the ball being touched: every kick function (`kick_ball`,
 `pass_ball`, `kick_ball_from_direction`, `Player.kick_direct`,
 `Player.kick_with_direction`) takes `release=False` to return its
 `KickPlan` (yaw, pitch, speed, error sigma) instead of launching, and
-`kick_intent.plan_kick_intent` / `kick_label_fields` use exactly that. Not routed through intents: the
+`kick_intent.plan_kick_intent` / `kick_label_fields` use exactly that.
+
+Every applied kick now does the same bookkeeping (`Player._finish_kick`: end a
+first touch, `kicked_this_tick`, `kick_count`, `last_kick_*`, `on_kick`).
+Before, shots and passes called `kick_ball` / `pass_ball` directly and skipped
+it: a rules-AI shot never counted as a kick, and a first-touch shooter stayed
+in CONTROLLING_BALL (moving as if still carrying the ball) until the control
+timer ran out. On the engine trace only 1v2, 2v2 and pass changed; their
+per-tick physics is bit-identical except 2v2 from the first first-touch shot
+(tick 18), and outcome totals are unchanged. Not routed through intents: the
 neural player's in-possession kick (`apply_nn_action.py`, whose kick-once logic
 reads the kick count right after applying), the engine's armed-kick on pickup,
 and the UI's manual kick.

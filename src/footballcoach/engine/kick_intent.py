@@ -113,21 +113,37 @@ def _carry_out(player: "Player", match: "Match", intent: KickIntent, release: bo
 
 
 def apply_kick_intent(player: "Player", match: "Match", intent: KickIntent) -> None:
-    """Carry out ``intent`` exactly as its order's ``execute()`` used to."""
-    _carry_out(player, match, intent, release=True)
+    """Carry out ``intent`` as its order's ``execute()`` used to, with the
+    same kick bookkeeping for every kind (``Player._finish_kick``: end a first
+    touch, set kicked_this_tick, count it, record last_kick_*, fire on_kick).
+    Until 2026-11-16 shots and passes skipped that bookkeeping (they called the
+    engine's kick_ball / pass_ball directly): a rules-AI shot never counted as a
+    kick, and a first-touch shooter stayed in CONTROLLING_BALL (moving as if
+    still carrying the ball) until the control timer ran out."""
     if intent.kind in ("direction", "aim"):
-        # The player's own kick methods log and fire on_kick themselves
-        # (Player._finish_kick); push-kicks also logged their own line.
+        # The player's own kick methods do the bookkeeping (Player._finish_kick).
+        _carry_out(player, match, intent, release=True)
         if intent.kind == "direction" and intent.log_msg:
             match._log_debug(intent.log_msg)
         return
+    from footballcoach.entities.player import PlayerState
+
+    is_first_touch = player.state == PlayerState.CONTROLLING_BALL
+    # The recorded power, in the same units as every other kick's
+    # last_kick_power_fraction: the shot's own (run-compensated) power, or a
+    # pass's equivalent power from its plan (computed before the ball moves).
+    if intent.kind == "shot":
+        recorded_power = float(intent.power_fraction)
+    else:
+        fields = kick_label_fields(player, match, intent)
+        recorded_power = fields["power_fraction"] if fields is not None else 0.0
+    _carry_out(player, match, intent, release=True)
     if intent.log_msg:
         if intent.kind == "shot":
             match._log_info(intent.log_msg)
         else:
             match._log_debug(intent.log_msg)
-    if player.on_kick is not None:
-        player.on_kick(player)
+    player._finish_kick(match, is_first_touch, intent.kind, recorded_power, recorded_power, Vector3.zero())
 
 
 def plan_kick_intent(player: "Player", match: "Match", intent: KickIntent) -> "Optional[KickPlan]":
