@@ -212,15 +212,18 @@ def group_report(trainer, data: dict, batch_size: int, max_rows: int = 40000) ->
                 continue
             rows = rows[:max_rows]
             kls, agrees, n = [], [], 0
+            heads: dict[str, float] = {}
             with torch.no_grad():
                 for s in range(0, len(rows), batch_size):
                     idx = rows[s:s + batch_size]
                     mb = _slice(data, idx, trainer.device)
                     d, e = _student_forward(trainer, mb["obs"])
                     globals_ = {k: getattr(trainer.execution_net, k).detach() for k in _SPREAD_KEYS}
-                    kl, _ = trainer._ppg_kl_penalty(d, e, mb["anchor"], globals_, mb["actions"], mb["obs"]["exists_mask"],
-                                                    detach_spread=True, soft_action_weights=True, forward_kl=True)
+                    kl, per_head = trainer._ppg_kl_penalty(d, e, mb["anchor"], globals_, mb["actions"], mb["obs"]["exists_mask"],
+                                                           detach_spread=True, soft_action_weights=True, forward_kl=True)
                     kls.append(float(kl) * len(idx))
+                    for h, v in per_head.items():
+                        heads[h] = heads.get(h, 0.0) + float(v) * len(idx)
                     agrees.append(_distill_agreement(e, mb["anchor"], torch.ones(len(idx), dtype=torch.bool,
                                                                                 device=trainer.device), mb["actions"]))
                     n += len(idx)
@@ -229,7 +232,8 @@ def group_report(trainer, data: dict, batch_size: int, max_rows: int = 40000) ->
             with warnings.catch_warnings():
                 warnings.simplefilter("ignore", RuntimeWarning)   # e.g. no teacher-kick rows -> NaN power diff
                 agree = dict(zip(_DISTILL_AGREE_KEYS, np.nanmean(np.asarray(agrees), axis=0).tolist()))
-            out[(pid, "cf" if cf else "real")] = {"kl": sum(kls) / max(n, 1), "agree": agree, "n": n}
+            out[(pid, "cf" if cf else "real")] = {"kl": sum(kls) / max(n, 1), "agree": agree, "n": n,
+                                                  "by_head": {h: v / max(n, 1) for h, v in heads.items()}}
     return out
 
 
@@ -240,6 +244,10 @@ def log_report(tag: str, report: dict) -> None:
                  f"move_dir err={a['move_dir_err_deg']:.1f}deg  P(kick) s/t={a['p_kick_student']:.3f}/{a['p_kick_teacher']:.3f}  "
                  f"|power diff|={a['power_diff']:.3f}  exec_move agree={100 * a['exec_move_agree']:.1f}%  "
                  f"sprint agree={100 * a['sprint_agree']:.1f}%")
+        top = sorted(r.get("by_head", {}).items(), key=lambda kv: -kv[1])[:5]
+        if top:
+            log.info(f"  [distill pretrain {tag}]   task-id phase {pid} ({copy}) KL by head: "
+                     + "  ".join(f"{h}={v:.4f}" for h, v in top))
 
 
 def composition(obs: dict, track_ids, phases: tuple[int, int], stats: dict) -> str:
