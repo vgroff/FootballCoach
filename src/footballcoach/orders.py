@@ -198,8 +198,15 @@ def _compute_movement_intent(
     arrival_speed: float | None = None,
     use_repulsion: bool = True,
     use_brake_to_turn: bool = True,
+    assume_ball_released: bool = False,
 ) -> "tuple[Vector3, object]":
     """Compute ``(adjusted_direction, speed_mode)`` for a movement intent tick.
+
+    ``assume_ball_released``: compute it for the state just after this player
+    kicks the ball away (not carrying, nobody holding it), for an order that
+    records a kick intent (engine/kick_intent.py) and sets its follow-through
+    before the engine applies the kick -- the same inputs the follow-through
+    used to see when the kick happened inside execute().
 
     All movement orders call this rather than duplicating braking / turning /
     repulsion logic.
@@ -225,7 +232,8 @@ def _compute_movement_intent(
     )
     from footballcoach.steering import compute_repulsion
 
-    has_ball = match.ball.possessed_by == player.player_id
+    ball_holder = None if assume_ball_released else match.ball.possessed_by
+    has_ball = ball_holder == player.player_id
     jog_speed = effective_top_speed(
         match.movement_params, player.attributes.top_speed, player.stamina,
         has_ball, player.attributes.ball_control, player.is_goalkeeper,
@@ -249,7 +257,7 @@ def _compute_movement_intent(
     if use_repulsion and target_direction.length_xy() > GEOM_ZERO_EPS:
         adj_dir, speed_mult = compute_repulsion(
             player, target_direction, match.players,
-            match.ball.possessed_by, match.repulsion_params, match.pitch,
+            ball_holder, match.repulsion_params, match.pitch,
         )
         if speed_mode is SpeedMode.SPRINT and speed_mult < 0.75:
             speed_mode = SpeedMode.JOG
@@ -610,16 +618,20 @@ class MoveOrder:
                 # power_fraction is already run-compensated by _try_push_kick
                 # -- compensate_for_run=False (the default) here, or this
                 # would compensate a second time.
-                player.kick_with_direction(match, direction_3d, power_fraction, Vector3.zero())
-                match._log_debug(
-                    f"{player.player_id} push-kick dir=({direction_3d.x:.2f},{direction_3d.y:.2f})"
-                    f" power={power_fraction:.2f}"
+                # A kick intent, applied by the engine right after this
+                # execute() (engine/kick_intent.py), not a kick here.
+                from footballcoach.engine.kick_intent import KickIntent
+                player.pending_kick = KickIntent(
+                    "direction", power_fraction, direction_3d=direction_3d, spin=Vector3.zero(),
+                    log_msg=(f"{player.player_id} push-kick dir=({direction_3d.x:.2f},{direction_3d.y:.2f})"
+                             f" power={power_fraction:.2f}"),
                 )
-                # Immediately set movement intent: sprint free (no ball this tick).
+                # Immediately set movement intent: sprint free (no ball this
+                # tick), computed for the state after the kick.
                 adj_dir, speed_mode = _compute_movement_intent(
                     player, direction, match,
                     sprint=True, arrival_dist=dist, arrival_speed=None,
-                    use_repulsion=True, use_brake_to_turn=True,
+                    use_repulsion=True, use_brake_to_turn=True, assume_ball_released=True,
                 )
                 player.desired_direction = adj_dir
                 player.desired_speed_mode = speed_mode
@@ -720,7 +732,11 @@ class KickOrder:
 
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
         """Kick the ball this tick if the player has possession.  Always completes in one tick."""
-        player.kick_direct(match, self.aim_point, self.power_fraction, self.spin, self.compensate_for_run)
+        from footballcoach.engine.kick_intent import KickIntent
+        player.pending_kick = KickIntent(
+            "aim", self.power_fraction, aim_point=self.aim_point, spin=self.spin,
+            compensate_for_run=self.compensate_for_run,
+        )
         # Follow through -- keep moving rather than freeze after striking the ball.
         adj_dir, speed_mode = _continue_current_motion(player, match, sprint=True)
         player.desired_direction = adj_dir
@@ -769,27 +785,11 @@ class PassOrder:
                 compensate_power_for_run_mult(self.power_fraction, run_mult)
                 if self.power_fraction is not None else None
             )
-            pass_ball(
-                match.ball,
-                player.position,
-                pass_target,
-                player.attributes.kick_precision,
-                match.rng_reduction,
-                match.rng,
-                match.passing_params,
-                gravity_mps2=match.ball_physics_params.gravity_mps2,
-                rolling_friction_coefficient=match.ball_physics_params.rolling_friction_coefficient,
-                power_fraction=compensated,
-                running_power_coefficient=match.kicking_params.running_power_coefficient,
-                kicker_velocity=player.velocity,
-                kicker_top_speed_mps=top_speed,
-                kick_power_attr=player.attributes.kick_power,
-                kicking_params=match.kicking_params,
-                power_multiplier=self.power_multiplier,
+            from footballcoach.engine.kick_intent import KickIntent
+            player.pending_kick = KickIntent(
+                "pass", compensated, aim_point=pass_target, power_multiplier=self.power_multiplier,
+                log_msg=f"{player.player_id} passed to {pass_target}",
             )
-            match._log_debug(f"{player.player_id} passed to {pass_target}")
-            if player.on_kick is not None:
-                player.on_kick(player)
         # Follow through (or, if the ball was already lost, just keep moving
         # rather than freeze) -- see _continue_current_motion.
         adj_dir, speed_mode = _continue_current_motion(player, match, sprint=True)
@@ -1172,6 +1172,27 @@ class ShootOrder:
     status: OrderStatus = OrderStatus.PENDING
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
+    def launch_power_fraction(self, player: "Player", match: "Match") -> float:
+        """The power fraction this shot passes to kick_ball(): power_fraction,
+        run-compensated when compensate_for_run (so the ball leaves at the
+        intended speed). The same quantity Player.last_kick_power_fraction
+        records for a direct kick, so BC labels for a shot (ai/bc/role_experts.py)
+        read it from here rather than re-deriving it."""
+        from footballcoach.engine.kicking import compensate_power_for_run_mult, running_power_multiplier
+        from footballcoach.engine.movement import effective_top_speed
+
+        if not self.compensate_for_run:
+            return self.power_fraction
+        top_speed = effective_top_speed(
+            match.movement_params, player.attributes.top_speed, player.stamina,
+            has_ball=True, ball_control_attr=player.attributes.ball_control,
+        )
+        run_mult = running_power_multiplier(
+            match.kicking_params.running_power_coefficient, player.velocity,
+            self.aim_point - player.position, top_speed,
+        )
+        return compensate_power_for_run_mult(self.power_fraction, run_mult)
+
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
         """Shoot at aim_point if player has possession; may pause when a blocker is on the line."""
         from footballcoach.engine.kicking import (
@@ -1218,31 +1239,11 @@ class ShootOrder:
                     player.current_order = None
                 return False  # ShootOrder itself is superseded; caller must NOT touch player.current_order for it
 
-        top_speed = effective_top_speed(
-            match.movement_params, player.attributes.top_speed, player.stamina,
-            has_ball=True, ball_control_attr=player.attributes.ball_control,
+        from footballcoach.engine.kick_intent import KickIntent
+        player.pending_kick = KickIntent(
+            "shot", self.launch_power_fraction(player, match), aim_point=self.aim_point,
+            log_msg=f"{player.player_id} shot at goal  power={self.power_fraction:.2f}",
         )
-        run_mult = running_power_multiplier(
-            match.kicking_params.running_power_coefficient, player.velocity,
-            self.aim_point - player.position, top_speed,
-        )
-        kick_ball(
-            match.ball,
-            player.position,
-            self.aim_point,
-            compensate_power_for_run_mult(self.power_fraction, run_mult) if self.compensate_for_run else self.power_fraction,
-            player.attributes.kick_precision,
-            player.attributes.kick_power,
-            Vector3.zero(),
-            match.rng_reduction,
-            match.rng,
-            match.kicking_params,
-            kicker_velocity=player.velocity,
-            kicker_top_speed_mps=top_speed,
-        )
-        match._log_info(f"{player.player_id} shot at goal  power={self.power_fraction:.2f}")
-        if player.on_kick is not None:
-            player.on_kick(player)
         # Follow through -- keep moving rather than freeze after the shot.
         adj_dir, speed_mode = _continue_current_motion(player, match, sprint=True)
         player.desired_direction = adj_dir

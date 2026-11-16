@@ -455,6 +455,12 @@ class Match(MatchTacklesMixin, MatchGetPossessionMixin):
                     self.match_logger.notify_kick(self.time_s, self.ball.position, player)
                 continue
             completed = order.execute(player, self, dt)
+            if player.pending_kick is not None:
+                # The order's kick, carried out here, at the same point in the
+                # tick it used to happen inside execute() (engine/kick_intent.py).
+                from footballcoach.engine.kick_intent import apply_kick_intent
+                _intent, player.pending_kick = player.pending_kick, None
+                apply_kick_intent(player, self, _intent)
             if player.desired_speed_mode is None:
                 # Every order must explicitly decide movement intent (even
                 # STANDSTILL) on every tick it executes -- leaving it unset

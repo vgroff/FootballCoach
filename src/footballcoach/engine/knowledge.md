@@ -400,6 +400,25 @@ that case. See `tests/unit/test_ball_physics.py`'s
 regression tests against this. If you ever see a rolling ball stopping
 suspiciously fast again, check this gate first.
 
+## Kick intents (`kick_intent.py`, 2026-11-16)
+
+Kicking orders (`MoveOrder` push-kick, `KickOrder`, `ShootOrder`, `PassOrder`)
+no longer kick inside `execute()`: they record a `KickIntent` on
+`player.pending_kick`, and `Match._process_orders` applies it right after that
+player's `execute()` -- the same point in the tick and per-player order as the
+old in-`execute()` kick, so play is unchanged (engine, env, batched-rollout and
+PPO-update traces identical; `scripts/rules_1v1_trace_snapshot.py`, whose
+rules-vs-rules 1v1 fires ~57 push-kicks against the engine trace's ~1, is
+identical too and catches a deliberately broken follow-through). An order's
+follow-through movement is set before the kick is applied, so `MoveOrder`
+computes it with `_compute_movement_intent(..., assume_ball_released=True)`
+(the other orders' `_continue_current_motion` never reads the ball). The point:
+a BC label's counterfactual `execute()` (ai/ppo/bc.py) can read what the order
+WOULD kick without the ball being touched. Not routed through intents: the
+neural player's in-possession kick (`apply_nn_action.py`, whose kick-once logic
+reads the kick count right after applying), the engine's armed-kick on pickup,
+and the UI's manual kick.
+
 ## `kicking.py` - power, direction, spin, and error
 
 **This module takes an absolute 3D `aim_point`, not a direction vector.**

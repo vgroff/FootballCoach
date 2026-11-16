@@ -191,6 +191,9 @@ class Player:
     opportunity: ActionOpportunity = field(default_factory=ActionOpportunity, repr=False, compare=False)
     # Set by GetPossessionOrder / neural AI; engine fires on_tackle on next contact.
     tackle_armed: bool = field(default=False, repr=False, compare=False)
+    # A kick an order recorded this tick (engine/kick_intent.KickIntent),
+    # applied by Match._process_orders right after that order's execute().
+    pending_kick: object = field(default=None, repr=False, compare=False)
     # Set by rules AI (orders.py's _try_push_kick, via MoveOrder /
     # GetPossessionOrder) or neural AI (apply_nn_action.py) during approach;
     # engine fires the kick on first-touch (_update_loose_ball_pickup),

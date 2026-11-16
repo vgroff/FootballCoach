@@ -378,6 +378,13 @@ def _counterfactual_execution(player: "Player", match: "Match", order) -> dict:
     try:
         _dt = match.dt_s
         order.execute(player, match, _dt)
+        if player.pending_kick is not None:
+            # The order's kick intent (engine/kick_intent.py), carried out here
+            # inside the snapshot exactly as the engine would, so every label
+            # below reads the same post-kick state as before kick intents.
+            from footballcoach.engine.kick_intent import apply_kick_intent
+            _intent, player.pending_kick = player.pending_kick, None
+            apply_kick_intent(player, match, _intent)
         if player.desired_speed_mode is not None:
             from footballcoach.engine.movement import SpeedMode
             move_direction_raw = player.desired_direction
