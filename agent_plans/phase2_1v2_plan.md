@@ -140,9 +140,11 @@ The PPG value refit only sees the primary phase (see Open follow-ups).
   550, timeout 10, shot_off_target 6, attacker_out 0. The rules attacker
   almost never misses, so the attacker_out / off-target branches are covered
   by constructed-state unit tests, not by play.
-- `detect_trial_outcome` reports a teammate's reception as "saved": the UI's
-  2v2 scenario ends all 49 traced trials as "saved". The 1v2 classifier raises
-  on that case; a phase with several attackers must fix it first.
+- (Fixed 2026-11-16) `detect_trial_outcome` reported a teammate's reception
+  as "saved": the UI's 2v2 scenario ended all 49 traced trials that way. Now
+  only the defence winning the ball ends a trial (team-based); the 2v2 plays
+  on to box possession, and the pass drill ends with "received" by opting in
+  (`ScenarioDefinition.teammate_reception_ends_trial`).
 
 - (2026-11-16) The phase-1 checkpoint never shoots in 1v2: all its goals
   were dribbles into the net past a rules keeper that ignored ball carriers.
@@ -188,10 +190,12 @@ The PPG value refit only sees the primary phase (see Open follow-ups).
 
 ## Open follow-ups
 
-- PPG value refit and value pre-training are primary-phase only; a phase-2
-  value warm-up would need them to take a phase mix.
-- A phase with several attackers needs detect_trial_outcome to stop ending a
-  trial on a teammate's reception ("saved"); see Findings.
+- Value pre-training (pretrain_value, pretrain_combined) refuses a phase mix
+  and role-based phases (NotImplementedError, 2026-11-16) instead of silently
+  warming the critic on phase 1 only. The PPG value refit still runs on the
+  primary phase only under a mix. Both share
+  `_collect_value_pretrain_rollout`; making that collector mix-aware is what
+  porting either needs.
 - Unfreezing tackle / pass / mark heads for a phase needs per-row head masks.
 - The UI cannot yet show role-based terminal payouts (ScenarioLoop's payout
   display is phase-1 only).

@@ -38,7 +38,7 @@ from footballcoach.ai.env.outcome import (
     remap_phase1_outcome,
 )
 from footballcoach.ai.env.reward import EMAFilter, phase1_reward
-from footballcoach.ai.obs.encoder import MAX_OTHER_PLAYERS, encode_observation, rollout_task_phase
+from footballcoach.ai.obs.encoder import MAX_OTHER_PLAYERS, encode_observation
 from footballcoach.ai.obs.schema import ObservationBatch
 from footballcoach.engine.match import Match
 from footballcoach.engine.match_logger import MatchLogger
@@ -320,7 +320,7 @@ class ScenarioEnv:
                     ema_smoothed=self._ema.smoothed,
                     rng=self.rng,
                     bc_label_fn=self.bc_label_fn,
-                    task_phase=rollout_task_phase(self.phase),
+                    task_phase=self.phase,
                 )
             except KeyError:
                 pass
@@ -334,7 +334,7 @@ class ScenarioEnv:
                     max_episode_s=self.max_episode_s,
                     ema_smoothed=self._sec_ema[pid].smoothed,
                     rng=self.rng,
-                    task_phase=rollout_task_phase(self.phase),
+                    task_phase=self.phase,
                 )
 
         # Initialise per-secondary-player state

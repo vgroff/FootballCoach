@@ -4,10 +4,10 @@ conventions, writing a NEW file (never overwrites the source):
 - the true time-remaining input: fold ai_config observation.legacy_time_remap
   into the weights (ai/ppo/time_input_remap.py). Training refuses
   unmigrated weights.
-- task ids in the training rows (observation.task_id_in_rollouts, opt-in):
-  zero the task-id input columns of the given phases, and is_goalkeeper when
-  a phase has a goalkeeper role (ai/ppo/new_phase_inputs.py), so turning the
-  switch on changes nothing at first.
+- task ids in the training rows (always set since 2026-11-16): zero the
+  task-id input columns of the given phases, and is_goalkeeper when a phase
+  has a goalkeeper role (ai/ppo/new_phase_inputs.py), so setting them changes
+  nothing at first. Training refuses unmigrated weights.
 
 The output records true_time_input_ready and task_id_inputs_ready. Train it
 WITHOUT --remap-time-input / --init-new-phase-inputs (those are for

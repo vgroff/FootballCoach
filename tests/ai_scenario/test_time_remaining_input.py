@@ -106,7 +106,6 @@ def test_remap_reproduces_the_old_outputs_exactly_on_an_exactly_linear_change(se
 
 def test_training_gate_and_checkpoint_marker_for_the_time_input(monkeypatch, tmp_path):
     t = _trainer()
-    monkeypatch.setitem(OBS, "task_id_in_rollouts", False)
     t._check_task_id_inputs()                                  # fresh weights: fine
     t._save_checkpoint_to(tmp_path / "true.pt")
     ck = torch.load(tmp_path / "true.pt", map_location="cpu", weights_only=False)
@@ -119,21 +118,18 @@ def test_training_gate_and_checkpoint_marker_for_the_time_input(monkeypatch, tmp
     with pytest.raises(RuntimeError, match="remap-time-input"):
         fresh._check_task_id_inputs()
     remap_time_remaining_input(fresh, a=0.0, b=1.0)
+    fresh.task_id_inputs_ready = True                          # (the task-id gate is tested elsewhere)
     fresh._check_task_id_inputs()
     fresh.load_checkpoint(tmp_path / "true.pt")
     assert fresh.true_time_input_ready is True
 
 
-def test_ui_task_phase_follows_the_training_switch(monkeypatch):
-    monkeypatch.setitem(OBS, "task_id_in_rollouts", False)
-    assert ui_task_phase("1v1") is None and ui_task_phase("1v2") is None
-    monkeypatch.setitem(OBS, "task_id_in_rollouts", True)
+def test_ui_task_phase_is_the_scenario_phase():
     assert ui_task_phase("1v1") == 1 and ui_task_phase("1v2") == 2
     assert ui_task_phase("pass") is None          # phase 3 is a stub: its task id never trained
     assert ui_task_phase(None) is None and ui_task_phase("no_such_scenario") is None
 
 
-def test_ui_checkpoint_picker_encodes_the_phase1_task_id(monkeypatch):
+def test_ui_checkpoint_picker_encodes_the_phase1_task_id():
     from footballcoach.ui import scenarios
-    monkeypatch.setitem(OBS, "task_id_in_rollouts", True)
     assert scenarios._picker_task_phase() == 1

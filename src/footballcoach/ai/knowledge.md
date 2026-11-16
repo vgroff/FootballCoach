@@ -1413,20 +1413,19 @@ still trained (by pre-training, presumably), so they are not neutral: on
 1240 phase-1 decisions, setting task_id_0 = 1 moves the kick logit by 3.8
 mean (24 max) and the move logit by 1.3 (8.8 max).
 
-**Fix, opt-in: `observation.task_id_in_rollouts`** (default false = exactly
-the old behaviour). When true, every neural player in a training or eval env
-encodes its env's phase (`NeuralPlayerAI(task_phase=...)`, from
-`obs.encoder.rollout_task_phase(env.phase)`), so rows, bootstrap and evals
+**Fix (always on since 2026-11-16; briefly an opt-in switch, removed):**
+every neural player in a training or eval env encodes its env's phase
+(`NeuralPlayerAI(task_phase=env.phase)`), so rows, bootstrap and evals
 agree. A checkpoint trained without task ids must first have its task-id
-input weights zeroed (`--init-new-phase-inputs`, below) so it plays exactly
-as before; checkpoints record `task_id_inputs_ready`, and
-`PPOTrainer._check_task_id_inputs` refuses to train unprepared weights with
-the switch on (training with it off marks the weights unprepared again). The
-UI's neural players follow the same switch: `curriculum.envs.ui_task_phase`
-maps the running UI scenario to the first buildable phase played in it
-("1v1" -> 1, "1v2" -> 2; stub phases and other scenarios -> no task id) and
-`ui/app.py` (neural opponent, training-mode trainee) and the UI's
-checkpoint-picker scenario pass it on.
+input weights zeroed (`--init-new-phase-inputs` or
+`scripts/migrate_checkpoint_inputs.py`, below) so it plays exactly as before;
+checkpoints record `task_id_inputs_ready`, and
+`PPOTrainer._check_task_id_inputs` refuses to train unprepared weights. The
+UI's neural players do the same: `curriculum.envs.ui_task_phase` maps the
+running UI scenario to the first buildable phase played in it ("1v1" -> 1,
+"1v2" -> 2; stub phases and other scenarios -> no task id) and `ui/app.py`
+(neural opponent, training-mode trainee) and the UI's checkpoint-picker
+scenario pass it on.
 
 ## Time remaining: the true clock (replaced 2026-11-16)
 
@@ -1572,10 +1571,14 @@ A `CurriculumPhase` with non-empty `roles` (player_id -> role) is built by
   the classifier and the raw outcomes that end a trial. `attack_defence`
   (`outcome.classify_attack_defence_outcome`): goal / saved /
   defence_possession / shot_off_target / attacker_out / timeout. It is
-  team-based, so it also fits N-vs-M. It raises when an attacking-team
-  player holds the ball at a "saved" end: `detect_trial_outcome` reports a
-  teammate's reception as "saved" (the UI's 2v2 ends every trial that way),
-  which must be fixed before a phase with several attackers.
+  team-based, so it also fits N-vs-M. `detect_trial_outcome` ends a trial
+  only when the DEFENCE wins the ball (keeper = "saved", outfield =
+  "dispossessed") and decides that by team; a teammate of the carrier
+  receiving the ball does not end it (fixed 2026-11-16: it used to fall
+  through to "saved", so the UI's 2v2 ended every trial that way). Passing
+  drills that should end on reception set
+  `ScenarioDefinition.teammate_reception_ends_trial` (raw outcome
+  "received"; the UI "pass" scenario does).
 
 Rewards are terminal only. Trainer contract: the episode's trainee is its
 first neural player in role order and the other neural players are
@@ -1665,8 +1668,8 @@ task ids on or adds a phase. (The first version, 2026-11-15, copied
 task_id_0's column into the new phase's instead; that reproduced
 "task_id_0 = 1", which is not how the checkpoint plays, and was replaced.)
 
-Recipe (not yet run): set `observation.task_id_in_rollouts` to true and
-`curriculum.phase2.controllers` to attacker and defender `{"neural": 1}`,
+Recipe (not yet run): set `curriculum.phase2.controllers` to attacker and
+defender `{"neural": 1}`,
 goalkeeper `{"rules": 1}`, then
 `uv run python -m footballcoach.ai.scripts.train --phase 1 --phase-mix 1:3,2:1
 --checkpoint checkpoints/migrated/phase1_run321_checkpoint763_migrated.pt`

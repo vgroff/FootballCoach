@@ -226,6 +226,19 @@ class PretrainingMixin:
     # Curriculum helpers
     # -----------------------------------------------------------------------
 
+    def _require_single_phase(self, what: str, phase_id) -> None:
+        """Value pre-training collects rollouts from ONE phase-1 env: it has no
+        notion of a phase mix or of a role-based phase's roles, so running it
+        there would silently warm the critic on the wrong (or only part of the)
+        data. Refuse instead, so it is not used by mistake; extending it is an
+        open follow-up (agent_plans/phase2_1v2_plan.md)."""
+        from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+        mix = getattr(self, "phase_mix", None)
+        if mix is not None and set(mix) != {phase_id}:
+            raise NotImplementedError(f"{what} does not support a phase mix yet (mix {mix}, phase {phase_id})")
+        if phase_id is not None and PHASES_BY_ID[phase_id].is_role_based:
+            raise NotImplementedError(f"{what} does not support role-based phases yet (phase {phase_id})")
+
     def _get_value_pretrain_freeze_params(self) -> list:
         """Return params to set requires_grad=False during value warm-up.
 
@@ -310,6 +323,7 @@ class PretrainingMixin:
         phase_id: Optional[int] = None,
         checkpoint_dir: Optional[Path] = None,
     ) -> None:
+        self._require_single_phase("pretrain_combined (BC + value warm-up)", phase_id)
         """Joint BC + value pre-training in a single pass.
 
         Collects one rollout to get GAE returns for the value loss, then for
@@ -2071,6 +2085,10 @@ class PretrainingMixin:
     ) -> dict:
         """Warm-start the value heads to predict actual returns before PPO starts.
 
+        Single-phase, phase-1 only for now: raises NotImplementedError for a
+        role-based phase or a run that mixes phases (see
+        ``_require_single_phase``).
+
         Collects n_steps of experience using the current (BC-warm-started) policy,
         computes Monte Carlo returns via GAE, then trains ONLY the value loss for
         n_epochs at the given lr. This prevents the enormous value gradient from
@@ -2121,6 +2139,7 @@ class PretrainingMixin:
             ``{"episode_returns": list[float], "outcomes_vs_rules": list[str],
             "outcomes_vs_immobile": list[str], "outcomes_vs_neural": list[str]}``
         """
+        self._require_single_phase("pretrain_value", phase_id)
         # Decoupled from ppo.minibatch_size -- see self._value_pretrain_batch_size.
         _batch_size = batch_size if batch_size is not None else self._value_pretrain_batch_size
         log.info(f"Value pre-training: {n_steps} steps, {n_epochs} epochs, lr={lr}, batch_size={_batch_size}")

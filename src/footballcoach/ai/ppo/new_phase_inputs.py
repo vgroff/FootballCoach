@@ -5,8 +5,8 @@ Two cases, both fixed by zeroing the first-layer weight columns that read the
 input, on every network:
 
 - Task ids. Until 2026-11-16 the rows PPO trains on never carried a task id
-  (NeuralPlayerAI encoded its observation without a phase; see ai_config
-  observation.task_id_in_rollouts), so a PPO-trained checkpoint plays at
+  (NeuralPlayerAI encoded its observation without a phase; now it always
+  does), so a PPO-trained checkpoint plays at
   "all task ids 0". Its task-id columns are not neutral, though: measured on
   phase1_run321/latest (1240 phase-1 decisions), setting task_id_0 = 1 moves
   the kick logit by 3.8 on average (max 24) and the move logit by 1.3 (max

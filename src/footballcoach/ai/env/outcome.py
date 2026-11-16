@@ -19,6 +19,10 @@ for what actually happened):
     "goal"          - scoreboard changed.
     "saved"         - initial carrier's opponent goalkeeper took the ball.
     "dispossessed"  - initial carrier's opponent outfield player took the ball.
+    "received"      - a TEAMMATE of the initial carrier took the ball; only
+                      returned when ``teammate_reception_ends_trial`` is set
+                      (passing drills). Otherwise a teammate's reception does
+                      not end the trial.
     "box_possession" - a player dribbled the ball into the opponent's box.
                       When ``phase1_trainee_player_id`` is given, this
                       specifically means the TRAINEE reached the opponent's
@@ -52,6 +56,7 @@ RAW_OUTCOME_KEYS: tuple[str, ...] = (
     "saved",
     "miss",
     "dispossessed",
+    "received",
     "box_possession",
     "opponent_box_possession",
     "course_complete",
@@ -63,6 +68,7 @@ RAW_OUTCOME_LABELS: dict[str, str] = {
     "saved": "Saved",
     "miss": "Miss",
     "dispossessed": "Disp",
+    "received": "Recv",
     "box_possession": "Box",
     "opponent_box_possession": "Opp box",
     "course_complete": "Done",
@@ -150,6 +156,7 @@ def detect_trial_outcome(
     trial_tick: int,
     timeout_ticks: int,
     phase1_trainee_player_id: str | None = None,
+    teammate_reception_ends_trial: bool = False,
 ) -> tuple[str | None, bool]:
     """Returns (outcome_key, is_half_linger) if the trial is over, else (None, False).
 
@@ -187,20 +194,20 @@ def detect_trial_outcome(
         match.notify_ball_out()
         return "miss", True
 
-    if ball_released:
-        if ball.possessed_by is not None and ball.possessed_by != initial_carrier_id:
-            try:
-                repossessor = match.player_by_id(ball.possessed_by)
-                initial_carrier = (
-                    match.player_by_id(initial_carrier_id) if initial_carrier_id else None
-                )
-                if initial_carrier is not None and repossessor.team != initial_carrier.team:
-                    if repossessor.is_goalkeeper:
-                        return "saved", False
-                    return "dispossessed", False
-            except KeyError:
-                pass
-            return "saved", False
+    # The defence winning the ball ends the trial: their goalkeeper = "saved",
+    # any other defender = "dispossessed" (tackle, interception or clearance).
+    # Team-based, so it holds for any number of players: a TEAMMATE of the
+    # initial carrier receiving the ball (a pass, a lay-off) does not end the
+    # trial, and a later loss to the defence is still caught. Until 2026-11-16
+    # a teammate's reception fell through to "saved", ending a pass move as if
+    # the keeper had the ball.
+    if ball_released and ball.possessed_by is not None and ball.possessed_by != initial_carrier_id:
+        repossessor = match.player_by_id(ball.possessed_by)        # a missing id is a bug: raise
+        attacking_team = match.player_by_id(initial_carrier_id).team
+        if repossessor.team != attacking_team:
+            return ("saved" if repossessor.is_goalkeeper else "dispossessed"), False
+        if teammate_reception_ends_trial:
+            return "received", False
 
     # Box possession. Skipped when box_possession_terminal is False (e.g.
     # 1v2, where the attacker is meant to enter the box and play to a
@@ -304,10 +311,11 @@ def classify_attack_defence_outcome(raw_outcome: str, final_match: Match, *, att
     writes; a deflection off a grounded player does not change it, so such a
     ball going out is attributed to whoever last had it.
 
-    Raises ValueError for a raw outcome this vocabulary has no answer for, and
-    for an attacking-team player holding the ball at a "saved"/"dispossessed"
-    end: detect_trial_outcome() reports a teammate's reception as "saved", so
-    a phase with several attackers must first stop that from ending a trial.
+    Raises ValueError for a raw outcome this vocabulary has no answer for
+    (including "received", a drills-only outcome), and for an attacking-team
+    player holding the ball at a "saved"/"dispossessed" end, which
+    detect_trial_outcome() no longer produces (since 2026-11-16 a teammate's
+    reception does not end the trial).
     """
     if raw_outcome in ("goal", "timeout"):
         return raw_outcome

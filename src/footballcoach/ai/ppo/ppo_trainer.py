@@ -507,11 +507,11 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
         # curriculum.training_phase_mix). None = only train()'s phase_id.
         # A mix of more than that one phase needs the batched rollout path.
         self.phase_mix: Optional[dict[int, float]] = None
-        # Whether these weights may train on rows that carry task ids (ai_config
-        # observation.task_id_in_rollouts). True for fresh weights; load_checkpoint
-        # sets it from the checkpoint, where only weights saved after
-        # init_new_phase_inputs (ai/ppo/new_phase_inputs.py) or trained with task
-        # ids on carry it. See _check_task_id_inputs.
+        # Whether these weights may train on rows that carry task ids (always,
+        # since 2026-11-16). True for fresh weights; load_checkpoint sets it from
+        # the checkpoint, where only weights saved after init_new_phase_inputs
+        # (ai/ppo/new_phase_inputs.py) or trained since carry it. Training
+        # refuses False; see _check_task_id_inputs.
         self.task_id_inputs_ready: bool = True
         # Whether these weights expect the true time-remaining input (fresh
         # weights, trained since 2026-11-16, or remapped once by
@@ -1052,26 +1052,20 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
     def _check_task_id_inputs(self) -> None:
         """Refuse to train weights on inputs they were not prepared for:
         weights trained on the old time-remaining input (see
-        ai/ppo/time_input_remap.py), and, with observation.task_id_in_rollouts
-        on, weights trained without task ids (their task-id columns are not
-        neutral, see ai/ppo/new_phase_inputs.py). Either would silently change
-        how the checkpoint plays."""
-        from footballcoach.ai.config import load_ai_config
+        ai/ppo/time_input_remap.py), and weights trained without task ids in
+        their rows (their task-id columns are not neutral, see
+        ai/ppo/new_phase_inputs.py). Either would silently change how the
+        checkpoint plays."""
         if not self.true_time_input_ready:
             raise RuntimeError(
                 "these weights were trained on the old time-remaining input; remap them once first "
                 "(train.py --remap-time-input or scripts/migrate_checkpoint_inputs.py, "
                 "ai/ppo/time_input_remap.py)"
             )
-        if not load_ai_config()["observation"].get("task_id_in_rollouts", False):
-            # Training on all-zero task ids from here on: the weights' task-id
-            # columns stop being neutral, and the checkpoints saved say so.
-            self.task_id_inputs_ready = False
-            return
         if not self.task_id_inputs_ready:
             raise RuntimeError(
-                "observation.task_id_in_rollouts is on but these weights were trained without task ids; "
-                "zero their task-id inputs once first (train.py --init-new-phase-inputs, "
+                "these weights were trained without task ids in their rows; zero their task-id inputs once "
+                "first (train.py --init-new-phase-inputs or scripts/migrate_checkpoint_inputs.py, "
                 "ai/ppo/new_phase_inputs.py)"
             )
 

@@ -96,8 +96,8 @@ def main() -> None:
                              "checkpoint before 2026-11-16) or before adding a phase: zero the task-id input "
                              "columns of every phase this run trains (--phase, or the whole phase mix), and the "
                              "is_goalkeeper column if a phase has a goalkeeper role, so the checkpoint plays exactly "
-                             "as before while those inputs can still learn (see ai/ppo/new_phase_inputs.py). Needed "
-                             "before training with ai_config observation.task_id_in_rollouts on. Not when resuming.")
+                             "as before while those inputs can still learn (see ai/ppo/new_phase_inputs.py); "
+                             "training refuses such a checkpoint otherwise. Not when resuming.")
     parser.add_argument("--remap-time-input", action="store_true",
                         help="Once, when starting from a checkpoint trained on the old time-remaining input "
                              "(every checkpoint before 2026-11-16): fold ai_config observation.legacy_time_remap "
@@ -666,6 +666,22 @@ def main() -> None:
             _reset_bernoullis()
         log.info(f"Loaded pre-trained checkpoint: {pretrained_path} — skipping BC/value pre-training")
 
+    # Phase mix (ai/curriculum/mix.py): several curriculum phases in one run.
+    # Set before pre-training, whose value warm-up is single-phase only and
+    # refuses a mix (PPOTrainer._require_single_phase).
+    _mix_spec = args.phase_mix
+    if _mix_spec is None:
+        _mix_spec = load_ai_config().get("curriculum", {}).get("training_phase_mix")
+    if _mix_spec is not None:
+        from footballcoach.ai.curriculum.mix import parse_phase_mix, validate_training_mix
+        _mix = parse_phase_mix(_mix_spec)
+        if args.phase not in _mix:
+            log.error(f"--phase {args.phase} must be part of the phase mix {_mix}")
+            return
+        _mix_phases = validate_training_mix(_mix)
+        trainer.phase_mix = _mix
+        log.info(f"Phase mix (shares of rollout env slots): {_mix}")
+
     # Pre-training phase: BC + value jointly when a dataset is available,
     # otherwise fall back to online BC then separate value pre-training.
     value_pretrain_steps = int(bc_cfg.get("value_pretrain_steps", 0))
@@ -960,19 +976,6 @@ def main() -> None:
     if not args.no_head_freeze and phase.frozen_heads:
         trainer.set_frozen_heads(phase.frozen_heads)
 
-    # Phase mix (ai/curriculum/mix.py): several curriculum phases in one run.
-    _mix_spec = args.phase_mix
-    if _mix_spec is None:
-        _mix_spec = load_ai_config().get("curriculum", {}).get("training_phase_mix")
-    if _mix_spec is not None:
-        from footballcoach.ai.curriculum.mix import parse_phase_mix, validate_training_mix
-        _mix = parse_phase_mix(_mix_spec)
-        if args.phase not in _mix:
-            log.error(f"--phase {args.phase} must be part of the phase mix {_mix}")
-            return
-        _mix_phases = validate_training_mix(_mix)
-        trainer.phase_mix = _mix
-        log.info(f"Phase mix (shares of rollout env slots): {_mix}")
     if args.remap_time_input:
         from footballcoach.ai.ppo.time_input_remap import remap_time_remaining_input
         _remap = load_ai_config()["observation"]["legacy_time_remap"]

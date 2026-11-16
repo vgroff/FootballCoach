@@ -34,13 +34,11 @@ def build_env(phase: CurriculumPhase):
 def ui_task_phase(scenario_key: Optional[str]) -> Optional[int]:
     """The task phase a neural player in the UI's *scenario_key* scenario
     encodes: that of the first buildable curriculum phase played in that
-    scenario, passed through obs.encoder.rollout_task_phase, so the UI follows
-    ai_config observation.task_id_in_rollouts exactly as training does. None
-    for scenarios no trained phase uses (their task-id weights never trained)."""
+    scenario, as in training. None for scenarios no trained phase uses (their
+    task-id weights never trained)."""
     from footballcoach.ai.curriculum.phases import ALL_PHASES
-    from footballcoach.ai.obs.encoder import rollout_task_phase
     phase = next((p for p in ALL_PHASES if p.scenario_key == scenario_key and is_buildable(p)), None)
-    return rollout_task_phase(phase.phase_id) if phase is not None else None
+    return phase.phase_id if phase is not None else None
 
 
 def _attack_defence_outcomes():

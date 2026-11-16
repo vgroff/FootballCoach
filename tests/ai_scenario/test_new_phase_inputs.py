@@ -1,4 +1,4 @@
-"""ai/ppo/new_phase_inputs.py and ai_config observation.task_id_in_rollouts.
+"""ai/ppo/new_phase_inputs.py and the task ids in the training rows (always set since 2026-11-16).
 
 White-box: the same match state encoded with and without a task id (or
 player flag) is run through every network and the outputs compared."""
@@ -125,33 +125,19 @@ def _row_and_env_task_ids(trainer, phase_id):
 
 
 @pytest.mark.parametrize("phase_id,expected", [(1, (1.0, 0.0)), (2, (0.0, 1.0))])
-def test_rows_carry_the_phase_task_id_only_when_switched_on(trainer, monkeypatch, phase_id, expected):
-    obs_cfg = load_ai_config()["observation"]
-    monkeypatch.setitem(obs_cfg, "task_id_in_rollouts", False)
-    rows, env_ids = _row_and_env_task_ids(trainer, phase_id)
-    assert env_ids == expected
-    assert all(r == (0.0, 0.0) for r in rows)               # the old behaviour, unchanged when off
-    monkeypatch.setitem(obs_cfg, "task_id_in_rollouts", True)
+def test_rows_always_carry_the_phase_task_id(trainer, phase_id, expected):
     rows, env_ids = _row_and_env_task_ids(trainer, phase_id)
     assert env_ids == expected and all(r == expected for r in rows)
     if phase_id == 2:
         assert len(rows) == 2                               # the secondary's rows too
 
 
-def test_training_refuses_unprepared_weights_when_switched_on(trainer, monkeypatch):
-    monkeypatch.setitem(load_ai_config()["observation"], "task_id_in_rollouts", True)
+def test_training_refuses_unprepared_weights(trainer):
     trainer.task_id_inputs_ready = False
     with pytest.raises(RuntimeError, match="init-new-phase-inputs"):
         trainer._check_task_id_inputs()
     init_new_phase_inputs(trainer, task_phases=[1])
     trainer._check_task_id_inputs()
-
-
-def test_training_without_task_ids_marks_the_weights_unprepared(trainer, monkeypatch):
-    monkeypatch.setitem(load_ai_config()["observation"], "task_id_in_rollouts", False)
-    assert trainer.task_id_inputs_ready
-    trainer._check_task_id_inputs()
-    assert not trainer.task_id_inputs_ready
 
 
 def test_checkpoint_round_trip_of_the_marker(trainer, tmp_path):

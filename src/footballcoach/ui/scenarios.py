@@ -245,6 +245,10 @@ class ScenarioDefinition:
     last_ball_toucher_id) before the outcome is recorded.  Used by phase1 to
     apply the same label transforms ScenarioEnv does (goal→miss, miss→invalid
     when untouched) so UI tallies match training/eval breakdowns exactly."""
+    teammate_reception_ends_trial: bool = False
+    """End a trial with "received" when a teammate of the initial carrier
+    takes the ball (passing drills). Default: a teammate's reception does not
+    end the trial (the move goes on; see detect_trial_outcome)."""
     phase1_trainee_player_id: str | None = None
     """player_id of the trainee, for phase-1 1v1 scenarios only. When set,
     forwarded to detect_trial_outcome() (ai/env/outcome.py) so box-possession
@@ -2201,6 +2205,7 @@ SCENARIOS: list[ScenarioDefinition] = [
         description="Two Premier-League-tier players, randomised distance/angle pass.",
         build=build_pass_scenario,
         on_tick=_pass_on_tick,
+        teammate_reception_ends_trial=True,   # the drill is the pass: done when it is received
         params=[
             ScenarioParam("max_distance_m", "Max pass distance (m)", 0.5, 105.0, 0.5, 30.0),
             ScenarioParam("attr_clamp_min", "Attr clamp min", 0.3, 1.0, 0.05, 0.70),
@@ -2269,6 +2274,10 @@ SCENARIOS: list[ScenarioDefinition] = [
         build=build_2v2_scenario,
         on_tick=None,
         params=_build_2v2_params(),
+        # Phase-2-style attack, like 1v2: the move (pass, then shot) plays out
+        # and the trial ends on a goal, the ball going out, or the defence
+        # winning it -- never on merely carrying the ball into the box.
+        box_possession_terminal=False,
     ),
     ScenarioDefinition(
         key="1v2",
@@ -2640,6 +2649,7 @@ class ScenarioLoop:
             trial_tick=self._trial_tick,
             timeout_ticks=self.timeout_ticks,
             phase1_trainee_player_id=self.definition.phase1_trainee_player_id,
+            teammate_reception_ends_trial=self.definition.teammate_reception_ends_trial,
         )
         if outcome is None:
             return None, 0.0

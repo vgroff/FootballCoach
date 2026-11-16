@@ -914,9 +914,8 @@ class NeuralPlayerAI(PlayerAI):
     ) -> None:
         self.sample_action_fn = sample_action_fn
         # Curriculum phase whose task-id one-hot this player's observations
-        # carry (None = all task ids 0). Training/eval envs pass
-        # ai.obs.encoder.rollout_task_phase(env.phase); see ai_config
-        # observation.task_id_in_rollouts.
+        # carry (None = all task ids 0, only for callers outside any phase).
+        # Training/eval envs pass env.phase, the UI curriculum.envs.ui_task_phase.
         self.task_phase = task_phase
         # One decision = at most one kick (config action.kick_one_shot; None =
         # read it). Without it the cached action is re-applied every tick of
