@@ -1669,7 +1669,10 @@ Recipe (not yet run): set `observation.task_id_in_rollouts` to true and
 `curriculum.phase2.controllers` to attacker and defender `{"neural": 1}`,
 goalkeeper `{"rules": 1}`, then
 `uv run python -m footballcoach.ai.scripts.train --phase 1 --phase-mix 1:3,2:1
---checkpoint checkpoints/phase1_run321/checkpoint763.pt --init-new-phase-inputs --remap-time-input`
+--checkpoint checkpoints/migrated/phase1_run321_checkpoint763_migrated.pt`
+(checkpoint 763 already migrated by `scripts/migrate_checkpoint_inputs.py`: time remap,
+task ids of phases 1 and 2 and `is_goalkeeper` zeroed; so NOT `--init-new-phase-inputs` /
+`--remap-time-input`. Its optimizer state was not carried over.)
 (writes to a fresh `phase1_run{next}` dir). Expect phase-2 value error to be
 high for the first rollouts: the value head has never seen phase-2 outcomes
 and the PPG refit only sees phase 1.
