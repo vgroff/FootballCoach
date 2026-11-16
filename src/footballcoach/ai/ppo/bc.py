@@ -278,6 +278,201 @@ def phase1_labels(env, player_id: str = None) -> BCLabel:
     return phase1_labels_for_player(player, match)
 
 
+def _counterfactual_execution(player: "Player", match: "Match", order) -> dict:
+    """Run ``order.execute()`` ONCE on ``player`` as it stands, read back every
+    execution-level field it produced (movement intent, push-kick fire/arm,
+    tackle arm), and restore EVERYTHING it touched, so the call has zero effect
+    on the real match (positions, flags, callbacks, ball, and the shared
+    ``match.rng``). Shared by phase1_labels_for_player and the role-based BC
+    experts (ai/bc/role_experts.py); see phase1_labels_for_player's docstring
+    for why each field is read from this counterfactual, never from the real
+    (possibly neural-driven) player, and why the per-tick flags are reset first.
+
+    Returns {move_direction, sprint_label, exec_move_label, kick_this_tick,
+    kick_direction, kick_power_fraction, kick_spin, tackle_attempt}.
+    """
+    move_direction = None
+    sprint_label = 0.0
+    exec_move_label = 0.0
+    kick_this_tick = 0.0
+    kick_direction = None
+    kick_power_fraction = None
+    kick_spin = None
+    tackle_attempt = 0.0
+
+    # Snapshot everything execute() might mutate, so this exploratory
+    # call has ZERO effect on the real simulation.
+    _snap_pos = player.position
+    _snap_vel = player.velocity
+    _snap_heading = player.heading_rad
+    _snap_desired_dir = player.desired_direction
+    _snap_desired_speed = player.desired_speed_mode
+    _snap_kicked_this_tick = player.kicked_this_tick
+    _snap_kick_count = player.kick_count
+    _snap_last_kick_dir = player.last_kick_direction
+    _snap_last_kick_power = player.last_kick_power_fraction
+    _snap_last_kick_spin = player.last_kick_spin
+    _snap_kick_armed = player.kick_armed
+    _snap_kick_armed_dir = player.kick_armed_direction
+    _snap_kick_armed_power = player.kick_armed_power_fraction
+    _snap_kick_armed_spin = player.kick_armed_spin
+    _snap_tackle_armed = player.tackle_armed
+    _snap_current_order = player.current_order
+    _snap_on_possession_gained = player.on_possession_gained
+    _snap_on_kick = player.on_kick
+    _snap_on_tackle = player.on_tackle
+    _snap_on_tackle_result = player.on_tackle_result
+    _snap_on_auto_tackle_result = player.on_auto_tackle_result
+    _snap_ball_possessed_by = match.ball.possessed_by
+    _snap_ball_velocity = match.ball.velocity
+    _snap_ball_position = match.ball.position
+    # match.rng: Player.kick_direct() -> kicking._launch_ball()/
+    # kick_ball_from_direction() -> _release_kick() draws its yaw/pitch
+    # noise from match.rng (a SINGLE Random instance shared by the whole
+    # simulation -- see entities/player.py's kick_direct(), which passes
+    # match.rng straight through). If this exploratory execute() call
+    # causes a real push-kick to fire, it draws 2 real rng.gauss() calls
+    # from that SAME shared stream -- silently desyncing every
+    # subsequent REAL random draw in this match (kick noise, tackle
+    # rolls, anything else keyed off match.rng) from what it would have
+    # been had this label never been computed. getstate()/setstate()
+    # (not just noting "a kick happened") is the only way to undo this
+    # exactly -- there's no way to know in advance how many draws (0, 2,
+    # or more via retries) execute() will consume.
+    _snap_rng_state = match.rng.getstate()
+    # Every attribute of the player and the ball, restored wholesale below on
+    # top of the named fields above. The named list missed fields a kick also
+    # writes: Player._finish_kick ends a first touch (state CONTROLLING_BALL ->
+    # ACTIVE, state_timer_s -> 0) and the launch sets ball.spin, so before
+    # 2026-11-16 a counterfactual push-kick could cut the REAL trainee's ball
+    # control short or overwrite the ball's spin (measured on checkpoint 763:
+    # 4 control cuts and 33 spin overwrites in 5746 phase-1 label calls; 8 of
+    # 60 fully seeded episodes diverged with labels on vs off, 0 after this).
+    # tests/ai_unit/test_counterfactual_is_invisible.py diffs every attribute.
+    _snap_player_vars = dict(vars(player))
+    _snap_ball_vars = dict(vars(match.ball))
+    # order is a FRESH object from Phase1RulesAI().act() above (not
+    # current_exec), so its own internal state starts clean.
+    player.current_order = order
+    # Reset the same three per-tick flags Match._process_orders() itself
+    # resets before running a REAL order's execute() (see that method:
+    # "Reset before this tick's AI/order execution so kick_direct() ...
+    # can set it fresh"). This exploratory execute() call bypasses
+    # _process_orders entirely, so without this reset it would evaluate
+    # the hypothetical order on top of whatever kicked_this_tick/
+    # kick_armed/tackle_armed the REAL tick's REAL order already left
+    # behind -- contaminating "would the rules AI arm/fire right now"
+    # with leftover state from whichever AI is actually driving the
+    # player. Matching the real per-tick reset makes this genuinely
+    # stateless, independent of real history, exactly like decide().
+    player.kicked_this_tick = False
+    player.kick_armed = False
+    player.tackle_armed = False
+    # Prevent on_kick/on_tackle/on_tackle_result from firing real callbacks
+    # during this exploratory execute() (e.g. record_demonstrations.py wires
+    # these to _record_now(), which would otherwise recursively re-enter here).
+    player.on_kick = None
+    player.on_tackle = None
+    player.on_tackle_result = None
+    player.on_auto_tackle_result = None
+    try:
+        _dt = match.dt_s
+        order.execute(player, match, _dt)
+        if player.desired_speed_mode is not None:
+            from footballcoach.engine.movement import SpeedMode
+            move_direction_raw = player.desired_direction
+            if move_direction_raw.length_xy() > 1e-6:
+                _n = move_direction_raw.normalized()
+                move_direction = np.array([_n.x, _n.y], dtype=np.float32)
+            sprint_label = 1.0 if player.desired_speed_mode is SpeedMode.SPRINT else 0.0
+            exec_move_label = 0.0 if player.desired_speed_mode is SpeedMode.STANDSTILL else 1.0
+        # kick_this_tick / kick_direction / kick_power_fraction /
+        # kick_spin: same formula this function used to apply to the
+        # REAL executed state, now applied to the COUNTERFACTUAL
+        # post-execute() state -- a genuine "did the rules AI's own
+        # hypothetical order actually fire or arm a push-kick right
+        # now" answer, independent of whoever is really driving
+        # *player*. See Player.kicked_this_tick's docstring: kick_direct()
+        # sets it unconditionally whenever it actually executes kick
+        # physics, including MoveOrder's push-kick path (rules_ai.py's
+        # box-run), which never creates a separate Shoot/Kick/PassOrder.
+        if player.kicked_this_tick:
+            # Actual kick this tick — use real post-physics values.
+            kick_this_tick = 1.0
+            if player.last_kick_direction is not None:
+                kick_direction = np.array(
+                    [player.last_kick_direction.x, player.last_kick_direction.y, player.last_kick_direction.z],
+                    dtype=np.float32,
+                )
+            kick_power_fraction = player.last_kick_power_fraction
+            if player.last_kick_spin is not None:
+                kick_spin = np.array(
+                    [player.last_kick_spin.x, player.last_kick_spin.y, player.last_kick_spin.z],
+                    dtype=np.float32,
+                )
+        elif player.kick_armed and player.kick_armed_direction is not None:
+            # Approach tick: arm intent with the pre-computed direction/power.
+            kick_this_tick = 1.0
+            _d = player.kick_armed_direction
+            kick_direction = np.array([_d.x, _d.y, _d.z], dtype=np.float32)
+            kick_power_fraction = player.kick_armed_power_fraction
+            kick_spin = np.zeros(3, dtype=np.float32)
+        # tackle_attempt: `order` here is always MoveOrder/GetPossessionOrder
+        # (Phase1RulesAI.decide() never produces a ChaseTackleOrder
+        # directly -- that only ever arises from MarkOrder's own
+        # intercept/tackle fallback, which decide() never chooses), and
+        # only GetPossessionOrder's execute() (via
+        # Match._run_get_possession_behaviour) can arm a tackle. Reading
+        # tackle_armed post-execute() covers exactly that case with no
+        # extra branching needed.
+        if player.tackle_armed:
+            tackle_attempt = 1.0
+    finally:
+        # Restore EVERYTHING — this call must be perfectly invisible to
+        # the real simulation.
+        player.position = _snap_pos
+        player.velocity = _snap_vel
+        player.heading_rad = _snap_heading
+        player.desired_direction = _snap_desired_dir
+        player.desired_speed_mode = _snap_desired_speed
+        player.kicked_this_tick = _snap_kicked_this_tick
+        player.kick_count = _snap_kick_count
+        player.last_kick_direction = _snap_last_kick_dir
+        player.last_kick_power_fraction = _snap_last_kick_power
+        player.last_kick_spin = _snap_last_kick_spin
+        player.kick_armed = _snap_kick_armed
+        player.kick_armed_direction = _snap_kick_armed_dir
+        player.kick_armed_power_fraction = _snap_kick_armed_power
+        player.kick_armed_spin = _snap_kick_armed_spin
+        player.tackle_armed = _snap_tackle_armed
+        player.current_order = _snap_current_order
+        player.on_possession_gained = _snap_on_possession_gained
+        player.on_kick = _snap_on_kick
+        player.on_tackle = _snap_on_tackle
+        player.on_tackle_result = _snap_on_tackle_result
+        player.on_auto_tackle_result = _snap_on_auto_tackle_result
+        match.ball.possessed_by = _snap_ball_possessed_by
+        match.ball.velocity = _snap_ball_velocity
+        match.ball.position = _snap_ball_position
+        match.rng.setstate(_snap_rng_state)
+        for _obj, _saved in ((player, _snap_player_vars), (match.ball, _snap_ball_vars)):
+            _d = vars(_obj)
+            for _k in [k for k in _d if k not in _saved]:
+                del _d[_k]
+            _d.update(_saved)
+
+    return dict(
+        move_direction=move_direction,
+        sprint_label=sprint_label,
+        exec_move_label=exec_move_label,
+        kick_this_tick=kick_this_tick,
+        kick_direction=kick_direction,
+        kick_power_fraction=kick_power_fraction,
+        kick_spin=kick_spin,
+        tackle_attempt=tackle_attempt,
+    )
+
+
 def phase1_labels_for_player(player: "Player", match: "Match") -> BCLabel:
     """Derive BC labels for Phase 1 by asking Phase1RulesAI what it would do,
     from ``player``'s CURRENT state in ``match`` (whatever that state is at
@@ -430,151 +625,15 @@ def phase1_labels_for_player(player: "Player", match: "Match") -> BCLabel:
     tackle_attempt = 0.0
 
     if isinstance(order, (MoveOrder, GetPossessionOrder)):
-        # Snapshot everything execute() might mutate, so this exploratory
-        # call has ZERO effect on the real simulation.
-        _snap_pos = player.position
-        _snap_vel = player.velocity
-        _snap_heading = player.heading_rad
-        _snap_desired_dir = player.desired_direction
-        _snap_desired_speed = player.desired_speed_mode
-        _snap_kicked_this_tick = player.kicked_this_tick
-        _snap_kick_count = player.kick_count
-        _snap_last_kick_dir = player.last_kick_direction
-        _snap_last_kick_power = player.last_kick_power_fraction
-        _snap_last_kick_spin = player.last_kick_spin
-        _snap_kick_armed = player.kick_armed
-        _snap_kick_armed_dir = player.kick_armed_direction
-        _snap_kick_armed_power = player.kick_armed_power_fraction
-        _snap_kick_armed_spin = player.kick_armed_spin
-        _snap_tackle_armed = player.tackle_armed
-        _snap_current_order = player.current_order
-        _snap_on_possession_gained = player.on_possession_gained
-        _snap_on_kick = player.on_kick
-        _snap_on_tackle = player.on_tackle
-        _snap_on_tackle_result = player.on_tackle_result
-        _snap_on_auto_tackle_result = player.on_auto_tackle_result
-        _snap_ball_possessed_by = match.ball.possessed_by
-        _snap_ball_velocity = match.ball.velocity
-        _snap_ball_position = match.ball.position
-        # match.rng: Player.kick_direct() -> kicking._launch_ball()/
-        # kick_ball_from_direction() -> _release_kick() draws its yaw/pitch
-        # noise from match.rng (a SINGLE Random instance shared by the whole
-        # simulation -- see entities/player.py's kick_direct(), which passes
-        # match.rng straight through). If this exploratory execute() call
-        # causes a real push-kick to fire, it draws 2 real rng.gauss() calls
-        # from that SAME shared stream -- silently desyncing every
-        # subsequent REAL random draw in this match (kick noise, tackle
-        # rolls, anything else keyed off match.rng) from what it would have
-        # been had this label never been computed. getstate()/setstate()
-        # (not just noting "a kick happened") is the only way to undo this
-        # exactly -- there's no way to know in advance how many draws (0, 2,
-        # or more via retries) execute() will consume.
-        _snap_rng_state = match.rng.getstate()
-        # order is a FRESH object from Phase1RulesAI().act() above (not
-        # current_exec), so its own internal state starts clean.
-        player.current_order = order
-        # Reset the same three per-tick flags Match._process_orders() itself
-        # resets before running a REAL order's execute() (see that method:
-        # "Reset before this tick's AI/order execution so kick_direct() ...
-        # can set it fresh"). This exploratory execute() call bypasses
-        # _process_orders entirely, so without this reset it would evaluate
-        # the hypothetical order on top of whatever kicked_this_tick/
-        # kick_armed/tackle_armed the REAL tick's REAL order already left
-        # behind -- contaminating "would the rules AI arm/fire right now"
-        # with leftover state from whichever AI is actually driving the
-        # player. Matching the real per-tick reset makes this genuinely
-        # stateless, independent of real history, exactly like decide().
-        player.kicked_this_tick = False
-        player.kick_armed = False
-        player.tackle_armed = False
-        # Prevent on_kick/on_tackle/on_tackle_result from firing real callbacks
-        # during this exploratory execute() (e.g. record_demonstrations.py wires
-        # these to _record_now(), which would otherwise recursively re-enter here).
-        player.on_kick = None
-        player.on_tackle = None
-        player.on_tackle_result = None
-        player.on_auto_tackle_result = None
-        try:
-            _dt = match.dt_s
-            order.execute(player, match, _dt)
-            if player.desired_speed_mode is not None:
-                from footballcoach.engine.movement import SpeedMode
-                move_direction_raw = player.desired_direction
-                if move_direction_raw.length_xy() > 1e-6:
-                    _n = move_direction_raw.normalized()
-                    move_direction = np.array([_n.x, _n.y], dtype=np.float32)
-                sprint_label = 1.0 if player.desired_speed_mode is SpeedMode.SPRINT else 0.0
-                exec_move_label = 0.0 if player.desired_speed_mode is SpeedMode.STANDSTILL else 1.0
-            # kick_this_tick / kick_direction / kick_power_fraction /
-            # kick_spin: same formula this function used to apply to the
-            # REAL executed state, now applied to the COUNTERFACTUAL
-            # post-execute() state -- a genuine "did the rules AI's own
-            # hypothetical order actually fire or arm a push-kick right
-            # now" answer, independent of whoever is really driving
-            # *player*. See Player.kicked_this_tick's docstring: kick_direct()
-            # sets it unconditionally whenever it actually executes kick
-            # physics, including MoveOrder's push-kick path (rules_ai.py's
-            # box-run), which never creates a separate Shoot/Kick/PassOrder.
-            if player.kicked_this_tick:
-                # Actual kick this tick — use real post-physics values.
-                kick_this_tick = 1.0
-                if player.last_kick_direction is not None:
-                    kick_direction = np.array(
-                        [player.last_kick_direction.x, player.last_kick_direction.y, player.last_kick_direction.z],
-                        dtype=np.float32,
-                    )
-                kick_power_fraction = player.last_kick_power_fraction
-                if player.last_kick_spin is not None:
-                    kick_spin = np.array(
-                        [player.last_kick_spin.x, player.last_kick_spin.y, player.last_kick_spin.z],
-                        dtype=np.float32,
-                    )
-            elif player.kick_armed and player.kick_armed_direction is not None:
-                # Approach tick: arm intent with the pre-computed direction/power.
-                kick_this_tick = 1.0
-                _d = player.kick_armed_direction
-                kick_direction = np.array([_d.x, _d.y, _d.z], dtype=np.float32)
-                kick_power_fraction = player.kick_armed_power_fraction
-                kick_spin = np.zeros(3, dtype=np.float32)
-            # tackle_attempt: `order` here is always MoveOrder/GetPossessionOrder
-            # (Phase1RulesAI.decide() never produces a ChaseTackleOrder
-            # directly -- that only ever arises from MarkOrder's own
-            # intercept/tackle fallback, which decide() never chooses), and
-            # only GetPossessionOrder's execute() (via
-            # Match._run_get_possession_behaviour) can arm a tackle. Reading
-            # tackle_armed post-execute() covers exactly that case with no
-            # extra branching needed.
-            if player.tackle_armed:
-                tackle_attempt = 1.0
-        finally:
-            # Restore EVERYTHING — this call must be perfectly invisible to
-            # the real simulation.
-            player.position = _snap_pos
-            player.velocity = _snap_vel
-            player.heading_rad = _snap_heading
-            player.desired_direction = _snap_desired_dir
-            player.desired_speed_mode = _snap_desired_speed
-            player.kicked_this_tick = _snap_kicked_this_tick
-            player.kick_count = _snap_kick_count
-            player.last_kick_direction = _snap_last_kick_dir
-            player.last_kick_power_fraction = _snap_last_kick_power
-            player.last_kick_spin = _snap_last_kick_spin
-            player.kick_armed = _snap_kick_armed
-            player.kick_armed_direction = _snap_kick_armed_dir
-            player.kick_armed_power_fraction = _snap_kick_armed_power
-            player.kick_armed_spin = _snap_kick_armed_spin
-            player.tackle_armed = _snap_tackle_armed
-            player.current_order = _snap_current_order
-            player.on_possession_gained = _snap_on_possession_gained
-            player.on_kick = _snap_on_kick
-            player.on_tackle = _snap_on_tackle
-            player.on_tackle_result = _snap_on_tackle_result
-            player.on_auto_tackle_result = _snap_on_auto_tackle_result
-            match.ball.possessed_by = _snap_ball_possessed_by
-            match.ball.velocity = _snap_ball_velocity
-            match.ball.position = _snap_ball_position
-            match.rng.setstate(_snap_rng_state)
-
+        _cf = _counterfactual_execution(player, match, order)
+        move_direction = _cf["move_direction"]
+        sprint_label = _cf["sprint_label"]
+        exec_move_label = _cf["exec_move_label"]
+        kick_this_tick = _cf["kick_this_tick"]
+        kick_direction = _cf["kick_direction"]
+        kick_power_fraction = _cf["kick_power_fraction"]
+        kick_spin = _cf["kick_spin"]
+        tackle_attempt = _cf["tackle_attempt"]
     if isinstance(order, MoveOrder):
         move_region_center = np.array(
             [order.target_position.x, order.target_position.y], dtype=np.float32
