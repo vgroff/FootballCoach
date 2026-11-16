@@ -1728,12 +1728,21 @@ across env slots but is not balanced per phase. Value pre-training
 phases. Phase-2 rows reuse phase 1's `secondary_weight` and land on the
 `trainee` track like phase 1's.
 
-**Per-phase evals.** Each role-based phase lists `eval_specs` (name + pinned
-controller per role); `PPOTrainer._eval_role_phases()` runs every spec of
-every role-based phase in the mix after the phase-1 evals, on the fixed seeds
-`curriculum.<key>.eval_seed_offset .. + eval_episodes - 1`, one line each
-(`[eval phase2_1v2/attacker_vs_rules] ...`). Rules-only specs are cached
-(they never change). `ai/eval/role_phase_eval.py`.
+**Per-phase evals (generic: a new role-based phase needs only its
+`eval_specs` and `curriculum.<key>.eval_seed_offset`).** Every rollout,
+`trainer_eval._run_rollout_evals` evaluates exactly the phases the run trains
+(`_trained_phase_ids`: the phase mix, else train()'s `phase_id`, so a
+`--phase 2` run with no mix gets its phase-2 evals). The phase-1 1v1 evals
+(vs rules, neural snapshots) run only when phase 1 is trained, or no phase is
+known. `_eval_role_phases` then runs, for each trained role-based phase,
+`role_phase_eval.specs_to_evaluate`: the rules-only specs (cached, they never
+change) plus every spec with a neural role whose neural weight in
+`curriculum.<key>.controllers` is > 0. Each spec runs the phase-1 eval budget
+(`eval_plan`: `eval.eval_n_seeds` seeds x `eval.eval_repeats_per_seed`,
+115 x 4), on the seeds from `eval_seed_offset`, spread over the persistent
+eval pool (`eval_worker`'s `role_eval` command, weights pushed once per
+call), one line each (`[eval phase2_1v2/attacker_vs_rules] step=... ...`).
+`ai/eval/role_phase_eval.py`.
 
 **Starting from an existing checkpoint: `--init-new-phase-inputs`.**
 Zeroes, on every network, the first-layer weight columns reading the task id

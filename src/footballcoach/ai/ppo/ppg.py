@@ -550,7 +550,8 @@ class PPGMixin:
         num_rollouts = num_rollouts if num_rollouts is not None else self._ppg_num_rollouts
         log.info(
             f"PPG value refit: {num_rollouts} rollout(s), {n_steps} steps/rollout, "
-            f"{epochs} epochs, lr={lr}, kl_coef={kl_coef}, batch_size={_batch_size}"
+            f"{epochs} epochs, lr={lr}, kl_coef={kl_coef}, batch_size={_batch_size}, "
+            f"targets={'Monte Carlo returns (bc.ppg_mc_returns)' if self._ppg_mc_returns else 'GAE returns'}"
         )
 
         # Optimizer (+ its grad-clip param groups) built ONCE and reused
@@ -674,8 +675,11 @@ class PPGMixin:
                 _cycle_replay_seeds = first_rollout_replay_seeds if _rollout_i == 0 else _ppg_next_cycle_replay_seeds
                 if _cycle_replay_seeds:
                     log.info(f"  [ppg value refit] replaying {len(_cycle_replay_seeds)} queued episode-replay seed(s) in this cycle's rollout")
+                # bc.ppg_mc_returns: pure Monte Carlo targets instead, for a
+                # critic that is cold on this data (its own predictions would
+                # be most of each GAE target -- see the config comment).
                 batch, _rollout_stats = self._collect_value_pretrain_rollout(
-                    env, n_steps, phase_id, use_gae=True, pool=_pool,
+                    env, n_steps, phase_id, use_gae=not self._ppg_mc_returns, pool=_pool,
                     replay_seeds=_cycle_replay_seeds,
                     collect_episode_replay_stats=self._ppg_episode_replay_enabled, **_mc_kw,
                 )

@@ -263,28 +263,65 @@ class TrainerEvalMixin:
         self._eval_vs_immobile(max_episode_s)
         self._eval_vs_opponent_type(max_episode_s, use_rules_ai=True)
 
+    def _trained_phase_ids(self) -> list[int]:
+        """The phases this run trains: the phase mix's, else the single phase
+        train() was called with (empty before train() / when it wasn't given)."""
+        if self.phase_mix:
+            return sorted(self.phase_mix)
+        pid = getattr(self, "_train_phase_id", None)
+        return [pid] if pid is not None else []
+
+    def _run_rollout_evals(self, max_episode_s: float) -> None:
+        """Every rollout's evals, for exactly the phases this run trains: the
+        phase-1 1v1 evals (vs rules, and the neural-snapshot comparisons) when
+        phase 1 is trained, and each trained role-based phase's eval specs
+        (_eval_role_phases). A run with no phase known (e.g. a bare
+        single-process train() without phase_id) is a phase-1 run, as before."""
+        phases = self._trained_phase_ids()
+        if not phases or 1 in phases:
+            if self.rollout_eval_trials > 0:
+                self._eval_vs_rules(max_episode_s)
+            self._maybe_run_neural_snapshot_eval(max_episode_s)
+        if self.rollout_eval_trials > 0:
+            self._eval_role_phases()
+
     def _eval_role_phases(self) -> None:
-        """Seeded evals of every role-based phase in the training mix, one log
-        line per eval spec (ai/eval/role_phase_eval.py). Rules-only specs give
-        the same result every time, so each runs once and is cached. No-op
-        without a phase mix, so a phase-1-only run is unchanged."""
-        if not self.phase_mix:
-            return
+        """Seeded evals of every role-based phase this run trains, one log line
+        per eval spec, generic over phases (ai/eval/role_phase_eval.py: the
+        seed plan, and which specs a run evaluates). Rules-only specs give the
+        same result every time, so each runs once and is cached. Runs on the
+        persistent eval worker pool when there is one (weights pushed once per
+        call), else in this process."""
         from footballcoach.ai.curriculum.phases import PHASES_BY_ID
-        from footballcoach.ai.eval.role_phase_eval import run_role_phase_eval
-        for pid in sorted(self.phase_mix):
+        from footballcoach.ai.eval import role_phase_eval as rpe
+        workers = getattr(self, "_persistent_eval_workers", None)
+        workers = workers if (workers and self._eval_n_parallel_workers > 1) else None
+        weights_pushed = False
+        for pid in self._trained_phase_ids():
             phase = PHASES_BY_ID[pid]
             if not phase.is_role_based:
                 continue
-            for spec in phase.eval_specs:
-                rules_only = all(c == "rules" for c in spec["controllers"].values())
+            for spec in rpe.specs_to_evaluate(phase):
+                rules_only = rpe.is_rules_only(spec)
                 key = (phase.name, spec["name"])
                 result = self._role_eval_cache.get(key) if rules_only else None
                 if result is None:
-                    result = run_role_phase_eval(phase, spec, self._sample_action)
+                    try:
+                        if workers is not None:
+                            if not rules_only and not weights_pushed:
+                                _d, _e, _v = self._cpu_state_dicts()
+                                for w in workers:
+                                    w.set_weights(_d, _e, _v)
+                                weights_pushed = True
+                            result = rpe.run_role_phase_eval_on_workers(workers, phase, spec)
+                        else:
+                            result = rpe.run_role_phase_eval(phase, spec, self._sample_action)
+                    except Exception as _e:
+                        log.warning(f"  [eval {phase.name}/{spec['name']}] failed: {_e}")
+                        continue
                     if rules_only:
                         self._role_eval_cache[key] = result
-                log.info(f"  [eval {phase.name}/{spec['name']}] {result.summary()}")
+                log.info(f"  [eval {phase.name}/{spec['name']}] step={self._total_steps:,}  {result.summary()}")
 
     def _eval_vs_immobile(self, max_episode_s: float) -> None:
         """Seeded eval vs a standing-still opponent -- see _eval_vs_rules()."""

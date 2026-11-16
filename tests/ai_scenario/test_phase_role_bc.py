@@ -59,10 +59,19 @@ def test_sources_and_their_schedules(bc_config):
     assert bc_sources.coeff_table(0.9, (0, 0, 0))[1, 1].item() == pytest.approx(0.0)
 
 
+def test_a_held_schedule(bc_config):
+    bc_config({"attacker": {"kick": {"coeff_start": 1.0, "coeff_end": 0.2, "hold_fraction": 0.5,
+                                     "anneal_fraction": 1.0}}})
+    kick = [bc_sources.coeff_table(p, (0, 0, 0))[1, 1].item() for p in (0.0, 0.49, 0.5, 0.75, 1.0, 1.2)]
+    assert kick == pytest.approx([1.0, 1.0, 1.0, 0.6, 0.2, 0.2])
+
+
 @pytest.mark.parametrize("bad,match", [
     ({"striker": {"kick": KICK_ONLY["attacker"]["kick"]}}, "unknown role"),
     ({"attacker": {"heading": KICK_ONLY["attacker"]["kick"]}}, "unknown BC group"),
     ({"attacker": {"kick": {"coeff_start": 1.0}}}, "schedule needs"),
+    ({"attacker": {"kick": {**KICK_ONLY["attacker"]["kick"], "hold_fraction": 0.7}}}, "hold_fraction"),
+    ({"attacker": {"kick": {**KICK_ONLY["attacker"]["kick"], "hold_frac": 0.2}}}, "unknown schedule key"),
 ])
 def test_bad_config_is_refused(bc_config, bad, match):
     bc_config(bad)

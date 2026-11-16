@@ -13,7 +13,9 @@ power / spin), "tackle" (tackle_attempt) and "other" (everything else:
 decision heads, movement, region). A group left out has coefficient 0 for
 that role. Each schedule anneals linearly from coeff_start to coeff_end over
 the first anneal_fraction of training, exactly like the global bc.aux_coeff_*
-schedules. Default: no "bc" entry = no labels, no BC.
+schedules; an optional hold_fraction (default 0) keeps it at coeff_start until
+then, the anneal running from hold_fraction to anneal_fraction instead
+(fractions of the run's total steps). Default: no "bc" entry = no labels, no BC.
 
 Every training row carries a BC SOURCE id: 0 for every row the global
 schedules govern (phase 1, and any role without BC), i for the i-th
@@ -32,6 +34,7 @@ from typing import Optional
 
 GROUPS: tuple[str, ...] = ("other", "kick", "tackle")
 _SCHEDULE_KEYS = {"coeff_start", "coeff_end", "anneal_fraction"}
+_OPTIONAL_SCHEDULE_KEYS = {"hold_fraction"}
 
 
 def _phase_bc_config(phase) -> dict:
@@ -53,6 +56,11 @@ def _phase_bc_config(phase) -> dict:
             missing = _SCHEDULE_KEYS - set(sched)
             if missing:
                 raise ValueError(f"{phase.name}/{role}/{group}: schedule needs {sorted(missing)}")
+            unknown = set(sched) - _SCHEDULE_KEYS - _OPTIONAL_SCHEDULE_KEYS
+            if unknown:
+                raise ValueError(f"{phase.name}/{role}/{group}: unknown schedule key(s) {sorted(unknown)}")
+            if not 0.0 <= float(sched.get("hold_fraction", 0.0)) <= float(sched["anneal_fraction"]):
+                raise ValueError(f"{phase.name}/{role}/{group}: hold_fraction must be in [0, anneal_fraction]")
     return {r: {g: s for g, s in gs.items() if not g.startswith("_")}
             for r, gs in cfg.items() if not r.startswith("_") and gs}
 
@@ -82,9 +90,12 @@ def source_id(phase_id: int, role: str) -> int:
 
 def _anneal(sched: dict, progress: float) -> float:
     start, end, frac = float(sched["coeff_start"]), float(sched["coeff_end"]), float(sched["anneal_fraction"])
-    if frac <= 0.0:
+    hold = float(sched.get("hold_fraction", 0.0))
+    if progress < hold:
+        return start
+    if frac <= hold:
         return end
-    t = min(progress / frac, 1.0)
+    t = min((progress - hold) / (frac - hold), 1.0)
     return start + (end - start) * t
 
 

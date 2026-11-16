@@ -507,6 +507,9 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
         # curriculum.training_phase_mix). None = only train()'s phase_id.
         # A mix of more than that one phase needs the batched rollout path.
         self.phase_mix: Optional[dict[int, float]] = None
+        # The phase train() was called with (trainer_eval._trained_phase_ids:
+        # what the periodic evals cover when there is no mix).
+        self._train_phase_id: Optional[int] = None
         # Whether these weights may train on rows that carry task ids (always,
         # since 2026-11-16). True for fresh weights; load_checkpoint sets it from
         # the checkpoint, where only weights saved after init_new_phase_inputs
@@ -729,6 +732,11 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
         # much of the value loss floor is the agent's own action-sampling
         # noise. Off for real use. Needs the batched collection path.
         self._ppg_rollout_deterministic = bool(bc_cfg.get("ppg_rollout_deterministic", False))
+        # ppg_value_refit fits pure Monte Carlo returns instead of GAE returns
+        # (bc.ppg_mc_returns, default off): for a critic that is cold on the
+        # data (e.g. a phase-1 critic on a new phase), where GAE's targets
+        # would be ~80% its own predictions (gamma 0.99, lam 0.96).
+        self._ppg_mc_returns = bool(bc_cfg.get("ppg_mc_returns", False))
         # ppg_value_refit's OWN rollout-to-rollout episode-seed-replay loop (independent of,
         # but modeled on, the main PPO loop's episode_replay_enabled/_update_episode_replay).
         # See _comment_ppg_episode_replay_enabled in ai_config.json for the full mechanism.
@@ -1099,6 +1107,7 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 ai/ppo/rollout_worker.py.
         """
         self._check_task_id_inputs()
+        self._train_phase_id = phase_id
         _mixed = self.phase_mix is not None and set(self.phase_mix) != {phase_id}
         if _mixed and not (self.n_processes > 1 and self.batched_rollout):
             raise NotImplementedError(
@@ -1369,10 +1378,8 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 if self.checkpoint_dir is not None:
                     self._save_checkpoint(self._total_steps)
 
-                # Quick periodic eval vs rules-based AI (always, regardless of training opponent)
-                if self.rollout_eval_trials > 0:
-                    self._eval_vs_rules(env.max_episode_s)
-                self._maybe_run_neural_snapshot_eval(env.max_episode_s)
+                # Periodic evals of the phases this run trains (trainer_eval._run_rollout_evals)
+                self._run_rollout_evals(env.max_episode_s)
                 self._maybe_run_ppg_interleave(env, phase_id)
 
         # Always save a final checkpoint so the result of the run is not lost
@@ -1556,9 +1563,7 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 if self.checkpoint_dir is not None:
                     self._save_checkpoint(self._total_steps)
 
-                if self.rollout_eval_trials > 0:
-                    self._eval_vs_rules(max_episode_s)
-                self._maybe_run_neural_snapshot_eval(max_episode_s)
+                self._run_rollout_evals(max_episode_s)
 
                 def _close_main_pools() -> None:
                     nonlocal workers, eval_workers
@@ -1931,10 +1936,7 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 if self.checkpoint_dir is not None:
                     self._save_checkpoint(self._total_steps)
 
-                if self.rollout_eval_trials > 0:
-                    self._eval_vs_rules(max_episode_s)
-                    self._eval_role_phases()
-                self._maybe_run_neural_snapshot_eval(max_episode_s)
+                self._run_rollout_evals(max_episode_s)
 
                 def _close_main_pools() -> None:
                     nonlocal workers, eval_workers

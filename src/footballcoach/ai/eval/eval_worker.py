@@ -75,6 +75,16 @@ def _eval_worker_main(conn, separate_value_net: bool, worker_torch_threads: int 
                     swap_sides=msg.get("swap_sides", False),
                 )
             conn.send(result)
+        elif cmd == "role_eval":
+            # Generic over role-based phases (ai/eval/role_phase_eval.py); a
+            # rules-only spec needs no weights.
+            from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+            from footballcoach.ai.eval.role_phase_eval import run_role_phase_eval
+            conn.send(run_role_phase_eval(
+                PHASES_BY_ID[msg["phase_id"]], msg["spec"],
+                trainer._sample_action if trainer is not None else None,
+                seeds=msg["seeds"], repeats_per_seed=msg["repeats_per_seed"],
+            ))
         else:
             raise ValueError(f"unknown eval worker command: {cmd!r}")
 
@@ -115,6 +125,12 @@ class EvalWorkerHandle:
             "batched": batched,
             "envs_per_process": envs_per_process,
         })
+
+    def role_eval(self, phase_id: int, spec: dict, seed_chunk: list[int], repeats_per_seed: int) -> None:
+        """Fire-and-forget, like eval(): one role-based phase eval spec over
+        this worker's seeds (ai/eval/role_phase_eval.py)."""
+        self.conn.send({"cmd": "role_eval", "phase_id": phase_id, "spec": spec,
+                        "seeds": seed_chunk, "repeats_per_seed": repeats_per_seed})
 
     def recv_result(self):
         return self.conn.recv()

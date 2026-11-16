@@ -26,10 +26,38 @@ def trainer():
     return t
 
 
-def test_eval_seeds_come_from_the_phase_config():
+NEURAL_ATTACKER = {"attacker": {"rules": 0, "neural": 1}, "defender": {"rules": 1, "neural": 0},
+                   "goalkeeper": {"rules": 1, "neural": 0}}
+
+
+@pytest.fixture
+def controllers(monkeypatch):
     cfg = load_ai_config()["curriculum"]["phase2"]
-    seeds = rpe.eval_seeds(PHASE2)
-    assert seeds[0] == cfg["eval_seed_offset"] and len(seeds) == cfg["eval_episodes"]
+
+    def _set(value):
+        monkeypatch.setitem(cfg, "controllers", value)
+    return _set
+
+
+def test_the_eval_plan_is_the_phase1_budget_on_the_phase_seed_range():
+    cfg = load_ai_config()
+    seeds, repeats = rpe.eval_plan(PHASE2)
+    assert seeds[0] == cfg["curriculum"]["phase2"]["eval_seed_offset"]
+    assert len(seeds) == cfg["eval"]["eval_n_seeds"] and repeats == cfg["eval"]["eval_repeats_per_seed"]
+
+
+def test_only_specs_of_trained_roles_are_evaluated(controllers):
+    controllers(NEURAL_ATTACKER)
+    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == ["rules_baseline", "attacker_vs_rules"]
+    controllers({**NEURAL_ATTACKER, "defender": {"rules": 1, "neural": 2}})
+    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == list(SPECS)
+    controllers({r: {"rules": 1, "neural": 0} for r in ("attacker", "defender", "goalkeeper")})
+    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == ["rules_baseline"]
+
+
+def test_explicit_seeds_with_repeats():
+    res = rpe.run_role_phase_eval(PHASE2, SPECS["rules_baseline"], None, seeds=[5000, 5001], repeats_per_seed=3)
+    assert len(res.outcomes) == 6
 
 
 def test_rules_baseline_matches_the_training_env_on_the_same_seeds():
@@ -62,11 +90,12 @@ def test_a_spec_must_pin_every_role():
         rpe.run_role_phase_eval(PHASE2, {"name": "x", "controllers": {"attacker": "rules"}}, None, seeds=[1])
 
 
-def test_trainer_runs_every_spec_and_caches_the_rules_baseline(trainer, monkeypatch, caplog):
+def test_trainer_runs_every_spec_and_caches_the_rules_baseline(trainer, monkeypatch, caplog, controllers):
+    controllers({**NEURAL_ATTACKER, "defender": {"rules": 1, "neural": 1}})
     calls = []
     real = rpe.run_role_phase_eval
 
-    def _counting(phase, spec, fn, seeds=None):
+    def _counting(phase, spec, fn, seeds=None, repeats_per_seed=None):
         calls.append(spec["name"])
         return real(phase, spec, fn, seeds=[11, 12])
     monkeypatch.setattr(rpe, "run_role_phase_eval", _counting)
@@ -83,8 +112,68 @@ def test_trainer_runs_every_spec_and_caches_the_rules_baseline(trainer, monkeypa
         assert caplog.text.count(f"[eval phase2_1v2/{name}]") == 2
 
 
-def test_no_phase_mix_means_no_role_evals(trainer, caplog):
-    trainer.phase_mix = None
+def _dispatch(trainer, monkeypatch, phase_mix, train_phase):
+    calls = []
+    monkeypatch.setattr(trainer, "rollout_eval_trials", 1)
+    monkeypatch.setattr(trainer, "phase_mix", phase_mix)
+    monkeypatch.setattr(trainer, "_train_phase_id", train_phase)
+    monkeypatch.setattr(trainer, "_eval_vs_rules", lambda s: calls.append("phase1_vs_rules"))
+    monkeypatch.setattr(trainer, "_maybe_run_neural_snapshot_eval", lambda s: calls.append("phase1_snapshots"))
+    monkeypatch.setattr(trainer, "_eval_role_phases", lambda: calls.append(("role", tuple(trainer._trained_phase_ids()))))
+    trainer._run_rollout_evals(15.0)
+    return calls
+
+
+def test_rollout_evals_cover_exactly_the_trained_phases(trainer, monkeypatch):
+    assert _dispatch(trainer, monkeypatch, None, 1) == ["phase1_vs_rules", "phase1_snapshots", ("role", (1,))]
+    assert _dispatch(trainer, monkeypatch, None, 2) == [("role", (2,))]
+    assert _dispatch(trainer, monkeypatch, {2: 1.0}, 2) == [("role", (2,))]
+    assert _dispatch(trainer, monkeypatch, {1: 3.0, 2: 1.0}, 1) == ["phase1_vs_rules", "phase1_snapshots", ("role", (1, 2))]
+    assert _dispatch(trainer, monkeypatch, None, None) == ["phase1_vs_rules", "phase1_snapshots", ("role", ())]
+
+
+def test_a_phase2_only_run_without_a_mix_runs_the_role_evals(trainer, monkeypatch, caplog, controllers):
+    controllers(NEURAL_ATTACKER)
+    real = rpe.run_role_phase_eval
+    monkeypatch.setattr(rpe, "run_role_phase_eval",
+                        lambda phase, spec, fn, seeds=None, repeats_per_seed=None: real(phase, spec, fn, seeds=[11]))
+    monkeypatch.setattr(trainer, "phase_mix", None)
+    monkeypatch.setattr(trainer, "_train_phase_id", 2)
+    trainer._role_eval_cache = {}
+    with caplog.at_level(logging.INFO, logger="footballcoach"):
+        trainer._eval_role_phases()
+    assert "[eval phase2_1v2/attacker_vs_rules]" in caplog.text
+    assert "[eval phase2_1v2/defender_vs_rules]" not in caplog.text
+
+
+def test_a_phase1_only_run_runs_no_role_evals(trainer, monkeypatch, caplog):
+    monkeypatch.setattr(trainer, "phase_mix", None)
+    monkeypatch.setattr(trainer, "_train_phase_id", 1)
     with caplog.at_level(logging.INFO, logger="footballcoach"):
         trainer._eval_role_phases()
     assert "[eval phase2" not in caplog.text
+
+
+def test_the_persistent_pool_gives_the_in_process_result(trainer):
+    """Rules-only episodes are deterministic per seed, so the pool must
+    reproduce the in-process run exactly (seeds dealt round-robin, merged
+    back per worker); a neural spec returns every episode."""
+    from footballcoach.ai.eval.eval_worker import close_eval_workers, spawn_eval_workers
+    seeds = list(range(5000, 5007))
+    local = rpe.run_role_phase_eval(PHASE2, SPECS["rules_baseline"], None, seeds=seeds, repeats_per_seed=2)
+    workers = spawn_eval_workers(2)
+    try:
+        pooled = rpe.run_role_phase_eval_on_workers(workers, PHASE2, SPECS["rules_baseline"], seeds=seeds,
+                                                    repeats_per_seed=2)
+        d, e, v = trainer._cpu_state_dicts()
+        for w in workers:
+            w.set_weights(d, e, v)
+        neural = rpe.run_role_phase_eval_on_workers(workers, PHASE2, SPECS["attacker_vs_rules"], seeds=seeds[:3],
+                                                    repeats_per_seed=2)
+    finally:
+        close_eval_workers(workers)
+    order = seeds[0::2] + seeds[1::2]                     # worker 0's seeds, then worker 1's
+    by_seed = {s: local.outcomes[2 * i:2 * i + 2] for i, s in enumerate(seeds)}
+    assert pooled.outcomes == [o for s in order for o in by_seed[s]]
+    assert sorted(pooled.rewards) == sorted(local.rewards)
+    assert len(neural.outcomes) == 6 and "attacker=neural" in neural.episode_tag
