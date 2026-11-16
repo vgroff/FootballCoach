@@ -124,6 +124,31 @@ def test_ppg_refit_collects_both_phases_and_replays_per_phase(mixed_config, monk
     assert sorted({untag_seed(s)[1] for s in next_seeds}) == [1, 2]   # and both got replay slots
 
 
+def test_one_mixed_cycle_with_phase1_distillation(mixed_config, monkeypatch, tmp_path, caplog):
+    """Phase-1 teacher distillation (ai/ppo/distill.py) through the real
+    multi-process training path: the teacher is loaded, its KL applied to the
+    phase-1 rows and logged."""
+    import json as _json
+    from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+
+    torch.manual_seed(0)
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    trainer.set_frozen_heads(PHASES_BY_ID[1].frozen_heads)
+    teacher = tmp_path / "teacher.pt"
+    trainer._save_checkpoint_to(teacher)
+    monkeypatch.setitem(mixed_config["curriculum"], "distill", {
+        "1": {"teacher": str(teacher), "coeff_start": 1.0, "coeff_end": 1.0, "anneal_fraction": 1.0}})
+    (tmp_path / "ai_config.json").write_text(_json.dumps(mixed_config))
+    trainer.phase_mix = {1: 1.0, 2: 1.0}
+    trainer._ppg_interleave_enabled = False
+    trainer._eval_n_parallel_workers = 1
+    trainer.checkpoint_dir = None
+    with caplog.at_level(logging.INFO, logger="footballcoach"):
+        trainer.train(None, total_steps=500, phase_id=1)
+    assert "distill [phase1_get_possession] kl=" in caplog.text
+
+
 def test_ppg_over_a_mix_refuses_the_single_process_path(mixed_config, monkeypatch):
     from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
     monkeypatch.setitem(mixed_config["ppo"], "value_pretrain_n_processes", 1)

@@ -71,6 +71,12 @@ class RolloutLoggingMixin:
                     f"  bc agree [{_src}] expert kick-now={100 * _a['label_kick_rate']:.0f}% of rows  "
                     f"P(kick)|kick-now={_a['p_kick_label_kick']:.3f}  P(kick)|else={_a['p_kick_label_no_kick']:.3f}  "
                     f"|power err|={_a['power_err']:.3f}  kick_dir err={_a['kick_dir_err_deg']:.1f}deg")
+        for _ph, _dv in (metrics.get("distill") or {}).items():
+            # Teacher distillation of a phase (ai/ppo/distill.py): its mean KL to
+            # the teacher and the largest per-head terms.
+            _top = sorted(_dv["by_head"].items(), key=lambda kv: -abs(kv[1]))[:4]
+            bc_lines.append(f"  distill [{_ph}] kl={_dv['kl']:.4f} x{_dv['coeff']:.2f}  ("
+                            + "  ".join(f"{h} {v:.4f}" for h, v in _top) + ")")
         _p = metrics.get("bc_pull") or {}
         if _p:
             # How hard BC pulls on the shared weights (ppo_update._measure_bc_pull):

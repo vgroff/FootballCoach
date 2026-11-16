@@ -1674,6 +1674,8 @@ class PPGMixin:
         self, d_heads, e_heads, anchor: dict[str, torch.Tensor],
         anchor_globals: dict[str, torch.Tensor], mb_actions: dict, exists_mask: torch.Tensor,
         return_per_row: bool = False,
+        row_weights: Optional[torch.Tensor] = None,
+        detach_spread: bool = False,
     ) -> tuple:
         """Analytic per-head KL(current policy || anchor snapshot), for
         ``ppg_value_refit()``'s KL-anchor loss term.
@@ -1707,6 +1709,12 @@ class PPGMixin:
             folded into its parent's entry (``pass_target`` -> ``pass_``
             etc.), matching how ``_recompute_log_prob`` never surfaces the
             target categoricals as a separate scalar either.
+
+        ``row_weights`` (N,): the means become weighted means (rows with 0
+        contribute nothing) -- e.g. one phase's rows only (ai/ppo/distill.py).
+        ``detach_spread``: the CURRENT continuous heads use detached spread
+        parameters (kappa / log_std), so the KL pulls only on the
+        state-dependent means and no gradient reaches the spreads.
         """
         device = self.device
         bsz = exists_mask.shape[0]
@@ -1790,10 +1798,11 @@ class PPGMixin:
             else _bern_kl(e_heads.tackle_attempt_logit, anchor["tackle_attempt_logit"])
         )
 
-        log_kappa_move = self.execution_net.move_dir_log_kappa.to(device)
-        log_kappa_kick = self.execution_net.kick_dir_log_kappa.to(device)
-        log_std_z_kick = self.execution_net.kick_dir_z_log_std.to(device)
-        log_std_power = self.execution_net.kick_power_log_std.to(device)
+        _sp = (lambda p: p.detach().to(device)) if detach_spread else (lambda p: p.to(device))
+        log_kappa_move = _sp(self.execution_net.move_dir_log_kappa)
+        log_kappa_kick = _sp(self.execution_net.kick_dir_log_kappa)
+        log_std_z_kick = _sp(self.execution_net.kick_dir_z_log_std)
+        log_std_power = _sp(self.execution_net.kick_power_log_std)
 
         if "move_dir" in inactive:
             kl_move_dir = zero
@@ -1830,7 +1839,7 @@ class PPGMixin:
         if "kick_spin" in inactive:
             kl_kick_spin = zero
         else:
-            log_std_spin = self.execution_net.kick_spin_log_std.to(device)
+            log_std_spin = _sp(self.execution_net.kick_spin_log_std)
             cur_spin = self._kick_spin_dist(e_heads.kick_spin, log_std_spin)
             anc_spin = self._kick_spin_dist(anchor["kick_spin"], anchor_globals["kick_spin_log_std"])
             kl_kick_spin = kick_mask * torch.distributions.kl_divergence(cur_spin, anc_spin).sum(dim=-1)
@@ -1843,6 +1852,14 @@ class PPGMixin:
             "kick_dir": kl_kick_dir, "kick_power": kl_kick_power, "kick_spin": kl_kick_spin,
         }
         total_per_row = sum(per_head.values())
+        if row_weights is not None:
+            _w = row_weights.to(device).float()
+            _den = _w.sum().clamp(min=1e-12)
+            per_head_mean = {k: (v * _w).sum() / _den for k, v in per_head.items()}
+            if return_per_row:
+                return ((total_per_row * _w).sum() / _den, per_head_mean, total_per_row.detach(),
+                        {k: v.detach() for k, v in per_head.items()})
+            return (total_per_row * _w).sum() / _den, per_head_mean
         per_head_mean = {k: v.mean() for k, v in per_head.items()}
         if return_per_row:
             return total_per_row.mean(), per_head_mean, total_per_row.detach(), {k: v.detach() for k, v in per_head.items()}

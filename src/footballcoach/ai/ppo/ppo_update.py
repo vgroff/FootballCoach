@@ -150,6 +150,9 @@ class _UpdateContext:
     # is configured, in which case the global coefficients above apply to
     # every row exactly as before.
     bc_coeff_table: Optional[torch.Tensor] = None
+    # Per-phase teacher distillation (ai/ppo/distill.py): [{phase_id, coeff,
+    # means_only, nets}] for this update; None when not configured.
+    distill_terms: Optional[list] = None
 
 
 @dataclasses.dataclass
@@ -185,6 +188,9 @@ class _UpdateStats:
     # How hard BC pulls (_measure_bc_pull, first minibatch of each epoch):
     # [|g_bc| main, |g_rest| main, cos main, |g_bc| dir, |g_rest| dir, cos dir].
     bc_pull: list = dataclasses.field(default_factory=list)
+    # phase id -> per-minibatch (mean KL to the teacher, {head: KL}) over that
+    # phase's rows (_ppo_distill_loss).
+    distill_by_phase: dict = dataclasses.field(default_factory=dict)
     epoch_sample_policy_loss: list = dataclasses.field(default_factory=list)
     epoch_sample_value_loss: list = dataclasses.field(default_factory=list)
     epoch_sample_surrogate: list = dataclasses.field(default_factory=list)  # unclipped (r-1)*A per row
@@ -974,6 +980,8 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
             bc_coeff_table = _bcs.coeff_table(progress, (bc_coeff, bc_kick_coeff, bc_tackle_coeff))
             _used = torch.unique(batch["bc_sources"])
             has_bc = "bc_labels" in batch and bool((bc_coeff_table[_used] > 0.0).any())
+        from footballcoach.ai.ppo import distill as _distill
+        distill_terms = _distill.active_terms(progress, self.separate_value_net, self.device)
         adv = batch["advantages"]
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         old_log_probs = batch["log_probs"]
@@ -991,6 +999,7 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
             warm_base_lrs=[pg["lr"] for pg in self.optimizer.param_groups],
             step_outcomes=batch.get("step_outcomes", []),
             bc_coeff_table=bc_coeff_table,
+            distill_terms=distill_terms,
         )
 
     def _direction_spread_means(self) -> tuple[float, float, float]:
@@ -1205,6 +1214,54 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
                     out[describe(s)]["agree"] = dict(zip(_AGREE_KEYS, np.nanmean(np.asarray(agree), axis=0).tolist()))
         return out
 
+    def _ppo_distill_loss(self, ctx: _UpdateContext, stats: _UpdateStats, mb_obs: dict,
+                          d_heads, e_heads, mb_actions: dict, em: torch.Tensor) -> torch.Tensor:
+        """Coefficient-weighted KL(student || frozen teacher) over each
+        distilled phase's rows of this minibatch (ai/ppo/distill.py), through
+        the PPG refit's analytic per-head KL. The teacher runs on the whole
+        minibatch (its own physics encoders on the raw obs); rows of other
+        phases get weight 0. means_only: the student's spreads are detached
+        and the teacher is compared at them, so only means / logits move."""
+        from footballcoach.ai.ppo.distill import phase_row_mask
+        spread_keys = ["move_dir_log_kappa", "kick_dir_log_kappa", "kick_dir_z_log_std", "kick_power_log_std"]
+        if not self._kick_spin_frozen:
+            spread_keys.append("kick_spin_log_std")
+        total = torch.zeros((), device=self.device)
+        for term in ctx.distill_terms:
+            rows = phase_row_mask(mb_obs["global_feat"], term["phase_id"])
+            if not bool(rows.any()):
+                continue
+            teacher_obs = {k: v for k, v in mb_obs.items() if not k.endswith("physics_full")}
+            with torch.no_grad():
+                anchor = self._ppg_snapshot_anchor(teacher_obs, len(teacher_obs["self_feat"]), nets=term["nets"])
+            spread_src = self.execution_net if term["means_only"] else term["nets"][1]
+            anchor_globals = {k: getattr(spread_src, k).detach().to(self.device) for k in spread_keys}
+            kl, per_head = self._ppg_kl_penalty(
+                d_heads, e_heads, anchor, anchor_globals, mb_actions, em,
+                row_weights=rows.float(), detach_spread=term["means_only"],
+            )
+            total = total + term["coeff"] * kl
+            with torch.no_grad():
+                stats.distill_by_phase.setdefault(term["phase_id"], []).append(
+                    (float(kl), {k: float(v) for k, v in per_head.items()}))
+        return total
+
+    @staticmethod
+    def _distill_metrics(ctx: _UpdateContext, stats: _UpdateStats) -> dict:
+        """{phase name: {"coeff", "kl", "by_head"}} for each distilled phase seen."""
+        if not ctx.distill_terms:
+            return {}
+        from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+        coeffs = {t["phase_id"]: t["coeff"] for t in ctx.distill_terms}
+        out = {}
+        for pid, vals in sorted(stats.distill_by_phase.items()):
+            heads = vals[0][1].keys()
+            out[PHASES_BY_ID[pid].name] = {
+                "coeff": coeffs[pid], "kl": float(np.mean([v[0] for v in vals])),
+                "by_head": {h: float(np.mean([v[1][h] for v in vals])) for h in heads},
+            }
+        return out
+
     @staticmethod
     def _bc_pull_metrics(stats: _UpdateStats) -> dict:
         """Mean of _measure_bc_pull's samples over this update ({} if none)."""
@@ -1370,6 +1427,8 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
             if mb_i == 0:
                 self._measure_bc_pull(stats, total_loss, bc_aux)
             total_loss = total_loss + bc_aux
+        if ctx.distill_terms:
+            total_loss = total_loss + self._ppo_distill_loss(ctx, stats, mb_obs, d_heads, e_heads, mb_actions, em)
         with torch.no_grad():
             tackle_prob_t = torch.sigmoid(e_heads.tackle_attempt_logit).mean()
             kick_prob_t = torch.sigmoid(e_heads.kick_logit).mean()
@@ -1824,6 +1883,7 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
             "bc_tackle_coeff": ctx.bc_tackle_coeff,
             "bc_by_source": self._bc_by_source_metrics(ctx, stats),
             "bc_pull": self._bc_pull_metrics(stats),
+            "distill": self._distill_metrics(ctx, stats),
             "epoch_time_ms": float(np.mean(stats.epoch_times)) if stats.epoch_times else 0.0,
             "move_log_std": self.execution_net.move_dir_log_kappa.data.tolist(),
             "kick_log_std": self.execution_net.kick_dir_log_kappa.data.tolist(),

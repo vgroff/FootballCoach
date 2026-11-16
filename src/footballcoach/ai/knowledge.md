@@ -1624,6 +1624,33 @@ default). Example, kick BC for the phase-2 attacker only:
 With BC off, every trace is identical apart from the new per-row
 `bc_sources` (all 0) and an empty `bc_by_source` metric.
 
+## Per-phase teacher distillation (`ai/ppo/distill.py`, 2026-11-16)
+
+Against forgetting one phase while training another. Measured: phase-2-only
+training took phase-1 wins vs rules 65% -> 17% (misses 45%: the new hard
+shooting leaked into the 1v1); a 30/70 mix with kick BC 65% -> 21% in three
+updates; even an 80/20 mix with weak kick BC and 1-epoch updates slid ~1 pt
+per round. Phase identity is visible in the observation (task-id one-hot,
+plus a keeper and a second defender in phase 2), so this is not the network
+being unable to tell the phases apart: nothing in the loss kept phase-1
+behaviour.
+
+`curriculum.distill = {"<phase id>": {teacher, coeff_start, coeff_end,
+anneal_fraction[, hold_fraction][, means_only]}}` adds, in every PPO
+minibatch, coeff x KL(student || frozen teacher) over that phase's rows
+(`phase_row_mask`: the task-id column of `global_feat`, so nothing new in the
+rollout buffer), through the PPG refit's analytic per-head KL
+(`_ppg_kl_penalty`, new `row_weights` and `detach_spread` arguments) on the
+states the student visits. `means_only` (default true): the student's spreads
+(kappa / log_std, global and shared by every phase) are detached and the
+teacher compared at them, so only state-dependent means / logits are pulled.
+The teacher is loaded once per process (inference only, frozen) and run on the
+whole minibatch with its own physics encoders. Logged as `distill [<phase>]
+kl=... x<coeff>` with the largest per-head terms. Off by default. Tests:
+`tests/ai_scenario/test_distill.py` (zero against itself, only the phase's
+rows count, means_only keeps the spreads' gradient at 0) and a mixed-training
+smoke test.
+
 ## Phase-1 step early exit and stale transitions (fixed 2026-11-16)
 
 `ScenarioEnv.step()` (phase 1) used to stop a step early when "the trainee
