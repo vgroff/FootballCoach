@@ -567,16 +567,29 @@ class TestPhase1Labels:
         """When the trainee has possession, Phase1RulesAI issues a MoveOrder
         toward the opponent box -- verify move==1.0 and direction points at
         the MoveOrder's target."""
+        # Seeded, and only spawns OUTSIDE the opponent box: a trainee already
+        # in it is aimed at its own position (the box's nearest point), so
+        # there is no direction -- and in play holding the ball there ends
+        # the episode, so that state is never labelled. (Unseeded, this test
+        # drew such a spawn ~9% of the time and failed.)
         env = _make_env()
-        env.reset()
-        match = env.match
-        player = match.player_by_id(env.trainee_player_id)
-        match.ball.possessed_by = player.player_id
+        checked = 0
+        for seed in range(40):
+            env.reset(seed=seed)
+            match = env.match
+            player = match.player_by_id(env.trainee_player_id)
+            from footballcoach.entities.player import Team
+            if match.pitch.is_in_box(player.position, left=(player.team == Team.RIGHT)):
+                continue
+            match.ball.possessed_by = player.player_id
+            match._sync_possessed_ball()
 
-        label = phase1_labels(env, env.trainee_player_id)
-        assert label.valid
-        assert label.move == pytest.approx(1.0)
-        assert label.move_direction is not None
+            label = phase1_labels(env, env.trainee_player_id)
+            assert label.valid
+            assert label.move == pytest.approx(1.0)
+            assert label.move_direction is not None, seed
+            checked += 1
+        assert checked >= 20
 
     def test_valid_when_player_already_at_target(self):
         """Degenerate zero-length raw target vector (player exactly at the

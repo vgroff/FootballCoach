@@ -47,3 +47,21 @@ def test_a_shot_or_pass_does_the_kick_bookkeeping(make_order):
     assert fired == ["atk_a"]                                                 # on_kick exactly once
     assert a.state is PlayerState.ACTIVE and a.state_timer_s == 0.0           # first touch ended
     assert a.pending_kick is None
+
+
+def test_a_chase_tackle_counts_like_an_armed_tackle():
+    from footballcoach.orders import ChaseTackleOrder
+    m = build_2v2_scenario()
+    for p in m.players:
+        p.ai, p.current_order = None, None
+    a, d = m.player_by_id("atk_b"), m.player_by_id("defender")
+    a.position, d.position = Vector3(10.0, 0.0, 0.0), Vector3(10.5, 0.0, 0.0)
+    m.ball.position = Vector3(10.3, 0.0, m.ball.radius_m)
+    m._set_possession("atk_b")
+    m._sync_possessed_ball()
+    tackles = []
+    d.on_tackle = lambda *x: tackles.append(x)
+    d.current_order = ChaseTackleOrder(target_player_id="atk_b")
+    before = d.tackle_fire_count
+    m._process_orders(m.dt_s)
+    assert tackles and d.tackle_fire_count == before + 1 and d.pending_tackle is None

@@ -435,8 +435,8 @@ counterfactual tackled the REAL opponent. It now records
 `player.pending_tackle`, resolved by `_process_orders` right after
 `execute()` (traces identical). The other tackling orders (GetPossession,
 Mark) only arm (`tackle_armed`), resolved later by `_check_armed_tackles`.
-Unlike armed tackles it does not count `tackle_fire_count` (unchanged; it is a
-UI-only order). `SaveOrder` writes the keeper's position directly when the
+Its tackle counts in `tackle_fire_count` like an armed tackle's (it did not
+before 2026-11-16). `SaveOrder` writes the keeper's position directly when the
 save point is within one tick's reach (a snap); that is the labelled player
 and is restored by the counterfactual. Not routed through intents: the
 neural player's in-possession kick (`apply_nn_action.py`, whose kick-once logic

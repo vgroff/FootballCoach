@@ -465,6 +465,9 @@ class Match(MatchTacklesMixin, MatchGetPossessionMixin):
                 # The order's tackle, resolved here at the same point in the
                 # tick it used to be resolved inside execute().
                 _target_id, player.pending_tackle = player.pending_tackle, None
+                # Counted like an armed tackle's (_check_armed_tackles), so every
+                # tackle a player makes is in tackle_fire_count.
+                player.tackle_fire_count += 1
                 self._attempt_tackle_contact(player, self.player_by_id(_target_id))
             if player.desired_speed_mode is None:
                 # Every order must explicitly decide movement intent (even
