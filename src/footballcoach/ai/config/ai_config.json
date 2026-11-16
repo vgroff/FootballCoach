@@ -12,7 +12,7 @@
     "lr_warmup_steps": 300,
     "_comment_epochs_warmup": "12 epochs (6 left the KL still falling ~0.13/epoch in the first run) and a 300-step linear LR warmup at the start of the run (user's call, 2026-11-16).",
     "batch_size": 8000,
-    "rollout_steps": 540000,
+    "rollout_steps": 370000,
     "num_rollouts": 4,
     "_comment": "train.py --distill-pretrain-only (ai/ppo/distill_pretrain.py): one frozen teacher per phase, KL (means only, kick / move sub-heads weighted by the teacher's probabilities) on student-driven rollouts over the phase mix, each row also as a task-id-swapped counterfactual copy targeted at the other teacher (no value loss), Monte Carlo value fit on the real rows. Teachers (2026-11-16): phase 1 = 763 (65% wins vs rules at 22 s), phase 2 = phase2_run6/checkpoint3 (75.1% goals vs rules, 1840 episodes; phase2_run4/latest 46.5%, run6/checkpoint2 65.3%)."
   },
