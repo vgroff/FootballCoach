@@ -99,3 +99,10 @@ behaviour) -- proper DAgger aggregation: fit on this cycle's rows plus the last
 but train the KL only, not the value head (their MC returns came from an
 earlier student). Tests: concat / history, and the smoke test runs 2 cycles
 with aggregation. To be used from the next continuation (N = 3).
+
+### 00:51 phase2_run22 stopped after cycle 2 (checkpoint saved), continuing with aggregation
+
+run22 after-fit (real p1 / real p2 / cf p1 / cf p2): c1 0.199 / 0.054 / 0.176 / 1.21;
+c2 0.191 / 0.054 / 0.199 / 1.20. Small steps; fresh rollouts keep resetting
+phase 1 to ~0.29. Next: phase2_run23 from run22's checkpoint, aggregate_cycles
+1 -> 3 (only change; lr 3e-5, counterfactual weight 0.3 kept).
