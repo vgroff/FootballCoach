@@ -131,3 +131,25 @@ def _disable_mask_untriggered_actions_for_generic_trainers():
         ppo_cfg["mask_untriggered_actions"] = original_mask
     else:
         ppo_cfg.pop("mask_untriggered_actions", None)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _disable_run_teacher_distillation():
+    """curriculum.distill (per-phase teacher KL, ai/ppo/distill.py) is a RUN
+    setting in the live config, naming a real full-size checkpoint as the
+    teacher. Every PPO update in this directory would load it into the shrunk
+    test networks (shape mismatch: a random teacher) and add its KL to tests
+    that are not about distillation. Off for the session; the distillation
+    tests set their own config (tests/ai_scenario/test_distill.py)."""
+    cfg = load_ai_config()
+    cur = cfg.setdefault("curriculum", {})
+    had = "distill" in cur
+    original = cur.get("distill")
+    cur["distill"] = {}
+
+    yield
+
+    if had:
+        cur["distill"] = original
+    else:
+        cur.pop("distill", None)

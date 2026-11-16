@@ -1,4 +1,19 @@
 {
+  "distill_pretrain": {
+    "teachers": {"1": "checkpoints/migrated/phase1_run321_checkpoint763_migrated.pt", "2": "checkpoints/phase2_run6/checkpoint3.pt"},
+    "counterfactual": true,
+    "counterfactual_weight": 1.0,
+    "label_smoothing": 1e-05,
+    "_comment_label_smoothing": "Teachers' Bernoulli targets mixed with a fair coin by this much: caps the target logits at ~+-11.5 (763's kick logits sit near -20, several of its probabilities at 1.0000), so the student does not inherit saturated heads PPO could no longer move. User's call, 2026-11-16.",
+    "kl_coef": 5.0,
+    "value_coef": 1.0,
+    "epochs": 6,
+    "lr": 0.0001,
+    "batch_size": 8000,
+    "rollout_steps": 540000,
+    "num_rollouts": 4,
+    "_comment": "train.py --distill-pretrain-only (ai/ppo/distill_pretrain.py): one frozen teacher per phase, KL (means only, kick / move sub-heads weighted by the teacher's probabilities) on student-driven rollouts over the phase mix, each row also as a task-id-swapped counterfactual copy targeted at the other teacher (no value loss), Monte Carlo value fit on the real rows. Teachers (2026-11-16): phase 1 = 763 (65% wins vs rules at 22 s), phase 2 = phase2_run6/checkpoint3 (75.1% goals vs rules, 1840 episodes; phase2_run4/latest 46.5%, run6/checkpoint2 65.3%)."
+  },
   "_comment": "AI neural network and PPO hyperparameters. All tunable constants live here, not hardcoded - mirrors physics.json/attributes.json pattern.",
   "action": {
     "arm_tackle_without_carrier": true,

@@ -232,6 +232,14 @@ def main() -> None:
                             "by a KL-anchor penalty, without risking policy damage. A no-op (with "
                             "a warning) if --separate-value-net is set."
                         ))
+    parser.add_argument("--distill-pretrain-only", action="store_true",
+                        help=(
+                            "After checkpoint loading, run the multi-teacher distillation pretraining "
+                            "(ai/ppo/distill_pretrain.py, ai_config.json distill_pretrain: one frozen "
+                            "teacher per phase, KL on student-driven rollouts over the phase mix, "
+                            "task-id-swapped counterfactual copies, Monte Carlo value fit), save "
+                            "checkpoint_pretrained.pt after every cycle, then exit without PPO."
+                        ))
     parser.add_argument("--ppg-num-rollouts", type=int, default=None,
                         help="--ppg-refit-only: override bc.ppg_num_rollouts (collect+fit cycles in the call).")
     parser.add_argument("--consistency-refit-only", action="store_true",
@@ -990,6 +998,13 @@ def main() -> None:
         for _row in init_new_phase_inputs(trainer, task_phases=_init_phases, zero_player_features=_zero):
             log.info(f"  [new phase inputs] {_row['network']}.{_row['layer']} {_row['column']}: "
                      f"{_row['action']} (norm {_row['norm_before']:.3f} -> {_row['norm_after']:.3f})")
+
+    if args.distill_pretrain_only:
+        from footballcoach.ai.ppo.distill_pretrain import distill_pretrain
+        _dp_ckpt = checkpoint_dir / "checkpoint_pretrained.pt"
+        distill_pretrain(trainer, phase_id=args.phase, checkpoint_path=_dp_ckpt)
+        log.info(f"--distill-pretrain-only: done, checkpoint saved to {_dp_ckpt}, exiting.")
+        return
 
     if args.ppg_refit_only:
         # Ad-hoc "starting from a decent checkpoint" use case -- reuses every

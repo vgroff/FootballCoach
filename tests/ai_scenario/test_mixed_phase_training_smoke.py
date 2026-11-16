@@ -150,6 +150,38 @@ def test_one_mixed_cycle_with_phase1_distillation(mixed_config, monkeypatch, tmp
     assert "distill agree [phase1_get_possession] move_dir err=" in caplog.text
 
 
+def test_distill_pretrain_over_a_mix(mixed_config, monkeypatch, tmp_path, caplog):
+    """Multi-teacher distillation (ai/ppo/distill_pretrain.py) through the real
+    worker pool over a 1:1 mix: both phases' rows (trainee and secondary)
+    collected, real and counterfactual copies fitted, per-group report logged,
+    checkpoint saved."""
+    import json as _json
+    from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+    from footballcoach.ai.ppo.distill_pretrain import distill_pretrain
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+
+    for path, value in _PPG_OVERRIDES.items():
+        monkeypatch.setitem(mixed_config[path[0]], path[1], value)
+    (tmp_path / "ai_config.json").write_text(_json.dumps(mixed_config))
+    torch.manual_seed(0)
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    trainer.set_frozen_heads(PHASES_BY_ID[1].frozen_heads)
+    trainer.phase_mix = {1: 1.0, 2: 1.0}
+    teacher = tmp_path / "teacher.pt"
+    trainer._save_checkpoint_to(teacher)
+    cfg = {"teachers": {1: str(teacher), 2: str(teacher)}, "counterfactual": True, "counterfactual_weight": 1.0,
+           "kl_coef": 5.0, "value_coef": 1.0, "epochs": 1, "lr": 1e-4, "batch_size": 512,
+           "rollout_steps": 4000, "num_rollouts": 1}
+    out = tmp_path / "distilled.pt"
+    with caplog.at_level(logging.INFO, logger="footballcoach"):
+        report = distill_pretrain(trainer, phase_id=1, cfg=cfg, checkpoint_path=out)
+    text = caplog.text
+    assert "[distill pretrain] rollout: phase 1: " in text and "secondary" in text
+    assert "phase-1 episodes vs rules" in text
+    assert set(report) == {(1, "real"), (1, "cf"), (2, "real"), (2, "cf")}
+    assert out.exists()
+
+
 def test_ppg_over_a_mix_refuses_the_single_process_path(mixed_config, monkeypatch):
     from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
     monkeypatch.setitem(mixed_config["ppo"], "value_pretrain_n_processes", 1)

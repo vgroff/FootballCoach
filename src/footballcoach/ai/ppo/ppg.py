@@ -1676,6 +1676,7 @@ class PPGMixin:
         return_per_row: bool = False,
         row_weights: Optional[torch.Tensor] = None,
         detach_spread: bool = False,
+        soft_action_weights: bool = False,
     ) -> tuple:
         """Analytic per-head KL(current policy || anchor snapshot), for
         ``ppg_value_refit()``'s KL-anchor loss term.
@@ -1715,6 +1716,10 @@ class PPGMixin:
         ``detach_spread``: the CURRENT continuous heads use detached spread
         parameters (kappa / log_std), so the KL pulls only on the
         state-dependent means and no gradient reaches the spreads.
+        ``soft_action_weights``: ``mb_actions["exec_move"]`` / ``["kick"]`` are
+        used as float weights as given (e.g. the TEACHER's probabilities, for
+        distillation: power / aim are then matched where the teacher would
+        kick) instead of thresholding sampled actions at 0.5.
         """
         device = self.device
         bsz = exists_mask.shape[0]
@@ -1747,10 +1752,18 @@ class PPGMixin:
             ).squeeze(-1)
 
         def _cat_kl(new_logits, anchor_logits):
-            return torch.distributions.kl_divergence(
-                MaskedCategorical(new_logits, exists_mask).dist,
-                MaskedCategorical(anchor_logits, exists_mask).dist,
-            )
+            # KL(new || anchor) over the existing slots, computed directly:
+            # torch's Categorical KL on -inf-masked logits is right in the
+            # forward pass but its BACKWARD gives NaN (0 x inf) on the masked
+            # slots. A large finite fill keeps those slots' probability at
+            # exactly 0 with finite gradients. Same all-masked-row guard as
+            # MaskedCategorical (such a row is left unmasked).
+            invalid = exists_mask < 0.5
+            invalid = invalid & ~invalid.all(dim=-1, keepdim=True)
+            fill = -1e9
+            lp_new = torch.log_softmax(new_logits.masked_fill(invalid, fill), dim=-1)
+            lp_anc = torch.log_softmax(anchor_logits.masked_fill(invalid, fill), dim=-1)
+            return (lp_new.exp() * (lp_new - lp_anc)).masked_fill(invalid, 0.0).sum(dim=-1)
 
         kl_shoot = zero if "shoot" in inactive else _bern_kl(d_heads.shoot_logit, anchor["shoot_logit"])
         kl_move = zero if "move" in inactive else _bern_kl(d_heads.move_logit, anchor["move_logit"])
@@ -1787,8 +1800,12 @@ class PPGMixin:
             d_heads.mark_target_logits, anchor["mark_target_logits"],
         )
 
-        exec_move_mask = (mb_actions["exec_move"].squeeze(-1) > 0.5).float()
-        kick_mask = (mb_actions["kick"].squeeze(-1) > 0.5).float()
+        if soft_action_weights:
+            exec_move_mask = mb_actions["exec_move"].reshape(bsz).float()
+            kick_mask = mb_actions["kick"].reshape(bsz).float()
+        else:
+            exec_move_mask = (mb_actions["exec_move"].squeeze(-1) > 0.5).float()
+            kick_mask = (mb_actions["kick"].squeeze(-1) > 0.5).float()
 
         kl_exec_move = zero if "exec_move" in inactive else _bern_kl(e_heads.exec_move_logit, anchor["exec_move_logit"])
         kl_sprint = zero if "sprint" in inactive else exec_move_mask * _bern_kl(e_heads.sprint_logit, anchor["sprint_logit"])

@@ -1624,6 +1624,46 @@ default). Example, kick BC for the phase-2 attacker only:
 With BC off, every trace is identical apart from the new per-row
 `bc_sources` (all 0) and an empty `bc_by_source` metric.
 
+## Multi-teacher distillation pretraining (`ai/ppo/distill_pretrain.py`, 2026-11-16)
+
+`train.py --distill-pretrain-only` (config `distill_pretrain`): no PPO. One
+frozen teacher per phase (two phases): phase 1 = 763, phase 2 =
+phase2_run6/checkpoint3 (75.1% goals vs rules on 1840 episodes; the rules
+attacker scores 35.7%). Each cycle collects student-driven rollouts over the
+phase mix through the PPG / value-pretrain worker pool (the same batched
+workers and env builders as PPO, so phase-1 rows have the training opponent
+mix, rules 1 : neural 3, and both trainee and opponent rows; a composition
+line logs it), then fits for several epochs:
+
+- each row twice: the real copy (own task id; KL to its own phase's teacher;
+  value MSE to Monte Carlo returns) and the counterfactual copy (task ids of
+  the two phases swapped; KL to the OTHER teacher; no value loss: its return
+  is not valid). So the task id alone selects the behaviour on every state;
+  each teacher sees its own task id;
+- the KL is `_ppg_kl_penalty`, means only (`detach_spread`), with the kick and
+  move sub-heads weighted by the TEACHER's probabilities
+  (`soft_action_weights`), so power and aim are learned where the teacher
+  would kick (the PPO masks use the student's sampled actions, which would
+  never teach a non-shooting student to shoot hard).
+
+Per cycle it logs the KL and the readable agreement (`_distill_agreement`)
+per (task-id phase, real / counterfactual) group, before and after the fit,
+and saves `checkpoint_pretrained.pt`. A student only matches its teachers;
+beating them needs PPO afterwards (with `curriculum.distill` on).
+
+Teacher Bernoulli targets are label-smoothed (`label_smoothing`, 1e-5: p' =
+(1-eps) p + eps/2, target logits capped at ~+-11.5) so saturated teacher heads
+(763's kick logits ~-20) do not leave the student with heads PPO cannot move.
+
+**Fixed with it: NaN gradient in `_ppg_kl_penalty`'s target-categorical KL.**
+torch's Categorical KL on -inf-masked logits (absent player slots) is right in
+the forward pass but NaN in the backward (0 x inf). Never hit before because
+the pass / tackle / mark target heads are frozen in phases 1 and 2 (that KL is
+skipped); a trainer with every head trainable plus any KL anchor hit it. Now
+computed directly from log_softmax with a finite fill
+(`tests/ai_unit/test_ppg_cat_kl_masked.py`). Would have hit PPG and
+distillation as soon as a passing / tackling phase unfreezes those heads.
+
 ## Per-phase teacher distillation (`ai/ppo/distill.py`, 2026-11-16)
 
 Against forgetting one phase while training another. Measured: phase-2-only
