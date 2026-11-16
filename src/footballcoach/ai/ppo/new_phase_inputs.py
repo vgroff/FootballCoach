@@ -1,20 +1,31 @@
-"""Prepare a trained checkpoint's input layers for phases it has never seen.
+"""Prepare a trained checkpoint's input layers for inputs it has never been
+trained on, so switching them on changes nothing at first.
 
-An input feature that was always 0 during training never gets a gradient, so
-the first-layer weights reading it stay at their random initial values.
-Measured on phase1_run321 (checkpoint1 vs checkpoint763): the task_id_1 and
-is_goalkeeper columns are bit-identical across the whole run, with norms at
-the median random-init column norm (e.g. global_mlp: task_id_1 0.61 vs median
-0.61), while the trained task_id_0 column has norm 3.65. A phase-2 observation
-(task_id_1 = 1, task_id_0 = 0) would therefore lose task_id_0's trained
-contribution and gain a random one, and a keeper's flag would add random noise.
+Two cases, both fixed by zeroing the first-layer weight columns that read the
+input, on every network:
 
-init_new_phase_inputs() fixes both, in place, on every network:
-- copies the source phase's task-id column into each new phase's column, so a
-  new phase's observations are first processed exactly like the source
-  phase's (the columns then diverge through training);
-- zeroes the named player-feature columns (e.g. is_goalkeeper), so the flag
-  starts with no effect.
+- Task ids. Until 2026-11-16 the rows PPO trains on never carried a task id
+  (NeuralPlayerAI encoded its observation without a phase; see ai_config
+  observation.task_id_in_rollouts), so a PPO-trained checkpoint plays at
+  "all task ids 0". Its task-id columns are not neutral, though: measured on
+  phase1_run321/latest (1240 phase-1 decisions), setting task_id_0 = 1 moves
+  the kick logit by 3.8 on average (max 24) and the move logit by 1.3 (max
+  8.8); pre-training, which encodes the env's own observation, did set it.
+  Zeroing the columns of every phase that will now be switched on makes
+  "task id = 1" add exactly nothing, so the checkpoint plays as it did.
+- Player flags that were always 0 in training (e.g. is_goalkeeper before any
+  goalkeeper role), whose columns are still at random init.
+
+A zeroed column is not inert for learning: its gradient is the upstream
+gradient times the input, and the input is 1 on the rows that set it. Only
+the forward contribution starts at zero (tests/ai_scenario/
+test_new_phase_inputs.py runs one optimizer step to show the column moves).
+Within a single-phase run a task id is constant and acts like an extra bias;
+it becomes a phase switch once phases are mixed.
+
+(An earlier version, 2026-11-15, copied task_id_0's column into the new
+phase's column instead. That reproduced "task_id_0 = 1", which is not how
+the checkpoint plays, so it was replaced.)
 
 The physics encoders read only specific global fields (pitch size,
 restitution, time), never the task ids, so they need nothing here. Layers are
@@ -54,17 +65,18 @@ def _layers(net, suffixes) -> list[tuple[str, torch.nn.Parameter]]:
     return out
 
 
-def init_new_phase_inputs(trainer, *, from_phase: int, to_phases, zero_player_features=()) -> list[dict]:
-    """See the module docstring. Returns one report row per column touched:
-    {network, layer, column, action, norm_before, norm_after}; ``layer`` is
-    the name without wrapper prefixes."""
+def init_new_phase_inputs(trainer, *, task_phases=(), zero_player_features=()) -> list[dict]:
+    """Zero, in place, the task-id columns of ``task_phases`` (1-based phase
+    ids) and the named player-feature columns, on every network. Returns one
+    report row per column touched: {network, layer, column, action,
+    norm_before, norm_after}; ``layer`` is the name without wrapper prefixes.
+    Sets ``trainer.task_id_inputs_ready`` when task phases were given."""
     g_names = [f.name for f in dataclasses.fields(GlobalFeatures)]
     p_names = [f.name for f in dataclasses.fields(PlayerFeatures)]
-    for pid in (from_phase, *to_phases):
+    for pid in task_phases:
         if not 1 <= pid <= MAX_TASK_IDS:
             raise ValueError(f"phase {pid} has no task-id slot (1..{MAX_TASK_IDS})")
-    src = g_names.index(f"task_id_{from_phase - 1}")
-    dsts = [g_names.index(f"task_id_{p - 1}") for p in to_phases if p != from_phase]
+    task_cols = sorted({g_names.index(f"task_id_{p - 1}") for p in task_phases})
     zero_cols = [p_names.index(n) for n in zero_player_features]
     report: list[dict] = []
     found_global = found_player = 0
@@ -74,11 +86,11 @@ def init_new_phase_inputs(trainer, *, from_phase: int, to_phases, zero_player_fe
                 if w.shape[1] != GLOBAL_FEATURE_DIM:
                     raise ValueError(f"{net_name}.{layer}: {w.shape[1]} inputs, expected {GLOBAL_FEATURE_DIM}")
                 found_global += 1
-                for d in dsts:
-                    before = float(w[:, d].norm())
-                    w[:, d] = w[:, src]
-                    report.append(dict(network=net_name, layer=layer, column=g_names[d], action=f"copy {g_names[src]}",
-                                       norm_before=before, norm_after=float(w[:, d].norm())))
+                for c in task_cols:
+                    before = float(w[:, c].norm())
+                    w[:, c] = 0.0
+                    report.append(dict(network=net_name, layer=layer, column=g_names[c], action="zero",
+                                       norm_before=before, norm_after=0.0))
             for layer, w in _layers(net, PLAYER_INPUT_LAYERS):
                 if w.shape[1] < PLAYER_FEATURE_DIM:
                     raise ValueError(f"{net_name}.{layer}: {w.shape[1]} inputs, fewer than {PLAYER_FEATURE_DIM} player features")
@@ -88,6 +100,8 @@ def init_new_phase_inputs(trainer, *, from_phase: int, to_phases, zero_player_fe
                     w[:, c] = 0.0
                     report.append(dict(network=net_name, layer=layer, column=p_names[c], action="zero",
                                        norm_before=before, norm_after=0.0))
-    if found_global == 0 or (zero_cols and found_player == 0):
+    if (task_cols and found_global == 0) or (zero_cols and found_player == 0):
         raise ValueError("no input layers found (network layout changed? update GLOBAL/PLAYER_INPUT_LAYERS)")
+    if task_cols:
+        trainer.task_id_inputs_ready = True
     return report

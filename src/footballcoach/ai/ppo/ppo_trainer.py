@@ -507,6 +507,12 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
         # curriculum.training_phase_mix). None = only train()'s phase_id.
         # A mix of more than that one phase needs the batched rollout path.
         self.phase_mix: Optional[dict[int, float]] = None
+        # Whether these weights may train on rows that carry task ids (ai_config
+        # observation.task_id_in_rollouts). True for fresh weights; load_checkpoint
+        # sets it from the checkpoint, where only weights saved after
+        # init_new_phase_inputs (ai/ppo/new_phase_inputs.py) or trained with task
+        # ids on carry it. See _check_task_id_inputs.
+        self.task_id_inputs_ready: bool = True
         # (phase name, eval spec name) -> cached result of a rules-only role-phase eval.
         self._role_eval_cache: dict = {}
         # Opt-in, only meaningful alongside batched_rollout=True: also
@@ -1038,6 +1044,24 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
     # Main training entry point
     # -----------------------------------------------------------------------
 
+    def _check_task_id_inputs(self) -> None:
+        """Refuse to train on task-id rows with weights that were trained
+        without them: their task-id columns are not neutral (see
+        ai/ppo/new_phase_inputs.py), so switching the ids on would silently
+        change how the checkpoint plays."""
+        from footballcoach.ai.config import load_ai_config
+        if not load_ai_config()["observation"].get("task_id_in_rollouts", False):
+            # Training on all-zero task ids from here on: the weights' task-id
+            # columns stop being neutral, and the checkpoints saved say so.
+            self.task_id_inputs_ready = False
+            return
+        if not self.task_id_inputs_ready:
+            raise RuntimeError(
+                "observation.task_id_in_rollouts is on but these weights were trained without task ids; "
+                "zero their task-id inputs once first (train.py --init-new-phase-inputs, "
+                "ai/ppo/new_phase_inputs.py)"
+            )
+
     def train(self, env, total_steps: int, bc_label_fn=None, phase_id: Optional[int] = None) -> None:
         """Run PPO for ``total_steps`` decision-interval steps.
 
@@ -1067,6 +1091,7 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 own env from this id via ``curriculum.envs.build_env``). See
                 ai/ppo/rollout_worker.py.
         """
+        self._check_task_id_inputs()
         _mixed = self.phase_mix is not None and set(self.phase_mix) != {phase_id}
         if _mixed and not (self.n_processes > 1 and self.batched_rollout):
             raise NotImplementedError(

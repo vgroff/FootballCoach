@@ -48,7 +48,8 @@ entry plus (at most) a new outcome classifier.
   `is_goalkeeper` is set, so a neural keeper needs no new action head.
 - Observations have room for 21 other players, an `is_goalkeeper` flag and a
   20-slot task-ID one-hot (`task_id_{phase-1}`), so a phase-1 checkpoint
-  loads into a phase-2 run unchanged.
+  loads into a phase-2 run unchanged. (Correction 2026-11-16: the training
+  rows never actually carried the task id; see Stage 5.)
 - Every training loop drains one neural "trainee" per env plus a list of
   neural "secondaries"; the batched worker requires the trainee to be
   neural. Phase 2 therefore picks the trainee per episode as the first
@@ -111,8 +112,8 @@ row share per phase is what to tune against.
 Load into a fresh run directory. The phase-2 task-ID column and the
 `is_goalkeeper` column were always 0 in phase 1, so their first-layer
 weights never got a gradient and are still at random init (verified in stage
-4). Opt-in `--init-new-phase-inputs`: copy the phase-1 task-ID column into
-phase 2's and zero `is_goalkeeper` (stage 4 changed this from zeroing).
+4). Opt-in `--init-new-phase-inputs`: zero the task-ID columns of every
+trained phase and `is_goalkeeper` (stage 5; the copy from stage 4 was wrong).
 The PPG value refit only sees the primary phase (see Open follow-ups).
 
 ## Stages
@@ -175,7 +176,15 @@ The PPG value refit only sees the primary phase (see Open follow-ups).
   because the measurement showed the trained task_id_0 column carries a large
   weight that phase-2 rows would otherwise lose (zeroing task_id_1 alone would
   still have shifted outputs). `train.py --init-new-phase-inputs`. Run recipe
-  in ai/knowledge.md; nothing trained.
+  in ai/knowledge.md; nothing trained. SUPERSEDED by stage 5: the
+  measurement used the env's own observations, not the training rows.
+- [x] Stage 5 (2026-11-16): found that NeuralPlayerAI never encoded the task
+  id, so training rows had all task ids 0 in every phase. Opt-in
+  `observation.task_id_in_rollouts` puts the env's phase in every neural
+  player's observation; `--init-new-phase-inputs` now ZEROES the task-id
+  columns of all trained phases (checkpoint 763 then plays bit-identically
+  with task ids on); checkpoints carry `task_id_inputs_ready` and the
+  trainer refuses unprepared weights. See ai/knowledge.md "Task-id".
 
 ## Open follow-ups
 
@@ -186,3 +195,11 @@ The PPG value refit only sees the primary phase (see Open follow-ups).
 - Unfreezing tackle / pass / mark heads for a phase needs per-row head masks.
 - The UI cannot yet show role-based terminal payouts (ScenarioLoop's payout
   display is phase-1 only).
+- The UI's own neural players (ui/app.py, the UI checkpoint-picker scenario)
+  pass no task_phase, so with task ids on they play at "all task ids 0"
+  while training uses the phase's id.
+- Untested side finding: NeuralPlayerAI's time_remaining uses
+  `_episode_ticks / 30.0` while the env uses `_episode_ticks * dt` (0.04 s
+  in training), so the rows' time-remaining input and the bootstrap's
+  disagree. Rows and evals agree with each other, so behaviour is consistent;
+  only the boundary bootstrap differs.

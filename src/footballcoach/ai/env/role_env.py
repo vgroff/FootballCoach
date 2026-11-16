@@ -25,6 +25,7 @@ from typing import Callable, Optional
 
 from footballcoach.ai.env.reward import EMAFilter, terminal_outcome_reward, validate_terminal_reward_table
 from footballcoach.ai.env.scenario_env import ScenarioEnv, StepInfo
+from footballcoach.ai.obs.encoder import rollout_task_phase
 from footballcoach.ai.obs.schema import ObservationBatch
 from footballcoach.engine.match import Match
 from footballcoach.ui.scenarios import ScenarioDefinition, ScenarioLoop
@@ -187,6 +188,7 @@ class RoleScenarioEnv(ScenarioEnv):
                 ema_smoothed=ema.smoothed,
                 rng=self.rng,
                 bc_label_fn=self.bc_label_fn if pid == self.trainee_player_id else None,
+                task_phase=rollout_task_phase(self.phase),
             )
             # The scenario's scripted opening order belongs to the rules AI.
             player.current_order = None

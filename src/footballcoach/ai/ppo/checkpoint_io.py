@@ -116,6 +116,7 @@ class CheckpointIOMixin:
             "checkpoint_count": self._checkpoint_count,
             "decision_net": self.decision_net.state_dict(),
             "execution_net": self.execution_net.state_dict(),
+            "task_id_inputs_ready": bool(getattr(self, "task_id_inputs_ready", True)),
             "optimizer": self.optimizer.state_dict(),
         }
         if self.value_net is not None:
@@ -152,6 +153,7 @@ class CheckpointIOMixin:
             "step": self._total_steps,
             "decision_net": self.decision_net.state_dict(),
             "execution_net": self.execution_net.state_dict(),
+            "task_id_inputs_ready": bool(getattr(self, "task_id_inputs_ready", True)),
         }
         if self.optimizer is not None:
             ckpt["optimizer"] = self.optimizer.state_dict()
@@ -227,6 +229,10 @@ class CheckpointIOMixin:
                     "(network weights still loaded normally)."
                 )
         self._total_steps = ckpt["step"]
+        # Absent = saved before task ids reached the training rows (2026-11-16):
+        # those weights were trained at "all task ids 0". See
+        # ai/ppo/new_phase_inputs.py and PPOTrainer._check_task_id_inputs.
+        self.task_id_inputs_ready = bool(ckpt.get("task_id_inputs_ready", False))
         # checkpoint{N}.pt / training_log{N}.txt numbering is driven ENTIRELY by
         # what's physically on disk in THIS checkpoint_dir -- never by the loaded
         # checkpoint's own embedded "checkpoint_count" field. Two real incidents

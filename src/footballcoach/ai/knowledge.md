@@ -1393,19 +1393,37 @@ Key test files:
 - `test_reward.py` – per-component arithmetic, EMA latency, convergence
 - `test_networks.py` – forward pass shapes, no-NaN, get_possession constraint
 
-## Task-id (GlobalFeatures): scaffolded, not yet load-bearing
+## Task-id (GlobalFeatures): in the training rows only when switched on
 
 `GlobalFeatures` has a `MAX_TASK_IDS`-wide (20) one-hot field
-(`task_id_0`..`task_id_19`) identifying the active curriculum phase/task.
-It is correctly populated by `encode_observation(..., phase=N)` (1-based;
-phase 1 → index 0) via `ScenarioEnv._get_obs()`/`_encode_obs_for_player()`,
-which pass `self.phase` through automatically. `phase=None` or an
-out-of-range value yields an all-zero one-hot (no error).
+(`task_id_0`..`task_id_19`) identifying the active curriculum phase/task,
+set by `encode_observation(..., phase=N)` (1-based; phase 1 → index 0).
+`phase=None` or an out-of-range value yields an all-zero one-hot (no error).
 
-Until phases are mixed within one run (planned:
-`agent_plans/phase2_1v2_plan.md`, stage 2) every row of a run has the same
-pattern, so any gradient through it is uninformative. Role-based envs pass
-their own phase id, so phase 2 rows set `task_id_1`.
+**Bug found 2026-11-16: the rows PPO trains on never carried it.** They come
+from `NeuralPlayerAI`'s own encoder call, which passed no phase, so every
+training row (and every eval/UI decision) had all task ids 0, in phase 1 and
+phase 2 alike. Only the env's own observation (`ScenarioEnv._get_obs()`) set
+the phase, and that is used for the value bootstrap at rollout-window
+boundaries and by pre-training. Consequences: the critic was bootstrapped on
+an input it never trained on (on phase1_run321/latest the value moves by
+0.11 mean, 1.9 max, against a value spread of 1.6), and mixed phases looked
+alike to the network apart from the scene itself. The task_id_0 weights were
+still trained (by pre-training, presumably), so they are not neutral: on
+1240 phase-1 decisions, setting task_id_0 = 1 moves the kick logit by 3.8
+mean (24 max) and the move logit by 1.3 (8.8 max).
+
+**Fix, opt-in: `observation.task_id_in_rollouts`** (default false = exactly
+the old behaviour). When true, every neural player in a training or eval env
+encodes its env's phase (`NeuralPlayerAI(task_phase=...)`, from
+`obs.encoder.rollout_task_phase(env.phase)`), so rows, bootstrap and evals
+agree. A checkpoint trained without task ids must first have its task-id
+input weights zeroed (`--init-new-phase-inputs`, below) so it plays exactly
+as before; checkpoints record `task_id_inputs_ready`, and
+`PPOTrainer._check_task_id_inputs` refuses to train unprepared weights with
+the switch on (training with it off marks the weights unprepared again). The
+UI's own neural players (ui/app.py, the checkpoint-picker scenario) still
+encode no task id; see the phase-2 plan's open follow-ups.
 
 ## Curriculum phases
 
@@ -1516,23 +1534,28 @@ every role-based phase in the mix after the phase-1 evals, on the fixed seeds
 (`[eval phase2_1v2/attacker_vs_rules] ...`). Rules-only specs are cached
 (they never change). `ai/eval/role_phase_eval.py`.
 
-**Starting from a phase-1 checkpoint: `--init-new-phase-inputs`.** An input
-that was always 0 in training never gets a gradient, so its first-layer
-weights stay at random init. Measured on phase1_run321 (checkpoint1 vs 763,
-bit-identical columns): `task_id_1` and `is_goalkeeper` columns at random-init
-norm, while the trained `task_id_0` column has norm 3.65 in `global_mlp`.
-Relabelling the same 1v1 states from phase 1 to phase 2 shifted checkpoint
-763's outputs by mean |move_logit| 2.36, |kick_logit| 4.62, |value| 0.42;
-after the fix, exactly 0 (equal up to float rounding). The keeper's random
-`is_goalkeeper` weights moved its own kick logit by 5.2. The fix
-(`ai/ppo/new_phase_inputs.py`) copies the source phase's task-id column into
-each new phase's and zeroes `is_goalkeeper`, in the explicitly named input
-layers of every network (not by shape: `execution_net.value_head.1` has the
-same width as `self_mlp.0`). Use once, when a run first adds a phase. The
-physics encoders never read the task ids.
+**Starting from an existing checkpoint: `--init-new-phase-inputs`.**
+Zeroes, on every network, the first-layer weight columns reading the task id
+of every phase the run trains (`--phase`, or the whole phase mix) and, if a
+phase has a goalkeeper role, `is_goalkeeper` (always 0 in phase 1, so still
+at random init: on phase1_run321 its columns are bit-identical between
+checkpoint1 and 763, and the keeper's random flag weights moved its own kick
+logit by 5.2). With task ids zeroed a task id of 1 adds exactly nothing:
+checkpoint 763 gives bit-identical outputs with and without them, in both
+phases, and identical to the untouched checkpoint on phase-1 rows (on
+phase-2 rows the only change is the removed keeper-flag noise, max 2.07). A
+zeroed column still learns: its gradient is the upstream gradient times the
+input, which is 1 on that phase's rows (a test runs one optimizer step and
+the column moves). Layers are named explicitly, not found by shape
+(`execution_net.value_head.1` has the same width as `self_mlp.0`); the
+physics encoders never read the task ids. Use once, when a run first turns
+task ids on or adds a phase. (The first version, 2026-11-15, copied
+task_id_0's column into the new phase's instead; that reproduced
+"task_id_0 = 1", which is not how the checkpoint plays, and was replaced.)
 
-Recipe (not yet run): set `curriculum.phase2.controllers` to attacker and
-defender `{"neural": 1}`, goalkeeper `{"rules": 1}`, then
+Recipe (not yet run): set `observation.task_id_in_rollouts` to true and
+`curriculum.phase2.controllers` to attacker and defender `{"neural": 1}`,
+goalkeeper `{"rules": 1}`, then
 `uv run python -m footballcoach.ai.scripts.train --phase 1 --phase-mix 1:3,2:1
 --checkpoint checkpoints/phase1_run321/checkpoint763.pt --init-new-phase-inputs`
 (writes to a fresh `phase1_run{next}` dir). Expect phase-2 value error to be

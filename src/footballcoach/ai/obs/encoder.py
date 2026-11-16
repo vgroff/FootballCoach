@@ -431,6 +431,15 @@ def _global_features(
     return feat.to_array()
 
 
+def rollout_task_phase(phase: Optional[int]) -> Optional[int]:
+    """The phase a neural player's own observation encodes in a training or
+    eval env: ``phase`` when ai_config observation.task_id_in_rollouts is on,
+    else None (all task ids 0, the pre-2026-11-16 behaviour). See that
+    config key's comment."""
+    from footballcoach.ai.config import load_ai_config
+    return phase if load_ai_config()["observation"].get("task_id_in_rollouts", False) else None
+
+
 def _task_id_one_hot_kwargs(phase: Optional[int]) -> dict:
     """Build the ``task_id_N`` one-hot kwargs for GlobalFeatures.
 

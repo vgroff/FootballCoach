@@ -123,6 +123,7 @@ def _build_neural_vs_neural_env_factory(max_episode_s: float, opponent_sample_ac
     class _NeuralOpponentEnv(ScenarioEnv):
         def reset(self, *, seed: Optional[int] = None):
             obs = super().reset(seed=seed)
+            from footballcoach.ai.obs.encoder import rollout_task_phase
             from footballcoach.rules_ai import NeuralPlayerAI
             match = self._loop.match
             opponent = match.player_by_id_or_none("opponent")
@@ -134,6 +135,7 @@ def _build_neural_vs_neural_env_factory(max_episode_s: float, opponent_sample_ac
                 max_episode_s=self.max_episode_s,
                 ema_smoothed=self._sec_ema["opponent"].smoothed,
                 rng=self.rng,
+                task_phase=rollout_task_phase(self.phase),
             )
             return obs
 

@@ -910,8 +910,14 @@ class NeuralPlayerAI(PlayerAI):
         rng=None,
         bc_label_fn=None,
         kick_one_shot: bool | None = None,
+        task_phase: int | None = None,
     ) -> None:
         self.sample_action_fn = sample_action_fn
+        # Curriculum phase whose task-id one-hot this player's observations
+        # carry (None = all task ids 0). Training/eval envs pass
+        # ai.obs.encoder.rollout_task_phase(env.phase); see ai_config
+        # observation.task_id_in_rollouts.
+        self.task_phase = task_phase
         # One decision = at most one kick (config action.kick_one_shot; None =
         # read it). Without it the cached action is re-applied every tick of
         # the decision interval, so a kick decided while in possession
@@ -1074,6 +1080,7 @@ class NeuralPlayerAI(PlayerAI):
             time_remaining_s=time_remaining,
             attack_defence_smoothed=self.ema_smoothed,
             rng=self._rng,
+            phase=self.task_phase,
         )
         obs_dict = obs.to_torch_dict()
 
@@ -1225,6 +1232,7 @@ def maybe_assign_neural_opponent(
     ema_smoothed: float = 0.0,
     rng=None,
     bc_label_fn=None,
+    task_phase: int | None = None,
 ) -> bool:
     """Assign ``NeuralPlayerAI`` to ``player_id`` IFF the match's own
     opponent-type roll (``build_1v1_scenario``'s ``_opponent_use_rules_ai``/
@@ -1272,6 +1280,7 @@ def maybe_assign_neural_opponent(
         ema_smoothed=ema_smoothed,
         rng=rng,
         bc_label_fn=bc_label_fn,
+        task_phase=task_phase,
     )
     return True
 
@@ -1443,6 +1452,7 @@ class HybridPlayerAI(NeuralPlayerAI):
             time_remaining_s=time_remaining,
             attack_defence_smoothed=self.ema_smoothed,
             rng=self._rng,
+            phase=self.task_phase,
         )
         obs_dict = obs.to_torch_dict()
 
