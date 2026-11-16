@@ -77,6 +77,14 @@ class RolloutLoggingMixin:
             _top = sorted(_dv["by_head"].items(), key=lambda kv: -abs(kv[1]))[:4]
             bc_lines.append(f"  distill [{_ph}] kl={_dv['kl']:.4f} x{_dv['coeff']:.2f}  ("
                             + "  ".join(f"{h} {v:.4f}" for h, v in _top) + ")")
+            _da = _dv.get("agree")
+            if _da:
+                # The same, readable (ppo_update._distill_agreement).
+                bc_lines.append(
+                    f"  distill agree [{_ph}] move_dir err={_da['move_dir_err_deg']:.1f}deg  "
+                    f"P(kick) student/teacher={_da['p_kick_student']:.3f}/{_da['p_kick_teacher']:.3f}  "
+                    f"|power diff|={_da['power_diff']:.3f}  exec_move agree={100 * _da['exec_move_agree']:.1f}%  "
+                    f"sprint agree={100 * _da['sprint_agree']:.1f}%")
         _p = metrics.get("bc_pull") or {}
         if _p:
             # How hard BC pulls on the shared weights (ppo_update._measure_bc_pull):

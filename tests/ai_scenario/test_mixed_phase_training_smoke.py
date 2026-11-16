@@ -147,6 +147,7 @@ def test_one_mixed_cycle_with_phase1_distillation(mixed_config, monkeypatch, tmp
     with caplog.at_level(logging.INFO, logger="footballcoach"):
         trainer.train(None, total_steps=500, phase_id=1)
     assert "distill [phase1_get_possession] kl=" in caplog.text
+    assert "distill agree [phase1_get_possession] move_dir err=" in caplog.text
 
 
 def test_ppg_over_a_mix_refuses_the_single_process_path(mixed_config, monkeypatch):

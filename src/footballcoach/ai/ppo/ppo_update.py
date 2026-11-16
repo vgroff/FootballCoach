@@ -40,6 +40,39 @@ from footballcoach.ai.ppo.ppo_update_diagnostics import (  # noqa: F401  (trimme
 # floor, so only the NaN changes. Below the cap the result is bit-identical.
 _MAX_LOG_RATIO = 80.0
 
+# _distill_agreement's fields, in order.
+_DISTILL_AGREE_KEYS = ("move_dir_err_deg", "p_kick_student", "p_kick_teacher", "power_diff",
+                       "exec_move_agree", "sprint_agree")
+
+
+def _distill_agreement(e_heads, anchor: dict, rows: torch.Tensor, mb_actions: dict) -> list:
+    """How close the student is to its distillation teacher over the boolean
+    ``rows`` (no grad), in readable units: the mean angle (deg) between the two
+    move-direction means on rows where the student moved; mean P(kick) of the
+    student and of the teacher; mean |power fraction difference| on rows where
+    the student kicked; agreement rates of the exec_move / sprint decisions
+    (p > 0.5). NaN for a field with no rows."""
+    from footballcoach.ai.ppo.bc import _kick_power_physical
+    nan = float("nan")
+    with torch.no_grad():
+        moved = rows & (mb_actions["exec_move"].reshape(-1) > 0.5)
+        kicked = rows & (mb_actions["kick"].reshape(-1) > 0.5)
+        out = []
+        if moved.any():
+            s, t = F.normalize(e_heads.move_direction[moved], dim=-1), F.normalize(anchor["move_direction"][moved], dim=-1)
+            out.append(float(torch.rad2deg(torch.acos((s * t).sum(dim=-1).clamp(-1.0, 1.0))).mean()))
+        else:
+            out.append(nan)
+        out.append(float(torch.sigmoid(e_heads.kick_logit[rows]).mean()))
+        out.append(float(torch.sigmoid(anchor["kick_logit"][rows]).mean()))
+        out.append(float((_kick_power_physical(e_heads.kick_power[kicked].reshape(-1))
+                          - _kick_power_physical(anchor["kick_power"][kicked].reshape(-1))).abs().mean())
+                   if kicked.any() else nan)
+        for key in ("exec_move_logit", "sprint_logit"):
+            out.append(float(((getattr(e_heads, key)[rows] > 0) == (anchor[key][rows] > 0)).float().mean()))
+        return out
+
+
 # _kick_agreement's fields, in order.
 _AGREE_KEYS = ("label_kick_rate", "p_kick_label_kick", "p_kick_label_no_kick", "power_err", "kick_dir_err_deg")
 
@@ -191,6 +224,8 @@ class _UpdateStats:
     # phase id -> per-minibatch (mean KL to the teacher, {head: KL}) over that
     # phase's rows (_ppo_distill_loss).
     distill_by_phase: dict = dataclasses.field(default_factory=dict)
+    # phase id -> per-minibatch _distill_agreement rows.
+    distill_agree_by_phase: dict = dataclasses.field(default_factory=dict)
     epoch_sample_policy_loss: list = dataclasses.field(default_factory=list)
     epoch_sample_value_loss: list = dataclasses.field(default_factory=list)
     epoch_sample_surrogate: list = dataclasses.field(default_factory=list)  # unclipped (r-1)*A per row
@@ -1244,6 +1279,8 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
             with torch.no_grad():
                 stats.distill_by_phase.setdefault(term["phase_id"], []).append(
                     (float(kl), {k: float(v) for k, v in per_head.items()}))
+                stats.distill_agree_by_phase.setdefault(term["phase_id"], []).append(
+                    _distill_agreement(e_heads, anchor, rows, mb_actions))
         return total
 
     @staticmethod
@@ -1260,6 +1297,12 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
                 "coeff": coeffs[pid], "kl": float(np.mean([v[0] for v in vals])),
                 "by_head": {h: float(np.mean([v[1][h] for v in vals])) for h in heads},
             }
+            agree = stats.distill_agree_by_phase.get(pid)
+            if agree:
+                with warnings.catch_warnings():
+                    warnings.simplefilter("ignore", RuntimeWarning)   # all-NaN columns
+                    out[PHASES_BY_ID[pid].name]["agree"] = dict(
+                        zip(_DISTILL_AGREE_KEYS, np.nanmean(np.asarray(agree), axis=0).tolist()))
         return out
 
     @staticmethod

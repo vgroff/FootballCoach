@@ -128,6 +128,23 @@ def test_zero_against_itself_positive_once_the_student_moves(trainer, tmp_path):
     assert kl == pytest.approx(float(loss)) and by_head["kick"] > 0.0
 
 
+def test_agreement_is_exact_against_itself_and_not_after_a_move(trainer, tmp_path):
+    from footballcoach.ai.ppo.ppo_update import _DISTILL_AGREE_KEYS
+    b, actions = _batch(trainer)
+    nets = _teacher_of(trainer, tmp_path)
+    _, stats = _loss(trainer, nets, b, actions)
+    same = dict(zip(_DISTILL_AGREE_KEYS, stats.distill_agree_by_phase[1][0]))
+    assert same["move_dir_err_deg"] == pytest.approx(0.0, abs=0.05)
+    assert same["p_kick_student"] == pytest.approx(same["p_kick_teacher"], abs=1e-6)
+    assert same["power_diff"] == pytest.approx(0.0, abs=1e-6)
+    assert same["exec_move_agree"] == 1.0 and same["sprint_agree"] == 1.0
+    _perturb_means(trainer, scale=0.2)
+    _, stats = _loss(trainer, nets, b, actions)
+    moved = dict(zip(_DISTILL_AGREE_KEYS, stats.distill_agree_by_phase[1][0]))
+    assert moved["move_dir_err_deg"] > 0.1 and moved["power_diff"] > 1e-4
+    assert moved["p_kick_student"] != pytest.approx(moved["p_kick_teacher"], abs=1e-4)
+
+
 def test_only_the_distilled_phase_rows_count(trainer, tmp_path):
     b, actions = _batch(trainer)
     nets = _teacher_of(trainer, tmp_path)
