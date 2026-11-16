@@ -7,8 +7,12 @@ damage afterwards. Now a kicking order records a ``KickIntent`` on
 ``player.pending_kick`` and ``Match._process_orders`` applies it immediately
 after that player's ``execute()`` returns -- the same point in the tick, and the
 same per-player order, as the old in-``execute()`` kick, so play is unchanged.
-A counterfactual ``execute()`` (ai/ppo/bc.py) can then read the intent without
-the ball being touched.
+
+A BC label's counterfactual ``execute()`` (ai/ppo/bc.py) reads the intent
+instead: ``plan_kick_intent`` runs the SAME kick functions with
+``release=False``, which return the planned launch (direction, speed, error
+size) without drawing the random error, touching the ball or doing the kick
+bookkeeping, and ``kick_label_fields`` turns that into the kick heads' targets.
 
 Kinds, one per kicking order, each applied exactly as that order used to kick:
 
@@ -28,8 +32,10 @@ from dataclasses import dataclass
 from typing import TYPE_CHECKING, Optional
 
 from footballcoach.mathutils import Vector3
+from footballcoach.mathutils.tolerances import GEOM_ZERO_EPS
 
 if TYPE_CHECKING:
+    from footballcoach.engine.kicking import KickPlan
     from footballcoach.engine.match import Match
     from footballcoach.entities.player import Player
 
@@ -46,16 +52,17 @@ class KickIntent:
     log_msg: str = ""                          # logged when applied, as the order used to
 
 
-def apply_kick_intent(player: "Player", match: "Match", intent: KickIntent) -> None:
-    """Carry out ``intent`` exactly as its order's ``execute()`` used to."""
+def _carry_out(player: "Player", match: "Match", intent: KickIntent, release: bool) -> "Optional[KickPlan]":
+    """The kick, through the same function its order always used. With
+    ``release=False`` that function returns its KickPlan instead of launching
+    (None when the player cannot kick, exactly when a real kick would not
+    happen)."""
     if intent.kind == "direction":
-        player.kick_with_direction(match, intent.direction_3d, intent.power_fraction, intent.spin)
-        if intent.log_msg:
-            match._log_debug(intent.log_msg)
-        return
+        return player.kick_with_direction(match, intent.direction_3d, intent.power_fraction, intent.spin,
+                                          release=release)
     if intent.kind == "aim":
-        player.kick_direct(match, intent.aim_point, intent.power_fraction, intent.spin, intent.compensate_for_run)
-        return
+        return player.kick_direct(match, intent.aim_point, intent.power_fraction, intent.spin,
+                                  intent.compensate_for_run, release=release)
     from footballcoach.engine.movement import effective_top_speed
 
     top_speed = effective_top_speed(
@@ -65,7 +72,7 @@ def apply_kick_intent(player: "Player", match: "Match", intent: KickIntent) -> N
     if intent.kind == "shot":
         from footballcoach.engine.kicking import kick_ball
 
-        kick_ball(
+        return kick_ball(
             match.ball,
             player.position,
             intent.aim_point,
@@ -78,11 +85,12 @@ def apply_kick_intent(player: "Player", match: "Match", intent: KickIntent) -> N
             match.kicking_params,
             kicker_velocity=player.velocity,
             kicker_top_speed_mps=top_speed,
+            release=release,
         )
-    elif intent.kind == "pass":
+    if intent.kind == "pass":
         from footballcoach.engine.kicking import pass_ball
 
-        pass_ball(
+        return pass_ball(
             match.ball,
             player.position,
             intent.aim_point,
@@ -99,9 +107,20 @@ def apply_kick_intent(player: "Player", match: "Match", intent: KickIntent) -> N
             kick_power_attr=player.attributes.kick_power,
             kicking_params=match.kicking_params,
             power_multiplier=intent.power_multiplier,
+            release=release,
         )
-    else:
-        raise ValueError(f"unknown kick intent kind {intent.kind!r}")
+    raise ValueError(f"unknown kick intent kind {intent.kind!r}")
+
+
+def apply_kick_intent(player: "Player", match: "Match", intent: KickIntent) -> None:
+    """Carry out ``intent`` exactly as its order's ``execute()`` used to."""
+    _carry_out(player, match, intent, release=True)
+    if intent.kind in ("direction", "aim"):
+        # The player's own kick methods log and fire on_kick themselves
+        # (Player._finish_kick); push-kicks also logged their own line.
+        if intent.kind == "direction" and intent.log_msg:
+            match._log_debug(intent.log_msg)
+        return
     if intent.log_msg:
         if intent.kind == "shot":
             match._log_info(intent.log_msg)
@@ -109,3 +128,42 @@ def apply_kick_intent(player: "Player", match: "Match", intent: KickIntent) -> N
             match._log_debug(intent.log_msg)
     if player.on_kick is not None:
         player.on_kick(player)
+
+
+def plan_kick_intent(player: "Player", match: "Match", intent: KickIntent) -> "Optional[KickPlan]":
+    """The launch ``intent`` would produce now, before its random error, with
+    nothing launched or recorded; None if the kick would not happen."""
+    return _carry_out(player, match, intent, release=False)
+
+
+def kick_label_fields(player: "Player", match: "Match", intent: KickIntent) -> Optional[dict]:
+    """The kick heads' BC targets for ``intent``: {direction (unit 3-D launch
+    direction, before the random error), power_fraction, spin}, or None if the
+    kick would not happen.
+
+    Power is in the neural kick head's own units: the fraction a
+    ``kick_with_direction(direction, power, compensate_for_run=False)`` call
+    (what the network's kick does) needs to launch at the planned speed, i.e.
+    speed / (max kick speed x running multiplier along that direction). For a
+    push-kick that is its own power fraction exactly, which is used as is."""
+    plan = plan_kick_intent(player, match, intent)
+    if plan is None:
+        return None
+    direction = plan.direction
+    if intent.kind == "direction":
+        power = float(intent.power_fraction)
+    else:
+        from footballcoach.engine.kicking import max_kick_speed_mps, running_power_multiplier
+        from footballcoach.engine.movement import effective_top_speed
+
+        top_speed = effective_top_speed(
+            match.movement_params, player.attributes.top_speed, player.stamina,
+            has_ball=True, ball_control_attr=player.attributes.ball_control,
+        )
+        run_mult = running_power_multiplier(
+            match.kicking_params.running_power_coefficient, player.velocity, direction, top_speed,
+        )
+        power = plan.speed / max(max_kick_speed_mps(match.kicking_params, player.attributes.kick_power) * run_mult,
+                                 GEOM_ZERO_EPS)
+    spin = intent.spin if intent.kind in ("direction", "aim") else Vector3.zero()
+    return {"direction": direction, "power_fraction": power, "spin": spin}

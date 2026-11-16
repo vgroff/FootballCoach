@@ -394,6 +394,24 @@ def _release_kick(
     ball.spin = spin
 
 
+@dataclass(frozen=True)
+class KickPlan:
+    """A kick as decided, before its random error: launch yaw/pitch (rad),
+    speed (m/s) and the error's sigma (rad). What every kick function computes
+    before ``_release_kick`` draws the noise and launches the ball; returned
+    instead of launching when called with ``release=False`` (BC labels read it,
+    see engine/kick_intent.py)."""
+    yaw: float
+    pitch: float
+    speed: float
+    sigma: float
+
+    @property
+    def direction(self) -> Vector3:
+        return Vector3(math.cos(self.pitch) * math.cos(self.yaw),
+                       math.cos(self.pitch) * math.sin(self.yaw), math.sin(self.pitch))
+
+
 def _launch_ball(
     ball: Ball,
     kicker_position: Vector3,
@@ -403,7 +421,8 @@ def _launch_ball(
     spin: Vector3,
     rng: random.Random,
     gravity_mps2: float,
-) -> None:
+    release: bool = True,
+) -> "KickPlan | None":
     """Shared aim-then-launch logic used by both `kick_ball` and
     `pass_ball`: solves the ballistic angle to `aim_point` at the given
     `speed` (the part `kick_ball_from_direction` does NOT need -- it
@@ -414,7 +433,10 @@ def _launch_ball(
     horizontal_distance = delta.xy().length()
     yaw = delta.xy().angle_xy() if horizontal_distance > GEOM_ZERO_EPS else 0.0
     pitch = solve_launch_pitch_rad(horizontal_distance, delta.z, speed, gravity_mps2)
+    if not release:
+        return KickPlan(yaw, pitch, speed, sigma)
     _release_kick(ball, kicker_position, yaw, pitch, speed, sigma, spin, rng)
+    return None
 
 
 def _log_kick_debug(
@@ -472,8 +494,12 @@ def kick_ball(
     gravity_mps2: float = 9.81,
     kicker_velocity: Vector3 = Vector3.zero(),
     kicker_top_speed_mps: float = 0.0,
-) -> None:
-    """Applies a kick to `ball`, releasing it from possession and giving it
+    release: bool = True,
+) -> "KickPlan | None":
+    """``release=False``: return the KickPlan instead of launching (no rng
+    draw, ball untouched).
+
+    Applies a kick to `ball`, releasing it from possession and giving it
     a velocity/spin aimed at `aim_point` (an absolute world position), with
     the launch angle solved ballistically (see solve_launch_pitch_rad) so
     the ball actually reaches the intended height at the intended distance
@@ -506,7 +532,7 @@ def kick_ball(
         kick_precision, effective_precision, effective_power, sigma, speed, rng_reduction,
     )
 
-    _launch_ball(ball, kicker_position, aim_point, speed, sigma, spin, r, gravity_mps2)
+    return _launch_ball(ball, kicker_position, aim_point, speed, sigma, spin, r, gravity_mps2, release=release)
 
 
 def pass_ball(
@@ -526,8 +552,10 @@ def pass_ball(
     kick_power_attr: float = 0.5,
     kicking_params: "KickingParams | None" = None,
     power_multiplier: float = 1.0,
-) -> None:
+    release: bool = True,
+) -> "KickPlan | None":
     """Applies a grounded pass to `ball`, aimed at `target_position`.
+    ``release=False``: return the KickPlan instead of launching.
     Height component of target_position is ignored - passes travel along
     the ground.
 
@@ -587,7 +615,8 @@ def pass_ball(
     # spin-free and can't reproduce it; see agent_plans/physics_update.md
     # section 8 for the full history). Compensated instead via
     # pass_speed_mps's spinup_speed_boost -- see PassingParams.
-    _launch_ball(ball, kicker_position, aim_point, speed, sigma, Vector3.zero(), r, gravity_mps2)
+    return _launch_ball(ball, kicker_position, aim_point, speed, sigma, Vector3.zero(), r, gravity_mps2,
+                        release=release)
 
 def kick_ball_from_direction(
     ball: Ball,
@@ -603,7 +632,8 @@ def kick_ball_from_direction(
     difficulty_multiplier: float = 1.0,
     kicker_velocity: Vector3 = Vector3.zero(),
     kicker_top_speed_mps: float = 0.0,
-) -> None:
+    release: bool = True,
+) -> "KickPlan | None":
     """Apply a kick from a 3D unit direction vector directly — no ballistic solve.
 
     Used by the neural network (Player.kick_with_direction) and by
@@ -629,7 +659,10 @@ def kick_ball_from_direction(
     yaw = direction_unit3.xy().angle_xy() if horiz_len > GEOM_ZERO_EPS else 0.0
     pitch = math.atan2(direction_unit3.z, max(horiz_len, GEOM_ZERO_EPS))
 
+    if not release:
+        return KickPlan(yaw, pitch, speed, sigma)
     _release_kick(ball, kicker_position, yaw, pitch, speed, sigma, spin, r)
+    return None
 
 
 # ShootOrder blocker detection: perpendicular-distance threshold from the shot

@@ -414,7 +414,11 @@ follow-through movement is set before the kick is applied, so `MoveOrder`
 computes it with `_compute_movement_intent(..., assume_ball_released=True)`
 (the other orders' `_continue_current_motion` never reads the ball). The point:
 a BC label's counterfactual `execute()` (ai/ppo/bc.py) can read what the order
-WOULD kick without the ball being touched. Not routed through intents: the
+WOULD kick without the ball being touched: every kick function (`kick_ball`,
+`pass_ball`, `kick_ball_from_direction`, `Player.kick_direct`,
+`Player.kick_with_direction`) takes `release=False` to return its
+`KickPlan` (yaw, pitch, speed, error sigma) instead of launching, and
+`kick_intent.plan_kick_intent` / `kick_label_fields` use exactly that. Not routed through intents: the
 neural player's in-possession kick (`apply_nn_action.py`, whose kick-once logic
 reads the kick count right after applying), the engine's armed-kick on pickup,
 and the UI's manual kick.

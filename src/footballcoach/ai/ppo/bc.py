@@ -378,13 +378,17 @@ def _counterfactual_execution(player: "Player", match: "Match", order) -> dict:
     try:
         _dt = match.dt_s
         order.execute(player, match, _dt)
+        # The order's kick intent (engine/kick_intent.py) is READ, not carried
+        # out: kick_label_fields asks the same kick functions for the planned
+        # launch with release=False (no ball, no rng, no bookkeeping). Since
+        # 2026-11-16 the kick-direction label is that intended launch direction,
+        # before the random kick error (it used to be the noisy direction the
+        # ball actually left at, from a real counterfactual kick).
+        _kick = None
         if player.pending_kick is not None:
-            # The order's kick intent (engine/kick_intent.py), carried out here
-            # inside the snapshot exactly as the engine would, so every label
-            # below reads the same post-kick state as before kick intents.
-            from footballcoach.engine.kick_intent import apply_kick_intent
+            from footballcoach.engine.kick_intent import kick_label_fields
             _intent, player.pending_kick = player.pending_kick, None
-            apply_kick_intent(player, match, _intent)
+            _kick = kick_label_fields(player, match, _intent)
         if player.desired_speed_mode is not None:
             from footballcoach.engine.movement import SpeedMode
             move_direction_raw = player.desired_direction
@@ -403,8 +407,15 @@ def _counterfactual_execution(player: "Player", match: "Match", order) -> dict:
         # sets it unconditionally whenever it actually executes kick
         # physics, including MoveOrder's push-kick path (rules_ai.py's
         # box-run), which never creates a separate Shoot/Kick/PassOrder.
-        if player.kicked_this_tick:
-            # Actual kick this tick — use real post-physics values.
+        if _kick is not None:
+            kick_this_tick = 1.0
+            _d, _s = _kick["direction"], _kick["spin"]
+            kick_direction = np.array([_d.x, _d.y, _d.z], dtype=np.float32)
+            kick_power_fraction = _kick["power_fraction"]
+            kick_spin = np.array([_s.x, _s.y, _s.z], dtype=np.float32)
+        elif player.kicked_this_tick:
+            # A kick some code path still fired directly (no order does since
+            # kick intents): real post-physics values.
             kick_this_tick = 1.0
             if player.last_kick_direction is not None:
                 kick_direction = np.array(

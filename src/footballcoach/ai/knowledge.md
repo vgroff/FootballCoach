@@ -107,6 +107,23 @@ once, reads back every execution field from the result, then restores
 everything — this makes the exploratory call invisible to the real
 simulation.
 
+**Since 2026-11-16 (`_counterfactual_execution`, shared with the role-based
+BC experts):** kicks are no longer executed in the counterfactual at all.
+Kicking orders record a `KickIntent` (engine/kick_intent.py) that the engine
+applies after `execute()`; the counterfactual reads it through
+`kick_label_fields`, which asks the SAME kick functions for their planned
+launch with `release=False` (no ball, no rng draw, no kick bookkeeping). The
+kick labels are therefore the INTENDED launch: direction before the random
+kick error (it used to be the noisy direction a real counterfactual kick left
+at; measured on 4467 phase-1 rows of checkpoint 763, only the three
+kick-direction columns changed, only on the 386 kick rows, by 1.1 deg mean /
+7.9 deg max), power in the network's own kick-power units (speed / (max kick
+speed x running multiplier); a push-kick's own power exactly). The restore
+also covers every attribute of the player and the ball, not just the named
+fields: the named list once missed the ball's spin and the first-touch state,
+so a label could change the real match (`tests/ai_unit/
+test_counterfactual_is_invisible.py`).
+
 ## Package layout
 
 ```

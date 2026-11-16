@@ -412,7 +412,8 @@ class Player:
         if self.on_kick is not None:
             self.on_kick(self)
 
-    def kick_direct(self, match: "Match", aim_point: Vector3, power_fraction: float, spin: Vector3, compensate_for_run: bool = True) -> None:
+    def kick_direct(self, match: "Match", aim_point: Vector3, power_fraction: float, spin: Vector3,
+                    compensate_for_run: bool = True, release: bool = True):
         """Execute kick physics immediately WITHOUT issuing a KickOrder.
 
         THE NEURAL NETWORK CALLS THIS DIRECTLY — no Order is created.
@@ -447,7 +448,7 @@ class Player:
             if compensate_for_run
             else power_fraction
         )
-        kick_ball(
+        plan = kick_ball(
             match.ball,
             self.position,
             aim_point,
@@ -461,13 +462,16 @@ class Player:
             difficulty_multiplier=diff_mult,
             kicker_velocity=self.velocity,
             kicker_top_speed_mps=top_speed,
+            release=release,
         )
+        if not release:
+            return plan   # the kick as planned; nothing launched, no bookkeeping
         self._finish_kick(match, is_first_touch, "direct", power_fraction, adjusted_power, spin)
 
     def kick_with_direction(
         self, match: "Match", direction_3d: "Vector3", power_fraction: float, spin: "Vector3",
-        compensate_for_run: bool = False,
-    ) -> None:
+        compensate_for_run: bool = False, release: bool = True,
+    ):
         """Execute a kick with an explicit 3D unit direction vector (no ballistic solve).
 
         Used by the neural network (default compensate_for_run=False --
@@ -515,7 +519,7 @@ class Player:
             adjusted_power = compensate_power_for_run_mult(power_fraction, run_mult)
         else:
             adjusted_power = power_fraction
-        kick_ball_from_direction(
+        plan = kick_ball_from_direction(
             match.ball,
             self.position,
             direction_3d,
@@ -529,7 +533,10 @@ class Player:
             difficulty_multiplier=diff_mult,
             kicker_velocity=self.velocity,
             kicker_top_speed_mps=top_speed,
+            release=release,
         )
+        if not release:
+            return plan   # the kick as planned; nothing launched, no bookkeeping
         self._finish_kick(match, is_first_touch, "direct 3D", power_fraction, adjusted_power, spin)
 
     def pass_ball(
