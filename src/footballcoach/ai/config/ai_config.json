@@ -240,6 +240,8 @@
         "goalkeeper": {"rules": 1, "neural": 0}
       }
     },
+    "distill": {"1": {"teacher": "checkpoints/migrated/phase1_run321_checkpoint763_migrated.pt", "coeff_start": 1.0, "coeff_end": 1.0, "anneal_fraction": 1.0, "means_only": true}},
+    "_comment_distill_20261116": "Phase-1 teacher distillation (ai/ppo/distill.py), user's call: KL to 763 on phase-1 rows, means only, coefficient 1.0 constant. Measured before: phase2_run14 (80/20 mix, kick BC) had drifted 0.34 nats per phase-1 row from 763 (move_dir 0.19, kick gate 0.06, power 0.04) and phase-1 wins vs rules 50% -> 45%.",
     "phase1_max_episode_s": 22,
     "phase1_max_episode_s_variability": 10.0,
     "_comment_phase1_max_episode_s_variability": "Extra seconds, uniformly sampled in [0, this], ADDED to phase1_max_episode_s EACH EPISODE (see ScenarioEnv.max_episode_s_variability_s) -- never subtracted, so episodes are never shorter than phase1_max_episode_s. Added 2026-10-14, set to 10.0 2026-10-15 (user's call, picking the upper end of the 5-10s range discussed): episodes now range 22-32s (up to ~45% longer at the ceiling, ~23% longer on average) -- never shorter, so a losing player can't reliably time a 'retreat and force a timeout' strategy against a fixed, known episode length. Does not hide the live clock mid-episode (time_remaining is still an exact, real-time-computed observation feature every tick, see obs/encoder.py) -- the main effect is preventing the value/policy from learning an overly crisp, memorized-constant horizon across episodes, not blinding the agent during play. 0.0 = every episode gets exactly phase1_max_episode_s, bit-identical to before this knob existed.",
