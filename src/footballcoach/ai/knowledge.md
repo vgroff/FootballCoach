@@ -1594,6 +1594,15 @@ default). Example, kick BC for the phase-2 attacker only:
   the KL BCE - H(y)). PPO itself is unaffected: its log-probs are on the raw
   pre-squash sample. Same pattern, not yet changed: `move_region_center`'s
   tanh MSE ("other" group).
+- **...and even with the BCE the gate wins (phase2_run3, 2026-11-16).** One
+  update at kick 0.25: on 536 fixed kick-now states, P(kick) 0.021 -> 0.086
+  but power only 0.071 -> 0.081 (MSE run: 0.075): the gate needs ~+1 logit to
+  quadruple kicks, power needs raw -4.6 -> +3.3 to be visibly harder, and
+  Adam steps each parameter by ~lr whatever the loss scale (likely, not
+  isolated). So the kick group now splits per row into `kick_gate`,
+  `kick_power` and `kick_aim` (direction + spin; columns
+  `bc.GROUP_ROW_COLUMNS`), each settable per role, overriding `kick`; the
+  global schedules keep `kick` on all three (phase 1 unchanged).
 - **Exploration params barely matter to phase-2 outcomes (measured).** On the
   refit of 763 (attacker vs rules, 1840 episodes each, +-0.65 pt), relaxing
   move_dir kappa 1000 -> 60 (1.8 -> 7.7 deg spread, checked in sampling),

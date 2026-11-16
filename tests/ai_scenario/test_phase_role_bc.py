@@ -51,12 +51,23 @@ def test_sources_and_their_schedules(bc_config):
     assert bc_sources.sources() == [(2, "attacker"), (2, "goalkeeper")]
     assert bc_sources.source_id(2, "attacker") == 1 and bc_sources.source_id(2, "defender") == 0
     assert bc_sources.describe(1) == "phase2_1v2/attacker"
-    t0 = bc_sources.coeff_table(0.0, (0.1, 0.2, 0.3))
-    assert t0.tolist()[0] == pytest.approx([0.1, 0.2, 0.3])          # row 0: the global schedules
-    assert t0.tolist()[1] == pytest.approx([0.0, 0.6, 0.0])          # attacker: kick only
-    assert t0.tolist()[2] == pytest.approx([1.0, 0.0, 0.0])
+    t0 = bc_sources.coeff_table(0.0, (0.1, 0.2, 0.3))                # columns: bc.GROUP_ROW_COLUMNS
+    assert t0.tolist()[0] == pytest.approx([0.1, 0.2, 0.2, 0.2, 0.3])  # row 0: the global schedules
+    assert t0.tolist()[1] == pytest.approx([0.0, 0.6, 0.6, 0.6, 0.0])  # attacker: kick (all three parts)
+    assert t0.tolist()[2] == pytest.approx([1.0, 0.0, 0.0, 0.0, 0.0])
     assert bc_sources.coeff_table(0.25, (0, 0, 0))[1, 1].item() == pytest.approx(0.3)   # halfway through its anneal
     assert bc_sources.coeff_table(0.9, (0, 0, 0))[1, 1].item() == pytest.approx(0.0)
+
+
+def test_kick_parts_override_kick(bc_config):
+    const = lambda c: {"coeff_start": c, "coeff_end": c, "anneal_fraction": 1.0}
+    bc_config({"attacker": {"kick": const(0.3), "kick_power": const(1.0), "kick_gate": const(0.0)}})
+    from footballcoach.ai.ppo.bc import GROUP_ROW_COLUMNS
+    row = dict(zip(GROUP_ROW_COLUMNS, bc_sources.coeff_table(0.0, (0, 0, 0))[1].tolist()))
+    assert row == pytest.approx({"other": 0.0, "kick_gate": 0.0, "kick_power": 1.0, "kick_aim": 0.3, "tackle": 0.0})
+    bc_config({"attacker": {"kick_power": const(0.5)}})                  # a part alone, no "kick"
+    row = dict(zip(GROUP_ROW_COLUMNS, bc_sources.coeff_table(0.0, (0, 0, 0))[1].tolist()))
+    assert row["kick_power"] == pytest.approx(0.5) and row["kick_gate"] == 0.0 and row["kick_aim"] == 0.0
 
 
 def test_a_held_schedule(bc_config):
@@ -185,7 +196,8 @@ def test_per_row_coefficients_on_source_0_equal_the_old_weighted_loss(trainer):
     _, _, split = bc_loss_from_tensor(labels, d, e, **trainer._bc_loss_kwargs(), return_breakdown=True,
                                       split_kick=True, split_tackle=True)
     old = c[0] * split["other_group_loss"] + c[1] * split["kick_group_loss"] + c[2] * split["tackle_group_loss"]
-    new = _per_row_weighted(trainer, labels, d, e, torch.tensor([c]).repeat(labels.shape[0], 1))
+    per_column = [c[0], c[1], c[1], c[1], c[2]]                       # kick on all three kick parts
+    new = _per_row_weighted(trainer, labels, d, e, torch.tensor([per_column]).repeat(labels.shape[0], 1))
     assert float(new) == pytest.approx(float(old), rel=1e-5)
 
 
@@ -194,7 +206,7 @@ def test_a_phase2_coefficient_puts_no_gradient_through_phase1_rows(trainer):
     n = labels.shape[0]
     phase2 = torch.zeros(n, dtype=torch.bool)
     phase2[: n // 2] = True
-    table = torch.tensor([[0.0, 0.0, 0.0], [0.0, 0.8, 0.0]])        # global 0, attacker kick 0.8
+    table = torch.tensor([[0.0] * 5, [0.0, 0.8, 0.8, 0.8, 0.0]])     # global 0, attacker kick 0.8
     coeffs = table[phase2.long()]
     loss = _per_row_weighted(trainer, labels, d, e, coeffs)
     # Changing a phase-1 row's labels must not change the loss at all.
@@ -206,6 +218,17 @@ def test_a_phase2_coefficient_puts_no_gradient_through_phase1_rows(trainer):
     labels3 = labels.clone()
     labels3[phase2, 12] = 1.0 - labels3[phase2, 12]
     assert float(_per_row_weighted(trainer, labels3, d, e, coeffs)) != pytest.approx(float(loss), rel=1e-6)
+
+
+def test_the_kick_part_columns_sum_to_the_kick_group(trainer):
+    labels, d, e = _labels_and_heads(trainer)
+    _, _, split = bc_loss_from_tensor(labels, d, e, **trainer._bc_loss_kwargs(), return_breakdown=True,
+                                      split_kick=True, split_tackle=True, return_group_rows=True)
+    rows, valid = split["rows"], split["valid"]
+    assert rows.shape[1] == 5
+    assert float(rows[valid, 1:4].sum(dim=1).mean()) == pytest.approx(float(split["kick_group_loss"]), rel=1e-5)
+    assert float(rows[valid, 0].mean()) == pytest.approx(float(split["other_group_loss"]), rel=1e-5)
+    assert float(rows[valid, 4].mean()) == pytest.approx(float(split["tackle_group_loss"]), rel=1e-5)
 
 
 def test_augmentation_carries_bc_sources():

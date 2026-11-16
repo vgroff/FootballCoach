@@ -10,8 +10,11 @@ A role-based phase switches BC on for a role in ai_config
 
 Groups are bc_loss_from_tensor's split: "kick" (kick_this_tick / direction /
 power / spin), "tackle" (tackle_attempt) and "other" (everything else:
-decision heads, movement, region). A group left out has coefficient 0 for
-that role. Each schedule anneals linearly from coeff_start to coeff_end over
+decision heads, movement, region). The kick group's parts can also be set on
+their own, overriding "kick" for that part: "kick_gate" (kick_this_tick),
+"kick_power" and "kick_aim" (direction + spin) -- e.g. teach how to kick
+before when (the gate moves behaviour long before power does). A group left
+out has coefficient 0 for that role. Each schedule anneals linearly from coeff_start to coeff_end over
 the first anneal_fraction of training, exactly like the global bc.aux_coeff_*
 schedules; an optional hold_fraction (default 0) keeps it at coeff_start until
 then, the anneal running from hold_fraction to anneal_fraction instead
@@ -32,7 +35,8 @@ from __future__ import annotations
 
 from typing import Optional
 
-GROUPS: tuple[str, ...] = ("other", "kick", "tackle")
+GROUPS: tuple[str, ...] = ("other", "kick", "tackle", "kick_gate", "kick_power", "kick_aim")
+_KICK_PARTS = ("kick_gate", "kick_power", "kick_aim")
 _SCHEDULE_KEYS = {"coeff_start", "coeff_end", "anneal_fraction"}
 _OPTIONAL_SCHEDULE_KEYS = {"hold_fraction"}
 
@@ -99,17 +103,29 @@ def _anneal(sched: dict, progress: float) -> float:
     return start + (end - start) * t
 
 
+def _column_coeff(groups: dict, column: str, progress: float) -> float:
+    if column in groups:
+        return _anneal(groups[column], progress)
+    if column in _KICK_PARTS and "kick" in groups:
+        return _anneal(groups["kick"], progress)
+    return 0.0
+
+
 def coeff_table(progress: float, global_coeffs: tuple[float, float, float]):
-    """(n_sources + 1, 3) tensor of (other, kick, tackle) coefficients at this
-    training progress: row 0 = the global schedules (as given), row i = the
-    i-th configured (phase, role)."""
+    """(n_sources + 1, len(GROUP_ROW_COLUMNS)) tensor of per-column
+    coefficients (other, kick_gate, kick_power, kick_aim, tackle) at this
+    training progress: row 0 = the global (other, kick, tackle) schedules as
+    given (kick on all three kick parts), row i = the i-th configured
+    (phase, role)."""
     import torch
 
     from footballcoach.ai.curriculum.phases import PHASES_BY_ID
-    rows = [list(global_coeffs)]
+    from footballcoach.ai.ppo.bc import GROUP_ROW_COLUMNS
+    other, kick, tackle = global_coeffs
+    rows = [[other, kick, kick, kick, tackle]]
     for phase_id, role in sources():
         groups = _phase_bc_config(PHASES_BY_ID[phase_id])[role]
-        rows.append([_anneal(groups[g], progress) if g in groups else 0.0 for g in GROUPS])
+        rows.append([_column_coeff(groups, c, progress) for c in GROUP_ROW_COLUMNS])
     return torch.tensor(rows, dtype=torch.float32)
 
 

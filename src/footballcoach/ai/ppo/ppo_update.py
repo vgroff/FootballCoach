@@ -145,8 +145,8 @@ class _UpdateContext:
     opp_grad_scale: Optional[torch.Tensor]
     warm_base_lrs: list               # this update's scheduled lrs, for the per-update warmup
     step_outcomes: list
-    # Per-row BC coefficients (ai/ppo/bc_sources.py): (n_sources + 1, 3)
-    # (other, kick, tackle) by row source; None when no per-phase / per-role BC
+    # Per-row BC coefficients (ai/ppo/bc_sources.py): (n_sources + 1, n_columns)
+    # by row source and bc.GROUP_ROW_COLUMNS; None when no per-phase / per-role BC
     # is configured, in which case the global coefficients above apply to
     # every row exactly as before.
     bc_coeff_table: Optional[torch.Tensor] = None
@@ -175,7 +175,7 @@ class _UpdateStats:
     kick_prob: list = dataclasses.field(default_factory=list)        # mean sigmoid(kick_logit) per mb
     ratios: list = dataclasses.field(default_factory=list)
     entropy_breakdown: dict = dataclasses.field(default_factory=dict)
-    # BC source id -> [(other, kick, tackle) mean group loss over its valid
+    # BC source id -> [per-GROUP_ROW_COLUMNS mean loss over its valid
     # rows, per minibatch] (per-phase / per-role BC only).
     bc_by_source: dict = dataclasses.field(default_factory=dict)
     # BC source id -> per-minibatch kick agreement with the expert
@@ -1165,7 +1165,7 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
         )
         stats.bc_tackle_loss.append(_bkdn.get("tackle_attempt", 0.0))
         if per_row:
-            # Each row's (other, kick, tackle) group losses weighted by ITS
+            # Each row's per-column (bc.GROUP_ROW_COLUMNS) losses weighted by ITS
             # source's coefficients, averaged over the valid rows -- with every
             # row on source 0 this is the expression below (same means).
             src = ctx.batch["bc_sources"][mb_idx].to(self.device)
@@ -1189,8 +1189,8 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
 
     @staticmethod
     def _bc_by_source_metrics(ctx: _UpdateContext, stats: _UpdateStats) -> dict:
-        """{"phase2_1v2/attacker": {"coeff": [other, kick, tackle], "loss":
-        [other, kick, tackle]}} for each per-phase / per-role BC source seen."""
+        """{"phase2_1v2/attacker": {"coeff": [per GROUP_ROW_COLUMNS], "loss":
+        [per GROUP_ROW_COLUMNS], "agree": {...}}} for each per-phase / per-role BC source seen."""
         if ctx.bc_coeff_table is None:
             return {}
         from footballcoach.ai.ppo.bc_sources import describe

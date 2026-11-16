@@ -61,8 +61,9 @@ class RolloutLoggingMixin:
         bc_lines = []
         for _src, _v in (metrics.get("bc_by_source") or {}).items():
             _c, _l = _v["coeff"], _v["loss"]
+            from footballcoach.ai.ppo.bc import GROUP_ROW_COLUMNS
             bc_str += (f"  bc[{_src}]=" + "/".join(
-                f"{g} {l:.3f}x{c:.2f}" for g, c, l in zip(("other", "kick", "tackle"), _c, _l) if c > 0.0))
+                f"{g} {l:.3f}x{c:.2f}" for g, c, l in zip(GROUP_ROW_COLUMNS, _c, _l) if c > 0.0))
             _a = _v.get("agree")
             if _a:
                 # The policy vs its expert on the kick group (ppo_update._kick_agreement).

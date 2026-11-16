@@ -90,6 +90,12 @@ def _kick_power_physical(raw: "torch.Tensor") -> "torch.Tensor":
     (ppo.kick_power_floor + (1 - floor) * sigmoid(raw)) -- what BC labels/targets are in."""
     return kick_power_from_raw(raw, configured_kick_power_floor())
 
+# Columns of bc_loss_from_tensor(..., return_group_rows=True)["rows"]: the
+# per-row loss split the per-phase / per-role BC coefficients act on
+# (ai/ppo/bc_sources.py). kick_aim = kick direction + spin.
+GROUP_ROW_COLUMNS: tuple[str, ...] = ("other", "kick_gate", "kick_power", "kick_aim", "tackle")
+
+
 def kick_power_bce(raw: "torch.Tensor", target_power: "torch.Tensor") -> "torch.Tensor":
     """Per-row soft-target BCE for the kick_power head, as KL(y || s): the
     target power fraction mapped past the floor to y in [0, 1] (the same map
@@ -1197,7 +1203,7 @@ def bc_loss_from_tensor(
             if split_tackle:
                 _zero_split["tackle_group_loss"] = _zero
             if return_group_rows:
-                _zero_split["rows"] = torch.zeros(labels.shape[0], 3, device=labels.device)
+                _zero_split["rows"] = torch.zeros(labels.shape[0], len(GROUP_ROW_COLUMNS), device=labels.device)
                 _zero_split["valid"] = valid
             result += (_zero_split,)
         return result if len(result) > 1 else result[0]
@@ -1363,9 +1369,17 @@ def bc_loss_from_tensor(
         if split_tackle:
             split["tackle_group_loss"] = _group_mean(tackle_group_per_row)
         if return_group_rows:
-            # Per-row (other, kick, tackle) group losses (differentiable) and
-            # the valid mask, for per-row coefficients (ai/ppo/bc_sources.py).
-            split["rows"] = torch.stack([other_group_per_row, kick_group_per_row, tackle_group_per_row], dim=1)
+            # Per-row losses by GROUP_ROW_COLUMNS (differentiable; the kick
+            # group split into its gate, power and aim parts) and the valid
+            # mask, for per-row coefficients (ai/ppo/bc_sources.py).
+            _zr = torch.zeros(labels.shape[0], device=labels.device)
+            split["rows"] = torch.stack([
+                other_group_per_row,
+                exec_weight * kick_loss if split_kick else _zr,
+                exec_weight * kick_power_loss_per if split_kick else _zr,
+                exec_weight * (kick_dir_loss_per + kick_spin_loss_per) if split_kick else _zr,
+                tackle_group_per_row,
+            ], dim=1)
             split["valid"] = valid
 
     if return_breakdown:
