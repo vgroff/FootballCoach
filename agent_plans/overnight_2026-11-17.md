@@ -85,3 +85,17 @@ kappa (1 - cos dtheta) ~ 250 dtheta^2, so a ~1 deg mean error already costs
 is effectively a move-direction precision target (rms error under ~1 deg for
 phase 1), and its scale depends on kappa (the same match reads ~5x lower at
 kappa 100). The behavioural evals already meet the teachers (run21).
+
+### 00:52 Finding: the phase-1 plateau is a generalisation gap, not (only) the LR
+
+run22 cycle 1 (lr 3e-5) fitted phase 1 real down to 0.199 (move_dir 0.136),
+but cycle 2's fresh rollout read 0.291 again -- the same as run21's fresh
+0.29. Each cycle fits its own 370k-step rollout well, and the next rollout's
+new states show the error again; the data of each cycle was discarded.
+
+Change (code, opt-in): `distill_pretrain.aggregate_cycles` (default 1 = old
+behaviour) -- proper DAgger aggregation: fit on this cycle's rows plus the last
+(N - 1) cycles' rows. Old rows keep their teacher targets (frozen teachers)
+but train the KL only, not the value head (their MC returns came from an
+earlier student). Tests: concat / history, and the smoke test runs 2 cycles
+with aggregation. To be used from the next continuation (N = 3).

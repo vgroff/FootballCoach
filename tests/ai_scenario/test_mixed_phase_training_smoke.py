@@ -171,13 +171,14 @@ def test_distill_pretrain_over_a_mix(mixed_config, monkeypatch, tmp_path, caplog
     trainer._save_checkpoint_to(teacher)
     cfg = {"teachers": {1: str(teacher), 2: str(teacher)}, "counterfactual": True, "counterfactual_weight": 1.0,
            "kl_coef": 5.0, "value_coef": 1.0, "epochs": 1, "lr": 1e-4, "batch_size": 512,
-           "rollout_steps": 4000, "num_rollouts": 1}
+           "rollout_steps": 4000, "num_rollouts": 2, "aggregate_cycles": 2}
     out = tmp_path / "distilled.pt"
     with caplog.at_level(logging.INFO, logger="footballcoach"):
         report = distill_pretrain(trainer, phase_id=1, cfg=cfg, checkpoint_path=out)
     text = caplog.text
     assert "[distill pretrain] rollout: phase 1: " in text and "secondary" in text
     assert "phase-1 episodes vs rules" in text
+    assert "+ 1 earlier cycle(s)" in text                 # cycle 2 fitted on both cycles' rows
     assert set(report) == {(1, "real"), (1, "cf"), (2, "real"), (2, "cf")}
     assert out.exists()
 

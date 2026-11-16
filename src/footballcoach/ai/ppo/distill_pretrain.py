@@ -50,7 +50,31 @@ _SPREAD_KEYS = ("move_dir_log_kappa", "kick_dir_log_kappa", "kick_dir_z_log_std"
 
 DEFAULTS = {"counterfactual": True, "counterfactual_weight": 1.0, "kl_coef": 5.0, "value_coef": 1.0,
             "label_smoothing": 0.0, "epochs": 6, "lr": 1e-4, "lr_warmup_steps": 0, "batch_size": 8000,
-            "rollout_steps": 540000, "num_rollouts": 4}
+            "rollout_steps": 540000, "num_rollouts": 4, "aggregate_cycles": 1}
+
+
+_DATA_TENSORS = ("returns", "target_phase", "value_w", "kl_w", "is_cf")
+_DATA_DICTS = ("obs", "anchor", "actions")
+
+
+def concat_data(parts: list) -> dict:
+    """One fit dataset from several cycles' (build_copies + anchor + actions)
+    dicts, row-wise."""
+    if len(parts) == 1:
+        return parts[0]
+    out = {k: torch.cat([p[k] for p in parts]) for k in _DATA_TENSORS}
+    for d in _DATA_DICTS:
+        out[d] = {k: torch.cat([p[d][k] for p in parts]) for k in parts[0][d]}
+    return out
+
+
+def as_history(data: dict) -> dict:
+    """A cycle's data kept for later cycles (DAgger aggregation): its teacher
+    targets stay valid (the teachers are frozen) but its Monte Carlo returns
+    came from an earlier student, so it no longer trains the value head."""
+    out = dict(data)
+    out["value_w"] = torch.zeros_like(data["value_w"])
+    return out
 
 
 def warmup_lr(base_lr: float, step: int, warmup_steps: int) -> float:
@@ -287,6 +311,8 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
     pool = trainer._spawn_value_pretrain_workers(phase_id)
     report: dict = {}
     step = 0
+    keep = max(1, int(cfg["aggregate_cycles"]))
+    history: list = []          # previous cycles' data (as_history), newest last
     try:
         for cycle in range(int(cfg["num_rollouts"])):
             log.info(f"=== Distill pretrain: cycle {cycle + 1}/{cfg['num_rollouts']} ===")
@@ -303,15 +329,22 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
             data["actions"] = soft_actions(data["anchor"], len(data["returns"]))
             phys = trainer._precompute_physics_full({f"obs/{k}": v for k, v in data["obs"].items()}, bs)
             data["obs"].update({k[len("obs/"):]: v for k, v in phys.items()})
-            n = len(data["returns"])
-            log.info(f"  [distill pretrain] {n} rows ({int((~data['is_cf']).sum())} real, {int(data['is_cf'].sum())} counterfactual)"
+            n_new = len(data["returns"])
+            log.info(f"  [distill pretrain] {n_new} rows ({int((~data['is_cf']).sum())} real, {int(data['is_cf'].sum())} counterfactual)"
                      f"  returns std={ret_std:.2f}")
             log_report(f"cycle {cycle + 1} before", group_report(trainer, data, bs))
+            # DAgger aggregation (aggregate_cycles > 1): fit on this cycle's rows
+            # plus the last (aggregate_cycles - 1) cycles' rows.
+            fit = concat_data(history + [data])
+            n = len(fit["returns"])
+            if history:
+                log.info(f"  [distill pretrain] fitting {n} rows: this cycle {n_new} + {len(history)} earlier cycle(s) "
+                         f"{n - n_new} (KL only: their returns are another student's)")
             for epoch in range(int(cfg["epochs"])):
                 perm = torch.randperm(n)
                 vals, kls = [], []
                 for s in range(0, n, bs):
-                    mb = _slice(data, perm[s:s + bs], trainer.device)
+                    mb = _slice(fit, perm[s:s + bs], trainer.device)
                     loss, vloss, kl = minibatch_loss(trainer, mb, ret_std, float(cfg["kl_coef"]), float(cfg["value_coef"]))
                     for g in opt.param_groups:
                         g["lr"] = warmup_lr(float(cfg["lr"]), step, int(cfg["lr_warmup_steps"]))
@@ -326,6 +359,9 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
                          f"value_mse/var={np.mean(vals):.4f} (rmse {ret_std * math.sqrt(max(np.mean(vals), 0.0)):.2f})")
             report = group_report(trainer, data, bs)
             log_report(f"cycle {cycle + 1} after", report)
+            del fit
+            if keep > 1:
+                history = (history + [as_history(data)])[-(keep - 1):]
             del data
             if checkpoint_path is not None:
                 trainer._save_checkpoint_to(checkpoint_path)

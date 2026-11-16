@@ -111,6 +111,26 @@ def test_each_row_gets_its_target_teachers_output(trainer, tmp_path):
     assert torch.allclose(acts["kick"].reshape(-1), torch.sigmoid(anchor["kick_logit"]).reshape(-1))
 
 
+def test_concat_and_history(trainer, tmp_path):
+    b = _obs(trainer)
+    same = _teacher(trainer, tmp_path, "agg.pt")
+    parts = []
+    for i in range(2):
+        d = dp.build_copies(b, torch.full((N,), float(i)), (1, 2), True, 0.3)
+        d["anchor"] = dp.teacher_anchor(trainer, d["obs"], d["target_phase"], {1: same, 2: same}, 64)
+        d["actions"] = dp.soft_actions(d["anchor"], len(d["returns"]))
+        parts.append(d)
+    old = dp.as_history(parts[0])
+    assert float(old["value_w"].sum()) == 0.0 and float(parts[0]["value_w"].sum()) == N   # original untouched
+    both = dp.concat_data([old, parts[1]])
+    assert len(both["returns"]) == 4 * N
+    assert both["returns"][:2 * N].tolist() == [0.0] * (2 * N) and both["returns"][2 * N:].tolist() == [1.0] * (2 * N)
+    assert both["obs"]["self_feat"].shape[0] == 4 * N and both["anchor"]["kick_logit"].shape[0] == 4 * N
+    assert both["actions"]["kick"].shape[0] == 4 * N
+    assert float(both["value_w"][:2 * N].sum()) == 0.0 and float(both["value_w"][2 * N:].sum()) == N
+    assert dp.concat_data([parts[1]]) is parts[1]
+
+
 def test_warmup_lr():
     assert dp.warmup_lr(1e-4, 0, 0) == 1e-4
     assert dp.warmup_lr(1e-4, 0, 100) == pytest.approx(1e-6)
