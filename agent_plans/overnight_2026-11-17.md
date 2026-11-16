@@ -71,3 +71,17 @@ smoothed 763 targets was 0.0005, the whole floor smoothing adds. Kept on.
 Change: group report now also logs the top-5 per-head KL per group (to see
 what the phase-1 0.23 is made of). Next: phase2_run22 = continuation from
 run21 with lr 1e-4 -> 3e-5 (one change: is the plateau an LR noise floor?).
+
+### 00:45 phase2_run22 cycle 1 "before" -- per-head KL breakdown
+
+Move direction is most of every group's KL (top heads):
+- phase 1 real 0.288: move_dir 0.208, kick_power 0.023, kick 0.021, sprint 0.011, exec_move 0.011;
+- phase 2 cf 1.329: move_dir 0.982, kick_power 0.104, kick 0.096, sprint 0.050, exec_move 0.040;
+- phase 1 cf 0.198: move_dir 0.131; phase 2 real 0.068: move_dir 0.044.
+
+Note on the "KL < 0.1" target: at move kappa 500 the von Mises KL is about
+kappa (1 - cos dtheta) ~ 250 dtheta^2, so a ~1 deg mean error already costs
+~0.1, and the quadratic makes a few larger-error rows dominate. The KL target
+is effectively a move-direction precision target (rms error under ~1 deg for
+phase 1), and its scale depends on kappa (the same match reads ~5x lower at
+kappa 100). The behavioural evals already meet the teachers (run21).
