@@ -1622,13 +1622,19 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 if (info := self._pending_replay_before.get(seed)) is not None
             ]
             if _matched:
-                _before_mean = float(np.mean([b for _s, b, _a in _matched]))
-                _after_mean = float(np.mean([a for _s, _b, a in _matched]))
-                log.info(
-                    f"  [episode replay] matched={len(_matched)}/{len(self._pending_replay_before)}  "
-                    f"before_mean_rew={_before_mean:.3f}  after_mean_rew={_after_mean:.3f}  "
-                    f"delta={_after_mean - _before_mean:+.3f}"
-                )
+                from footballcoach.ai.curriculum.mix import untag_seed
+                _groups = {"": _matched}
+                _phases = sorted({untag_seed(s)[1] for s, _b, _a in _matched})
+                if len(_phases) > 1:   # rewards of different phases are not comparable: report each
+                    _groups = {f" phase{p}": [m for m in _matched if untag_seed(m[0])[1] == p] for p in _phases}
+                for _tag, _ms in _groups.items():
+                    _before_mean = float(np.mean([b for _s, b, _a in _ms]))
+                    _after_mean = float(np.mean([a for _s, _b, a in _ms]))
+                    log.info(
+                        f"  [episode replay{_tag}] matched={len(_ms)}/{len(self._pending_replay_before)}  "
+                        f"before_mean_rew={_before_mean:.3f}  after_mean_rew={_after_mean:.3f}  "
+                        f"delta={_after_mean - _before_mean:+.3f}"
+                    )
             else:
                 log.info(
                     f"  [episode replay] 0/{len(self._pending_replay_before)} queued seeds were "
@@ -1639,12 +1645,21 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
         if not all_episode_seed_reward_adv:
             return []
 
-        n_top = max(1, math.ceil(self._episode_replay_top_fraction * len(all_episode_seed_reward_adv)))
-        top_k = sorted(all_episode_seed_reward_adv, key=lambda t: t[2], reverse=True)[:n_top]
+        # Top fraction WITHIN each phase (curriculum/mix.py): phases have
+        # different reward and advantage scales, so ranking them together would
+        # let one phase take every slot. One phase = the plain top fraction.
+        from footballcoach.ai.curriculum.mix import top_fraction_per_phase, untag_seed
+        top_k = top_fraction_per_phase(all_episode_seed_reward_adv, self._episode_replay_top_fraction,
+                                       seed_of=lambda t: t[0], score_of=lambda t: t[2])
         self._pending_replay_before = {seed: {"reward": rew, "abs_adv": adv} for seed, rew, adv in top_k}
+        _phases = sorted({untag_seed(t[0])[1] for t in all_episode_seed_reward_adv})
+        _per_phase = "" if len(_phases) == 1 else " [" + ", ".join(
+            f"phase{p}: {sum(untag_seed(t[0])[1] == p for t in top_k)}/"
+            f"{sum(untag_seed(t[0])[1] == p for t in all_episode_seed_reward_adv)}" for p in _phases) + "]"
         log.info(
             f"  [episode replay] queued {len(top_k)} seed(s) for next rollout "
-            f"(top {self._episode_replay_top_fraction * 100:.1f}% of {len(all_episode_seed_reward_adv)} episodes by |adv|)"
+            f"(top {self._episode_replay_top_fraction * 100:.1f}% of {len(all_episode_seed_reward_adv)} episodes by |adv|"
+            + (", per phase" if len(_phases) > 1 else "") + ")" + _per_phase
         )
         return list(self._pending_replay_before.keys())
 
@@ -1710,6 +1725,12 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
             )
         else:
             _env_phases = phase_id
+        # Which phases each worker's envs run, so a replayed seed only goes to a
+        # worker that can replay it (curriculum/mix.route_seeds_to_workers).
+        _worker_phases = (
+            [{phase_id}] * n_processes if isinstance(_env_phases, int)
+            else [set(_env_phases[w * envs_per_process:(w + 1) * envs_per_process]) for w in range(n_processes)]
+        )
         workers = spawn_batched_workers(
             _env_phases, n_processes, envs_per_process, base_seed,
             self.separate_value_net, self.worker_torch_threads,
@@ -1748,12 +1769,8 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 for w in workers:
                     w.set_weights(dec_state, exec_state, val_state)
 
-                if replay_seeds_for_next_cycle:
-                    _replay_chunks = [
-                        c for c in (replay_seeds_for_next_cycle[i::len(workers)] for i in range(len(workers))) if c
-                    ]
-                else:
-                    _replay_chunks = []
+                from footballcoach.ai.curriculum.mix import route_seeds_to_workers
+                _replay_chunks = route_seeds_to_workers(replay_seeds_for_next_cycle, _worker_phases)
                 # Workers finalize their own results (GAE with THIS process's
                 # gamma/lam -- passed explicitly so a worker's separately-read
                 # ai_config.json can never drift from ours -- plus as_tensors)
@@ -1763,7 +1780,7 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 for _wi, w in enumerate(workers):
                     w.collect(
                         steps_per_worker,
-                        replay_seeds=(_replay_chunks[_wi] if _wi < len(_replay_chunks) else None),
+                        replay_seeds=(_replay_chunks[_wi] or None),
                         returns=_returns_spec,
                     )
 
@@ -1939,14 +1956,12 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                         )
                     self._persistent_eval_workers = eval_workers
 
-                # The PPG refit collects in phase_id's envs only, so it gets
-                # only that phase's replay seeds, untagged (curriculum/mix.py);
-                # for a phase-1-only run this is the same list.
-                from footballcoach.ai.curriculum.mix import untag_seed
+                # The PPG refit collects across the whole phase mix (its worker
+                # pool gets the same per-env phase assignment), so it takes
+                # every phase's replay seeds, still tagged (curriculum/mix.py).
                 self._maybe_run_ppg_interleave(
                     None, phase_id, _close_main_pools, _respawn_main_pools,
-                    replay_seeds=[untag_seed(_s)[0] for _s in replay_seeds_for_next_cycle
-                                  if untag_seed(_s)[1] == phase_id],
+                    replay_seeds=list(replay_seeds_for_next_cycle),
                 )
         finally:
             close_batched_workers(workers)

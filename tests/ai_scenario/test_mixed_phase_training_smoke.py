@@ -72,3 +72,62 @@ def test_one_mixed_cycle_collects_both_phases_and_logs_them(mixed_config, caplog
     assert "phase mix phase1=4/8 env slots  phase2=4/8 env slots" in text
     assert "phase2_1v2[attacker=neural,defender=neural,goalkeeper=rules](" in text
     assert trainer._total_steps >= 500
+
+
+_PPG_OVERRIDES = {
+    **{("ppo", k): v for k, v in {
+        "value_pretrain_n_processes": 2, "value_pretrain_batched_rollout": True,
+        "value_pretrain_envs_per_process": 4, "value_pretrain_chunk_steps": 0,
+    }.items()},
+    **{("bc", k): v for k, v in {
+        "ppg_epochs": 1, "ppg_episode_replay_enabled": True, "ppg_loss_diagnostics": False,
+        "ppg_compare_to_original": False, "ppg_val_episode_fraction": 0.0,
+    }.items()},
+}
+
+
+def test_ppg_refit_collects_both_phases_and_replays_per_phase(mixed_config, monkeypatch, tmp_path, caplog):
+    """The PPG value refit over a phase mix: its worker pool runs both phases,
+    logs the role-based phase's outcomes, and its second cycle replays seeds
+    selected per phase."""
+    import json as _json
+    import os
+    from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+
+    for path, value in _PPG_OVERRIDES.items():
+        monkeypatch.setitem(mixed_config[path[0]], path[1], value)
+    (tmp_path / "ai_config.json").write_text(_json.dumps(mixed_config))
+    assert os.environ["FOOTBALLCOACH_AI_CONFIG_PATH"] == str(tmp_path / "ai_config.json")
+    torch.manual_seed(0)
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    trainer.set_frozen_heads(PHASES_BY_ID[1].frozen_heads)
+    trainer.phase_mix = {1: 1.0, 2: 1.0}
+    trainer.checkpoint_dir = None
+    from footballcoach.ai.curriculum.mix import untag_seed
+    queued = []
+    real = trainer._ppg_update_episode_replay
+
+    def _capture(seed_mse, pending):
+        out = real(seed_mse, pending)
+        queued.append((sorted({untag_seed(s)[1] for s, _ in seed_mse}), out[1]))
+        return out
+    trainer._ppg_update_episode_replay = _capture
+    with caplog.at_level(logging.INFO, logger="footballcoach"):
+        trainer.ppg_value_refit(None, n_steps=8000, phase_id=1, num_rollouts=2)
+    text = caplog.text
+    assert "[value pretrain rollout] phase mix phase1=4/8 env slots  phase2=4/8 env slots" in text
+    assert "[value pretrain rollout] phase2_1v2[attacker=neural,defender=neural,goalkeeper=rules](" in text
+    assert len(queued) == 1                      # selected after cycle 1, for cycle 2
+    phases_seen, next_seeds = queued[0]
+    assert phases_seen == [1, 2]                 # both phases' episodes were ranked
+    assert sorted({untag_seed(s)[1] for s in next_seeds}) == [1, 2]   # and both got replay slots
+
+
+def test_ppg_over_a_mix_refuses_the_single_process_path(mixed_config, monkeypatch):
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+    monkeypatch.setitem(mixed_config["ppo"], "value_pretrain_n_processes", 1)
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    trainer.phase_mix = {1: 1.0, 2: 1.0}
+    with pytest.raises(NotImplementedError, match="phase mix"):
+        trainer._collect_value_pretrain_rollout(None, 100, 1)

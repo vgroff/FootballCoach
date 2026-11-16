@@ -1611,8 +1611,8 @@ role's mean terminal reward. Tests: `tests/ai_scenario/test_phase2_role_env.py`.
 
 `train.py --phase 1 --phase-mix 1:3,2:1` (or `ai_config.json
 curriculum.training_phase_mix`, absent by default) trains phases together.
-`--phase` must be in the mix and still drives pre-training, the PPG value
-refit and the periodic evals. Rules:
+`--phase` must be in the mix and still drives the periodic phase-1 evals
+(each role-based phase has its own evals, below). Rules:
 
 - **Batched rollout only.** `PPOTrainer.train()` raises for a mix on the
   single-process or one-env-per-worker paths.
@@ -1629,8 +1629,15 @@ refit and the periodic evals. Rules:
   rejected.
 - **Episode-seed replay is phase-tagged.** Seeds recorded and replayed are
   `tag_seed(seed, phase)` = `seed + (phase - 1) * 2**31`, so phase-1 seeds are
-  unchanged; each worker hands a replayed seed only to an env of its phase.
-  The PPG refit (primary phase only) gets only its phase's seeds.
+  unchanged; each worker hands a replayed seed only to an env of its phase,
+  and seeds are only routed to workers running their phase
+  (`route_seeds_to_workers`; a plain round-robin for one phase).
+- **Replay selection is per phase** (2026-11-16): the top
+  `episode_replay_top_fraction` is taken WITHIN each phase, at least one per
+  phase (`top_fraction_per_phase`), for PPO (by mean |advantage|) and PPG (by
+  value MSE) alike: phases have different reward and value scales, so ranking
+  them together would let one take every slot. The before/after replay report
+  is printed per phase too. One phase = exactly the old selection.
 - **Logging.** Role-based episodes are tallied per `StepInfo.episode_tag`
   (`episode_outcomes_by_tag` / `episode_rewards_by_tag` in the worker stats)
   and printed one line per tag in the rollout summary, in the phase's outcome
@@ -1638,9 +1645,18 @@ refit and the periodic evals. Rules:
   `vs_rules` / `vs_immobile` / `vs_neural` lists, so a phase-1-only summary is
   unchanged.
 
-Not yet mixed: the PPG value refit and value pre-training collect only
-`--phase`'s envs. Phase-2 rows reuse phase 1's `secondary_weight` and land on
-the `trainee` track like phase 1's.
+**PPG value refit over a mix** (2026-11-16): its rollout pool
+(`_spawn_value_pretrain_workers`) gets the same per-env phase assignment as
+the main loop (`assign_env_phases`), which needs
+`ppo.value_pretrain_batched_rollout`; the single-process / plain-worker paths
+raise `NotImplementedError` for a mix. It logs one line per role-based
+episode tag, takes every phase's (tagged) replay seeds from the main loop, and
+selects its own replays per phase. Not yet checked: the train/val episode
+split takes the last episodes in collection order, which interleaves phases
+across env slots but is not balanced per phase. Value pre-training
+(`pretrain_value` / `pretrain_combined`) still refuses a mix and role-based
+phases. Phase-2 rows reuse phase 1's `secondary_weight` and land on the
+`trainee` track like phase 1's.
 
 **Per-phase evals.** Each role-based phase lists `eval_specs` (name + pinned
 controller per role); `PPOTrainer._eval_role_phases()` runs every spec of
@@ -1678,7 +1694,7 @@ task ids of phases 1 and 2 and `is_goalkeeper` zeroed; so NOT `--init-new-phase-
 `--remap-time-input`. Its optimizer state was not carried over.)
 (writes to a fresh `phase1_run{next}` dir). Expect phase-2 value error to be
 high for the first rollouts: the value head has never seen phase-2 outcomes
-and the PPG refit only sees phase 1.
+(an interleaved PPG refit now covers both phases).
 
 Verification: `scripts/batched_rollout_trace_snapshot.py` (seeded in-process
 phase-1 collections with replay; identical before and after this change apart

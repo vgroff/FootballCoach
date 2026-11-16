@@ -138,6 +138,8 @@ class _ValuePretrainWorkers:
     progress_value: object
     n_processes: int
     envs_per_process: int
+    # Phases each worker's envs run (curriculum/mix.route_seeds_to_workers).
+    worker_phases: Optional[list] = None
 
 def _finalize_value_pretrain_result(
     r: dict, gamma: float, lam: float, use_gae: bool, allow_empty: bool = False,
@@ -1634,6 +1636,14 @@ class PretrainingMixin:
 
         n_workers = self.value_pretrain_n_processes
         base_seed = random.randint(0, 2**31 - 1)
+        # A phase mix: every env slot gets its phase exactly as in the main loop
+        # (curriculum/mix.assign_env_phases), which needs the batched workers
+        # (the plain one-env workers take a single phase).
+        _mixed = getattr(self, "phase_mix", None) is not None and set(self.phase_mix) != {phase_id}
+        if _mixed and not self.value_pretrain_batched_rollout:
+            raise NotImplementedError(
+                "a value-pretrain / PPG rollout over a phase mix needs ppo.value_pretrain_batched_rollout=true"
+            )
         # Must be created with the SAME "spawn" context the spawn functions
         # use, and passed at process-creation time (a raw ctx.Value can't be
         # sent to an already-running worker afterwards).
@@ -1643,13 +1653,22 @@ class PretrainingMixin:
             from footballcoach.ai.ppo.batched_rollout_worker import spawn_batched_workers
 
             envs_per_process = max(1, self.value_pretrain_envs_per_process)
+            if _mixed:
+                from footballcoach.ai.curriculum.mix import assign_env_phases
+                env_phases = assign_env_phases(self.phase_mix, n_workers * envs_per_process)
+                worker_phases = [set(env_phases[w * envs_per_process:(w + 1) * envs_per_process])
+                                 for w in range(n_workers)]
+                log.info("  [value pretrain rollout] phase mix " + "  ".join(
+                    f"phase{p}={env_phases.count(p)}/{len(env_phases)} env slots" for p in sorted(set(env_phases))))
+            else:
+                env_phases, worker_phases = phase_id, [{phase_id}] * n_workers
             handles = spawn_batched_workers(
-                phase_id, n_workers, envs_per_process, base_seed,
+                env_phases, n_workers, envs_per_process, base_seed,
                 self.separate_value_net, self.worker_torch_threads,
                 batch_secondary_players=self.batch_secondary_players,
                 chunk_steps=self.value_pretrain_chunk_steps or None, progress_value=progress_value,
             )
-            return _ValuePretrainWorkers(handles, True, progress_value, n_workers, envs_per_process)
+            return _ValuePretrainWorkers(handles, True, progress_value, n_workers, envs_per_process, worker_phases)
         from footballcoach.ai.ppo.rollout_worker import spawn_workers
 
         handles = spawn_workers(
@@ -1767,6 +1786,11 @@ class PretrainingMixin:
         _owns_pool = pool is None
         if _owns_pool:
             pool = self._spawn_value_pretrain_workers(phase_id)
+        if pool is None and getattr(self, "phase_mix", None) is not None and set(self.phase_mix) != {phase_id}:
+            raise NotImplementedError(
+                "a value-pretrain / PPG rollout over a phase mix needs parallel batched collection "
+                "(ppo.value_pretrain_n_processes > 1 and ppo.value_pretrain_batched_rollout=true)"
+            )
         if replay_seeds and pool is None:
             log.info(
                 f"  [value pretrain rollout] {len(replay_seeds)} replay seed(s) given but ignored "
@@ -1808,6 +1832,8 @@ class PretrainingMixin:
             episode_comp_list: list[dict[str, float]] = []
             episode_durations_s: list[float] = []
             episode_seed_mse: list[tuple[int, float]] = []
+            outcomes_by_tag: dict[str, list[str]] = {}
+            rewards_by_tag: dict[str, list[float]] = {}
             n_dropped_total = 0
             _n_rows_total = 0
 
@@ -1851,6 +1877,10 @@ class PretrainingMixin:
                 outcomes_vs_neural.extend(stats["episode_outcomes_vs_neural"])
                 episode_comp_list.extend(stats["episode_comp_list"])
                 episode_durations_s.extend(stats["episode_durations_s"])
+                for _tag, _outs in stats.get("episode_outcomes_by_tag", {}).items():
+                    outcomes_by_tag.setdefault(_tag, []).extend(_outs)
+                for _tag, _rews in stats.get("episode_rewards_by_tag", {}).items():
+                    rewards_by_tag.setdefault(_tag, []).extend(_rews)
 
             try:
                 dec_state = self.decision_net.state_dict()
@@ -1883,15 +1913,18 @@ class PretrainingMixin:
                 # Round-robin chunking, identical to _train_batched_parallel's own
                 # episode-seed replay (_update_episode_replay's caller) -- each
                 # worker gets every len(pool.handles)-th seed.
+                # Phase-aware (curriculum/mix.route_seeds_to_workers): a seed only
+                # goes to a worker running its phase. One phase = plain round-robin.
+                from footballcoach.ai.curriculum.mix import route_seeds_to_workers
                 _replay_chunks = (
-                    [c for c in (replay_seeds[i::n_workers] for i in range(n_workers)) if c]
+                    route_seeds_to_workers(replay_seeds, pool.worker_phases or [{phase_id}] * n_workers)
                     if (replay_seeds and pool.batched) else []
                 )
                 for _wi, w in enumerate(pool.handles):
                     if pool.batched:
                         w.collect(
                             steps_per_worker, returns=_returns_spec, deterministic=deterministic,
-                            replay_seeds=(_replay_chunks[_wi] if _wi < len(_replay_chunks) else None),
+                            replay_seeds=((_replay_chunks[_wi] or None) if _wi < len(_replay_chunks) else None),
                         )
                     else:
                         w.collect(steps_per_worker, progress=0.0)
@@ -1954,6 +1987,7 @@ class PretrainingMixin:
             episode_comp_list = []
             episode_durations_s = []
             episode_seed_mse = []  # single-process branch has no seed-injection support
+            outcomes_by_tag, rewards_by_tag = {}, {}   # single phase-1 env: no role-based tags
             progress = ProgressReporter(n_steps, prefix="  [value pretrain rollout] ", live=True)
 
             for _step_i in range(n_steps):
@@ -2065,12 +2099,22 @@ class PretrainingMixin:
                     f"{len(episode_comp_list)} ep)\n" + "\n".join(_rew_stats_lines)
                 )
 
+        # Role-based phases' episodes (a phase mix), one line per episode tag;
+        # they are kept out of the phase-1 opponent-type tallies above.
+        if outcomes_by_tag:
+            from footballcoach.ai.ppo.rollout_logging import format_tag_outcomes
+            for _tag in sorted(outcomes_by_tag):
+                log.info("  [value pretrain rollout] "
+                         + format_tag_outcomes(_tag, outcomes_by_tag[_tag], rewards_by_tag.get(_tag, [])))
+
         return batch, {
             "episode_returns": episode_returns,
             "outcomes_vs_rules": outcomes_vs_rules,
             "outcomes_vs_immobile": outcomes_vs_immobile,
             "outcomes_vs_neural": outcomes_vs_neural,
             "episode_seed_mse": episode_seed_mse,
+            "outcomes_by_tag": outcomes_by_tag,
+            "rewards_by_tag": rewards_by_tag,
         }
 
     def pretrain_value(

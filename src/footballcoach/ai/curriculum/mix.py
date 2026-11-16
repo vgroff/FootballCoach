@@ -110,3 +110,43 @@ def assign_env_phases(mix: dict[int, float], n_slots: int) -> list[int]:
         out.append(pid)
         given[pid] += 1
     return out
+
+
+def top_fraction_per_phase(items, fraction: float, *, seed_of, score_of) -> list:
+    """The top ``fraction`` of ``items`` by ``score_of`` (descending), taken
+    WITHIN each phase separately (phase from the tagged seed ``seed_of(item)``)
+    and at least one per phase that has items. Phases have different reward
+    and value scales, so ranking them together would let one phase take every
+    replay slot. With a single phase this is exactly the plain top fraction
+    (same ceil, same stable order). Returned grouped by phase id, each group
+    in score order."""
+    import math
+
+    by_phase: dict[int, list] = {}
+    for it in items:
+        by_phase.setdefault(untag_seed(seed_of(it))[1], []).append(it)
+    out = []
+    for _pid, group in sorted(by_phase.items()):
+        n_top = max(1, math.ceil(fraction * len(group)))
+        out.extend(sorted(group, key=score_of, reverse=True)[:n_top])
+    return out
+
+
+def route_seeds_to_workers(seeds: list[int], worker_phases: list[set[int]]) -> list[list[int]]:
+    """Split tagged replay seeds across workers, each seed only to workers that
+    run an env of its phase (a worker without one could never replay it),
+    round-robin within each phase. ``worker_phases[w]`` is the set of phases
+    worker w's envs run. With every worker running every phase (a single-phase
+    run) this is the plain round-robin ``seeds[w::n_workers]``. Seeds of a
+    phase no worker runs are dropped."""
+    out: list[list[int]] = [[] for _ in worker_phases]
+    next_idx: dict[int, int] = {}
+    for s in seeds:
+        pid = untag_seed(s)[1]
+        eligible = [w for w, ph in enumerate(worker_phases) if pid in ph]
+        if not eligible:
+            continue
+        k = next_idx.get(pid, 0)
+        out[eligible[k % len(eligible)]].append(s)
+        next_idx[pid] = k + 1
+    return out

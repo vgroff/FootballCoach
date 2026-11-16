@@ -259,13 +259,19 @@ class PPGMixin:
                 if seed in pending_before
             ]
             if matched:
-                before_mean = float(np.mean([b for _s, b, _a in matched]))
-                after_mean = float(np.mean([a for _s, _b, a in matched]))
-                log.info(
-                    f"  [ppg episode replay] matched={len(matched)}/{len(pending_before)}  "
-                    f"before_mean_mse={before_mean:.4f}  after_mean_mse={after_mean:.4f}  "
-                    f"delta={after_mean - before_mean:+.4f}"
-                )
+                from footballcoach.ai.curriculum.mix import untag_seed
+                groups = {"": matched}
+                phases = sorted({untag_seed(s)[1] for s, _b, _a in matched})
+                if len(phases) > 1:   # value errors of different phases are not comparable
+                    groups = {f" phase{p}": [m for m in matched if untag_seed(m[0])[1] == p] for p in phases}
+                for tag, ms in groups.items():
+                    before_mean = float(np.mean([b for _s, b, _a in ms]))
+                    after_mean = float(np.mean([a for _s, _b, a in ms]))
+                    log.info(
+                        f"  [ppg episode replay{tag}] matched={len(ms)}/{len(pending_before)}  "
+                        f"before_mean_mse={before_mean:.4f}  after_mean_mse={after_mean:.4f}  "
+                        f"delta={after_mean - before_mean:+.4f}"
+                    )
             else:
                 log.info(
                     f"  [ppg episode replay] 0/{len(pending_before)} queued seeds were "
@@ -276,8 +282,11 @@ class PPGMixin:
         if not this_cycle_seed_mse:
             return pending_before, None
 
-        n_top = max(1, math.ceil(self._episode_replay_top_fraction * len(this_cycle_seed_mse)))
-        top_k = sorted(this_cycle_seed_mse, key=lambda t: t[1], reverse=True)[:n_top]
+        # Top fraction WITHIN each phase, like PPO's own (value scales differ
+        # between phases). One phase = the plain top fraction.
+        from footballcoach.ai.curriculum.mix import top_fraction_per_phase
+        top_k = top_fraction_per_phase(this_cycle_seed_mse, self._episode_replay_top_fraction,
+                                       seed_of=lambda t: t[0], score_of=lambda t: t[1])
         pending_before = {seed: mse for seed, mse in top_k}
         log.info(
             f"  [ppg episode replay] queued {len(top_k)} seed(s) for next cycle "

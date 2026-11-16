@@ -192,10 +192,9 @@ The PPG value refit only sees the primary phase (see Open follow-ups).
 
 - Value pre-training (pretrain_value, pretrain_combined) refuses a phase mix
   and role-based phases (NotImplementedError, 2026-11-16) instead of silently
-  warming the critic on phase 1 only. The PPG value refit still runs on the
-  primary phase only under a mix. Both share
-  `_collect_value_pretrain_rollout`; making that collector mix-aware is what
-  porting either needs.
+  warming the critic on phase 1 only. (The PPG value refit was ported to
+  mixes 2026-11-16 by making the shared collector mix-aware; value
+  pre-training could reuse that, but stays disabled for now.)
 - Unfreezing tackle / pass / mark heads for a phase needs per-row head masks.
 - The UI cannot yet show role-based terminal payouts (ScenarioLoop's payout
   display is phase-1 only).
