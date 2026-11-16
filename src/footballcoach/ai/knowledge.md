@@ -1425,6 +1425,36 @@ the switch on (training with it off marks the weights unprepared again). The
 UI's own neural players (ui/app.py, the checkpoint-picker scenario) still
 encode no task id; see the phase-2 plan's open follow-ups.
 
+## Phase-1 step early exit and stale transitions (fixed 2026-11-16)
+
+`ScenarioEnv.step()` (phase 1) used to stop a step early when "the trainee
+held the ball at the end of the PREVIOUS tick and the ball is in the opponent
+box now". That is not the episode-ending test (`detect_phase1_box_terminal`:
+the trainee holds the ball in the box NOW, with a controller), so a ball
+pushed loose into the box cut the step short without ending the episode; the
+stored previous-tick flag was not refreshed on that path, so every following
+step lasted one tick while the ball stayed in the box. The trainee decides
+every `_ticks_per_decision` ticks, and a step with no new decision re-reported
+the AI's previous `last_transition` as a new row with a fresh reward: on
+checkpoint 763, 64 duplicate rows in 400 in-process episodes (0.4%; they
+cluster in a few episodes) and 4 in 336 batched episodes (trainee and neural
+opponent rows alike). Found while chasing a time-remaining mismatch the stale
+rows carried.
+
+Now the exit is the episode-ending detector itself, evaluated per tick for
+both sides (the opponent's box terminal used to be seen only at the end of a
+full step), so a step is cut short only when the episode ends; the terminal
+tick's progress/approach shaping is not accumulated, on either side.
+`_fresh_transition` (ScenarioEnv and RoleScenarioEnv, trainee and secondaries)
+reports a transition only if the AI made a new decision during the step; a
+stale one is counted in `stale_transition_steps` and logged, and dropped unless
+the step ended the episode (kept then, so the done flag is never lost). After
+the fix: 400 episodes, 330 short steps, all terminal, 0 duplicates; batched
+350 episodes, 0 duplicates. `tests/ai_unit/test_scenario_env_early_exit.py`
+(6 of its 7 tests fail on the old code). Phase-1 env trace: 3 of 5 regimes
+identical; the other two first differ at an opponent box terminal now caught on
+its own tick (152 instead of 156) and at a terminal tick's approach shaping.
+
 ## Curriculum phases
 
 - **Phase 1** (`--phase 1`, `PHASE_1_GET_POSSESSION`): 1v1 get-possession and

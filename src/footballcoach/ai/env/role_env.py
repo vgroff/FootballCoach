@@ -229,6 +229,10 @@ class RoleScenarioEnv(ScenarioEnv):
         trainee = match.player_by_id(self.trainee_player_id)
         info = StepInfo()
         self.last_trainee_transition = None
+        # Stale-transition guard (ScenarioEnv._fresh_transition): what each
+        # neural AI held when this step started.
+        tr_at_start = {pid: getattr(match.player_by_id(pid).ai, "last_transition", None)
+                       for pid in [self.trainee_player_id, *self.secondary_player_ids]}
 
         raw_outcome: Optional[str] = None
         kicks = armed_kicks = 0
@@ -268,8 +272,9 @@ class RoleScenarioEnv(ScenarioEnv):
         info.trainee_armed_kicks_this_step = armed_kicks
         info.episode_tag = self.episode_tag
 
-        if getattr(trainee.ai, "last_transition", None) is not None:
-            self.last_trainee_transition = trainee.ai.last_transition
+        fresh = self._fresh_transition(trainee.ai, tr_at_start[self.trainee_player_id], done)
+        if fresh is not None:
+            self.last_trainee_transition = fresh
             if self._opp_flags_enabled:
                 self.last_trainee_transition = self._with_opportunity_flags(self.last_trainee_transition, trainee, done)
             info.illegal_action = self.last_trainee_transition.get("illegal_action", False)
@@ -277,7 +282,7 @@ class RoleScenarioEnv(ScenarioEnv):
         self.last_secondary_results = []
         for pid in self.secondary_player_ids:
             sec_player = match.player_by_id(pid)
-            transition = getattr(sec_player.ai, "last_transition", None)
+            transition = self._fresh_transition(sec_player.ai, tr_at_start[pid], done)
             if transition is None:
                 continue
             if self._opp_flags_enabled:

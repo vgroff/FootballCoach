@@ -403,6 +403,8 @@ class TestNotDueEnvHandledGracefully:
     AND that the not-due env's resulting transitions are IDENTICAL to
     stepping that same env unbatched from the same starting state -- the
     real correctness bar this fix has to clear, not just "doesn't raise."
+    (Since 2026-11-16 the early exit only fires when the episode ends, so this
+    state no longer arises naturally; the tolerance it tests is kept.)
     """
 
     @staticmethod

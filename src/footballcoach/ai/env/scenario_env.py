@@ -17,6 +17,7 @@ API:
 """
 from __future__ import annotations
 
+import logging
 import math
 import random
 from dataclasses import dataclass, field
@@ -44,6 +45,8 @@ from footballcoach.engine.match_logger import MatchLogger
 from footballcoach.engine.movement import SpeedMode
 from footballcoach.entities.player import Team
 from footballcoach.ui.scenarios import ScenarioDefinition, ScenarioLoop
+
+log = logging.getLogger(__name__)
 
 
 @dataclass
@@ -220,14 +223,10 @@ class ScenarioEnv:
         # it correctly-ordered, i.e. AFTER each match.step(), including the
         # trial-ending tick; this env used to keep its own separate, less
         # correctly-ordered copy, now removed).
-        # Whether the trainee held the ball at the end of the last engine tick
-        # processed, carried across step() calls. Read by step()'s early exit
-        # (trainee already holding the ball in the opponent box). Until
-        # 2026-11-15 this was the poss_prev output of a per-tick possession
-        # gain/loss state machine whose counts no longer fed any reward; at
-        # the end of each tick that machine always left poss_prev equal to
-        # (possessed_by == trainee), which is what is stored here now.
-        self._trainee_had_possession_last_step: bool = False
+        # Steps whose AI made no new decision although the step was not the
+        # end of the episode (see step()'s stale-transition guard). Should stay
+        # 0; counted so a regression is visible.
+        self.stale_transition_steps: int = 0
         # Per-secondary-player attack/defence EMA (the trainee's is self._ema).
         self._sec_ema: dict = {}
         # Populated after each step(); drained by PPOTrainer for the rollout buffer.
@@ -302,7 +301,6 @@ class ScenarioEnv:
         self._episode_ticks = 0
         self._box_bounds_cache = {}
         self._max_episode_ticks = max(1, int(self.max_episode_s / self._dt_s))
-        self._trainee_had_possession_last_step = False
         self.last_trainee_transition = None
         self.last_secondary_results = []
         self.last_terminal_match = None
@@ -402,7 +400,15 @@ class ScenarioEnv:
         goal_scored = False
         possession_lost_to_keeper = False
 
-        _trainee_poss_prev = self._trainee_had_possession_last_step
+        # Stale-transition guard: an AI's last_transition is only replaced when
+        # it makes a new decision, so a step in which it made none would
+        # re-report the previous decision as a new row (a duplicate with a
+        # fresh reward). Remember what each AI held when this step started.
+        _trainee_tr_at_start = getattr(player.ai, "last_transition", None)
+        _sec_tr_at_start = {}
+        for pid in self.secondary_player_ids:
+            _sp = match.player_by_id_or_none(pid)
+            _sec_tr_at_start[pid] = getattr(getattr(_sp, "ai", None), "last_transition", None)
         # Per-tick kick scan -- see StepInfo.trainee_kicks_this_step's own
         # comment for why a single post-loop read would silently miss kicks
         # that land on any tick but the last one of this decision interval.
@@ -506,11 +512,22 @@ class ScenarioEnv:
                 trial_ended_this_step = True
                 break
 
-            # Early-exit when the trainee is already in the opponent box with possession —
-            # any further ticks only accumulate spurious negative progress as box_dist=0.
-            if (_trainee_poss_prev and match.pitch.is_in_box(
-                match.ball.position, left=(player.team == Team.RIGHT)
-            )):
+            # End the step on the tick a box terminal happens (trainee holding
+            # the ball in the opponent box, or the opponent in the trainee's):
+            # the SAME detector that decides `done` below, evaluated on the same
+            # match state, so a step can only be cut short when the episode
+            # ends. Until 2026-11-16 this exit tested "trainee held the ball at
+            # the end of the PREVIOUS tick and the ball is in the box now", so
+            # a ball pushed loose into the box cut the step short without
+            # ending the episode, and the stored previous-tick flag was not
+            # refreshed on that path, so every following step lasted one tick
+            # while the ball stayed in the box. The trainee decides every
+            # _ticks_per_decision ticks, so those steps re-reported its
+            # previous decision as new rows (measured: 64 duplicate rows in 400
+            # episodes of checkpoint 763; 4 in 336 on the batched path). It
+            # also only checked the trainee's side, so the opponent's box
+            # terminal was only seen at the end of a full step.
+            if detect_phase1_box_terminal(match, trainee_player_id=self.trainee_player_id) is not None:
                 break
 
             # Accumulate progress/approach using PRE-tick last_touched_by (the
@@ -540,8 +557,6 @@ class ScenarioEnv:
             # ball-level read, since last_touched_by_player_id is one field
             # every player_id is just compared against.
             _last_toucher_prev = match.ball.last_touched_by_player_id
-            # Possession as of the end of this tick, for the next tick's early exit.
-            _trainee_poss_prev = match.ball.possessed_by == self.trainee_player_id
 
         # Update EMA with the trainee's attack/defence output (from NeuralPlayerAI transition)
         if self.last_trainee_transition is not None:
@@ -587,7 +602,6 @@ class ScenarioEnv:
         _phase1_terminal = detect_phase1_box_terminal(match, trainee_player_id=self.trainee_player_id)
         box_terminal = _phase1_terminal == "box_possession"
         opponent_box_terminal = _phase1_terminal == "opponent_box_possession"
-        self._trainee_had_possession_last_step = _trainee_poss_prev
 
         timeout = self._episode_ticks >= int(self.max_episode_s / self._dt_s)
         if self.phase == 1:
@@ -644,7 +658,7 @@ class ScenarioEnv:
 
         # --- Collect trainee transition from NeuralPlayerAI ---
         if hasattr(player, "ai") and player.ai is not None and hasattr(player.ai, "last_transition"):
-            self.last_trainee_transition = player.ai.last_transition
+            self.last_trainee_transition = self._fresh_transition(player.ai, _trainee_tr_at_start, done)
             if self._opp_flags_enabled and self.last_trainee_transition is not None:
                 self.last_trainee_transition = self._with_opportunity_flags(
                     self.last_trainee_transition, player, done,
@@ -660,6 +674,7 @@ class ScenarioEnv:
                 hasattr(sec_player, "ai") and sec_player.ai is not None
                 and hasattr(sec_player.ai, "last_transition")
                 and sec_player.ai.last_transition is not None
+                and self._fresh_transition(sec_player.ai, _sec_tr_at_start.get(pid), done) is not None
             )
             if not _sec_has_transition and not self.always_compute_secondary_reward:
                 continue
@@ -965,6 +980,23 @@ class ScenarioEnv:
     def _find_trainee(self, match: Match):
         return match.player_by_id(self.trainee_player_id)
 
+    def _fresh_transition(self, ai, at_step_start, done: bool):
+        """``ai.last_transition`` if the AI made a new decision during this
+        step; otherwise the stale-transition guard (see step()): counted in
+        stale_transition_steps and logged, and dropped (None) unless the step
+        ended the episode. A terminal step keeps it, so the episode boundary
+        (done flag, terminal reward) is never lost. Since the early exit only
+        fires when the episode ends, steps always start on a decision tick and
+        this should never happen."""
+        tr = getattr(ai, "last_transition", None)
+        if tr is None or tr is not at_step_start:
+            return tr
+        self.stale_transition_steps += 1
+        log.warning("ScenarioEnv: a step ended with no new decision from %s (%s; %d so far)",
+                    type(ai).__name__, "kept: episode end" if done else "stale transition dropped",
+                    self.stale_transition_steps)
+        return tr if done else None
+
     def _with_opportunity_flags(self, transition: dict, player, done: bool) -> dict:
         """Copy of a NeuralPlayerAI ``last_transition`` whose ``raw_exec`` also carries the
         decision interval's opportunity flags (``entities/action_opportunity.OPP_ACTION_KEYS``),
@@ -976,8 +1008,10 @@ class ScenarioEnv:
         end of ``step()``, which normally spans exactly that interval. ``opp_partial`` marks the
         exceptions -- an interval cut short by an early exit that is NOT the end of the episode
         (the next ``step()`` starts mid-interval), whose flags are therefore incomplete; counted
-        so the size of that exception is visible instead of assumed. A copy, never an in-place
-        edit: on such a not-due step ``last_transition`` is still the previous decision's dict.
+        so the size of that exception is visible instead of assumed. Since 2026-11-16 the early
+        exit fires only when the episode ends, so this should stay 0 (and a step with no new
+        decision no longer reports the previous one: see _fresh_transition). A copy, never an
+        in-place edit.
         """
         f = player.opportunity.flags(player.kick_count, player.tackle_fire_count, self._opp_cross_head_cutoff)
         ai = player.ai

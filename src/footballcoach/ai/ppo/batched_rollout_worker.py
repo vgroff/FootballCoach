@@ -40,7 +40,7 @@ falls through to ``act()``'s completely normal cached-gating path for that
 tick -- identical to what happens for that same tick in the unbatched
 ``rollout_worker.py`` path, so this is not a behavior change, just
 tolerance for something the original design incorrectly assumed could never
-happen.
+happen. (Since 2026-11-16 that exit fires only on the tick the episode ends on a box terminal, so a non-terminal step is never cut short and this case should no longer arise; the tolerance stays, and ScenarioEnv counts any step that ends without a fresh decision in stale_transition_steps. Before, a ball pushed loose into the box cut steps short without ending the episode and the steps with no decision re-reported the previous row: see ScenarioEnv.step().)
 
 Mechanism, per round:
   1. For each env: check its trainee's ``NeuralPlayerAI.is_due_for_decision()``;
@@ -379,7 +379,8 @@ class BatchedEnvGroup:
         top docstring), but it has at least one legitimate early-exit
         (trainee already in the opponent box with possession -- further
         ticks would only accumulate spurious negative progress) that can
-        end an interval several ticks short. When that happens, the
+        end an interval several ticks short (only at the end of an episode
+        since 2026-11-16; see this module's top docstring). When that happens, the
         NEXT round's would-be decision is not actually due yet -- calling
         ``prepare()`` on it would legitimately return ``None`` (exactly the
         cached-gating-reapply behavior the unbatched path already relies
