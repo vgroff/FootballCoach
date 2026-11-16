@@ -117,6 +117,16 @@ class RoleScenarioEnv(ScenarioEnv):
         self.episode_controllers: dict[str, str] = {}
         self.episode_tag: str = ""
         self._attacking_team = None
+        # BC (ai/ppo/bc_sources.py): role -> source id for the roles this
+        # phase has BC switched on for; their neural players are labelled by
+        # the role's own rules AI (ai/bc/role_experts.RulesExpert).
+        from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+        from footballcoach.ai.ppo.bc_sources import bc_roles, source_id
+        self._bc_source_of_role: dict[str, int] = (
+            {role: source_id(phase, role) for role in bc_roles(PHASES_BY_ID[phase])}
+            if phase in PHASES_BY_ID else {}
+        )
+        self._bc_source_of_player: dict[str, int] = {}
 
     # ------------------------------------------------------------------
 
@@ -177,16 +187,26 @@ class RoleScenarioEnv(ScenarioEnv):
                 self._sec_ema[pid] = EMAFilter.from_config()
         for pid in self.secondary_player_ids:
             self._sec_ema[pid].reset()
+        self._bc_source_of_player = {}
         for pid in neural:
             player = match.player_by_id(pid)
             ema = self._ema if pid == self.trainee_player_id else self._sec_ema[pid]
+            source = self._bc_source_of_role.get(self.roles[pid], 0)
+            self._bc_source_of_player[pid] = source
+            if source:
+                # The role's rules AI and its opening order, as the scenario
+                # built them, BEFORE the neural AI replaces them below.
+                from footballcoach.ai.bc.role_experts import RulesExpert
+                label_fn = RulesExpert(player.ai, player.current_order, player).label
+            else:
+                label_fn = self.bc_label_fn if pid == self.trainee_player_id else None
             player.ai = NeuralPlayerAI(
                 self.sample_action_fn,
                 decision_interval_ticks=self._ticks_per_decision,
                 max_episode_s=self.max_episode_s,
                 ema_smoothed=ema.smoothed,
                 rng=self.rng,
-                bc_label_fn=self.bc_label_fn if pid == self.trainee_player_id else None,
+                bc_label_fn=label_fn,
                 task_phase=self.phase,
             )
             # The scenario's scripted opening order belongs to the rules AI.
@@ -277,6 +297,9 @@ class RoleScenarioEnv(ScenarioEnv):
             if self._opp_flags_enabled:
                 self.last_trainee_transition = self._with_opportunity_flags(self.last_trainee_transition, trainee, done)
             info.illegal_action = self.last_trainee_transition.get("illegal_action", False)
+            source = self._bc_source_of_player.get(self.trainee_player_id, 0)
+            if source:
+                self.last_trainee_transition = {**self.last_trainee_transition, "bc_source": source}
 
         self.last_secondary_results = []
         for pid in self.secondary_player_ids:
@@ -294,6 +317,7 @@ class RoleScenarioEnv(ScenarioEnv):
                 "done": 1.0 if done else 0.0,
                 "step_outcome": outcome or "",
                 "reward_components": dict(sec_comps),
+                "bc_source": self._bc_source_of_player.get(pid, 0),
             })
 
         if done:

@@ -1214,6 +1214,7 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                 reward=reward,
                 done=1.0 if done else 0.0,
                 bc_label=bc_label_arr,
+                bc_source=tr.get("bc_source", 0),
                 head_log_probs=tr.get("head_log_probs"),
                 reward_comps=dict(getattr(env, "last_reward_components", {})),
                 step_outcome=(info.trial_outcome or "") if (done and info is not None) else "",
@@ -1228,7 +1229,10 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
                     value=sec["value"],
                     reward=sec["reward"],
                     done=sec["done"],
-                    bc_label=None,
+                    # A role-based phase labels secondaries too (BC-enabled roles,
+                    # ai/ppo/bc_sources.py); phase-1 secondaries carry None.
+                    bc_label=sec.get("bc_label"),
+                    bc_source=sec.get("bc_source", 0),
                     # Secondary players use the same NeuralPlayerAI as the
                     # trainee (see rules_ai.py's last_transition, which sets
                     # "head_log_probs" unconditionally), so this is real

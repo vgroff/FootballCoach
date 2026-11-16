@@ -136,6 +136,11 @@ class RolloutBuffer:
     # ai/knowledge.md "Per-track GAE segmentation" for the bug this fixes.
     track_ids: list[str] = field(default_factory=list)
 
+    # Which BC schedule governs this row's label (ai/ppo/bc_sources.py): 0 =
+    # the global bc.aux_coeff_* schedules (phase 1, and roles without BC);
+    # i > 0 = the i-th configured (phase, role).
+    bc_sources: list[int] = field(default_factory=list)
+
     def add(
         self,
         obs: dict[str, np.ndarray],
@@ -150,6 +155,7 @@ class RolloutBuffer:
         reward_comps: Optional[dict] = None,
         step_outcome: str = "",
         track_id: str = "trainee",
+        bc_source: int = 0,
     ) -> None:
         from footballcoach.ai.ppo.bc import BC_LABEL_DIM
         self.obs.append(obs)
@@ -170,6 +176,7 @@ class RolloutBuffer:
         self.reward_comps.append(reward_comps if reward_comps is not None else {})
         self.step_outcomes.append(step_outcome)
         self.track_ids.append(track_id)
+        self.bc_sources.append(int(bc_source))
 
     def _track_index_groups(self) -> dict[str, list[int]]:
         """Row indices grouped by ``track_ids``, each preserving original order.
@@ -357,6 +364,7 @@ class RolloutBuffer:
         self.reward_comps = self.reward_comps[:keep]
         self.step_outcomes = self.step_outcomes[:keep]
         self.track_ids = self.track_ids[:keep]
+        self.bc_sources = self.bc_sources[:keep]
         return n_dropped
 
     def as_tensors(
@@ -416,6 +424,7 @@ class RolloutBuffer:
         # secondary_weight is ever set to 1.0, and doesn't extend past two
         # tracks). A plain list, not a tensor -- these are strings.
         result["track_ids"] = list(self.track_ids)
+        result["bc_sources"] = torch.tensor(self.bc_sources, dtype=torch.long)
 
         return result
 
@@ -432,3 +441,4 @@ class RolloutBuffer:
         self.reward_comps.clear()
         self.step_outcomes.clear()
         self.track_ids.clear()
+        self.bc_sources.clear()

@@ -105,6 +105,11 @@ class _UpdateContext:
     opp_grad_scale: Optional[torch.Tensor]
     warm_base_lrs: list               # this update's scheduled lrs, for the per-update warmup
     step_outcomes: list
+    # Per-row BC coefficients (ai/ppo/bc_sources.py): (n_sources + 1, 3)
+    # (other, kick, tackle) by row source; None when no per-phase / per-role BC
+    # is configured, in which case the global coefficients above apply to
+    # every row exactly as before.
+    bc_coeff_table: Optional[torch.Tensor] = None
 
 
 @dataclasses.dataclass
@@ -130,6 +135,9 @@ class _UpdateStats:
     kick_prob: list = dataclasses.field(default_factory=list)        # mean sigmoid(kick_logit) per mb
     ratios: list = dataclasses.field(default_factory=list)
     entropy_breakdown: dict = dataclasses.field(default_factory=dict)
+    # BC source id -> [(other, kick, tackle) mean group loss over its valid
+    # rows, per minibatch] (per-phase / per-role BC only).
+    bc_by_source: dict = dataclasses.field(default_factory=dict)
     epoch_sample_policy_loss: list = dataclasses.field(default_factory=list)
     epoch_sample_value_loss: list = dataclasses.field(default_factory=list)
     epoch_sample_surrogate: list = dataclasses.field(default_factory=list)  # unclipped (r-1)*A per row
@@ -913,6 +921,12 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
         for pg in self.optimizer.param_groups:
             pg["lr"] = value_lr if pg.get("name") == "value" else lr
         has_bc = "bc_labels" in batch and (bc_coeff > 0.0 or bc_kick_coeff > 0.0 or bc_tackle_coeff > 0.0)
+        from footballcoach.ai.ppo import bc_sources as _bcs
+        bc_coeff_table = None
+        if _bcs.sources() and "bc_sources" in batch:
+            bc_coeff_table = _bcs.coeff_table(progress, (bc_coeff, bc_kick_coeff, bc_tackle_coeff))
+            _used = torch.unique(batch["bc_sources"])
+            has_bc = "bc_labels" in batch and bool((bc_coeff_table[_used] > 0.0).any())
         adv = batch["advantages"]
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
         old_log_probs = batch["log_probs"]
@@ -929,6 +943,7 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
             returns=batch["returns"], opp_mask=opp_mask, opp_grad_scale=opp_grad_scale,
             warm_base_lrs=[pg["lr"] for pg in self.optimizer.param_groups],
             step_outcomes=batch.get("step_outcomes", []),
+            bc_coeff_table=bc_coeff_table,
         )
 
     def _direction_spread_means(self) -> tuple[float, float, float]:
@@ -1091,20 +1106,50 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
         bc_tackle)."""
         from footballcoach.ai.ppo.bc import bc_loss_from_tensor
         mb_bc = ctx.batch["bc_labels"][mb_idx].to(self.device)
+        per_row = ctx.bc_coeff_table is not None
         bc_loss_val, _bkdn, _bsplit = bc_loss_from_tensor(
             mb_bc, self._bc_heads_for_loss(d_heads), e_heads,
             **self._bc_loss_kwargs(),
             return_breakdown=True,
             split_kick=True,
             split_tackle=True,
+            return_group_rows=per_row,
         )
         stats.bc_tackle_loss.append(_bkdn.get("tackle_attempt", 0.0))
+        if per_row:
+            # Each row's (other, kick, tackle) group losses weighted by ITS
+            # source's coefficients, averaged over the valid rows -- with every
+            # row on source 0 this is the expression below (same means).
+            src = ctx.batch["bc_sources"][mb_idx].to(self.device)
+            coeffs = ctx.bc_coeff_table.to(self.device)[src]
+            valid = _bsplit["valid"]
+            rows = _bsplit["rows"]
+            weighted = ((coeffs * rows).sum(dim=1) * valid).sum() / valid.sum().clamp(min=1)
+            with torch.no_grad():
+                for s in torch.unique(src[valid]).tolist():
+                    if s:
+                        m = valid & (src == s)
+                        stats.bc_by_source.setdefault(int(s), []).append(rows[m].mean(dim=0).tolist())
+            return bc_loss_val, weighted
         weighted = (
             ctx.bc_coeff * _bsplit["other_group_loss"]
             + ctx.bc_kick_coeff * _bsplit["kick_group_loss"]
             + ctx.bc_tackle_coeff * _bsplit["tackle_group_loss"]
         )
         return bc_loss_val, weighted
+
+    @staticmethod
+    def _bc_by_source_metrics(ctx: _UpdateContext, stats: _UpdateStats) -> dict:
+        """{"phase2_1v2/attacker": {"coeff": [other, kick, tackle], "loss":
+        [other, kick, tackle]}} for each per-phase / per-role BC source seen."""
+        if ctx.bc_coeff_table is None:
+            return {}
+        from footballcoach.ai.ppo.bc_sources import describe
+        out = {}
+        for s, vals in sorted(stats.bc_by_source.items()):
+            out[describe(s)] = {"coeff": ctx.bc_coeff_table[s].tolist(),
+                                "loss": np.mean(np.asarray(vals), axis=0).tolist()}
+        return out
 
     def _ppo_pre_update_value_loss(self, ctx: _UpdateContext) -> float:
         """Value loss on the full batch with the weights as they are BEFORE this
@@ -1589,6 +1634,12 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
                     continue
                 mb_obs = self._minibatch_obs(ctx.batch, mb_idx)
                 mb_bc = ctx.batch["bc_labels"][mb_idx].to(self.device)
+                if ctx.bc_coeff_table is not None:
+                    # The continuation applies the GLOBAL coefficient: keep it to
+                    # the rows the global schedules govern (source 0).
+                    from footballcoach.ai.ppo.bc import _I_VALID
+                    mb_bc = mb_bc.clone()
+                    mb_bc[ctx.batch["bc_sources"][mb_idx].to(self.device) != 0, _I_VALID] = 0.0
                 parts = _obs_parts(mb_obs)
                 sf, of, em, bf, gf, sat, oat = parts
                 d_heads_bo = self._ppo_decision_forward(mb_obs, parts)
@@ -1677,6 +1728,7 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
             "bc_coeff": ctx.bc_coeff,
             "bc_kick_coeff": ctx.bc_kick_coeff,
             "bc_tackle_coeff": ctx.bc_tackle_coeff,
+            "bc_by_source": self._bc_by_source_metrics(ctx, stats),
             "epoch_time_ms": float(np.mean(stats.epoch_times)) if stats.epoch_times else 0.0,
             "move_log_std": self.execution_net.move_dir_log_kappa.data.tolist(),
             "kick_log_std": self.execution_net.kick_dir_log_kappa.data.tolist(),

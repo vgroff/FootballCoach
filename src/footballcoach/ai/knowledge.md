@@ -1540,6 +1540,42 @@ their critic is unchanged exactly; the optimizer state is then not restored
 (its Adam moments have the old shape). Without it the tolerant loader would
 silently have left that whole layer at random init.
 
+## Per-phase, per-role BC (`ai/ppo/bc_sources.py`, 2026-11-16)
+
+A role-based phase switches BC on per role in `curriculum.<phase>.bc`
+(`{role: {group: {coeff_start, coeff_end, anneal_fraction}}}`, groups
+`other` / `kick` / `tackle` = bc_loss_from_tensor's split; empty = off, the
+default). Example, kick BC for the phase-2 attacker only:
+`{"attacker": {"kick": {"coeff_start": 0.5, "coeff_end": 0.0, "anneal_fraction": 0.3}}}`.
+
+- **Labels** come from the role's own rules AI through
+  `ai/bc/role_experts.RulesExpert`, for every neural player in that role,
+  trainee or secondary. The expert's memory (shadow order + the AI's fields)
+  follows the episode as the neural player plays it (per-AI reconcilers:
+  keeper close-down commitment / cooldown, attacker run after a neural kick);
+  orders are labelled by `ai/bc/order_labels.order_label` (audited per order
+  class, see the CRITICAL section above). Roles without BC get no labels.
+- **Rows** carry a BC source id (`RolloutBuffer.bc_sources`, threaded through
+  every rollout path, augmentation and batch splits): 0 = the global
+  `bc.aux_coeff_*` schedules (phase 1), i = the i-th configured (phase, role)
+  (ids are a sorted function of the config, so workers and trainer agree).
+- **Loss**: when any source is configured, `_ppo_bc_aux_loss` weights each
+  row's (other, kick, tackle) group losses by ITS source's coefficients
+  (`coeff_table`), averaged over the valid rows; with every row on source 0
+  that is the old expression (tested). Nothing configured = the old code path.
+  A phase-2 coefficient puts no gradient through phase-1 rows and vice versa
+  (tested); the BC-only continuation only touches source-0 rows. Logged per
+  source as `bc[phase2_1v2/attacker]=kick <loss>x<coeff>`.
+- **Measured** on checkpoint 763's own phase-2 episodes (neural attacker, rules
+  defender and keeper; 150 episodes, 1508 attacker rows): 44% of rows say
+  "kick now" (99 of 150 episodes have at least one), 54% move, 2% hold. Since
+  763 never shoots, once the rules attacker would shoot it keeps saying so at
+  every decision: a strong, steady pull towards shooting, no positive-label
+  weighting needed.
+
+With BC off, every trace is identical apart from the new per-row
+`bc_sources` (all 0) and an empty `bc_by_source` metric.
+
 ## Phase-1 step early exit and stale transitions (fixed 2026-11-16)
 
 `ScenarioEnv.step()` (phase 1) used to stop a step early when "the trainee

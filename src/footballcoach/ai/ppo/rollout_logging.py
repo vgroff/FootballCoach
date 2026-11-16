@@ -56,6 +56,12 @@ class RolloutLoggingMixin:
             + f")[tk={_bc_tk:.3f}]"
             if metrics.get("bc_coeff", 0.0) > 0.0 or _bc_kick_coeff > 0.0 or _bc_tackle_coeff > 0.0 else ""
         )
+        # Per-phase / per-role BC (ai/ppo/bc_sources.py): its coefficients and
+        # its (other, kick, tackle) group losses, one entry per source.
+        for _src, _v in (metrics.get("bc_by_source") or {}).items():
+            _c, _l = _v["coeff"], _v["loss"]
+            bc_str += (f"  bc[{_src}]=" + "/".join(
+                f"{g} {l:.3f}x{c:.2f}" for g, c, l in zip(("other", "kick", "tackle"), _c, _l) if c > 0.0))
         # Phase-1 outcome breakdown over this rollout's episodes, split by
         # opponent type -- win/loss/timeout/miss(+other), see
         # outcome_breakdown() for the win%/loss%/tout%/miss% format.

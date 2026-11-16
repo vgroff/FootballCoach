@@ -188,6 +188,17 @@ The PPG value refit only sees the primary phase (see Open follow-ups).
   with task ids on); checkpoints carry `task_id_inputs_ready` and the
   trainer refuses unprepared weights. See ai/knowledge.md "Task-id".
 
+- [x] Stage 6 (2026-11-16): per-phase, per-role BC (ai/ppo/bc_sources.py):
+  labels from each role's own rules AI via ai/bc/role_experts.RulesExpert
+  (memory kept true to the neural player's play), per-row source ids and
+  per-row coefficients in the PPO update; off by default
+  (curriculum.phase2.bc = {}). Kick BC for the attacker is one config entry;
+  BC for a neural goalkeeper later is another (its rules AI is supported).
+  Along the way: kick and tackle intents (engine applies them after
+  execute(), so a label's counterfactual never acts on the match), shots and
+  passes do the kick bookkeeping, an audit of every order class's labels,
+  and a fix for phase-1 label counterfactuals that leaked into the match.
+
 ## Open follow-ups
 
 - Value pre-training (pretrain_value, pretrain_combined) refuses a phase mix

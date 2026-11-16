@@ -242,6 +242,7 @@ def augment_batch(
     has_reward_comps: bool = "reward_comps_raw" in batch
     has_step_outcomes: bool = "step_outcomes" in batch
     has_track_ids: bool = "track_ids" in batch
+    has_bc_sources: bool = "bc_sources" in batch
 
     # Pre-build index tensors once (avoids repeated Python list → tensor conv)
     _px = torch.tensor(PLAYER_FLIP_X_IDX, dtype=torch.long)
@@ -387,6 +388,9 @@ def augment_batch(
                 # therefore desync row-count with everything else) the
                 # moment augmentation is enabled.
                 part["track_ids"] = batch["track_ids"]
+            if has_bc_sources:
+                # Per-row BC schedule id (ai/ppo/bc_sources.py): not geometric.
+                part["bc_sources"] = batch["bc_sources"]
 
             parts.append(part)
 

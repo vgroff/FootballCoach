@@ -1053,6 +1053,7 @@ def bc_loss_from_tensor(
     exec_label_smoothing: float = 0.0,
     split_kick: bool = False,
     split_tackle: bool = False,
+    return_group_rows: bool = False,
 ):
     """Compute BC loss for a minibatch, given packed label tensors.
 
@@ -1172,6 +1173,9 @@ def bc_loss_from_tensor(
                 _zero_split["kick_group_loss"] = _zero
             if split_tackle:
                 _zero_split["tackle_group_loss"] = _zero
+            if return_group_rows:
+                _zero_split["rows"] = torch.zeros(labels.shape[0], 3, device=labels.device)
+                _zero_split["valid"] = valid
             result += (_zero_split,)
         return result if len(result) > 1 else result[0]
 
@@ -1331,6 +1335,11 @@ def bc_loss_from_tensor(
             split["kick_group_loss"] = _group_mean(kick_group_per_row)
         if split_tackle:
             split["tackle_group_loss"] = _group_mean(tackle_group_per_row)
+        if return_group_rows:
+            # Per-row (other, kick, tackle) group losses (differentiable) and
+            # the valid mask, for per-row coefficients (ai/ppo/bc_sources.py).
+            split["rows"] = torch.stack([other_group_per_row, kick_group_per_row, tackle_group_per_row], dim=1)
+            split["valid"] = valid
 
     if return_breakdown:
         # kick_direction/kick_power/kick_spin are gated to zero on non-kick

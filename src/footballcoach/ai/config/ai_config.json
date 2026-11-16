@@ -225,6 +225,8 @@
     "phase2": {
       "_comment": "Phase 2 (1v2) env settings, read by curriculum/envs.py's role-based env builder. controllers: per role, unnormalised weights over 'rules' / 'neural', rolled independently per role at every reset. All-rules episodes have no neural player, so they work for playthroughs and evals but produce no training rows; training needs at least one role able to roll neural (the plan: attacker + defender neural, goalkeeper rules; goalkeeper neural later).",
       "max_episode_s": 15.0,
+      "bc": {},
+      "_comment_bc": "Per-role BC for this phase (ai/ppo/bc_sources.py), off when empty. role -> {group: {coeff_start, coeff_end, anneal_fraction}}, groups 'other' (decision heads, movement, region), 'kick' (kick_this_tick / direction / power / spin) and 'tackle' (tackle_attempt); a group left out is 0 for that role. Labels come from the role's own rules AI (ai/bc/role_experts.RulesExpert, its memory kept true to the neural player's play) for every neural player in the role, trainee or secondary, and only those rows get these coefficients (phase-1 rows keep the global bc.aux_coeff_* ones). Each schedule anneals linearly over the first anneal_fraction of training, like bc.aux_coeff_*. Example, kick BC for the attacker only: {\"attacker\": {\"kick\": {\"coeff_start\": 0.5, \"coeff_end\": 0.0, \"anneal_fraction\": 0.3}}}.",
       "eval_episodes": 40,
       "eval_seed_offset": 1000000,
       "_comment_eval": "Periodic phase-2 evals (PHASE_2_1V2.eval_specs, ai/eval/role_phase_eval.py): every spec runs seeds eval_seed_offset .. eval_seed_offset + eval_episodes - 1, one episode each, whenever ppo.rollout_eval_trials > 0 and phase 2 is in the training mix.",

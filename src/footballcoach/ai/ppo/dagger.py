@@ -38,7 +38,7 @@ log = logging.getLogger("footballcoach.ai.ppo.dagger")
 _ROLLOUT_BUFFER_FIELDS = [
     "obs", "actions", "log_probs", "values", "rewards", "dones",
     "bc_labels", "head_log_probs", "weights", "reward_comps",
-    "step_outcomes", "track_ids",
+    "step_outcomes", "track_ids", "bc_sources",
 ]
 
 
