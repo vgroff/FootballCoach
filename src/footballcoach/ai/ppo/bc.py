@@ -289,7 +289,13 @@ def _counterfactual_execution(player: "Player", match: "Match", order) -> dict:
     (possibly neural-driven) player, and why the per-tick flags are reset first.
 
     Returns {move_direction, sprint_label, exec_move_label, kick_this_tick,
-    kick_direction, kick_power_fraction, kick_spin, tackle_attempt}.
+    kick_direction, kick_power_fraction, kick_spin, tackle_attempt, completed
+    (execute()'s return: the order finished this tick), order_after (the order
+    the player would hold next: ``order`` itself unless it handed over to
+    another, e.g. a ShootOrder pausing for a blocker)}. ``order``'s own
+    internal state (status, reached_target, ...) does advance: callers pass a
+    fresh order (phase 1) or the expert's shadow order, whose progress should
+    track the real player (ai/bc/role_experts.py).
     """
     move_direction = None
     sprint_label = 0.0
@@ -375,9 +381,19 @@ def _counterfactual_execution(player: "Player", match: "Match", order) -> dict:
     player.on_tackle = None
     player.on_tackle_result = None
     player.on_auto_tackle_result = None
+    # The game log is not part of the match state, but a counterfactual's log
+    # lines ("shot at goal", "push-kick ...") describe things that never
+    # happened, so the UI's log must not see them.
+    _snap_log_callback = match.log_callback
+    match.log_callback = None
+    _completed, _order_after = False, order
     try:
         _dt = match.dt_s
-        order.execute(player, match, _dt)
+        _completed = bool(order.execute(player, match, _dt))
+        # The order the player would hold next: normally ``order`` itself,
+        # but an order may hand over to another one (ShootOrder pausing for a
+        # blocker installs a MoveOrder). Read before the restore below.
+        _order_after = player.current_order
         # The order's kick intent (engine/kick_intent.py) is READ, not carried
         # out: kick_label_fields asks the same kick functions for the planned
         # launch with release=False (no ball, no rng, no bookkeeping). Since
@@ -385,6 +401,10 @@ def _counterfactual_execution(player: "Player", match: "Match", order) -> dict:
         # before the random kick error (it used to be the noisy direction the
         # ball actually left at, from a real counterfactual kick).
         _kick = None
+        # Likewise a tackle intent (ChaseTackleOrder on contact) is read, not
+        # resolved: the network's equivalent is arming a tackle.
+        _tackle_intent = player.pending_tackle is not None
+        player.pending_tackle = None
         if player.pending_kick is not None:
             from footballcoach.engine.kick_intent import kick_label_fields
             _intent, player.pending_kick = player.pending_kick, None
@@ -435,15 +455,10 @@ def _counterfactual_execution(player: "Player", match: "Match", order) -> dict:
             kick_direction = np.array([_d.x, _d.y, _d.z], dtype=np.float32)
             kick_power_fraction = player.kick_armed_power_fraction
             kick_spin = np.zeros(3, dtype=np.float32)
-        # tackle_attempt: `order` here is always MoveOrder/GetPossessionOrder
-        # (Phase1RulesAI.decide() never produces a ChaseTackleOrder
-        # directly -- that only ever arises from MarkOrder's own
-        # intercept/tackle fallback, which decide() never chooses), and
-        # only GetPossessionOrder's execute() (via
-        # Match._run_get_possession_behaviour) can arm a tackle. Reading
-        # tackle_armed post-execute() covers exactly that case with no
-        # extra branching needed.
-        if player.tackle_armed:
+        # tackle_attempt: an armed tackle (GetPossessionOrder / MarkOrder, via
+        # Match._run_get_possession_behaviour) or a ChaseTackleOrder's tackle
+        # intent on contact -- both are what the network expresses by arming.
+        if player.tackle_armed or _tackle_intent:
             tackle_attempt = 1.0
     finally:
         # Restore EVERYTHING — this call must be perfectly invisible to
@@ -473,6 +488,7 @@ def _counterfactual_execution(player: "Player", match: "Match", order) -> dict:
         match.ball.velocity = _snap_ball_velocity
         match.ball.position = _snap_ball_position
         match.rng.setstate(_snap_rng_state)
+        match.log_callback = _snap_log_callback
         for _obj, _saved in ((player, _snap_player_vars), (match.ball, _snap_ball_vars)):
             _d = vars(_obj)
             for _k in [k for k in _d if k not in _saved]:
@@ -488,6 +504,8 @@ def _counterfactual_execution(player: "Player", match: "Match", order) -> dict:
         kick_power_fraction=kick_power_fraction,
         kick_spin=kick_spin,
         tackle_attempt=tackle_attempt,
+        completed=_completed,
+        order_after=_order_after,
     )
 
 

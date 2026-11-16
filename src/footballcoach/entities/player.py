@@ -194,6 +194,9 @@ class Player:
     # A kick an order recorded this tick (engine/kick_intent.KickIntent),
     # applied by Match._process_orders right after that order's execute().
     pending_kick: object = field(default=None, repr=False, compare=False)
+    # The player_id an order chose to tackle this tick (ChaseTackleOrder on
+    # contact), resolved by Match._process_orders right after execute().
+    pending_tackle: object = field(default=None, repr=False, compare=False)
     # Set by rules AI (orders.py's _try_push_kick, via MoveOrder /
     # GetPossessionOrder) or neural AI (apply_nn_action.py) during approach;
     # engine fires the kick on first-touch (_update_loose_ball_pickup),

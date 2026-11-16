@@ -124,6 +124,23 @@ fields: the named list once missed the ball's spin and the first-touch state,
 so a label could change the real match (`tests/ai_unit/
 test_counterfactual_is_invisible.py`).
 
+**Every order class is audited** (`ai/bc/order_labels.order_label`, the
+general labeller the role-based BC experts use; `tests/ai_scenario/
+test_order_label_audit.py`): for MoveOrder (plain and push-kick),
+GetPossession (loose ball, tackle arm, armed first touch), ShootOrder (and its
+pause-for-a-blocker handover to a MoveOrder), PassOrder, KickOrder,
+ChaseTackleOrder (chasing and in contact), MarkOrder, StopOrder, SaveOrder and
+JogOrder, the label call leaves every player, the ball, the match rng / clock
+and the game log unchanged, and its execution labels equal what the order
+then really does that tick (movement intent, kick fire / arm, exact kick
+direction with the random error off, launch speed, power, tackle). Decision
+heads come from the order type (`DECISION_HEAD_OF_ORDER`); SaveOrder is
+labelled move (the network has no save action), KickOrder shoot, JogOrder
+move. Target heads (pass / tackle / mark target) are not in the label vector.
+On phase 1's own orders it gives phase1_labels_for_player's labels bit for
+bit. The audit found ChaseTackleOrder resolving a REAL tackle in the
+counterfactual (fixed with a tackle intent, engine/knowledge.md).
+
 ## Package layout
 
 ```

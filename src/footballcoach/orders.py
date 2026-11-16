@@ -830,7 +830,10 @@ class ChaseTackleOrder:
         if are_touching(player, target):
             from footballcoach.engine.collision import can_tackle
             if can_tackle(player, target):
-                match._attempt_tackle_contact(player, target)
+                # A tackle intent, resolved by the engine right after this
+                # execute() (Match._process_orders), not here: a BC label's
+                # counterfactual execute() must not tackle the real opponent.
+                player.pending_tackle = target.player_id
             return True
         return False
 

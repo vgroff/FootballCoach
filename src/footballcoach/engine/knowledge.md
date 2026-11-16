@@ -427,7 +427,18 @@ it: a rules-AI shot never counted as a kick, and a first-touch shooter stayed
 in CONTROLLING_BALL (moving as if still carrying the ball) until the control
 timer ran out. On the engine trace only 1v2, 2v2 and pass changed; their
 per-tick physics is bit-identical except 2v2 from the first first-touch shot
-(tick 18), and outcome totals are unchanged. Not routed through intents: the
+(tick 18), and outcome totals are unchanged.
+
+Tackles likewise: `ChaseTackleOrder` used to resolve its tackle inside
+`execute()` on contact (`match._attempt_tackle_contact`), so a BC label's
+counterfactual tackled the REAL opponent. It now records
+`player.pending_tackle`, resolved by `_process_orders` right after
+`execute()` (traces identical). The other tackling orders (GetPossession,
+Mark) only arm (`tackle_armed`), resolved later by `_check_armed_tackles`.
+Unlike armed tackles it does not count `tackle_fire_count` (unchanged; it is a
+UI-only order). `SaveOrder` writes the keeper's position directly when the
+save point is within one tick's reach (a snap); that is the labelled player
+and is restored by the counterfactual. Not routed through intents: the
 neural player's in-possession kick (`apply_nn_action.py`, whose kick-once logic
 reads the kick count right after applying), the engine's armed-kick on pickup,
 and the UI's manual kick.

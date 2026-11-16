@@ -461,6 +461,11 @@ class Match(MatchTacklesMixin, MatchGetPossessionMixin):
                 from footballcoach.engine.kick_intent import apply_kick_intent
                 _intent, player.pending_kick = player.pending_kick, None
                 apply_kick_intent(player, self, _intent)
+            if player.pending_tackle is not None:
+                # The order's tackle, resolved here at the same point in the
+                # tick it used to be resolved inside execute().
+                _target_id, player.pending_tackle = player.pending_tackle, None
+                self._attempt_tackle_contact(player, self.player_by_id(_target_id))
             if player.desired_speed_mode is None:
                 # Every order must explicitly decide movement intent (even
                 # STANDSTILL) on every tick it executes -- leaving it unset
