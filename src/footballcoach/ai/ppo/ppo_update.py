@@ -1140,6 +1140,7 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
             exec_weight=self._bc_exec_weight,
             dec_label_smoothing=self._bc_dec_label_smoothing,
             exec_label_smoothing=self._bc_exec_label_smoothing,
+            kick_power_loss=self._bc_kick_power_loss,
         )
 
     def _ppo_bc_aux_loss(self, ctx: _UpdateContext, stats: _UpdateStats, mb_idx: torch.Tensor,

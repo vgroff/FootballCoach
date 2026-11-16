@@ -1583,6 +1583,25 @@ default). Example, kick BC for the phase-2 attacker only:
   pulled from 0.04 to 0.9), the shared trunk moved and the narrow move_dir
   (kappa ~1000) followed (KL 1.3); the eval goal rate fell 9% -> 4% after that
   single update. Restarted at 0.25 -> 0.02 with target_kl 0.3.
+- **...and the gate learns before the power (second phase2_run2, 2026-11-16).**
+  At 0.25 the updates stayed within KL 0.3 but the eval goal rate went
+  8% -> 7.2 -> 3.9 -> 0.2% in three updates: kicks/episode 0.11 -> 0.33 at an
+  unchanged power ~0.04 (soft pokes to the defender). The kick gate's BCE has
+  gradient (p - y) on its logit, ~0.9 per kick-now row; the power MSE's
+  gradient on the raw output carries the sigmoid slope s(1-s) ~0.055 at a
+  power near the floor, ~0.09. Fix: `bc.kick_power_loss = "bce"`
+  (`bc.kick_power_bce`: soft-target BCE, gradient on raw = s - y, logged as
+  the KL BCE - H(y)). PPO itself is unaffected: its log-probs are on the raw
+  pre-squash sample. Same pattern, not yet changed: `move_region_center`'s
+  tanh MSE ("other" group).
+- **Exploration params barely matter to phase-2 outcomes (measured).** On the
+  refit of 763 (attacker vs rules, 1840 episodes each, +-0.65 pt), relaxing
+  move_dir kappa 1000 -> 60 (1.8 -> 7.7 deg spread, checked in sampling),
+  kick_dir kappa 110 -> 15, kick power sigma 0.1 -> 1.0 or elevation sigma
+  0.06 -> 0.25 left the goal rate within noise (7.7-9.7% vs base 8.0-8.8%).
+  The run uses kappa 100 / 20, sigma 0.5 / 0.25 (config `*_init`, applied with
+  `--reset-dir-log-std --reset-kick-power-log-std`): the same mean shift then
+  costs ~10x / ~5x / ~25x less KL.
 - **Diagnostics** (rollout log, below the loss lines):
   `bc agree [<source>]` = the policy vs its expert on the kick group
   (`ppo_update._kick_agreement`: the expert's kick-now share, P(kick) on

@@ -627,6 +627,8 @@ class PPOTrainer(PPOUpdateMixin, PPGMixin, PretrainingMixin, ActionSamplingMixin
         self._aug_rng = random.Random()
         self._bc_cfg = bc_cfg
         self._bc_dir_loss_w = float(bc_cfg.get("direction_loss_weight", 3.0))
+        # BC kick-power loss form (bc.py bc_loss_from_tensor's kick_power_loss): "mse" (default) or "bce".
+        self._bc_kick_power_loss = str(bc_cfg.get("kick_power_loss", "mse"))
         self._bc_dir_loss_mode = str(bc_cfg.get("direction_loss_mode", "cosine"))
         self._bc_dir_mag_reg_coef = float(bc_cfg.get("direction_mag_reg_coef", 0.0))
         self._bc_region_loss_w = float(bc_cfg.get("region_loss_weight", 1.0))

@@ -90,6 +90,21 @@ def _kick_power_physical(raw: "torch.Tensor") -> "torch.Tensor":
     (ppo.kick_power_floor + (1 - floor) * sigmoid(raw)) -- what BC labels/targets are in."""
     return kick_power_from_raw(raw, configured_kick_power_floor())
 
+def kick_power_bce(raw: "torch.Tensor", target_power: "torch.Tensor") -> "torch.Tensor":
+    """Per-row soft-target BCE for the kick_power head, as KL(y || s): the
+    target power fraction mapped past the floor to y in [0, 1] (the same map
+    kick_power_from_raw inverts), s = sigmoid(raw). Its gradient on raw is
+    exactly s - y (the sigmoid's slope cancels, unlike an MSE on the power
+    fraction), it is bounded and needs no clamping at y = 0 or 1, and its
+    minimum is s = y. Reported as BCE - H(y), the KL, so a matched head reads
+    0 (same gradient as the plain BCE)."""
+    floor = configured_kick_power_floor()
+    y = ((target_power - floor) / (1.0 - floor)).clamp(0.0, 1.0)
+    bce = torch.nn.functional.binary_cross_entropy_with_logits(raw, y, reduction="none")
+    entropy = -(torch.xlogy(y, y) + torch.xlogy(1.0 - y, 1.0 - y))
+    return bce - entropy
+
+
 log = logging.getLogger("footballcoach.ai.bc")
 
 BC_LABEL_DIM = 27  # elements in the flat label vector (see module docstring)
@@ -1054,8 +1069,16 @@ def bc_loss_from_tensor(
     split_kick: bool = False,
     split_tackle: bool = False,
     return_group_rows: bool = False,
+    kick_power_loss: str = "mse",
 ):
     """Compute BC loss for a minibatch, given packed label tensors.
+
+    ``kick_power_loss`` (ai_config bc.kick_power_loss): "mse" = squared error
+    on the power fraction (the gradient on the head's raw output carries the
+    sigmoid's slope, ~0.05 at a power near the floor, so power learns ~10x
+    slower than the kick gate); "bce" = soft-target binary cross-entropy
+    between sigmoid(raw) and the target power mapped to [0, 1] past the floor
+    (``kick_power_bce``): gradient on raw = (s - y), the power error itself.
 
     Args:
         labels: (N, BC_LABEL_DIM) float32 tensor from the rollout buffer.
@@ -1273,10 +1296,14 @@ def bc_loss_from_tensor(
         # --- Execution: kick_power (MSE) and kick_spin (MSE, normalized) ---
         kicked_mask = labels[:, _I_KICK_THIS_TICK] > 0.5
         if kicked_mask.any():
-            pred_power = _kick_power_physical(exec_heads.kick_power.squeeze(-1))
             target_power = labels[:, _I_KICK_POWER]
-            power_mse = (pred_power - target_power) ** 2
-            kick_power_loss_per = torch.where(kicked_mask, power_mse, torch.zeros_like(power_mse))
+            if kick_power_loss == "bce":
+                power_err = kick_power_bce(exec_heads.kick_power.squeeze(-1), target_power)
+            elif kick_power_loss == "mse":
+                power_err = (_kick_power_physical(exec_heads.kick_power.squeeze(-1)) - target_power) ** 2
+            else:
+                raise ValueError(f"unknown kick_power_loss {kick_power_loss!r} (expected 'mse' or 'bce')")
+            kick_power_loss_per = torch.where(kicked_mask, power_err, torch.zeros_like(power_err))
             loss += exec_weight * kick_power_loss_per
 
             target_spin = labels[:, _I_KICK_SPIN_X:_I_KICK_SPIN_Z + 1] / _SPIN_NN_NORM_RAD_S
