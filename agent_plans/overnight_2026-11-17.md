@@ -222,3 +222,13 @@ so far; at the user's spreads it now matches or beats both teachers:
 Next: phase2_run24 from run23, counterfactual weight 0.3 -> 0.5 (the lever
 left for the counterfactual KLs), aggregation kept; fall back to run23 for
 PPO if phase 1 slips on the eval.
+
+### 01:50 phase2_run24 (cf 0.5) cycle 1
+
+After-fit: real p1 0.212, real p2 0.040, cf p1 0.119, **cf p2 0.834** (run23
+ended 0.925). Fresh-rollout phase-1 real rose 0.194 -> 0.264 (move 1.0 deg):
+the higher weight pulls phase 1 away from 763, slowly. Behaviour check on the
+cycle-1 checkpoint: phase 1 vs rules **62.5%** (misses 2.4%) at the user's
+spreads vs run23's 64% (within the +-1.6 noise). Rule: re-check after cycle
+3; continue while phase 1 >= ~61%, else stop and take the best-by-eval
+checkpoint (run23 so far) into PPO.
