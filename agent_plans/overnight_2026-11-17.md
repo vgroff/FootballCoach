@@ -345,3 +345,15 @@ sharing the CPU; rounds are not slowing overall.)
 Phase 1 now level with 763 (65%), phase 2 at ~70% on the varied matchup
 (rules 25.2%; started at 33.3%). Health: log current, CPU 142k -> 179k s,
 265 checkpoints.
+
+### 08:39 check-in
+
+| time | phase-1 vs rules | phase-2 attacker vs rules |
+|---|---|---|
+| 07:57 | — | **74.3%** |
+| 08:20 | — | 74.3% |
+| 08:39 | 65% | 74.3% (shot_off_target 3.9%) |
+
+Phase 2 now plateauing around 72-74% (rules 25.2%); phase 1 steady at 65%
+(= 763), 45-46% vs its own past snapshots. Health: log current (08:39), CPU
+179k -> 216k s, no errors.
