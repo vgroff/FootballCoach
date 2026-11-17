@@ -287,3 +287,21 @@ Logs: scratchpad/ppo_overnight.log and checkpoints/phase2_run25/training_log*.tx
 Phase 2 climbing fast (rules baseline with variety 25.2%), phase 1 holding at
 the teacher's level (763: 65%) with no BC / teacher term: the separation test
 is passing so far.
+
+### 04:40 check-in: PPO phase2_run25 healthy (~100 rounds, ~25M steps)
+
+| time | ~round | phase 1 vs rules | phase 2 goals |
+|---|---|---|---|
+| 03:45 | 51 | 63% | 59.8% |
+| 04:05 | 69 | 63% | 63.5% |
+| 04:16 | 79 | 64% | 58.7% |
+| 04:35 | 98 | 63% | **66.7%** |
+
+Learning signals (~87 rounds): KL per update ~0.001 (target 0.15 never hit,
+0 early stops) -- 1 epoch over ~23 minibatches moves the policy very little;
+entropy steady (~-1.38), kick entropy slowly falling, value loss 0.25 ->
+0.21. Phase 2 creeping up slowly rather than plateaued; phase 1 rock steady.
+Not changed unattended (the user chose the small-step setup for smoothness);
+morning option if it stays flat: 2 epochs or a higher LR.
+Health: log current, python CPU 30047 s -> 67276 s since 03:39, 100
+checkpoints, 623 GB disk free.
