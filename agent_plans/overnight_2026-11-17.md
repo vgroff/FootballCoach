@@ -543,3 +543,15 @@ ordinary wobble. KL per update steady 0.014-0.016. Health: log current, CPU
 
 Both phase-2 evals ~90-94% (plateau-ish, still edging up); phase 1 flat 63-65%.
 Health: log current, CPU 97k -> 119k s, no errors.
+
+### 21:46 run26 check-in
+
+| time | phase-1 vs rules | phase-2 with keeper | phase-2 no keeper |
+|---|---|---|---|
+| 21:01 | ~64% | 92.2% | 94.6% |
+| 21:12 | ~64% | 92.0% | 94.6% |
+| 21:31 | ~64% | 92.6% | 94.1% |
+| 21:42 | 64% | 90.9% | **95.0%** |
+
+Plateau: with keeper ~91-93%, no keeper ~94-95% for ~1.5 h; phase 1 flat
+63-65%. Health: log current, CPU 119k -> 141k s, no errors.
