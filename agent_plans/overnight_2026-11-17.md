@@ -421,3 +421,9 @@ No changes.
 
 Phase 2 now ~78-80%; phase 1 63-64%. ~149M of 300M steps. Health: log
 current, CPU 364k -> 402k s, no errors. No changes.
+
+### 14:39 check-in
+
+Phase 2 attacker vs rules: 79.8% (14:30), then 81.7 / 82.8 / 81.5 / 81.3%
+(14:35-14:38) -- new highs, now ~81-83%. Phase 1 vs rules 63-64%. ~163M of
+300M steps. Health: log current, CPU 402k -> 440k s, no errors. No changes.
