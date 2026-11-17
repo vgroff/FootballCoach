@@ -531,3 +531,15 @@ while no-keeper held 91-93%; I floated (untested) an empty-goal-vs-keeper
 shot trade-off. RETRACTED: 19:41 recovered to 93.5% (saves 1.1%), so it was
 ordinary wobble. KL per update steady 0.014-0.016. Health: log current, CPU
 76k -> 97k s, no errors.
+
+### 20:46 run26 check-in
+
+| time | phase-1 vs rules | phase-2 with keeper | phase-2 no keeper |
+|---|---|---|---|
+| 20:00 | ~64% | 91.5% | 91.5% |
+| 20:11 | ~64% | 90.2% | 93.7% |
+| 20:30 | ~64% | 92.0% | 94.1% |
+| 20:41 | 65% | 92.2% | **94.3%** |
+
+Both phase-2 evals ~90-94% (plateau-ish, still edging up); phase 1 flat 63-65%.
+Health: log current, CPU 97k -> 119k s, no errors.
