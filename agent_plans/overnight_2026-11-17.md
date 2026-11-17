@@ -305,3 +305,16 @@ Not changed unattended (the user chose the small-step setup for smoothness);
 morning option if it stays flat: 2 epochs or a higher LR.
 Health: log current, python CPU 30047 s -> 67276 s since 03:39, 100
 checkpoints, 623 GB disk free.
+
+### 05:40 check-in: PPO healthy (~156 rounds, ~39M steps)
+
+| time | ~round | phase 1 | phase 2 |
+|---|---|---|---|
+| 04:46 | 108 | 63% | 65.4% |
+| 05:06 | 126 | 63% | 63.5% |
+| 05:16 | 136 | 64% | 64.8% |
+| 05:36 | 154 | 64% | **68.3%** |
+
+Phase 2 still creeping up, phase 1 steady at 63-64%. Health: log current,
+CPU 67k -> 105k s since 04:39, 156 checkpoints (51 python processes =
+rollout + eval pools + the every-4th-round snapshot pool).
