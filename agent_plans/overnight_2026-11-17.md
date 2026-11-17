@@ -489,3 +489,17 @@ No-keeper 27.6% -> 75.2% in ~80 min (rules attacker 56.5%): dribbling out
 27.8% -> 0.2% first, then shots wide 38% -> 15.7%. With-keeper also up
 (79.8 -> 85.0%), phase 1 flat 62-65%. Health: log current, CPU 7k -> 32k s,
 no errors.
+
+### 17:46 run26 check-in
+
+| time | phase-1 vs rules | phase-2 with keeper | phase-2 no keeper |
+|---|---|---|---|
+| 17:02 | ~64% | 85.9% | 76.3% |
+| 17:14 | ~64% | **87.0%** | 78.5% |
+| 17:29 | 64% | **87.0%** | **81.7%** |
+| 17:40 | 64% | 85.9% | 81.5% |
+
+No-keeper levelling off ~81-82% (rules attacker 56.5%), with keeper ~86-87%,
+phase 1 flat 63-66%. Health: log current, CPU 32k -> 54k s, no errors.
+Also added (bddfd1a): UI scenario `phase2_neural_attacker` to watch phase-2
+checkpoints (attacker checkpoint picker, no-keeper chance, player variety).
