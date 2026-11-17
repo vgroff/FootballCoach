@@ -263,3 +263,13 @@ curriculum.distill = {}, curriculum.phase2.scenario_kwargs = player variety
 attacker-only neural, the student's own spreads. Full suite: 2764 passed.
 Launch: --phase 2 --phase-mix "1:0.7,2:0.3" --checkpoint
 checkpoints/phase2_run23/checkpoint_pretrained.pt --total-steps 300000000.
+
+### 02:53 PPO run phase2_run25 started (300M steps, ~1.5 min / round -> ~30 h)
+
+Round 1 (rows trained once): phase 1 vs rules (22 s) **63%** (misses 1.3%),
+consistent with run23's offline 64% (and confirms the in-run eval-length
+fix); phase 2 attacker **33.3%** goals WITH player variety; the all-rules
+phase-2 baseline with variety is **25.2%** (35.7% on the old fixed matchup) --
+the varied matchup is much harder, so the student is ~1.3x rules there (was
+~2.2x on the fixed matchup). Phase-1 rules-vs-rules baseline 46% (unchanged).
+Logs: scratchpad/ppo_overnight.log and checkpoints/phase2_run25/training_log*.txt.
