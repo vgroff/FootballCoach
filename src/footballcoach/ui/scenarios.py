@@ -1538,6 +1538,121 @@ def _find_latest_phase1_checkpoint_dir() -> str:
 _phase1_build, _phase1_on_tick = _make_phase1_scenario_pair(_find_latest_phase1_checkpoint_dir())
 
 
+def _make_phase2_attacker_scenario():
+    """Build function + params for the Phase 2 UI scenario: the 1v2 trial
+    (build_1v2_scenario, exactly as phase-2 training plays it) with the
+    ATTACKER driven by a checkpoint picked from ``checkpoints/phase2_run*/``
+    (and ``checkpoints/longterm/``), the defender and goalkeeper by their rules
+    AIs. A separate scenario from the plain rules-only ``1v2`` entry, which is
+    left untouched.
+
+    Params: attacker checkpoint (grouped by run dir) / rules override, the
+    no-keeper chance (1.0 = always an empty goal), player variety as in
+    training (curriculum.phase2.scenario_kwargs attribute_tiers /
+    stamina_range; off = the fixed 0.9-vs-0.55 matchup) and the decision
+    interval. Checkpoints are listed when the UI starts (as for phase 1).
+    """
+    import glob as _glob
+    import logging
+    import re as _re
+    log_ui = logging.getLogger("footballcoach.ui.scenarios")
+    train_cfg = _phase1_training_cfg()
+    decision_ms_default = train_cfg["decision_interval_s"] * 1000.0
+    ui_tick_hz = 30.0  # as the phase-1 picker: the UI ticks the engine at 30 Hz
+
+    def _phase2_cfg() -> dict:
+        try:
+            from footballcoach.ai.config import load_ai_config
+            return load_ai_config().get("curriculum", {}).get("phase2", {})
+        except Exception:
+            return {}
+
+    run_dirs = sorted(
+        _glob.glob("checkpoints/phase2_run*/"),
+        key=lambda d: int(m.group(1)) if (m := _re.search(r"phase2_run(\d+)", d)) else -1,
+    )
+    checkpoints: list[str] = []
+    for d in run_dirs:
+        checkpoints.extend(_discover_checkpoints(d.rstrip("/")))
+    n_phase2 = len(checkpoints)
+    checkpoints.extend(_discover_checkpoints("checkpoints/longterm"))
+
+    def _label(path: str) -> str:
+        parts = Path(path).parts
+        return f"{parts[-2]}/{parts[-1]}" if len(parts) >= 2 else parts[-1]
+
+    labels = tuple(_label(c) for c in checkpoints) if checkpoints else ("(none)",)
+    default = labels[n_phase2 - 1] if n_phase2 > 0 else labels[-1]
+    groups: dict[str, list[str]] = {}
+    for lab in labels:
+        groups.setdefault(lab.partition("/")[0], []).append(lab)
+    grouped = tuple((g, tuple(v)) for g, v in groups.items())
+
+    params = [
+        ScenarioGroupedChoiceParam("attacker_checkpoint", "Attacker checkpoint", grouped, default),
+        ScenarioBoolParam("attacker_rules", "Attacker: rules-based override", False),
+        ScenarioParam("no_keeper_prob", "No-keeper chance", 0.0, 1.0, 0.05, 0.0),
+        ScenarioBoolParam("player_variety", "Player variety (as training)", True),
+        ScenarioParam("decision_interval_ms", "Decision interval (ms)", 50.0, 2000.0, 50.0, decision_ms_default),
+    ]
+
+    trainer_cache: dict[str, object] = {}
+
+    def _trainer_for(label: str):
+        path = next((c for c in checkpoints if _label(c) == label), None)
+        if path is None:
+            return None
+        if path not in trainer_cache:
+            trainer, err = _load_trainer(path)
+            if err:
+                log_ui.warning(f"Phase 2 UI: {err} -- using the rules attacker")
+            trainer_cache[path] = trainer
+        return trainer_cache[path]
+
+    def build(
+        rng_reduction: float = 0.3,
+        *,
+        attacker_checkpoint: str = default,
+        attacker_rules: bool = False,
+        no_keeper_prob: float = 0.0,
+        player_variety: bool = True,
+        decision_interval_ms: float = decision_ms_default,
+        sim_dt_s: float = 1.0 / 30.0,
+        seed: int | None = None,
+        **_ignored,
+    ) -> Match:
+        from footballcoach.ai.curriculum.envs import ui_task_phase
+        cfg = _phase2_cfg()
+        variety = {}
+        if player_variety:
+            kw = dict(cfg.get("scenario_kwargs") or {})
+            variety = {k: kw[k] for k in ("attribute_tiers", "stamina_range") if k in kw}
+        match = build_1v2_scenario(rng_reduction, sim_dt_s=sim_dt_s, seed=seed,
+                                   no_keeper_prob=float(no_keeper_prob), **variety)
+        trainer = None if attacker_rules else _trainer_for(attacker_checkpoint)
+        if trainer is not None:
+            attacker = match.player_by_id("attacker")
+            # The scenario's scripted opening run belongs to the rules AI;
+            # training clears it the same way (RoleScenarioEnv.reset).
+            attacker.current_order = None
+            attacker.ai = NeuralPlayerAI(
+                trainer._sample_action,
+                decision_interval_ticks=max(1, round(decision_interval_ms / 1000.0 * ui_tick_hz)),
+                max_episode_s=float(cfg.get("max_episode_s", 15.0)),
+                task_phase=ui_task_phase("1v2"),
+            )
+        # Every player's AI is final here: no generic neural-opponent wiring.
+        match._ai_fully_wired = True
+        keeper = "yes" if match.player_by_id_or_none("keeper") is not None else "NO"
+        log_ui.info(f"Phase 2 UI: attacker={'rules' if trainer is None else attacker_checkpoint}  keeper={keeper}")
+        return match
+
+    return build, params
+
+
+_phase2_attacker_build, _phase2_attacker_params = _make_phase2_attacker_scenario()
+
+
 def build_1v1_scenario(
     rng_reduction: float = 0.3,
     *,
@@ -2203,6 +2318,20 @@ SCENARIOS: list[ScenarioDefinition] = [
         params=_phase1_build._phase1_params,  # type: ignore[attr-defined]
         win_outcome="box_possession",  # matches seeded_eval win_outcome
         outcome_remap=_phase1_outcome_remap,
+    ),
+    ScenarioDefinition(
+        key="phase2_neural_attacker",
+        label="Phase 2: Neural attacker 1v2 (checkpoint picker)",
+        description=(
+            "The phase-2 1v2 trial as training plays it: the attacker is driven by the picked "
+            "checkpoint (checkpoints/phase2_run*/), the defender and goalkeeper by their rules AIs. "
+            "'No-keeper chance' 1.0 = always an empty goal. 'Player variety' draws attributes and "
+            "stamina per trial as in training; off = the fixed elite-vs-average matchup."
+        ),
+        build=_phase2_attacker_build,
+        params=_phase2_attacker_params,
+        box_possession_terminal=False,  # as 1v2: ends on goal / out / dispossession
+        win_outcome="goal",
     ),
     ScenarioDefinition(
         key="1v1_phase1",

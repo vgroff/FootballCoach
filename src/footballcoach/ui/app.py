@@ -1099,7 +1099,7 @@ class App:
         y1 = 110
         items.append(("header", "", "── AI Scenarios ──", pygame.Rect(col1_x, y1, col_w, header_h)))
         y1 += header_h + 4
-        ai_keys = {"phase1_neural_ai", "1v1_phase1"}
+        ai_keys = {"phase1_neural_ai", "phase2_neural_attacker", "1v1_phase1"}
         for definition in scenarios.SCENARIOS:
             if definition.key in ai_keys:
                 items.append(("scenario", definition.key, definition.label,

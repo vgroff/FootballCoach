@@ -1339,13 +1339,25 @@ an opposing-team right-click.)
 
 `SCENARIOS` originally held six `ScenarioDefinition` objects, all fully
 parameterized (table below). It has since grown — the full key list in
-`scenarios.py` is `phase1_neural_ai`, `1v1_phase1` (both shown in the menu's
+`scenarios.py` is `phase1_neural_ai`, `phase2_neural_attacker`, `1v1_phase1` (all three shown in the menu's
 left "AI Scenarios" column, everything else in the right "Balance Scenarios"
 column), `save_close`, `pass`, `tackle`, `goal_to_goal_sprint`,
 `sprint_shuttle`, `sprint`, `2v2`, `1v2`, `repulsion_obstacle`,
 `repulsion_obstacle_no_ball`, `mark_standoff`, `penalty_corner_accuracy`,
 `gk_far_post` — the newer ones aren't described in this file yet; read their
-`ScenarioDefinition` in `scenarios.py`. The original six:
+`ScenarioDefinition` in `scenarios.py`.
+
+**`phase2_neural_attacker`** (AI column, 2026-11-17): the phase-2 1v2 trial
+with the attacker driven by a checkpoint picked from `checkpoints/phase2_run*/`
+(+ `longterm/`), defender and keeper on their rules AIs, task id 2 (as
+training). Params: attacker checkpoint / rules override, `no_keeper_prob`
+(1.0 = always an empty goal), player variety (training's
+`curriculum.phase2.scenario_kwargs` attribute tiers + stamina), decision
+interval. Built by `_make_phase2_attacker_scenario()`; the rules-only `1v2`
+entry is a separate, unchanged scenario. Checkpoints are listed when the UI
+starts, so a run started later needs a UI restart to appear.
+
+The original six:
 
 | key | Description |
 |---|---|
