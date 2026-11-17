@@ -357,3 +357,15 @@ Phase 1 now level with 763 (65%), phase 2 at ~70% on the varied matchup
 Phase 2 now plateauing around 72-74% (rules 25.2%); phase 1 steady at 65%
 (= 763), 45-46% vs its own past snapshots. Health: log current (08:39), CPU
 179k -> 216k s, no errors.
+
+### 09:39 check-in
+
+| time | phase-1 vs rules | phase-2 attacker vs rules |
+|---|---|---|
+| 08:50 | — | 71.7% |
+| 09:10 | — | **74.8%** |
+| 09:20 | — | 73.7% |
+| 09:39 | 64% | 71.1% |
+
+Plateau: phase 2 71-75% for ~2 h, phase 1 64-65%. Health: log current,
+CPU 216k -> 253k s, no errors. No changes made.
