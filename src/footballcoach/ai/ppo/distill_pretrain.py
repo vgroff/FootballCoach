@@ -50,7 +50,39 @@ _SPREAD_KEYS = ("move_dir_log_kappa", "kick_dir_log_kappa", "kick_dir_z_log_std"
 
 DEFAULTS = {"counterfactual": True, "counterfactual_weight": 1.0, "kl_coef": 5.0, "value_coef": 1.0,
             "label_smoothing": 0.0, "epochs": 6, "lr": 1e-4, "lr_warmup_steps": 0, "batch_size": 8000,
-            "rollout_steps": 540000, "num_rollouts": 4, "aggregate_cycles": 1}
+            "rollout_steps": 540000, "num_rollouts": 4, "aggregate_cycles": 1,
+            "counterfactual_kick_only_phases": ()}
+
+# The anchor fields of the kick sub-heads (gate, power, direction, spin).
+KICK_KEYS = ("kick_logit", "kick_power", "kick_direction", "kick_spin")
+
+
+def kick_only_counterfactuals(trainer, data: dict, anchor: dict, teachers: dict, kick_only_phases, batch_size: int) -> dict:
+    """For counterfactual rows whose target phase is in ``kick_only_phases``:
+    keep the target teacher's KICK heads (``KICK_KEYS``) but take every other
+    head from the row's REAL phase's teacher. E.g. 1v1 states labelled task id
+    2: shoot like the phase-2 teacher, move like the phase-1 one -- the task id
+    then only has to switch the kicking, and both copies of a state agree on
+    the movement (measured overnight: the phase-2 counterfactual's KL was
+    mostly move direction, 0.98 of 1.33)."""
+    phases = set(int(p) for p in kick_only_phases)
+    if not phases:
+        return anchor
+    rows = data["is_cf"] & torch.isin(data["target_phase"], torch.tensor(sorted(phases)))
+    idx = torch.nonzero(rows).squeeze(-1)
+    if len(idx) == 0:
+        return anchor
+    pa, pb = sorted(teachers)
+    real_phase = torch.where(data["target_phase"][idx] == pa, torch.full_like(idx, pb), torch.full_like(idx, pa))
+    out = {k: v.clone() for k, v in anchor.items()}
+    teacher_obs = {k: v for k, v in data["obs"].items() if not k.endswith("physics_full")}
+    for pid in sorted(set(real_phase.tolist())):
+        sub = idx[real_phase == pid]
+        alt = trainer._ppg_snapshot_anchor({k: v[sub] for k, v in teacher_obs.items()}, batch_size, nets=teachers[pid])
+        for k, v in alt.items():
+            if k not in KICK_KEYS and k in out:
+                out[k][sub] = v.cpu()
+    return out
 
 
 _DATA_TENSORS = ("returns", "target_phase", "value_w", "kl_w", "is_cf")
@@ -304,7 +336,9 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
     params = list(trainer.decision_net.parameters()) + list(trainer.execution_net.parameters())
     params = [p for p in params if p.requires_grad]
     opt = torch.optim.Adam(params, lr=float(cfg["lr"]), eps=1e-5)
-    log.info(f"Distill pretrain: teachers {cfg['teachers']}, label_smoothing={cfg['label_smoothing']}, counterfactual={cfg['counterfactual']} "
+    log.info(f"Distill pretrain: teachers {cfg['teachers']}, label_smoothing={cfg['label_smoothing']}, "
+             f"counterfactual_kick_only_phases={list(cfg['counterfactual_kick_only_phases'])}, "
+             f"aggregate_cycles={cfg['aggregate_cycles']}, counterfactual={cfg['counterfactual']} "
              f"(weight {cfg['counterfactual_weight']}), kl_coef={cfg['kl_coef']}, value_coef={cfg['value_coef']}, "
              f"{cfg['num_rollouts']} cycle(s) x {cfg['rollout_steps']} steps x {cfg['epochs']} epoch(s), lr={cfg['lr']} "
              f"(linear warmup over {cfg['lr_warmup_steps']} steps)")
@@ -325,7 +359,9 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
             data = build_copies(obs, returns, phases, bool(cfg["counterfactual"]), float(cfg["counterfactual_weight"]))
             del batch, obs
             data["anchor"] = smooth_bernoulli_targets(
-                teacher_anchor(trainer, data["obs"], data["target_phase"], teachers, bs), float(cfg["label_smoothing"]))
+                kick_only_counterfactuals(trainer, data, teacher_anchor(trainer, data["obs"], data["target_phase"], teachers, bs),
+                                          teachers, cfg["counterfactual_kick_only_phases"], bs),
+                float(cfg["label_smoothing"]))
             data["actions"] = soft_actions(data["anchor"], len(data["returns"]))
             phys = trainer._precompute_physics_full({f"obs/{k}": v for k, v in data["obs"].items()}, bs)
             data["obs"].update({k[len("obs/"):]: v for k, v in phys.items()})

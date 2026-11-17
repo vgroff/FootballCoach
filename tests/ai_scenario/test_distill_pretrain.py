@@ -131,6 +131,30 @@ def test_concat_and_history(trainer, tmp_path):
     assert dp.concat_data([parts[1]]) is parts[1]
 
 
+def test_kick_only_counterfactuals(trainer, tmp_path):
+    """Counterfactual rows targeting phase 2: kick heads from teacher 2, the
+    rest from the row's real (phase-1) teacher; everything else untouched."""
+    b = _obs(trainer)
+    t1 = _teacher(trainer, tmp_path, "k1.pt")
+    t2 = _teacher(trainer, tmp_path, "k2.pt", perturb=0.3)
+    teachers = {1: t1, 2: t2}
+    data = dp.build_copies(b, torch.zeros(N), (1, 2), True, 1.0)
+    anchor = dp.teacher_anchor(trainer, data["obs"], data["target_phase"], teachers, 64)
+    out = dp.kick_only_counterfactuals(trainer, data, anchor, teachers, [2], 64)
+    sel = data["is_cf"] & (data["target_phase"] == 2)          # 1v1 states as task id 2
+    rows = torch.nonzero(sel).squeeze(-1)
+    as_t1 = trainer._ppg_snapshot_anchor({k: v[rows] for k, v in data["obs"].items()}, 64, nets=t1)
+    for k in dp.KICK_KEYS:
+        if k in out:
+            assert torch.equal(out[k][rows], anchor[k][rows])            # kicks: still teacher 2
+    assert torch.allclose(out["move_direction"][rows], as_t1["move_direction"], atol=1e-6)   # movement: teacher 1
+    assert torch.allclose(out["exec_move_logit"][rows], as_t1["exec_move_logit"], atol=1e-6)
+    assert not torch.allclose(anchor["move_direction"][rows], as_t1["move_direction"], atol=1e-4)  # teachers differ
+    for k in anchor:                                                # all other rows untouched
+        assert torch.equal(out[k][~sel], anchor[k][~sel])
+    assert dp.kick_only_counterfactuals(trainer, data, anchor, teachers, [], 64) is anchor
+
+
 def test_warmup_lr():
     assert dp.warmup_lr(1e-4, 0, 0) == 1e-4
     assert dp.warmup_lr(1e-4, 0, 100) == pytest.approx(1e-6)

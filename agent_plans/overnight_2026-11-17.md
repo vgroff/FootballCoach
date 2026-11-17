@@ -160,3 +160,19 @@ goalkeeper role):
   role sets in RoleScenarioEnv. NOT added to tonight's PPO run (the agreed
   setup; changing the scenario unattended would muddy it). Candidate for the
   morning.
+
+### 01:22 Added (off): `distill_pretrain.counterfactual_kick_only_phases`
+
+User's idea (then withdrawn once the "erratic" hypothesis was refuted):
+counterfactual rows targeting a listed phase take only the KICK heads from
+that phase's teacher, every other head from the row's real teacher (e.g. 1v1
+states as task id 2: shoot like run6, move like 763). Implemented + tested,
+default () = off; NOT used tonight (the user's design -- counterfactuals match
+the other teacher's whole output -- is kept). Possible later use: the cf phase
+2 KL is mostly move direction (0.98 of 1.33).
+
+Checked (user asked): phase 2 can't overfit to a side / team -- the attacker
+is always Team.LEFT, but observations are canonicalised (x mirrored by the
+player's attacking direction, incl. the absolute last_touch_team_direction;
+y-canonical), so inside the network the attacker always attacks +x and the
+absolute team is unrecoverable; the scenario is randomised per seed.
