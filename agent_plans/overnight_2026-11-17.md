@@ -555,3 +555,19 @@ Health: log current, CPU 97k -> 119k s, no errors.
 
 Plateau: with keeper ~91-93%, no keeper ~94-95% for ~1.5 h; phase 1 flat
 63-65%. Health: log current, CPU 119k -> 141k s, no errors.
+
+### 22:46 run26 check-in
+
+| time | phase-1 vs rules | phase-2 with keeper | phase-2 no keeper |
+|---|---|---|---|
+| 22:01 | ~64% | 92.8% | 92.6% |
+| 22:12 | ~64% | 91.3% | 93.9% |
+| 22:31 | ~64% | 92.4% | **96.1%** |
+| 22:42 | 64% | 91.7% | 93.9% |
+
+Plateau continues (with keeper ~91-93%, no keeper ~93-96%, phase 1 62-65%).
+GIFs sent to the user (scratchpad/goal_gifs.py, checkpoint109 copy, game
+Renderer offscreen): over the 115 eval seeds with a keeper the AI scores on
+78 where rules fails (44 rules tackled, 34 rules saved), 1 the other way;
+empty goal: 47 vs 3. AI goals are low shots (median peak height 0.3 m, none
+above ~1 m). Health: log current, CPU 141k -> 163k s, no errors.
