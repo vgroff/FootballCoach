@@ -503,3 +503,16 @@ No-keeper levelling off ~81-82% (rules attacker 56.5%), with keeper ~86-87%,
 phase 1 flat 63-66%. Health: log current, CPU 32k -> 54k s, no errors.
 Also added (bddfd1a): UI scenario `phase2_neural_attacker` to watch phase-2
 checkpoints (attacker checkpoint picker, no-keeper chance, player variety).
+
+### 18:46 run26 check-in
+
+| time | phase-1 vs rules | phase-2 with keeper | phase-2 no keeper |
+|---|---|---|---|
+| 17:59 | ~64% | 88.5% | 81.5% |
+| 18:10 | ~64% | 89.6% | 84.6% |
+| 18:30 | 65% | 89.8% | 88.7% |
+| 18:41 | 63% | **90.2%** | **89.1%** |
+
+Both phase-2 evals still rising; the empty-goal gap is now ~1 pt (was 52 pts
+at the run26 start). Phase 1 flat 63-65%. Health: log current, CPU 54k ->
+76k s, no errors.
