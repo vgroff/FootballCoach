@@ -381,3 +381,16 @@ CPU 216k -> 253k s, no errors. No changes made.
 
 Plateau continues: phase 2 71-75% (~3 h), phase 1 63-65%. Health: log
 current, CPU 253k -> 290k s, no errors. No changes made.
+
+### 11:39 check-in
+
+| time | phase-1 vs rules | phase-2 attacker vs rules |
+|---|---|---|
+| 10:50 | — | **78.5%** |
+| 11:09 | — | 76.3% |
+| 11:19 | — | **78.5%** |
+| 11:39 | 63% | 74.8% |
+
+Phase 2 stepped up after ~10:45: three evals at 76-78.5%, now above the run6
+teacher (75.1%). Phase 1 checked over 08:23-11:34: flat 62-66% (mostly 64%),
+no drift. Health: log current, CPU 290k -> 327k s, no errors. No changes.
