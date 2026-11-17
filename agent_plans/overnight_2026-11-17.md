@@ -332,3 +332,16 @@ Phase 2 high 70.2%, phase 1 steady at 64% (763: 65%). Health: log current,
 CPU 105k -> 142k s, 211 checkpoints. (Some rounds' phase-2 eval lands ~39 s
 after the phase-1 one instead of ~6 s: the every-4th-round snapshot pool
 sharing the CPU; rounds are not slowing overall.)
+
+### 07:40 check-in: PPO healthy (~265 rounds, ~66M steps)
+
+| time | ~round | phase 1 | phase 2 |
+|---|---|---|---|
+| 06:47 | 219 | 64% | **71.5%** |
+| 07:05 | 236 | **65%** | 70.2% |
+| 07:17 | 246 | 65% | 71.3% |
+| 07:36 | 264 | 64% | 69.1% |
+
+Phase 1 now level with 763 (65%), phase 2 at ~70% on the varied matchup
+(rules 25.2%; started at 33.3%). Health: log current, CPU 142k -> 179k s,
+265 checkpoints.
