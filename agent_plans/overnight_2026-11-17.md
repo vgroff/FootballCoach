@@ -183,3 +183,25 @@ In case of usage limits / stalls: each check-in re-reads this log and the
 latest run logs, checks what is running before launching anything (no
 duplicate runs, no resuming into an existing dir), then continues the plan.
 Session-only: dies if the Claude session or the machine closes.
+
+### 01:30 Phase-2 player variety (user asked: do attributes vary? avoid overfitting, esp. for PPO)
+
+They did NOT: build_1v2_scenario always used attacker 0.9 / defender 0.55 /
+keeper 0.55, all eight attributes equal (PlayerAttributes.average), full
+stamina, every episode. Phase 1 randomises attributes (generate_attributes by
+tier), stamina and headings.
+
+Added (off by default; code + tests): build_1v2_scenario `attribute_tiers`
+({role: [tier, ...]}, attributes drawn per trial with generate_attributes from
+a uniformly chosen tier) and `stamina_range`; drawn from their own seeded
+stream so a seed keeps exactly the same positions; wired from
+`curriculum.phase2.scenario_kwargs` through build_role_env.
+
+Plan: keep it OFF for the distillation (run6, the phase-2 teacher, only ever
+saw the fixed matchup, so copying it on random attributes would teach its
+out-of-distribution guesses) and switch it ON for the PPO run, which learns
+from reward: attacker tiers premier_league / boosted (means 0.72 / 0.71),
+defender and keeper generic / championship / league_one (0.55 / 0.56 /
+0.44), stamina U(0.5, 1.0). The attacker is weaker on average than the old
+0.9, so phase-2 goal rates and the rules baseline under PPO are NOT
+comparable with the numbers above (the run recomputes its rules baseline).

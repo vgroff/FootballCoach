@@ -885,8 +885,19 @@ def build_1v2_scenario(
     move_fraction_max: float = 0.50,
     sim_dt_s: float = 1.0 / 30.0,
     seed: int | None = None,
+    attribute_tiers: dict | None = None,
+    stamina_range: tuple | list | None = None,
 ) -> Match:
     """1v2: elite attacker vs. average defender + GK.
+
+    ``attribute_tiers`` ({"attacker" / "defender" / "keeper": [tier, ...]}):
+    each player's attributes are drawn per trial with
+    ``generate_attributes`` from a tier picked uniformly from its list
+    (attributes.json tiers), instead of the fixed uniform skills above (a role
+    left out keeps its fixed skill). ``stamina_range`` ([lo, hi]): starting
+    stamina uniform in it (default: full). Both are drawn from their own
+    seeded stream, so a given seed keeps exactly the same positions as without
+    them. ``None`` (default) = the original fixed matchup.
 
     ``seed``: when given, positions, the move target and every later physics
     draw from the Match's own rng are deterministic for that seed (training
@@ -928,9 +939,25 @@ def build_1v2_scenario(
 
     # Attacker runs toward the RIGHT goal (+x) so must be Team.LEFT (attacks +x).
     # GK and defender are Team.RIGHT (defend the right goal).
-    attacker = Player.create("attacker", Team.LEFT, PlayerAttributes.average(attacker_skill), position=attacker_start)
-    defender = Player.create("defender", Team.RIGHT, PlayerAttributes.average(defender_skill), position=defender_start)
-    gk = Player.create("keeper", Team.RIGHT, PlayerAttributes.average(gk_skill), position=gk_start, is_goalkeeper=True)
+    # Attributes / stamina from their own stream (seeded off ``seed``), so
+    # enabling them does not move any position drawn from ``rng`` above.
+    attr_rng = random.Random(f"{seed}-1v2-attributes") if seed is not None else random.Random()
+
+    def _attrs(role: str, skill: float) -> PlayerAttributes:
+        tiers = (attribute_tiers or {}).get(role)
+        if not tiers:
+            return PlayerAttributes.average(skill)
+        from footballcoach.generation.attributes import generate_attributes
+        tier = tiers[attr_rng.randrange(len(tiers))]
+        return generate_attributes(tier=tier, rng=random.Random(attr_rng.random()))
+
+    attacker = Player.create("attacker", Team.LEFT, _attrs("attacker", attacker_skill), position=attacker_start)
+    defender = Player.create("defender", Team.RIGHT, _attrs("defender", defender_skill), position=defender_start)
+    gk = Player.create("keeper", Team.RIGHT, _attrs("keeper", gk_skill), position=gk_start, is_goalkeeper=True)
+    if stamina_range is not None:
+        lo, hi = float(stamina_range[0]), float(stamina_range[1])
+        for _p in (attacker, defender, gk):
+            _p.stamina = attr_rng.uniform(lo, hi)
 
     ball = Ball.at_rest(attacker_start)
     ball.set_initial_possession(attacker.player_id)

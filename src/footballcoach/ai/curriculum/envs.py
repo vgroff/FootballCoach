@@ -97,6 +97,10 @@ def build_role_env(phase: CurriculumPhase, *, controller_weights: Optional[dict]
         terminal_raw_outcomes=terminal_raw,
         phase=phase.phase_id,
         phase_name=phase.name,
+        # Scenario build kwargs from the phase's config (e.g. phase 2's
+        # attribute_tiers / stamina_range: per-episode player variety).
+        # (ScenarioEnv collects these as **scenario_kwargs and forwards them to the build.)
+        **dict(env_cfg.get("scenario_kwargs") or {}),
         **phase.env_kwargs,
     )
 
