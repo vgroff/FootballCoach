@@ -408,3 +408,16 @@ no drift. Health: log current, CPU 290k -> 327k s, no errors. No changes.
 New level holding: phase 2 75.7-78.5% since ~10:45 (above run6 teacher
 75.1%); phase 1 64%. Health: log current, CPU 327k -> 364k s, no errors.
 No changes.
+
+### 13:39 check-in (user back)
+
+| time | phase-1 vs rules | phase-2 attacker vs rules |
+|---|---|---|
+| 12:39 | — | 77.2% |
+| 12:49 | — | **80.4%** |
+| 13:09 | — | 78.7% |
+| 13:19 | — | 78.9% |
+| 13:39 | 63% | 80.0% |
+
+Phase 2 now ~78-80%; phase 1 63-64%. ~149M of 300M steps. Health: log
+current, CPU 364k -> 402k s, no errors. No changes.
