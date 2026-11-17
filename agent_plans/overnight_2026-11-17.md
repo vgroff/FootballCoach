@@ -120,3 +120,14 @@ states labelled task id 2, an input run6 never saw (its own mix had phase-1
 states at task id 1), so run6's outputs there may be erratic / partly
 unlearnable. 763's counterfactual is also OOD, but 763's task-id columns are
 zeroed, so it ignores the label and fits fine.
+
+**01:12 Hypothesis refuted (tested).** On 2218 phase-1 states: run6's move
+direction with task id 1 vs task id 2 differs by 0.11 deg mean (p90 0.26);
+its sensitivity to a 1% input nudge is the same with either label (move angle
+2.37 vs 2.36 deg mean, |dP(kick)| 0.024 vs 0.024) and the same as 763's. So
+run6 on "1v1 + task id 2" is just run6's own smooth 1v1 behaviour (P(kick)
+0.25 vs 763's 0.12) -- run6 itself barely uses the task id. cf phase 2's
+plateau is the weighting trade-off: on the SAME 1v1 states the student must
+produce 763's behaviour (real, weight 1) and run6's (cf, weight 0.3) split
+only by the task id; the gradient favours 763 there. Lever: a higher
+counterfactual weight, watching phase-1 real.
