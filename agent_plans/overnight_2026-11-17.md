@@ -473,3 +473,19 @@ rollout episodes 20.2% (1369/6768 in round 1).
 Hourly check-in job replaced: the old prompt's fallback (restart from run23
 with 1 epoch / 250k / target_kl 0.15) was stale; the new one restarts from
 run26's latest checkpoint with the current config.
+
+### 16:46 run26 check-in
+
+| time | phase-1 vs rules | phase-2 with keeper | phase-2 no keeper |
+|---|---|---|---|
+| 15:43 | 64% | 83.0% | 34.6% |
+| 15:51 | ~64% | 83.7% | 40.7% |
+| 16:02 | 63% | 84.3% | 44.1% |
+| 16:13 | 64% | 84.3% | 54.6% |
+| 16:32 | ~63% | 83.9% | 70.2% |
+| 16:44 | 65% | **85.0%** | **75.2%** |
+
+No-keeper 27.6% -> 75.2% in ~80 min (rules attacker 56.5%): dribbling out
+27.8% -> 0.2% first, then shots wide 38% -> 15.7%. With-keeper also up
+(79.8 -> 85.0%), phase 1 flat 62-65%. Health: log current, CPU 7k -> 32k s,
+no errors.
