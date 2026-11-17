@@ -609,3 +609,23 @@ User's call: phase 2 uses phase 1's attribute distribution, attacker = phase
 Phase-2 evals (rules baselines included) are NOT comparable with earlier
 runs. Run28 from run27 checkpoint24, checkpoints/phase2_run28, log
 scratchpad/ppo_run28.log; watchdog moved to run28.
+
+### 00:55 run28 check-in (4 rounds)
+
+Rules baselines with phase-1-style tiers: rules attacker vs rules defence
+15.7% (keeper) / 49.6% (no keeper).
+
+| round | phase-1 vs rules | attacker vs rules (keeper) | (no keeper) | defender_vs_rules conceded | NvN rollout: attacker goals |
+|---|---|---|---|---|---|
+| 0 | 65% | 83.0% | 85.7% | 25.7% (rules def 15.7%) | 80.9% |
+| 1 | 65% | 84.1% | 83.7% | 28.0% | 74.5% |
+| 2 | 65% | 84.6% | 86.7% | 29.8% | 70.2% |
+| 3 | 65% | 82.8% | 85.4% | 28.3% | 65.9% |
+
+Defender: flat on the defender_vs_rules eval but learning fast vs the AI
+attacker it trains against (NvN rollout goals 80.9 -> 65.9%, defence
+possession 10.8 -> 23.5%; vs rules defender ~78-86%). Under "attacker always
+neural" the defender never trains vs the rules attacker, which the eval uses
+-- I first read the flat eval as "not learning", RETRACTED. Option for the
+user: some rules-attacker episodes so the defender sees both styles.
+Health: log current, no errors.
