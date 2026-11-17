@@ -394,3 +394,17 @@ current, CPU 253k -> 290k s, no errors. No changes made.
 Phase 2 stepped up after ~10:45: three evals at 76-78.5%, now above the run6
 teacher (75.1%). Phase 1 checked over 08:23-11:34: flat 62-66% (mostly 64%),
 no drift. Health: log current, CPU 290k -> 327k s, no errors. No changes.
+
+### 12:39 check-in
+
+| time | phase-1 vs rules | phase-2 attacker vs rules |
+|---|---|---|
+| 11:40 | — | 77.0% |
+| 11:50 | — | 77.0% |
+| 12:09 | — | 77.8% |
+| 12:20 | — | 75.7% |
+| 12:38 | 64% | 77.0% |
+
+New level holding: phase 2 75.7-78.5% since ~10:45 (above run6 teacher
+75.1%); phase 1 64%. Health: log current, CPU 327k -> 364k s, no errors.
+No changes.
