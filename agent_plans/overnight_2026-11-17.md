@@ -516,3 +516,18 @@ checkpoints (attacker checkpoint picker, no-keeper chance, player variety).
 Both phase-2 evals still rising; the empty-goal gap is now ~1 pt (was 52 pts
 at the run26 start). Phase 1 flat 63-65%. Health: log current, CPU 54k ->
 76k s, no errors.
+
+### 19:46 run26 check-in
+
+| time | phase-1 vs rules | phase-2 with keeper | phase-2 no keeper |
+|---|---|---|---|
+| 19:00 | 64% | 91.1% | 90.2% |
+| 19:11 | 63% | 92.0% | 91.5% |
+| 19:30 | 63% | 88.5% | 91.3% |
+| 19:41 | 65% | **93.5%** | 90.0% |
+
+19:15-19:30 the with-keeper eval drifted 92.0 -> 88.5% (saves 3.3 -> 4.8%)
+while no-keeper held 91-93%; I floated (untested) an empty-goal-vs-keeper
+shot trade-off. RETRACTED: 19:41 recovered to 93.5% (saves 1.1%), so it was
+ordinary wobble. KL per update steady 0.014-0.016. Health: log current, CPU
+76k -> 97k s, no errors.
