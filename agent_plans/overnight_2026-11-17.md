@@ -232,3 +232,34 @@ cycle-1 checkpoint: phase 1 vs rules **62.5%** (misses 2.4%) at the user's
 spreads vs run23's 64% (within the +-1.6 noise). Rule: re-check after cycle
 3; continue while phase 1 >= ~61%, else stop and take the best-by-eval
 checkpoint (run23 so far) into PPO.
+
+### 02:45 Distillation stopped; PPO start point = phase2_run23
+
+phase2_run24 (cf weight 0.5) after-fit c2 / c3: real p1 0.219 / 0.227, real p2
+0.037 / 0.040, cf p1 0.106 / **0.0996**, cf p2 0.752 / 0.747 (flattening);
+fresh-rollout phase-1 real rising 0.194 -> 0.264 -> 0.269 -> 0.305.
+Phase-1 eval slid run23 64% -> run24 c1 62.5% -> c3 61%; phase 2 (user's
+spreads) run24 c3 80.6% / 85.0% tight -- same as run23 within noise. The
+higher weight was trading phase-1 play for counterfactual KL that had stopped
+improving: stopped. PPO starts from **phase2_run23** (better phase 1, same
+phase 2); run24 kept as the low-counterfactual-KL alternative.
+
+Final distillation KLs (run23 / run24 c3): real p1 0.160 / 0.227, real p2
+0.041 / 0.040, cf p1 0.129 / 0.0996, cf p2 0.925 / 0.747. The < 0.1 target
+is met for phase-2 real and (run24) cf phase 1, not for phase-1 real (move
+direction precision at kappa 500, see 00:45) nor cf phase 2.
+
+Incident: a phase-2 eval of run24 hung at 02:03 (processes alive, ~2 s CPU
+each in 38 min; it started while run24's fit was spawning workers) and the
+02:24 check-in reported it as running. Killed and re-run (normal, ~5 min). The
+hourly check-in was rewritten to check real progress (CPU / log time) and its
+own schedule (job bf7c02cd); saved to memory as feedback.
+
+PPO config (committed with this entry): curriculum.phase2.bc = {},
+curriculum.distill = {}, curriculum.phase2.scenario_kwargs = player variety
+(attacker premier_league / boosted; defender + keeper generic / championship
+/ league_one; stamina U(0.5, 1)), eval.neural_snapshot_eval_every_n_rollouts
+1 -> 4. Unchanged: n_epochs 1, rollout_steps 250000, target_kl 0.15, PPG off,
+attacker-only neural, the student's own spreads. Full suite: 2764 passed.
+Launch: --phase 2 --phase-mix "1:0.7,2:0.3" --checkpoint
+checkpoints/phase2_run23/checkpoint_pretrained.pt --total-steps 300000000.

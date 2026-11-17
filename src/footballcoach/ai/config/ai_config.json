@@ -44,7 +44,8 @@
     "batched_eval": true,
     "eval_envs_per_process": 30,
     "_comment_batched_eval": "When true, every seeded eval in this file (vs-rules, vs-immobile, rules-vs-rules baseline, neural-snapshot comparisons) batches its episodes' decision-network calls across eval_envs_per_process envs at a time per worker process, via ai/eval/seeded_eval.py's run_seeded_evaluation_batched -- the same amortized-dispatch-overhead speedup ppo.batched_rollout gives real rollout collection (see that key's comment), applied to evaluation. False (default) = unchanged: each worker runs its assigned episodes one at a time (batch-of-1 network calls) via run_seeded_evaluation. Neural-vs-neural snapshot eval also batches the opponent's decisions (a second _sample_action_batch call per round, using the frozen snapshot's own weights) when this is true -- rules/immobile opponents have no neural decision to batch either way.",
-    "neural_snapshot_eval_every_n_rollouts": 1,
+    "neural_snapshot_eval_every_n_rollouts": 4,
+    "_comment_neural_snapshot_eval_every_n_rollouts_20261117": "1 -> 4 for the overnight 300M PPO run: with 250k-step rollouts the phase-1 snapshot comparisons would dominate the round time.",
     "neural_snapshot_lookbacks": [
       1,
       0.5
@@ -250,7 +251,9 @@
     "phase2": {
       "_comment": "Phase 2 (1v2) env settings, read by curriculum/envs.py's role-based env builder. controllers: per role, unnormalised weights over 'rules' / 'neural', rolled independently per role at every reset. All-rules episodes have no neural player, so they work for playthroughs and evals but produce no training rows; training needs at least one role able to roll neural (the plan: attacker + defender neural, goalkeeper rules; goalkeeper neural later).",
       "max_episode_s": 15.0,
-      "bc": {"attacker": {"kick_gate": {"coeff_start": 0.028, "coeff_end": 0.028, "anneal_fraction": 1.0}, "kick_power": {"coeff_start": 0.555, "coeff_end": 0.0555, "hold_fraction": 0.5, "anneal_fraction": 1.0}, "kick_aim": {"coeff_start": 0.139, "coeff_end": 0.011, "hold_fraction": 0.5, "anneal_fraction": 1.0}}},
+      "scenario_kwargs": {"attribute_tiers": {"attacker": ["premier_league", "boosted"], "defender": ["generic", "championship", "league_one"], "keeper": ["generic", "championship", "league_one"]}, "stamina_range": [0.5, 1.0]},
+      "_comment_scenario_kwargs_20261117": "Per-episode player variety for phase 2 (build_1v2_scenario attribute_tiers / stamina_range), switched on overnight for the PPO run (user's request: avoid overfitting the fixed attacker-0.9-vs-0.55 matchup). Phase-2 goal rates and the rules baseline from here on are NOT comparable with earlier fixed-matchup numbers.",
+      "bc": {},
       "_comment_bc_20261116": "Phase-2 attacker test run (user's call): kick BC 0.25 held for the first half of the run, annealing to 0.02 at the end. 1.0 -> 0.2 (phase2_run2) broke the policy in one update: BC gradient ~4x the clip limit, expert labels kick-now on 45% of rows at power 0.9 vs the policy's 2% at 0.04. Then (phase2_run3, kick BC 0.25 with the power BCE): the gate still won the race (kicks 0.12 -> 0.49/ep in one update, power at the floor, eval 3%), so the kick group is split: gate 0.05 constant (user's call), power 1.0 held half then -> 0.1, aim (direction + spin) 0.25 -> 0.02.",
       "_comment_bc": "Per-role BC for this phase (ai/ppo/bc_sources.py), off when empty. role -> {group: {coeff_start, coeff_end, anneal_fraction}}, groups 'other' (decision heads, movement, region), 'kick' (kick_this_tick / direction / power / spin) and 'tackle' (tackle_attempt); a group left out is 0 for that role. Labels come from the role's own rules AI (ai/bc/role_experts.RulesExpert, its memory kept true to the neural player's play) for every neural player in the role, trainee or secondary, and only those rows get these coefficients (phase-1 rows keep the global bc.aux_coeff_* ones). Each schedule anneals linearly over the first anneal_fraction of training, like bc.aux_coeff_*. Example, kick BC for the attacker only: {\"attacker\": {\"kick\": {\"coeff_start\": 0.5, \"coeff_end\": 0.0, \"anneal_fraction\": 0.3}}}.",
       "eval_seed_offset": 1000000,
@@ -261,7 +264,7 @@
         "goalkeeper": {"rules": 1, "neural": 0}
       }
     },
-    "distill": {"1": {"teacher": "checkpoints/migrated/phase1_run321_checkpoint763_migrated.pt", "coeff_start": 1.0, "coeff_end": 1.0, "anneal_fraction": 1.0, "means_only": true}},
+    "distill": {},
     "_comment_distill_20261116": "Phase-1 teacher distillation (ai/ppo/distill.py), user's call: KL to 763 on phase-1 rows, means only, coefficient 1.0 constant. Measured before: phase2_run14 (80/20 mix, kick BC) had drifted 0.34 nats per phase-1 row from 763 (move_dir 0.19, kick gate 0.06, power 0.04) and phase-1 wins vs rules 50% -> 45%.",
     "phase1_max_episode_s": 22,
     "phase1_max_episode_s_variability": 10.0,
