@@ -48,11 +48,12 @@ def test_the_eval_plan_is_the_phase1_budget_on_the_phase_seed_range():
 
 def test_only_specs_of_trained_roles_are_evaluated(controllers):
     controllers(NEURAL_ATTACKER)
-    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == ["rules_baseline", "attacker_vs_rules"]
+    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == [
+        "rules_baseline", "attacker_vs_rules", "rules_baseline_no_keeper", "attacker_vs_rules_no_keeper"]
     controllers({**NEURAL_ATTACKER, "defender": {"rules": 1, "neural": 2}})
     assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == list(SPECS)
     controllers({r: {"rules": 1, "neural": 0} for r in ("attacker", "defender", "goalkeeper")})
-    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == ["rules_baseline"]
+    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == ["rules_baseline", "rules_baseline_no_keeper"]
 
 
 def test_explicit_seeds_with_repeats():
@@ -107,7 +108,10 @@ def test_trainer_runs_every_spec_and_caches_the_rules_baseline(trainer, monkeypa
             trainer._eval_role_phases()
     finally:
         trainer.phase_mix = None
-    assert calls == ["rules_baseline", "attacker_vs_rules", "defender_vs_rules", "attacker_vs_rules", "defender_vs_rules"]
+    # Rules-only specs run once (cached); the neural ones every time.
+    assert calls == ["rules_baseline", "attacker_vs_rules", "defender_vs_rules",
+                     "rules_baseline_no_keeper", "attacker_vs_rules_no_keeper",
+                     "attacker_vs_rules", "defender_vs_rules", "attacker_vs_rules_no_keeper"]
     for name in SPECS:
         assert caplog.text.count(f"[eval phase2_1v2/{name}]") == 2
 

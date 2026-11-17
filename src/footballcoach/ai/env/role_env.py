@@ -71,6 +71,10 @@ class RoleScenarioEnv(ScenarioEnv):
         classify_outcome: (raw_outcome, final_match, attacking_team) -> outcome.
         terminal_raw_outcomes: raw detect_trial_outcome() keys that end a trial.
         phase_name: label used in the episode tag (logging).
+        optional_roles: roles the built match may leave out (e.g. the
+            goalkeeper under the 1v2 builder's no_keeper_prob). Each episode's
+            roles are ``episode_roles``: the configured ones whose player is in
+            the match; a missing role not listed here is an error.
         Remaining arguments are ScenarioEnv's.
     """
 
@@ -87,6 +91,7 @@ class RoleScenarioEnv(ScenarioEnv):
         phase: int,
         phase_name: str,
         max_episode_s: float,
+        optional_roles=frozenset(),
         **kwargs,
     ):
         if not roles:
@@ -99,6 +104,10 @@ class RoleScenarioEnv(ScenarioEnv):
         super().__init__(definition, trainee_player_id=first_id, max_episode_s=max_episode_s,
                          phase=phase, secondary_player_ids=[], **kwargs)
         self.roles: dict[str, str] = dict(roles)
+        self.optional_roles = frozenset(optional_roles)
+        # This episode's player_id -> role: self.roles minus any optional role
+        # the scenario left out (set at reset).
+        self.episode_roles: dict[str, str] = dict(roles)
         self.controller_weights = controller_weights
         self.reward_table = reward_table
         self.outcome_keys = tuple(outcome_keys)
@@ -168,18 +177,21 @@ class RoleScenarioEnv(ScenarioEnv):
         if carrier is None:
             raise ValueError(f"{self.definition.key}: an attack/defence trial must start with a player on the ball")
         self._attacking_team = carrier.team
-        for pid in self.roles:
-            match.player_by_id(pid)   # every role must exist in the built match
+        missing = {pid: role for pid, role in self.roles.items() if match.player_by_id_or_none(pid) is None}
+        required = {pid: role for pid, role in missing.items() if role not in self.optional_roles}
+        if required:
+            raise ValueError(f"{self.phase_name}: the built match has no player for roles {required}")
+        self.episode_roles = {pid: role for pid, role in self.roles.items() if pid not in missing}
 
         roll_rng = random.Random(f"controllers:{seed}") if seed is not None else self.rng
         self.episode_controllers = self._roll_controllers(roll_rng)
         neural = [pid for pid, c in self.episode_controllers.items() if c == "neural"]
         if neural and self.sample_action_fn is None:
             raise ValueError(f"{self.phase_name}: roles rolled neural ({neural}) but no sample_action_fn is set")
-        self.trainee_player_id = neural[0] if neural else next(iter(self.roles))
+        self.trainee_player_id = neural[0] if neural else next(iter(self.episode_roles))
         self.secondary_player_ids = neural[1:]
         self.episode_tag = f"{self.phase_name}[" + ",".join(
-            f"{self.roles[pid]}={self.episode_controllers[pid]}" for pid in self.roles
+            f"{self.roles[pid]}={self.episode_controllers[pid]}" for pid in self.episode_roles
         ) + "]"
 
         for pid in neural:
@@ -230,11 +242,11 @@ class RoleScenarioEnv(ScenarioEnv):
             pinned = self.controller_overrides.get(role)
             return pinned == "neural" if pinned is not None else float(self.controller_weights[role].get("neural", 0)) > 0
 
-        if self.require_neural_player and not any(_can_be_neural(r) for r in self.roles.values()):
+        if self.require_neural_player and not any(_can_be_neural(r) for r in self.episode_roles.values()):
             raise ValueError(f"{self.phase_name}: require_neural_player is set but no role can be neural")
         while True:
             out = {}
-            for pid, role in self.roles.items():
+            for pid, role in self.episode_roles.items():
                 ctrl = self.controller_overrides.get(role)
                 out[pid] = ctrl if ctrl is not None else roll_controller(self.controller_weights[role], rng)
             if not self.require_neural_player or "neural" in out.values():
@@ -336,4 +348,4 @@ class RoleScenarioEnv(ScenarioEnv):
     def episode_rewards_by_player(self, outcome: str) -> dict[str, float]:
         """Every role player's terminal reward for ``outcome`` (whatever its
         controller), e.g. for playthrough summaries."""
-        return {pid: terminal_outcome_reward(self.reward_table, role, outcome)[0] for pid, role in self.roles.items()}
+        return {pid: terminal_outcome_reward(self.reward_table, role, outcome)[0] for pid, role in self.episode_roles.items()}

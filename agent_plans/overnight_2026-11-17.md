@@ -427,3 +427,30 @@ current, CPU 364k -> 402k s, no errors. No changes.
 Phase 2 attacker vs rules: 79.8% (14:30), then 81.7 / 82.8 / 81.5 / 81.3%
 (14:35-14:38) -- new highs, now ~81-83%. Phase 1 vs rules 63-64%. ~163M of
 300M steps. Health: log current, CPU 402k -> 440k s, no errors. No changes.
+
+## Morning (user back): restore training settings, add no-keeper episodes
+
+Config audit vs before the phase-2 test runs (154f14d^): n_epochs 13 -> 1,
+rollout_steps 750k -> 250k, target_kl 2.0 -> 0.15, snapshot evals every 1 -> 4,
+PPG + interleave on -> off, ppg_mc_returns off -> on were all test-run
+settings. User's call:
+
+- `ppo.n_epochs` 10, `ppo.rollout_steps` 500000, `ppo.target_kl` 0.5,
+  `eval.neural_snapshot_eval_every_n_rollouts` 2. PPG stays off.
+- New: `curriculum.phase2.scenario_kwargs.no_keeper_prob` 0.2 -- 20% of
+  phase-2 episodes have no goalkeeper (overnight probe: empty-goal scoring
+  only 20-24%).
+
+Implementation: `build_1v2_scenario(no_keeper_prob=)` (own seeded stream; the
+keeper is still built so a seed's positions/attributes/stamina are identical
+either way); `CurriculumPhase.optional_roles` (phase 2: goalkeeper);
+`RoleScenarioEnv.episode_roles` = configured roles present in the match
+(a missing non-optional role still raises); eval specs may carry
+`scenario_kwargs`: rules_baseline / attacker_vs_rules / defender_vs_rules pin
+the keeper IN (comparable with run25), new rules_baseline_no_keeper /
+attacker_vs_rules_no_keeper pin it OUT. No-keeper training episodes log under
+their own tag `phase2_1v2[attacker=neural,defender=rules]`.
+Smoke: 44/200 seeds drop the keeper; rules attacker 34/60 goals at an empty
+goal vs 14/60 with a keeper. Tests: tests/ai_scenario/test_phase2_no_keeper.py,
+conftest fixture zeroes no_keeper_prob for other tests (run-config leak),
+spec-list expectations updated.

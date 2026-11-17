@@ -887,8 +887,15 @@ def build_1v2_scenario(
     seed: int | None = None,
     attribute_tiers: dict | None = None,
     stamina_range: tuple | list | None = None,
+    no_keeper_prob: float = 0.0,
 ) -> Match:
     """1v2: elite attacker vs. average defender + GK.
+
+    ``no_keeper_prob``: chance the trial has NO goalkeeper (an empty goal, the
+    defender alone). Drawn from its own seeded stream, and the keeper is still
+    built (attributes, stamina) before being left out, so a given seed keeps
+    exactly the same positions / attributes either way. 0.0 (default) = always
+    a keeper, as before.
 
     ``attribute_tiers`` ({"attacker" / "defender" / "keeper": [tier, ...]}):
     each player's attributes are drawn per trial with
@@ -958,6 +965,8 @@ def build_1v2_scenario(
         lo, hi = float(stamina_range[0]), float(stamina_range[1])
         for _p in (attacker, defender, gk):
             _p.stamina = attr_rng.uniform(lo, hi)
+    keeper_rng = random.Random(f"{seed}-1v2-keeper") if seed is not None else random.Random()
+    with_keeper = not (no_keeper_prob > 0.0 and keeper_rng.random() < no_keeper_prob)
 
     ball = Ball.at_rest(attacker_start)
     ball.set_initial_possession(attacker.player_id)
@@ -971,7 +980,7 @@ def build_1v2_scenario(
 
     ui_cfg = load_gameplay_config().get("ui", {})
     match = Match(
-        pitch=pitch, players=[attacker, defender, gk],
+        pitch=pitch, players=[attacker, defender, gk] if with_keeper else [attacker, defender],
         ball=ball, rng_reduction=rng_reduction, rng=rng,
         goal_linger_s=ui_cfg.get("goal_linger_s", 3.0),
         dt_s=sim_dt_s,

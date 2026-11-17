@@ -153,3 +153,20 @@ def _disable_run_teacher_distillation():
         cur["distill"] = original
     else:
         cur.pop("distill", None)
+
+
+@pytest.fixture(scope="session", autouse=True)
+def _disable_run_no_keeper_episodes():
+    """curriculum.phase2.scenario_kwargs.no_keeper_prob is a RUN setting (a
+    share of phase-2 episodes with no goalkeeper). Tests that count tags or
+    roles assume the full 1v2 matchup; off for the session. The no-keeper
+    tests set their own value (tests/ai_scenario/test_phase2_no_keeper.py)."""
+    kw = load_ai_config().get("curriculum", {}).get("phase2", {}).get("scenario_kwargs")
+    if not isinstance(kw, dict) or "no_keeper_prob" not in kw:
+        yield
+        return
+    original = kw.pop("no_keeper_prob")
+
+    yield
+
+    kw["no_keeper_prob"] = original

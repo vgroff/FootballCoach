@@ -96,7 +96,7 @@ def run_role_phase_eval(phase: CurriculumPhase, spec: dict, sample_action_fn, se
     def _factory(seed: int, _swap: bool):
         env = build_role_env(phase, controller_weights=weights)
         env.controller_overrides = controllers
-        env.scenario_kwargs = {**env.scenario_kwargs, "seed": seed}
+        env.scenario_kwargs = {**env.scenario_kwargs, **dict(spec.get("scenario_kwargs") or {}), "seed": seed}
         last_env["env"] = env
         return env
 

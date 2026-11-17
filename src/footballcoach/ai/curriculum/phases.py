@@ -44,7 +44,13 @@ class CurriculumPhase:
         eval_specs: role-based phases only: the periodic seeded evals, each
             {"name": ..., "controllers": {role: "rules" | "neural"}} pinning
             every role (ai/eval/role_phase_eval.py). A spec with no neural
-            role is a rules baseline.
+            role is a rules baseline. A spec may also carry "scenario_kwargs",
+            overriding the configured build kwargs for that eval (e.g.
+            {"no_keeper_prob": 1.0}).
+        optional_roles: roles the scenario may leave out of an episode (e.g.
+            phase 2's goalkeeper under ``no_keeper_prob``). Such an episode
+            simply has no player in that role; a missing role NOT listed here
+            is an error.
     """
     name: str
     phase_id: int
@@ -57,6 +63,7 @@ class CurriculumPhase:
     config_key: str = ""
     outcome_kind: str = ""
     eval_specs: list[dict] = field(default_factory=list)
+    optional_roles: frozenset = frozenset()
 
     @property
     def is_role_based(self) -> bool:
@@ -129,11 +136,21 @@ PHASE_2_1V2 = CurriculumPhase(
     roles={"attacker": "attacker", "defender": "defender", "keeper": "goalkeeper"},
     config_key="phase2",
     outcome_kind="attack_defence",
+    # The main specs always keep the keeper (comparable with runs before
+    # no_keeper_prob); the *_no_keeper specs are the empty-goal case alone.
     eval_specs=[
-        {"name": "rules_baseline", "controllers": {"attacker": "rules", "defender": "rules", "goalkeeper": "rules"}},
-        {"name": "attacker_vs_rules", "controllers": {"attacker": "neural", "defender": "rules", "goalkeeper": "rules"}},
-        {"name": "defender_vs_rules", "controllers": {"attacker": "rules", "defender": "neural", "goalkeeper": "rules"}},
+        {"name": "rules_baseline", "controllers": {"attacker": "rules", "defender": "rules", "goalkeeper": "rules"},
+         "scenario_kwargs": {"no_keeper_prob": 0.0}},
+        {"name": "attacker_vs_rules", "controllers": {"attacker": "neural", "defender": "rules", "goalkeeper": "rules"},
+         "scenario_kwargs": {"no_keeper_prob": 0.0}},
+        {"name": "defender_vs_rules", "controllers": {"attacker": "rules", "defender": "neural", "goalkeeper": "rules"},
+         "scenario_kwargs": {"no_keeper_prob": 0.0}},
+        {"name": "rules_baseline_no_keeper", "controllers": {"attacker": "rules", "defender": "rules", "goalkeeper": "rules"},
+         "scenario_kwargs": {"no_keeper_prob": 1.0}},
+        {"name": "attacker_vs_rules_no_keeper", "controllers": {"attacker": "neural", "defender": "rules", "goalkeeper": "rules"},
+         "scenario_kwargs": {"no_keeper_prob": 1.0}},
     ],
+    optional_roles=frozenset({"goalkeeper"}),
 )
 
 # Future phases (stubs for reference, not yet implemented):
