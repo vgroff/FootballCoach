@@ -131,3 +131,32 @@ plateau is the weighting trade-off: on the SAME 1v1 states the student must
 produce 763's behaviour (real, weight 1) and run6's (cf, weight 0.3) split
 only by the task id; the gradient favours 763 there. Lever: a higher
 counterfactual weight, watching phase-1 real.
+
+### 01:20 User's idea (woke briefly): does the student switch behaviour on the keeper instead of the task id?
+
+Probe (`scratchpad/no_keeper_probe.py`, not committed): phase 2, task id 2,
+150 seeds, keeper present vs removed from the match (role env without the
+goalkeeper role):
+
+| | keeper | goals | kicks/ep | power | notable |
+|---|---|---|---|---|---|
+| 763 | yes | 8.7% | 0.13 | 0.05 | |
+| 763 | no | 16.0% | 0.35 | 0.19 | 112/150 dribbled out |
+| run6 | yes | 74.7% | 0.89 | 0.83 | |
+| run6 | no | 24.0% | 0.66 | 0.89 | 65 shots off target, 35 out |
+| student (run23 c3) | yes | 82.0% | 0.93 | 0.84 | |
+| student | no | 20.0% | 0.53 | 0.89 | 60 off target, 55 out |
+
+- The student does NOT revert to phase-1 behaviour without the keeper: it
+  keeps shooting hard (power 0.89, 0.53 kicks/ep vs 763's 0.13). So the
+  phase-2 "mode" isn't keyed on the keeper.
+- But run6 and the student both collapse at an EMPTY goal (75-82% -> 20-24%,
+  mostly wide): their shot aim / timing is keeper-relative. The student
+  inherited it from run6. Partly just out-of-distribution (one opponent fewer
+  than ever seen).
+- As a distillation augmentation: no good teacher for it (run6 is 24% there).
+  As a phase-2 setting for PPO (~10% episodes without the keeper): sensible
+  for robust shooting (and 5v5, keepers out of position), needs per-episode
+  role sets in RoleScenarioEnv. NOT added to tonight's PPO run (the agreed
+  setup; changing the scenario unattended would muddy it). Candidate for the
+  morning.
