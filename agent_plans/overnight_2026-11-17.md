@@ -273,3 +273,17 @@ phase-2 baseline with variety is **25.2%** (35.7% on the old fixed matchup) --
 the varied matchup is much harder, so the student is ~1.3x rules there (was
 ~2.2x on the fixed matchup). Phase-1 rules-vs-rules baseline 46% (unchanged).
 Logs: scratchpad/ppo_overnight.log and checkpoints/phase2_run25/training_log*.txt.
+
+### 03:36 PPO phase2_run25 progress (~41 rounds, ~10M steps)
+
+| time | ~round | phase 1 vs rules | phase 2 goals (varied matchup) |
+|---|---|---|---|
+| 02:52 | 1 | 63% | 33.3% |
+| 02:54 | 3 | 63% | 39.6% |
+| 03:05 | 13 | 63% | 49.3% |
+| 03:15 | 23 | 61% | 56.5% |
+| 03:35 | 41 | 63% | 63.9% |
+
+Phase 2 climbing fast (rules baseline with variety 25.2%), phase 1 holding at
+the teacher's level (763: 65%) with no BC / teacher term: the separation test
+is passing so far.
