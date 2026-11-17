@@ -318,3 +318,17 @@ checkpoints, 623 GB disk free.
 Phase 2 still creeping up, phase 1 steady at 63-64%. Health: log current,
 CPU 67k -> 105k s since 04:39, 156 checkpoints (51 python processes =
 rollout + eval pools + the every-4th-round snapshot pool).
+
+### 06:40 check-in: PPO healthy (~211 rounds, ~53M steps)
+
+| time | ~round | phase 1 | phase 2 |
+|---|---|---|---|
+| 05:47 | 164 | 64% | 65.4% |
+| 06:06 | 181 | 64% | 63.7% |
+| 06:16 | 191 | 64% | **70.2%** |
+| 06:36 | 209 | 64% | 68.7% |
+
+Phase 2 high 70.2%, phase 1 steady at 64% (763: 65%). Health: log current,
+CPU 105k -> 142k s, 211 checkpoints. (Some rounds' phase-2 eval lands ~39 s
+after the phase-1 one instead of ~6 s: the every-4th-round snapshot pool
+sharing the CPU; rounds are not slowing overall.)
