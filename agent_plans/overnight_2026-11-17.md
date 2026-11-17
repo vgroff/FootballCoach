@@ -587,3 +587,25 @@ the rules defender, so it stays comparable. Note: attacker and defender share
 task id 2 (no role input). Phase-2 tests pass with the config. Run dir
 checkpoints/phase2_run27, log scratchpad/ppo_run27.log; watchdog job moved to
 run27.
+
+## 23:4x run27 stopped -> run28 with phase-1-style attributes
+
+Run27 (neural defender, 4 rounds): attacker vs rules ~93% / no keeper ~96%
+held; defender_vs_rules (rules attacker vs neural defender, goals CONCEDED)
+30.9 -> 28.9 -> 34.6 -> 34.6% (rules defender concedes 25.2%) -- getting
+worse, not better, so far. In training rollouts the neural defender held the
+neural attacker slightly better than the rules one (88.5% vs 90.9% goals).
+
+Tier sensitivity (run26 checkpoint109, 115 eval seeds, keeper in, AI / rules
+attacker goal %): premier vs league_one 97.4 / 30.4; premier vs premier 90.4
+/ 9.6; championship vs championship 66.1 / 9.6; championship vs premier 34.8
+/ 1.7; league_one vs league_one 46.1 / 4.3; league_one vs premier 12.2 / 0.0.
+The AI beats the rules attacker in every cell, but the ~92% headline came from
+a ~0.2 attribute edge (attacker premier_league/boosted vs defence
+generic/championship/league_one).
+
+User's call: phase 2 uses phase 1's attribute distribution, attacker = phase
+1's trainee: attacker boosted, defender + keeper patsy, stamina 0.6-1.0.
+Phase-2 evals (rules baselines included) are NOT comparable with earlier
+runs. Run28 from run27 checkpoint24, checkpoints/phase2_run28, log
+scratchpad/ppo_run28.log; watchdog moved to run28.
