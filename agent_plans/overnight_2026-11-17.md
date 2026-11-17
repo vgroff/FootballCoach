@@ -454,3 +454,22 @@ Smoke: 44/200 seeds drop the keeper; rules attacker 34/60 goals at an empty
 goal vs 14/60 with a keeper. Tests: tests/ai_scenario/test_phase2_no_keeper.py,
 conftest fixture zeroes no_keeper_prob for other tests (run-config leak),
 spec-list expectations updated.
+
+### 15:39 run26 check-in
+
+Run26 = `checkpoints/phase2_run26`, from run25 checkpoint684 (stopped 15:12),
+log scratchpad/ppo_run26.log. 10-epoch updates run all epochs (no early
+stop), KL ~0.095 per update (run25: ~0.001). No-keeper share of phase-2
+rollout episodes 20.2% (1369/6768 in round 1).
+
+| time | phase-1 vs rules | phase-2 with keeper | phase-2 no keeper |
+|---|---|---|---|
+| 15:23 (start) | 65% | 79.8% | 27.6% (rules attacker 56.5%) |
+| 15:27 | 63% | 82.0% | 30.0% |
+| 15:31 | 63% | 83.3% | 29.3% |
+| 15:35 | 64% | 83.5% | 29.8% |
+| 15:39 | 64% | 82.4% | 33.5% |
+
+Hourly check-in job replaced: the old prompt's fallback (restart from run23
+with 1 epoch / 250k / target_kl 0.15) was stale; the new one restarts from
+run26's latest checkpoint with the current config.
