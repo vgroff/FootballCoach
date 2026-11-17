@@ -205,3 +205,20 @@ defender and keeper generic / championship / league_one (0.55 / 0.56 /
 0.44), stamina U(0.5, 1.0). The attacker is weaker on average than the old
 0.9, so phase-2 goal rates and the rules baseline under PPO are NOT
 comparable with the numbers above (the run recomputes its rules baseline).
+
+### 01:40 phase2_run23 done (6 cycles, aggregation 3, lr 3e-5, cf 0.3)
+
+After-fit (real p1 / real p2 / cf p1 / cf p2): c4 0.172 / 0.045 / 0.137 / 1.00;
+c5 0.176 / 0.044 / 0.132 / 1.03; c6 **0.160 / 0.041 / 0.129 / 0.925** (all best).
+Phase-1 real flattening at ~0.16-0.18.
+
+Offline evals of `phase2_run23/checkpoint_pretrained.pt` -- the best student
+so far; at the user's spreads it now matches or beats both teachers:
+- phase 1 vs rules (920 eps, 22 s): **64%** at the user's spreads (misses
+  1.7%), 66% at 763's -- 763 itself 65%;
+- phase 2 (1840 eps): **79.7%** at the user's spreads, 82.7% at 763's -- run6 75.1%.
+(run21 at the user's spreads: 61% / 76%; aggregation helped play too.)
+
+Next: phase2_run24 from run23, counterfactual weight 0.3 -> 0.5 (the lever
+left for the counterfactual KLs), aggregation kept; fall back to run23 for
+PPO if phase 1 slips on the eval.

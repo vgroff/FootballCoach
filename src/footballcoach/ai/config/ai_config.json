@@ -2,7 +2,7 @@
   "distill_pretrain": {
     "teachers": {"1": "checkpoints/migrated/phase1_run321_checkpoint763_migrated.pt", "2": "checkpoints/phase2_run6/checkpoint3.pt"},
     "counterfactual": true,
-    "counterfactual_weight": 0.3,
+    "counterfactual_weight": 0.5,
     "_comment_counterfactual_weight_20261117": "1.0 -> 0.1 (user's call): at 1.0 phase-1 real rows regressed from KL 0.0005 to 1.35 in one cycle (power diff 0 -> 0.25), the hard-kicking task-id-2 copies of the same phase-1 states pulling them before the task-id switch is learned. Real rows now outweigh their counterfactual 10:1 on every state.",
     "label_smoothing": 1e-05,
     "_comment_label_smoothing": "Teachers' Bernoulli targets mixed with a fair coin by this much: caps the target logits at ~+-11.5 (763's kick logits sit near -20, several of its probabilities at 1.0000), so the student does not inherit saturated heads PPO could no longer move. User's call, 2026-11-16.",
