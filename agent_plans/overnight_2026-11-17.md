@@ -571,3 +571,19 @@ Renderer offscreen): over the 115 eval seeds with a keeper the AI scores on
 78 where rules fails (44 rules tackled, 34 rules saved), 1 the other way;
 empty goal: 47 vs 3. AI goals are low shots (median peak height 0.3 m, none
 above ~1 m). Health: log current, CPU 141k -> 163k s, no errors.
+
+## 23:05 run26 stopped -> run27 with the neural defender
+
+User's call: stop run26 at its plateau (last evals: with keeper 93.0%, no
+keeper 94.6%, phase 1 ~64%), start a new run from its last checkpoint
+(checkpoint122) with the defender neural too. Controllers (user picked
+"attacker always neural"): attacker {neural 1}, defender {rules 1, neural 1},
+keeper rules -- half the phase-2 episodes are neural attacker vs neural
+defender. The defender trains as the episode's secondary player
+(batched_rollout_worker adds last_secondary_results rows, secondary_weight
+0.99, defender reward table). defender_vs_rules eval (rules attacker vs
+neural defender, keeper in) now runs automatically; attacker_vs_rules keeps
+the rules defender, so it stays comparable. Note: attacker and defender share
+task id 2 (no role input). Phase-2 tests pass with the config. Run dir
+checkpoints/phase2_run27, log scratchpad/ppo_run27.log; watchdog job moved to
+run27.
