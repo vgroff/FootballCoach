@@ -369,3 +369,15 @@ Phase 2 now plateauing around 72-74% (rules 25.2%); phase 1 steady at 65%
 
 Plateau: phase 2 71-75% for ~2 h, phase 1 64-65%. Health: log current,
 CPU 216k -> 253k s, no errors. No changes made.
+
+### 10:39 check-in
+
+| time | phase-1 vs rules | phase-2 attacker vs rules |
+|---|---|---|
+| 09:50 | — | 70.7% |
+| 10:08 | — | 74.6% |
+| 10:20 | — | **74.8%** |
+| 10:39 | 63% | 74.1% |
+
+Plateau continues: phase 2 71-75% (~3 h), phase 1 63-65%. Health: log
+current, CPU 253k -> 290k s, no errors. No changes made.
