@@ -176,3 +176,10 @@ is always Team.LEFT, but observations are canonicalised (x mirrored by the
 player's attacking direction, incl. the absolute last_touch_team_direction;
 y-canonical), so inside the network the attacker always attacks +x and the
 absolute team is unrecoverable; the scenario is randomised per seed.
+
+### 01:24 Hourly check-in scheduled (session cron job 3946e5bc, :17 past each hour, first ~02:24)
+
+In case of usage limits / stalls: each check-in re-reads this log and the
+latest run logs, checks what is running before launching anything (no
+duplicate runs, no resuming into an existing dir), then continues the plan.
+Session-only: dies if the Claude session or the machine closes.
