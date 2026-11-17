@@ -106,3 +106,17 @@ run22 after-fit (real p1 / real p2 / cf p1 / cf p2): c1 0.199 / 0.054 / 0.176 / 
 c2 0.191 / 0.054 / 0.199 / 1.20. Small steps; fresh rollouts keep resetting
 phase 1 to ~0.29. Next: phase2_run23 from run22's checkpoint, aggregate_cycles
 1 -> 3 (only change; lr 3e-5, counterfactual weight 0.3 kept).
+
+### 01:10 phase2_run23 (aggregation 3, lr 3e-5, cf 0.3), cycles 1-3
+
+After-fit (real p1 / real p2 / cf p1 / cf p2): c1 0.184 / 0.053 / 0.188 / 1.25;
+c2 0.173 / 0.053 / 0.162 / 1.09; c3 0.171 / 0.046 / 0.154 / 1.11.
+Fresh-rollout phase-1 real: 0.25, 0.219, 0.216 (was resetting to ~0.29
+without aggregation) -- the fresh-data gap shrank from ~0.1 to ~0.04.
+Phase 2 real is under 0.05. Flattening again; cf phase 2 flat at ~1.1.
+
+Hypothesis for cf phase 2 (to test, not assumed): its target is run6 on 1v1
+states labelled task id 2, an input run6 never saw (its own mix had phase-1
+states at task id 1), so run6's outputs there may be erratic / partly
+unlearnable. 763's counterfactual is also OOD, but 763's task-id columns are
+zeroed, so it ignores the label and fits fine.
