@@ -697,3 +697,10 @@ check.
 Everything flat across run29. Fixed-seed NvN check on the latest checkpoint
 running (920 eps; earlier: 76.8 / 77.5 / 77.2% for run26-122 / run27-24 /
 run28-7). Health: log current, CPU rising, no errors.
+
+Fixed-seed NvN on run29/checkpoint18 (~29 defender updates): AI attacker vs
+AI defender 78.9% (920 eps, +-1.4) vs 76.8 / 77.5 / 77.2% before. The
+defender is NOT learning to concede fewer goals (behaviour changes: faster,
+closer -- outcome flat). Untested options put to the user: easier opponents
+for the defender (weak signal at ~78% conceded), more defender data, role
+input / shaping.
