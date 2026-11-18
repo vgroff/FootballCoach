@@ -781,3 +781,16 @@ with the 50:50 mix. Run30 left running (user's config).
 
 Phase 1 dipped to 62% twice (was 64-65%) -- watch; possibly the 50:50 mix.
 Health: log current, CPU 27k -> 47k s, no errors.
+
+### 20:43 run30 check-in
+
+| | last 8 evals | rules baseline |
+|---|---|---|
+| phase 1 vs rules | 64-65% (the 19:4x 62% dips were noise) | -- |
+| attacker vs rules (keeper) | 84-88% (new high 88.0%) | 15.7% |
+| attacker vs rules (no keeper) | 87-89% | 49.6% |
+| defender_vs_rules conceded | 23.7-27.2% (earlier in run30 25-30%) | 15.7% |
+
+defender_vs_rules may be edging down (8 evals averaging ~25% vs ~27.5%
+over the first ~10) -- tentative, each eval +-2 pts. Health: log current,
+CPU 47k -> 68k s, no errors.
