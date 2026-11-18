@@ -629,3 +629,21 @@ neural" the defender never trains vs the rules attacker, which the eval uses
 -- I first read the flat eval as "not learning", RETRACTED. Option for the
 user: some rules-attacker episodes so the defender sees both styles.
 Health: log current, no errors.
+
+## 01:06 Stopped for the night (user switching off)
+
+Run28 stopped cleanly after ~5 rounds; last checkpoint
+`checkpoints/phase2_run28/checkpoint7.pt`. Last evals: attacker vs rules
+85.2% (keeper) / 87.2% (no keeper), defender_vs_rules conceded 27.4% (rules
+defender 15.7%), phase 1 65%. Monitor and hourly watchdog cancelled.
+
+To resume (fresh run dir, current config -- 10 epochs, 500k rollouts,
+target_kl 0.5, no_keeper_prob 0.2, defender neural 1 / rules 1, phase-1-style
+tiers):
+
+    .venv/Scripts/python.exe -m footballcoach.ai.scripts.train --phase 2 \
+        --phase-mix "1:0.7,2:0.3" \
+        --checkpoint checkpoints/phase2_run28/checkpoint7.pt --total-steps 300000000
+
+Open decision for tomorrow: give the defender some rules-attacker episodes
+(e.g. attacker {rules 1, neural 3}) so it trains against both attacker styles.
