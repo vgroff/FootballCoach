@@ -683,3 +683,17 @@ check.
    speed 2.15 -> 3.13 m/s, distance to attacker 5.9 -> 5.3 m, tackles/ep
    0.29 -> 0.33; attacker kicks/ep 0.87 -> 0.89 (control). So the defender's
    updates land; they have not yet turned into fewer goals.
+
+### 17:06 run29 check-in (18 rounds)
+
+| | rounds 1-6 | rounds 13-18 | rules baseline |
+|---|---|---|---|
+| phase 1 vs rules | 64-65% | 64% | -- |
+| attacker vs rules (keeper) | 83-86% | 82-85% | 15.7% |
+| attacker vs rules (no keeper) | 86-87% | 85-89% | 49.6% |
+| defender_vs_rules conceded | 26-29% | 25-29% | 15.7% |
+| NvN rollout attacker goals (replay-skewed) | 83 -> 69% | 69-70% | -- |
+
+Everything flat across run29. Fixed-seed NvN check on the latest checkpoint
+running (920 eps; earlier: 76.8 / 77.5 / 77.2% for run26-122 / run27-24 /
+run28-7). Health: log current, CPU rising, no errors.
