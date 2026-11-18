@@ -669,7 +669,7 @@ check.
 2. **Fixed-seed NvN (115 eval seeds x 8 = 920 eps, keeper in, scratchpad
    nvn_fixed8.py)**: AI attacker vs AI defender goals: run26/ckpt122 (no
    defender training) 76.8%, run27/ckpt24 77.5%, run28/ckpt7 77.2% (+-1.4) --
-   NO improvement in outcomes. (An earlier 230-ep read of 80.0 -> 74.3% was
+   NO improvement in outcomes [RETRACTED 18:4x: confounded -- the attacker co-adapts; see the fixed-attacker test]. (An earlier 230-ep read of 80.0 -> 74.3% was
    noise -- retracted.) AI defender ~77% vs rules defender ~83% vs the AI
    attacker already before training (phase-1 chasing prior).
 3. **Value head tells the roles apart -- hypothesis REFUTED** (role_value_probe.py,
@@ -700,7 +700,7 @@ run28-7). Health: log current, CPU rising, no errors.
 
 Fixed-seed NvN on run29/checkpoint18 (~29 defender updates): AI attacker vs
 AI defender 78.9% (920 eps, +-1.4) vs 76.8 / 77.5 / 77.2% before. The
-defender is NOT learning to concede fewer goals (behaviour changes: faster,
+defender is NOT learning to concede fewer goals [RETRACTED 18:4x: confounded by the co-adapting attacker; with the attacker held fixed the defender DID improve] (behaviour changes: faster,
 closer -- outcome flat). Untested options put to the user: easier opponents
 for the defender (weak signal at ~78% conceded), more defender data, role
 input / shaping.
@@ -732,3 +732,25 @@ First-rollout mix as planned: neural attacker 85.3%, neural defender 73.5%,
 rules attacker vs neural defender 14.7%; env slots 272/272 phase 1/2 (~11.4k
 phase-2 episodes per round vs ~6.8k at 70:30). Too early for the defender;
 fixed-seed NvN re-test after ~10-15 updates. Health: log current, no errors.
+
+### 18:4x CORRECTION: the defender IS learning (fixed-attacker test)
+
+AI-vs-AI fixed-seed tests change BOTH players between checkpoints; the
+attacker co-adapts to the defender it trains against, so a flat head-to-head
+does not mean a flat defender. Isolated test (scratchpad
+defender_fixed_attacker.py: attacker network fixed at run26/checkpoint122,
+only the defender's network swapped; 115 eval seeds x 8 = 920 eps, keeper in):
+
+| defender network | goals conceded | ball won |
+|---|---|---|
+| run26/checkpoint122 (untrained) | 76.8% | 15.1% |
+| run30/checkpoint16 | **69.5%** | **20.7%** |
+
+-7.3 pts (~3.6 SE). The first row reproduces the earlier 76.8% exactly
+(same seeds), validating the per-player network swap. Earlier "defender NOT
+learning" entries marked RETRACTED. run28/7 and run29/18 defenders running
+on the same test to see whether the run30 mix change mattered.
+
+run30 18:43 check-in: attacker vs rules 85-86% (keeper) / 86-89% (no
+keeper), defender_vs_rules conceded 26-30% (rules def 15.7%), phase 1 64-65%.
+Health: log current, no errors.

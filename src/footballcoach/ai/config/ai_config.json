@@ -266,7 +266,7 @@
         "defender":   {"rules": 3, "neural": 7},
         "goalkeeper": {"rules": 1, "neural": 0}
       },
-      "_comment_controllers_20261118": "User's call (run30, with the phase mix 50:50): attacker rules:neural 20:80, defender 30:70. After fixed-seed tests showed the neural defender not conceding fewer goals over ~29 updates vs the always-neural attacker (AI attacker vs AI defender 76.8 -> 78.9%, 920 eps): give it some easier (rules) attackers and more data. Rolls with no neural player (rules attacker + rules defender, 6%) are redrawn, so effectively ~85% neural attacker, ~75% neural defender, ~15% rules attacker vs neural defender.",
+      "_comment_controllers_20261118": "User's call (run30, with the phase mix 50:50): attacker rules:neural 20:80, defender 30:70. After AI-vs-AI fixed-seed tests showed no change over ~29 updates (76.8 -> 78.9%, 920 eps) -- later found confounded (the attacker co-adapts; with the attacker held fixed the defender did improve, agent_plans/overnight_2026-11-17.md 2026-11-18 18:4x): give it some easier (rules) attackers and more data. Rolls with no neural player (rules attacker + rules defender, 6%) are redrawn, so effectively ~85% neural attacker, ~75% neural defender, ~15% rules attacker vs neural defender.",
       "_comment_controllers_20261117": "Defender neural 0 -> 1 (user's call, phase2_run27 from run26): attacker always neural, defender neural in half the phase-2 episodes (its moves trained as a secondary player, secondary_weight 0.99, defender reward table), keeper rules. The defender_vs_rules eval (rules attacker vs neural defender, keeper in) runs automatically once the defender can be neural. Attacker and defender share task id 2 (no role input)."
     },
     "distill": {},
