@@ -718,3 +718,17 @@ checkpoints/phase2_run30, log scratchpad/ppo_run30.log; watchdog moved.
 Judge the defender by the fixed-seed NvN test (scratchpad nvn_fixed8.py;
 baseline 76.8-78.9%) and defender_vs_rules (rules defender 15.7%), not the
 replay-skewed rollout rate.
+
+### 17:43 run30 check-in (4 evals)
+
+| round | phase-1 vs rules | attacker vs rules (keeper) | (no keeper) | defender_vs_rules conceded (rules def 15.7%) |
+|---|---|---|---|---|
+| 0 | 63% | 84.3% | 87.6% | 29.6% |
+| 1 | 64% | 85.0% | 85.2% | 27.2% |
+| 2 | 65% | 84.3% | 88.3% | 25.2% |
+| 3 | 65% | 85.4% | 85.7% | 26.1% |
+
+First-rollout mix as planned: neural attacker 85.3%, neural defender 73.5%,
+rules attacker vs neural defender 14.7%; env slots 272/272 phase 1/2 (~11.4k
+phase-2 episodes per round vs ~6.8k at 70:30). Too early for the defender;
+fixed-seed NvN re-test after ~10-15 updates. Health: log current, no errors.
