@@ -754,3 +754,18 @@ on the same test to see whether the run30 mix change mattered.
 run30 18:43 check-in: attacker vs rules 85-86% (keeper) / 86-89% (no
 keeper), defender_vs_rules conceded 26-30% (rules def 15.7%), phase 1 64-65%.
 Health: log current, no errors.
+
+Fixed-attacker series complete (attacker = run26/checkpoint122, 920 eps each):
+
+| defender network | ~defender updates | conceded | ball won |
+|---|---|---|---|
+| run26/122 | 0 | 76.8% | 15.1% |
+| run28/7 | ~11 | 73.5% | 16.2% |
+| run29/18 | ~29 | 68.2% | 19.3% |
+| run30/16 | ~45 | 69.5% | 20.7% |
+
+The defender learned steadily under the OLD settings (runs 28-29: attacker
+always neural, defender 50:50, mix 70:30); the run30 change was motivated by
+the confounded test and has added nothing measurable yet (68.2 vs 69.5%,
+within noise; plateau ~68-70% vs this attacker). Phase 1 holding at 64-65%
+with the 50:50 mix. Run30 left running (user's config).
