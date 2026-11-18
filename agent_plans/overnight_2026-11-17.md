@@ -658,3 +658,28 @@ phase-1-style tiers). Log scratchpad/ppo_run29.log; hourly watchdog re-armed.
 The defender's real metric here is the neural-vs-neural rollout goal rate;
 defender_vs_rules (vs the rules attacker it never trains against) is a side
 check.
+
+### 2026-11-18 16:3x Is the neural defender learning? (white-box probes)
+
+1. **Rollout trend was a replay artefact -- RETRACTED "learning fast".** The
+   NvN rollout goal rate fell 80.9 -> 67.9% within run28, but run29's FIRST
+   rollout (checkpoint7 weights, no update yet) was 83.3% again, as run28's
+   was (80.9%). Episode replay re-plays the top 25% |advantage| episodes,
+   skewing in-run rollout outcome rates; not comparable across rounds/runs.
+2. **Fixed-seed NvN (115 eval seeds x 8 = 920 eps, keeper in, scratchpad
+   nvn_fixed8.py)**: AI attacker vs AI defender goals: run26/ckpt122 (no
+   defender training) 76.8%, run27/ckpt24 77.5%, run28/ckpt7 77.2% (+-1.4) --
+   NO improvement in outcomes. (An earlier 230-ep read of 80.0 -> 74.3% was
+   noise -- retracted.) AI defender ~77% vs rules defender ~83% vs the AI
+   attacker already before training (phase-1 chasing prior).
+3. **Value head tells the roles apart -- hypothesis REFUTED** (role_value_probe.py,
+   ckpt7): attacker mean V +2.69 vs return +2.90 (corr 0.88), defender -2.38
+   vs -2.70 (corr 0.82). The bimodal "value RMSE by outcome" line just pools
+   both roles.
+4. Plumbing checked: GAE is per track_id (rollout_buffer.compute_gae);
+   secondary rows enter the update with weight 0.99; secondary rows get their
+   own opportunity flags (role_env.py:323).
+5. **Behaviour does change** (role_behaviour.py, 230 NvN eps): defender mean
+   speed 2.15 -> 3.13 m/s, distance to attacker 5.9 -> 5.3 m, tackles/ep
+   0.29 -> 0.33; attacker kicks/ep 0.87 -> 0.89 (control). So the defender's
+   updates land; they have not yet turned into fewer goals.
