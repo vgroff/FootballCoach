@@ -769,3 +769,15 @@ always neural, defender 50:50, mix 70:30); the run30 change was motivated by
 the confounded test and has added nothing measurable yet (68.2 vs 69.5%,
 within noise; plateau ~68-70% vs this attacker). Phase 1 holding at 64-65%
 with the 50:50 mix. Run30 left running (user's config).
+
+### 19:43 run30 check-in
+
+| | last 8 evals | rules baseline |
+|---|---|---|
+| phase 1 vs rules | 62-64% | -- |
+| attacker vs rules (keeper) | 85-87% (edging up from 84%) | 15.7% |
+| attacker vs rules (no keeper) | 87-89% | 49.6% |
+| defender_vs_rules conceded | 25-28% (ball won 38-41%) | 15.7% |
+
+Phase 1 dipped to 62% twice (was 64-65%) -- watch; possibly the 50:50 mix.
+Health: log current, CPU 27k -> 47k s, no errors.
