@@ -647,3 +647,14 @@ tiers):
 
 Open decision for tomorrow: give the defender some rules-attacker episodes
 (e.g. attacker {rules 1, neural 3}) so it trains against both attacker styles.
+
+## 2026-11-18: resumed as run29
+
+User's call: no rules-attacker episodes for the defender (the rules attacker
+is the weaker opponent); keep "attacker always neural". Run29 from
+`checkpoints/phase2_run28/checkpoint7.pt`, config unchanged (10 epochs, 500k
+rollouts, target_kl 0.5, no_keeper_prob 0.2, defender neural 1 / rules 1,
+phase-1-style tiers). Log scratchpad/ppo_run29.log; hourly watchdog re-armed.
+The defender's real metric here is the neural-vs-neural rollout goal rate;
+defender_vs_rules (vs the rules attacker it never trains against) is a side
+check.
