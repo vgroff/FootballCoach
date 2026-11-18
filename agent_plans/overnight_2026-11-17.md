@@ -704,3 +704,17 @@ defender is NOT learning to concede fewer goals (behaviour changes: faster,
 closer -- outcome flat). Untested options put to the user: easier opponents
 for the defender (weak signal at ~78% conceded), more defender data, role
 input / shaping.
+
+## 17:3x run29 stopped -> run30: more and easier defender data
+
+User's calls after the defender-not-learning finding:
+1. Attacker rules:neural 20:80 (some easier, rules attackers for the defender).
+2. Phase mix 1:2 = 50:50 (was 70:30); defender rules:neural 30:70 (was 50:50).
+3. No role input (the obs already carries teams / possession).
+No-neural rolls (rules + rules, 6%) are redrawn: effectively ~85% neural
+attacker, ~75% neural defender, ~15% rules attacker vs neural defender.
+Phase-2 tests pass. Run30 from run29/checkpoint23, `--phase-mix "1:0.5,2:0.5"`,
+checkpoints/phase2_run30, log scratchpad/ppo_run30.log; watchdog moved.
+Judge the defender by the fixed-seed NvN test (scratchpad nvn_fixed8.py;
+baseline 76.8-78.9%) and defender_vs_rules (rules defender 15.7%), not the
+replay-skewed rollout rate.

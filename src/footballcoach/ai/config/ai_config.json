@@ -262,10 +262,11 @@
       "eval_seed_offset": 1000000,
       "_comment_eval": "Periodic phase-2 evals (PHASE_2_1V2.eval_specs, ai/eval/role_phase_eval.py), generic over role-based phases: whenever ppo.rollout_eval_trials > 0 and this run trains phase 2 (the phase mix, or --phase 2 alone), each spec runs the SAME budget as the phase-1 evals (eval.eval_n_seeds seeds x eval.eval_repeats_per_seed, on the persistent eval pool) over seeds eval_seed_offset .. + eval_n_seeds - 1. Only the rules-only baseline (cached) and specs with a neural role whose controllers neural weight here is > 0 are run.",
       "controllers": {
-        "attacker":   {"rules": 0, "neural": 1},
-        "defender":   {"rules": 1, "neural": 1},
+        "attacker":   {"rules": 1, "neural": 4},
+        "defender":   {"rules": 3, "neural": 7},
         "goalkeeper": {"rules": 1, "neural": 0}
       },
+      "_comment_controllers_20261118": "User's call (run30, with the phase mix 50:50): attacker rules:neural 20:80, defender 30:70. After fixed-seed tests showed the neural defender not conceding fewer goals over ~29 updates vs the always-neural attacker (AI attacker vs AI defender 76.8 -> 78.9%, 920 eps): give it some easier (rules) attackers and more data. Rolls with no neural player (rules attacker + rules defender, 6%) are redrawn, so effectively ~85% neural attacker, ~75% neural defender, ~15% rules attacker vs neural defender.",
       "_comment_controllers_20261117": "Defender neural 0 -> 1 (user's call, phase2_run27 from run26): attacker always neural, defender neural in half the phase-2 episodes (its moves trained as a secondary player, secondary_weight 0.99, defender reward table), keeper rules. The defender_vs_rules eval (rules attacker vs neural defender, keeper in) runs automatically once the defender can be neural. Attacker and defender share task id 2 (no role input)."
     },
     "distill": {},
