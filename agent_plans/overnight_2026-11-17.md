@@ -794,3 +794,14 @@ Health: log current, CPU 27k -> 47k s, no errors.
 defender_vs_rules may be edging down (8 evals averaging ~25% vs ~27.5%
 over the first ~10) -- tentative, each eval +-2 pts. Health: log current,
 CPU 47k -> 68k s, no errors.
+
+## 20:44 Stopped run30 (user needs the machine)
+
+Last checkpoint `checkpoints/phase2_run30/checkpoint53.pt`. Monitor and watchdog cancelled. To resume (fresh run
+dir, current config: attacker rules 1 / neural 4, defender rules 3 / neural
+7, phase-1-style tiers, no_keeper_prob 0.2, 10 epochs, 500k rollouts):
+
+    .venv/Scripts/python.exe -m footballcoach.ai.scripts.train --phase 2         --phase-mix "1:0.5,2:0.5" --checkpoint checkpoints/phase2_run30/checkpoint53.pt --total-steps 300000000
+
+Open question: keep run30's mix or revert to the old one (attacker always
+neural, defender 50:50, mix 70:30), under which the defender learned.
