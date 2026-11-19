@@ -191,3 +191,13 @@ Plateau-ish: all within noise of the last hour. Health: log current, CPU
 The AI defender now matches the rules defender on goals conceded vs the rules
 attacker (it trained mostly vs the AI attacker). Health: log current, CPU
 88k -> 110k s, no errors.
+
+## 19:0x Run34 stopped (user's call, "seems like it's working") -- final checkpoint82
+
+Confirmatory fixed-attacker test, machine free so parallel (scratchpad
+defender_fixed_attacker_mp.py; attacker run31/checkpoint1; 115 eval seeds x 8
+= 920 eps each): untrained defender (run30/53) 54.5% conceded, ball won 24.7%
+-> run34/82 **44.9%**, ball won **36.0%**. -9.6 pts, ~4 SE: the defender IS
+improving. Final evals: attacker vs rules 61-65% (keeper) / 62-65% (no
+keeper), defender_vs_rules conceded 6.5-7.8% (rules defender 7.0%), phase 1
+63-65%. Next (user): neural goalkeeper + keeper physics changes.
