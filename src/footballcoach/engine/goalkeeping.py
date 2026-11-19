@@ -216,3 +216,50 @@ def save_target_position(
 
     default_x = goal_x + sign * params.default_position_fraction_of_half_length * pitch.half_length
     return Vector3(default_x, 0.0, 0.0)
+
+
+def ball_aimed_at_goal(match, team: Team, margin: float = 1.3) -> bool:
+    """True if the LOOSE ball's straight-line path projects into ``team``'s
+    goal mouth (widened by ``margin`` for early reaction). The rules keeper's
+    trigger for a save (StagedGoalkeeperAI) and the gate of the keeper's
+    save-target shaping (ai/env/role_env.py) -- one definition for both."""
+    ball = match.ball
+    if ball.possessed_by is not None:
+        return False
+    if ball.velocity.length() < 1.0:
+        return False
+    pitch = match.pitch
+    vx, vy = ball.velocity.x, ball.velocity.y
+    bx, by = ball.position.x, ball.position.y
+    if team == Team.LEFT:
+        goal_x = -pitch.half_length
+        if vx >= 0.0:
+            return False
+    else:
+        goal_x = pitch.half_length
+        if vx <= 0.0:
+            return False
+    t = (goal_x - bx) / vx
+    if t < 0.0:
+        return False
+    return abs(by + vy * t) < pitch.goal_width_m / 2.0 * margin
+
+
+def keeper_save_target(player, match) -> Vector3:
+    """Where a keeper should go for the incoming ball: an early intercept when
+    one gives the better margin, else the goal-line save point -- exactly the
+    rules keeper's SaveOrder target, shared with the keeper's save-target
+    shaping (ai/env/role_env.py)."""
+    from footballcoach.engine.movement import effective_top_speed
+    gk_top_speed = effective_top_speed(
+        match.movement_params, player.attributes.top_speed, player.stamina, has_ball=False, is_goalkeeper=True,
+    )
+    intercept = early_intercept_target(
+        gk_position=player.position, gk_effective_top_speed_mps=gk_top_speed,
+        ball_position=match.ball.position, ball_velocity=match.ball.velocity, pitch=match.pitch,
+        team=player.team, gravity_mps2=match.ball_physics_params.gravity_mps2, params=match.goalkeeping_params,
+    )
+    if intercept is not None:
+        return intercept
+    return save_target_position(match.pitch, player.team, match.ball.position, match.ball.velocity,
+                                match.ball_physics_params.gravity_mps2, match.goalkeeping_params)

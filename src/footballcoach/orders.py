@@ -862,7 +862,7 @@ class SaveOrder:
 
     def execute(self, player: "Player", match: "Match", dt: float) -> bool:
         """Move keeper toward save position each tick.  Never returns True (persistent duty)."""
-        from footballcoach.engine.goalkeeping import early_intercept_target, save_target_position
+        from footballcoach.engine.goalkeeping import keeper_save_target
         from footballcoach.engine.movement import SpeedMode, effective_top_speed
         from footballcoach.entities.player import Team
 
@@ -893,24 +893,7 @@ class SaveOrder:
             match.movement_params, player.attributes.top_speed,
             player.stamina, has_ball=False, is_goalkeeper=True,
         )
-        intercept = early_intercept_target(
-            gk_position=player.position,
-            gk_effective_top_speed_mps=gk_top_speed,
-            ball_position=match.ball.position,
-            ball_velocity=match.ball.velocity,
-            pitch=match.pitch,
-            team=player.team,
-            gravity_mps2=match.ball_physics_params.gravity_mps2,
-            params=match.goalkeeping_params,
-        )
-        target_position = intercept if intercept is not None else save_target_position(
-            match.pitch,
-            player.team,
-            match.ball.position,
-            match.ball.velocity,
-            match.ball_physics_params.gravity_mps2,
-            match.goalkeeping_params,
-        )
+        target_position = keeper_save_target(player, match)
         direction = target_position - player.position
         dist_to_save = direction.length_xy()
         snap_threshold = max(0.15, gk_top_speed * dt)

@@ -136,6 +136,16 @@ class RoleScenarioEnv(ScenarioEnv):
             if phase in PHASES_BY_ID else {}
         )
         self._bc_source_of_player: dict[str, int] = {}
+        # Keeper save-target shaping (reward.<phase>.shaping.goalkeeper,
+        # _keeper_shaping_tick): coefficient per metre (0 = off) and the
+        # keeper's distance to his save target on the previous gated tick.
+        from footballcoach.ai.config import load_ai_config
+        _rcfg = load_ai_config().get("reward", {})
+        _key = PHASES_BY_ID[phase].config_key if phase in PHASES_BY_ID else None
+        _shape = ((_rcfg.get(_key) or {}).get("shaping") or {}) if _key else {}
+        self._gk_shaping_coef: float = float((_shape.get("goalkeeper") or {}).get("save_target_coef", 0.0))
+        self._gk_prev_dist: float | None = None
+        self._gk_shaping_step: float = 0.0
 
     # ------------------------------------------------------------------
 
@@ -224,6 +234,7 @@ class RoleScenarioEnv(ScenarioEnv):
             # The scenario's scripted opening order belongs to the rules AI.
             player.current_order = None
 
+        self._gk_prev_dist = None
         self._episode_index += 1
         self._match_logger.reset()
         match.match_logger = self._match_logger
@@ -270,6 +281,8 @@ class RoleScenarioEnv(ScenarioEnv):
         for tick_idx in range(self._ticks_per_decision):
             tick_done = self._loop.step(skip_state_timers=(timers_already_advanced and tick_idx == 0))
             self._episode_ticks += 1
+            if self._gk_shaping_coef:
+                self._keeper_shaping_tick(self._loop.last_completed_trial_match if tick_done else self._loop.match)
             if trainee.kicked_this_tick:
                 kicks += 1
                 if trainee.kick_armed:
@@ -292,10 +305,14 @@ class RoleScenarioEnv(ScenarioEnv):
                 raise ValueError(f"classifier returned {outcome!r}, not in this phase's outcome_keys")
             info.trial_outcome = outcome
 
+        shaping, self._gk_shaping_step = self._gk_shaping_step, 0.0
+
         def _reward(pid: str) -> tuple[float, dict]:
-            if not done:
-                return 0.0, {}
-            return terminal_outcome_reward(self.reward_table, self.roles[pid], outcome)
+            r, comps = (terminal_outcome_reward(self.reward_table, self.roles[pid], outcome) if done else (0.0, {}))
+            if self.roles[pid] == "goalkeeper" and self._gk_shaping_coef:
+                r += shaping
+                comps = {**comps, "gk_save_target": shaping}
+            return r, comps
 
         reward, self.last_reward_components = _reward(self.trainee_player_id)
         info.ticks_elapsed = self._episode_ticks
@@ -350,6 +367,27 @@ class RoleScenarioEnv(ScenarioEnv):
         if done and self.last_terminal_match is not None:
             return self._get_obs(match=self.last_terminal_match), reward, done, info
         return self._get_obs(), reward, done, info
+
+    def _keeper_shaping_tick(self, match) -> None:
+        """One tick of the keeper's save-target shaping: while the ball is
+        loose and heading for his goal (engine/goalkeeping.ball_aimed_at_goal,
+        the rules keeper's save trigger), pay coef * (previous distance -
+        current distance) to his save target (keeper_save_target, the rules
+        keeper's SaveOrder target); off the gate the potential is 0 and the
+        previous distance is forgotten. A pure potential, Phi = -coef * dist
+        while gated, so it telescopes (gamma = 1, as the phase-1 approach
+        shaping) and cannot be farmed. Accumulated into _gk_shaping_step."""
+        from footballcoach.engine.goalkeeping import ball_aimed_at_goal, keeper_save_target
+        if match is None:
+            return
+        gk = next((p for p in match.players if p.is_goalkeeper and self.roles.get(p.player_id) == "goalkeeper"), None)
+        if gk is None or not ball_aimed_at_goal(match, gk.team):
+            self._gk_prev_dist = None
+            return
+        d = gk.position.xy().distance_to(keeper_save_target(gk, match).xy())
+        if self._gk_prev_dist is not None:
+            self._gk_shaping_step += self._gk_shaping_coef * (self._gk_prev_dist - d)
+        self._gk_prev_dist = d
 
     def episode_rewards_by_player(self, outcome: str) -> dict[str, float]:
         """Every role player's terminal reward for ``outcome`` (whatever its

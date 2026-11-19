@@ -475,6 +475,8 @@
         "defender":   {"goal": -4.0, "saved": 2.0,  "defence_possession": 3.0,  "shot_off_target": 2.0,  "attacker_out": 2.0,  "timeout": 1.0},
         "goalkeeper": {"goal": -4.0, "saved": 3.0,  "defence_possession": 1.0,  "shot_off_target": 2.0,  "attacker_out": 1.0,  "timeout": 1.0}
       },
+      "shaping": {"goalkeeper": {"save_target_coef": 0.1}},
+      "_comment_shaping_20261119": "Keeper save-target shaping (user's call, 2026-11-19; ai/env/role_env._keeper_shaping_tick): while the ball is loose and heading for his goal (the rules keeper's save trigger), the keeper earns save_target_coef per metre he closes on his save target (the rules keeper's SaveOrder target: early intercept or goal-line point), loses it per metre he opens. Pure potential (telescopes, cannot be farmed): ~0.5 for closing 5 m, vs save +3 / goal -4. Never while the ball is held. 0 = off.",
       "_comment_terminal_20261119": "Audit (user's call, goal stays +-4 like phase 1, no shaping). Before: attacker saved +1 (a saved shot paid 3 more than a tackle or a miss: shoot-from-anywhere incentive, and saved paid BOTH sides +1), attacker_out -4, timeout -1; defender saved +1 (less than a forced miss +2); keeper saved +2 = miss = out, out +2 > defence_possession +1. Now: attacker goal +4 > saved -1 (at least he shot) > miss = tackled -2 > out = timeout -3 (timeout quite bad); defender earns most for winning the ball (+3), a save or forced miss or run-out +2, timeout +1; keeper earns most for its own save (+3), forced miss +2 (its closing down forces misses), defence possession / run-out +1 (little contribution). Value refit (PPG, MC returns) before PPO."
     }
   },

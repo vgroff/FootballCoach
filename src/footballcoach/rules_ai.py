@@ -486,35 +486,11 @@ class StagedGoalkeeperAI(_RulesBasedAI):
         return 0.0 if player.team == Team.LEFT else math.pi
 
     def _ball_aimed_at_goal(self, player: Player, match: Match) -> bool:
-        """True if the loose ball's straight-line path projects into the goal mouth."""
-        from footballcoach.entities.player import Team
-        if match.ball.possessed_by is not None:
-            return False
-        ball_speed = match.ball.velocity.length()
-        if ball_speed < 1.0:
-            return False
-
-        pitch = match.pitch
-        vx = match.ball.velocity.x
-        vy = match.ball.velocity.y
-        bx = match.ball.position.x
-        by = match.ball.position.y
-
-        if player.team == Team.LEFT:
-            goal_x = -pitch.half_length
-            if vx >= 0.0:
-                return False  # ball moving away from left goal
-        else:
-            goal_x = pitch.half_length
-            if vx <= 0.0:
-                return False  # ball moving away from right goal
-
-        t = (goal_x - bx) / vx
-        if t < 0.0:
-            return False
-        proj_y = by + vy * t
-        half_goal_w = pitch.goal_width_m / 2.0 * 1.3  # 30% margin for early reaction
-        return abs(proj_y) < half_goal_w
+        """True if the loose ball's straight-line path projects into the goal
+        mouth (engine/goalkeeping.ball_aimed_at_goal, shared with the keeper's
+        save-target shaping)."""
+        from footballcoach.engine.goalkeeping import ball_aimed_at_goal
+        return ball_aimed_at_goal(match, player.team)
 
     def _face_outfield_if_parked(self, player: Player, match: Match) -> None:
         """If already stationary at goal centre, snap heading to face outfield.
