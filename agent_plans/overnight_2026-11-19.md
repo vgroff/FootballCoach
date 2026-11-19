@@ -51,3 +51,22 @@ and after ONE 10-epoch update the eval was 52.0% with 4.1% off target. My
 | defender_vs_rules conceded | 8-10% | 9-11% | 7.0% |
 
 Health: log current, CPU rising, no errors.
+
+## 12:14 run31 crashed (my fault) -> run32
+
+I ran a 24-worker fixed-seed NvN sweep next to the live run; run31 died with
+`OSError: [WinError 1450] Insufficient system resources` (Windows resource
+limit, not RAM: 25.7 GB free). Restarted as run32 from run31/checkpoint16
+(saved complete at 12:11:50, before the crash), config unchanged; watchdog
+moved. Memory note updated: no multi-process probes next to a live run.
+
+Fixed-seed NvN on run31/checkpoint16 (AI attacker of the same checkpoint;
+115 eval seeds x 8 = 920 eps; run31 scenario, 10 m keeper):
+
+| | AI defender | rules defender |
+|---|---|---|
+| keeper in: AI attacker scores | 60.0% (ball won 26.4%) | 57.8% (ball won 35.7%) |
+| no keeper: AI attacker scores | 67.8% (ball won 19.9%) | 60.4% (ball won 30.0%) |
+
+Under the new start the AI defender is now WORSE than the rules one against
+the AI attacker (it was better before: ~77% vs ~83% under the old start).
