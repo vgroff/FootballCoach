@@ -70,3 +70,21 @@ Fixed-seed NvN on run31/checkpoint16 (AI attacker of the same checkpoint;
 
 Under the new start the AI defender is now WORSE than the rules one against
 the AI attacker (it was better before: ~77% vs ~83% under the old start).
+
+### 12:53 run32 check-in (9 evals) + defender test
+
+| | run32 evals | run31 rules baselines |
+|---|---|---|
+| phase 1 vs rules | 64-65% | -- |
+| attacker vs rules (keeper) | 57-61% | 7.0% |
+| attacker vs rules (no keeper) | 59-67% | 54.8% |
+| defender_vs_rules conceded | 8.5-10.4% (slight drift down) | 7.0% |
+
+Fixed-attacker defender test (single process; attacker = run31/checkpoint1,
+460 eps each, run31 scenario + 10 m keeper): defender run30/53 conceded 53.7%
+(ball won 23.9%), run31/16 53.0% (27.6%), run32/4 52.6% (28.3%). Goals
+conceded flat over ~20 updates; ball wins +4.4 pts (~1.6 SE, hint only;
+keeper saves fell 16.3 -> 13.3%, i.e. the extra ball wins replace keeper
+saves). Re-test at ~30-40 updates. Free RAM only 4.4-5.6 GB during
+training now -- keep probes single-process and light.
+Health: log current, CPU rising, no errors.
