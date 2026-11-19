@@ -678,3 +678,28 @@ class TestSmoothTarget:
         at_optimum = F.binary_cross_entropy_with_logits(torch.logit(smoothed), smoothed, reduction="none")
         floor = -(smoothed * torch.log(smoothed) + (1.0 - smoothed) * torch.log(1.0 - smoothed))
         assert at_optimum.tolist() == pytest.approx(floor.tolist(), abs=1e-6)
+
+
+def test_log_exclude_decision_heads_changes_only_the_logged_rows():
+    """bc_loss_from_tensor(log_exclude_decision_heads=...): the loss and
+    split["rows"] are unchanged; split["rows_logged"] has exactly those
+    decision heads' BCE terms taken out of the "other" column."""
+    import torch
+    from footballcoach.ai.ppo.bc import BC_LABEL_DIM, bc_loss_from_tensor, _I_SHOOT, _I_VALID
+    from footballcoach.ai.models.decision_network import DecisionHeadsRaw
+    torch.manual_seed(0)
+    n = 6
+    labels = torch.zeros(n, BC_LABEL_DIM)
+    labels[:, _I_VALID] = 1.0
+    labels[:, _I_SHOOT] = 1.0
+    heads = DecisionHeadsRaw(**{f.name: torch.randn(n, *([1] if "target" not in f.name else [21]))
+                                for f in __import__("dataclasses").fields(DecisionHeadsRaw)})
+    base_loss, _, base = bc_loss_from_tensor(labels, heads, None, return_breakdown=True, return_group_rows=True,
+                                           split_kick=True, split_tackle=True)
+    loss, _, split = bc_loss_from_tensor(labels, heads, None, return_breakdown=True, return_group_rows=True,
+                                         split_kick=True, split_tackle=True,
+                                         log_exclude_decision_heads=("shoot_logit",))
+    assert torch.allclose(loss, base_loss) and torch.allclose(split["rows"], base["rows"])
+    shoot = torch.nn.functional.binary_cross_entropy_with_logits(heads.shoot_logit.squeeze(-1), labels[:, _I_SHOOT],
+                                                                 reduction="none")
+    assert torch.allclose(split["rows"][:, 0] - split["rows_logged"][:, 0], shoot, atol=1e-5)

@@ -1076,8 +1076,14 @@ def bc_loss_from_tensor(
     split_tackle: bool = False,
     return_group_rows: bool = False,
     kick_power_loss: str = "mse",
+    log_exclude_decision_heads: tuple = (),
 ):
     """Compute BC loss for a minibatch, given packed label tensors.
+
+    ``log_exclude_decision_heads`` (logging only, never changes the loss): with
+    ``return_group_rows``, ``split["rows_logged"]`` is ``split["rows"]`` with
+    these decision heads' terms (e.g. the phase's frozen heads, which train
+    the shared trunk but cannot act) taken out of the "other" column.
 
     ``kick_power_loss`` (ai_config bc.kick_power_loss): "mse" = squared error
     on the power fraction (the gradient on the head's raw output carries the
@@ -1227,15 +1233,16 @@ def bc_loss_from_tensor(
             loss = loss * w
         return loss
 
-    dec_loss = (
-        _bce(decision_heads.shoot_logit,          _I_SHOOT,   smoothing=dec_label_smoothing)
-        + _bce(decision_heads.pass_logit,          _I_PASS,    smoothing=dec_label_smoothing)
-        + _bce(decision_heads.move_logit,          _I_MOVE,    smoothing=dec_label_smoothing)
-        + _bce(decision_heads.tackle_logit,        _I_TACKLE,  smoothing=dec_label_smoothing)
-        + _bce(decision_heads.get_possession_raw,  _I_GP_EXTRA, smoothing=dec_label_smoothing)
-        + _bce(decision_heads.mark_logit,          _I_MARK,    smoothing=dec_label_smoothing)
-        + _bce(decision_heads.hold_position_logit, _I_HOLD,    smoothing=dec_label_smoothing)
-    )
+    dec_terms = {
+        "shoot_logit": _bce(decision_heads.shoot_logit, _I_SHOOT, smoothing=dec_label_smoothing),
+        "pass_logit": _bce(decision_heads.pass_logit, _I_PASS, smoothing=dec_label_smoothing),
+        "move_logit": _bce(decision_heads.move_logit, _I_MOVE, smoothing=dec_label_smoothing),
+        "tackle_logit": _bce(decision_heads.tackle_logit, _I_TACKLE, smoothing=dec_label_smoothing),
+        "get_possession_raw": _bce(decision_heads.get_possession_raw, _I_GP_EXTRA, smoothing=dec_label_smoothing),
+        "mark_logit": _bce(decision_heads.mark_logit, _I_MARK, smoothing=dec_label_smoothing),
+        "hold_position_logit": _bce(decision_heads.hold_position_logit, _I_HOLD, smoothing=dec_label_smoothing),
+    }
+    dec_loss = sum(dec_terms.values())
     loss += dec_weight * dec_loss
 
     exec_bce_loss = torch.zeros(labels.shape[0], device=labels.device)
@@ -1381,6 +1388,13 @@ def bc_loss_from_tensor(
                 tackle_group_per_row,
             ], dim=1)
             split["valid"] = valid
+            excl = [dec_terms[h] for h in log_exclude_decision_heads if h in dec_terms]
+            if excl:
+                logged = split["rows"].detach().clone()
+                logged[:, 0] = logged[:, 0] - dec_weight * sum(excl).detach()
+                split["rows_logged"] = logged
+            else:
+                split["rows_logged"] = split["rows"].detach()
 
     if return_breakdown:
         # kick_direction/kick_power/kick_spin are gated to zero on non-kick

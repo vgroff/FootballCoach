@@ -237,19 +237,31 @@ def _student_forward(trainer, mb_obs: dict):
     return d, e
 
 
-def role_bc_loss(trainer, d, e, mb: dict, label_smoothing: float) -> torch.Tensor:
+def role_bc_loss(trainer, d, e, mb: dict, label_smoothing: float) -> tuple[torch.Tensor, torch.Tensor]:
     """BC to the role's rules AI (role_bc) on the rows with bc_w > 0: the
     per-row loss (sum over bc.GROUP_ROW_COLUMNS) weighted by bc_w, averaged
-    over those rows; Bernoulli targets smoothed y -> y (1 - s) + s / 2."""
+    over those rows; Bernoulli targets smoothed y -> y (1 - s) + s / 2.
+
+    Returns (loss to train on, value to LOG). The logged value leaves out the
+    decision heads frozen in this phase (trainer._ppo_lp_masked_heads): with
+    bc.bc_trains_frozen_heads their terms still train the shared trunk (kept,
+    so they train normally once unfrozen), but they cannot act, so they are
+    not part of how well the role is matched."""
     from footballcoach.ai.ppo.bc import bc_loss_from_tensor
     w = mb["bc_w"]
     if not bool((w > 0).any()):
-        return torch.zeros((), device=w.device)
+        z = torch.zeros((), device=w.device)
+        return z, z
     kw = {**trainer._bc_loss_kwargs(), "dec_label_smoothing": label_smoothing, "exec_label_smoothing": label_smoothing}
+    frozen = tuple(getattr(trainer, "_ppo_lp_masked_heads", ()) or ())
     _, _, split = bc_loss_from_tensor(mb["bc_labels"], trainer._bc_heads_for_loss(d), e, **kw,
-                                      return_breakdown=True, split_kick=True, split_tackle=True, return_group_rows=True)
+                                      return_breakdown=True, split_kick=True, split_tackle=True, return_group_rows=True,
+                                      log_exclude_decision_heads=frozen)
     m = (w > 0) & split["valid"].bool()
-    return (split["rows"].sum(dim=1) * w * m).sum() / m.sum().clamp(min=1)
+    denom = m.sum().clamp(min=1)
+    train = (split["rows"].sum(dim=1) * w * m).sum() / denom
+    logged = (split["rows_logged"].sum(dim=1) * w * m).sum() / denom
+    return train, logged
 
 
 def minibatch_loss(trainer, mb: dict, ret_std: float, kl_coef: float, value_coef: float,
@@ -266,8 +278,8 @@ def minibatch_loss(trainer, mb: dict, ret_std: float, kl_coef: float, value_coef
     vw = mb["value_w"]
     sq = (e.value.squeeze(-1) - mb["returns"]) ** 2
     vloss = (sq * vw).sum() / vw.sum().clamp(min=1.0) / (ret_std ** 2)
-    bc = role_bc_loss(trainer, d, e, mb, bc_label_smoothing)
-    return kl_coef * kl + value_coef * vloss + bc, vloss, kl, bc
+    bc, bc_logged = role_bc_loss(trainer, d, e, mb, bc_label_smoothing)
+    return kl_coef * kl + value_coef * vloss + bc, vloss, kl, bc_logged
 
 
 def _slice(data: dict, idx: torch.Tensor, device) -> dict:
@@ -353,7 +365,8 @@ def attach_role_bc(data: dict, batch: dict, role_bc: dict) -> None:
 
 
 def bc_report(trainer, data: dict, batch_size: int, smoothing: float, max_rows: int = 40000) -> float:
-    """Mean role-BC loss over (up to max_rows of) the BC-taught rows, no grad."""
+    """Mean LOGGED role-BC loss (frozen decision heads left out, see
+    role_bc_loss) over (up to max_rows of) the BC-taught rows, no grad."""
     rows = torch.nonzero(data["bc_w"] > 0).squeeze(-1)[:max_rows]
     if len(rows) == 0:
         return float("nan")
@@ -363,7 +376,7 @@ def bc_report(trainer, data: dict, batch_size: int, smoothing: float, max_rows: 
             idx = rows[start:start + batch_size]
             mb = _slice(data, idx, trainer.device)
             d, e = _student_forward(trainer, mb["obs"])
-            tot += float(role_bc_loss(trainer, d, e, mb, smoothing)) * len(idx)
+            tot += float(role_bc_loss(trainer, d, e, mb, smoothing)[1]) * len(idx)
             n += len(idx)
     return tot / max(n, 1)
 
