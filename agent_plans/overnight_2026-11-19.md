@@ -286,3 +286,22 @@ measured on 156 keeper rows the decision part fell 28.8 -> 13.6 by cycle 3
 interference and a plausible part of the slow KL drift (share not measured).
 Fix available (detach frozen heads in role BC); user chose to let run39
 finish as is.
+
+Cycles 4-12 after (watchdog 23:04, healthy: log live, no errors, cycle
+checkpoints 2-12 kept): KL phase 1 0.010-0.020, phase 2 0.015-0.024, flat.
+Keeper BC unweighted (logged / 0.005; frozen decision heads already excluded
+from the log since 0f8d877, so no 28 to subtract): 35.2, 28.2, 21.7, 17.0,
+14.7, 13.2, 12.1, 11.4, 10.4 -- still falling, steps shrinking.
+
+### Same evening (user's calls)
+
+- Replay-score repeatability measured (agent_plans/engine_luck_control_variate.md):
+  Spearman ~0.73 across plays with fresh dice, 0.88 with the seed's dice;
+  my earlier "the pile is mostly luck" was an estimate and wrong.
+  episode_replay_top_fraction 0.25 -> 0.35 (af6c940). Engine-luck control
+  variate parked in that note.
+- Evals fully seeded: eval.seed_network_sampling on (a672f9d). Batched
+  evals ~2.5x slower (per-row sampling), sequential unchanged.
+- Pretrain log will print unweighted BC too (distill_pretrain.bc_report_line);
+  its smoke test needs the worker pool, so it waits until run39 is done
+  (not committed yet).
