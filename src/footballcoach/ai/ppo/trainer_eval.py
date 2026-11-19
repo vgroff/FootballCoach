@@ -121,8 +121,8 @@ def _build_neural_vs_neural_env_factory(max_episode_s: float, opponent_sample_ac
     from footballcoach.ai.eval.seeded_eval import swap_player_states
 
     class _NeuralOpponentEnv(ScenarioEnv):
-        def reset(self, *, seed: Optional[int] = None):
-            obs = super().reset(seed=seed)
+        def reset(self, *, seed: Optional[int] = None, fresh_engine_rng: bool = False):
+            obs = super().reset(seed=seed, fresh_engine_rng=fresh_engine_rng)
             from footballcoach.rules_ai import NeuralPlayerAI
             match = self._loop.match
             opponent = match.player_by_id_or_none("opponent")

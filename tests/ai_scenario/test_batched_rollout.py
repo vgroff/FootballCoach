@@ -730,3 +730,35 @@ class TestChunkedStreaming:
         result_buffer_ids = {id(r["buffer"]) for r in results}
         assert len(results) == 2, "the empty-buffer env must be skipped, not included"
         assert id(group._buffers[1]) not in result_buffer_ids
+
+
+class TestReplayFreshEngineRng:
+    """ppo.episode_replay_fresh_engine_rng: only episodes started from a
+    queued replay seed are reset with fresh engine dice."""
+
+    def _calls(self, trainer, flag: bool, replay):
+        envs = _make_envs(trainer, 2, max_episode_s=2.0)
+        calls = []
+        for i, env in enumerate(envs):
+            real = env.reset
+
+            def _spy(*, seed=None, fresh_engine_rng=False, _real=real):
+                calls.append((seed, fresh_engine_rng))
+                return _real(seed=seed, fresh_engine_rng=fresh_engine_rng)
+            env.reset = _spy
+        group = BatchedEnvGroup(envs, trainer, seeds=[9500, 9501])
+        group.replay_fresh_engine_rng = flag
+        group.collect(n_steps=400, replay_seeds=replay)
+        return calls
+
+    def test_replayed_episodes_get_fresh_dice_others_do_not(self, trainer):
+        calls = self._calls(trainer, True, [777001, 777002])
+        replayed = [c for c in calls if c[0] in (777001, 777002)]
+        fresh = [c for c in calls if c[0] not in (777001, 777002)]
+        assert replayed and all(f for _, f in replayed)
+        assert fresh and not any(f for _, f in fresh)
+
+    def test_switch_off_keeps_full_seed_replay(self, trainer):
+        calls = self._calls(trainer, False, [777001, 777002])
+        assert any(c[0] in (777001, 777002) for c in calls)
+        assert not any(f for _, f in calls)

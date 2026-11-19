@@ -149,8 +149,18 @@ class RoleScenarioEnv(ScenarioEnv):
 
     # ------------------------------------------------------------------
 
-    def reset(self, *, seed: int | None = None) -> ObservationBatch:
+    def reset(self, *, seed: int | None = None, fresh_engine_rng: bool = False) -> ObservationBatch:
         """Build a new trial, roll each role's controller and wire neural players.
+
+        ``fresh_engine_rng`` (episode replay, ppo.episode_replay_fresh_engine_rng):
+        the scenario is still BUILT from ``seed`` (positions, attributes,
+        controller rolls...), but the match's own rng -- the engine's dice:
+        kick noise, tackle rolls, control-time noise -- is then reseeded from
+        fresh entropy, in place (so every holder of that Random sees it). A
+        replayed episode then revisits the same situation without repeating
+        the same luck (measured 2026-11-19: a phase-2 episode makes ~2 engine
+        draws, both at its decisive shot / tackle, so a seed fixes that roll
+        whatever the policy does).
 
         With ``seed`` the controller rolls are seeded too (from a string derived
         from it, so they do not shift the scenario's own draws), so replaying a
@@ -169,6 +179,8 @@ class RoleScenarioEnv(ScenarioEnv):
             timeout_ticks=10**9,
             terminal_outcomes=self._terminal_raw_outcomes,
         )
+        if fresh_engine_rng:
+            self._loop.match.rng.seed(random.getrandbits(63))
         if self._max_episode_s_variability_s > 0.0:
             self.max_episode_s = self._base_max_episode_s + self.rng.uniform(0.0, self._max_episode_s_variability_s)
         else:

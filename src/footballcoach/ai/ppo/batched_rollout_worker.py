@@ -304,6 +304,9 @@ class BatchedEnvGroup:
         self.envs = envs
         self.trainer = trainer
         self.secondary_trainer = secondary_trainer
+        # ppo.episode_replay_fresh_engine_rng: replayed episodes get fresh engine dice.
+        from footballcoach.ai.config import load_ai_config
+        self.replay_fresh_engine_rng: bool = bool(load_ai_config().get("ppo", {}).get("episode_replay_fresh_engine_rng", False))
         from footballcoach.ai.ppo.rollout_buffer import RolloutBuffer
         self._buffers = [RolloutBuffer() for _ in envs]
         # Always resets every env exactly once here, regardless of whether
@@ -456,14 +459,28 @@ class BatchedEnvGroup:
         episode_armed_kick_accum = [0] * n
         _replay_queue: list[int] = list(replay_seeds) if replay_seeds else []
 
-        def _next_episode_seed(phase_id: int) -> int:
+        _replayed: set[int] = set()   # ids of envs whose current episode came off the replay queue
+
+        def _next_episode_seed(phase_id: int, env_idx: int | None = None) -> int:
             """A phase-tagged seed (curriculum/mix.py tag_seed): the first queued
             replay seed of this env's phase, else a fresh one. Phase-1 seeds are
-            their plain values, so a phase-1-only run is unchanged."""
+            their plain values, so a phase-1-only run is unchanged. Records in
+            ``_replayed`` whether env ``env_idx``'s next episode is a replay."""
             for k, tagged in enumerate(_replay_queue):
                 if untag_seed(tagged)[1] == phase_id:
+                    if env_idx is not None:
+                        _replayed.add(env_idx)
                     return _replay_queue.pop(k)
+            if env_idx is not None:
+                _replayed.discard(env_idx)
             return tag_seed(_random.randint(0, 2**31 - 1), phase_id)
+
+        def _reset_env(i: int, env, tagged_seed: int):
+            # A replayed episode revisits the seed's situation; with
+            # ppo.episode_replay_fresh_engine_rng its engine dice are fresh
+            # (ScenarioEnv/RoleScenarioEnv.reset fresh_engine_rng).
+            return env.reset(seed=untag_seed(tagged_seed)[0],
+                             fresh_engine_rng=self.replay_fresh_engine_rng and i in _replayed)
 
         collected = 0
         _last_flush_at = 0  # only meaningful when chunk_steps is set
@@ -555,9 +572,9 @@ class BatchedEnvGroup:
                         stats[i]["episode_outcome_labels"].append(
                             info.trial_outcome if (info is not None and info.trial_outcome is not None) else "unknown"
                         )
-                        _seed = _next_episode_seed(env.phase)
+                        _seed = _next_episode_seed(env.phase, i)
                         self._current_episode_seed[i] = _seed
-                        self._last_obs[i] = env.reset(seed=untag_seed(_seed)[0])
+                        self._last_obs[i] = _reset_env(i, env, _seed)
                     else:
                         self._last_obs[i] = next_obs
                     continue
@@ -639,9 +656,9 @@ class BatchedEnvGroup:
                             stats[i]["episode_outcomes_vs_neural"].append(info.trial_outcome)
                     if info is not None:
                         stats[i]["episode_durations_s"].append(info.ticks_elapsed * env._dt_s)
-                    _seed = _next_episode_seed(env.phase)
+                    _seed = _next_episode_seed(env.phase, i)
                     self._current_episode_seed[i] = _seed
-                    self._last_obs[i] = env.reset(seed=untag_seed(_seed)[0])
+                    self._last_obs[i] = _reset_env(i, env, _seed)
                 else:
                     self._last_obs[i] = next_obs
 

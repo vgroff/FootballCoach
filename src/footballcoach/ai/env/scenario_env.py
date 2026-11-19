@@ -252,8 +252,18 @@ class ScenarioEnv:
     # Gym-like API
     # -----------------------------------------------------------------------
 
-    def reset(self, *, seed: int | None = None) -> ObservationBatch:
+    def reset(self, *, seed: int | None = None, fresh_engine_rng: bool = False) -> ObservationBatch:
         """Start a new trial and return the initial observation.
+
+        ``fresh_engine_rng`` (episode replay, ppo.episode_replay_fresh_engine_rng):
+        the scenario is still BUILT from ``seed`` (positions, attributes,
+        controller rolls...), but the match's own rng -- the engine's dice:
+        kick noise, tackle rolls, control-time noise -- is then reseeded from
+        fresh entropy, in place (so every holder of that Random sees it). A
+        replayed episode then revisits the same situation without repeating
+        the same luck (measured 2026-11-19: a phase-2 episode makes ~2 engine
+        draws, both at its decisive shot / tackle, so a seed fixes that roll
+        whatever the policy does).
 
         ``seed``, when given, is forwarded as the scenario builder's own
         ``seed`` kwarg (e.g. ``build_1v1_scenario(seed=...)``) -- makes the
@@ -285,6 +295,8 @@ class ScenarioEnv:
             timeout_ticks=10**9,
             terminal_outcomes=_terminal,
         )
+        if fresh_engine_rng:
+            self._loop.match.rng.seed(random.getrandbits(63))
         # Resample this episode's EFFECTIVE duration before anything below
         # reads self.max_episode_s (_max_episode_ticks, the NeuralPlayerAI
         # construction further down, the time-remaining observation feature).
