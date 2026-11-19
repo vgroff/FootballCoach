@@ -88,3 +88,25 @@ keeper saves fell 16.3 -> 13.3%, i.e. the extra ball wins replace keeper
 saves). Re-test at ~30-40 updates. Free RAM only 4.4-5.6 GB during
 training now -- keep probes single-process and light.
 Health: log current, CPU rising, no errors.
+
+## 13:2x Reward audit -> PPG value refit (run33)
+
+Run32 stopped at checkpoint16 (attacker ~55-58% / no keeper ~63%, defender
+7-10% vs rules). New phase-2 terminal rewards (user's calls, goal stays +-4,
+no shaping; ai_config.json reward.phase2 _comment_terminal_20261119):
+
+| outcome | attacker | defender | keeper |
+|---|---|---|---|
+| goal | +4 | -4 | -4 |
+| saved | -1 (was +1) | +2 (was +1) | +3 (was +2) |
+| defence_possession | -2 | +3 | +1 |
+| shot_off_target | -2 | +2 | +2 |
+| attacker_out | -3 (was -4) | +2 | +1 (was +2) |
+| timeout | -3 (was -1) | +1 | +1 |
+
+PPG value refit before PPO (user's idea, avoids noisy first checkpoints):
+`--ppg-refit-only --ppg-num-rollouts 6` from run32/checkpoint16, SAME mix as
+PPO (`--phase-mix "1:0.5,2:0.5"`, confirmed 288/288 env slots; phase-2
+controllers / tiers / start / keeper from the same config). MC returns, KL
+anchor 600, 770k steps x 6. Output checkpoints/phase2_run33/checkpoint_pretrained.pt,
+log scratchpad/ppg_refit_run33.log. PPO run34 from it next.
