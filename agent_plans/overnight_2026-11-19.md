@@ -134,3 +134,15 @@ PPO run34 started from checkpoints/phase2_run33/checkpoint_pretrained.pt
 Flat overall; defender_vs_rules drifting toward the rules defender (7.2% last
 two); saves slightly down (consistent with saved -1, weak signal). Health:
 log current, CPU rising, no errors.
+
+### 15:48 run34 check-in (32 checkpoints)
+
+| | last 8 evals | run31 rules baseline |
+|---|---|---|
+| phase 1 vs rules | 64-65% | -- |
+| attacker vs rules (keeper) | 60-64% (up from 57-60%) | 7.0% |
+| attacker vs rules (no keeper) | 59-65% | 54.8% |
+| defender_vs_rules conceded | 7.6-9.3% | 7.0% |
+
+Fixed-attacker defender test on run34's latest started (single process).
+Health: log current, CPU rising, no errors.
