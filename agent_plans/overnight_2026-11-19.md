@@ -305,3 +305,17 @@ from the log since 0f8d877, so no 28 to subtract): 35.2, 28.2, 21.7, 17.0,
 - Pretrain log will print unweighted BC too (distill_pretrain.bc_report_line);
   its smoke test needs the worker pool, so it waits until run39 is done
   (not committed yet).
+
+### Run39 done (23:39) -- and a label-frame bug (fixed in 6dcbec1)
+
+20 cycles, KL 0.010-0.024 throughout; keeper BC unweighted 107 -> 7.0.
+But building the "KL vs rules keeper" probe found that role BC (and the PPO
+BC loss) compared WORLD-frame labels to CANONICAL-frame heads: for a
+right-team player (the keeper) every x-signed target was mirrored. Evidence:
+region loss vs raw labels 3.1 -> 0.6, vs canonical -> 4.5; move direction
+~75-90 deg off either way, unchanged since run34/82. Run39 is therefore not
+a PPO start point (kept for comparison). Current PPO configs have BC
+coefficients 0, so no live PPO was affected; past phase-1 PPO runs with BC
+on (if any) had ~43% right-team rows mirrored -- not audited.
+Next (waiting for the user): fresh keeper pretrain run40 from run34/82,
+same settings, then the rules-keeper comparison probe, then PPG refit.
