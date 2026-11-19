@@ -146,3 +146,9 @@ log current, CPU rising, no errors.
 
 Fixed-attacker defender test on run34's latest started (single process).
 Health: log current, CPU rising, no errors.
+
+Fixed-attacker defender test (attacker run31/checkpoint1, 460 eps each, run31
+scenario + 10 m keeper): run30/53 53.7% conceded (ball won 23.9%) -> run31/16
+53.0% (27.6%) -> run32/4 52.6% (28.3%) -> **run34/32 47.0% (31.7%)**. -6.7 pts
+vs untrained (~2 SE, likely real); improvement came after ~20 updates, during
+the new-reward stretch (cannot separate rewards from more training).
