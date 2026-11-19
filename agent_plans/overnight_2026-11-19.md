@@ -177,3 +177,17 @@ Health: log current, CPU 45k -> 67k s, no errors.
 
 Plateau-ish: all within noise of the last hour. Health: log current, CPU
 67k -> 88k s, no errors.
+
+### 18:48 run34 check-in
+
+| | last 8 evals | run31 rules baseline |
+|---|---|---|
+| phase 1 vs rules | 63-65% | -- |
+| attacker vs rules (keeper) | 62-65% (best 64.8%) | 7.0% |
+| attacker vs rules (no keeper) | 62-65% | 54.8% |
+| defender_vs_rules conceded | 6.5-8.3% (two evals at 6.5%, below rules) | 7.0% |
+| defender_vs_rules ball won | 43-47% | 48.7% |
+
+The AI defender now matches the rules defender on goals conceded vs the rules
+attacker (it trained mostly vs the AI attacker). Health: log current, CPU
+88k -> 110k s, no errors.
