@@ -233,3 +233,21 @@ in 0 / 0 -- the tackle nerf cannot matter in phase 2. The keeper saves only
 2-5% of the AI attacker's attempts: vs the AI attacker he is not the
 bottleneck (the defender's ball wins are). Pickup x1.5 is a buff, the
 largest effect; all three together = slightly stronger keeper.
+
+## Neural goalkeeper: steps 1-4 (user's plan, 2026-11-19 evening)
+
+1. Dive timers as player inputs (e448f63): PlayerFeatures.gk_dive_remaining /
+   gk_dive_recovery appended (39 -> 41); older checkpoints get zero columns on
+   load (checkpoint_io.pad_player_feature_columns). Verified: run34/82 gives
+   identical outcomes on 40 seeded episodes, old code vs new.
+2. distill_pretrain role_bc (400139f): a role taught by its rules AI (BC,
+   label-smoothed) instead of a teacher network.
+3. Keeper evals (0380f51): goalkeeper_vs_rules (vs rules_baseline 7.0%),
+   attacker_vs_ai_keeper (vs attacker_vs_rules ~62%); specs now run only when
+   all their neural roles train.
+4. Keeper pretrain started (config c3c08d8): student run34/82, frozen self as
+   teacher for both phases, keeper rows taught by the rules keeper,
+   bc_label_smoothing 0.01 (targets 0.995/0.005), counterfactual off,
+   goalkeeper neural 50%, phase mix 50:50, 6 cycles x 370k x 12 epochs, lr
+   3e-5. Log scratchpad/keeper_pretrain_run35.log. Next (user): PPG value
+   refit, then PPO -- not started unattended.
