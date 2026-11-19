@@ -120,3 +120,17 @@ timeout / out ~0-2%), so the old value net was already nearly right. R2
 0.72 -> 0.63 reflects each cycle replaying the hardest 25% of seeds.
 PPO run34 started from checkpoints/phase2_run33/checkpoint_pretrained.pt
 (same 50:50 mix), log scratchpad/ppo_run34.log.
+
+### 14:48 run34 check-in (16 evals, new rewards)
+
+| | evals 1-4 | evals 13-16 | run31 rules baseline |
+|---|---|---|---|
+| phase 1 vs rules | 63-65% | 64-65% | -- |
+| attacker vs rules (keeper) | 57-60% | 59-60% | 7.0% |
+| attacker vs rules (no keeper) | 62-65% | 61-65% | 54.8% |
+| defender_vs_rules conceded | 8.0-8.7% | 7.2-8.0% | 7.0% |
+| attacker shots saved (keeper in) | 3.5-4.3% | 2.6-3.5% | -- |
+
+Flat overall; defender_vs_rules drifting toward the rules defender (7.2% last
+two); saves slightly down (consistent with saved -1, weak signal). Health:
+log current, CPU rising, no errors.
