@@ -164,3 +164,16 @@ the new-reward stretch (cannot separate rewards from more training).
 | defender_vs_rules ball won | 43-47% (was 41-43% earlier in run34) | 48.7% |
 
 Health: log current, CPU 45k -> 67k s, no errors.
+
+### 17:48 run34 check-in
+
+| | last 8 evals | run31 rules baseline |
+|---|---|---|
+| phase 1 vs rules | 64-65% | -- |
+| attacker vs rules (keeper) | 62-64% | 7.0% |
+| attacker vs rules (no keeper) | 61-65% | 54.8% |
+| defender_vs_rules conceded | 7.6-8.5% | 7.0% |
+| defender_vs_rules ball won | 43-46% | 48.7% |
+
+Plateau-ish: all within noise of the last hour. Health: log current, CPU
+67k -> 88k s, no errors.
