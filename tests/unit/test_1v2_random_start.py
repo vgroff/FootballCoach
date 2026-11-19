@@ -38,3 +38,18 @@ def test_random_velocity_is_seeded():
     a = build_1v2_scenario(seed=7, random_initial_velocity=True)
     b = build_1v2_scenario(seed=7, random_initial_velocity=True)
     assert [p.velocity for p in a.players] == [p.velocity for p in b.players]
+
+
+def test_keeper_off_line_jitter_moves_only_the_keeper_both_ways():
+    pitch_x = build_1v2_scenario(seed=0).player_by_id("keeper").position.x   # on the line
+    xs = []
+    for s in range(60):
+        a = build_1v2_scenario(seed=s)
+        b = build_1v2_scenario(seed=s, gk_start_x_jitter_m=0.5)
+        ka, kb = a.player_by_id("keeper"), b.player_by_id("keeper")
+        assert kb.position.y == ka.position.y                        # sideways draw unchanged
+        assert abs(kb.position.x - ka.position.x) <= 0.5
+        for pid in ("attacker", "defender"):
+            assert b.player_by_id(pid).position == a.player_by_id(pid).position
+        xs.append(kb.position.x - pitch_x)
+    assert min(xs) < -0.1 and max(xs) > 0.1                           # in front of AND behind the line

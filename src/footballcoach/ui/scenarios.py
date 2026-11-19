@@ -889,6 +889,7 @@ def build_1v2_scenario(
     stamina_range: tuple | list | None = None,
     no_keeper_prob: float = 0.0,
     random_initial_velocity: bool = False,
+    gk_start_x_jitter_m: float = 0.0,
 ) -> Match:
     """1v2: elite attacker vs. average defender + GK.
 
@@ -899,6 +900,11 @@ def build_1v2_scenario(
     others standing still. Drawn from its own seeded stream (positions,
     attributes and the keeper draw are unchanged for a seed). False (default)
     = as before.
+
+    ``gk_start_x_jitter_m``: the keeper's start is also moved uniformly
+    within +-this off / onto his goal line (orthogonal to the line; behind
+    the line = inside the goal), from its own seeded stream. 0 (default) = on
+    the line, as before. ``gk_start_jitter_m`` is the sideways jitter.
 
     ``no_keeper_prob``: chance the trial has NO goalkeeper (an empty goal, the
     defender alone). Drawn from its own seeded stream, and the keeper is still
@@ -969,6 +975,9 @@ def build_1v2_scenario(
 
     attacker = Player.create("attacker", Team.LEFT, _attrs("attacker", attacker_skill), position=attacker_start)
     defender = Player.create("defender", Team.RIGHT, _attrs("defender", defender_skill), position=defender_start)
+    if gk_start_x_jitter_m > 0.0:
+        gk_x_rng = random.Random(f"{seed}-1v2-keeper-x") if seed is not None else random.Random()
+        gk_start = Vector3(gk_start.x + gk_x_rng.uniform(-gk_start_x_jitter_m, gk_start_x_jitter_m), gk_start.y, 0)
     gk = Player.create("keeper", Team.RIGHT, _attrs("keeper", gk_skill), position=gk_start, is_goalkeeper=True)
     if stamina_range is not None:
         lo, hi = float(stamina_range[0]), float(stamina_range[1])
