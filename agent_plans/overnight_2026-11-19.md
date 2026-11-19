@@ -251,3 +251,22 @@ largest effect; all three together = slightly stronger keeper.
    goalkeeper neural 50%, phase mix 50:50, 6 cycles x 370k x 12 epochs, lr
    3e-5. Log scratchpad/keeper_pretrain_run35.log. Next (user): PPG value
    refit, then PPO -- not started unattended.
+
+### Keeper pretrain: two crashes fixed, boost + shaping added, restarted as run37
+
+- run35 crash: RoleScenarioEnv's end-of-episode obs was encoded on the NEXT
+  trial's match (unseeded episodes draw the keeper per trial) -> KeyError with
+  the keeper as trainee. Fixed: encode on the episode's own final tick
+  (8ef49be).
+- run36 crash: _bootstrap_last_values re-encoded every secondary track in the
+  buffer against the current episode; a keeper track from an earlier episode
+  -> KeyError. Fixed: only current neural secondaries (a26ffa5). New smoke
+  tests (neural keeper + no-keeper trials through the real worker pool, for
+  the pretrain and a PPO cycle) reproduce both KeyErrors on the old code; the
+  session fixture that strips no_keeper_prob is why the existing ones missed it.
+- User's calls (f8fd71e): keeper dive boost accel 3.3 -> 3.5, speed 1.23 ->
+  1.4 (only during a gated dive); keeper save-target shaping 0.1/m while the
+  ball is loose and heading for his goal (pure potential; target = the rules
+  keeper's SaveOrder target; never while held).
+- Restarted: checkpoints/phase2_run37, log scratchpad/keeper_pretrain_run37.log.
+  run35/run36 dirs (crashed attempts) left in place. Next: PPG refit, then PPO.
