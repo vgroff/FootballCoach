@@ -319,3 +319,18 @@ coefficients 0, so no live PPO was affected; past phase-1 PPO runs with BC
 on (if any) had ~43% right-team rows mirrored -- not audited.
 Next (waiting for the user): fresh keeper pretrain run40 from run34/82,
 same settings, then the rules-keeper comparison probe, then PPG refit.
+
+### Run40 (keeper pretrain after the frame fix), watchdog 00:42
+
+Started 23:56 into checkpoints/phase2_run40 (same command/settings as run39).
+Healthy at cycle 12/20: log live, no errors, cycle checkpoints 1-11 kept.
+KL per cycle (phase 1 / phase 2): 0.004/0.006, 0.011/0.015, 0.019/0.022,
+0.014/0.029, 0.017/0.015, 0.013/0.017, 0.014/0.015, 0.020/0.017,
+0.016/0.019, 0.018/0.014, 0.012/0.030 (stop line 0.35).
+Keeper BC unweighted after each cycle: 95.0, 68.7, 46.7, 37.4, 29.9, 23.5,
+19.5, 16.7, 15.2, 13.9, 13.3 (run39 ran ~2 lower: run39's could not fit
+its mirrored targets, so not comparable 1:1).
+Cycle-5 white-box check: the region term now fits the canonical labels
+(1.3 vs 3.6 raw; run39 the reverse). Move direction still barely learned in
+either run (BC term ~1.9 raw / 4.0 canonical, near run34/82's) -- likely
+gradient-starved at role BC 0.005 next to the gate terms; untested.
