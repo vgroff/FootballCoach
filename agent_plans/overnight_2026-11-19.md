@@ -110,3 +110,13 @@ PPO (`--phase-mix "1:0.5,2:0.5"`, confirmed 288/288 env slots; phase-2
 controllers / tiers / start / keeper from the same config). MC returns, KL
 anchor 600, 770k steps x 6. Output checkpoints/phase2_run33/checkpoint_pretrained.pt,
 log scratchpad/ppg_refit_run33.log. PPO run34 from it next.
+
+Refit done in 22 min (6 cycles x ~3.7 min). Value fit vs the original value
+net on the same fresh rows: +0.0% (cycle 1 baseline), then +2.3 / +1.2 /
++0.9 / +1.2 / +1.2% better; overall bias -0.035 -> +0.007; KL to the old
+policy <= 0.007. Per-outcome biases (e.g. saved|defender -2.5) are hindsight
+grouping, not fit errors. The new rewards touch rare outcomes (saved ~5%,
+timeout / out ~0-2%), so the old value net was already nearly right. R2
+0.72 -> 0.63 reflects each cycle replaying the hardest 25% of seeds.
+PPO run34 started from checkpoints/phase2_run33/checkpoint_pretrained.pt
+(same 50:50 mix), log scratchpad/ppo_run34.log.
