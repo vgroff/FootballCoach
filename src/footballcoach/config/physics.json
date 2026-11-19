@@ -51,8 +51,8 @@
     "min_speed_for_turn_mps": 0.2,
     "goalkeeper_accel_multiplier": 3.3,
     "goalkeeper_speed_multiplier": 1.23,
-    "_comment_goalkeeper_dive": "Gated dive (added 2026-11-19, OFF by default = the old keeper, boosted all the time). With goalkeeper_dive_gating a keeper's sprint IS its dive: goalkeeper_speed_multiplier / goalkeeper_accel_multiplier apply only while diving (outfield speed and acceleration otherwise). A dive starts when the keeper asks to sprint with no recovery pending and lasts at most goalkeeper_dive_duration_s; when it ends (time up, or he stops asking to sprint) goalkeeper_dive_recovery_s starts counting down, during which a sprint request is forced to a jog (the countdown keeps running). Player.gk_dive_remaining_s / gk_dive_recovery_s hold the two timers.",
-    "goalkeeper_dive_gating": false,
+    "_comment_goalkeeper_dive": "Gated dive (added 2026-11-19, switched ON 2026-11-19 (user's call); false = the old keeper, boosted all the time). With goalkeeper_dive_gating a keeper's sprint IS its dive: goalkeeper_speed_multiplier / goalkeeper_accel_multiplier apply only while diving (outfield speed and acceleration otherwise). A dive starts when the keeper asks to sprint with no recovery pending and lasts at most goalkeeper_dive_duration_s; when it ends (time up, or he stops asking to sprint) goalkeeper_dive_recovery_s starts counting down, during which a sprint request is forced to a jog (the countdown keeps running). Player.gk_dive_remaining_s / gk_dive_recovery_s hold the two timers.",
+    "goalkeeper_dive_gating": true,
     "goalkeeper_dive_duration_s": 1.5,
     "goalkeeper_dive_recovery_s": 1.5,
     "standstill_decel_multiplier": 1.8,
@@ -102,8 +102,8 @@
   "tackling": {
     "tackler_boost": 1.35,
     "tackle_cooldown_s": 1.35,
-    "goalkeeper_tackle_cooldown_multiplier": 1.0,
-    "_comment_goalkeeper_tackle_cooldown": "Multiplies the TACKLER's inactive time after a tackle when the tackler is a goalkeeper (added 2026-11-19; 1.0 = as before). The tacklee's time is unchanged.",
+    "goalkeeper_tackle_cooldown_multiplier": 2.0,
+    "_comment_goalkeeper_tackle_cooldown": "Multiplies the TACKLER's inactive time after a tackle when the tackler is a goalkeeper (added 2026-11-19, 2.0 = user's call: hands give him a tackling boost in the box, this is the price; 1.0 = as before). The tacklee's time is unchanged. Measured: the rules keeper never tackles in phase 2, so no effect there.",
     "tackle_attempt_tackler_speed_mult": 0.6,
     "tackle_attempt_tacklee_speed_mult": 0.9,
     "loser_speed_penalty_scale": 1.2,
@@ -178,8 +178,8 @@
   "ball_pickup": {
     "_comment": "Loose-ball pickup eligibility. A player within pickup_radius_m may only pick up the ball if they are CLOSING on it (relative velocity, i.e. (ball.velocity - player.velocity), has a component reducing the separation) OR the relative speed is below closing_speed_deadzone_mps (near-stationary relative motion -- e.g. a ball resting or barely rolling next to a player -- is always pickable, no need to be actively closing). This replaces the old time-based release-grace hack: a player can no longer instantly re-pick-up a ball they just kicked away at real speed, because it is moving away from them (not closing) -- with no special-casing of 'who kicked it'. It also naturally lets a ball rolling past a slow/stationary player be picked up only if the player has a real closing velocity component toward it, not by proximity alone. See engine/knowledge.md.",
     "pickup_radius_m": 0.45,
-    "goalkeeper_pickup_radius_multiplier": 1.0,
-    "_comment_goalkeeper_pickup_radius": "Multiplies pickup_radius_m for a goalkeeper inside his own box (hands; added 2026-11-19; 1.0 = as before).",
+    "goalkeeper_pickup_radius_m": 0.6,
+    "_comment_goalkeeper_pickup_radius": "Pickup radius for a goalkeeper inside his own box (hands; added 2026-11-19, 0.6 m = user's call; null = pickup_radius_m, as before). Measured at 0.675 m (x1.5): the strongest of the keeper changes, a buff -- rules attacker 7.0 -> 2.6% scoring, keeper saves vs the AI attacker 2.3 -> 4.7%.",
     "closing_speed_deadzone_mps": 1.0,
     "_comment_armed_redirect_settle_vz": "Match._update_loose_ball_pickup's armed-redirect gate: an armed push-kick redirect is only honoured while the ball's vertical speed is at or below this. Originally 1e-6 (effectively 'exactly zero') to stop a redirect firing on genuinely wrong mid-bounce data -- but a push-kick's own kick-angle noise routinely gives it some small vz (commonly ~0.5-0.6 m/s), so 1e-6 almost never re-settles before a fast-sprinting player recatches it, forcing every touch through the slow CONTROLLING_BALL grant instead (defeating the point of arming at all -- confirmed via a real traced episode: 40 short, speed-losing hops instead of ~7 long full-speed ones). Tuned empirically across 500 real episodes at 0.01/0.5/0.7/1.0/1.5: timeouts fell monotonically from 7/502 to 3/502 as this loosened, flattening out by 1.0 (1.0 and 1.5 were identical); 0.5 was a notably bad in-between choice since it sits right on ball_physics.rolling_friction/bounce_threshold_mps (also 0.5), making the redirect decision flip on the same noise that decides real-bounce-vs-settle. 1.0 is comfortably clear of that boundary with all the measured benefit.",
     "armed_redirect_settle_vz_mps": 1.0

@@ -414,15 +414,15 @@ class Match(MatchTacklesMixin, MatchGetPossessionMixin):
 
     def _pickup_params_for(self, player: Player):
         """Ball-pickup params for ``player``: a goalkeeper inside his own box
-        gets pickup_radius_m x goalkeeper_pickup_radius_multiplier (hands)."""
+        uses goalkeeper_pickup_radius_m (hands) when it is set."""
         bp = self.ball_pickup_params
-        mult = bp.goalkeeper_pickup_radius_multiplier
-        if mult == 1.0 or not player.is_goalkeeper:
+        r = bp.goalkeeper_pickup_radius_m
+        if r is None or not player.is_goalkeeper:
             return bp
         if not self.pitch.is_in_box(player.position, left=self._defends_left(player)):
             return bp
         import dataclasses
-        return dataclasses.replace(bp, pickup_radius_m=bp.pickup_radius_m * mult)
+        return dataclasses.replace(bp, pickup_radius_m=r)
 
     def _set_possession(self, player_id: str | None) -> None:
         """Single write-path for ball possession.

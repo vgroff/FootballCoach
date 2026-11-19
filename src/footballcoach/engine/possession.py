@@ -87,7 +87,7 @@ class BallPickupParams:
     # here too (not just in from_config) so direct construction elsewhere
     # (tests) doesn't need updating for an unrelated field.
     armed_redirect_settle_vz_mps: float = 1.0
-    goalkeeper_pickup_radius_multiplier: float = 1.0  # keeper in own box: pickup_radius_m x this (hands)
+    goalkeeper_pickup_radius_m: float | None = None  # keeper in own box (hands); None = pickup_radius_m
 
     @staticmethod
     def from_config() -> "BallPickupParams":
@@ -96,7 +96,8 @@ class BallPickupParams:
             pickup_radius_m=d["pickup_radius_m"],
             closing_speed_deadzone_mps=d["closing_speed_deadzone_mps"],
             armed_redirect_settle_vz_mps=d.get("armed_redirect_settle_vz_mps", 1.0),
-            goalkeeper_pickup_radius_multiplier=float(d.get("goalkeeper_pickup_radius_multiplier", 1.0)),
+            goalkeeper_pickup_radius_m=(None if d.get("goalkeeper_pickup_radius_m") is None
+                                        else float(d["goalkeeper_pickup_radius_m"])),
         )
 
 

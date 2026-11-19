@@ -2,7 +2,7 @@
 gated dive (movement.goalkeeper_dive_gating), the keeper tackler's longer
 post-tackle inactivity (tackling.goalkeeper_tackle_cooldown_multiplier) and
 the keeper's larger pickup radius in his own box
-(ball_pickup.goalkeeper_pickup_radius_multiplier)."""
+(ball_pickup.goalkeeper_pickup_radius_m)."""
 from __future__ import annotations
 
 import dataclasses
@@ -59,7 +59,7 @@ def test_stopping_early_ends_the_dive_and_starts_the_recovery():
 def test_no_boost_outside_a_dive_and_no_gating_by_default():
     m = _gated(); gk = m.player_by_id("keeper")
     assert m._gate_goalkeeper_dive(gk, SpeedMode.JOG, DT) == (SpeedMode.JOG, False)
-    assert MovementParams.from_config().goalkeeper_dive_gating is False
+    assert m.movement_params.goalkeeper_dive_gating is True
 
 
 def test_the_unboosted_keeper_moves_like_an_outfielder():
@@ -90,10 +90,13 @@ def test_a_keeper_tackler_sits_out_longer_the_tacklee_does_not():
 
 def test_the_keeper_gets_a_larger_pickup_radius_only_in_his_own_box():
     m = build_1v2_scenario(seed=3)
-    m.ball_pickup_params = dataclasses.replace(m.ball_pickup_params, goalkeeper_pickup_radius_multiplier=1.5)
+    m.ball_pickup_params = dataclasses.replace(m.ball_pickup_params, pickup_radius_m=0.45, goalkeeper_pickup_radius_m=0.6)
     base = m.ball_pickup_params.pickup_radius_m
     gk, dfn = m.player_by_id("keeper"), m.player_by_id("defender")
-    assert m._pickup_params_for(gk).pickup_radius_m == pytest.approx(1.5 * base)   # parked on his line
+    assert m._pickup_params_for(gk).pickup_radius_m == pytest.approx(0.6)          # parked on his line
     assert m._pickup_params_for(dfn).pickup_radius_m == pytest.approx(base)
     gk.position = Vector3(0.0, 0.0, 0.0)                                              # halfway line
     assert m._pickup_params_for(gk).pickup_radius_m == pytest.approx(base)
+    m.ball_pickup_params = dataclasses.replace(m.ball_pickup_params, goalkeeper_pickup_radius_m=None)
+    gk.position = m.pitch.right_goal_centre
+    assert m._pickup_params_for(gk).pickup_radius_m == pytest.approx(base)          # unset = everyone's radius
