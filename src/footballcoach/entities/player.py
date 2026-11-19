@@ -274,6 +274,12 @@ class Player:
     # unusable for that -- see match._apply_movement()). Never read by any
     # engine/order logic, only by the AI observation layer.
     last_desired_speed_mode: SpeedMode | None = field(default=None, repr=False, compare=False)
+    # Gated keeper dive (physics.json movement.goalkeeper_dive_gating; see
+    # Match._apply_movement): seconds left in the current dive (0 = not
+    # diving) and seconds until the keeper may dive again. Always 0 for
+    # outfielders and when gating is off.
+    gk_dive_remaining_s: float = field(default=0.0, repr=False, compare=False)
+    gk_dive_recovery_s: float = field(default=0.0, repr=False, compare=False)
 
     radius_m: float = 0.3
     height_m: float = 1.8

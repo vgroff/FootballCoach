@@ -66,6 +66,10 @@ class MovementParams:
     accel_taper_exponent: float  # 1.0 = linear falloff; >1 stays explosive longer then drops harder
     accel_taper_min_fraction: float  # floor multiplier so accel never tapers all the way to zero
     accel_taper_peak_boost: float  # multiplies accel_base/scale up to get the at-rest ("explosive") peak
+    # Gated keeper dive (physics.json movement._comment_goalkeeper_dive); off = boosted all the time.
+    goalkeeper_dive_gating: bool = False
+    goalkeeper_dive_duration_s: float = 1.5
+    goalkeeper_dive_recovery_s: float = 1.5
 
     @staticmethod
     def from_config() -> "MovementParams":
@@ -97,6 +101,9 @@ class MovementParams:
             accel_taper_exponent=d.get("accel_taper_exponent", 1.0),
             accel_taper_min_fraction=d.get("accel_taper_min_fraction", 1.0),
             accel_taper_peak_boost=d.get("accel_taper_peak_boost", 1.0),
+            goalkeeper_dive_gating=bool(d.get("goalkeeper_dive_gating", False)),
+            goalkeeper_dive_duration_s=float(d.get("goalkeeper_dive_duration_s", 1.5)),
+            goalkeeper_dive_recovery_s=float(d.get("goalkeeper_dive_recovery_s", 1.5)),
         )
 
 
@@ -361,6 +368,7 @@ def step_player_towards(
     dt_s: float,
     params: MovementParams | None = None,
     has_ball: bool = False,
+    goalkeeper_boost: bool | None = None,
 ) -> None:
     """Advances `player`'s velocity/heading/position one physics tick towards
     `target_direction` (need not be normalized; zero vector means decelerate
@@ -372,10 +380,14 @@ def step_player_towards(
     """
     params = params or MovementParams.from_config()
     attrs = player.attributes
+    # goalkeeper_boost: whether the keeper speed/accel multipliers apply this
+    # tick (None = player.is_goalkeeper, i.e. always for a keeper, as before;
+    # Match passes False outside a gated dive).
+    gk = player.is_goalkeeper if goalkeeper_boost is None else (goalkeeper_boost and player.is_goalkeeper)
 
-    v_top = effective_top_speed(params, attrs.top_speed, player.stamina, has_ball, attrs.ball_control, player.is_goalkeeper)
+    v_top = effective_top_speed(params, attrs.top_speed, player.stamina, has_ball, attrs.ball_control, gk)
     a_max = effective_acceleration(
-        params, attrs.acceleration, player.stamina, player.is_goalkeeper, has_ball, attrs.ball_control
+        params, attrs.acceleration, player.stamina, gk, has_ball, attrs.ball_control
     )
 
     current_speed = player.velocity.length_xy()
@@ -406,7 +418,7 @@ def step_player_towards(
     current_heading = player.heading_rad
     desired_heading = desired_dir.angle_xy() if desired_dir.length() > GEOM_ZERO_EPS else current_heading
     lateral_peak = lateral_accel_capability(
-        params, attrs.acceleration, has_ball, attrs.ball_control, player.is_goalkeeper, attrs.dribbling
+        params, attrs.acceleration, has_ball, attrs.ball_control, gk, attrs.dribbling
     )
     omega_max = lateral_peak / max(current_speed, 0.5)
 

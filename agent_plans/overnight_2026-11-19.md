@@ -201,3 +201,35 @@ defender_fixed_attacker_mp.py; attacker run31/checkpoint1; 115 eval seeds x 8
 improving. Final evals: attacker vs rules 61-65% (keeper) / 62-65% (no
 keeper), defender_vs_rules conceded 6.5-7.8% (rules defender 7.0%), phase 1
 63-65%. Next (user): neural goalkeeper + keeper physics changes.
+
+## Keeper mechanics (user's proposal), implemented behind physics.json switches, all OFF
+
+- movement.goalkeeper_dive_gating (+ goalkeeper_dive_duration_s 1.5 /
+  goalkeeper_dive_recovery_s 1.5): sprint IS the dive; the keeper speed x1.23
+  / accel x3.3 apply only while diving; after a dive (time up or stopped) a
+  recovery countdown during which a sprint request is forced to a jog (the
+  countdown keeps running). Match._gate_goalkeeper_dive, Player.gk_dive_*.
+- tackling.goalkeeper_tackle_cooldown_multiplier: keeper TACKLER's inactive
+  time x this (apply_tackle_result).
+- ball_pickup.goalkeeper_pickup_radius_multiplier: keeper in own box
+  (Match._pickup_params_for).
+Tests: tests/unit/test_goalkeeper_dive_and_hands.py; full suite passes with
+all off (2781).
+
+Sweep (scratchpad keeper_phys_sweep.py; run31 scenario, 10 m rules keeper,
+rules defender; AI attacker = run34/82; 920 eps, rules rows = 115 unique):
+
+| keeper | rules attacker scores | AI attacker scores | keeper saves vs AI |
+|---|---|---|---|
+| off | 7.0% | 62.8% | 2.3% |
+| dive gating | 9.6% | 61.8% | 2.8% |
+| tackle cooldown x2 | 7.0% | 62.8% | 2.3% (identical) |
+| pickup radius x1.5 | 2.6% | 60.4% | 4.7% |
+| all three | 5.2% | 60.1% | 4.6% |
+
+Activity check (gk_activity.py, 115 eps each, gating on): dives in 37 (rules
+attacker) / 73 (AI) episodes, forced recovery jogs in 26 / 31, keeper tackles
+in 0 / 0 -- the tackle nerf cannot matter in phase 2. The keeper saves only
+2-5% of the AI attacker's attempts: vs the AI attacker he is not the
+bottleneck (the defender's ball wins are). Pickup x1.5 is a buff, the
+largest effect; all three together = slightly stronger keeper.

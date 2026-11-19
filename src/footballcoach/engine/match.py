@@ -369,10 +369,60 @@ class Match(MatchTacklesMixin, MatchGetPossessionMixin):
                 or player.state == PlayerState.CONTROLLING_BALL
             )
             speed_mode = player.desired_speed_mode
-            step_player_towards(player, player.desired_direction, speed_mode, dt, self.movement_params, has_ball)
+            gk_boost = None
+            if player.is_goalkeeper and self.movement_params.goalkeeper_dive_gating:
+                speed_mode, gk_boost = self._gate_goalkeeper_dive(player, speed_mode, dt)
+            step_player_towards(player, player.desired_direction, speed_mode, dt, self.movement_params, has_ball,
+                                goalkeeper_boost=gk_boost)
             player.stamina = _drain_if_sprinting(self.movement_params, player, speed_mode is SpeedMode.SPRINT, dt)
             player.last_desired_speed_mode = speed_mode  # NOT cleared -- see Player.last_desired_speed_mode
             player.desired_speed_mode = None  # consumed; reset for next tick
+
+    def _gate_goalkeeper_dive(self, player: Player, speed_mode: SpeedMode, dt: float) -> tuple[SpeedMode, bool]:
+        """Gated keeper dive (physics.json movement._comment_goalkeeper_dive):
+        a keeper's sprint is its dive. Returns (the speed mode to apply this
+        tick, whether the keeper speed/accel boost applies), updating
+        player.gk_dive_remaining_s / gk_dive_recovery_s.
+
+        - Diving and still asking to sprint: keep diving until the window runs
+          out; the tick that exhausts it is the last boosted one.
+        - Diving and not asking to sprint: the dive ends now, recovery starts.
+        - Not diving, asking to sprint, no recovery pending: a new dive starts.
+        - Recovering: a sprint request is forced to a jog; the recovery
+          countdown keeps running either way.
+        """
+        mp = self.movement_params
+        wants_sprint = speed_mode is SpeedMode.SPRINT
+        if player.gk_dive_remaining_s > 0.0:
+            if wants_sprint:
+                player.gk_dive_remaining_s = max(0.0, player.gk_dive_remaining_s - dt)
+                if player.gk_dive_remaining_s == 0.0:
+                    player.gk_dive_recovery_s = mp.goalkeeper_dive_recovery_s
+                return speed_mode, True
+            player.gk_dive_remaining_s = 0.0
+            player.gk_dive_recovery_s = mp.goalkeeper_dive_recovery_s
+            return speed_mode, False
+        if player.gk_dive_recovery_s > 0.0:
+            player.gk_dive_recovery_s = max(0.0, player.gk_dive_recovery_s - dt)
+            return (SpeedMode.JOG if wants_sprint else speed_mode), False
+        if wants_sprint:
+            player.gk_dive_remaining_s = max(0.0, mp.goalkeeper_dive_duration_s - dt)
+            if player.gk_dive_remaining_s == 0.0:
+                player.gk_dive_recovery_s = mp.goalkeeper_dive_recovery_s
+            return speed_mode, True
+        return speed_mode, False
+
+    def _pickup_params_for(self, player: Player):
+        """Ball-pickup params for ``player``: a goalkeeper inside his own box
+        gets pickup_radius_m x goalkeeper_pickup_radius_multiplier (hands)."""
+        bp = self.ball_pickup_params
+        mult = bp.goalkeeper_pickup_radius_multiplier
+        if mult == 1.0 or not player.is_goalkeeper:
+            return bp
+        if not self.pitch.is_in_box(player.position, left=self._defends_left(player)):
+            return bp
+        import dataclasses
+        return dataclasses.replace(bp, pickup_radius_m=bp.pickup_radius_m * mult)
 
     def _set_possession(self, player_id: str | None) -> None:
         """Single write-path for ball possession.
@@ -521,7 +571,7 @@ class Match(MatchTacklesMixin, MatchGetPossessionMixin):
                 continue
             player_pre_tick_position = pre_tick_player_positions.get(player.player_id)
             if not can_pick_up_ball(
-                player, self.ball, self.ball_pickup_params, pre_flight_position, player_pre_tick_position,
+                player, self.ball, self._pickup_params_for(player), pre_flight_position, player_pre_tick_position,
             ):
                 continue
             candidates.append(player)

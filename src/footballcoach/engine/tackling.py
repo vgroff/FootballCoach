@@ -37,6 +37,7 @@ class TacklingParams:
     dribble_beaten_max_penalty: float
     tackling_skill_floor: float
     dribbling_skill_floor: float
+    goalkeeper_tackle_cooldown_multiplier: float = 1.0  # keeper TACKLER's inactive time x this
 
     @staticmethod
     def from_config() -> "TacklingParams":
@@ -60,6 +61,7 @@ class TacklingParams:
             dribble_beaten_max_penalty=d["dribble_beaten_max_penalty"],
             tackling_skill_floor=d.get("tackling_skill_floor", 0.1),
             dribbling_skill_floor=d.get("dribbling_skill_floor", 0.1),
+            goalkeeper_tackle_cooldown_multiplier=float(d.get("goalkeeper_tackle_cooldown_multiplier", 1.0)),
         )
 
 
@@ -147,7 +149,8 @@ def apply_tackle_result(
     tackler.velocity = tackler.velocity * result.tackler_speed_mult
     tacklee.velocity = tacklee.velocity * result.tacklee_speed_mult
     tackler.state = PlayerState.INACTIVE_TACKLED
-    tackler.state_timer_s = params.tackle_cooldown_s
+    tackler.state_timer_s = params.tackle_cooldown_s * (
+        params.goalkeeper_tackle_cooldown_multiplier if tackler.is_goalkeeper else 1.0)
     tacklee.state = PlayerState.INACTIVE_TACKLED
     tacklee.state_timer_s = params.tackle_cooldown_s
 
