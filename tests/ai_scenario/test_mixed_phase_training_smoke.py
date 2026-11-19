@@ -215,3 +215,51 @@ def test_one_mixed_cycle_with_attacker_kick_bc(mixed_config, monkeypatch, tmp_pa
     assert "bc[phase2_1v2/attacker]=kick_gate " in caplog.text and "/kick_power " in caplog.text
     assert "bc agree [phase2_1v2/attacker] expert kick-now=" in caplog.text
     assert "bc pull  main |g_bc|=" in caplog.text
+
+
+def test_distill_pretrain_with_a_rules_taught_keeper(mixed_config, monkeypatch, tmp_path, caplog):
+    """distill_pretrain role_bc through the real worker pool: the phase-2
+    goalkeeper is neural, labelled in the workers by its rules AI (curriculum
+    phase2 bc lists it, zero PPO coefficients), and those rows are fitted by
+    label-smoothed BC (kl weight 0) while every other row follows the frozen
+    self-teacher; the role-BC loss is logged and falls."""
+    import json as _json
+    import re
+    from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+    from footballcoach.ai.ppo.distill_pretrain import distill_pretrain
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+
+    for path, value in _PPG_OVERRIDES.items():
+        monkeypatch.setitem(mixed_config[path[0]], path[1], value)
+    zero = {"coeff_start": 0.0, "coeff_end": 0.0, "anneal_fraction": 1.0}
+    monkeypatch.setitem(mixed_config["curriculum"]["phase2"], "bc",
+                        {"goalkeeper": {"other": zero, "kick": zero, "tackle": zero}})
+    monkeypatch.setitem(mixed_config["curriculum"]["phase2"], "controllers",
+                        {"attacker": {"neural": 1}, "defender": {"rules": 1}, "goalkeeper": {"neural": 1}})
+    (tmp_path / "ai_config.json").write_text(_json.dumps(mixed_config))
+    torch.manual_seed(0)
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    trainer.set_frozen_heads(PHASES_BY_ID[1].frozen_heads)
+    trainer.phase_mix = {1: 1.0, 2: 1.0}
+    teacher = tmp_path / "teacher.pt"
+    trainer._save_checkpoint_to(teacher)
+    cfg = {"teachers": {1: str(teacher), 2: str(teacher)}, "counterfactual": False, "kl_coef": 5.0,
+           "value_coef": 1.0, "epochs": 3, "lr": 1e-3, "batch_size": 512, "rollout_steps": 4000,
+           "num_rollouts": 1, "aggregate_cycles": 1, "role_bc": {"goalkeeper": 1.0}, "bc_label_smoothing": 0.01}
+    with caplog.at_level(logging.INFO, logger="footballcoach"):
+        distill_pretrain(trainer, phase_id=1, cfg=cfg, checkpoint_path=tmp_path / "out.pt")
+    text = caplog.text
+    n_rows = int(re.search(r"role BC rows: (\d+)", text).group(1))
+    before = float(re.search(r"bc loss before=([0-9.]+)", text).group(1))
+    after = float(re.search(r"bc loss after=([0-9.]+)", text).group(1))
+    assert n_rows > 0
+    assert after < before, (before, after)
+
+
+def test_role_bc_needs_counterfactual_off(mixed_config):
+    from footballcoach.ai.ppo.distill_pretrain import distill_pretrain
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    with pytest.raises(ValueError, match="counterfactual off"):
+        distill_pretrain(trainer, phase_id=1, cfg={"teachers": {1: "x", 2: "x"}, "counterfactual": True,
+                                                   "role_bc": {"goalkeeper": 1.0}})

@@ -188,18 +188,18 @@ def test_loss_is_zero_against_itself_and_value_counts_only_real_rows(trainer, tm
     data = dp.build_copies(b, torch.zeros(N), (1, 2), True, 1.0)
     data["anchor"] = dp.teacher_anchor(trainer, data["obs"], data["target_phase"], {1: same, 2: same}, 64)
     mb = _mb(trainer, data)
-    _, _, kl = dp.minibatch_loss(trainer, mb, 1.0, 5.0, 0.0)
+    _, _, kl, _ = dp.minibatch_loss(trainer, mb, 1.0, 5.0, 0.0)
     assert float(kl) == pytest.approx(0.0, abs=1e-5)
-    loss_a, vloss_a, _ = dp.minibatch_loss(trainer, mb, 1.0, 0.0, 1.0)
+    loss_a, vloss_a, _, _ = dp.minibatch_loss(trainer, mb, 1.0, 0.0, 1.0)
     mb2 = dict(mb)
     mb2["returns"] = mb["returns"].clone()
     mb2["returns"][N:] += 100.0                                   # counterfactual rows' returns: ignored
-    _, vloss_b, _ = dp.minibatch_loss(trainer, mb2, 1.0, 0.0, 1.0)
+    _, vloss_b, _, _ = dp.minibatch_loss(trainer, mb2, 1.0, 0.0, 1.0)
     assert float(vloss_a) == pytest.approx(float(vloss_b), rel=1e-6)
     mb3 = dict(mb)
     mb3["returns"] = mb["returns"].clone()
     mb3["returns"][:N] += 1.0                                     # real rows' returns: counted
-    _, vloss_c, _ = dp.minibatch_loss(trainer, mb3, 1.0, 0.0, 1.0)
+    _, vloss_c, _, _ = dp.minibatch_loss(trainer, mb3, 1.0, 0.0, 1.0)
     assert float(vloss_c) != pytest.approx(float(vloss_a), rel=1e-3)
 
 
@@ -213,7 +213,7 @@ def test_the_loss_trains_the_student_towards_two_different_teachers(trainer, tmp
     opt = torch.optim.Adam(params, lr=1e-3)
     first = None
     for _ in range(40):
-        loss, _, kl = dp.minibatch_loss(trainer, mb, 1.0, 1.0, 0.0)
+        loss, _, kl, _ = dp.minibatch_loss(trainer, mb, 1.0, 1.0, 0.0)
         first = float(kl) if first is None else first
         opt.zero_grad()
         loss.backward()

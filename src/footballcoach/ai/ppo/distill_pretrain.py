@@ -85,7 +85,7 @@ def kick_only_counterfactuals(trainer, data: dict, anchor: dict, teachers: dict,
     return out
 
 
-_DATA_TENSORS = ("returns", "target_phase", "value_w", "kl_w", "is_cf")
+_DATA_TENSORS = ("returns", "target_phase", "value_w", "kl_w", "is_cf", "bc_w", "bc_labels")
 _DATA_DICTS = ("obs", "anchor", "actions")
 
 
@@ -137,6 +137,11 @@ def swap_task_ids(global_feat: torch.Tensor, phase_a: int, phase_b: int) -> torc
     return out
 
 
+def _bc_label_dim() -> int:
+    from footballcoach.ai.ppo.bc import BC_LABEL_DIM
+    return BC_LABEL_DIM
+
+
 def build_copies(obs: dict, returns: torch.Tensor, phases: tuple[int, int], counterfactual: bool,
                  counterfactual_weight: float) -> dict:
     """The rows to fit: the real copy (own phase, value target) and, if on,
@@ -163,6 +168,9 @@ def build_copies(obs: dict, returns: torch.Tensor, phases: tuple[int, int], coun
         "value_w": torch.cat([p[2] for p in parts]),
         "kl_w": torch.cat([p[3] for p in parts]),
         "is_cf": torch.cat([p[4] for p in parts]),
+        # Role BC (attach_role_bc): none by default.
+        "bc_w": torch.zeros(n * len(parts)),
+        "bc_labels": torch.zeros(n * len(parts), _bc_label_dim()),
     }
 
 
@@ -229,8 +237,26 @@ def _student_forward(trainer, mb_obs: dict):
     return d, e
 
 
-def minibatch_loss(trainer, mb: dict, ret_std: float, kl_coef: float, value_coef: float) -> tuple:
-    """(loss, value_mse_norm, kl) on one minibatch dict of device tensors."""
+def role_bc_loss(trainer, d, e, mb: dict, label_smoothing: float) -> torch.Tensor:
+    """BC to the role's rules AI (role_bc) on the rows with bc_w > 0: the
+    per-row loss (sum over bc.GROUP_ROW_COLUMNS) weighted by bc_w, averaged
+    over those rows; Bernoulli targets smoothed y -> y (1 - s) + s / 2."""
+    from footballcoach.ai.ppo.bc import bc_loss_from_tensor
+    w = mb["bc_w"]
+    if not bool((w > 0).any()):
+        return torch.zeros((), device=w.device)
+    kw = {**trainer._bc_loss_kwargs(), "dec_label_smoothing": label_smoothing, "exec_label_smoothing": label_smoothing}
+    _, _, split = bc_loss_from_tensor(mb["bc_labels"], trainer._bc_heads_for_loss(d), e, **kw,
+                                      return_breakdown=True, split_kick=True, split_tackle=True, return_group_rows=True)
+    m = (w > 0) & split["valid"].bool()
+    return (split["rows"].sum(dim=1) * w * m).sum() / m.sum().clamp(min=1)
+
+
+def minibatch_loss(trainer, mb: dict, ret_std: float, kl_coef: float, value_coef: float,
+                   bc_label_smoothing: float = 0.0) -> tuple:
+    """(loss, value_mse_norm, kl, bc) on one minibatch dict of device tensors.
+    ``kl`` covers the rows with kl_w > 0 (the frozen teachers), ``bc`` the rows
+    with bc_w > 0 (a role taught by its rules AI, see role_bc)."""
     d, e = _student_forward(trainer, mb["obs"])
     globals_ = {k: getattr(trainer.execution_net, k).detach() for k in _SPREAD_KEYS}
     kl, _ = trainer._ppg_kl_penalty(
@@ -240,7 +266,8 @@ def minibatch_loss(trainer, mb: dict, ret_std: float, kl_coef: float, value_coef
     vw = mb["value_w"]
     sq = (e.value.squeeze(-1) - mb["returns"]) ** 2
     vloss = (sq * vw).sum() / vw.sum().clamp(min=1.0) / (ret_std ** 2)
-    return kl_coef * kl + value_coef * vloss, vloss, kl
+    bc = role_bc_loss(trainer, d, e, mb, bc_label_smoothing)
+    return kl_coef * kl + value_coef * vloss + bc, vloss, kl, bc
 
 
 def _slice(data: dict, idx: torch.Tensor, device) -> dict:
@@ -251,6 +278,8 @@ def _slice(data: dict, idx: torch.Tensor, device) -> dict:
         "returns": data["returns"][idx].to(device),
         "value_w": data["value_w"][idx].to(device),
         "kl_w": data["kl_w"][idx].to(device),
+        "bc_w": data["bc_w"][idx].to(device),
+        "bc_labels": data["bc_labels"][idx].to(device),
     }
 
 
@@ -263,7 +292,7 @@ def group_report(trainer, data: dict, batch_size: int, max_rows: int = 40000) ->
     gf = data["obs"]["global_feat"]
     for pid in sorted(set(data["target_phase"].tolist())):
         for cf in (False, True):
-            rows = torch.nonzero((data["target_phase"] == pid) & (data["is_cf"] == cf)).squeeze(-1)
+            rows = torch.nonzero((data["target_phase"] == pid) & (data["is_cf"] == cf) & (data["kl_w"] > 0)).squeeze(-1)
             if len(rows) == 0:
                 continue
             rows = rows[:max_rows]
@@ -291,6 +320,52 @@ def group_report(trainer, data: dict, batch_size: int, max_rows: int = 40000) ->
             out[(pid, "cf" if cf else "real")] = {"kl": sum(kls) / max(n, 1), "agree": agree, "n": n,
                                                   "by_head": {h: v / max(n, 1) for h, v in heads.items()}}
     return out
+
+
+def attach_role_bc(data: dict, batch: dict, role_bc: dict) -> None:
+    """In place: give ``data`` (build_copies' real rows, counterfactual off)
+    the rollout's BC labels and per-row BC weights. A row whose BC source is a
+    role in ``role_bc`` ({role: coeff}; its rules AI labels it, see
+    ai/bc/role_experts.RulesExpert and the phase's curriculum bc config) is
+    taught by that label instead of a teacher network: bc_w = coeff, kl_w = 0."""
+    from footballcoach.ai.curriculum.phases import ALL_PHASES
+    from footballcoach.ai.ppo.bc import BC_LABEL_DIM
+    from footballcoach.ai.ppo.bc_sources import source_id
+    n = len(data["returns"])
+    labels = batch.get("bc_labels")
+    data["bc_labels"] = (labels.float() if labels is not None and len(labels) == n
+                         else torch.zeros(n, BC_LABEL_DIM))
+    data["bc_w"] = torch.zeros(n)
+    if not role_bc:
+        return
+    src = batch.get("bc_sources")
+    if src is None or len(src) != n:
+        raise ValueError("distill_pretrain role_bc: the rollout carries no per-row BC sources")
+    for role, coeff in role_bc.items():
+        sids = [source_id(ph.phase_id, role) for ph in ALL_PHASES if ph.is_role_based and role in ph.roles.values()]
+        sids = [x for x in sids if x]
+        if not sids:
+            raise ValueError(f"distill_pretrain role_bc: role {role!r} has no BC configured in any phase "
+                             "(curriculum.<phase>.bc must list it so its rules AI labels its rows)")
+        m = torch.isin(src, torch.tensor(sids))
+        data["bc_w"][m] = coeff
+        data["kl_w"][m] = 0.0
+
+
+def bc_report(trainer, data: dict, batch_size: int, smoothing: float, max_rows: int = 40000) -> float:
+    """Mean role-BC loss over (up to max_rows of) the BC-taught rows, no grad."""
+    rows = torch.nonzero(data["bc_w"] > 0).squeeze(-1)[:max_rows]
+    if len(rows) == 0:
+        return float("nan")
+    tot, n = 0.0, 0
+    with torch.no_grad():
+        for start in range(0, len(rows), batch_size):
+            idx = rows[start:start + batch_size]
+            mb = _slice(data, idx, trainer.device)
+            d, e = _student_forward(trainer, mb["obs"])
+            tot += float(role_bc_loss(trainer, d, e, mb, smoothing)) * len(idx)
+            n += len(idx)
+    return tot / max(n, 1)
 
 
 def log_report(tag: str, report: dict) -> None:
@@ -330,13 +405,19 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
     every cycle when given."""
     from footballcoach.ai.ppo.distill import teacher_nets
     cfg = {**DEFAULTS, **(cfg or load_config())}
+    role_bc = {r: float(c) for r, c in (cfg.get("role_bc") or {}).items() if not str(r).startswith("_")}
+    smoothing = float(cfg.get("bc_label_smoothing", 0.0))
+    if role_bc and cfg["counterfactual"]:
+        raise ValueError("distill_pretrain: role_bc needs counterfactual off (a task-id-swapped copy of a "
+                         "rules-taught row would have no teacher)")
     teachers = {pid: teacher_nets(path, trainer.separate_value_net, trainer.device) for pid, path in cfg["teachers"].items()}
     phases = tuple(sorted(teachers))
     bs = int(cfg["batch_size"])
     params = list(trainer.decision_net.parameters()) + list(trainer.execution_net.parameters())
     params = [p for p in params if p.requires_grad]
     opt = torch.optim.Adam(params, lr=float(cfg["lr"]), eps=1e-5)
-    log.info(f"Distill pretrain: teachers {cfg['teachers']}, label_smoothing={cfg['label_smoothing']}, "
+    log.info(f"Distill pretrain: teachers {cfg['teachers']}, role_bc={role_bc} (bc_label_smoothing={smoothing}), "
+             f"label_smoothing={cfg['label_smoothing']}, "
              f"counterfactual_kick_only_phases={list(cfg['counterfactual_kick_only_phases'])}, "
              f"aggregate_cycles={cfg['aggregate_cycles']}, counterfactual={cfg['counterfactual']} "
              f"(weight {cfg['counterfactual_weight']}), kl_coef={cfg['kl_coef']}, value_coef={cfg['value_coef']}, "
@@ -357,6 +438,7 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
             returns = batch["returns"].float()
             ret_std = float(returns.std().clamp(min=1.0))
             data = build_copies(obs, returns, phases, bool(cfg["counterfactual"]), float(cfg["counterfactual_weight"]))
+            attach_role_bc(data, batch, role_bc)
             del batch, obs
             data["anchor"] = smooth_bernoulli_targets(
                 kick_only_counterfactuals(trainer, data, teacher_anchor(trainer, data["obs"], data["target_phase"], teachers, bs),
@@ -369,6 +451,9 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
             log.info(f"  [distill pretrain] {n_new} rows ({int((~data['is_cf']).sum())} real, {int(data['is_cf'].sum())} counterfactual)"
                      f"  returns std={ret_std:.2f}")
             log_report(f"cycle {cycle + 1} before", group_report(trainer, data, bs))
+            if role_bc:
+                log.info(f"  [distill pretrain] role BC rows: {int((data['bc_w'] > 0).sum())}  "
+                         f"bc loss before={bc_report(trainer, data, bs, smoothing):.4f}")
             # DAgger aggregation (aggregate_cycles > 1): fit on this cycle's rows
             # plus the last (aggregate_cycles - 1) cycles' rows.
             fit = concat_data(history + [data])
@@ -378,10 +463,11 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
                          f"{n - n_new} (KL only: their returns are another student's)")
             for epoch in range(int(cfg["epochs"])):
                 perm = torch.randperm(n)
-                vals, kls = [], []
+                vals, kls, bcs = [], [], []
                 for s in range(0, n, bs):
                     mb = _slice(fit, perm[s:s + bs], trainer.device)
-                    loss, vloss, kl = minibatch_loss(trainer, mb, ret_std, float(cfg["kl_coef"]), float(cfg["value_coef"]))
+                    loss, vloss, kl, bcl = minibatch_loss(trainer, mb, ret_std, float(cfg["kl_coef"]),
+                                                          float(cfg["value_coef"]), smoothing)
                     for g in opt.param_groups:
                         g["lr"] = warmup_lr(float(cfg["lr"]), step, int(cfg["lr_warmup_steps"]))
                     opt.zero_grad()
@@ -391,10 +477,13 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
                     step += 1
                     vals.append(float(vloss.detach()))
                     kls.append(float(kl.detach()))
-                log.info(f"  [distill pretrain] epoch {epoch + 1}/{cfg['epochs']}: kl={np.mean(kls):.4f}  "
+                    bcs.append(float(bcl.detach()))
+                log.info(f"  [distill pretrain] epoch {epoch + 1}/{cfg['epochs']}: kl={np.mean(kls):.4f}  bc={np.mean(bcs):.4f}  "
                          f"value_mse/var={np.mean(vals):.4f} (rmse {ret_std * math.sqrt(max(np.mean(vals), 0.0)):.2f})")
             report = group_report(trainer, data, bs)
             log_report(f"cycle {cycle + 1} after", report)
+            if role_bc:
+                log.info(f"  [distill pretrain] bc loss after={bc_report(trainer, data, bs, smoothing):.4f}")
             del fit
             if keep > 1:
                 history = (history + [as_history(data)])[-(keep - 1):]
