@@ -31,3 +31,23 @@ rushing out; expected to recover with training (untested).
 Run31 from run30/checkpoint53, checkpoints/phase2_run31, log
 scratchpad/ppo_run31.log; watchdog moved. Phase-2 evals not comparable with
 earlier runs (new start + keeper).
+
+## Run31 first hour (13 evals)
+
+Rules baselines (harder start + 10 m keeper): rules attacker 7.0% (keeper) /
+54.8% (no keeper); rules defender concedes 7.0% to the rules attacker.
+
+The sweep's 10 m-keeper collapse was real but short-lived: run31's FIRST
+rollout (run30/53 weights, before any update) had the AI attacker at 32.3%
+goals with 31.5% shots off target vs the rules defence (sweep: 26.3% / 32.0%),
+and after ONE 10-epoch update the eval was 52.0% with 4.1% off target. My
+"will take time to adapt" guess was wrong -- one update.
+
+| | evals 1-4 | evals 10-13 | rules |
+|---|---|---|---|
+| phase 1 vs rules | 63-65% | 64% | -- |
+| attacker vs rules (keeper) | 52-55% | 55-58% | 7.0% |
+| attacker vs rules (no keeper) | 55-58% | 57-62% | 54.8% |
+| defender_vs_rules conceded | 8-10% | 9-11% | 7.0% |
+
+Health: log current, CPU rising, no errors.
