@@ -1,7 +1,10 @@
 {
   "distill_pretrain": {
-    "teachers": {"1": "checkpoints/migrated/phase1_run321_checkpoint763_migrated.pt", "2": "checkpoints/phase2_run6/checkpoint3.pt"},
-    "counterfactual": true,
+    "teachers": {"1": "checkpoints/phase2_run34/checkpoint82.pt", "2": "checkpoints/phase2_run34/checkpoint82.pt"},
+    "role_bc": {"goalkeeper": 1.0},
+    "bc_label_smoothing": 0.01,
+    "_comment_keeper_pretrain_20261119": "Keeper pretrain (user's call): student = run34/checkpoint82, teachers = that same checkpoint frozen for both phases (anchors attacker / defender / phase 1 while the keeper rows are fitted), and the neural keeper's rows taught by the rules keeper (role_bc; labels from curriculum.phase2.bc's zero-coefficient goalkeeper entry) with bc_label_smoothing 0.01 = targets 0.995 / 0.005 (logits capped at ~+-5.3) so it does not come out with hard decisions. counterfactual off (required with role_bc; the teacher is the student's own checkpoint). Then a PPG value refit, then PPO. Before: teachers 763 (phase 1) / phase2_run6 checkpoint3 (phase 2), counterfactual on.",
+    "counterfactual": false,
     "counterfactual_weight": 0.5,
     "_comment_counterfactual_weight_20261117": "1.0 -> 0.1 (user's call): at 1.0 phase-1 real rows regressed from KL 0.0005 to 1.35 in one cycle (power diff 0 -> 0.25), the hard-kicking task-id-2 copies of the same phase-1 states pulling them before the task-id switch is learned. Real rows now outweigh their counterfactual 10:1 on every state.",
     "label_smoothing": 1e-05,
@@ -257,7 +260,10 @@
       "_comment_attribute_tiers_20261118": "Same distribution as phase 1 (user's call, attacker = phase 1's trainee): attacker boosted (0.71+-0.19), defender and keeper patsy (0.61+-0.23), stamina 0.6-1.0 (phase1_scenario trainee_tier / opponent_tier / stamina_min-max). Before: attacker premier_league/boosted vs defence generic/championship/league_one, stamina 0.5-1.0 -- a ~0.2 attacker edge; measured on run26 checkpoint109 (115 eval seeds, keeper in) the AI scored 90% premier-vs-premier, 66% championship-vs-championship, 46% league_one-vs-league_one, 12-35% when outclassed. Phase-2 evals from here on are NOT comparable with earlier runs.",
       "_comment_no_keeper_prob_20261117": "20% of phase-2 episodes without the goalkeeper (user's call): overnight, run6 and the distilled student scored only 20-24% at an EMPTY goal vs 75-82% with a keeper (shot aim keeper-relative). Evals: attacker_vs_rules / rules_baseline keep the keeper; *_no_keeper specs are the empty-goal case.",
       "_comment_scenario_kwargs_20261117": "Per-episode player variety for phase 2 (build_1v2_scenario attribute_tiers / stamina_range), switched on overnight for the PPO run (user's request: avoid overfitting the fixed attacker-0.9-vs-0.55 matchup). Phase-2 goal rates and the rules baseline from here on are NOT comparable with earlier fixed-matchup numbers.",
-      "bc": {},
+      "bc": {"goalkeeper": {"other": {"coeff_start": 0.0, "coeff_end": 0.0, "anneal_fraction": 1.0},
+                            "kick": {"coeff_start": 0.0, "coeff_end": 0.0, "anneal_fraction": 1.0},
+                            "tackle": {"coeff_start": 0.0, "coeff_end": 0.0, "anneal_fraction": 1.0}}},
+      "_comment_bc_gk_20261119": "goalkeeper listed with ZERO PPO coefficients so its rules AI labels the neural keeper's rows (ai/bc/role_experts.RulesExpert); the labels are used by distill_pretrain role_bc, not by PPO (all coefficients 0).",
       "_comment_bc_20261116": "Phase-2 attacker test run (user's call): kick BC 0.25 held for the first half of the run, annealing to 0.02 at the end. 1.0 -> 0.2 (phase2_run2) broke the policy in one update: BC gradient ~4x the clip limit, expert labels kick-now on 45% of rows at power 0.9 vs the policy's 2% at 0.04. Then (phase2_run3, kick BC 0.25 with the power BCE): the gate still won the race (kicks 0.12 -> 0.49/ep in one update, power at the floor, eval 3%), so the kick group is split: gate 0.05 constant (user's call), power 1.0 held half then -> 0.1, aim (direction + spin) 0.25 -> 0.02.",
       "_comment_bc": "Per-role BC for this phase (ai/ppo/bc_sources.py), off when empty. role -> {group: {coeff_start, coeff_end, anneal_fraction}}, groups 'other' (decision heads, movement, region), 'kick' (kick_this_tick / direction / power / spin) and 'tackle' (tackle_attempt); a group left out is 0 for that role. Labels come from the role's own rules AI (ai/bc/role_experts.RulesExpert, its memory kept true to the neural player's play) for every neural player in the role, trainee or secondary, and only those rows get these coefficients (phase-1 rows keep the global bc.aux_coeff_* ones). Each schedule anneals linearly over the first anneal_fraction of training, like bc.aux_coeff_*. Example, kick BC for the attacker only: {\"attacker\": {\"kick\": {\"coeff_start\": 0.5, \"coeff_end\": 0.0, \"anneal_fraction\": 0.3}}}.",
       "eval_seed_offset": 1000000,
@@ -265,8 +271,9 @@
       "controllers": {
         "attacker":   {"rules": 1, "neural": 4},
         "defender":   {"rules": 3, "neural": 7},
-        "goalkeeper": {"rules": 1, "neural": 0}
+        "goalkeeper": {"rules": 1, "neural": 1}
       },
+      "_comment_controllers_gk_20261119": "Goalkeeper neural in half the phase-2 episodes (user's call, 2026-11-19): the keeper pretrain (distill_pretrain role_bc, taught by the rules keeper) and the PPO run after it.",
       "_comment_controllers_20261118": "User's call (run30, with the phase mix 50:50): attacker rules:neural 20:80, defender 30:70. After AI-vs-AI fixed-seed tests showed no change over ~29 updates (76.8 -> 78.9%, 920 eps) -- later found confounded (the attacker co-adapts; with the attacker held fixed the defender did improve, agent_plans/overnight_2026-11-17.md 2026-11-18 18:4x): give it some easier (rules) attackers and more data. Rolls with no neural player (rules attacker + rules defender, 6%) are redrawn, so effectively ~85% neural attacker, ~75% neural defender, ~15% rules attacker vs neural defender.",
       "_comment_controllers_20261117": "Defender neural 0 -> 1 (user's call, phase2_run27 from run26): attacker always neural, defender neural in half the phase-2 episodes (its moves trained as a secondary player, secondary_weight 0.99, defender reward table), keeper rules. The defender_vs_rules eval (rules attacker vs neural defender, keeper in) runs automatically once the defender can be neural. Attacker and defender share task id 2 (no role input)."
     },
