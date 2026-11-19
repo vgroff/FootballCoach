@@ -40,6 +40,44 @@ def pad_value_side_columns(state_dict: dict, module: torch.nn.Module, label: str
     return padded
 
 
+#: PlayerFeatures fields appended after checkpoints already existed, newest
+#: last (all at the END of the PlayerFeatures block, see obs/schema.py).
+#: A checkpoint missing the last k of them gets k zero columns there.
+APPENDED_PLAYER_FEATURES: tuple[str, ...] = ("gk_dive_remaining", "gk_dive_recovery")
+#: First layers reading [PlayerFeatures columns..., physics-encoder outputs...]
+#: (same list as ai/ppo/new_phase_inputs.PLAYER_INPUT_LAYERS).
+_PLAYER_INPUT_LAYER_SUFFIXES: tuple[str, ...] = ("self_mlp.0.weight", "entity_encoder.per_entity_mlp.0.weight")
+
+
+def pad_player_feature_columns(state_dict: dict, module: torch.nn.Module, label: str) -> bool:
+    """In place: give a checkpoint saved before the APPENDED_PLAYER_FEATURES
+    (the keeper dive timers, 2026-11-19) their player-input columns, as ZEROS,
+    so every network computes exactly what it did: the new columns sit right
+    after the old PlayerFeatures block and before the physics-encoder outputs.
+    Without this the tolerant loader would skip the shape-mismatched weight
+    and leave those first layers at random init. Returns whether anything was
+    padded (the optimizer's Adam moments for those weights no longer fit)."""
+    from footballcoach.ai.obs.schema import PLAYER_FEATURE_DIM
+    own = module.state_dict()
+    padded = False
+    for k in list(state_dict):
+        if not any(k.endswith(s) for s in _PLAYER_INPUT_LAYER_SUFFIXES) or k not in own:
+            continue
+        v, want = state_dict[k], own[k].shape
+        if v.shape == want:
+            continue
+        missing = want[1] - v.shape[1] if v.dim() == 2 and v.shape[0] == want[0] else -1
+        if not 0 < missing <= len(APPENDED_PLAYER_FEATURES):
+            continue   # some other mismatch: left to the tolerant loader's warning
+        at = PLAYER_FEATURE_DIM - missing
+        zeros = torch.zeros(v.shape[0], missing, dtype=v.dtype, device=v.device)
+        state_dict[k] = torch.cat([v[:, :at], zeros, v[:, at:]], dim=1)
+        padded = True
+        log.info(f"{label}: {k} saved before {list(APPENDED_PLAYER_FEATURES[-missing:])}; inserted "
+                 f"{missing} zero column(s) at player-feature column {at}")
+    return padded
+
+
 def _migrate_direction_log_std_to_kappa(state_dict: dict) -> dict:
     """Backward-compat shim for the move_dir_log_std/kick_dir_log_std ->
     move_dir_log_kappa/kick_dir_log_kappa/kick_dir_z_log_std rename (see
@@ -220,8 +258,11 @@ class CheckpointIOMixin:
         # feature enabled never has them either -- strict loading would
         # otherwise raise "missing keys" for a submodule that's already
         # correctly populated from its own physics_pretrain checkpoint path.
-        _load_state_dict_tolerant(self.decision_net, ckpt["decision_net"], "decision_net")
+        _decision_sd = dict(ckpt["decision_net"])
+        _padded_player = pad_player_feature_columns(_decision_sd, self.decision_net, "decision_net")
+        _load_state_dict_tolerant(self.decision_net, _decision_sd, "decision_net")
         _execution_sd = _migrate_direction_log_std_to_kappa(ckpt["execution_net"])
+        _padded_player = pad_player_feature_columns(_execution_sd, self.execution_net, "execution_net") or _padded_player
         _padded_value_side = pad_value_side_columns(_execution_sd, self.execution_net, "execution_net")
         _load_state_dict_tolerant(self.execution_net, _execution_sd, "execution_net")
         if self.value_net is not None:
@@ -232,7 +273,8 @@ class CheckpointIOMixin:
                 # checkpoint -- migrate here too, purely for a clean load
                 # (these params are never actually used by the critic).
                 _value_sd = _migrate_direction_log_std_to_kappa(ckpt["value_net"])
-                _value_padded = pad_value_side_columns(_value_sd, self.value_net, "value_net")
+                _padded_player = pad_player_feature_columns(_value_sd, self.value_net, "value_net") or _padded_player
+                _value_padded = pad_value_side_columns(_value_sd, self.value_net, "value_net") or _padded_player
                 _padded_value_side = _padded_value_side or _value_padded
                 _load_state_dict_tolerant(self.value_net, _value_sd, "value_net")
                 if (not reset_optimizer and not _value_padded and self.value_net_optimizer is not None
@@ -246,9 +288,9 @@ class CheckpointIOMixin:
                 )
         if reset_optimizer:
             log.info(f"--reset-optimizer: skipping optimizer state restore for {path} (network weights still loaded normally)")
-        elif _padded_value_side and self.optimizer is not None and "optimizer" in ckpt:
-            log.warning(f"{path} predates the value side features (value_head widened): skipping optimizer "
-                        "state restore, whose Adam moments have the old shape (weights loaded normally)")
+        elif (_padded_value_side or _padded_player) and self.optimizer is not None and "optimizer" in ckpt:
+            log.warning(f"{path} predates newer inputs (input layers widened with zero columns): skipping "
+                        "optimizer state restore, whose Adam moments have the old shape (weights loaded normally)")
         elif self.optimizer is not None and "optimizer" in ckpt:
             saved_n_groups = len(ckpt["optimizer"].get("param_groups", []))
             current_n_groups = len(self.optimizer.param_groups)

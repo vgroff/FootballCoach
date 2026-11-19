@@ -25,8 +25,8 @@ from footballcoach.ai.obs.schema import (
 # Dimension constants
 # ---------------------------------------------------------------------------
 
-def test_player_feature_dim_is_39():
-    """PLAYER_FEATURE_DIM must stay 39 (change this test IFF you change the schema).
+def test_player_feature_dim_is_41():
+    """PLAYER_FEATURE_DIM must stay 41 (change this test IFF you change the schema).
 
     Fields: rel_dx, rel_dy, distance_m, ball_rel_dx, ball_rel_dy,
     ball_distance_m, ball_vel_rel_x, ball_vel_rel_y, ball_closing_speed,
@@ -35,9 +35,11 @@ def test_player_feature_dim_is_39():
     ball_control, tackling, stamina_attr, is_own_team, is_self, has_possession,
     is_inactive_tackled, is_controlling_ball, is_goalkeeper, attacking_direction,
     exists, is_immobile, pos_x, pos_y, heading_sin, heading_cos, desired_dir_x,
-    desired_dir_y, desired_speed_standstill, desired_speed_jog, desired_speed_sprint.
+    desired_dir_y, desired_speed_standstill, desired_speed_jog, desired_speed_sprint,
+    gk_dive_remaining, gk_dive_recovery (appended 2026-11-19; older checkpoints
+    get zero columns for them, ai/ppo/checkpoint_io.pad_player_feature_columns).
     """
-    assert PLAYER_FEATURE_DIM == 39
+    assert PLAYER_FEATURE_DIM == 41
 
 
 def test_ball_feature_dim_is_12():
@@ -146,23 +148,26 @@ def test_player_features_pos_at_fixed_indices():
     assert arr[31] == pytest.approx(-0.3)
 
 
-def test_player_features_heading_and_intent_are_last_seven():
+def test_player_features_heading_and_intent_follow_pos_y_then_the_dive_timers():
     """heading_sin/cos + desired_dir_x/y + speed-mode one-hot are appended
     after pos_y, in this exact order (see the field-ordering constraint in
-    ai/knowledge.md's 'Heading and previous-decision movement intent' note)."""
+    ai/knowledge.md's 'Heading and previous-decision movement intent' note);
+    the keeper dive timers come last (2026-11-19)."""
     import dataclasses
     names = [f.name for f in dataclasses.fields(PlayerFeatures)]
-    assert names[-7:] == [
+    assert names[-9:] == [
         "heading_sin", "heading_cos",
         "desired_dir_x", "desired_dir_y",
         "desired_speed_standstill", "desired_speed_jog", "desired_speed_sprint",
+        "gk_dive_remaining", "gk_dive_recovery",
     ]
     feat = PlayerFeatures(
         heading_sin=0.1, heading_cos=0.2, desired_dir_x=0.3, desired_dir_y=0.4,
         desired_speed_standstill=0.5, desired_speed_jog=0.6, desired_speed_sprint=0.7,
     )
     arr = feat.to_array()
-    assert arr[-7:] == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+    assert arr[-9:-2] == pytest.approx([0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7])
+    assert arr[-2:] == pytest.approx([0.0, 0.0])        # dive timers default to 0
 
 
 def test_ball_features_is_possessed_at_fixed_indices():

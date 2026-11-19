@@ -264,5 +264,10 @@ def test_rules_ai_driven_mirrored_match_stays_identical_for_almost_seven_seconds
                                        "velocity damping are decided by rounding (~1e-16) -> O(1) m/s velocity differences between a match and its mirror "
                                        "after the first contact; flips to XPASS (and fails) when the engine is made rounding-robust")
 def test_contact_between_opposing_players_is_not_mirror_stable(tmp_path):
-    r = run_mirrored_simulation(tmp_path, 0, None, "x", ticks=300, contact_damping=True)
+    # Rules-driven (the networks only shadow), so the trajectory -- and whether
+    # it reaches the knife-edge contact -- does not depend on random network
+    # init: the neural-driven seed-0 run stopped reaching it when the player
+    # inputs widened (2026-11-19, keeper dive timers). Searched: rules driver
+    # hits it on seeds 0/1/4/5 across mirrors; neural driver on none of 30 x 3.
+    r = run_mirrored_simulation(tmp_path, 0, None, "xy", ticks=300, contact_damping=True, driver="rules")
     assert max(r.state_dev) < 1e-6

@@ -319,6 +319,14 @@ def _player_features(
     desired_speed_jog = 1.0 if speed_mode is SpeedMode.JOG else 0.0
     desired_speed_sprint = 1.0 if speed_mode is SpeedMode.SPRINT else 0.0
 
+    # Keeper dive timers as fractions of their windows (0 for outfielders /
+    # gating off: Player.gk_dive_* stay 0 then).
+    mp = match.movement_params
+    gk_dive_remaining = (player.gk_dive_remaining_s / mp.goalkeeper_dive_duration_s
+                         if player.is_goalkeeper and mp.goalkeeper_dive_duration_s > 0 else 0.0)
+    gk_dive_recovery = (player.gk_dive_recovery_s / mp.goalkeeper_dive_recovery_s
+                        if player.is_goalkeeper and mp.goalkeeper_dive_recovery_s > 0 else 0.0)
+
     feat = PlayerFeatures(
         rel_dx=dx / half_diag,
         rel_dy=dy / half_diag,
@@ -359,6 +367,8 @@ def _player_features(
         desired_speed_standstill=desired_speed_standstill,
         desired_speed_jog=desired_speed_jog,
         desired_speed_sprint=desired_speed_sprint,
+        gk_dive_remaining=gk_dive_remaining,
+        gk_dive_recovery=gk_dive_recovery,
     )
     return feat.to_array()
 

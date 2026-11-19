@@ -6,6 +6,8 @@ exactly (w - 1) x the three kick terms, and it must only carry gradient into the
 import pytest
 import torch
 
+from footballcoach.ai.obs.schema import PLAYER_FEATURE_DIM
+
 from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
 from footballcoach.ai.ppo.ppo_update import _kick_power_frac_stats
 
@@ -34,7 +36,7 @@ def _isolate_move_dir_weight(trainer):
 
 def _heads(trainer, n=16, seed=0):
     torch.manual_seed(seed)
-    sf, of, bf, gf = torch.randn(n, 39), torch.randn(n, 21, 39), torch.randn(n, 12), torch.randn(n, 31)
+    sf, of, bf, gf = torch.randn(n, PLAYER_FEATURE_DIM), torch.randn(n, 21, PLAYER_FEATURE_DIM), torch.randn(n, 12), torch.randn(n, 31)
     ex, sat, oat = torch.ones(n, 21), torch.randn(n, 3), torch.randn(n, 21, 3)
     d = trainer.decision_net(sf, of, ex, bf, gf, sat, oat)
     e = trainer.execution_net(sf, of, ex, bf, gf, d, sat, oat)

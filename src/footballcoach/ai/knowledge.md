@@ -2843,3 +2843,20 @@ For further moves, `scripts/split_module.py` does the AST-based move and
 records every number, weight hash and log line from a fixed-seed run through
 these methods; run it before and after a refactor and require identical
 output.
+
+## Keeper dive timers as player inputs (2026-11-19)
+
+`PlayerFeatures` gained `gk_dive_remaining` / `gk_dive_recovery` (fractions of
+`physics.json movement.goalkeeper_dive_duration_s` / `_recovery_s`; 0 for
+outfielders and with `goalkeeper_dive_gating` off), APPENDED LAST so every
+absolute index (`physics_pretrain/live_encoder_features.PF_*`, the mirror
+columns) is unchanged. `PLAYER_FEATURE_DIM` 39 -> 41. Older checkpoints load
+through `ai/ppo/checkpoint_io.pad_player_feature_columns`: the two new columns
+of every player-input first layer (`self_mlp.0`, `entity_encoder.per_entity_mlp.0`;
+the player block comes before the physics-encoder outputs) are inserted as
+zeros, and the stale optimizer state is skipped. Verified end to end: run34/82
+on 40 seeded phase-2 episodes (old keeper physics) gives the same outcomes,
+episode for episode, under the old code (a worktree) and the new; first-decision
+values agree to ~1e-5 (float32 rounding of the wider matmul). Tests:
+tests/unit/test_gk_dive_inputs.py. Saved datasets recorded at the old width
+(demos, physics-pretrain data) would need the same padding if reused.

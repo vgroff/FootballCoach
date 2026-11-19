@@ -141,6 +141,14 @@ class PlayerFeatures:
     desired_speed_standstill: float = 1.0
     desired_speed_jog: float = 0.0
     desired_speed_sprint: float = 0.0
+    # Gated keeper dive (physics.json movement.goalkeeper_dive_gating,
+    # 2026-11-19): fraction of the dive window left (1 = a dive just started,
+    # 0 = not diving) and fraction of the recovery left (1 = just ended, 0 =
+    # may dive). Always 0 for outfielders and with gating off. APPENDED LAST
+    # on purpose: checkpoints from before get these two input columns padded
+    # with zeros on load (ai/ppo/checkpoint_io.pad_player_feature_columns).
+    gk_dive_remaining: float = 0.0
+    gk_dive_recovery: float = 0.0
 
     def to_array(self) -> np.ndarray:
         # vars(self).values() preserves field-declaration order (Python 3.7+ dict
