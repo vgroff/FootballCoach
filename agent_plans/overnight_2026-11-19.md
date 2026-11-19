@@ -270,3 +270,19 @@ largest effect; all three together = slightly stronger keeper.
   keeper's SaveOrder target; never while held).
 - Restarted: checkpoints/phase2_run37, log scratchpad/keeper_pretrain_run37.log.
   run35/run36 dirs (crashed attempts) left in place. Next: PPG refit, then PPO.
+
+### Keeper pretrain run39 (role BC 0.005, 20 cycles, keeper start +-2 m / +-0.5 m)
+
+Cycles 1-3 after: frozen-teacher KL phase 1 0.004 / 0.011 / 0.012, phase 2
+0.006 / 0.018 / 0.022 (user's stop threshold 0.35); keeper BC (x0.005)
+0.476 / 0.341 / 0.226. Per-cycle checkpoints copied to
+checkpoints/phase2_run39/checkpoint_cycleN.pt (pretrain overwrites one file).
+
+CORRECTION: I called ~28 of the unweighted keeper BC (decision heads) an
+unlearnable floor (~0.14 logged). Wrong: bc.bc_trains_frozen_heads is true,
+so the frozen heads' BC backpropagates through them into the shared trunk;
+measured on 156 keeper rows the decision part fell 28.8 -> 13.6 by cycle 3
+(total 130 -> 56). Those heads never act in phases 1-2, so that trunk push is
+interference and a plausible part of the slow KL drift (share not measured).
+Fix available (detach frozen heads in role BC); user chose to let run39
+finish as is.
