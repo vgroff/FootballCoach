@@ -339,13 +339,21 @@ def attach_role_bc(data: dict, batch: dict, role_bc: dict) -> None:
     the rollout's BC labels and per-row BC weights. A row whose BC source is a
     role in ``role_bc`` ({role: coeff}; its rules AI labels it, see
     ai/bc/role_experts.RulesExpert and the phase's curriculum bc config) is
-    taught by that label instead of a teacher network: bc_w = coeff, kl_w = 0."""
+    taught by that label instead of a teacher network: bc_w = coeff, kl_w = 0.
+
+    The labels are recorded in the world frame (ai/ppo/bc.py); the student's
+    heads come out in the canonical frame (observer attacks +x), so they are
+    canonicalized here (obs/canonical.canonicalize_bc_labels) -- without it a
+    right-team player's (the keeper's) direction / region / kick targets have
+    their x mirrored."""
     from footballcoach.ai.curriculum.phases import ALL_PHASES
+    from footballcoach.ai.obs.canonical import canonicalize_bc_labels, x_sign_of
     from footballcoach.ai.ppo.bc import BC_LABEL_DIM
     from footballcoach.ai.ppo.bc_sources import source_id
     n = len(data["returns"])
     labels = batch.get("bc_labels")
-    data["bc_labels"] = (labels.float() if labels is not None and len(labels) == n
+    data["bc_labels"] = (canonicalize_bc_labels(labels.float(), x_sign_of(data["obs"]["self_feat"][:n]))
+                         if labels is not None and len(labels) == n
                          else torch.zeros(n, BC_LABEL_DIM))
     data["bc_w"] = torch.zeros(n)
     if not role_bc:
@@ -364,9 +372,12 @@ def attach_role_bc(data: dict, batch: dict, role_bc: dict) -> None:
         data["kl_w"][m] = 0.0
 
 
-def bc_report(trainer, data: dict, batch_size: int, smoothing: float, max_rows: int = 40000) -> float:
+def bc_report(trainer, data: dict, batch_size: int, smoothing: float, max_rows: int = 40000,
+              unweighted: bool = False) -> float:
     """Mean LOGGED role-BC loss (frozen decision heads left out, see
-    role_bc_loss) over (up to max_rows of) the BC-taught rows, no grad."""
+    role_bc_loss) over (up to max_rows of) the BC-taught rows, no grad.
+    Weighted by each row's role_bc coefficient (the value trained on), or
+    with ``unweighted`` the plain per-row loss (every taught row weight 1)."""
     rows = torch.nonzero(data["bc_w"] > 0).squeeze(-1)[:max_rows]
     if len(rows) == 0:
         return float("nan")
@@ -375,10 +386,18 @@ def bc_report(trainer, data: dict, batch_size: int, smoothing: float, max_rows: 
         for start in range(0, len(rows), batch_size):
             idx = rows[start:start + batch_size]
             mb = _slice(data, idx, trainer.device)
+            if unweighted:
+                mb = {**mb, "bc_w": (mb["bc_w"] > 0).to(mb["bc_w"].dtype)}
             d, e = _student_forward(trainer, mb["obs"])
             tot += float(role_bc_loss(trainer, d, e, mb, smoothing)[1]) * len(idx)
             n += len(idx)
     return tot / max(n, 1)
+
+
+def bc_report_line(trainer, data: dict, batch_size: int, smoothing: float) -> str:
+    """'<weighted> (unweighted <plain>)' for the pretrain log."""
+    return (f"{bc_report(trainer, data, batch_size, smoothing):.4f} "
+            f"(unweighted {bc_report(trainer, data, batch_size, smoothing, unweighted=True):.3f})")
 
 
 def log_report(tag: str, report: dict) -> None:
@@ -466,7 +485,7 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
             log_report(f"cycle {cycle + 1} before", group_report(trainer, data, bs))
             if role_bc:
                 log.info(f"  [distill pretrain] role BC rows: {int((data['bc_w'] > 0).sum())}  "
-                         f"bc loss before={bc_report(trainer, data, bs, smoothing):.4f}")
+                         f"bc loss before={bc_report_line(trainer, data, bs, smoothing)}")
             # DAgger aggregation (aggregate_cycles > 1): fit on this cycle's rows
             # plus the last (aggregate_cycles - 1) cycles' rows.
             fit = concat_data(history + [data])
@@ -491,12 +510,12 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
                     vals.append(float(vloss.detach()))
                     kls.append(float(kl.detach()))
                     bcs.append(float(bcl.detach()))
-                log.info(f"  [distill pretrain] epoch {epoch + 1}/{cfg['epochs']}: kl={np.mean(kls):.4f}  bc={np.mean(bcs):.4f}  "
+                log.info(f"  [distill pretrain] epoch {epoch + 1}/{cfg['epochs']}: kl={np.mean(kls):.4f}  bc(weighted)={np.mean(bcs):.4f}  "
                          f"value_mse/var={np.mean(vals):.4f} (rmse {ret_std * math.sqrt(max(np.mean(vals), 0.0)):.2f})")
             report = group_report(trainer, data, bs)
             log_report(f"cycle {cycle + 1} after", report)
             if role_bc:
-                log.info(f"  [distill pretrain] bc loss after={bc_report(trainer, data, bs, smoothing):.4f}")
+                log.info(f"  [distill pretrain] bc loss after={bc_report_line(trainer, data, bs, smoothing)}")
             del fit
             if keep > 1:
                 history = (history + [as_history(data)])[-(keep - 1):]

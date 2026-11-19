@@ -245,15 +245,18 @@ def test_distill_pretrain_with_a_rules_taught_keeper(mixed_config, monkeypatch, 
     trainer._save_checkpoint_to(teacher)
     cfg = {"teachers": {1: str(teacher), 2: str(teacher)}, "counterfactual": False, "kl_coef": 5.0,
            "value_coef": 1.0, "epochs": 3, "lr": 1e-3, "batch_size": 512, "rollout_steps": 4000,
-           "num_rollouts": 1, "aggregate_cycles": 1, "role_bc": {"goalkeeper": 1.0}, "bc_label_smoothing": 0.01}
+           "num_rollouts": 1, "aggregate_cycles": 1, "role_bc": {"goalkeeper": 0.5}, "bc_label_smoothing": 0.01}
     with caplog.at_level(logging.INFO, logger="footballcoach"):
         distill_pretrain(trainer, phase_id=1, cfg=cfg, checkpoint_path=tmp_path / "out.pt")
     text = caplog.text
     n_rows = int(re.search(r"role BC rows: (\d+)", text).group(1))
     before = float(re.search(r"bc loss before=([0-9.]+)", text).group(1))
     after = float(re.search(r"bc loss after=([0-9.]+)", text).group(1))
+    after_unweighted = float(re.search(r"bc loss after=[0-9.]+ \(unweighted ([0-9.]+)\)", text).group(1))
     assert n_rows > 0
     assert after < before, (before, after)
+    # every keeper row carries the role_bc coefficient 0.5: the plain loss is twice the logged one
+    assert after_unweighted == pytest.approx(after / 0.5, abs=2e-3)
 
 
 def test_role_bc_needs_counterfactual_off(mixed_config):

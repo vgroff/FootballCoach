@@ -1187,6 +1187,15 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
             kick_power_loss=self._bc_kick_power_loss,
         )
 
+    def _canonical_bc_labels(self, batch: dict, mb_idx: torch.Tensor) -> torch.Tensor:
+        """The minibatch's BC labels in the canonical frame the heads output
+        in: labels are recorded in the world frame (ai/ppo/bc.py), so a
+        right-team row's x-signed columns are mirrored here, exactly as the
+        pretraining paths do (obs/canonical.canonicalize_bc_labels)."""
+        from footballcoach.ai.obs.canonical import canonicalize_bc_labels, x_sign_of
+        labels = batch["bc_labels"][mb_idx].to(self.device)
+        return canonicalize_bc_labels(labels, x_sign_of(batch["obs/self_feat"][mb_idx].to(self.device)))
+
     def _ppo_bc_aux_loss(self, ctx: _UpdateContext, stats: _UpdateStats, mb_idx: torch.Tensor,
                          d_heads, e_heads) -> tuple[torch.Tensor, torch.Tensor]:
         """BC auxiliary loss for one minibatch: (unweighted total, for logging;
@@ -1197,7 +1206,7 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
         scaled by its own annealed coefficient (TrainingSchedules.bc / bc_kick /
         bc_tackle)."""
         from footballcoach.ai.ppo.bc import bc_loss_from_tensor
-        mb_bc = ctx.batch["bc_labels"][mb_idx].to(self.device)
+        mb_bc = self._canonical_bc_labels(ctx.batch, mb_idx)
         per_row = ctx.bc_coeff_table is not None
         bc_loss_val, _bkdn, _bsplit = bc_loss_from_tensor(
             mb_bc, self._bc_heads_for_loss(d_heads), e_heads,
@@ -1829,7 +1838,7 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
                 if len(mb_idx) == 0:
                     continue
                 mb_obs = self._minibatch_obs(ctx.batch, mb_idx)
-                mb_bc = ctx.batch["bc_labels"][mb_idx].to(self.device)
+                mb_bc = self._canonical_bc_labels(ctx.batch, mb_idx)
                 if ctx.bc_coeff_table is not None:
                     # The continuation applies the GLOBAL coefficient: keep it to
                     # the rows the global schedules govern (source 0).

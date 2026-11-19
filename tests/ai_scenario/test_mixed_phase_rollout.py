@@ -80,9 +80,9 @@ def test_replayed_seeds_only_reach_envs_of_their_phase(trainer, neural_phase2):
     for i, env in enumerate(envs):
         orig = env.reset
 
-        def _spy(*, seed=None, _i=i, _orig=orig):
+        def _spy(*, seed=None, fresh_engine_rng=False, _i=i, _orig=orig):
             reset_seeds[_i].append(seed)
-            return _orig(seed=seed)
+            return _orig(seed=seed, fresh_engine_rng=fresh_engine_rng)
         env.reset = _spy
     queued = [tag_seed(4242, 2), tag_seed(4343, 2), 777]
     results = group.collect(600, replay_seeds=list(queued))
