@@ -343,6 +343,12 @@ class RoleScenarioEnv(ScenarioEnv):
             self.last_terminal_match = self._loop.last_completed_trial_match
         else:
             self.last_terminal_match = self._loop.match
+        # At episode end encode the episode's OWN final tick: self._loop.match
+        # is by then the next trial, which may lack a role this episode had
+        # (no_keeper_prob draws per trial) -- a crash once the keeper can be
+        # the trainee. Callers reset() on done and discard this obs anyway.
+        if done and self.last_terminal_match is not None:
+            return self._get_obs(match=self.last_terminal_match), reward, done, info
         return self._get_obs(), reward, done, info
 
     def episode_rewards_by_player(self, outcome: str) -> dict[str, float]:

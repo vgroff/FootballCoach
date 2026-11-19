@@ -80,3 +80,33 @@ def test_eval_specs_pin_the_keeper_in_or_out(monkeypatch):
     without = rpe.run_role_phase_eval(PHASE2, specs["rules_baseline_no_keeper"], None, seeds=range(6))
     assert with_gk.episode_tag.endswith("goalkeeper=rules]")
     assert without.episode_tag == "phase2_1v2[attacker=rules,defender=rules]"
+
+
+def test_a_neural_keeper_trainee_survives_trials_without_a_keeper(monkeypatch):
+    """Regression (2026-11-19 keeper pretrain crash): with the keeper as the
+    episode's trainee, the end-of-episode observation was encoded against the
+    NEXT trial's match, which (unseeded episodes draw the keeper per trial) may
+    have no keeper -> KeyError. It now uses the episode's own final tick."""
+    import random
+    import torch
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+    cfg = load_ai_config()["curriculum"]["phase2"]
+    monkeypatch.setitem(cfg, "scenario_kwargs", {"no_keeper_prob": 0.5})
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    weights = {"attacker": {"rules": 1}, "defender": {"rules": 1}, "goalkeeper": {"neural": 1}}
+    env = build_role_env(PHASE2, controller_weights=weights)
+    env.sample_action_fn = trainer._sample_action
+    keeper_trainee = 0
+    random.seed(0)
+    for seed in range(30):
+        # UNSEEDED resets, as the rollout workers' fresh episodes: each trial
+        # then draws the keeper afresh, so the next trial (already built when
+        # an episode ends) can lack him. Seeded ones rebuild the same trial.
+        env.rng = random.Random(seed)
+        env.reset(seed=None)
+        keeper_trainee += env.trainee_player_id == "keeper"
+        done = False
+        while not done:
+            obs, _, done, _ = env.step()
+        assert obs is not None
+    assert keeper_trainee > 0
