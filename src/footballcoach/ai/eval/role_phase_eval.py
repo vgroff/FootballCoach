@@ -13,8 +13,8 @@ episode's trainee); a spec with no neural role is a rules baseline, which the
 trainer runs once and caches.
 
 Which specs a training run evaluates (``specs_to_evaluate``): the rules-only
-ones, plus every spec with a neural role this run trains (its neural weight in
-``curriculum[<config_key>].controllers`` is above zero) -- evaluating a role
+ones, plus every spec whose neural roles this run all trains (neural weight in
+``curriculum[<config_key>].controllers`` above zero) -- evaluating a role
 nobody trains says nothing about the run.
 """
 from __future__ import annotations
@@ -71,10 +71,12 @@ def trained_roles(phase: CurriculumPhase) -> set[str]:
 
 
 def specs_to_evaluate(phase: CurriculumPhase) -> list[dict]:
-    """The rules-only specs, plus each spec with a neural role this run trains."""
+    """The rules-only specs, plus each spec whose neural roles this run ALL
+    trains (a spec pairing a trained role with an untrained neural one, e.g.
+    the AI attacker vs a never-trained AI keeper, says nothing about the run)."""
     trained = trained_roles(phase)
     return [s for s in phase.eval_specs
-            if is_rules_only(s) or any(c == "neural" and r in trained for r, c in s["controllers"].items())]
+            if is_rules_only(s) or all(r in trained for r, c in s["controllers"].items() if c == "neural")]
 
 
 def run_role_phase_eval(phase: CurriculumPhase, spec: dict, sample_action_fn, seeds=None,

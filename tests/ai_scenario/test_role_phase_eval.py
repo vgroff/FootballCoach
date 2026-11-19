@@ -51,7 +51,11 @@ def test_only_specs_of_trained_roles_are_evaluated(controllers):
     assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == [
         "rules_baseline", "attacker_vs_rules", "rules_baseline_no_keeper", "attacker_vs_rules_no_keeper"]
     controllers({**NEURAL_ATTACKER, "defender": {"rules": 1, "neural": 2}})
-    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == list(SPECS)
+    keeper_specs = ["goalkeeper_vs_rules", "attacker_vs_ai_keeper"]
+    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == [n for n in SPECS if n not in keeper_specs]
+    controllers({**NEURAL_ATTACKER, "goalkeeper": {"rules": 1, "neural": 1}})
+    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == [
+        "rules_baseline", "attacker_vs_rules", *keeper_specs, "rules_baseline_no_keeper", "attacker_vs_rules_no_keeper"]
     controllers({r: {"rules": 1, "neural": 0} for r in ("attacker", "defender", "goalkeeper")})
     assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == ["rules_baseline", "rules_baseline_no_keeper"]
 
@@ -112,7 +116,7 @@ def test_trainer_runs_every_spec_and_caches_the_rules_baseline(trainer, monkeypa
     assert calls == ["rules_baseline", "attacker_vs_rules", "defender_vs_rules",
                      "rules_baseline_no_keeper", "attacker_vs_rules_no_keeper",
                      "attacker_vs_rules", "defender_vs_rules", "attacker_vs_rules_no_keeper"]
-    for name in SPECS:
+    for name in set(calls):
         assert caplog.text.count(f"[eval phase2_1v2/{name}]") == 2
 
 

@@ -145,6 +145,13 @@ PHASE_2_1V2 = CurriculumPhase(
          "scenario_kwargs": {"no_keeper_prob": 0.0}},
         {"name": "defender_vs_rules", "controllers": {"attacker": "rules", "defender": "neural", "goalkeeper": "rules"},
          "scenario_kwargs": {"no_keeper_prob": 0.0}},
+        # Neural keeper (2026-11-19): vs the rules attacker (compare rules_baseline)
+        # and vs the AI attacker (compare attacker_vs_rules, the same attacker
+        # against the rules keeper). Evaluated whenever the keeper trains.
+        {"name": "goalkeeper_vs_rules", "controllers": {"attacker": "rules", "defender": "rules", "goalkeeper": "neural"},
+         "scenario_kwargs": {"no_keeper_prob": 0.0}},
+        {"name": "attacker_vs_ai_keeper", "controllers": {"attacker": "neural", "defender": "rules", "goalkeeper": "neural"},
+         "scenario_kwargs": {"no_keeper_prob": 0.0}},
         {"name": "rules_baseline_no_keeper", "controllers": {"attacker": "rules", "defender": "rules", "goalkeeper": "rules"},
          "scenario_kwargs": {"no_keeper_prob": 1.0}},
         {"name": "attacker_vs_rules_no_keeper", "controllers": {"attacker": "neural", "defender": "rules", "goalkeeper": "rules"},
