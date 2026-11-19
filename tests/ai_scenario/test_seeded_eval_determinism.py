@@ -4,6 +4,10 @@ Pinned: the scenario setup and, with a deterministic policy, the whole episode.
 Not pinned: a stochastic policy's own samples, which come from torch's global
 RNG. The same seed list therefore gives different episodes on every stochastic
 eval unless the caller reseeds torch first.
+
+That is the eval.seed_network_sampling = false behaviour, pinned explicitly
+here; with it on, every episode's sampling is seeded too (see
+test_seeded_eval_sampling.py).
 """
 from __future__ import annotations
 
@@ -37,7 +41,8 @@ def _deterministic(trainer):
 
 def _run(sample_action_fn, seeds=_SEEDS, swap_sides=False):
     env_factory = _build_eval_env_factory(use_rules_ai=True, max_episode_s=12.0)
-    return run_seeded_evaluation(env_factory, sample_action_fn, seeds, repeats_per_seed=1, swap_sides=swap_sides)
+    return run_seeded_evaluation(env_factory, sample_action_fn, seeds, repeats_per_seed=1, swap_sides=swap_sides,
+                                 seed_network_sampling=False)
 
 
 def _episodes(result):

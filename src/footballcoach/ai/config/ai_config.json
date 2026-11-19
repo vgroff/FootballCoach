@@ -39,6 +39,8 @@
     "eval_n_seeds": 115,
     "eval_seed_base": 1100000,
     "eval_repeats_per_seed": 4,
+    "seed_network_sampling": true,
+    "_comment_seed_network_sampling_20261119": "User's call, 2026-11-19 (ai/eval/seeded_eval.py eval_episode_sampling_seed): an eval seed already pins the scenario and the engine dice; this also seeds the NETWORK side of every eval episode (seed, side, repeat) -- its torch sampling noise and the observation encoder's slot-shuffle Random -- so the same checkpoint gives the same eval numbers every time and two checkpoints share their noise while their play stays alike. Repeats of a seed still differ (the repeat index is in the seed). torch's global RNG is forked around each episode, so training's stream is untouched. Batched evals then sample slot by slot (each slot its own RNG state): slower. false = the old unseeded sampling.",
     "eval_n_parallel_workers": 16,
     "pre_ppo_eval_enabled": false,
     "_comment_pre_ppo_eval_enabled": "train.py only: whether to run the 4 pre-PPO evals (vs rules-based AI, vs immobile, self-play, rules-vs-rules baseline) after pre-training but before PPO starts. Only takes effect when --pre-ppo-eval-trials is NOT passed on the CLI -- an explicit --pre-ppo-eval-trials (0 or otherwise) always overrides this. false = skip all 4 entirely, matching --pre-ppo-eval-trials 0. These evals have no effect on training itself (informational only) and no downstream dependency: skipping them doesn't change the separate, lazily-cached rules-vs-rules baseline computed during training for the '[eval baseline rules-vs-rules]'/gap= numbers.",

@@ -768,6 +768,7 @@ class ActionSamplingMixin:
         deterministic: bool = False,
         deterministic_decision: bool = False,
         deterministic_direction: bool = False,
+        row_rng_holders: list | None = None,
     ) -> list:
         """Batched variant of ``_sample_action``: ``obs_dict_batch`` already
         has a batch dimension (K rows, K>=1). Runs the 3 network forward
@@ -779,8 +780,40 @@ class ActionSamplingMixin:
         row's own observation (see ``_sample_action_from_heads``'s
         docstring for the exact tuple contents; ``_sample_action_from_heads_batch``
         returns the same shape, just computed vectorized).
+
+        ``row_rng_holders`` (seeded evals, eval.seed_network_sampling): one
+        dict per row holding that row's own torch CPU RNG state under
+        ``"torch_state"``. The forward pass stays batched; each row is then
+        sampled on its own under its holder's state (written back after), so
+        a row's draws do not depend on which other rows share the batch.
+        Rows sharing a holder draw in row order. The caller's global RNG is
+        restored afterwards.
         """
         d_heads_b, e_heads_b, value_b, x_sign_b, em_b = self._sample_action_networks(obs_dict_batch)
+        if row_rng_holders is not None:
+            import dataclasses
+            K = int(value_b.shape[0])
+            assert len(row_rng_holders) == K, (len(row_rng_holders), K)
+
+            def _row(obj, k):
+                return dataclasses.replace(obj, **{
+                    f.name: getattr(obj, f.name)[k:k + 1]
+                    for f in dataclasses.fields(obj)
+                    if isinstance(getattr(obj, f.name), torch.Tensor) and getattr(obj, f.name).dim() > 0
+                })
+
+            out = []
+            with torch.random.fork_rng(devices=[]):
+                for k, holder in enumerate(row_rng_holders):
+                    torch.set_rng_state(holder["torch_state"])
+                    out.extend(self._sample_action_from_heads_batch(
+                        _row(d_heads_b, k), _row(e_heads_b, k), value_b[k:k + 1], x_sign_b[k:k + 1], em_b[k:k + 1],
+                        deterministic=deterministic,
+                        deterministic_decision=deterministic_decision,
+                        deterministic_direction=deterministic_direction,
+                    ))
+                    holder["torch_state"] = torch.get_rng_state()
+            return out
         return self._sample_action_from_heads_batch(
             d_heads_b, e_heads_b, value_b, x_sign_b, em_b,
             deterministic=deterministic,

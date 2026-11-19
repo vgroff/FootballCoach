@@ -208,6 +208,7 @@ def _secondary_neural_candidates(env) -> list[tuple]:
 def _batch_due_decisions(
     candidates: list[tuple], trainer,
     deterministic: bool, deterministic_decision: bool, deterministic_direction: bool,
+    rng_holders: list | None = None,
 ) -> None:
     """Shared by BatchedEnvGroup's trainee/secondary collection phases AND
     ai/eval/seeded_eval.py's batched eval consumer: given (player, ai, match)
@@ -218,12 +219,18 @@ def _batch_due_decisions(
     next time ``Match._process_orders()`` calls that ai's ``act()`` (see
     ``NeuralPlayerAI.act()``'s own docstring for the hook). No-op if nothing
     in `candidates` is due this round. Module-level (not a method) so it has
-    exactly one implementation shared by both consumers."""
+    exactly one implementation shared by both consumers.
+
+    ``rng_holders`` (seeded evals only): one RNG-state holder per candidate,
+    forwarded for the due rows to ``_sample_action_batch(row_rng_holders=)``."""
     obs_dicts = []
     due_ais = []
-    for player, ai, match in candidates:
+    due_holders = []
+    for idx, (player, ai, match) in enumerate(candidates):
         if not ai.is_due_for_decision():
             continue
+        if rng_holders is not None:
+            due_holders.append(rng_holders[idx])
         obs_dict = ai.prepare(player, match, 0)
         assert obs_dict is not None, (
             "is_due_for_decision() said this player was due, but "
@@ -242,6 +249,7 @@ def _batch_due_decisions(
         deterministic=deterministic,
         deterministic_decision=deterministic_decision,
         deterministic_direction=deterministic_direction,
+        **({"row_rng_holders": due_holders} if rng_holders is not None else {}),
     )
     for ai, result in zip(due_ais, results):
         ai._precomputed_result = result

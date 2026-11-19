@@ -29,6 +29,60 @@ from footballcoach.ai.env.scenario_env import ScenarioEnv
 
 log = logging.getLogger("footballcoach.ai.eval.seeded_eval")
 
+
+# ---------------------------------------------------------------------------
+# Seeded network sampling (eval.seed_network_sampling)
+# ---------------------------------------------------------------------------
+# A seed already pins an eval episode's scenario AND its engine dice (the
+# match rng is built from it). What was left unseeded is the network side:
+# action sampling draws from torch's global RNG, and the observation encoder
+# shuffles the other players' slots with the env's unseeded random.Random
+# (which decides which slot a pass / tackle / mark target is sampled from).
+# With the flag on, every eval episode -- (seed, side, repeat) -- gets its own
+# torch sampling seed and its own encoder Random, so the same checkpoint gives
+# the same numbers every time, and two checkpoints see the same noise
+# (common random numbers) for as long as their play stays alike. Repeats of a
+# seed still differ (the repeat index is part of the seed). torch's global
+# RNG is forked around every episode, so the caller's (training's) stream is
+# untouched.
+
+
+def seed_network_sampling_enabled(flag: Optional[bool] = None) -> bool:
+    """``flag`` if given, else ai_config.json eval.seed_network_sampling
+    (default False)."""
+    if flag is not None:
+        return bool(flag)
+    from footballcoach.ai.config import load_ai_config
+    return bool(load_ai_config().get("eval", {}).get("seed_network_sampling", False))
+
+
+def eval_episode_sampling_seed(seed: int, do_swap: bool, repeat: int) -> int:
+    """The network-sampling seed of eval episode (seed, side, repeat)."""
+    import hashlib
+    h = hashlib.sha256(f"eval-net:{int(seed)}:{int(bool(do_swap))}:{int(repeat)}".encode()).digest()
+    return int.from_bytes(h[:8], "little") & ((1 << 63) - 1)
+
+
+def seed_env_sampling(env, sampling_seed: int) -> None:
+    """Give ``env`` (before its reset) a seeded Random for the observation
+    encoder's slot shuffle (shared with its NeuralPlayerAIs) and any other
+    env-level draw (episode-length variability)."""
+    import random
+    env.rng = random.Random(sampling_seed)
+
+
+@contextlib.contextmanager
+def _seeded_torch(sampling_seed: Optional[int]):
+    """Run the block on a forked torch RNG seeded with ``sampling_seed``
+    (no-op for None); the caller's RNG state is restored afterwards."""
+    if sampling_seed is None:
+        yield
+        return
+    import torch
+    with torch.random.fork_rng(devices=[]):
+        torch.manual_seed(sampling_seed)
+        yield
+
 _THREAD_ENV_VARS = (
     "OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
     "NUMEXPR_NUM_THREADS", "VECLIB_MAXIMUM_THREADS",
@@ -218,9 +272,13 @@ def run_seeded_evaluation(
     trial_log_every: int = 0,
     gamma: float = 0.98,
     swap_sides: bool = False,
+    seed_network_sampling: Optional[bool] = None,
 ) -> SeededEvalResult:
     """Run ``len(seeds) * repeats_per_seed`` (x2 if ``swap_sides``) episodes,
     return aggregate stats.
+
+    ``seed_network_sampling`` (None = eval.seed_network_sampling): seed each
+    episode's network sampling too (see ``eval_episode_sampling_seed``).
 
     Args:
         env_factory: ``(seed, swap) -> freshly-built ScenarioEnv``. ``swap``
@@ -266,35 +324,40 @@ def run_seeded_evaluation(
     n = 0
     _sides = (False, True) if swap_sides else (False,)
     total = len(seeds) * max(1, repeats_per_seed) * len(_sides)
+    _seeded = seed_network_sampling_enabled(seed_network_sampling)
     for seed in seeds:
         for do_swap in _sides:
-            for _ in range(max(1, repeats_per_seed)):
+            for _rep in range(max(1, repeats_per_seed)):
                 env = env_factory(seed, do_swap)
                 env.sample_action_fn = sample_action_fn
-                env.reset()
+                _ss = eval_episode_sampling_seed(seed, do_swap, _rep) if _seeded else None
+                if _ss is not None:
+                    seed_env_sampling(env, _ss)
                 done = False
                 info = None
                 ep_reward = 0.0
                 ep_step_v: list[float] = []
                 ep_step_rew: list[float] = []
                 ep_component_sums: dict[str, float] = {}
-                while not done:
-                    _, reward, done, info = env.step()
-                    ep_reward += reward
-                    for _k, _v in getattr(env, "last_reward_components", {}).items():
-                        # Cast to plain float -- numpy/torch scalar types here make
-                        # the running sum (and therefore reward_components/as_dict())
-                        # non-JSON-serializable downstream in evaluate.py.
-                        _v = float(_v.item()) if hasattr(_v, "item") else float(_v)
-                        reward_component_sums[_k] = reward_component_sums.get(_k, 0.0) + _v
-                        ep_component_sums[_k] = ep_component_sums.get(_k, 0.0) + _v
-                    tr = getattr(env, "last_trainee_transition", None)
-                    if tr is not None and "value" in tr:
-                        _v = tr["value"]
-                        _v = float(_v.item()) if hasattr(_v, "item") else float(_v)
-                        value_preds.append(_v)
-                        ep_step_v.append(_v)
-                        ep_step_rew.append(reward)
+                with _seeded_torch(_ss):
+                    env.reset()
+                    while not done:
+                        _, reward, done, info = env.step()
+                        ep_reward += reward
+                        for _k, _v in getattr(env, "last_reward_components", {}).items():
+                            # Cast to plain float -- numpy/torch scalar types here make
+                            # the running sum (and therefore reward_components/as_dict())
+                            # non-JSON-serializable downstream in evaluate.py.
+                            _v = float(_v.item()) if hasattr(_v, "item") else float(_v)
+                            reward_component_sums[_k] = reward_component_sums.get(_k, 0.0) + _v
+                            ep_component_sums[_k] = ep_component_sums.get(_k, 0.0) + _v
+                        tr = getattr(env, "last_trainee_transition", None)
+                        if tr is not None and "value" in tr:
+                            _v = tr["value"]
+                            _v = float(_v.item()) if hasattr(_v, "item") else float(_v)
+                            value_preds.append(_v)
+                            ep_step_v.append(_v)
+                            ep_step_rew.append(reward)
                 # Discounted return-to-go for each step in this episode (no
                 # bootstrap at the end) -- V-vs-R diagnostic.
                 G = 0.0
@@ -352,6 +415,7 @@ def run_seeded_evaluation_batched(
     deterministic: bool = False,
     deterministic_decision: bool = False,
     deterministic_direction: bool = False,
+    seed_network_sampling: Optional[bool] = None,
 ) -> SeededEvalResult:
     """Batched variant of ``run_seeded_evaluation()``: instead of stepping one
     ``ScenarioEnv`` at a time (batch-of-1 network calls), runs up to
@@ -405,17 +469,29 @@ def run_seeded_evaluation_batched(
             ``sample_action_fn``); set them for a fully reproducible,
             RNG-free comparison (e.g. tests checking this against
             ``run_seeded_evaluation``'s output on the same seeds).
+        seed_network_sampling: None = eval.seed_network_sampling. When on,
+            every slot keeps its OWN torch RNG state (seeded per episode,
+            ``eval_episode_sampling_seed``): the network forward stays
+            batched, but each row is sampled under its slot's state
+            (``_sample_action_batch(row_rng_holders=)``), and each env step
+            runs under it too -- so an episode's noise does not depend on
+            which other episodes share its batch. Without a
+            ``secondary_trainer`` the draws come in the same order as
+            ``run_seeded_evaluation`` with the same flag, so the episodes
+            match it (up to batched-vs-single forward float rounding); with
+            one, the secondary's draws come after the trainee's.
     """
     from footballcoach.ai.ppo.trainer_common import outcome_breakdown  # local: avoid import cycle
     from footballcoach.ai.ppo.batched_rollout_worker import _batch_due_decisions, _secondary_neural_candidates
 
     _sides = (False, True) if swap_sides else (False,)
     tasks = [
-        (seed, do_swap)
+        (seed, do_swap, rep)
         for seed in seeds
         for do_swap in _sides
-        for _ in range(max(1, repeats_per_seed))
+        for rep in range(max(1, repeats_per_seed))
     ]
+    _seeded = seed_network_sampling_enabled(seed_network_sampling)
 
     rewards: list[float] = []
     outcomes: dict[str, int] = {}
@@ -437,11 +513,20 @@ def run_seeded_evaluation_batched(
     task_iter = iter(tasks)
 
     def _new_slot():
-        seed, do_swap = next(task_iter)  # raises StopIteration when exhausted
+        seed, do_swap, rep = next(task_iter)  # raises StopIteration when exhausted
         env = env_factory(seed, do_swap)
         env.sample_action_fn = trainer._sample_action
-        env.reset()
-        return env, {"reward": 0.0, "step_v": [], "step_rew": [], "comps": {}}
+        acc = {"reward": 0.0, "step_v": [], "step_rew": [], "comps": {}}
+        if _seeded:
+            import torch
+            _ss = eval_episode_sampling_seed(seed, do_swap, rep)
+            seed_env_sampling(env, _ss)
+            with _seeded_torch(_ss):
+                env.reset()
+                acc["torch_state"] = torch.get_rng_state()
+        else:
+            env.reset()
+        return env, acc
 
     def _trainee_player_and_ai(env):
         player = env.match.player_by_id(env.trainee_player_id)
@@ -450,24 +535,36 @@ def run_seeded_evaluation_batched(
     n_slots = min(max(1, envs_per_process), len(tasks))
     slots = [_new_slot() for _ in range(n_slots)]  # list of (env, accum)
 
-    while slots:
-        trainee_candidates = [(*_trainee_player_and_ai(env), env.match) for env, _ in slots]
+    def _decide(groups) -> None:
+        trainee_candidates = [(*_trainee_player_and_ai(env), env.match) for env, _ in groups]
         _batch_due_decisions(
             trainee_candidates, trainer, deterministic, deterministic_decision, deterministic_direction,
+            rng_holders=[acc for _, acc in groups] if _seeded else None,
         )
-
         if secondary_trainer is not None:
-            secondary_candidates = [
-                triple for env, _ in slots for triple in _secondary_neural_candidates(env)
-            ]
+            secondary = [(triple, acc) for env, acc in groups for triple in _secondary_neural_candidates(env)]
             _batch_due_decisions(
-                secondary_candidates, secondary_trainer,
+                [t for t, _ in secondary], secondary_trainer,
                 deterministic, deterministic_decision, deterministic_direction,
+                rng_holders=[acc for _, acc in secondary] if _seeded else None,
             )
+
+    def _step(env, acc):
+        if not _seeded:
+            return env.step()
+        import torch
+        with torch.random.fork_rng(devices=[]):
+            torch.set_rng_state(acc["torch_state"])
+            out = env.step()
+            acc["torch_state"] = torch.get_rng_state()
+        return out
+
+    while slots:
+        _decide(slots)
 
         next_slots = []
         for env, acc in slots:
-            _, reward, done, info = env.step()
+            _, reward, done, info = _step(env, acc)
             acc["reward"] += reward
             for _k, _v in getattr(env, "last_reward_components", {}).items():
                 _v = float(_v.item()) if hasattr(_v, "item") else float(_v)
