@@ -464,10 +464,11 @@
     "phase2": {
       "_comment": "Phase 2 (1v2: attacker vs defender + goalkeeper) pays ONLY terminal rewards, one table per role, keyed by the outcome from ai/env/outcome.py's classify_attack_defence_outcome (goal / saved / defence_possession / shot_off_target / attacker_out / timeout). Every role must list every outcome (a missing entry raises). Placeholder values (2026-11-15): the defending-team entries follow the user's first sketch, with defence_possession paid most to the defender and saved most to the goalkeeper; attacker_out (dribbling or kicking the ball out anywhere other than over the attacked goal line) is the heavy attacker failure.",
       "terminal": {
-        "attacker":   {"goal": 4.0,  "saved": 1.0, "defence_possession": -2.0, "shot_off_target": -2.0, "attacker_out": -4.0, "timeout": -1.0},
-        "defender":   {"goal": -4.0, "saved": 1.0, "defence_possession": 3.0,  "shot_off_target": 2.0,  "attacker_out": 2.0,  "timeout": 1.0},
-        "goalkeeper": {"goal": -4.0, "saved": 2.0, "defence_possession": 1.0,  "shot_off_target": 2.0,  "attacker_out": 2.0,  "timeout": 1.0}
-      }
+        "attacker":   {"goal": 4.0,  "saved": -1.0, "defence_possession": -2.0, "shot_off_target": -2.0, "attacker_out": -3.0, "timeout": -3.0},
+        "defender":   {"goal": -4.0, "saved": 2.0,  "defence_possession": 3.0,  "shot_off_target": 2.0,  "attacker_out": 2.0,  "timeout": 1.0},
+        "goalkeeper": {"goal": -4.0, "saved": 3.0,  "defence_possession": 1.0,  "shot_off_target": 2.0,  "attacker_out": 1.0,  "timeout": 1.0}
+      },
+      "_comment_terminal_20261119": "Audit (user's call, goal stays +-4 like phase 1, no shaping). Before: attacker saved +1 (a saved shot paid 3 more than a tackle or a miss: shoot-from-anywhere incentive, and saved paid BOTH sides +1), attacker_out -4, timeout -1; defender saved +1 (less than a forced miss +2); keeper saved +2 = miss = out, out +2 > defence_possession +1. Now: attacker goal +4 > saved -1 (at least he shot) > miss = tackled -2 > out = timeout -3 (timeout quite bad); defender earns most for winning the ball (+3), a save or forced miss or run-out +2, timeout +1; keeper earns most for its own save (+3), forced miss +2 (its closing down forces misses), defence possession / run-out +1 (little contribution). Value refit (PPG, MC returns) before PPO."
     }
   },
   "phase1_scenario": {
