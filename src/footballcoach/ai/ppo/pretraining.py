@@ -2536,8 +2536,19 @@ class PretrainingMixin:
                 k: v.unsqueeze(0).to(self.device) for k, v in next_obs.to_torch_dict().items()
             }
             last_values = {"trainee": self._get_value(last_obs_dict)}
+            # Only a player who is a neural secondary in the env's CURRENT
+            # episode can have an unfinished last transition to bootstrap. A
+            # track recorded in an earlier episode (e.g. a phase-2 keeper who
+            # is rules-controlled or absent now -- no_keeper_prob) ended with
+            # a done transition: compute_gae's 0.0 fallback is exact for it,
+            # and encoding it here would look the player up in a match that
+            # may not contain them (the 2026-11-19 keeper pretrain crash).
+            live = set(getattr(env, "secondary_player_ids", None) or [])
+            match = getattr(env, "match", None)
             for track in set(buffer.track_ids):
-                if track == "trainee" or track in last_values:
+                if track == "trainee" or track in last_values or track not in live:
+                    continue
+                if match is not None and match.player_by_id_or_none(track) is None:
                     continue
                 sec_obs = env._get_obs(player_id=track)
                 sec_obs_dict = {

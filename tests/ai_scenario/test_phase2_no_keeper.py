@@ -110,3 +110,26 @@ def test_a_neural_keeper_trainee_survives_trials_without_a_keeper(monkeypatch):
             obs, _, done, _ = env.step()
         assert obs is not None
     assert keeper_trainee > 0
+
+
+def test_bootstrap_skips_a_secondary_track_from_an_earlier_episode(monkeypatch):
+    """Regression (second 2026-11-19 keeper pretrain crash): a rollout buffer
+    holding a 'keeper' track from an earlier episode, while the env's current
+    episode has no keeper, made _bootstrap_last_values look the keeper up in
+    the current match -> KeyError. Only current neural secondaries are
+    bootstrapped; the stale track falls back to compute_gae's 0.0."""
+    import torch
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+
+    class _Buf:
+        track_ids = ["trainee", "keeper", "defender"]
+    cfg = load_ai_config()["curriculum"]["phase2"]
+    monkeypatch.setitem(cfg, "scenario_kwargs", {"no_keeper_prob": 1.0})
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    weights = {"attacker": {"neural": 1}, "defender": {"neural": 1}, "goalkeeper": {"neural": 1}}
+    env = build_role_env(PHASE2, controller_weights=weights)
+    env.sample_action_fn = trainer._sample_action
+    obs = env.reset(seed=3)
+    assert "keeper" not in _ids(env.match) and env.secondary_player_ids == ["defender"]
+    values = trainer._bootstrap_last_values(env, obs, _Buf())
+    assert set(values) == {"trainee", "defender"}

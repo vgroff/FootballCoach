@@ -263,3 +263,55 @@ def test_role_bc_needs_counterfactual_off(mixed_config):
     with pytest.raises(ValueError, match="counterfactual off"):
         distill_pretrain(trainer, phase_id=1, cfg={"teachers": {1: "x", 2: "x"}, "counterfactual": True,
                                                    "role_bc": {"goalkeeper": 1.0}})
+
+
+def _neural_keeper_no_keeper_config(mixed_config, monkeypatch, tmp_path):
+    """Neural keeper (labelled by its rules AI) and half the phase-2 trials
+    without one -- the combination that crashed the 2026-11-19 keeper pretrain
+    twice; the session fixture strips no_keeper_prob, so set it here."""
+    import json as _json
+    zero = {"coeff_start": 0.0, "coeff_end": 0.0, "anneal_fraction": 1.0}
+    p2 = mixed_config["curriculum"]["phase2"]
+    monkeypatch.setitem(p2, "bc", {"goalkeeper": {"other": zero, "kick": zero, "tackle": zero}})
+    monkeypatch.setitem(p2, "controllers", {"attacker": {"rules": 1, "neural": 4}, "defender": {"rules": 3, "neural": 7},
+                                            "goalkeeper": {"rules": 1, "neural": 1}})
+    monkeypatch.setitem(p2, "scenario_kwargs", {**(p2.get("scenario_kwargs") or {}), "no_keeper_prob": 0.5})
+    (tmp_path / "ai_config.json").write_text(_json.dumps(mixed_config))
+
+
+def test_keeper_pretrain_with_no_keeper_trials_runs(mixed_config, monkeypatch, tmp_path, caplog):
+    from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+    from footballcoach.ai.ppo.distill_pretrain import distill_pretrain
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+    for path, value in _PPG_OVERRIDES.items():
+        monkeypatch.setitem(mixed_config[path[0]], path[1], value)
+    _neural_keeper_no_keeper_config(mixed_config, monkeypatch, tmp_path)
+    torch.manual_seed(0)
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    trainer.set_frozen_heads(PHASES_BY_ID[1].frozen_heads)
+    trainer.phase_mix = {1: 1.0, 2: 1.0}
+    teacher = tmp_path / "teacher.pt"
+    trainer._save_checkpoint_to(teacher)
+    cfg = {"teachers": {1: str(teacher), 2: str(teacher)}, "counterfactual": False, "epochs": 1, "batch_size": 512,
+           "rollout_steps": 6000, "num_rollouts": 2, "aggregate_cycles": 2, "role_bc": {"goalkeeper": 1.0},
+           "bc_label_smoothing": 0.01}
+    with caplog.at_level(logging.INFO, logger="footballcoach"):
+        distill_pretrain(trainer, phase_id=1, cfg=cfg, checkpoint_path=tmp_path / "out.pt")
+    assert "role BC rows:" in caplog.text and (tmp_path / "out.pt").exists()
+
+
+def test_ppo_cycle_with_a_neural_keeper_and_no_keeper_trials_runs(mixed_config, monkeypatch, tmp_path, caplog):
+    from footballcoach.ai.curriculum.phases import PHASES_BY_ID
+    from footballcoach.ai.ppo.ppo_trainer import PPOTrainer
+    monkeypatch.setitem(mixed_config["ppo"], "rollout_steps", 3000)
+    _neural_keeper_no_keeper_config(mixed_config, monkeypatch, tmp_path)
+    torch.manual_seed(0)
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    trainer.set_frozen_heads(PHASES_BY_ID[1].frozen_heads)
+    trainer.phase_mix = {1: 1.0, 2: 1.0}
+    trainer._ppg_interleave_enabled = False
+    trainer._eval_n_parallel_workers = 1
+    trainer.checkpoint_dir = None
+    with caplog.at_level(logging.INFO, logger="footballcoach"):
+        trainer.train(None, total_steps=3000, phase_id=1)
+    assert "goalkeeper=neural" in caplog.text
