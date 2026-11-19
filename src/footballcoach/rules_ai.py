@@ -533,6 +533,47 @@ class StagedGoalkeeperAI(_RulesBasedAI):
     def _close_down_cfg(self) -> dict:
         return require_section(load_orders_config(), "goalkeeper_ai", "orders.json")
 
+    def _guard_target(self, player: Player, match: Match) -> Vector3:
+        """Where the keeper stands when not saving or closing down: goal centre,
+        or -- with orders.json goalkeeper_ai.angle_positioning -- on the line
+        from goal centre toward the ball, off its line by angle_advance_fraction
+        of the ball's distance (capped at angle_advance_max_m), while the ball
+        is within angle_activate_dist_m."""
+        centre = self._goal_centre(player, match)
+        cfg = self._close_down_cfg()
+        if not cfg["angle_positioning"]:
+            return centre
+        b = match.ball.position
+        dx, dy = b.x - centre.x, b.y - centre.y
+        dist = math.hypot(dx, dy)
+        if dist < 1e-6 or dist > float(cfg["angle_activate_dist_m"]):
+            return centre
+        adv = min(float(cfg["angle_advance_max_m"]), float(cfg["angle_advance_fraction"]) * dist)
+        tx, ty = centre.x + dx / dist * adv, centre.y + dy / dist * adv
+        # Never behind the goal line (a ball wide of the post can point the
+        # line backwards): keep the spot at least 0.3 m in front of it.
+        inward = 1.0 if centre.x < 0 else -1.0
+        if (tx - centre.x) * inward < 0.3:
+            tx = centre.x + inward * 0.3
+        return Vector3(tx, ty, 0.0)
+
+    def _guard(self, player: Player, match: Match) -> None:
+        """Angle-positioning mode only: hold the guard spot (``_guard_target``),
+        re-targeted every decision as the ball moves. Settled there it stops
+        (StopOrder keeps movement intent set) and faces the ball."""
+        cfg = self._close_down_cfg()
+        target = self._guard_target(player, match)
+        dist = player.position.xy().distance_to(target.xy())
+        if dist <= _GK_PARKED_TOLERANCE_M and player.speed_mps < 0.3:
+            if not isinstance(player.current_order, StopOrder):
+                player.current_order = StopOrder()
+            b = match.ball.position
+            player.heading_rad = math.atan2(b.y - player.position.y, b.x - player.position.x)
+            return
+        player.current_order = MoveOrder(
+            target_position=target, sprint=bool(cfg["angle_sprint"]), max_speed_on_arrival_mps=0.0,
+        )
+
     def _opponent_carrier(self, player: Player, match: Match) -> Player | None:
         holder = match.ball.possessed_by
         if holder is None or holder == player.player_id:
@@ -598,7 +639,9 @@ class StagedGoalkeeperAI(_RulesBasedAI):
 
         # Ball is held by anyone → cease SaveOrder and jog back to goal centre.
         if ball.possessed_by is not None:
-            if isinstance(player.current_order, SaveOrder):
+            if self._close_down_cfg()["angle_positioning"]:
+                self._guard(player, match)
+            elif isinstance(player.current_order, SaveOrder):
                 target = self._goal_centre(player, match)
                 player.current_order = MoveOrder(
                     target_position=target, sprint=False, max_speed_on_arrival_mps=0.0,
@@ -630,7 +673,11 @@ class StagedGoalkeeperAI(_RulesBasedAI):
                 match._log_info(f"[AI] {player.player_id}: SaveOrder")
             return
 
-        # Ball is loose but not threatening — fill None with goal-centre jog.
+        # Ball is loose but not threatening — fill None with goal-centre jog
+        # (or track the angle, with angle positioning).
+        if self._close_down_cfg()["angle_positioning"] and not isinstance(player.current_order, SaveOrder):
+            self._guard(player, match)
+            return
         if player.current_order is None:
             target = self._goal_centre(player, match)
             dist = player.position.xy().distance_to(target.xy())

@@ -184,15 +184,22 @@ def test_the_persistent_pool_gives_the_in_process_result(trainer):
     back per worker); a neural spec returns every episode."""
     from footballcoach.ai.eval.eval_worker import close_eval_workers, spawn_eval_workers
     seeds = list(range(5000, 5007))
-    local = rpe.run_role_phase_eval(PHASE2, SPECS["rules_baseline"], None, seeds=seeds, repeats_per_seed=2)
+    # Spawned eval workers load the run config from disk (the session
+    # fixtures patch only this process), so pin the run-only start settings
+    # in the specs themselves: both sides then build the same scenario.
+    pin = {"no_keeper_prob": 0.0, "attacker_start_min_m": 18.0, "attacker_start_max_m": 32.0,
+           "random_initial_velocity": False}
+    rules_spec = {**SPECS["rules_baseline"], "scenario_kwargs": pin}
+    neural_spec = {**SPECS["attacker_vs_rules"], "scenario_kwargs": pin}
+    local = rpe.run_role_phase_eval(PHASE2, rules_spec, None, seeds=seeds, repeats_per_seed=2)
     workers = spawn_eval_workers(2)
     try:
-        pooled = rpe.run_role_phase_eval_on_workers(workers, PHASE2, SPECS["rules_baseline"], seeds=seeds,
+        pooled = rpe.run_role_phase_eval_on_workers(workers, PHASE2, rules_spec, seeds=seeds,
                                                     repeats_per_seed=2)
         d, e, v = trainer._cpu_state_dicts()
         for w in workers:
             w.set_weights(d, e, v)
-        neural = rpe.run_role_phase_eval_on_workers(workers, PHASE2, SPECS["attacker_vs_rules"], seeds=seeds[:3],
+        neural = rpe.run_role_phase_eval_on_workers(workers, PHASE2, neural_spec, seeds=seeds[:3],
                                                     repeats_per_seed=2)
     finally:
         close_eval_workers(workers)

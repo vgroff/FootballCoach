@@ -888,8 +888,17 @@ def build_1v2_scenario(
     attribute_tiers: dict | None = None,
     stamina_range: tuple | list | None = None,
     no_keeper_prob: float = 0.0,
+    random_initial_velocity: bool = False,
 ) -> Match:
     """1v2: elite attacker vs. average defender + GK.
+
+    ``random_initial_velocity``: every player starts moving in a random
+    direction (heading = that direction) at a speed uniform in [0, their own
+    effective top speed at their stamina], as in phase 1's build_1v1_scenario,
+    instead of the attacker starting mid-run toward its move target and the
+    others standing still. Drawn from its own seeded stream (positions,
+    attributes and the keeper draw are unchanged for a seed). False (default)
+    = as before.
 
     ``no_keeper_prob``: chance the trial has NO goalkeeper (an empty goal, the
     defender alone). Drawn from its own seeded stream, and the keeper is still
@@ -1003,6 +1012,19 @@ def build_1v2_scenario(
         )
         attacker.velocity = Vector3(run_dir.x * run_speed, run_dir.y * run_speed, 0.0)
         attacker.heading_rad = math.atan2(run_dir.y, run_dir.x)
+
+    if random_initial_velocity:
+        vel_rng = random.Random(f"{seed}-1v2-velocity") if seed is not None else random.Random()
+        mvmt_r = MovementParams.from_config()
+        for _p in (attacker, defender, gk):
+            _dir = vel_rng.uniform(-math.pi, math.pi)
+            _top = effective_top_speed(
+                mvmt_r, _p.attributes.top_speed, _p.stamina, has_ball=(_p is attacker),
+                ball_control_attr=_p.attributes.ball_control, is_goalkeeper=_p.is_goalkeeper,
+            )
+            _spd = vel_rng.uniform(0.0, _top)
+            _p.heading_rad = _dir
+            _p.velocity = Vector3(math.cos(_dir) * _spd, math.sin(_dir) * _spd, 0.0)
 
     # aim_point omitted -> BallCarrierAttackerAI picks a live, goalkeeper-aware
     # corner at the moment of shooting (see shot_selection.choose_shot_target).
