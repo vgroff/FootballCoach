@@ -18,3 +18,10 @@ attacker 25.2% (rules keeper 62%).
   attacker rules:neural 1:4, defender 3:7, keeper 1:1; keeper save-target
   shaping 0.1; PPO n_epochs 10, rollout 500k, target_kl 0.5, replay 0.35
   with fresh engine dice; evals fully seeded.
+- 02:34: PPG refit done -> checkpoints/phase2_run41/checkpoint_pretrained.pt
+  (40 min, 6 cycles). Value MSE/var per cycle 0.40 -> 0.50 is the replayed
+  hardest episodes (the ORIGINAL net's MSE on the same rows rose too:
+  0.40 -> 0.51); the refit beats the original by a little each cycle
+  (0.500 vs 0.509 on the last). Policy KL <= 0.007.
+- 02:35: PPO started -> checkpoints/phase2_run42 (log scratchpad/ppo_run42.log),
+  --checkpoint checkpoints/phase2_run41/checkpoint_pretrained.pt, config as above.
