@@ -213,3 +213,13 @@ standing still from them". Run44 stopped right after checkpoint 40.
   lead the target -- via PPO, since BC copies the rules keeper's myopic
   per-tick commands); more BC first. role_bc 0.3 -> 0.6, run52 from run51
   final, 10 cycles; then PPG refit + PPO.
+- 19:2x run52 (BC 0.6, lr 3e-5) cycles 1-5: KL 0.016-0.061; keeper BC
+  2.05 -> 1.84. Cycle-3 shot probe flat vs run51 final (P(move) 0.65,
+  dir cos 0.56, dive 0.48/0.20). User asked whether epochs / LR need
+  tweaking: YES -- within each cycle the BC loss still falls linearly at
+  epoch 12 (cycle 4: 1.182 -> 1.150) and the next cycle's fresh rollouts
+  start at 1.130 (no generalisation gap): optimisation-limited. (Retracts
+  my "close to what BC can extract".) Hidden rules-keeper state:
+  _closing_down hysteresis (entry 10 m / exit 12 m) and
+  _close_down_ended_s cooldown, plus RulesExpert's shadow order.
+  distill lr 3e-5 -> 1e-4; run53 from run52 cycle 5, 10 cycles.
