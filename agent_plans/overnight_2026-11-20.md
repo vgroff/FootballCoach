@@ -348,3 +348,7 @@ standing still from them". Run44 stopped right after checkpoint 40.
   recovery 18%; open play dir 0.95. Saves vs rules attacker (60 seeds):
   6 sampled / 7 deterministic (c3 9/8, c6 7/6; run55 final 6/6) -- within
   the ~6-9 noise band: decisions keep improving, saves do not follow yet.
+- 23:4x User: more BC, no PPO until reasonably close to the rules keeper.
+  role_bc goalkeeper 1.2 -> 2.0; run57 from run56 final, 10 cycles. Test:
+  shot-time move agreement (~79%) and saves (6-9 / 60) must rise above the
+  band; otherwise BC is done.
