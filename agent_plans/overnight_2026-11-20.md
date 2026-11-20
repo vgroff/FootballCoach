@@ -355,3 +355,9 @@ standing still from them". Run44 stopped right after checkpoint 40.
 - 23:5x User: juice it even higher ("we can always cut back"). run57 (2.0)
   stopped before its first cycle; role_bc goalkeeper 4.0; run58 from run56
   final, 10 cycles, same test (move agreement / saves above the band).
+- 00:1x run58 (role BC 4.0) cycles 1-6: KL 0.123/0.105, 0.157/0.089,
+  0.126/0.158, 0.154/0.084, 0.147/0.101, 0.223/0.102; keeper BC 1.45 ->
+  1.31. c3: dir 0.79, dive 0.50/0.10, move agree 76%, saves 6/8. c6: dir
+  0.81, dive 0.61/0.11, move agree 80%, recovery 17%, saves 10 sampled /
+  9 deterministic (goals 18 / 20) -- first result above the 6-9 band
+  (borderline on 60 seeds; confirm at c9/c10).
