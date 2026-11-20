@@ -361,3 +361,10 @@ standing still from them". Run44 stopped right after checkpoint 40.
   0.81, dive 0.61/0.11, move agree 80%, recovery 17%, saves 10 sampled /
   9 deterministic (goals 18 / 20) -- first result above the 6-9 band
   (borderline on 60 seeds; confirm at c9/c10).
+- 00:3x run58 done (role BC 4.0, 10 cycles): KL c7-c10 0.164/0.152,
+  0.180/0.109, 0.236/0.271 (peak), 0.205/0.140; keeper BC 1.45 -> 1.24.
+  c9: saves 10 / 10, move agree 82%. FINAL: saves vs rules attacker (60
+  seeds) 11 sampled (18 goals) / 13 deterministic (16 goals) -- out of the
+  old 6-9 band, ~65-75% of the fair ceiling (~17). Shot-in-flight: move
+  agree 81%, dir cos 0.78, dive 0.51/0.11, recovery 16%; open play dir
+  0.97, move agree 83%.
