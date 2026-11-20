@@ -313,3 +313,9 @@ standing still from them". Run44 stopped right after checkpoint 40.
   recovery 22 -> 20%. Saves vs rules attacker (60 seeds): c3 and c6 both
   3 sampled / 8 deterministic (run51: 1 / 5; fair ceiling ~17). Cycle 6
   epoch curve 0.980 -> 0.969 (slowing), no fresh-rollout gap: ~flat.
+- 20:4x run55 done (10 cycles): KL c7-c10 0.073/0.076, 0.111/0.246 (peak),
+  0.080/0.097, 0.084/0.071; keeper BC 1.60 / 1.58 / 1.63 / 1.61 (flat).
+  Final: shot-in-flight P(move) 0.66 (agree 79%), dive 0.51/0.13, dir cos
+  0.63, recovery 18%; open play dir 0.93. Saves vs rules attacker (60
+  seeds): 6 sampled (24 goals) / 6 deterministic (23 goals); c6 was 3 / 8.
+  Fair ceiling ~17. Waiting for the user's go on PPG refit + PPO.
