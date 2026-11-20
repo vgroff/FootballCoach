@@ -41,13 +41,24 @@ basics for football".
    could stand beyond the defender and never be offside -- no offside to
    time against. Needs the real second-last-defender line (opt-in), so the
    defender sets it.
-3. Decide the consequence of an offside call in a phase-2 episode: end the
-   trial as a defence win (e.g. new terminal outcome `offside`, with its own
-   reward-table row for attacker / defender / keeper), rather than a free
-   kick.
-4. Law details to settle: judged at the moment the pass is played (not on
-   receipt), level = onside, not offside in own half (already), receiving
-   from behind the ball is onside (already: "beyond the ball carrier").
+3. Consequence of an offside call in a phase-2 episode: end the trial with
+   a new terminal outcome `offside` (not a free kick), with its own
+   reward-table row. User's call (2026-11-20): the DEFENDER gets a bit MORE
+   for an offside than for a timeout (his positioning can cause it -- he
+   sets the line); attacker negative (a wasted attack, like losing the
+   ball); keeper small positive. Exact numbers to agree.
+4. Law details (user's calls, 2026-11-20):
+   - **Only a PASS can trigger offside** -- the ball played by one attacker
+     to a teammate. An attacker kicking the ball ahead to himself
+     (dribbling / knock-on) or shooting never makes HIM offside.
+   - **The offside line includes the ball / passer**: if the attacker
+     playing the ball is himself beyond the last defender, the line is the
+     ball's position -- a teammate level with or behind the ball when it is
+     played is onside (already true in is_offside_position's "beyond the
+     ball carrier" check; keep it, and make the line max(second-last
+     defender, ball) in the attacking direction).
+   - Judged at the moment the pass is played (not on receipt); level =
+     onside; never offside in his own half (already).
 
 ## Rough order
 

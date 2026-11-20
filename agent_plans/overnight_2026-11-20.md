@@ -223,3 +223,16 @@ standing still from them". Run44 stopped right after checkpoint 40.
   _closing_down hysteresis (entry 10 m / exit 12 m) and
   _close_down_ended_s cooldown, plus RulesExpert's shadow order.
   distill lr 3e-5 -> 1e-4; run53 from run52 cycle 5, 10 cycles.
+- 19:3x run53 (lr 1e-4, BC 0.6) cycles 1-3: KL 0.063/0.059 -> 0.075/0.055
+  -> 0.087/0.069 (rising); keeper BC 1.87 -> 1.85 -> 1.83. Cycle 3 fits
+  faster within the cycle (1.120 -> 1.087) but the next fresh rollout
+  started above the previous end (1.143 vs 1.111; epoch-1 train KL 0.19):
+  a generalisation gap at the higher LR. NB every relaunch restarts the
+  1000-step LR warmup (~3 cycles at ~360 steps/cycle) -- user: halve it
+  next time. Shot probe c3: P(move) 0.66 (agree 76%), dir cos 0.58, dive
+  0.45/0.17, open play dir 0.90. Saves vs rules attacker (60 seeds): 1
+  sampled / 6 deterministic (run51: 1 / 5) -- no change in outcome yet.
+- Passing plan updated with the user's offside rules (pass only, never a
+  player kicking to himself; ball/passer as the line if beyond the last
+  defender) and terminal rewards (defender a bit more for offside than for
+  a timeout).
