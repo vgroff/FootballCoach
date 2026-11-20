@@ -332,3 +332,7 @@ standing still from them". Run44 stopped right after checkpoint 40.
   under-fits the intercept geometry (shot cos 0.63 vs open play 0.93).
   Options: PPO; upweight shot-in-flight rows in role BC (opt-in); a
   dedicated shot-row fit to test capacity.
+- User: juice the BC coefficients in general. role_bc goalkeeper 0.6 -> 1.2
+  (run55 KL mostly 0.06-0.11, spikes 0.196 / 0.246, ended 0.084/0.071;
+  keeper BC now ~1.6 vs ~107 when 1.0 wrecked run37). Run56 from run55
+  final, 10 cycles, lr 1e-4, warmup 500.
