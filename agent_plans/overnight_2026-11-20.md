@@ -73,3 +73,17 @@ attacker 25.2% (rules keeper 62%).
   mostly the attacker putting more on target vs the neural keeper
   (co-adaptation), so vs-rules-attacker is the cleaner keeper measure.
   No changes (slow BC->PPO is expected).
+
+## Morning (13:50) -- the laptop slept from ~04:37 to ~13:45
+
+Run44 paused with the machine (no crash, no errors) and resumed on wake;
+it reached checkpoint 17 by 04:37, i.e. only ~80 min of PPO overnight.
+Run44 ckpts 1-17 (conceded/saved %):
+- keeper vs rules attacker: 44.3/2.8 ... 43.7/3.3 -- flat (rules keeper 2.6/47.8)
+- keeper vs AI attacker: 25.9/19.1 -> 32.4/25.7 (attacker putting more on
+  target vs the neural keeper; co-adaptation)
+- attacker_vs_rules 63.0 -> 61.5 (saved 3.5 -> 6.5); defender_vs_rules 6.3 -> 7.8
+- phase-1 vs rules 62.1-64.2% (guard OK)
+Positioning probe on ckpt 17 (60 seeds, rules attacker): 26 goals / 2 saves;
+median 3.08 m off his line at shot time (03:15: 2.78 m), 5.25 m from the
+save target. Positioning has not improved.
