@@ -299,3 +299,8 @@ standing still from them". Run44 stopped right after checkpoint 40.
   10/16, per tick 4/24; k=0.3 held 7/19, per tick 5/22 -> +3 saves at the
   network's rate on both sets. Proposed save_settle_speed_s 0.3 (labels
   are computed at decision ticks = the held setting).
+- 20:4x run54 (no-snap keeper) cycles 1-3: KL 0.177/0.171 -> 0.076/0.057 ->
+  0.083/0.072; keeper BC 1.69 / 1.70 / 1.70. User: enable the speed-scaled
+  settle and restart from the latest -> orders.json save_settle_speed_s
+  0.3; run55 from run54 cycle 3, same settings (BC 0.6, lr 1e-4, warmup
+  500, 10 cycles).

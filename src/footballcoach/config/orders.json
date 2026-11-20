@@ -59,7 +59,8 @@
     "save_arrival_brake_offset_m": 0.0,
     "save_settle_radius_m": 0.5,
     "save_lead_velocity_s": 0.0,
-    "save_settle_speed_s": 0.0
+    "save_settle_speed_s": 0.3,
+    "_comment_save_settle_speed_s_20261120": "0 -> 0.3 (user's call, 2026-11-20 ~20:40): settle radius max(0.5 m, speed * 0.3 s). The keeper deciding every 0.24 s (the network's rate, and the rate the BC labels are taken at) reached the save point and ran ~1.7 m past at ~4.5 m/s; with 0.3 s: +3 saves held on two seed sets (14 -> 17 / 60, 16 -> 19 / 55), per tick 26 -> 26 / 24 -> 22."
   },
 
   "marking": {
