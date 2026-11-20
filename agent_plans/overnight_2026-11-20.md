@@ -274,3 +274,15 @@ standing still from them". Run44 stopped right after checkpoint 40.
   0.5. distill lr_warmup_steps 1000 -> 500 (user). lr stays 1e-4, epochs 12.
   Run54 from run53 cycle 6, role_bc 0.6, 10 cycles. NB the rules keeper
   changes everywhere it is used (phase-2 opponent, evals, labels).
+- 20:2x 0.24 s keeper ideas (held rules keeper, 60 seeds, no-snap settle-0.5
+  keeper; goals/saves): extra decision at shot start 17/13 (no help); hold
+  the save point + per-tick steering 11/19 (+5) -- user rejected (the
+  network must steer directly, no engine help). Interval-aware rules tweaks
+  (per tick | held): settle 1.0 6/23 | 15/15; settle 1.5 15/14 | 17/13;
+  momentum lead 0.12 / 0.24 s 3/26 | 16/14 and 3/26 | 15/15; settle 1.0 +
+  lead 0.12 / 0.24 6/23 | 14/16 and 5/24 | 14/16 -- within noise, so kept
+  settle 0.5; added opt-in SaveOrder lead_velocity_s
+  (save_lead_velocity_s, default 0). The rest of the interval gap is for
+  the network to learn (PPO).
+- run54 cycle 1-2: KL 0.177/0.171 (new labels + shorter warmup) -> 0.076/
+  0.057; keeper BC 1.73 -> 1.69 -> 1.78 (fresh) -> 1.70.

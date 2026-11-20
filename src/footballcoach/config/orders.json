@@ -57,7 +57,8 @@
     "save_snap": false,
     "save_arrival_brake": false,
     "save_arrival_brake_offset_m": 0.0,
-    "save_settle_radius_m": 0.5
+    "save_settle_radius_m": 0.5,
+    "save_lead_velocity_s": 0.0
   },
 
   "marking": {

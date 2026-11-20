@@ -652,6 +652,7 @@ class StagedGoalkeeperAI(_RulesBasedAI):
                     arrival_brake=bool(_gk.get("save_arrival_brake", False)),
                     arrival_brake_offset_m=float(_gk.get("save_arrival_brake_offset_m", 0.0)),
                     settle_radius_m=float(_gk.get("save_settle_radius_m", 0.0)),
+                    lead_velocity_s=float(_gk.get("save_lead_velocity_s", 0.0)),
                 )
                 match._log_info(f"[AI] {player.player_id}: SaveOrder")
             return

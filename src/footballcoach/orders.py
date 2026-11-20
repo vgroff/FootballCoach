@@ -872,6 +872,10 @@ class SaveOrder:
     # and still comes to rest within reach (user's idea, 2026-11-20).
     arrival_brake_offset_m: float = 0.0
     settle_radius_m: float = 0.0
+    # > 0: steer for the save point minus where the keeper's own velocity
+    # carries him in this many seconds (momentum compensation), so a command
+    # held for a decision interval does not drift past it.
+    lead_velocity_s: float = 0.0
     status: OrderStatus = OrderStatus.PENDING
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
@@ -911,6 +915,8 @@ class SaveOrder:
         target_position = keeper_save_target(player, match)
         direction = target_position - player.position
         dist_to_save = direction.length_xy()
+        if self.lead_velocity_s > 0.0:
+            direction = target_position - (player.position + player.velocity * self.lead_velocity_s)
         snap_threshold = max(0.15, gk_top_speed * dt)
         if self.snap and dist_to_save < snap_threshold:
             # GK is within one tick's reach — snap position then brake.
