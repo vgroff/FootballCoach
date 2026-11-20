@@ -319,3 +319,16 @@ standing still from them". Run44 stopped right after checkpoint 40.
   0.63, recovery 18%; open play dir 0.93. Saves vs rules attacker (60
   seeds): 6 sampled (24 goals) / 6 deterministic (23 goals); c6 was 3 / 8.
   Fair ceiling ~17. Waiting for the user's go on PPG refit + PPO.
+- 21:xx Why ~6 saves (fair ceiling ~17)? run55 final, rules attacker, 80
+  seeds: shot-in-flight imitation vs AI attacker is WORSE (38 rows, dir cos
+  0.30, move agree 74%) than vs rules attacker (256 rows, 0.63, 79%) -- so
+  not "too few rules-attacker rows". Labels during shots: MOVE labels point
+  exactly at keeper_save_target (median 0.0 deg, 100% within 10 deg) =
+  a function of observable state; 42/256 STAND labels 3 m from the save
+  point all come from SaveOrder itself (closing_down not involved), mostly
+  in the first 1-2 decision steps of the shot -- likely brake-to-turn in
+  _compute_movement_intent (use_brake_to_turn=True), which depends on the
+  keeper's velocity (observed). -> not hidden state; the network
+  under-fits the intercept geometry (shot cos 0.63 vs open play 0.93).
+  Options: PPO; upweight shot-in-flight rows in role BC (opt-in); a
+  dedicated shot-row fit to test capacity.
