@@ -87,3 +87,10 @@ Run44 ckpts 1-17 (conceded/saved %):
 Positioning probe on ckpt 17 (60 seeds, rules attacker): 26 goals / 2 saves;
 median 3.08 m off his line at shot time (03:15: 2.78 m), 5.25 m from the
 save target. Positioning has not improved.
+- 15:23: run44 ckpt 37, healthy (KL ~0.018, ratio clip 4.9%, grad clip 0%).
+  Keeper vs rules attacker 43.7 -> 43.3% conceded (ckpts 26-37), saved
+  ~3%: still flat. Keeper vs AI attacker 34 -> 40% conceded, saved ~26%:
+  the attacker is learning to beat the neural keeper faster than the
+  keeper improves. attacker_vs_rules ~62%, defender_vs_rules ~7.5% (was
+  6.3), phase-1 63-64%. Positioning probe ckpt 37: 25 goals / 3 saves,
+  still 2.93 m off his line at shot time. PPO alone is not fixing it.
