@@ -1,7 +1,11 @@
 {
   "distill_pretrain": {
-    "teachers": {"1": "checkpoints/phase2_run34/checkpoint82.pt", "2": "checkpoints/phase2_run34/checkpoint82.pt"},
+    "teachers": {"1": "checkpoints/phase2_run44/checkpoint40.pt", "2": "checkpoints/phase2_run44/checkpoint40.pt"},
+    "_comment_teachers_20261120": "Keeper BC refit (user's call, 2026-11-20 ~15:40): student AND frozen teacher = PPO run44/checkpoint40 (the keeper after ~40 PPO updates, still ~3 m off his line at shot time), so attacker / defender / phase 1 stay where PPO left them while the keeper rows are refitted by the rules keeper. Before: run34/checkpoint82 (keeper pretrains run39/run40).",
     "role_bc": {"goalkeeper": 0.005},
+    "role_bc_direction_moving_only": true,
+    "role_bc_direction_loss_weight": 12.0,
+    "_comment_role_bc_direction_20261120": "Role BC's move direction (distill_pretrain role_bc_loss overrides; bc_loss_from_tensor direction_moving_only). run40 never fitted it (direction term 3.49 -> 3.78 over 20 cycles): 74% of keeper direction rows are rules-STANDING rows whose label is the arrival point he already stands on (139 rows: median 166 deg away from the ball, towards his own goal in 98%, while his heading faced the ball), so fitting them would turn his back to play; standing itself is taught by exec_move. moving_only: fit direction only where the label moves. Weight 3 -> 12 for the role-BC rows only (x 0.005 = 0.06 per row): direction was swamped by the frozen-teacher KL. Defaults: false / bc.direction_loss_weight.",
     "_comment_role_bc_20261119": "1.0 -> 0.005 (user's call): at 1.0 (phase2_run37 cycle 1) the keeper BC loss fell 107 -> 46 but the frozen-teacher KL on everyone else jumped 0.0003 -> 0.63 (phase 1) / 1.56 (phase 2), mostly move_dir: the keeper's ~80 of learnable BC loss overwhelmed the anchor on the shared heads (move direction, sprint, tackle), and is_goalkeeper / the dive timers start with zero weights so keeper rows are hard to tell apart at first. Note ~28 of the logged BC loss sits on frozen decision heads (shoot/pass/tackle/mark/hold) and can never fall. num_rollouts 6 -> 20 to give the slower keeper BC time.",
     "bc_label_smoothing": 0.01,
     "_comment_keeper_pretrain_20261119": "Keeper pretrain (user's call): student = run34/checkpoint82, teachers = that same checkpoint frozen for both phases (anchors attacker / defender / phase 1 while the keeper rows are fitted), and the neural keeper's rows taught by the rules keeper (role_bc; labels from curriculum.phase2.bc's zero-coefficient goalkeeper entry) with bc_label_smoothing 0.01 = targets 0.995 / 0.005 (logits capped at ~+-5.3) so it does not come out with hard decisions. counterfactual off (required with role_bc; the teacher is the student's own checkpoint). Then a PPG value refit, then PPO. Before: teachers 763 (phase 1) / phase2_run6 checkpoint3 (phase 2), counterfactual on.",
@@ -19,7 +23,8 @@
     "_comment_epochs_warmup": "12 epochs (6 left the KL still falling ~0.13/epoch in the first run) and a 300-step linear LR warmup at the start of the run (user's call, 2026-11-16).",
     "batch_size": 8000,
     "rollout_steps": 370000,
-    "num_rollouts": 20,
+    "num_rollouts": 12,
+    "_comment_num_rollouts_20261120": "20 -> 12 for the keeper BC refit from run44 (the gates were already learned in run40; this mainly fits the direction).",
     "aggregate_cycles": 3,
     "_comment_aggregate_cycles_20261117": "DAgger aggregation overnight: fit each cycle on its rows plus the last 2 cycles' (KL only for those). Phase-1 real KL fitted to ~0.20 per cycle but read ~0.29 on every fresh rollout (run21, run22): a generalisation gap.",
     "_comment": "train.py --distill-pretrain-only (ai/ppo/distill_pretrain.py): one frozen teacher per phase, KL (means only, kick / move sub-heads weighted by the teacher's probabilities) on student-driven rollouts over the phase mix, each row also as a task-id-swapped counterfactual copy targeted at the other teacher (no value loss), Monte Carlo value fit on the real rows. Teachers (2026-11-16): phase 1 = 763 (65% wins vs rules at 22 s), phase 2 = phase2_run6/checkpoint3 (75.1% goals vs rules, 1840 episodes; phase2_run4/latest 46.5%, run6/checkpoint2 65.3%)."

@@ -252,7 +252,8 @@ def role_bc_loss(trainer, d, e, mb: dict, label_smoothing: float) -> tuple[torch
     if not bool((w > 0).any()):
         z = torch.zeros((), device=w.device)
         return z, z
-    kw = {**trainer._bc_loss_kwargs(), "dec_label_smoothing": label_smoothing, "exec_label_smoothing": label_smoothing}
+    kw = {**trainer._bc_loss_kwargs(), "dec_label_smoothing": label_smoothing, "exec_label_smoothing": label_smoothing,
+          **(getattr(trainer, "_role_bc_loss_overrides", None) or {})}
     frozen = tuple(getattr(trainer, "_ppo_lp_masked_heads", ()) or ())
     _, _, split = bc_loss_from_tensor(mb["bc_labels"], trainer._bc_heads_for_loss(d), e, **kw,
                                       return_breakdown=True, split_kick=True, split_tackle=True, return_group_rows=True,
@@ -439,6 +440,14 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
     cfg = {**DEFAULTS, **(cfg or load_config())}
     role_bc = {r: float(c) for r, c in (cfg.get("role_bc") or {}).items() if not str(r).startswith("_")}
     smoothing = float(cfg.get("bc_label_smoothing", 0.0))
+    # Role-BC-only loss options (role_bc_loss): fit the move direction only on
+    # rows whose label moves, and/or its own direction weight (default: bc's).
+    overrides = {}
+    if cfg.get("role_bc_direction_moving_only"):
+        overrides["direction_moving_only"] = True
+    if cfg.get("role_bc_direction_loss_weight") is not None:
+        overrides["direction_loss_weight"] = float(cfg["role_bc_direction_loss_weight"])
+    trainer._role_bc_loss_overrides = overrides
     if role_bc and cfg["counterfactual"]:
         raise ValueError("distill_pretrain: role_bc needs counterfactual off (a task-id-swapped copy of a "
                          "rules-taught row would have no teacher)")
@@ -448,7 +457,8 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
     params = list(trainer.decision_net.parameters()) + list(trainer.execution_net.parameters())
     params = [p for p in params if p.requires_grad]
     opt = torch.optim.Adam(params, lr=float(cfg["lr"]), eps=1e-5)
-    log.info(f"Distill pretrain: teachers {cfg['teachers']}, role_bc={role_bc} (bc_label_smoothing={smoothing}), "
+    log.info(f"Distill pretrain: teachers {cfg['teachers']}, role_bc={role_bc} (bc_label_smoothing={smoothing}, "
+             f"role-BC loss overrides {overrides}), "
              f"label_smoothing={cfg['label_smoothing']}, "
              f"counterfactual_kick_only_phases={list(cfg['counterfactual_kick_only_phases'])}, "
              f"aggregate_cycles={cfg['aggregate_cycles']}, counterfactual={cfg['counterfactual']} "

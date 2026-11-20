@@ -1077,8 +1077,18 @@ def bc_loss_from_tensor(
     return_group_rows: bool = False,
     kick_power_loss: str = "mse",
     log_exclude_decision_heads: tuple = (),
+    direction_moving_only: bool = False,
 ):
     """Compute BC loss for a minibatch, given packed label tensors.
+
+    ``direction_moving_only`` (distill_pretrain.role_bc_direction_moving_only):
+    fit the move_direction only on rows whose label MOVES (exec_move = 1).
+    A standing rules keeper's desired_direction points at the arrival point it
+    is already on (measured 2026-11-20: on 139 standing keeper rows the label
+    pointed away from the ball, median 166 deg, towards his own goal in 98%,
+    while his heading faced the ball) -- not where he faces -- so fitting it
+    would turn the keeper's back to play. Standing itself is still taught by
+    exec_move.
 
     ``log_exclude_decision_heads`` (logging only, never changes the loss): with
     ``return_group_rows``, ``split["rows_logged"]`` is ``split["rows"]`` with
@@ -1274,6 +1284,8 @@ def bc_loss_from_tensor(
         # Upweighted by direction_loss_weight so the single continuous head gets
         # proportional gradient against ~11 Bernoulli heads.
         has_dir = (labels[:, _I_DIR_X].abs() + labels[:, _I_DIR_Y].abs()) > 1e-6
+        if direction_moving_only:
+            has_dir = has_dir & (labels[:, _I_EXEC_MOVE] > 0.5)
         if has_dir.any():
             target_dir = labels[:, _I_DIR_X:_I_DIR_Y + 1]  # (N, 2), genuinely unit-length
             eps = 1e-6

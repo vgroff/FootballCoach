@@ -94,3 +94,23 @@ save target. Positioning has not improved.
   keeper improves. attacker_vs_rules ~62%, defender_vs_rules ~7.5% (was
   6.3), phase-1 63-64%. Positioning probe ckpt 37: 25 goals / 3 saves,
   still 2.93 m off his line at shot time. PPO alone is not fixing it.
+
+## Afternoon: keeper BC refit (user's call, ~15:35)
+
+User: stop the run, refit with the BC first; "it should be able to learn
+standing still from them". Run44 stopped right after checkpoint 40.
+- Sides: phase 2 never swaps (attacker LEFT, defender + keeper RIGHT); the
+  canonical frame (+x attack, y-mirror) makes the network side-agnostic.
+- Standing labels checked (139 standing rules-keeper rows, run34/82 play):
+  the direction label is the arrival point he already stands on -- median
+  166 deg away from the ball, towards his own goal in 98%, while his heading
+  faces the ball (label vs heading 164 deg). The network already faces the
+  ball (13 deg). So those labels would teach him to turn his back; standing
+  itself is taught by exec_move (label 0). They were 74% of the direction
+  rows -> why run40's direction term never fell.
+- New opt-in role-BC options (distill_pretrain): role_bc_direction_moving_only
+  (bc_loss_from_tensor direction_moving_only) and role_bc_direction_loss_weight
+  (3 -> 12 for role-BC rows only). Test added (test_role_bc_label_frame.py).
+- Refit run45 from checkpoints/phase2_run44/checkpoint40.pt, teachers = that
+  checkpoint frozen (both phases), role_bc 0.005, 12 cycles, phase mix 25:75
+  (log scratchpad/keeper_refit_run45.log). Stop if KL > 0.35.

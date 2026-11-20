@@ -104,3 +104,44 @@ def test_role_bc_teaches_the_keeper_the_rules_world_direction(keeper_rows):
         target = world_labels[k, B._I_DIR_X:B._I_DIR_Y + 1].numpy().astype(np.float64)
         cos.append(float(world @ target / (np.linalg.norm(world) * np.linalg.norm(target) + 1e-9)))
     assert np.median(cos) > 0.9, f"sampled world move vs rules world move: median cos {np.median(cos):.2f}"
+
+
+def test_direction_moving_only_ignores_standing_rows():
+    """bc_loss_from_tensor(direction_moving_only=True) fits the move direction
+    only on rows whose label moves; a standing row's direction (the arrival
+    point the rules keeper is already on) adds nothing."""
+    torch.manual_seed(2)
+    trainer = PPOTrainer.from_config(device=torch.device("cpu"))
+    from footballcoach.ai.obs.schema import PLAYER_FEATURE_DIM  # noqa: F401
+    from footballcoach.ai.ppo.bc import bc_loss_from_tensor
+    obs = {k: v[:2] for k, v in _fake_obs(trainer).items()}
+    d, e = _student_forward(trainer, obs)
+    labels = torch.zeros(2, B.BC_LABEL_DIM)
+    labels[:, B._I_VALID] = 1.0
+    labels[:, B._I_DIR_X] = 1.0                      # both rows carry a direction
+    labels[0, B._I_EXEC_MOVE] = 1.0                  # row 0 moves, row 1 stands
+    kw = trainer._bc_loss_kwargs()
+    _, all_rows = bc_loss_from_tensor(labels, d, e, **kw, return_breakdown=True)
+    _, moving = bc_loss_from_tensor(labels, d, e, **kw, return_breakdown=True, direction_moving_only=True)
+    standing_only = labels.clone(); standing_only[0, B._I_DIR_X] = 0.0
+    _, none = bc_loss_from_tensor(standing_only, d, e, **kw, return_breakdown=True, direction_moving_only=True)
+    assert none["direction"] == pytest.approx(0.0)
+    assert moving["direction"] != pytest.approx(all_rows["direction"])
+
+
+def _fake_obs(trainer):
+    """A small batch of real phase-2 observations (any players), for head shapes."""
+    ctrl = {"attacker": "rules", "defender": "rules", "goalkeeper": "neural"}
+    env = build_role_env(PHASE2, controller_weights={r: {c: 1} for r, c in ctrl.items()})
+    env.controller_overrides = ctrl
+    env.sample_action_fn = trainer._sample_action
+    env.scenario_kwargs = {**env.scenario_kwargs, "no_keeper_prob": 0.0}
+    env.rng = random.Random(0)
+    obs0 = env.reset(seed=3)
+    rows = []
+    for _ in range(4):
+        env.step()
+        t = env.last_trainee_transition
+        if t is not None:
+            rows.append(t["obs"])
+    return {k: torch.as_tensor(np.stack([np.asarray(r[k]) for r in rows])) for k in rows[0]}
