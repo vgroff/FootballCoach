@@ -128,3 +128,10 @@ standing still from them". Run44 stopped right after checkpoint 40.
   setting by mistake (my config edit failed JSON validation and was not
   written) and was stopped within a minute (no checkpoint). Refit relaunched
   as run47: same as run45 but moving_only off, direction weight 12.
+- 16:15: run47 (role BC 0.005, direction weight 12) cycles 1-7: KL 0.003-0.019;
+  keeper BC unweighted 26.4 -> 16.8 (slow, ~0.4/cycle late). Mid-run probe
+  cycle 3 vs start (run44/40, own play, 30 seeds): direction term 3.88 ->
+  3.71, angle moving 128 -> 120 deg, standing 140 -> 129: improving slowly.
+  User: "falling pretty slow, the KL is low, juice the coefficients" ->
+  role_bc goalkeeper 0.005 -> 0.02; continued from run47 cycle 7 as run48
+  (fresh dir, same frozen teacher run44/40), 10 cycles.
