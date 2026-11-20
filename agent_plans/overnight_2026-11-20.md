@@ -336,3 +336,9 @@ standing still from them". Run44 stopped right after checkpoint 40.
   (run55 KL mostly 0.06-0.11, spikes 0.196 / 0.246, ended 0.084/0.071;
   keeper BC now ~1.6 vs ~107 when 1.0 wrecked run37). Run56 from run55
   final, 10 cycles, lr 1e-4, warmup 500.
+- 23:2x run56 (role BC 1.2) cycles 1-6: KL 0.137/0.103, 0.080/0.092,
+  0.088/0.068, 0.087/0.058, 0.117/0.105, 0.107/0.101; keeper BC 1.57 ->
+  1.50. Shot probe (run55 final -> c3 -> c6): dir cos 0.63 -> 0.68 ->
+  0.75, move agree 79 -> 81 -> 78%, dive 0.51/0.13 -> 0.49/0.13 ->
+  0.48/0.12. Saves vs rules attacker (sampled / deterministic, 60 seeds):
+  6/6 -> 9/8 -> 7/6 (noise band ~6-9; ceiling ~17). Open-play dir 0.94.
