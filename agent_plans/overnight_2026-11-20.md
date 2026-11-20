@@ -342,3 +342,9 @@ standing still from them". Run44 stopped right after checkpoint 40.
   0.75, move agree 79 -> 81 -> 78%, dive 0.51/0.13 -> 0.49/0.13 ->
   0.48/0.12. Saves vs rules attacker (sampled / deterministic, 60 seeds):
   6/6 -> 9/8 -> 7/6 (noise band ~6-9; ceiling ~17). Open-play dir 0.94.
+- 23:38 run56 done: KL c7-c10 0.099/0.066, 0.130/0.146, 0.093/0.065,
+  0.098/0.108; keeper BC 1.51 / 1.44 / 1.44 / 1.49. Final: shot dir cos
+  0.76 (from 0.63 at run55 final), move agree 79%, dive 0.52/0.14,
+  recovery 18%; open play dir 0.95. Saves vs rules attacker (60 seeds):
+  6 sampled / 7 deterministic (c3 9/8, c6 7/6; run55 final 6/6) -- within
+  the ~6-9 noise band: decisions keep improving, saves do not follow yet.
