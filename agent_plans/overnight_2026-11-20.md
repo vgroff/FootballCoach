@@ -259,3 +259,11 @@ standing still from them". Run44 stopped right after checkpoint 40.
   3/26 | 17/13. Proposal: save_snap false + save_settle_radius_m 0.5
   (within the 0.6 m keeper pickup radius) -- to be switched on after run53
   (changing the rules keeper mid-run would change its labels).
+- 20:0x User's idea: brake for the save point + reach/2. Added
+  save_arrival_brake_offset_m (+ = brake target short of the save point,
+  - = beyond). Sweep (no snap, 60 seeds, per tick | held): brake 0.3 m
+  short 6/23 | 17/13; 0.3 beyond 9/20 | 19/11 (overshoots); with settle 0.5
+  every offset (-1.0..+0.5) 3/26 | 16/14 = settle alone. -> settle 0.5 alone
+  is best; offset kept, default 0. "Lead the target": the save point is
+  already a prediction of the crossing / intercept point, nearly static for
+  a straight shot, so not implemented.

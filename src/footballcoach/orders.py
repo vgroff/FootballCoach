@@ -867,6 +867,10 @@ class SaveOrder:
     # within this distance of the save point (close enough to collect it).
     snap: bool = True
     arrival_brake: bool = False
+    # With arrival_brake: brake for a point this much SHORT of the save point
+    # (e.g. half the catching reach), so the keeper runs at speed for longer
+    # and still comes to rest within reach (user's idea, 2026-11-20).
+    arrival_brake_offset_m: float = 0.0
     settle_radius_m: float = 0.0
     status: OrderStatus = OrderStatus.PENDING
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
@@ -927,7 +931,8 @@ class SaveOrder:
                 use_sprint = self.sprint
             adj_dir, speed_mode = _compute_movement_intent(
                 player, direction, match,
-                sprint=use_sprint, arrival_dist=dist_to_save,
+                sprint=use_sprint,
+                arrival_dist=(max(dist_to_save - self.arrival_brake_offset_m, 0.0) if self.arrival_brake else dist_to_save),
                 arrival_speed=0.0 if self.arrival_brake else None,
                 use_repulsion=False, use_brake_to_turn=True,
             )
