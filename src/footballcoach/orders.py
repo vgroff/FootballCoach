@@ -876,6 +876,12 @@ class SaveOrder:
     # carries him in this many seconds (momentum compensation), so a command
     # held for a decision interval does not drift past it.
     lead_velocity_s: float = 0.0
+    # > 0: the settle radius grows with speed -- max(settle_radius_m,
+    # speed * settle_speed_s) -- so a keeper whose command is held for a
+    # decision interval starts braking before he would run through the save
+    # point (measured 2026-11-20: with 0.24 s holds he reached it, 0.09 m,
+    # and ran 1.7 m past at 4.5 m/s).
+    settle_speed_s: float = 0.0
     status: OrderStatus = OrderStatus.PENDING
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
@@ -923,7 +929,8 @@ class SaveOrder:
             player.position = target_position.with_z(player.position.z)
             player.desired_direction = Vector3.zero()
             player.desired_speed_mode = SpeedMode.STANDSTILL
-        elif self.settle_radius_m > 0.0 and dist_to_save <= self.settle_radius_m:
+        elif (self.settle_radius_m > 0.0 or self.settle_speed_s > 0.0) and dist_to_save <= max(
+                self.settle_radius_m, player.velocity.length_xy() * self.settle_speed_s):
             # Close enough to collect it: stop, facing the ball.
             to_ball = match.ball.position - player.position
             player.desired_direction = (Vector3(to_ball.x, to_ball.y, 0.0).normalized()

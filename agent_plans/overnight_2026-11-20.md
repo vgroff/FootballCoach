@@ -286,3 +286,16 @@ standing still from them". Run44 stopped right after checkpoint 40.
   the network to learn (PPO).
 - run54 cycle 1-2: KL 0.177/0.171 (new labels + shorter warmup) -> 0.076/
   0.057; keeper BC 1.73 -> 1.69 -> 1.78 (fresh) -> 1.70.
+- 20:3x WHY the 0.24 s keeper concedes (user's question): it OVERSHOOTS
+  (retracting "not overshooting"). On the 13 shots saved per tick but
+  conceded when held: closest approach to the save point 0.08 vs 0.09 m
+  (both reach it), at ball arrival 0.21 vs 1.67 m, speed 2.45 vs 4.48 m/s;
+  the save point does not move (0.00 m). The settle check only runs at a
+  decision tick, a sprinting keeper covers ~1.4 m per decision and needs
+  ~1-1.5 m to stop. New opt-in SaveOrder settle_speed_s (settle radius =
+  max(settle_radius_m, speed * k)). Sweep (60 seeds; held | per tick):
+  k=0 16/14 | 3/26; 0.08-0.24 no change; 0.3 13/17 | 3/26; 0.4 13/17 |
+  11/17; 0.5 14/16 | 16/12; 0.7 18/11 | 21/7. Held-out 55 seeds: k=0 held
+  10/16, per tick 4/24; k=0.3 held 7/19, per tick 5/22 -> +3 saves at the
+  network's rate on both sets. Proposed save_settle_speed_s 0.3 (labels
+  are computed at decision ticks = the held setting).
