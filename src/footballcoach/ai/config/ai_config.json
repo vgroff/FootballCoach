@@ -2,7 +2,8 @@
   "distill_pretrain": {
     "teachers": {"1": "checkpoints/phase2_run44/checkpoint40.pt", "2": "checkpoints/phase2_run44/checkpoint40.pt"},
     "_comment_teachers_20261120": "Keeper BC refit (user's call, 2026-11-20 ~15:40): student AND frozen teacher = PPO run44/checkpoint40 (the keeper after ~40 PPO updates, still ~3 m off his line at shot time), so attacker / defender / phase 1 stay where PPO left them while the keeper rows are refitted by the rules keeper. Before: run34/checkpoint82 (keeper pretrains run39/run40).",
-    "role_bc": {"goalkeeper": 2.0},
+    "role_bc": {"goalkeeper": 4.0},
+    "_comment_role_bc_20261121b": "2.0 -> 4.0 (user's call: juice it even higher, can cut back if too much). run57 (2.0) stopped before its first cycle; run58 from run56 final.",
     "_comment_role_bc_20261121": "1.2 -> 2.0 (user's call, ~23:45: no PPO until reasonably close to the rules keeper). run56 at 1.2: KL 0.065-0.146; shot-time direction cos 0.63 -> 0.76 but move agreement stuck ~79% and saves 6-9 / 60 (fair ceiling ~17). Test for this round: move agreement and saves must rise above that band. Run57 from run56 final.",
     "_comment_role_bc_20261120e": "0.6 -> 1.2 (user's call, ~21:xx, juice BC in general): run55 at 0.6 kept the frozen-teacher KL mostly 0.06-0.11 (spikes 0.196 / 0.246 in phase 2, each back down within a cycle); the keeper's BC loss is now ~1.6 unweighted (vs ~107 when 1.0 wrecked the KL on run37), so the same weight means much smaller gradients. Run56 from run55 final.",
     "_comment_role_bc_20261120d": "0.3 -> 0.6 (user's call, ~19:00, more BC before PPO): run51 at 0.3 lifted shot-time direction cos 0.14 -> ~0.55 and P(move) 0.50 -> 0.65 with KL <= 0.046, but saves vs the rules attacker stayed 1 / 28 (5 with the deterministic mode). Continued from run51 final as run52, 10 cycles.",

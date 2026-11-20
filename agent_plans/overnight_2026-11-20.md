@@ -352,3 +352,6 @@ standing still from them". Run44 stopped right after checkpoint 40.
   role_bc goalkeeper 1.2 -> 2.0; run57 from run56 final, 10 cycles. Test:
   shot-time move agreement (~79%) and saves (6-9 / 60) must rise above the
   band; otherwise BC is done.
+- 23:5x User: juice it even higher ("we can always cut back"). run57 (2.0)
+  stopped before its first cycle; role_bc goalkeeper 4.0; run58 from run56
+  final, 10 cycles, same test (move agreement / saves above the band).
