@@ -280,7 +280,13 @@ def minibatch_loss(trainer, mb: dict, ret_std: float, kl_coef: float, value_coef
     sq = (e.value.squeeze(-1) - mb["returns"]) ** 2
     vloss = (sq * vw).sum() / vw.sum().clamp(min=1.0) / (ret_std ** 2)
     bc, bc_logged = role_bc_loss(trainer, d, e, mb, bc_label_smoothing)
-    return kl_coef * kl + value_coef * vloss + bc, vloss, kl, bc_logged
+    # The (||raw|| - 1)^2 direction-magnitude regularizer every other training
+    # path applies (bc.direction_magnitude_reg, bc.direction_mag_reg_coef; 0 =
+    # off): without it the raw move/kick direction drifts long (median ~28
+    # measured 2026-11-20) and every angle loss's gradient shrinks ~1/||raw||.
+    from footballcoach.ai.ppo.bc import direction_magnitude_reg
+    mag = direction_magnitude_reg(e, float(getattr(trainer, "_bc_dir_mag_reg_coef", 0.0)))
+    return kl_coef * kl + value_coef * vloss + bc + mag, vloss, kl, bc_logged
 
 
 def _slice(data: dict, idx: torch.Tensor, device) -> dict:

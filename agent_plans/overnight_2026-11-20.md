@@ -135,3 +135,27 @@ standing still from them". Run44 stopped right after checkpoint 40.
   User: "falling pretty slow, the KL is low, juice the coefficients" ->
   role_bc goalkeeper 0.005 -> 0.02; continued from run47 cycle 7 as run48
   (fresh dir, same frozen teacher run44/40), 10 cycles.
+- 16:2x run48 (role BC 0.02) cycles 1-5: KL 0.003-0.024; keeper BC 16.9 ->
+  8.6 unweighted. Breakdown (30 seeds, own play): gates fitted (exec_bce
+  8.97 -> 2.5 by cycle 1), direction 12.76 -> 9.59 by cycle 2 (mean cos
+  ~0.04 -> 0.2): the remaining loss is direction. In the keeper's own
+  states the rules label is simply "towards the centre of my own goal"
+  (median 0 deg; 88% / 96% within 30 deg, moving / standing; keeper ~2 m
+  off his line) -- easy target, yet unlearned.
+- Cause found: raw move-direction norm median ~28 (keeper rows), ~42 all
+  roles (kick ~54). bc.direction_mag_reg_coef had been 0.0 since it was
+  added (2026-09-02) and distill_pretrain never applied it; the policy
+  ignores the norm (atan2 mean, separate kappa) but every angle loss's
+  gradient on the raw vector shrinks ~1/||raw|| (and each Adam step rotates
+  it ~1/||raw||). Probably slows ALL roles' direction learning in PPO too
+  (untested).
+- User: enable it in BC too, rescaling sensible. Done:
+  src/footballcoach/ai/scripts/rescale_direction_heads.py rescaled run48
+  cycle 5 -> checkpoints/phase2_run48/checkpoint_cycle5_dirscaled.pt (move
+  / kick final layers / 41.6 / 54.3; verified on 1717 rows: normalized
+  directions equal to 2.6e-5, 0 action / log-prob mismatches over 300 rows
+  x deterministic + seeded); bc.direction_mag_reg_coef 0 -> 0.001
+  (PPO, BC, DAgger, and now distill_pretrain); role-BC direction weight
+  back to the default 3 (rescaled: ~10x run48's direction gradient).
+  Refit continued as run49 (5 cycles). Only two unit-vector outputs exist
+  (move_direction, kick_direction); the reg covers both.
