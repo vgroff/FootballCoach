@@ -55,3 +55,12 @@ attacker 25.2% (rules keeper 62%).
   Untested guess: generalizes "step at the attacker" from the defender
   (same team / canonical frame). Ckpt 6 saves vs AI attacker 17.6% (up
   from 11.7%). Watching before changing anything.
+- 03:17 (user's calls, still awake): phase mix 50:50 -> 25:75 (phase 2 is
+  more game-like / newer) and less rules-AI involvement: phase-2
+  controllers attacker rules:neural 1:4 -> 1:9, defender 3:7 -> 1:4,
+  keeper 1:1 -> 1:3 (some rules keeper kept so the attacker still meets
+  real saves). Run43 stopped right after ckpt 8 (keeper ckpt 6 evals: vs
+  rules attacker 44.6/2.6, vs AI attacker 23.7/17.6). Run44 (fresh dir)
+  from checkpoints/phase2_run43/checkpoint8.pt, --phase-mix "1:0.25,2:0.75"
+  --total-steps 300000000 (log scratchpad/ppo_run44.log). Guard: if
+  phase-1 [eval vs rules] (64%) drops > ~3 points, go back to 50:50.
