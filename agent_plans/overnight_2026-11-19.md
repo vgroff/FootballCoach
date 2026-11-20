@@ -334,3 +334,24 @@ Cycle-5 white-box check: the region term now fits the canonical labels
 (1.3 vs 3.6 raw; run39 the reverse). Move direction still barely learned in
 either run (BC term ~1.9 raw / 4.0 canonical, near run34/82's) -- likely
 gradient-starved at role BC 0.005 next to the gate terms; untested.
+
+### Run40 done (01:20) + rules-keeper comparison
+
+KL 0.004-0.034 all run; keeper BC unweighted 106 -> 9.6. Comparison probe
+(scratchpad keeper_vs_rules_probe.py; 115 eval seeds; states from
+run40-final's own play; labels canonicalized; KL to the 0.995/0.005
+smoothed rules label, nats):
+- gates learned: exec_move KL 7.5 -> 1.2 (agree 44 -> 61%), dive/sprint
+  6.5 -> 0.47 (24 -> 86%), tackle 14.5 -> 0.50 (8 -> 83%), move(dec)
+  8.6 -> 0.22, get_possession 11.7 -> 0.27. Run39 about equal on gates.
+- move direction NOT learned: on run40's own states its move (when rules
+  moves) is ~118 deg off the rules keeper's (run34/82: ~90). On run34/82's
+  states every checkpoint is ~20 deg off -> run40 reaches states where it
+  goes wrong. 74% of direction-labelled keeper rows are rules-STANDING
+  rows, ~150 deg off for every checkpoint and never fitted (dir term
+  3.49 -> 3.78 over the run). Untested lead: direction at role-BC weight
+  0.005 is gradient-starved next to the frozen-teacher move_dir KL on the
+  other 96% of rows; standing-row direction labels may be meaningless.
+- behaviour (115x4): neural keeper vs rules attacker concedes 44.1%
+  (run34/82 40.9%, run39 44.8%; rules keeper 7%); vs AI attacker 25.2%
+  (run34/82 30.7%, run39 45.0%; rules keeper 62%).
