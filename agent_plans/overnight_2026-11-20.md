@@ -267,3 +267,10 @@ standing still from them". Run44 stopped right after checkpoint 40.
   is best; offset kept, default 0. "Lead the target": the save point is
   already a prediction of the crossing / intercept point, nearly static for
   a straight shot, so not implemented.
+- 20:1x run53 (lr 1e-4) cycles 1-6: KL 0.055-0.087; keeper BC 1.87 -> 1.70.
+  Cycle-6 shot probe: P(move) 0.68 (agree 77%), dir cos 0.65, dive
+  0.44/0.18; open play dir cos 0.89. User: cut it and continue with the new
+  keeper. orders.json goalkeeper_ai: save_snap false, save_settle_radius_m
+  0.5. distill lr_warmup_steps 1000 -> 500 (user). lr stays 1e-4, epochs 12.
+  Run54 from run53 cycle 6, role_bc 0.6, 10 cycles. NB the rules keeper
+  changes everywhere it is used (phase-2 opponent, evals, labels).
