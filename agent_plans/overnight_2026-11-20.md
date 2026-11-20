@@ -189,3 +189,9 @@ standing still from them". Run44 stopped right after checkpoint 40.
   0.57/0.41 -> 0.51/0.35 -> 0.52/0.33; in dive recovery 28 -> 31 -> 33%
   (dives earlier, spent when the shot comes). Open-play direction cos
   steady ~0.72. Improving ~4x slower than open play did.
+- 18:10 run50 done (10 cycles, KL 0.015-0.039; keeper BC 4.59 -> 3.06).
+  Final shot-in-flight probe: P(move) 0.50 (agree 65%), dive 0.55 should /
+  0.28 shouldn't (gap 0.27, up from 0.16), direction cos 0.14 (c6 0.18:
+  noise-level, flat), in recovery 30%. Open play direction cos 0.76.
+  User: KL tiny, juice harder; no dedicated test needed. role_bc 0.1 ->
+  0.3, run51 from run50 final, 10 cycles.
