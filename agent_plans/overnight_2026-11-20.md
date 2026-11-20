@@ -182,3 +182,10 @@ standing still from them". Run44 stopped right after checkpoint 40.
   pretrain already encodes the ball trajectory, so just refit harder.
   role_bc goalkeeper 0.02 -> 0.1; run50 from run49 cycle 2, 10 cycles; KL
   may reach 0.3 if it comes back down. Probe: scratchpad/shot_rows_probe.py.
+- 17:5x run50 (BC 0.1) cycles 1-6: KL 0.015-0.039 (well under 0.3); keeper
+  BC unweighted 4.59 -> 3.33. Shot-in-flight probe (rules attacker, 80
+  seeds), run49 c2 -> run50 c3 -> c6: P(move) 0.25 -> 0.43 -> 0.48 (rules
+  ~65-75%); direction cos -0.01 -> 0.10 -> 0.18; P(dive) should / shouldn't
+  0.57/0.41 -> 0.51/0.35 -> 0.52/0.33; in dive recovery 28 -> 31 -> 33%
+  (dives earlier, spent when the shot comes). Open-play direction cos
+  steady ~0.72. Improving ~4x slower than open play did.
