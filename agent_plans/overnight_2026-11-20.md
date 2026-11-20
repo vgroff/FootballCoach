@@ -32,3 +32,14 @@ attacker 25.2% (rules keeper 62%).
   (saved 10.4%, shot off target 30.9%).
 - 02:40: relaunched as run43 (fresh dir), same start (run41 refit), with
   --total-steps 300000000 (log scratchpad/ppo_run43.log).
+- 03:09 watchdog: run43 healthy, 6 checkpoints (~5 min/round), no errors.
+  Policy KL ~0.02/update, ratio clipped 4.9%, grad clip 0%.
+  Keeper evals ckpt 1-5 (conceded / saved): vs rules attacker 44.1/2.6,
+  44.3/3.3, 44.3/2.8, 44.3/3.0, 44.6/3.0 (rules keeper 2.6/47.8); vs AI
+  attacker 23.7/11.7, 23.7/12.2, 24.1/12.6, 24.1/14.1, 24.8/15.7 (rules
+  keeper 62). No regressions: attacker_vs_rules 60.7-62.4%,
+  defender_vs_rules 6.3-7.4% conceded.
+  Checked (single process): the keeper's save-target shaping reaches its
+  SECONDARY rows (it is trainee only when attacker+defender are rules) --
+  13 non-zero rows / 20 all-neural episodes, sum +0.02: present but tiny.
+  Too early to call; no changes.
