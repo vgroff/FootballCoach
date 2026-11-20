@@ -25,3 +25,10 @@ attacker 25.2% (rules keeper 62%).
   (0.500 vs 0.509 on the last). Policy KL <= 0.007.
 - 02:35: PPO started -> checkpoints/phase2_run42 (log scratchpad/ppo_run42.log),
   --checkpoint checkpoints/phase2_run41/checkpoint_pretrained.pt, config as above.
+- 02:39: run42 stopped after ONE rollout ("Training complete"): launched
+  without --total-steps (earlier overnight runs pass --total-steps
+  300000000). Its checkpoint-1 evals = the refit's start point: keeper vs
+  rules attacker 44.1% conceded (saved 2.4%), vs AI attacker 24.3%
+  (saved 10.4%, shot off target 30.9%).
+- 02:40: relaunched as run43 (fresh dir), same start (run41 refit), with
+  --total-steps 300000000 (log scratchpad/ppo_run43.log).
