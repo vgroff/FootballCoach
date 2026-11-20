@@ -304,3 +304,12 @@ standing still from them". Run44 stopped right after checkpoint 40.
   settle and restart from the latest -> orders.json save_settle_speed_s
   0.3; run55 from run54 cycle 3, same settings (BC 0.6, lr 1e-4, warmup
   500, 10 cycles).
+- 20:2x run55 (rules keeper: no snap, settle max(0.5 m, speed*0.3 s)):
+  cycles 1-6 KL 0.072/0.095, 0.062/0.074, 0.110/0.196, 0.090/0.107,
+  0.079/0.103, 0.076/0.061; keeper BC 1.73 -> 1.62. Breakdown (c1, own
+  play): exec_move 0.55, direction 0.45 (cos ~0.85), sprint 0.10, tackle
+  0.075, kick 0.045, region 0.02 (+ frozen decision heads). Shot probe c3
+  -> c6: dive 0.47/0.15 -> 0.52/0.14, move agree 73 -> 78%, dir cos 0.60,
+  recovery 22 -> 20%. Saves vs rules attacker (60 seeds): c3 and c6 both
+  3 sampled / 8 deterministic (run51: 1 / 5; fair ceiling ~17). Cycle 6
+  epoch curve 0.980 -> 0.969 (slowing), no fresh-rollout gap: ~flat.
