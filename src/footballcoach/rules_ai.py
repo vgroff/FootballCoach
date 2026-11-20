@@ -645,7 +645,13 @@ class StagedGoalkeeperAI(_RulesBasedAI):
         # Ball is loose — enter SaveOrder if aimed at our goal.
         if self._ball_aimed_at_goal(player, match):
             if not isinstance(player.current_order, SaveOrder):
-                player.current_order = SaveOrder(auto_sprint=True)
+                _gk = self._close_down_cfg()
+                player.current_order = SaveOrder(
+                    auto_sprint=True,
+                    snap=bool(_gk.get("save_snap", True)),
+                    arrival_brake=bool(_gk.get("save_arrival_brake", False)),
+                    settle_radius_m=float(_gk.get("save_settle_radius_m", 0.0)),
+                )
                 match._log_info(f"[AI] {player.player_id}: SaveOrder")
             return
 

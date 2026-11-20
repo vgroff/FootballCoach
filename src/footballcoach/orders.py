@@ -857,6 +857,17 @@ class SaveOrder:
     """
     auto_sprint: bool = True
     sprint: bool = True  # fallback when auto_sprint=False
+    # orders.json goalkeeper_ai.save_* (StagedGoalkeeperAI passes them; the
+    # defaults are the old keeper). snap: within one tick's reach of the save
+    # point, SET the keeper's position onto it and stop -- a small teleport a
+    # neural keeper cannot do (measured 2026-11-20: worth 9 of 28 saves vs the
+    # rules attacker). arrival_brake: ask the movement intent for a zero
+    # arrival speed at the save point (decelerate onto it instead of running
+    # through). settle_radius_m: > 0 = stand still, facing the ball, once
+    # within this distance of the save point (close enough to collect it).
+    snap: bool = True
+    arrival_brake: bool = False
+    settle_radius_m: float = 0.0
     status: OrderStatus = OrderStatus.PENDING
     on_complete: Callable[[], None] | None = field(default=None, repr=False, compare=False)
 
@@ -897,10 +908,16 @@ class SaveOrder:
         direction = target_position - player.position
         dist_to_save = direction.length_xy()
         snap_threshold = max(0.15, gk_top_speed * dt)
-        if dist_to_save < snap_threshold:
+        if self.snap and dist_to_save < snap_threshold:
             # GK is within one tick's reach — snap position then brake.
             player.position = target_position.with_z(player.position.z)
             player.desired_direction = Vector3.zero()
+            player.desired_speed_mode = SpeedMode.STANDSTILL
+        elif self.settle_radius_m > 0.0 and dist_to_save <= self.settle_radius_m:
+            # Close enough to collect it: stop, facing the ball.
+            to_ball = match.ball.position - player.position
+            player.desired_direction = (Vector3(to_ball.x, to_ball.y, 0.0).normalized()
+                                        if to_ball.length_xy() > 1e-6 else Vector3.zero())
             player.desired_speed_mode = SpeedMode.STANDSTILL
         else:
             # Decide sprint vs jog.
@@ -910,7 +927,8 @@ class SaveOrder:
                 use_sprint = self.sprint
             adj_dir, speed_mode = _compute_movement_intent(
                 player, direction, match,
-                sprint=use_sprint, arrival_dist=dist_to_save, arrival_speed=None,
+                sprint=use_sprint, arrival_dist=dist_to_save,
+                arrival_speed=0.0 if self.arrival_brake else None,
                 use_repulsion=False, use_brake_to_turn=True,
             )
             player.desired_direction = adj_dir

@@ -51,7 +51,11 @@
     "angle_activate_dist_m": 40.0,
     "angle_advance_fraction": 0.15,
     "angle_advance_max_m": 4.0,
-    "angle_sprint": false
+    "angle_sprint": false,
+    "_comment_save_snap": "SaveOrder options (rules keeper, added 2026-11-20). save_snap: within max(0.15 m, top_speed*dt) of the save point SET the keeper's position onto it and stop -- a small teleport the neural keeper cannot do; measured 2026-11-20 (60 phase-2 eval seeds vs the rules attacker): with it 1 goal / 28 saves, without it 10 / 19 (per tick) and 21 / 9 with commands held 0.24 s like the network. User's call: remove it (it was always a backstop). save_arrival_brake: ask for zero arrival speed at the save point. save_settle_radius_m: > 0 = stand still facing the ball within this distance of the save point. Defaults (true / false / 0) = the old keeper.",
+    "save_snap": true,
+    "save_arrival_brake": false,
+    "save_settle_radius_m": 0.0
   },
 
   "marking": {

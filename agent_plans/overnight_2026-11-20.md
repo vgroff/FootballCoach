@@ -249,3 +249,13 @@ standing still from them". Run44 stopped right after checkpoint 40.
   Proposed (user's call): opt-in remove the snap from the rules keeper.
 - Passing plan: offside as a general Match rule for every player and
   scenario, full law (user).
+- 19:5x User: remove the snap ("always a bit of a backstop"); asked for
+  rules-AI ideas. Added SaveOrder options (orders.json goalkeeper_ai
+  save_snap / save_arrival_brake / save_settle_radius_m; defaults = old
+  keeper, verified 1 goal / 28 saves unchanged; tests
+  tests/test_unit/test_save_order_options.py). Sweep (60 seeds, rules
+  attacker; per tick | held 0.24 s): no snap 10/19 | 21/9; + brake 4/25 |
+  17/13; + settle 0.3 m 5/24 | 16/14; + settle 0.5 m 3/26 | 16/14; + both
+  3/26 | 17/13. Proposal: save_snap false + save_settle_radius_m 0.5
+  (within the 0.6 m keeper pickup radius) -- to be switched on after run53
+  (changing the rules keeper mid-run would change its labels).
