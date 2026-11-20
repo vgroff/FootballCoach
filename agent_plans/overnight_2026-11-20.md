@@ -174,3 +174,11 @@ standing still from them". Run44 stopped right after checkpoint 40.
   never diving at shot time (0%; rules 30%). Untested: dive-at-shot rows
   are too rare for BC; PPO should now be able to learn it since he is in
   position. Waiting for the user on PPG refit + PPO from run49 cycle 2.
+- 16:5x shot-in-flight probe (run49 c2, rules attacker, 80 seeds): shots in
+  flight are 34% of keeper decisions (281 rows). There the rules keeper
+  moves 75% / dives 48%; the network P(move) 0.25, P(dive) 0.57 when it
+  should vs 0.41 when not, direction cos -0.01, 28% of those rows already in
+  dive recovery. Rest of play: direction cos 0.70. User: the physics
+  pretrain already encodes the ball trajectory, so just refit harder.
+  role_bc goalkeeper 0.02 -> 0.1; run50 from run49 cycle 2, 10 cycles; KL
+  may reach 0.3 if it comes back down. Probe: scratchpad/shot_rows_probe.py.

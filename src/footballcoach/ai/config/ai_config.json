@@ -2,7 +2,8 @@
   "distill_pretrain": {
     "teachers": {"1": "checkpoints/phase2_run44/checkpoint40.pt", "2": "checkpoints/phase2_run44/checkpoint40.pt"},
     "_comment_teachers_20261120": "Keeper BC refit (user's call, 2026-11-20 ~15:40): student AND frozen teacher = PPO run44/checkpoint40 (the keeper after ~40 PPO updates, still ~3 m off his line at shot time), so attacker / defender / phase 1 stay where PPO left them while the keeper rows are refitted by the rules keeper. Before: run34/checkpoint82 (keeper pretrains run39/run40).",
-    "role_bc": {"goalkeeper": 0.02},
+    "role_bc": {"goalkeeper": 0.1},
+    "_comment_role_bc_20261120b": "0.02 -> 0.1 (user's call, ~16:55: 'continue refitting with higher BC coeffs; KL can go up to 0.3 so long as it comes back down'): at 0.02 the keeper fitted open play (direction cos 0.70) but not shots in flight (34% of keeper decisions: P(move) 0.25 vs rules 75%, direction cos -0.01, dive barely discriminated). Continued from run49 cycle 2 as run50, 10 cycles.",
     "_comment_role_bc_20261120": "0.005 -> 0.02 (user's call, 2026-11-20 ~16:15: 'falling pretty slow, the KL is low, juice the coefficients'): run47 at 0.005 fell ~0.4 unweighted BC per cycle (26.4 -> 16.8 over 7 cycles) with the frozen-teacher KL at ~0.01; 1.0 had pushed it to 0.63 / 1.56 in one cycle. Continued from run47 cycle 7 as run48 (same frozen teacher run44/checkpoint40), 10 cycles; stop if KL > 0.35.",
     "role_bc_direction_moving_only": false,
     "_comment_role_bc_direction_correction_20261120": "CORRECTION (user asked whether the rules keeper really turns its back; it does not): the 166 deg / towards-own-goal standing labels were measured in the NEURAL keeper's off-line states, and the heading compared was the neural keeper's. With the rules keeper in control (60 seeds, 160 standing+direction decisions) the label matches his real desired_direction (median 14 deg), points roughly along the goal line (87 deg from the ball, 55% towards his own goal) and he stands on his line (0.09 m). Standing labels are genuine facing commands (a STANDSTILL player turns to face desired_direction), so moving_only is back OFF (run45 stopped after 2 cycles; refit rerun). Weight 12 kept: direction still looks gradient-starved (untested).",
@@ -26,7 +27,7 @@
     "_comment_epochs_warmup": "12 epochs (6 left the KL still falling ~0.13/epoch in the first run) and a 300-step linear LR warmup at the start of the run (user's call, 2026-11-16).",
     "batch_size": 8000,
     "rollout_steps": 370000,
-    "num_rollouts": 5,
+    "num_rollouts": 10,
     "_comment_num_rollouts_20261120": "20 -> 12 for the keeper BC refit from run44 (the gates were already learned in run40; this mainly fits the direction).",
     "aggregate_cycles": 3,
     "_comment_aggregate_cycles_20261117": "DAgger aggregation overnight: fit each cycle on its rows plus the last 2 cycles' (KL only for those). Phase-1 real KL fitted to ~0.20 per cycle but read ~0.29 on every fresh rollout (run21, run22): a generalisation gap.",
