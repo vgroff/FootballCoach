@@ -195,3 +195,17 @@ standing still from them". Run44 stopped right after checkpoint 40.
   noise-level, flat), in recovery 30%. Open play direction cos 0.76.
   User: KL tiny, juice harder; no dedicated test needed. role_bc 0.1 ->
   0.3, run51 from run50 final, 10 cycles.
+- 18:50 run51 (BC 0.3) done: KL 0.015-0.046; keeper BC 2.84 -> 2.12.
+  Shot-in-flight (run50 final -> run51 c3 -> c6 -> final): direction cos
+  0.14 -> 0.33 -> 0.61 -> 0.53; P(move) 0.50 -> 0.53 -> 0.65 -> 0.65 (agree
+  74%; rules moves 77%); dive should/shouldn't 0.55/0.28 -> 0.48/0.22;
+  recovery 30 -> 26%. Open play direction cos 0.84.
+  Outcomes vs rules attacker (60 seeds): run51 final sampled 28 goals / 1
+  save; deterministic (mode) 23 / 5; rules keeper 1 / 28.
+  Shot trace (run51 c6): neural 3.8 -> 2.3 m from the save target over the
+  ~4-decision flight, 3.0 m/s; rules 3.1 -> 0.15 m, 3.9 m/s.
+  Decision-interval test: rules keeper with its command held 6 ticks
+  (0.24 s = the network's decision interval): 9 goals / 21 saves (vs 1/28
+  per tick; still gets SaveOrder's <=0.15 m position snap, so slightly
+  optimistic). -> the interval is a partial ceiling (~7 saves in 28), the
+  neural keeper's shot-time policy (5 deterministic) is the main gap.
