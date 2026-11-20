@@ -209,3 +209,7 @@ standing still from them". Run44 stopped right after checkpoint 40.
   per tick; still gets SaveOrder's <=0.15 m position snap, so slightly
   optimistic). -> the interval is a partial ceiling (~7 saves in 28), the
   neural keeper's shot-time policy (5 deterministic) is the main gap.
+- 19:0x user: no shorter decision interval (the network should learn to
+  lead the target -- via PPO, since BC copies the rules keeper's myopic
+  per-tick commands); more BC first. role_bc 0.3 -> 0.6, run52 from run51
+  final, 10 cycles; then PPG refit + PPO.

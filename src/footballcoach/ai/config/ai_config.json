@@ -2,7 +2,8 @@
   "distill_pretrain": {
     "teachers": {"1": "checkpoints/phase2_run44/checkpoint40.pt", "2": "checkpoints/phase2_run44/checkpoint40.pt"},
     "_comment_teachers_20261120": "Keeper BC refit (user's call, 2026-11-20 ~15:40): student AND frozen teacher = PPO run44/checkpoint40 (the keeper after ~40 PPO updates, still ~3 m off his line at shot time), so attacker / defender / phase 1 stay where PPO left them while the keeper rows are refitted by the rules keeper. Before: run34/checkpoint82 (keeper pretrains run39/run40).",
-    "role_bc": {"goalkeeper": 0.3},
+    "role_bc": {"goalkeeper": 0.6},
+    "_comment_role_bc_20261120d": "0.3 -> 0.6 (user's call, ~19:00, more BC before PPO): run51 at 0.3 lifted shot-time direction cos 0.14 -> ~0.55 and P(move) 0.50 -> 0.65 with KL <= 0.046, but saves vs the rules attacker stayed 1 / 28 (5 with the deterministic mode). Continued from run51 final as run52, 10 cycles.",
     "_comment_role_bc_20261120c": "0.1 -> 0.3 (user's call, ~18:00: KL still tiny at 0.1 -- 0.015-0.039 over run50 -- so juice harder): continued from run50 final as run51, 10 cycles.",
     "_comment_role_bc_20261120b": "0.02 -> 0.1 (user's call, ~16:55: 'continue refitting with higher BC coeffs; KL can go up to 0.3 so long as it comes back down'): at 0.02 the keeper fitted open play (direction cos 0.70) but not shots in flight (34% of keeper decisions: P(move) 0.25 vs rules 75%, direction cos -0.01, dive barely discriminated). Continued from run49 cycle 2 as run50, 10 cycles.",
     "_comment_role_bc_20261120": "0.005 -> 0.02 (user's call, 2026-11-20 ~16:15: 'falling pretty slow, the KL is low, juice the coefficients'): run47 at 0.005 fell ~0.4 unweighted BC per cycle (26.4 -> 16.8 over 7 cycles) with the frozen-teacher KL at ~0.01; 1.0 had pushed it to 0.63 / 1.56 in one cycle. Continued from run47 cycle 7 as run48 (same frozen teacher run44/checkpoint40), 10 cycles; stop if KL > 0.35.",
