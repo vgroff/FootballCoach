@@ -43,3 +43,15 @@ attacker 25.2% (rules keeper 62%).
   SECONDARY rows (it is trainee only when attacker+defender are rules) --
   13 non-zero rows / 20 all-neural episodes, sum +0.02: present but tiny.
   Too early to call; no changes.
+- 03:15 probe (single process, scratchpad/keeper_shot_state.py, run43
+  ckpt 6, 60 eval seeds, rules attacker + defender): keeper state at the
+  first tick a shot heads for goal.
+  neural keeper: 27 goals / 1 save; median 2.78 m OFF his line, 5.3 m from
+  the save target; diving 11%, in dive recovery 16%.
+  rules keeper: 1 goal / 28 saves; 0.06 m off his line, 3.1 m from the
+  save target; diving 30%, recovery 5%.
+  -> the failure is POSITIONING (comes ~3 m out and gets beaten), not
+  the dive gate; matches the unlearned move direction from the pretrain.
+  Untested guess: generalizes "step at the attacker" from the defender
+  (same team / canonical frame). Ckpt 6 saves vs AI attacker 17.6% (up
+  from 11.7%). Watching before changing anything.
