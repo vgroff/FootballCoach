@@ -64,3 +64,12 @@ attacker 25.2% (rules keeper 62%).
   from checkpoints/phase2_run43/checkpoint8.pt, --phase-mix "1:0.25,2:0.75"
   --total-steps 300000000 (log scratchpad/ppo_run44.log). Guard: if
   phase-1 [eval vs rules] (64%) drops > ~3 points, go back to 50:50.
+- 03:58 watchdog: run44 healthy, 8 checkpoints (~5 min/round), no errors;
+  KL ~0.02/update, ratio clipped 4.8%, grad clip 0%, entropy -1.51.
+  Run44 ckpts 1-8: phase-1 vs rules 62.3-64.2% (guard OK); attacker_vs_rules
+  61.5-63.7%; defender_vs_rules 6.3-6.7%; keeper vs rules attacker 43.9-44.8%
+  conceded, saved 2.4-3.3% (flat); keeper vs AI attacker 25.2-28.0%
+  conceded, saved 18.5-23.3% (rising) with shot_off_target 22 -> 16%:
+  mostly the attacker putting more on target vs the neural keeper
+  (co-adaptation), so vs-rules-attacker is the cleaner keeper measure.
+  No changes (slow BC->PPO is expected).
