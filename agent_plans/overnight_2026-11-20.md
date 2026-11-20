@@ -159,3 +159,18 @@ standing still from them". Run44 stopped right after checkpoint 40.
   back to the default 3 (rescaled: ~10x run48's direction gradient).
   Refit continued as run49 (5 cycles). Only two unit-vector outputs exist
   (move_direction, kick_direction); the reg covers both.
+- 16:4x run49 (rescaled heads, BC 0.02, direction weight 3, mag reg 0.001)
+  cycles 1-2: KL 0.029/0.010 -> 0.034/0.041 (rising: rescaled direction
+  heads move freely, other players' move_dir err vs teacher 0.2 -> 0.4 deg);
+  keeper BC flat (4.76 -> 4.70). Cycle 1 breakdown: direction 1.48 -> 1.50
+  at weight 3 (mean cos ~0.5) -- the rescale gave no visible speed-up in one
+  cycle; most direction progress came in run48 cycles 3-5 (cos 0.2 -> 0.5)
+  at BC 0.02. Keeper raw norm after rescale 0.67 (all-roles median used).
+  Stopped after cycle 2 (plateau + rising KL).
+  run49 cycle 2 probes: positioning FIXED-ish -- at shot time 0.62 m off
+  his line (run44/40: 2.93; rules 0.06), 3.9 m from the save target (5.2;
+  rules 3.1); direction vs rules on own states 50 deg moving / 51 standing
+  (run44/40: 84 / 97). But 29 goals / 0 saves vs rules attacker (60 seeds):
+  never diving at shot time (0%; rules 30%). Untested: dive-at-shot rows
+  are too rare for BC; PPO should now be able to learn it since he is in
+  position. Waiting for the user on PPG refit + PPO from run49 cycle 2.
