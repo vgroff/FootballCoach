@@ -1081,14 +1081,11 @@ def bc_loss_from_tensor(
 ):
     """Compute BC loss for a minibatch, given packed label tensors.
 
-    ``direction_moving_only`` (distill_pretrain.role_bc_direction_moving_only):
-    fit the move_direction only on rows whose label MOVES (exec_move = 1).
-    A standing rules keeper's desired_direction points at the arrival point it
-    is already on (measured 2026-11-20: on 139 standing keeper rows the label
-    pointed away from the ball, median 166 deg, towards his own goal in 98%,
-    while his heading faced the ball) -- not where he faces -- so fitting it
-    would turn the keeper's back to play. Standing itself is still taught by
-    exec_move.
+    ``direction_moving_only`` (distill_pretrain.role_bc_direction_moving_only,
+    off by default): fit the move_direction only on rows whose label MOVES
+    (exec_move = 1). A standing player's direction is a real command too --
+    step_player_towards() turns a STANDSTILL player to face it -- so this
+    drops genuine facing signal; kept as an opt-in switch only.
 
     ``log_exclude_decision_heads`` (logging only, never changes the loss): with
     ``return_group_rows``, ``split["rows_logged"]`` is ``split["rows"]`` with

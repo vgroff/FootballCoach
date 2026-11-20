@@ -114,3 +114,17 @@ standing still from them". Run44 stopped right after checkpoint 40.
 - Refit run45 from checkpoints/phase2_run44/checkpoint40.pt, teachers = that
   checkpoint frozen (both phases), role_bc 0.005, 12 cycles, phase mix 25:75
   (log scratchpad/keeper_refit_run45.log). Stop if KL > 0.35.
+- 15:4x CORRECTION (user: "does the rules AI turn its back to play? players
+  still turn when stationary"): yes they turn (step_player_towards faces a
+  STANDSTILL player towards desired_direction), and the rules keeper does
+  NOT turn his back. My 166-deg measurement was in the neural keeper's
+  off-line states and compared against the NEURAL keeper's heading. With
+  the rules keeper in control (60 seeds, 160 standing+direction decisions):
+  label = his real desired_direction (median 14 deg), roughly along the goal
+  line (87 deg from the ball, 55% towards own goal), he is on his line
+  (0.09 m). Standing labels are genuine facing commands -> moving_only OFF
+  again (kept as an opt-in switch, docstring corrected).
+  run45 (moving_only on) stopped after 2 cycles; run46 started with the old
+  setting by mistake (my config edit failed JSON validation and was not
+  written) and was stopped within a minute (no checkpoint). Refit relaunched
+  as run47: same as run45 but moving_only off, direction weight 12.
