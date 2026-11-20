@@ -47,7 +47,17 @@ basics for football".
    for an offside than for a timeout (his positioning can cause it -- he
    sets the line); attacker negative (a wasted attack, like losing the
    ball); keeper small positive. Exact numbers to agree.
-4. Law details (user's calls, 2026-11-20):
+4. **General rule, not a scenario special** (user, 2026-11-20): offside is
+   enabled for EVERY player in every scenario / phase (Match-level, on by
+   default once correct; phase-1 1v1 simply never triggers it -- no
+   teammate), with all the relevant law implemented correctly and tested:
+   second-last defender (the keeper counts as a defender), level = onside,
+   never offside in his own half, only when the ball is played by a
+   teammate, judged at the moment it is played, ball/passer as the line
+   when beyond the defenders. Restarts that exempt offside in the real law
+   (goal kick, throw-in, corner) only matter once those restarts exist --
+   note them as exemptions when they do.
+5. Law details (user's calls, 2026-11-20):
    - **Only a PASS can trigger offside** -- the ball played by one attacker
      to a teammate. An attacker kicking the ball ahead to himself
      (dribbling / knock-on) or shooting never makes HIM offside.

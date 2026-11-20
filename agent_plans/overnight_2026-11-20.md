@@ -236,3 +236,16 @@ standing still from them". Run44 stopped right after checkpoint 40.
   player kicking to himself; ball/passer as the line if beyond the last
   defender) and terminal rewards (defender a bit more for offside than for
   a timeout).
+- 19:4x KEY: the rules keeper's saves rely on SaveOrder's position SNAP
+  (within max(0.15 m, top_speed*dt) of the save point it sets
+  player.position = target and stops -- a teleport the network cannot do).
+  60 seeds vs rules attacker: rules keeper as is 1 goal / 28 saves; no snap,
+  per tick 10 / 19; no snap + command held 0.24 s (= the network's
+  decision interval, i.e. a perfect label replay through the network's
+  action path) 21 / 9. Neural keeper run53 c3: deterministic 22 / 6,
+  sampled 28 / 1. So the fair ceiling is ~9 saves, not 28; the neural
+  keeper (deterministic) is ~2/3 of the way; the rest is mostly sampling
+  noise. The snap also inflates every eval against the rules keeper.
+  Proposed (user's call): opt-in remove the snap from the rules keeper.
+- Passing plan: offside as a general Match rule for every player and
+  scenario, full law (user).
