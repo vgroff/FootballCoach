@@ -625,3 +625,20 @@ standing still from them". Run44 stopped right after checkpoint 40.
   possession ~42% (flat). Phase-1 vs rules, last-10 block 59.6% (blocks
   111-120 59.5, 121-130 59.8): drift has flattened, not recovering yet;
   user accepted it at 13:1x. No changes.
+- 15:07 watchdog: run65 healthy, 145 checkpoints, no errors, 0 early stops;
+  move_dir KL 0.014-0.022 (no spikes), policy kl ~0.027, kappa log 5.71
+  (~302). Keeper (135-143): vs rules attacker 20.0/28.9, 21.3/27.4,
+  19.8/29.6, 20.9/28.3, 21.1/28.3; AI attacker vs neural keeper saves 23.5,
+  24.8, 28.5, 26.5, 24.3; all_neural share 55.9/24.8/19.4, 56.7/24.0/19.3,
+  63.7/22.1/14.2 (one-off), 58.1/21.0/21.0, 55.5/23.3/21.2.
+  attacker_vs_rules 73.3-75.7% (still rising); defender_vs_rules 8.0-8.9%
+  (flat). Phase-1 vs rules last-10 block now 58.3% (reward 0.875; last 6:
+  58 57 58 59 57 59) -- below the ~59% guard, still declining ~0.3/10
+  ckpts. 14:5x analysis for the user: phase-1 rows ~20% of the batch
+  (value-fit row counts), advantages normalised jointly across phases,
+  phase-2 return variance larger and save rows ~3x up; the current net
+  wins only 45-47% vs its own earlier snapshots in phase 1 -> real loss,
+  consistent with cross-phase interference (untested mechanism).
+  Recommended a fresh-dir restart with --phase-mix "1:0.35,2:0.65";
+  user deciding -- no change made without their answer since they had
+  explicitly accepted the drift at 13:1x.
