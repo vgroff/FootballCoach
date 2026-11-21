@@ -382,3 +382,8 @@ standing still from them". Run44 stopped right after checkpoint 40.
   launched by hand: run60 (checkpoints/phase2_run60), --checkpoint
   checkpoints/phase2_run59/checkpoint_pretrained.pt --total-steps 300000000
   --phase-mix "1:0.25,2:0.75" (log scratchpad/ppo_after_run58.log).
+- 02:1x run60 PPO healthy (6+ checkpoints, no errors). Evals ckpt 1-6
+  (goals/saved %): keeper vs rules attacker 31.1/17.2 -> 32.0/17.2 (rules
+  keeper baseline now 7.0/41.7 without the snap); AI attacker vs neural
+  keeper 62.8/4.8 -> 64.1/1.7 (saves falling); AI attacker vs rules keeper
+  61.5/6.3 -> 59.8/4.8; defender_vs_rules 8.7/43; phase-1 64-65%.
