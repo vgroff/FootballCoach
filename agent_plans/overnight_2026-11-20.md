@@ -446,3 +446,13 @@ standing still from them". Run44 stopped right after checkpoint 40.
   24.6); goalkeeper_vs_rules 36.7/11.5; attacker_vs_ai_keeper 60.7/4.8;
   attacker_vs_rules 62.0/4.1; defender_vs_rules 8.7/43.0. Phase-1 guard:
   sustained < ~59% after ckpt ~20.
+- 03:07 watchdog: run65 healthy, 9 checkpoints (~4.5 min/round), no errors,
+  no early stops; approx KL 0.175 (update 1) -> 0.027-0.037, move_dir KL
+  0.025-0.034 (no longer dominant; kick_dir 0.03-0.06); move_dir log kappa
+  5.858 -> 5.842 (kappa ~345, slowly loosening, not re-tightening yet).
+  Evals ckpt 1-9: phase-1 62-64%; attacker_vs_rules 58.3-62.0%;
+  defender_vs_rules 7.6-9.3%; keeper vs rules attacker (every 2nd) 37.2/10.9,
+  37.0/11.7, 36.1/12.0, 34.3/13.7; AI attacker vs neural keeper 60.9/3.9,
+  61.1/3.0, 60.0/3.0, 59.6/3.9; all_neural share 68.1/6.1/25.8,
+  66.6/6.8/26.6, 67.5/7.3/25.2, 65.8/6.3/27.9. Within the first-20 noise
+  window -- no trend calls, no changes.
