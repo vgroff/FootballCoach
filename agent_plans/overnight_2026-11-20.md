@@ -611,3 +611,6 @@ standing still from them". Run44 stopped right after checkpoint 40.
   below the agreed ~59% guard, so no change made; raised with the user
   (options: raise the phase-1 share of the mix at the next restart, or
   accept the trade while the keeper learns).
+- 13:1x User: accept the phase-1 drift for now ("it should go back up as
+  they continue training") -- no mix change. Keep tracking the 10-eval
+  block average of phase-1 vs rules.
