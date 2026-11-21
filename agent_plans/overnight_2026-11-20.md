@@ -545,3 +545,23 @@ standing still from them". Run44 stopped right after checkpoint 40.
   85-87). attacker_vs_rules now 64.1-67.4% (was 61-63; baseline 62.0) --
   the attacker improving too. defender_vs_rules 8.0-8.5% conceded,
   possession ~42.5% (flat). phase-1 vs rules 60-62% (guard ok). No changes.
+- 11:07 watchdog: run65 healthy, 100 checkpoints, no errors, 0 early stops;
+  policy kl 0.022-0.030, move_dir KL ~0.018, kick_dir ~0.045; move_dir log
+  kappa 5.746 (kappa ~313). Evals (every 2nd ckpt, 89-99): keeper vs rules
+  attacker 27.8/20.4, 28.0/20.7, 28.5/20.4, 27.6/21.1, 27.4/20.7,
+  28.9/19.6 (holding ~28/20); AI attacker vs neural keeper 52.4/15.2,
+  52.4/18.3, 50.9/20.9, 49.6/23.0, 48.3/24.3, 51.5/22.6 (big rise from
+  ~11% saves at ckpt 81); all_neural share 58.5/16.0/25.4, 58.7/20.6/20.6,
+  57.3/21.5/21.1, 52.8/24.6/22.5, 55.4/22.4/22.2, 53.5/24.4/22.1.
+  Phase-1 vs rules 59-62% (one 59 in the last 8; guard is SUSTAINED <59).
+  Tested why the all-neural defended share fell (26.4 -> ~21-22):
+  hypothesis "the neural attacker now beats the defender more, not the
+  neural defender getting worse". Prediction that could have refuted it:
+  with a RULES defender against the neural attacker (attacker_vs_rules),
+  defence_possession should fall too, and the neural defender against the
+  rules attacker should stay flat. Result: attacker_vs_rules
+  defence_possession 32.4 -> 20.7% over the run (goals 62.0 -> 64-66%,
+  rules keeper saves 4.1 -> ~10%); defender_vs_rules defence_possession
+  44.8 -> 42.4% with goals conceded flat 8-9%. So the drop is the attacker
+  improving (dribbling past the defender), not a defender regression. No
+  changes.
