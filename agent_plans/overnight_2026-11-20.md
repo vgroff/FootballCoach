@@ -720,3 +720,19 @@ don't need the lower LR").
   specifically (self-play interaction; mechanism untested). Not a keeper
   regression by the guard's definition; watching whether the keeper
   adapts back. No change.
+- 19:19 watchdog (run66): healthy, 40 checkpoints, no errors, 0 early
+  stops; move_dir KL 0.018-0.022, policy kl ~0.027, kappa log 5.67 (~290).
+  10-checkpoint blocks 1-10 / 11-20 / 21-30 / 31-39(40):
+  phase-1 vs rules 58.4% 0.869 / 58.9% 0.893 / 59.5% 0.937 / 59.7% 0.963
+    (steady recovery, reward +0.13 since the mix change);
+  keeper vs rules attacker 19.7/29.2 / 22.3/26.2 / 20.4/28.0 / 20.1/28.1
+    (back to the run66 start, stable);
+  AI attacker vs neural keeper 58.4/24.4 / 62.2/21.3 / 64.3/19.7 /
+    63.1/20.7 (gap stopped widening);
+  all_neural raw 54.6/23.3/17.6 / 56.9/20.0/18.8 / 58.7/17.6/18.7 /
+    55.6/19.9/18.6;
+  attacker_vs_rules 77.7 / 78.2 / 79.5 / 80.8 (attacker still improving);
+  defender_vs_rules ~8.6% conceded (flat).
+  Reading: phase 1 recovering as intended; keeper flat vs the fixed
+  attacker; its gap vs the improving neural attacker has stopped
+  growing. No change.
