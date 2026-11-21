@@ -1571,13 +1571,15 @@ _phase1_build, _phase1_on_tick = _make_phase1_scenario_pair(_find_latest_phase1_
 
 def _make_phase2_attacker_scenario():
     """Build function + params for the Phase 2 UI scenario: the 1v2 trial
-    (build_1v2_scenario, exactly as phase-2 training plays it) with the
-    ATTACKER driven by a checkpoint picked from ``checkpoints/phase2_run*/``
-    (and ``checkpoints/longterm/``), the defender and goalkeeper by their rules
-    AIs. A separate scenario from the plain rules-only ``1v2`` entry, which is
-    left untouched.
+    (build_1v2_scenario, exactly as phase-2 training plays it) with ALL three
+    roles -- attacker, defender, goalkeeper -- driven by one checkpoint picked
+    from ``checkpoints/phase2_run*/`` (and ``checkpoints/longterm/``), as the
+    all_neural eval plays it (one network plays every role, task id 2). Each
+    role has its own rules-based override tick-box (e.g. tick defender +
+    goalkeeper for the old neural-attacker-only view). A separate scenario
+    from the plain rules-only ``1v2`` entry, which is left untouched.
 
-    Params: attacker checkpoint (grouped by run dir) / rules override, the
+    Params: checkpoint (grouped by run dir), per-role rules overrides, the
     no-keeper chance (1.0 = always an empty goal), player variety as in
     training (curriculum.phase2.scenario_kwargs attribute_tiers /
     stamina_range; off = the fixed 0.9-vs-0.55 matchup) and the decision
@@ -1620,8 +1622,10 @@ def _make_phase2_attacker_scenario():
     grouped = tuple((g, tuple(v)) for g, v in groups.items())
 
     params = [
-        ScenarioGroupedChoiceParam("attacker_checkpoint", "Attacker checkpoint", grouped, default),
+        ScenarioGroupedChoiceParam("checkpoint", "Checkpoint (all neural roles)", grouped, default),
         ScenarioBoolParam("attacker_rules", "Attacker: rules-based override", False),
+        ScenarioBoolParam("defender_rules", "Defender: rules-based override", False),
+        ScenarioBoolParam("keeper_rules", "Goalkeeper: rules-based override", False),
         ScenarioParam("no_keeper_prob", "No-keeper chance", 0.0, 1.0, 0.05, 0.0),
         ScenarioBoolParam("player_variety", "Player variety (as training)", True),
         ScenarioParam("decision_interval_ms", "Decision interval (ms)", 50.0, 2000.0, 50.0, decision_ms_default),
@@ -1636,15 +1640,17 @@ def _make_phase2_attacker_scenario():
         if path not in trainer_cache:
             trainer, err = _load_trainer(path)
             if err:
-                log_ui.warning(f"Phase 2 UI: {err} -- using the rules attacker")
+                log_ui.warning(f"Phase 2 UI: {err} -- using the rules AIs")
             trainer_cache[path] = trainer
         return trainer_cache[path]
 
     def build(
         rng_reduction: float = 0.3,
         *,
-        attacker_checkpoint: str = default,
+        checkpoint: str = default,
         attacker_rules: bool = False,
+        defender_rules: bool = False,
+        keeper_rules: bool = False,
         no_keeper_prob: float = 0.0,
         player_variety: bool = True,
         decision_interval_ms: float = decision_ms_default,
@@ -1660,22 +1666,31 @@ def _make_phase2_attacker_scenario():
             variety = {k: kw[k] for k in ("attribute_tiers", "stamina_range") if k in kw}
         match = build_1v2_scenario(rng_reduction, sim_dt_s=sim_dt_s, seed=seed,
                                    no_keeper_prob=float(no_keeper_prob), **variety)
-        trainer = None if attacker_rules else _trainer_for(attacker_checkpoint)
-        if trainer is not None:
-            attacker = match.player_by_id("attacker")
-            # The scenario's scripted opening run belongs to the rules AI;
+        overrides = {"attacker": attacker_rules, "defender": defender_rules, "keeper": keeper_rules}
+        trainer = None if all(overrides.values()) else _trainer_for(checkpoint)
+        controllers: dict[str, str] = {}
+        for pid, use_rules in overrides.items():
+            player = match.player_by_id_or_none(pid)
+            if player is None:  # the keeper under no_keeper_prob
+                continue
+            if use_rules or trainer is None:
+                controllers[pid] = "rules"
+                continue
+            # The scenario's scripted opening order belongs to the rules AI;
             # training clears it the same way (RoleScenarioEnv.reset).
-            attacker.current_order = None
-            attacker.ai = NeuralPlayerAI(
+            player.current_order = None
+            player.ai = NeuralPlayerAI(
                 trainer._sample_action,
                 decision_interval_ticks=max(1, round(decision_interval_ms / 1000.0 * ui_tick_hz)),
                 max_episode_s=float(cfg.get("max_episode_s", 15.0)),
                 task_phase=ui_task_phase("1v2"),
             )
+            controllers[pid] = "neural"
         # Every player's AI is final here: no generic neural-opponent wiring.
         match._ai_fully_wired = True
+        roles = "  ".join(f"{pid}={c}" for pid, c in controllers.items())
         keeper = "yes" if match.player_by_id_or_none("keeper") is not None else "NO"
-        log_ui.info(f"Phase 2 UI: attacker={'rules' if trainer is None else attacker_checkpoint}  keeper={keeper}")
+        log_ui.info(f"Phase 2 UI: checkpoint={checkpoint if trainer is not None else '-'}  {roles}  keeper={keeper}")
         return match
 
     return build, params
@@ -2352,10 +2367,11 @@ SCENARIOS: list[ScenarioDefinition] = [
     ),
     ScenarioDefinition(
         key="phase2_neural_attacker",
-        label="Phase 2: Neural attacker 1v2 (checkpoint picker)",
+        label="Phase 2: All-neural 1v2 (checkpoint picker)",
         description=(
-            "The phase-2 1v2 trial as training plays it: the attacker is driven by the picked "
-            "checkpoint (checkpoints/phase2_run*/), the defender and goalkeeper by their rules AIs. "
+            "The phase-2 1v2 trial as the all_neural eval plays it: attacker, defender and "
+            "goalkeeper all driven by the picked checkpoint (checkpoints/phase2_run*/). Tick a "
+            "role's 'rules-based override' to give that role its rules AI instead. "
             "'No-keeper chance' 1.0 = always an empty goal. 'Player variety' draws attributes and "
             "stamina per trial as in training; off = the fixed elite-vs-average matchup."
         ),

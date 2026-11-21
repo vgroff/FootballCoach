@@ -1347,10 +1347,13 @@ column), `save_close`, `pass`, `tackle`, `goal_to_goal_sprint`,
 `gk_far_post` — the newer ones aren't described in this file yet; read their
 `ScenarioDefinition` in `scenarios.py`.
 
-**`phase2_neural_attacker`** (AI column, 2026-11-17): the phase-2 1v2 trial
-with the attacker driven by a checkpoint picked from `checkpoints/phase2_run*/`
-(+ `longterm/`), defender and keeper on their rules AIs, task id 2 (as
-training). Params: attacker checkpoint / rules override, `no_keeper_prob`
+**`phase2_neural_attacker`** (AI column, 2026-11-17; all-neural since
+2026-11-21, menu label "Phase 2: All-neural 1v2"): the phase-2 1v2 trial with
+attacker, defender AND keeper all driven by one checkpoint picked from
+`checkpoints/phase2_run*/` (+ `longterm/`), task id 2 -- as the `all_neural`
+eval plays it (the key keeps its old name). Params: `checkpoint`, per-role
+rules overrides (`attacker_rules` / `defender_rules` / `keeper_rules`; tick
+defender + keeper for the old neural-attacker-only view), `no_keeper_prob`
 (1.0 = always an empty goal), player variety (training's
 `curriculum.phase2.scenario_kwargs` attribute tiers + stamina), decision
 interval. Built by `_make_phase2_attacker_scenario()`; the rules-only `1v2`
