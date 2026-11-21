@@ -434,3 +434,8 @@ standing still from them". Run44 stopped right after checkpoint 40.
   after ~1 min (no checkpoint; process tree killed and verified), relaunched
   as run65 from the same kappa-350 start checkpoint
   (log scratchpad/ppo_kappa350_dlr1e5.log).
+- 02:2x User: report every other checkpoint; going to bed at some point --
+  train as far as sensible by tomorrow, log, nothing destructive, choices
+  well justified and not hacky, keep timers running. And: don't read much
+  into trends over the first ~0-20 evals of a run (episode-replay list still
+  building up, noisy) -- no regression calls / plan changes on those alone.
