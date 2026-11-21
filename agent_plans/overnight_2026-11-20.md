@@ -565,3 +565,19 @@ standing still from them". Run44 stopped right after checkpoint 40.
   44.8 -> 42.4% with goals conceded flat 8-9%. So the drop is the attacker
   improving (dribbling past the defender), not a defender regression. No
   changes.
+- 11:55 event: ckpt 107 keeper vs rules attacker dropped to 37.6/10.4 (from
+  27.6/21.3 at 105, 28.0/20.4 at 106). Cause found in the log: the 11:45
+  update's policy KL jumped 0.019 -> 0.50 within one epoch (one minibatch
+  grad-norm max 27 vs ~5-11 normal), per-head move_dir KL 0.276 (was
+  0.015-0.048 for the previous hour); target_kl 2.0 did not stop it. Same
+  ckpt: attacker_vs_rules 72.6% (from ~65), attacker_vs_ai_keeper saves
+  18.5 (from 21-24), all_neural share 58.1/19.6/22.3 (from ~52/26/22). The
+  11:50 update was again large (KL to 0.78, move_dir 0.351), yet ckpt 108
+  keeper vs rules = 25.4/23.3 (best of the run) and attacker_vs_rules
+  70.2%. move_dir kappa unchanged (log 5.737), mean per-step angle change
+  unchanged (~0.18 deg), so the KL is likely concentrated in a few rows
+  (untested). Reading: a sudden larger policy move in move direction, not
+  (yet) a regression -- 107 bad, 108 best. Not acting on two updates;
+  watching move_dir KL and the keeper evals. Last checkpoint before the
+  jumps: checkpoint106.pt (keep as the rollback point if it turns out to
+  be damaging).
