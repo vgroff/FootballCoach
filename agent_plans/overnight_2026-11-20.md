@@ -414,3 +414,19 @@ standing still from them". Run44 stopped right after checkpoint 40.
   config restored after): 2-round PPO from run60 ckpt 8 with
   ppo.direction_learning_rate 3e-5 / 1e-5 / 3e-6; compare early-stop epoch,
   per-head KL, keeper evals (incl. new all_neural).
+- 02:1x Direction-LR probes abandoned before any result (user moved to
+  target_kl 2.0, kappa reset, +30% entropy -- the probes' question no
+  longer applies). NB: TaskStop on the probe script did not stop its
+  training process or its bash loop (it advanced to the next probe twice);
+  had to taskkill the process trees -- partial dirs phase2_run61/62/63 from
+  those (config + log only, no PPO checkpoints). Config restored from the
+  backup before the new changes.
+- 02:16 User: kappa back to ~350 ("it'll tighten again in no time, easier
+  for the keeper to explore"), entropy +30%, target_kl up (it was 2.0 for
+  most of phase 1; can go entirely if useless). New start checkpoint
+  checkpoints/phase2_run60_kappa350/checkpoint_start.pt = run60 ckpt 8 with
+  move_dir log kappa set to ln 350 (was 941), optimizer state dropped.
+  ppo.ent_coef_start/end 0.003 -> 0.0039, ppo.target_kl 0.5 -> 2.0,
+  direction LR unchanged (3e-5). PPO run64 (checkpoints/phase2_run64),
+  --total-steps 300000000, phase mix 25:75, with the new all_neural eval
+  (log scratchpad/ppo_kappa350.log).
