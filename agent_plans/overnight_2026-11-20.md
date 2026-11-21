@@ -403,3 +403,14 @@ standing still from them". Run44 stopped right after checkpoint 40.
   test updated) -- active from the next restart. Keeper vs rules attacker
   ckpt 7: 36.3/12.8 (worse than 31/17 at ckpts 1-4); AI attacker vs neural
   keeper 64.1/1.5.
+- 02:2x User asked whether the high direction gradients are temporary and
+  whether to relax kappa: move_dir kappa ~943 (noise ~1.9 deg; KL for a
+  mean shift ~ kappa*dtheta^2/2, so 0.64 KL = ~2.1 deg average rotation).
+  Not temporary (norm held ~1 by the reg; direction weights ~16x smaller,
+  so the same LR rotates them much more). Both unit-vector heads (move /
+  kick direction) carry the magnitude reg in PPO (coef 0.001, in
+  total_loss). User: suspicious of specialised LRs, probe first. run60
+  stopped at ckpt 8 (kept). Probes (scratchpad/dirlr_probes.sh, sequential,
+  config restored after): 2-round PPO from run60 ckpt 8 with
+  ppo.direction_learning_rate 3e-5 / 1e-5 / 3e-6; compare early-stop epoch,
+  per-head KL, keeper evals (incl. new all_neural).
