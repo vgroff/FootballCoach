@@ -736,3 +736,20 @@ don't need the lower LR").
   Reading: phase 1 recovering as intended; keeper flat vs the fixed
   attacker; its gap vs the improving neural attacker has stopped
   growing. No change.
+- 20:19 watchdog (run66): healthy, 51 checkpoints, no errors, 0 early
+  stops; move_dir KL 0.019-0.036, policy kl ~0.024, kappa log 5.664
+  (~288). Blocks 1-10 / 11-20 / 21-30 / 31-40 / 41-50:
+  phase-1 vs rules 58.4% 0.869 / 58.9% 0.893 / 59.5% 0.937 / 59.7% 0.963 /
+    59.8% 0.952 (recovery levelling off at ~60%, ~0.95-0.96);
+  keeper vs rules attacker 19.7/29.2 / 22.3/26.2 / 20.4/28.0 / 20.0/28.1 /
+    20.3/27.9 (stable);
+  AI attacker vs neural keeper 58.4/24.4 / 62.2/21.3 / 64.3/19.7 /
+    63.1/20.9 / 62.2/24.0 (keeper adapting back);
+  all_neural raw 54.6/23.3 / 56.9/20.0 / 58.7/17.6 / 55.5/20.0 /
+    53.7/22.7 (recovering);
+  attacker_vs_rules 77.7 / 78.2 / 79.5 / 80.9 / 81.5 (still improving);
+  defender_vs_rules 7.6-8.7% (flat).
+  Confirmed for the user: phase-1 shaping all live in run66's pinned
+  config and firing in rollouts (approach +0.035/ep, progress +0.076,
+  speed +0.054, sprint -0.089). User: if phase 1 stalls, distill from an
+  earlier model to push it back toward ~63-65%. No change.
