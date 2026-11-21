@@ -596,3 +596,18 @@ standing still from them". Run44 stopped right after checkpoint 40.
   conceded, possession ~43% (flat). Phase-1 vs rules 59-62% (one 59;
   guard is sustained <59). Verdict on the jump: transient, net positive;
   no rollback, no changes.
+- 13:07 watchdog: run65 healthy, 123 checkpoints, no errors, 0 early stops;
+  move_dir KL 0.018-0.030 (no spikes since 11:50), policy kl ~0.022, kappa
+  log 5.723 (~306). Keeper evals (115-121): vs rules attacker 24.1/23.9,
+  23.9/25.0, 25.7/22.8, 23.3/25.7 (best of run); AI attacker vs neural
+  keeper saves 20.9, 22.6, 22.4, 23.5; all_neural share 55.1/26.3/18.6,
+  55.4/25.6/19.0, 55.1/24.1/20.8, 56.1/24.5/19.5. attacker_vs_rules
+  69.6-72.2%; defender_vs_rules 8.0-8.9% conceded, possession ~43% (flat).
+  PHASE-1 DRIFT (flag): phase-1 vs rules averaged in blocks of 10 evals:
+  63.5, 63.0, 63.0, 62.2, 61.9, 61.3, 61.4, 61.2, 61.0, 60.8, 60.8, 59.5%
+  (latest 3: 60.0%); mean reward 1.17 -> 0.95 (per-eval sem ~0.09, so
+  ~0.2 is well outside noise). A slow, steady decline over the whole run
+  -- phase 1 is 25% of the mix while phase 2 is improving fast. Not yet
+  below the agreed ~59% guard, so no change made; raised with the user
+  (options: raise the phase-1 share of the mix at the next restart, or
+  accept the trade while the keeper learns).
