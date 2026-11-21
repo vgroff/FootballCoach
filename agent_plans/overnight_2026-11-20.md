@@ -493,3 +493,15 @@ standing still from them". Run44 stopped right after checkpoint 40.
   Checked the identical 31.5/16.7 at ckpt 33 and 35: ckpt 34 scored
   32.6/15.7, so the eval is not stale (defence share is fixed by the rules
   defender on seeded episodes). No changes.
+- 07:07 watchdog: run65 healthy, 55 checkpoints, no errors, 0 early stops;
+  policy kl 0.026-0.055, move_dir KL ~0.02-0.025, kick_dir ~0.045-0.054;
+  move_dir log kappa 5.78 (kappa ~324). Evals (every 2nd ckpt, 43-53):
+  keeper vs rules attacker 32.6/15.7, 31.7/16.5, 31.7/16.5, 32.2/16.3,
+  32.4/16.1, 32.4/16.1 (plateau ~32/16 since ckpt 31); AI attacker vs
+  neural keeper saves 8.9, 8.5, 11.5, 10.2, 11.1, 9.3 (slowly rising);
+  all_neural share 61.4/9.5/29.2, 64.2/9.2/26.6, 62.0/9.4/28.6,
+  63.1/10.6/26.3, 62.9/12.5/24.6, 62.5/12.3/25.3 (dip at 43-47 recovered;
+  keeper-only evals did not dip, so read as three-way-game noise).
+  attacker_vs_rules 62.4-63.0%, defender_vs_rules 8.5-9.6% / 41-43% saved.
+  Phase-1 vs rules 60-62% over the last 6 (was 62-63%): a slight drift,
+  above the ~59% guard; watching, no change.
