@@ -439,3 +439,10 @@ standing still from them". Run44 stopped right after checkpoint 40.
   well justified and not hacky, keep timers running. And: don't read much
   into trends over the first ~0-20 evals of a run (episode-replay list still
   building up, noisy) -- no regression calls / plan changes on those alone.
+- 02:2x User: after the kappa reset the base numbers differ -- judge drops
+  relative to run65's own first eval, not run60's. run65 ckpt-1 baseline:
+  phase-1 vs rules 62%; all_neural scored/saved/defended share (excl. off
+  target/out/timeout) 65.9/7.7/26.4% (raw goal 61.5, saved 7.2, defence
+  24.6); goalkeeper_vs_rules 36.7/11.5; attacker_vs_ai_keeper 60.7/4.8;
+  attacker_vs_rules 62.0/4.1; defender_vs_rules 8.7/43.0. Phase-1 guard:
+  sustained < ~59% after ckpt ~20.
