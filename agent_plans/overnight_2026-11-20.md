@@ -753,3 +753,18 @@ don't need the lower LR").
   config and firing in rollouts (approach +0.035/ep, progress +0.076,
   speed +0.054, sprint -0.089). User: if phase 1 stalls, distill from an
   earlier model to push it back toward ~63-65%. No change.
+- 21:19 watchdog (run66): healthy, 62 checkpoints, no errors, 0 early
+  stops; move_dir KL 0.015-0.025, policy kl ~0.023, kappa log 5.656 (~286).
+  Blocks ... 31-40 / 41-50 / 51-60:
+  phase-1 vs rules 59.7% 0.963 / 59.8% 0.952 / 59.5% 0.959 -> PLATEAU at
+    ~59.6% / ~0.96 for 30 evals (recovered +0.09-0.13 reward from the
+    run66 start, but not back to run65's start ~63% / 1.17);
+  keeper vs rules attacker 20.0/28.1 / 20.3/27.9 / 20.5/27.9 (stable);
+  AI attacker vs neural keeper 63.1/20.9 / 62.2/24.0 / 61.1/25.7 (keeper
+    recovered the self-play gap);
+  all_neural raw 55.5/20.0 / 53.7/22.7 / 54.1/22.4;
+  attacker_vs_rules 80.9 / 81.5 / 81.8 (levelling);
+  defender_vs_rules 7.7-8.5% (flat).
+  Phase 1 has stalled at 35/65 -- this is the case where the user said
+  distilling from an earlier model could push it back toward ~63-65%.
+  Raised with the user; no change made.
