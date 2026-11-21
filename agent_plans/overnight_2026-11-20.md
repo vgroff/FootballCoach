@@ -387,3 +387,11 @@ standing still from them". Run44 stopped right after checkpoint 40.
   keeper baseline now 7.0/41.7 without the snap); AI attacker vs neural
   keeper 62.8/4.8 -> 64.1/1.7 (saves falling); AI attacker vs rules keeper
   61.5/6.3 -> 59.8/4.8; defender_vs_rules 8.7/43; phase-1 64-65%.
+- 02:1x Side effect of the direction-head rescale on PPO (run60): direction
+  param group pre-clip grad norm mean 44 (run43: 2.2), clipped 141/141 steps
+  (limit 4.0); policy KL per update 0.07-0.11 (run43 ~0.02); updates
+  early-stop at epoch 3/10 (KL 0.644 > target 0.5) with move_dir = 0.643 of
+  it. Cause: ppo.direction_learning_rate 3e-5 unchanged, but with raw norm
+  ~1 (was ~40) each Adam step rotates the direction ~30x more. Proposed
+  (waiting for the user): direction_learning_rate 3e-5 -> 3e-6, restart from
+  the latest run60 checkpoint into a fresh dir.
