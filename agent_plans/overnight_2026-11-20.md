@@ -456,3 +456,15 @@ standing still from them". Run44 stopped right after checkpoint 40.
   61.1/3.0, 60.0/3.0, 59.6/3.9; all_neural share 68.1/6.1/25.8,
   66.6/6.8/26.6, 67.5/7.3/25.2, 65.8/6.3/27.9. Within the first-20 noise
   window -- no trend calls, no changes.
+- 04:07 watchdog: run65 healthy, 21 checkpoints, no errors, 0 early stops
+  over the whole run; approx KL ~0.025, move_dir KL ~0.023, kick_dir
+  ~0.035; move_dir log kappa 5.858 -> 5.828 (kappa ~340, drifting slowly
+  down). Evals (every 2nd ckpt, 10-19): keeper vs rules attacker 35.2/13.3,
+  36.1/12.2 (13), 35.4/12.8, 35.0/13.5, 33.9/14.3; AI attacker vs neural
+  keeper 60.0/2.0, 61.1/3.7, 60.2/4.1, 62.2/3.5, 60.7/4.1, 63.0/5.0;
+  all_neural share (scored/saved/defended) 63.4/7.5/29.1, 62.6/10.8/26.6,
+  64.9/9.3/25.9, 61.1/12.2/26.7, 62.8/10.2/27.0, 63.1/11.0/25.9.
+  attacker_vs_rules 58.5-62.0%, defender_vs_rules 8.0-9.8%, phase-1 62-64%
+  (guard ok). First ~20 checkpoints done; early signs vs ckpt-1 baseline:
+  all-neural saves 7.7 -> ~10-12%, scored 65.9 -> ~62-63%, keeper vs rules
+  attacker 36.7/11.5 -> ~34-35/13-14. No changes.
