@@ -534,3 +534,14 @@ standing still from them". Run44 stopped right after checkpoint 40.
   regression in goals; more likely the neural attacker/keeper interplay in
   the three-way game. attacker_vs_rules 61.3-62.2% (saves 6.7-8.5%);
   phase-1 vs rules 60-62% (guard ok). No changes.
+- 10:07 watchdog: run65 healthy, ~89 checkpoints, no errors, 0 early stops;
+  policy kl 0.022-0.028, move_dir KL 0.015-0.018, kick_dir ~0.045; move_dir
+  log kappa 5.755 (kappa ~316). Evals (every 2nd ckpt, 77-87): keeper vs
+  rules attacker 27.2/21.1, 28.7/19.6, 28.5/19.6, 28.0/20.2, 28.7/19.8,
+  29.1/19.6 (holding the 73+ step, ~28/20); AI attacker vs neural keeper
+  saves 10.7, 10.7, 10.9, 13.3, 15.0, 15.9 (rising; 54.8% conceded at 87,
+  best); all_neural share 63.7/14.2/22.1, 63.4/12.4/24.2, 61.7/13.3/25.0,
+  61.1/14.5/24.4, 57.0/20.6/22.4, 60.0/16.5/23.5 (saves stepping up at
+  85-87). attacker_vs_rules now 64.1-67.4% (was 61-63; baseline 62.0) --
+  the attacker improving too. defender_vs_rules 8.0-8.5% conceded,
+  possession ~42.5% (flat). phase-1 vs rules 60-62% (guard ok). No changes.
