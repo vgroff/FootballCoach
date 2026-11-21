@@ -787,3 +787,16 @@ don't need the lower LR").
   ~0.03). Offered a phase-1-only frozen-teacher KL. User: no -- let run66
   train and settle, then decide; the network is still learning well
   overall. Keep tracking the block averages; no change.
+- 23:19 watchdog (run66): healthy, 84 checkpoints, no errors, 0 early
+  stops; move_dir KL 0.016-0.026, policy kl ~0.021, kappa log 5.635
+  (~280). Phase-1 blocks 51-60 / 61-70 / 71-80 (/ 81-84): 59.5% 0.959 /
+  59.3% 0.941 / 59.0% 0.929 (/ 58.8% 0.902) -- slow easing continues
+  (~0.015 reward per block). Keeper vs rules attacker 19.6/29.0 / 19.7/28.6
+  (/ 20.6/27.8); AI attacker vs neural keeper 61.7/24.0 / 60.4/25.3;
+  all_neural raw 54.9/21.5 / 54.3/22.9 (/ 52.5/24.0; ckpt 83 share
+  52.6/28.3/19.2 = run66 best); attacker_vs_rules ~80-81%;
+  defender_vs_rules 7.3-7.5% (flat). 23:1x user asked if the net is still
+  healthy: yes (stable, no spikes/stops; entropy -0.926 -> -0.908, value
+  loss 0.31 -> 0.40), but learning only slowly in run66 -- keeper ~flat vs
+  the rules attacker for ~70 ckpts, attacker +1.8, phase 1 up then easing.
+  User: let it settle, then decide. No change.
