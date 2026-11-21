@@ -468,3 +468,14 @@ standing still from them". Run44 stopped right after checkpoint 40.
   (guard ok). First ~20 checkpoints done; early signs vs ckpt-1 baseline:
   all-neural saves 7.7 -> ~10-12%, scored 65.9 -> ~62-63%, keeper vs rules
   attacker 36.7/11.5 -> ~34-35/13-14. No changes.
+- 05:08 watchdog: run65 healthy, 32 checkpoints, no errors, 0 early stops;
+  policy kl ~0.019-0.03, per-head move_dir ~0.030, kick_dir ~0.050; move_dir
+  log kappa 5.81 (kappa ~333, still loosening slowly). Evals (every 2nd ckpt,
+  23-31): keeper vs rules attacker 32.4/15.9, 32.8/15.4, 35.2/13.3,
+  34.1/14.3, 31.5/16.5; AI attacker vs neural keeper 60.4/8.0, 62.2/7.2,
+  60.9/6.7, 59.3/7.6, 61.1/6.7; all_neural share 60.9/11.9/27.2,
+  61.1/12.2/26.7, 63.5/10.8/25.7, 61.9/12.3/25.8, 62.5/11.9/25.6.
+  attacker_vs_rules 61-62%, defender_vs_rules 7.4-7.8% conceded / 45% saved,
+  phase-1 vs rules 62-63% (guard ok). Sustained keeper gain vs ckpt-1
+  baseline (vs rules 36.7/11.5 -> ~33/15; AI-attacker saves 4.8 -> ~7;
+  all-neural saves 7.7 -> ~12). No regressions; no changes.
