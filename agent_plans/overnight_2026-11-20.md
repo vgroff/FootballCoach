@@ -814,3 +814,8 @@ don't need the lower LR").
   pinned eval.seed_network_sampling true; rules_baseline identical
   7.0/41.7/47.0 on all 85 checkpoints. User: keep training -- phase 1 took
   ~1M steps to get near convergence. No change.
+- 00:0x CORRECTION (user): phase 1 took ~1 BILLION steps (not 1 million)
+  to get near convergence. For scale: global step ~4.02B now; run66 has
+  done only ~45M steps (3.979B -> 4.024B) -- far too early to call any
+  plateau. Ckpt 89/91: keeper vs rules attacker 18.5/30.4, 18.0/30.9
+  (= run66 best), AI attacker vs keeper saves 24.3, 27.4.
