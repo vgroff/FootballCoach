@@ -614,3 +614,14 @@ standing still from them". Run44 stopped right after checkpoint 40.
 - 13:1x User: accept the phase-1 drift for now ("it should go back up as
   they continue training") -- no mix change. Keep tracking the 10-eval
   block average of phase-1 vs rules.
+- 14:07 watchdog: run65 healthy, 134 checkpoints, no errors, 0 early stops;
+  move_dir KL 0.017-0.019 (no spikes), policy kl ~0.023, kappa log 5.715
+  (~303). Keeper vs rules attacker 123-133: 22.8/25.7, 23.3/25.4,
+  22.6/26.1, 22.0/26.7, 21.5/27.4, 20.4/28.3 (new best every checkpoint
+  since 125); AI attacker vs neural keeper saves 22.0, 21.3, 19.6, 23.7,
+  22.2; all_neural share 58.7/26.1/15.2, 56.6/26.0/17.3, 58.6/24.5/16.9,
+  57.9/24.8/17.3, 56.7/24.4/18.9. attacker_vs_rules 70.9-73.5% (rules
+  defender possession 15-18%); defender_vs_rules 7.6-8.5% conceded,
+  possession ~42% (flat). Phase-1 vs rules, last-10 block 59.6% (blocks
+  111-120 59.5, 121-130 59.8): drift has flattened, not recovering yet;
+  user accepted it at 13:1x. No changes.
