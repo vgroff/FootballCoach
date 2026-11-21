@@ -687,3 +687,17 @@ don't need the lower LR").
   watches now report keeper evals only, phase 1 as block averages hourly.
 - 16:0x UI: phase-2 UI scenario now all-neural (a11327d); user: "looking
   good in the UI".
+- 17:19 watchdog (run66): healthy, 18 checkpoints, no errors, 0 early
+  stops; move_dir KL 0.016-0.037, policy kl ~0.023, kappa log 5.694
+  (~297). Phase-1 vs rules blocks: evals 1-10 58.4% / 0.869, 11-18 58.9% /
+  0.898 (baseline 58% / 0.835) -- slight recovery, decline stopped. Keeper
+  vs rules attacker: ckpts 1-10 ~19.5/29.3, 11-17 ~23/25 (22.6/26.1,
+  24.3/24.3, 23.5/25.2, 22.8/25.4, 22.2/26.1); AI attacker vs neural
+  keeper saves 22.6-27.2 early -> 18.5-22.4; all_neural share ckpt 13
+  57.0/20.8/22.2, 15 61.5/20.6/17.9, 17 56.3/24.1/19.6. Checked the keeper
+  dip is not a stronger attacker: attacker_vs_rules flat 75.9-78.9% the
+  whole run; defender_vs_rules flat 7-9%. Reading (untested mechanism):
+  the mix change trades a few keeper points for phase-1 recovery; the dip
+  levelled at ckpt 11-17. Still within the first ~20 evals -> no change;
+  reassess at ckpt 20-25 (options raised with the user: keep 35/65 until
+  phase 1 ~61% then back to 25/75, or 30/70).
