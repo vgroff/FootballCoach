@@ -819,3 +819,16 @@ don't need the lower LR").
   done only ~45M steps (3.979B -> 4.024B) -- far too early to call any
   plateau. Ckpt 89/91: keeper vs rules attacker 18.5/30.4, 18.0/30.9
   (= run66 best), AI attacker vs keeper saves 24.3, 27.4.
+- 00:33 watchdog (run66): healthy, 97 checkpoints, global step 4,026.9M
+  (run66 ~48M steps so far), no errors, 0 early stops, max move_dir KL
+  0.046, kappa log 5.622 (~277).
+  Training (20-update blocks): value 0.368/0.376/0.396/0.396/0.400, kl
+  0.026/0.022/0.025/0.021/0.024 (steady non-zero), |adv| 1.17/1.19/1.22/
+  1.22/1.22. Value RMSE now saved 2.298 (n 723k; was 2.38), goal 1.517
+  (2.16M; was 1.37), defence 2.158, box_possession 0.636.
+  Evals (blocks 71-80 / 81-90 / 91-97): phase-1 59.0% 0.929 / 59.2% 0.934
+  / 59.9% 0.959 (ticked back up); keeper vs rules attacker 19.7/28.6 /
+  19.5/29.1 / 17.8/31.1 (ckpt 97 17.0/32.0 = best of run65+66); AI
+  attacker vs keeper saves 25.3/24.7/25.2; all_neural raw scored 54.3 /
+  52.1 / 50.7 (falling = good for keeper/defender); attacker_vs_rules
+  79.5/81.2/82.4; defender_vs_rules ~7.5%. No change.
