@@ -768,3 +768,17 @@ don't need the lower LR").
   Phase 1 has stalled at 35/65 -- this is the case where the user said
   distilling from an earlier model could push it back toward ~63-65%.
   Raised with the user; no change made.
+- 22:19 watchdog (run66): healthy, 73 checkpoints, no errors, 0 early
+  stops; move_dir KL 0.017-0.027, policy kl ~0.025, kappa log 5.643 (~283).
+  Blocks 41-50 / 51-60 / 61-70 (/ 71-73):
+  phase-1 vs rules 59.8% 0.952 / 59.5% 0.959 / 59.3% 0.941 (/ 59.0% 0.936)
+    -- plateau, possibly easing slightly (-0.02 reward from the 31-40
+    peak; marginal vs noise);
+  keeper vs rules attacker 20.3/27.9 / 20.5/27.9 / 19.6/29.0 (/ 19.1/29.3)
+    (slightly improving);
+  AI attacker vs neural keeper 62.2/24.0 / 61.1/25.7 / 61.7/24.0;
+  all_neural raw 53.7/22.7 / 54.1/22.4 / 54.9/21.5 (ckpt 69/71 at
+    26-28% share, run66 best);
+  attacker_vs_rules ~81%; defender_vs_rules 8.0 / 7.7 / 7.3 (/ 6.9)%
+    conceded (defender improving).
+  Phase-1 distillation option still with the user; no change.
