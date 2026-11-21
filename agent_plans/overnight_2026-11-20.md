@@ -675,3 +675,15 @@ don't need the lower LR").
   scratchpad/ppo_run66_mix35.log. Config otherwise identical to run65.
 - Judge phase 1 on 10-eval blocks vs run66's own first evals; the first
   ~20 evals are noisy (episode-replay list rebuilds).
+- 16:07 watchdog (run66): healthy, 4 checkpoints, no errors, 0 early stops;
+  move_dir KL 0.018-0.044, policy kl ~0.025, kappa log 5.70 (~300).
+  Phase-1 vs rules 58, 58, 59, 59% (reward 0.835, 0.857, 0.897, 0.899);
+  keeper vs rules attacker 18.0/31.1, 20.2/28.9, 19.8/29.3, 19.8/29.1; AI
+  attacker vs neural keeper saves 22.6, 24.1, 25.9, 24.3; all_neural raw
+  59.1/18.5/17.4 ... 53.3/25.9/16.5; attacker_vs_rules ~77.5%;
+  defender_vs_rules 7.6-8.0% / possession ~46%. Inside the noisy first
+  ~20 evals -- no trend calls. Replaced the hourly cron with a run66
+  version (the old prompt still described run65 and the wrong 1e-5 LR);
+  watches now report keeper evals only, phase 1 as block averages hourly.
+- 16:0x UI: phase-2 UI scenario now all-neural (a11327d); user: "looking
+  good in the UI".
