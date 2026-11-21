@@ -520,3 +520,17 @@ standing still from them". Run44 stopped right after checkpoint 40.
   more shots reach the keeper; no change in goals. Mild, watching, not a
   regression trigger. attacker_vs_rules 60.9-63.3% (saves 5-7%), phase-1 vs
   rules 60-62% (guard ~59% ok). No changes.
+- 09:07 watchdog: run65 healthy, 78 checkpoints, no errors, 0 early stops;
+  policy kl ~0.02, move_dir KL 0.015-0.037, kick_dir ~0.045; move_dir log
+  kappa 5.765 (kappa ~319). Evals (every 2nd ckpt, 67-75): keeper vs rules
+  attacker 30.4/17.6, 29.6/18.5, 29.8/18.3, 26.5/21.5, 28.0/20.4 (a step
+  up at 73-75); AI attacker vs neural keeper 57.6/11.3, 56.7/12.0,
+  57.4/9.1, 56.5/12.4, 55.0/13.9 (best); all_neural share 61.8/14.0/24.2,
+  62.7/13.2/24.1, 64.4/11.9/23.7, 63.3/14.1/22.6, 62.0/13.7/24.3.
+  Defender recheck: defender_vs_rules goals conceded 7.8-8.9% (baseline
+  8.7, flat / slightly better), defence_possession steady ~42% over the
+  last 8 (the 44 -> 41 drift stopped), rules keeper saves ~45%. So the
+  lower all-neural defended share (~23-24 vs 26.4) is not a defender
+  regression in goals; more likely the neural attacker/keeper interplay in
+  the three-way game. attacker_vs_rules 61.3-62.2% (saves 6.7-8.5%);
+  phase-1 vs rules 60-62% (guard ok). No changes.
