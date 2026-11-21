@@ -701,3 +701,22 @@ don't need the lower LR").
   levelled at ckpt 11-17. Still within the first ~20 evals -> no change;
   reassess at ckpt 20-25 (options raised with the user: keep 35/65 until
   phase 1 ~61% then back to 25/75, or 30/70).
+- 18:19 watchdog (run66): healthy, 29 checkpoints, no errors, 0 early
+  stops; move_dir KL 0.016-0.033, policy kl ~0.022, kappa log 5.68 (~293).
+  10-checkpoint blocks (1-10 / 11-20 / 21-28or29):
+  phase-1 vs rules 58.4% 0.869 / 58.9% 0.893 / 59.7% 0.941 (recovering;
+    run66 start 58% 0.835);
+  keeper vs rules attacker 19.7/29.2 / 22.3/26.2 / 20.5/28.0 (dip
+    recovered); ckpt 29 20.4/27.8;
+  AI attacker vs neural keeper 58.4/24.4 / 62.2/21.3 / 64.4/19.9 (keeper
+    saves steadily down);
+  all_neural raw 54.6/23.3/17.6 / 56.9/20.0/18.8 / 58.6/17.7/18.7;
+  attacker_vs_rules 77.7/7.1 / 78.2/7.0 / 79.4/6.0 (attacker slightly up);
+  defender_vs_rules ~8.5-9.3% (flat).
+  Test of "the keeper got worse": against the fixed rules attacker it is
+  flat (20.5 vs 19.7 conceded), so mostly no. The AI attacker improved vs
+  the rules keeper by only ~1.7 points, but vs the neural keeper by ~6 --
+  so the gap is mainly the attacker learning to beat the NEURAL keeper
+  specifically (self-play interaction; mechanism untested). Not a keeper
+  regression by the guard's definition; watching whether the keeper
+  adapts back. No change.
