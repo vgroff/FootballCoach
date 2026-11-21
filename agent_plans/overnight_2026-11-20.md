@@ -642,3 +642,36 @@ standing still from them". Run44 stopped right after checkpoint 40.
   Recommended a fresh-dir restart with --phase-mix "1:0.35,2:0.65";
   user deciding -- no change made without their answer since they had
   explicitly accepted the drift at 13:1x.
+
+## CORRECTION (2026-11-21 ~15:40): run65 used direction LR 3e-5, NOT 1e-5
+
+The 02:1x patch that was meant to set ppo.direction_learning_rate 3e-5 ->
+1e-5 died with a Python SyntaxError (quoting bug in the inline patch), and
+run65 launched anyway on the unchanged config. Commit 361df61 ("Config:
+ppo.direction_learning_rate 3e-5 -> 1e-5") only touched this log -- the
+config was never changed. Verified: checkpoints/phase2_run65/ai_config.json
+(the run's pinned config) and the live ai_config.json both read
+"direction_learning_rate": 3e-05. Every entry above that says "direction LR
+1e-5" for run65 is wrong: run65 = target_kl 2.0, ent_coef 0.0039, move_dir
+kappa reset ~350, direction LR 3e-5 (direction-group grad clipped 100% of
+steps, pre-clip norm ~31 vs limit 4). User (15:3x): keep 3e-5 ("I guess we
+don't need the lower LR").
+
+## run65 -> run66 (2026-11-21 ~15:43): phase mix 25/75 -> 35/65
+
+- Why: phase-1 vs rules declined steadily the whole run (10-eval blocks
+  63.5 -> 59.0%, last block 58.3%; mean reward 1.17 -> 0.875), below the
+  ~59% guard; the net lost to its own earlier snapshots in phase 1 (45-47%),
+  so a real loss. Likely cross-phase interference with phase 1 ~20% of
+  batch rows and jointly-normalised advantages (mechanism untested).
+- User's call: option 1, ONLY the phase mix changes (one variable).
+- Stopped run65 after checkpoint152.pt (taskkill /T on PID 31508, verified
+  0 python processes left). run65 at ckpt 149: keeper vs rules attacker
+  18.7/30.2 (best), AI attacker vs neural keeper 57.4/24.3, all_neural
+  57.4/25.9/16.7, attacker_vs_rules ~75%, defender_vs_rules ~8.5%.
+- Launched: train --phase 2 --phase-mix "1:0.35,2:0.65" --checkpoint
+  checkpoints/phase2_run65/checkpoint152.pt --total-steps 300000000
+  (fresh auto dir, expected phase2_run66); log
+  scratchpad/ppo_run66_mix35.log. Config otherwise identical to run65.
+- Judge phase 1 on 10-eval blocks vs run66's own first evals; the first
+  ~20 evals are noisy (episode-replay list rebuilds).
