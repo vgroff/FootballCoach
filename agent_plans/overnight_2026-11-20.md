@@ -376,3 +376,9 @@ standing still from them". Run44 stopped right after checkpoint 40.
   ppo_after_run58.log). Watch the keeper's goalkeeper_vs_rules saves (note:
   the eval uses the new no-snap rules attacker/defender; fair ceiling
   ~17/60 in the 60-seed probe).
+- 01:43 PPG refit run59 done (3 rollouts; final value loss 0.4335, policy
+  KL ~0.022) -> checkpoints/phase2_run59/checkpoint_pretrained.pt. My chain
+  script's path parsing failed (reported "no checkpoint"), so PPO was
+  launched by hand: run60 (checkpoints/phase2_run60), --checkpoint
+  checkpoints/phase2_run59/checkpoint_pretrained.pt --total-steps 300000000
+  --phase-mix "1:0.25,2:0.75" (log scratchpad/ppo_after_run58.log).
