@@ -368,3 +368,11 @@ standing still from them". Run44 stopped right after checkpoint 40.
   old 6-9 band, ~65-75% of the fair ceiling (~17). Shot-in-flight: move
   agree 81%, dir cos 0.78, dive 0.51/0.11, recovery 16%; open play dir
   0.97, move agree 83%.
+- 01:3x User: that'll do -- short PPG then PPO. Chain script
+  (scratchpad/ppg_then_ppo.sh): PPG value refit --ppg-num-rollouts 3 from
+  checkpoints/phase2_run58/checkpoint_pretrained.pt -> checkpoints/phase2_run59,
+  then PPO from its checkpoint_pretrained.pt, --total-steps 300000000,
+  --phase-mix "1:0.25,2:0.75" (logs scratchpad/ppg_refit_after_run58.log,
+  ppo_after_run58.log). Watch the keeper's goalkeeper_vs_rules saves (note:
+  the eval uses the new no-snap rules attacker/defender; fair ceiling
+  ~17/60 in the 60-seed probe).
