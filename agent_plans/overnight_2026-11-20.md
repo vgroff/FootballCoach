@@ -782,3 +782,8 @@ don't need the lower LR").
   attacker_vs_rules ~81%; defender_vs_rules 8.0 / 7.7 / 7.3 (/ 6.9)%
     conceded (defender improving).
   Phase-1 distillation option still with the user; no change.
+- 23:0x Phase-1 blocks now 59.7/0.963 (31-40) -> 59.0/0.929 (71-80): peaked
+  and easing ~0.01 reward per block even at 35/65 (slower than run65's
+  ~0.03). Offered a phase-1-only frozen-teacher KL. User: no -- let run66
+  train and settle, then decide; the network is still learning well
+  overall. Keep tracking the block averages; no change.
