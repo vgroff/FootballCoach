@@ -581,3 +581,18 @@ standing still from them". Run44 stopped right after checkpoint 40.
   watching move_dir KL and the keeper evals. Last checkpoint before the
   jumps: checkpoint106.pt (keep as the rollback point if it turns out to
   be damaging).
+- 12:07 watchdog: run65 healthy, 112 checkpoints, no errors, 0 early stops.
+  The move_dir KL jump was two updates only (11:45 0.276, 11:50 0.351);
+  since then 0.019, 0.023, 0.021 (normal); kappa unchanged (log 5.736,
+  ~310); policy kl ~0.023-0.030. Evals: keeper vs rules attacker 107
+  37.6/10.4 (the dip), 108 25.4/23.3, 109 25.7/22.8 (best of run); AI
+  attacker vs neural keeper 101-109 saves 21.7, 20.9, 21.3, 18.5, 19.6;
+  all_neural share 101 57.8/21.4/20.8, 103 54.3/25.2/20.5, 105
+  52.1/25.8/22.1, 107 58.1/19.6/22.3, 109 53.8/24.9/21.3. After the jump
+  the attacker stepped up: attacker_vs_rules 70.2-72.6% (from ~65; base
+  62.0), rules defender possession ~18% -- which plausibly explains the
+  slightly lower keeper saves vs the AI attacker (harder attacks) while the
+  keeper vs the rules attacker is at its best. defender_vs_rules 8.5-8.7%
+  conceded, possession ~43% (flat). Phase-1 vs rules 59-62% (one 59;
+  guard is sustained <59). Verdict on the jump: transient, net positive;
+  no rollback, no changes.
