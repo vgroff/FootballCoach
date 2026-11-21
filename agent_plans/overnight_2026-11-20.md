@@ -800,3 +800,17 @@ don't need the lower LR").
   loss 0.31 -> 0.40), but learning only slowly in run66 -- keeper ~flat vs
   the rules attacker for ~70 ckpts, attacker +1.8, phase 1 up then easing.
   User: let it settle, then decide. No change.
+- 23:3x User: evals aren't the only learning signal under self-play;
+  look at KL, advantage and value. Checked (20-update blocks):
+  run65 1-20 value 0.314 / kl 0.043 / |adv| 1.12 -> run65 end 0.394 /
+  0.023 / 1.27; run66 1-20 0.368 / 0.026 / 1.17 -> 61-80 0.396 / 0.021 /
+  1.22. KL steady non-zero; |adv| alive. Value loss up, but per-outcome
+  value RMSE shows a composition shift: saved rows 287k -> 746k (x2.6)
+  with saved RMSE IMPROVING 2.77 -> 2.29; goal RMSE 1.24 -> 1.54 (goals
+  less certain once the keeper saves ~25%); defence/box flat. Reading
+  (not counterfactual-tested): harder, more contested game, value fitting
+  the hard bucket better. User adds: episode replay selection (top 35% by
+  |adv|) also shifts what the value sees. Seeded evals confirmed: run66
+  pinned eval.seed_network_sampling true; rules_baseline identical
+  7.0/41.7/47.0 on all 85 checkpoints. User: keep training -- phase 1 took
+  ~1M steps to get near convergence. No change.
