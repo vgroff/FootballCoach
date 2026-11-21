@@ -395,3 +395,11 @@ standing still from them". Run44 stopped right after checkpoint 40.
   ~1 (was ~40) each Adam step rotates the direction ~30x more. Proposed
   (waiting for the user): direction_learning_rate 3e-5 -> 3e-6, restart from
   the latest run60 checkpoint into a fresh dir.
+- 02:1x User: most interesting overall = scored / saved / defended share
+  (excluding off target, out, timeout) in the all-neural game, plus the
+  keeper-specific evals. All-neural from run60's TRAINING rollouts (not
+  seeded): scored 65.3 -> 64.5%, saved 12.6 -> 10.4%, defended 22.1 ->
+  25.2% (rollouts 1-7). Added a seeded eval spec all_neural (phases.py;
+  test updated) -- active from the next restart. Keeper vs rules attacker
+  ckpt 7: 36.3/12.8 (worse than 31/17 at ckpts 1-4); AI attacker vs neural
+  keeper 64.1/1.5.

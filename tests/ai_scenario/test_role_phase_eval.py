@@ -52,10 +52,13 @@ def test_only_specs_of_trained_roles_are_evaluated(controllers):
         "rules_baseline", "attacker_vs_rules", "rules_baseline_no_keeper", "attacker_vs_rules_no_keeper"]
     controllers({**NEURAL_ATTACKER, "defender": {"rules": 1, "neural": 2}})
     keeper_specs = ["goalkeeper_vs_rules", "attacker_vs_ai_keeper"]
-    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == [n for n in SPECS if n not in keeper_specs]
+    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == [
+        n for n in SPECS if n not in keeper_specs + ["all_neural"]]
     controllers({**NEURAL_ATTACKER, "goalkeeper": {"rules": 1, "neural": 1}})
     assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == [
         "rules_baseline", "attacker_vs_rules", *keeper_specs, "rules_baseline_no_keeper", "attacker_vs_rules_no_keeper"]
+    controllers({**NEURAL_ATTACKER, "defender": {"rules": 1, "neural": 2}, "goalkeeper": {"rules": 1, "neural": 1}})
+    assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == list(SPECS)   # all_neural needs all three
     controllers({r: {"rules": 1, "neural": 0} for r in ("attacker", "defender", "goalkeeper")})
     assert [s["name"] for s in rpe.specs_to_evaluate(PHASE2)] == ["rules_baseline", "rules_baseline_no_keeper"]
 

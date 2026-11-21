@@ -152,6 +152,10 @@ PHASE_2_1V2 = CurriculumPhase(
          "scenario_kwargs": {"no_keeper_prob": 0.0}},
         {"name": "attacker_vs_ai_keeper", "controllers": {"attacker": "neural", "defender": "rules", "goalkeeper": "neural"},
          "scenario_kwargs": {"no_keeper_prob": 0.0}},
+        # All three roles neural (user, 2026-11-20: the most interesting
+        # overall view -- scored / saved / defended in the all-AI game).
+        {"name": "all_neural", "controllers": {"attacker": "neural", "defender": "neural", "goalkeeper": "neural"},
+         "scenario_kwargs": {"no_keeper_prob": 0.0}},
         {"name": "rules_baseline_no_keeper", "controllers": {"attacker": "rules", "defender": "rules", "goalkeeper": "rules"},
          "scenario_kwargs": {"no_keeper_prob": 1.0}},
         {"name": "attacker_vs_rules_no_keeper", "controllers": {"attacker": "neural", "defender": "rules", "goalkeeper": "rules"},
