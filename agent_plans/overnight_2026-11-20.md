@@ -430,3 +430,7 @@ standing still from them". Run44 stopped right after checkpoint 40.
   direction LR unchanged (3e-5). PPO run64 (checkpoints/phase2_run64),
   --total-steps 300000000, phase mix 25:75, with the new all_neural eval
   (log scratchpad/ppo_kappa350.log).
+- 02:18 User: cut direction LR to 1e-5 ("not any lower"). run64 stopped
+  after ~1 min (no checkpoint; process tree killed and verified), relaunched
+  as run65 from the same kappa-350 start checkpoint
+  (log scratchpad/ppo_kappa350_dlr1e5.log).
