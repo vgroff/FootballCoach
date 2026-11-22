@@ -1212,3 +1212,18 @@ don't need the lower LR").
   (79.3); defender vs rules goal 8.0 (8.7).
   Launched run71: same refit config, --phase-mix "1:0.5,2:0.5", from
   checkpoints/phase2_run70/checkpoint_pretrained_cycle6.pt, 12 cycles.
+- 2026-11-22 20:20: run71 (50/50 mix) cycles 1-6. Fresh real KL phase 1:
+  1.69 1.65 1.49 1.46 1.50 1.83; phase 2: 0.55 0.54 0.65 0.56 0.54 0.86.
+  Fitted phase 1: 1.30 1.27 1.23 1.21 1.20; phase 2 0.41 0.45 0.50 0.44 0.76.
+  Mix change helped phase 1 for 4 cycles. Then cycle 5's fit RAISED phase-2
+  kick_dir on its own rows (0.19 -> 0.46; same rows before/after, training
+  loss fell smoothly 1.16 -> 0.99) while phase-1 kick_dir fell 0.54 -> 0.37,
+  and cycle 6 fresh kick_dir got worse for BOTH phases (p1 0.87, p2 0.49):
+  kick aim overfitting / tug-of-war on few effective rows (~6-10% kick rows,
+  scored at the student's kick kappa 1630 so the loss is very sharp).
+  Checkpoint is overwritten each cycle: now copying it per cycle
+  (checkpoint_pretrained_cycleN.pt in phase2_run71; cycle 5 = after the bad
+  fit; cycle <=4 states are gone, run70 cycle 6 backup remains).
+  Proposal (gentle, per the agreed rule): if cycle 7 fresh does not recover,
+  run72 = same config with lr 1e-4 -> 5e-5 from the best saved run71
+  checkpoint.
