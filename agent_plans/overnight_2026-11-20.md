@@ -910,3 +910,27 @@ don't need the lower LR").
   precise ball carrying. Not acting unilaterally (user explicitly accepted
   phase-1 easing; parked option = phase-1 teacher KL); flagged to the
   user. No change.
+- 06:33 watchdog (run66): healthy, 163 checkpoints, global step 4,059.9M
+  (run66 ~81M), no errors, 0 early stops, max last hour move_dir KL
+  0.016, kick_dir 0.063; kappa log 5.569 (~262). Training (20-update
+  blocks 121-140 / 141-160): value 0.396 / 0.388, kl 0.018 / 0.015, |adv|
+  1.221 / 1.205.
+  Evals (blocks 131-140 / 141-150 / 151-160):
+  phase-1 58.5% 0.886 / 58.5% 0.886 / 57.4% 0.831 (last 8: 0.79-0.90;
+    the 0.700 low recovered, but the block is now back at the run66 start
+    58% / 0.835);
+  attacker_vs_rules 82.3 / 81.1 / 79.2 (161-163: 78.6) -- falling;
+  AI attacker vs neural keeper 56.3/30.4 / 58.3/26.9 / 59.9/23.7, rules
+    defender possession there 11.5 -> 13.9%;
+  keeper vs rules attacker 16.3/34.0 / 15.2/35.2 / 15.7/34.4 (best range);
+  all_neural raw 50.7/27.4 / 53.7/22.8 / 52.5/24.4 (ckpt 163 share
+    51.7/30.4/17.9 = best saves of run65+66);
+  defender_vs_rules ~8.2% (flat).
+  Pattern since ~ckpt 125: ball carrying (phase 1, and the attacker vs the
+  rules defender+keeper) declining steadily while the keeper holds its
+  best. The keeper's lower saves vs the AI attacker coincide with the AI
+  attacker getting WEAKER vs the rules side, so not "attacker exploiting
+  the keeper" (retracting that earlier guess); untested alternative: the
+  attacker's shot choice changed (e.g. earlier/longer shots the rules
+  keeper handles and the neural keeper does not). Still flagged to the
+  user (05:33 push); no change.
