@@ -70,8 +70,73 @@ basics for football".
    - Judged at the moment the pass is played (not on receipt); level =
      onside; never offside in his own half (already).
 
+## Prerequisite: action-head refactor (spin on + bounded scalar heads)
+
+Decided 2026-11-22 (user): enable kick spin BEFORE the passing work, and do
+it as one refactor together with the bounded-scalar action heads, so the
+new head type and its checkpoint migration are built once (passing will add
+its own power-like head).
+
+**Why.** `kick_power` is the only bounded, sampled continuous head today: a
+sigmoid-squashed Gaussian on [floor, 1] (`SquashedNormalHead`, one global
+`kick_power_log_std`). Measured 2026-11-22: the phase-2 teacher's raw power
+mean on kick rows is about -11, deep in the sigmoid's flat tail. The raw-space
+KL is mathematically exact (KL is invariant under the sigmoid), but it
+spends about 0.31 KL per kick row there on an actual power difference of
+0.009. And in PPO a saturated mean gets almost no gradient on actual power.
+`spin_implementation_plan.md` §2.3 would add a second head of the same
+kind (spin magnitude), plus a normalised spin axis.
+
+**Candidate: Beta distribution for bounded scalars** (Chou et al. 2017, the
+reference fix for boundary bias). Applies to kick power, spin magnitude and
+any pass power. Direction heads stay von Mises. Region centres are mean-only
+and unaffected.
+- Pros: native support on [0, 1] (affine to [floor, 1]); no squash or
+  Jacobian; log-prob / entropy / KL in action space. With alpha = 1 +
+  softplus(a), beta = 1 + softplus(b) from the network, no saturation: a mean
+  near a bound needs a large alpha/beta ratio, and softplus is linear there.
+- Cons:
+  - The spread becomes state-dependent, so we lose the single global
+    log_std knob and the distill refit's frozen-spread trick. The variant
+    with mean = sigmoid(raw) and a global concentration brings the
+    saturation back.
+  - Near-deterministic targets (always full power) push alpha/beta very
+    large, and the log-prob diverges at exactly 0 / 1, so actions must be
+    clamped to (eps, 1 - eps).
+  - No exact policy-preserving migration from the squashed Gaussian, only
+    moment matching. The KL between a Beta student and a squashed-Gaussian
+    teacher has no closed form (sample-based KL in the migration refit).
+- Cheaper alternative if the Beta proves awkward: keep the squashed Gaussian
+  and add a penalty on |raw mean| beyond the useful range (the same idea as
+  the direction-norm regulariser).
+
+**What changes:**
+- a new head class in `action/distributions.py`, and `_kick_power_head` /
+  spin heads in `ppo/action_sampling.py`;
+- log-prob / entropy / KL paths (`ppg._ppg_kl_penalty`, the per-head
+  entropy weights such as `ent_kick_power_only_weight`, the PPO update);
+- the BC power loss (BCE on the mean can stay);
+- the apply path (`to_physical`, `kick_power_floor`);
+- a checkpoint migration script plus a distill refit to migrate;
+- tests.
+
+The spin axis is a normalised vector, so it needs the direction-norm
+regulariser and a rescale like move / kick direction (`bc.direction_mag_reg_coef`,
+`scripts/rescale_direction_heads.py`). Lesson from 2026-11-22: 0.001 did not
+hold the norm, 0.1 is in use.
+
+**Related, PPO-time:** `kick_power_log_std` grew 0.25 -> 0.425 during the
+phase-2 runs under `ent_kick_power_only_weight` 12 (763, the phase-1
+teacher, has 0.10). The weight is to be lowered at the next PPO launch;
+see the power-sigma eval sweep of 2026-11-22 in
+agent_plans/overnight_2026-11-20.md.
+
 ## Rough order
 
+0. Action-head refactor above: spin physics on per
+   `spin_implementation_plan.md` (its §0.4 re-enable checklist), bounded
+   scalar heads (Beta, or squashed Gaussian plus a mean penalty) for kick
+   power / spin magnitude, migration refit.
 1. Offside: wire into `Match` (at kick time), second-last-defender line,
    `offside` terminal outcome + reward rows; tests (incl. level / own half /
    behind the ball).
