@@ -1190,3 +1190,25 @@ don't need the lower LR").
     but a systematic bias on rare edge-of-pitch kicks would not show in RMS.
   * RAM: refit process 16.5 GB, 4.3 GB free of 31 GB, so raising
     aggregate_cycles (more data per fit) would risk OOM; not an option.
+- 2026-11-22 19:10: no reply to the 18:50 proposal within the agreed 20 min,
+  so applying it. run70 fresh phase-1 real KL over 7 cycles: 1.90 1.89 1.93
+  1.71 1.83 1.93 1.72 (fitted 1.45 1.46 1.51 1.41 1.44 1.53) -> stalled;
+  phase 2 fitted 0.62 0.59 0.49 0.57 0.43 0.50. Stopped run70 in cycle 7
+  (taskkill /T of its own tree only; cycle-6 checkpoint saved 19:05 and
+  copied to checkpoints/phase2_run70/checkpoint_pretrained_cycle6.pt).
+  Next: batched evals on it (nothing training), then run71 = same refit
+  config from that checkpoint with --phase-mix "1:0.5,2:0.5" (288/288 env
+  slots instead of 202/374), RAM-neutral.
+- 2026-11-22 19:17: evals of run70 cycle 6 (scratchpad/evals_batched.py,
+  first use; 920 eps phase 1, 460 per phase-2 spec; 3 phase-1 evals in
+  1m46s). Path validated: 763 vs rules batched 1.331 / 66.2% / 0 misses vs
+  sequential 1.337 / 65.8% / 1 (within sem 0.085).
+  Phase 1 NOT restored: vs rules 0.754 / 57.4%, 52 misses (run69 0.743 /
+  57.3% / 49; 763 1.331 / 66.2%; run66 0.886 / 58.7% / 13); h2h vs 763
+  -0.202 / 40.5%; vs run66 +0.193 / 46.2%.
+  Phase 2 kept (run66 ckpt241 in brackets): gk vs rules goal 13.9 saved 37.6
+  (13.5 / 38.5); attacker vs ai keeper 63.7 / 19.8 (61.3 / 21.1); all neural
+  54.1 / 24.3 / def 17.6 (61.3 / 20.2 / 16.5); attacker vs rules 80.0
+  (79.3); defender vs rules goal 8.0 (8.7).
+  Launched run71: same refit config, --phase-mix "1:0.5,2:0.5", from
+  checkpoints/phase2_run70/checkpoint_pretrained_cycle6.pt, 12 cycles.
