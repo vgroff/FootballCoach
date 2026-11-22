@@ -1412,3 +1412,27 @@ don't need the lower LR").
   ent_kick_power_only_weight 4, dir reg 0.1, no ppo distill anchor; spreads
   start at kick kappa 300 / power sigma 0.2 / move kappa 265. Per-checkpoint
   spread tracking: scratchpad/spreads.py. Hourly cron updated for the night.
+- 2026-11-23 00:50: DETERMINISTIC critical evals (scratchpad/final_run81c12.txt,
+  final_run81c7.txt; 920 eps phase 1, 460 per phase-2 spec):
+  cycle 12 / cycle 7 / run66 ckpt241 --
+  keeper vs rules goal 12.2 / 13.0 / 13.0, saved 40.0 / 39.1 / 39.1;
+  attacker vs rules goal 84.8 / 82.6 / 80.9; defender vs rules goal 10.4 /
+  7.8 / 9.6, defence 46.1 / 46.1 / 42.6; attacker vs ai keeper (same net)
+  71.1 / 70.4 / 68.7; all-neural goal 54.1 / 56.7 / 58.3, saved 26.1 / 23.7
+  / 20.7. CROSS-PLAY: student attacker vs run66 keeper 69.1 (c12) / 70.7
+  (c7) vs run66-vs-run66 68.7; run66 attacker vs student keeper 65.2 / 20.4
+  saved (c12) and 73.3 / 13.0 (c7) vs 68.7 / 16.5 -> c12's keeper BEATS
+  run66's keeper, c7's is worse (~2 SE). Phase 1: c7 1.456 / 69.0%, h2h vs
+  763 +0.195; c12 1.438 / 68.0%, +0.121; 763 1.384 / 67.8%.
+  VERDICT: cycle 12 passes (every metric within ~1 SE of the teachers or
+  better; all-neural differs only as self-play balance, cross-play shows no
+  weaker role); cycle 7 fails the cross-play keeper test. Caveat: deterministic
+  -- stochastic play at kick kappa 300 / power sigma 0.2 will start lower
+  until PPO re-tightens. ARCHIVED: checkpoints/archive/phase12_refit_run81_cycle12.pt
+  (+ .md note with method, spreads, evals; checkpoints/ is gitignored).
+  PPO run82 LAUNCHED from it: --phase 2 --phase-mix "1:0.35,2:0.65"
+  --total-steps 300000000, log scratchpad/ppo_run82.log; pinned config
+  verified (n_epochs 6, lr 3e-5, target_kl 2.0, 500k, ent 0.0039,
+  ent_kick_power_only_weight 4, dir reg 0.1, no distill anchor). Monitoring:
+  checkpoints, evals, per-head KL, kappa lines; spreads per checkpoint
+  (spreads.py), report every other checkpoint in the full format.
