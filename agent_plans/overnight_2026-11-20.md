@@ -975,3 +975,20 @@ don't need the lower LR").
   the rules side, which is actually what specialisation predicts.
   Untested which shots; the all-neural game (neural defender) is
   unaffected. No change.
+- 09:33 watchdog (run66): healthy, 196 checkpoints, global step 4,076.4M
+  (run66 ~98M), no errors, 0 early stops, max last hour move_dir KL
+  0.015, kick_dir 0.068; kappa log 5.562 (~260, flat). Training
+  (20-update blocks 161-180 / 181-196): value 0.382 / 0.362 (falling), kl
+  0.017 / 0.017, |adv| 1.189 / 1.152. Value RMSE saved 2.364 (660k), goal
+  1.428, defence 2.091, box 0.638.
+  Evals (blocks 171-180 / 181-190 / 191-196): phase-1 57.2% 0.826 / 58.3%
+  0.886 / 58.3% 0.886 (recovered a little); keeper vs rules attacker
+  15.7/35.0 / 14.7/36.2 / 13.8/37.6 (best ever, ckpt 191 13.3/38.3); AI
+  attacker vs neural keeper 62.3/23.0 / 62.2/21.1 / 63.4/19.3 (ckpt 195
+  65.2/17.4); all_neural raw 52.4/24.0 / 53.6/24.3 / 54.5/21.1;
+  attacker_vs_rules ~78.5 (flat); defender_vs_rules ~8% (flat).
+  Running a single-process cross-play probe (scratchpad/crossplay_probe.py:
+  attacker_vs_ai_keeper with attacker and keeper from different
+  checkpoints). Plumbing check ckpt195 vs ckpt195: 65.9/17.2/14.1 vs logged
+  65.2/17.4/14.3 (within ~1 point; residual likely batched-vs-sequential
+  RNG streams). Pairs 133/133, 195/133, 133/195 in progress.
