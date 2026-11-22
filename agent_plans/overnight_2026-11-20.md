@@ -1357,3 +1357,18 @@ don't need the lower LR").
   / switches, possibly teacher chatter). Suggested: judge by behaviour + log
   a tail-robust KL (median / 95%-trimmed) next to the mean; user to decide
   the gate. Untested: whether the tail matters for play.
+- 2026-11-22 23:15: run79 (2 epochs, lr 5e-5) cycles 1-3 held-out before
+  fit p1 real 1.06 1.07 1.01, p2 0.49 0.36 0.36, cf p1 1.74 1.63 1.63, cf p2
+  1.61 1.49 1.47. User: gate refined (behaving as well as the teachers at a
+  matched power sigma is enough; keep refitting while cf falls; no PPO
+  without the user's yes, keep refitting if no reply).
+  BEHAVIOUR CHECK run79 cycle 3 at power sigma 0.10 (seeded, batched):
+  phase 1 vs rules 1.167 / 63.3% / 6 misses (763 1.331 / 66.2% / 0);
+  h2h vs 763 mean_rew +0.036 (sem 0.091) / win 43.4% (run69 -0.175 / 40.8%,
+  run70 c6 -0.202 / 40.5%) -> mean-reward parity with 763 head to head;
+  attacker_vs_ai_keeper goal 62.8 / saved 20.4 (run66 61.3 / 21.1);
+  goalkeeper_vs_rules goal 13.9 / saved 37.8 (run66 13.5 / 38.5).
+  Config: counterfactual_weight 0.2 -> 0.3 (user, 'tune up as we go'),
+  rollout_steps 650k -> 600k (user: some swapping). label_smoothing is 1e-5
+  (Bernoulli targets), bc_label_smoothing 0.01 (unused, role_bc off).
+  run80 from run79 cycle 3; pinned config verified.
