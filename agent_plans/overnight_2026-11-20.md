@@ -1309,3 +1309,23 @@ don't need the lower LR").
   epochs 3, lr 7e-5, holdout 0.1, from run74 cycle 1; pinned config
   verified. Two changes at once (epochs + lr), so per-change attribution is
   lost; the held-out curve per epoch is the readout.
+- 2026-11-22 22:22: run76 (epochs 3, lr 7e-5) held-out p1 real: c1 0.936 ->
+  0.932 / 0.940 / 0.922 per epoch; c2 0.922 -> 0.930 / 0.927 / 0.946; c3
+  before 0.943 -> flat within and across cycles (watch: plateau?). Stopped
+  after cycle 2 for the power-sigma sweep.
+  POWER SIGMA SWEEP (run76 cycle 2, only kick_power_log_std changed,
+  scratchpad/set_spread.py; seeded batched; p1 920 eps, p2 460):
+  sigma 0.425 / 0.25 / 0.10 -> p1 vs rules mean_rew 0.759 / 0.994 / 1.144
+  (sem ~0.09), win 57.5 / 60.7 / 62.8%, MISSES 51 / 25 / 3;
+  attacker_vs_rules goal 74.6 / 75.2 / 75.2; attacker_vs_ai_keeper 58.7 /
+  57.2 / 63.3. => the phase-1 misses were KICK POWER NOISE (student 0.425 vs
+  763's 0.10), not lost phase-1 behaviour; at 0.10 phase 1 is 1.144 / 62.8% /
+  3 vs 763's 1.331 / 66.2% / 0, phase 2 unhurt. (Kick aim was ruled out
+  earlier by the kappa sweep.) Sigma had grown 0.25 -> 0.425 in phase-2 PPO
+  under ent_kick_power_only_weight 12.
+  Decision: play-time (evals + PPO) power sigma 0.10, set at the PPO launch
+  (+ lower ent_kick_power_only_weight). The refit keeps 0.425 for its loss
+  scale (spreads are frozen there; at 0.10 the power KL would be ~18x
+  sharper, ~0.85/row in phase 1, dominated by saturated-tail differences).
+  Evaluate refit checkpoints with a 0.10 copy. run77 = run76 config from
+  run76 cycle 2.
