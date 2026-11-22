@@ -1281,3 +1281,10 @@ don't need the lower LR").
   refit config, 50/50, from the rescaled checkpoint; pinned config verified
   (reg 0.1). Watch: raw norms per cycle (scratchpad/norm_check.py) and
   whether phase-1 move_dir fresh KL falls faster than run72's.
+- 2026-11-22 21:20: TODO at the first PPO run after the refit (user): check
+  that direction_mag_reg_coef 0.1 holds the raw norms near 1 without hurting
+  learning over small deviations. Per checkpoint: raw-norm p5/p50/p95, the
+  reg term against the policy loss (add a log line if needed), the
+  direction-group gradient clip rate (was 100% clipped in run65/66; shorter
+  vectors give larger direction gradients), move_dir per-head KL. Lower the
+  coefficient (0.03 / 0.01) if learning looks hurt.
