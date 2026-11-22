@@ -1396,3 +1396,19 @@ don't need the lower LR").
   Plan (user): no more restarts; run81 runs its 12 cycles, then full
   behaviour evals at power sigma 0.10, then continue (run82, same config).
   Restarts reset the refit's Adam + its 500-step warmup (~1 cycle each).
+- 2026-11-23 00:30: run81 done (12 cycles; paired vs reference run79 c3,
+  whole rollout at c12 start: cf p1 -0.126, cf p2 -0.078, real p1 -0.005,
+  real p2 +0.046 -- a real phase-2 real-row drift over c7-c12, mostly
+  move/kick dir; held-out after c12: cf -0.147 / -0.115, real -0.030 /
+  +0.020). User: evaluate DETERMINISTICALLY (modes / means, so spreads play
+  no part; evals_batched.py --det, own worker entry around
+  run_seeded_evaluation_batched(deterministic=True), partial(_sample_action,
+  deterministic=True) for role evals / cross-play), and if it looks okay
+  start PPO. Phase 1 (det, cycle 12): vs rules 1.438 (sem 0.084) / 68.0% / 0
+  misses; 763 1.384 / 67.8% / 0; run66 1.048 / 60.9% / 8. h2h vs 763 +0.121
+  (sem 0.092) / 45.7%; vs run66 +0.535 / 50.9% (763 vs run66 +0.666 /
+  54.1%) -> PHASE 1 PASSES. Phase 2 + cross-play running (c12 then c7).
+  PPO prepared: phase mix 35/65, 300M, fresh dir, n_epochs 6,
+  ent_kick_power_only_weight 4, dir reg 0.1, no ppo distill anchor; spreads
+  start at kick kappa 300 / power sigma 0.2 / move kappa 265. Per-checkpoint
+  spread tracking: scratchpad/spreads.py. Hourly cron updated for the night.
