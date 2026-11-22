@@ -1076,3 +1076,28 @@ don't need the lower LR").
   eval vs rules, single process: 763 = 53.7% / reward 0.62 (920 eps) --
   weaker than run66's ~59% / 0.93; run60 checkpoint_start and run66 latest
   in progress; then a seeded head-to-head between them.
+
+## run66 -> refit run67 (2026-11-22 ~13:43-15:35)
+
+- run66 stopped at the user's request after checkpoint241.pt (13:43;
+  taskkill /T on PID 28840, verified gone).
+- Teacher choice: evaluate.py's phase-1 eval uses the TRAINING env
+  (opponent mix 1 rules : 3 self-play), so its numbers (763 53.7% / 0.62,
+  run60 start 51.7 / 0.53, run66 ckpt237 48.4 / 0.39) were mostly
+  self-play -- retracted. Re-ran with the trainer's own vs-rules env
+  (scratchpad/p1_teachers.py), fully seeded, 920 eps each, in parallel:
+    vs rules: 763 1.337 / 65.8%; run60 checkpoint_start 1.140 / 63.0%;
+              run66 ckpt241 0.886 / 58.7% (logged ckpt240 0.941 / 59%).
+    head-to-head (A's reward / win): run60 vs 763 -0.030 / 42.2%;
+              763 vs run66 0.763 / 55.4%; run60 vs run66 0.500 / 50.4%.
+  -> 763 is the best phase-1 net on every measure.
+- Refit run67 launched 15:33 (user: go): student run66 ckpt241, teachers
+  {1: 763, 2: run66 ckpt241}, counterfactual 0.2 without keeper rows, role
+  BC off, 10 cycles x 370k steps x 12 epochs (commit 3429ba6; pinned config
+  verified). Cycle-1 before: phase 1 real KL 24.1 (kick_dir 16.8, move_dir
+  5.0; move_dir err 8.1 deg), phase 1 cf 94.0 (kick_dir 70.3), phase 2
+  real/cf 0.0002. Kick-dir KL is large partly by scale (student kick kappa
+  ~900, KL ~ kappa*dtheta^2/2). Capacity read: does phase-1 KL fall while
+  phase-2 KL stays small?
+- User (busy today): proceed through the agreed plan without waiting for
+  okays if everything looks right.
