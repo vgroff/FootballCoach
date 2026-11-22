@@ -1240,3 +1240,18 @@ don't need the lower LR").
   1630 / 600 / 300 running (phase 1 vs rules; p2 attacker_vs_rules,
   attacker_vs_ai_keeper, goalkeeper_vs_rules). Then run72 = same refit
   config from the chosen kappa copy.
+- 2026-11-22 20:40: kick kappa sweep on run71 cycle 6 (seeded, batched;
+  p1 920 eps, p2 460 per spec). kappa 1630 / 600 / 300:
+  p1 vs rules mean_rew 0.828 / 0.772 / 0.785 (sem 0.094), win 59.0 / 58.3 /
+  58.3, misses 50 / 49 / 47 -> no phase-1 effect; the phase-1 misses are NOT
+  a kick-aim-precision problem (retires that hypothesis).
+  attacker_vs_rules goal 76.1 / 76.3 / 73.3, off target 2.0 / 2.2 / 3.7;
+  attacker_vs_ai_keeper goal 60.0 / 57.4 / 55.0, off target 2.0 / 2.6 / 4.6
+  (monotone; ~-5 pts at 300, SE ~2.3) -> precision IS worth something vs
+  a neural keeper, so the kappa rise in phase-2 PPO is partly a real signal,
+  not only weak entropy. goalkeeper_vs_rules identical for all three.
+  Chose 300 (user: be loose, it re-tightens in PPO): kick_dir KL loss scale
+  /5.4. Launched run72 = same refit config, 50/50, from
+  checkpoints/phase2_run71/checkpoint_pretrained_cycle6_kick300.pt; pinned
+  config verified; per-cycle checkpoint copies on. Note: kick_dir KL now
+  falls ~5.4x mechanically -- report aim error in degrees alongside.
