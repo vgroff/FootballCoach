@@ -1147,3 +1147,15 @@ don't need the lower LR").
   (phase-1 fresh kick_dir KL ~1.1 = ~8 deg per kick at kappa ~900) -> many
   more misses; mean KL hides it (kicks ~10% of rows). Holding: no PPO,
   waiting for the user before a kick-weighted refit / quantile probe.
+- 17:5x Head-to-heads for run69: vs 763 -0.175 / 40.8% (763 wins 51.4%);
+  vs run66 ckpt241 +0.240 / 47.4% (run66 41.8%). Phase-1 'miss' = ball out
+  of bounds with a last toucher (penalised -4.5): 49 for the refit vs rules
+  vs 13 run66 / 1 for 763 -- ~-0.24 reward, about the whole drop.
+- User: always use the batched/parallel eval path with the configured
+  params (saved as a feedback memory); keep refitting until the KL is low;
+  don't re-weight the loss heads unless it really isn't converging, then
+  gently. -> Refit run70: continues run69's final checkpoint, identical
+  loss / lr 1e-4 / 650k / 10 epochs / aggregate 2, 12 cycles (338ae42);
+  pinned config verified. New fast probe scratchpad/evals_batched.py
+  (trainer's batched factories, eval_n_parallel_workers 16,
+  eval_envs_per_process 30); not run next to the refit (WinError 1450 risk).
