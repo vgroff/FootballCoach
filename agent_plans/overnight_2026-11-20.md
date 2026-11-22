@@ -992,3 +992,22 @@ don't need the lower LR").
   checkpoints). Plumbing check ckpt195 vs ckpt195: 65.9/17.2/14.1 vs logged
   65.2/17.4/14.3 (within ~1 point; residual likely batched-vs-sequential
   RNG streams). Pairs 133/133, 195/133, 133/195 in progress.
+- 09:45 CROSS-PLAY RESULT (scratchpad/crossplay_probe.py, single process,
+  attacker_vs_ai_keeper spec = neural attacker / rules defender / neural
+  keeper, same 460 seeded episodes):
+    attacker 133 vs keeper 133: goal 55.9 / saved 32.6 (logged 54.6/32.4)
+    attacker 195 vs keeper 133: goal 68.0 / saved 15.7
+    attacker 133 vs keeper 195: goal 49.3 / saved 37.0
+    attacker 195 vs keeper 195: goal 65.9 / saved 17.2 (logged 65.2/17.4)
+  Reading (tested): BOTH improved. The ckpt-195 keeper saves MORE than the
+  ckpt-133 keeper against the same old attacker (37.0 vs 32.6), and
+  against the new attacker too (17.2 vs 15.7) -- no keeper regression.
+  The ckpt-195 attacker beats both keepers by much more (+12 goals vs the
+  old keeper) -- it has improved a lot against neural keepers, while
+  scoring less against the rules keeper (81 -> 78%). So the falling
+  "AI attacker vs AI keeper" save rate is the attacker outpacing the
+  keeper, not the keeper getting worse; the attacker's gain is specific to
+  neural-keeper weaknesses (shared by old and new keeper), not general.
+  Refines the 08:33 note: not exploitation of the CURRENT keeper only --
+  of neural keepers generally. Plumbing check: logged vs probe within ~1
+  point on both self-pairs. No change.
