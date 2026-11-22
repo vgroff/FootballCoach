@@ -847,3 +847,17 @@ don't need the lower LR").
   defender_vs_rules ~7.7% (flat); phase-1 59.2% 0.934 / 59.8% 0.955 /
   59.5% 0.942 (holding ~59.5%, no longer easing). Keeper on a clear
   upswing in both keeper evals; no change.
+- 02:33 watchdog (run66): healthy, 119 checkpoints, global step 4,038.4M
+  (run66 ~60M), no errors, 0 early stops, max move_dir KL last hour
+  0.024, kappa log 5.596 (~269).
+  Training (20-update blocks 81-100 / 101-120): value 0.400 / 0.400, kl
+  0.024 / 0.021, |adv| 1.218 / 1.221 (steady). Value RMSE saved 2.294
+  (720k), goal 1.525 (2.18M), defence 2.134, box 0.650.
+  Evals (blocks 91-100 / 101-110 / 111-119): keeper vs rules attacker
+  17.5/31.4 / 16.5/33.5 / 16.4/33.9 (best 15.9/34.6 at ckpt 115); AI
+  attacker vs neural keeper 57.4/25.8 / 54.5/28.6 / 54.9/27.9; all_neural
+  raw 50.9/23.6 / 51.9/22.6 / 51.2/23.7 (ckpt 117 share 50.3/27.6/22.1 =
+  lowest scored of run65+66); attacker_vs_rules 82.7 / 83.9 / 85.0 (still
+  rising); defender_vs_rules ~7.6-8.0%; phase-1 59.8% 0.955 / 59.4%
+  0.936 / 59.1% 0.939 (holding ~59-60%). 01:4x all-neural save dip (ckpts
+  109-111 ~20.8%) recovered by 113. No change.
