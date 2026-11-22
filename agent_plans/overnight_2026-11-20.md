@@ -1038,3 +1038,7 @@ don't need the lower LR").
   (flat -- the gap stopped widening); all_neural raw 54.1/21.3 / 52.9/23.7
   / 54.9/21.4; attacker_vs_rules 78.6 / 79.0 / 79.6; defender_vs_rules
   ~8.2%. No change.
+- 12:0x User: let the self-play arms race continue ("not expected to be
+  perfectly stable learning") -- no shot-breakdown probe, no change.
+  Phase-1 teacher KL stays parked (phase 1 recovered to 59.6% / 0.96 on
+  its own).
