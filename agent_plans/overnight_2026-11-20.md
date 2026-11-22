@@ -1042,3 +1042,16 @@ don't need the lower LR").
   perfectly stable learning") -- no shot-breakdown probe, no change.
   Phase-1 teacher KL stays parked (phase 1 recovered to 59.6% / 0.96 on
   its own).
+- 12:33 watchdog (run66): healthy, 228 checkpoints, global step 4,092.5M
+  (run66 ~114M), no errors, 0 early stops, max last hour move_dir KL
+  0.020, kick_dir 0.076; kappa log 5.570 (~262). Training (20-update
+  blocks 181-200 / 201-220 / 221-228): value 0.360 / 0.349 / 0.353, kl
+  0.017 / 0.016 / 0.018, |adv| 1.150 / 1.122 / 1.119. Value RMSE saved
+  2.321 (629k), goal 1.434, defence 2.049, box 0.615.
+  Evals (blocks 201-210 / 211-220 / 221-228): phase-1 58.5% 0.891 / 59.5%
+  0.947 / 59.0% 0.926; keeper vs rules attacker 14.0/37.3 / 14.4/37.2 /
+  14.4/37.2 (flat at best); AI attacker vs neural keeper 64.8/19.8 /
+  64.0/19.4 / 66.2/17.9; all_neural raw 52.9/23.7 / 55.2/20.5 / 56.0/17.9
+  (keeper saves falling there too); attacker_vs_rules 79.0 / 79.7 / 81.2
+  (rising again); defender_vs_rules 8.4 / 8.2 / 9.0%. Self-play race
+  continuing per the user; no change.
