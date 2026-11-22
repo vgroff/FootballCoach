@@ -1227,3 +1227,16 @@ don't need the lower LR").
   Proposal (gentle, per the agreed rule): if cycle 7 fresh does not recover,
   run72 = same config with lr 1e-4 -> 5e-5 from the best saved run71
   checkpoint.
+- 2026-11-22 20:35: user: kick kappa 1630 is huge -> reset it for smoother
+  refit (fewer epochs also allowed; "be a bit loose" on eval cost, it
+  re-tightens fast in PPO; maybe higher kick entropy during PPO later --
+  note: ent_kick_dir_azimuth_only_weight is already 5 and kappa still rose
+  110 -> 1630, so either entropy is too weak or precision is really rewarded
+  in phase 2; the kappa eval sweep is evidence on which). run71 cycle 6
+  checkpoint fresh (cycle 7 before): p1 1.48, p2 0.66 (better than cycle 5's
+  1.83 / 0.86). Stopped run71 in cycle 7 (own tree only). Made
+  checkpoint_pretrained_cycle6_kick600.pt / _kick300.pt (only
+  kick_dir_log_kappa changed; scratchpad/set_kick_kappa.py). Eval sweep
+  1630 / 600 / 300 running (phase 1 vs rules; p2 attacker_vs_rules,
+  attacker_vs_ai_keeper, goalkeeper_vs_rules). Then run72 = same refit
+  config from the chosen kappa copy.
