@@ -949,3 +949,29 @@ don't need the lower LR").
   52.5/24.4 / 50.5/27.9 (ckpts 163-171 share ~29-30% saves, best sustained
   level); defender_vs_rules ~8.2%. No change; the ball-carrying question
   stays with the user.
+- 08:33 watchdog (run66): healthy, 185 checkpoints, global step 4,070.9M
+  (run66 ~92M), no errors, 0 early stops, max last hour move_dir KL
+  0.033, kick_dir 0.068; kappa log 5.562 (~260). Training (20-update
+  blocks 141-160 / 161-180 / 181-185): value 0.388 / 0.382 / 0.365
+  (falling), kl 0.015 / 0.017 / 0.020, |adv| 1.205 / 1.189 / 1.156.
+  Value RMSE saved 2.326 (712k), goal 1.471, defence 2.085, box 0.640.
+  Evals (blocks 141-150 / 151-160 / 161-170 / 171-180 / 181-185):
+  phase-1 58.5% 0.886 / 57.4 0.831 / 57.4 0.836 / 57.2 0.826 / 58.0 0.872;
+  keeper vs rules attacker 15.2/35.2 / 15.7/34.4 / 15.7/34.7 / 15.7/35.0
+    / 15.3/35.3 (flat at its best);
+  AI attacker vs neural keeper 58.3/26.9 / 59.9/23.7 / 59.7/24.7 /
+    62.3/23.0 / 62.4/21.5;
+  attacker_vs_rules 81.1 / 79.2 / 78.4 / 78.5 / 77.9;
+  all_neural raw 53.7/22.8 / 52.5/24.4 / 50.5/27.9 / 52.4/24.0 / 52.4/25.3;
+  defender_vs_rules ~8.3%.
+  Re-test of the AI-attacker-vs-keeper split: the neural attacker scores
+  MORE vs the neural keeper (58.3 -> 62.4) while scoring LESS vs the
+  rules keeper (81.1 -> 77.9), and the keeper is flat vs the rules
+  attacker. A general attacker gain would raise both; a general keeper
+  loss would show vs the rules attacker. Neither -- so this is the
+  attacker specialising against the NEURAL keeper (self-play
+  exploitation). CORRECTION: this reinstates the exploitation reading I
+  retracted at 06:33; the retraction relied on the attacker weakening vs
+  the rules side, which is actually what specialisation predicts.
+  Untested which shots; the all-neural game (neural defender) is
+  unaffected. No change.
