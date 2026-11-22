@@ -1125,3 +1125,25 @@ don't need the lower LR").
   OOM); try different LRs. Relaunched as refit run69 from run68 cycle 2:
   lr 1e-4, epochs 10, rollout_steps 650k, aggregate_cycles 2 (keep RAM near
   the old ~1.9M rows), 6 cycles (fa53687); pinned config verified.
+- 17:31 refit run69 done (checkpoints/phase2_run69/checkpoint_pretrained.pt).
+  Per cycle real KL (fresh / after): phase 1 2.58/1.87, 2.21/1.78,
+  2.26/1.72, 2.05/1.60, 2.02/1.57, 2.39/1.70; phase 2 0.85/0.50, 0.65/0.93,
+  1.11/0.70, 0.78/0.64, 0.92/0.47, 0.61/0.53. Last-cycle real by head:
+  phase 1 fresh kick_dir 1.11, move_dir 0.89 (after 0.61 / 0.74); phase 2
+  fresh kick_dir 0.31, move_dir 0.23. Bigger rollouts (650k) broke the
+  ~2.8 fresh plateau; no capacity trade-off seen.
+- User (17:4x): no PPO distill anchor (avoid the complication); prefer
+  driving the refit KLs below ~0.3 if achievable; wins + reward close to
+  the teachers is what matters. User agrees move_dir at kappa ~300 with KL
+  ~0.9 (~5 deg RMS) is still significant.
+- Seeded evals (parallel per job, sequential per episode -- slow; switch to
+  the batched/parallel eval path next time): PHASE 1 NOT RESTORED --
+  refit vs rules mean reward 0.743 / 57.3% (763 1.337 / 65.8%; run66
+  ckpt241 0.886 / 58.7%), misses 49 vs 13 (run66) vs 1 (763). Phase 2
+  mostly kept: keeper vs rules 14.6/37.0 (run66 13.5/38.5); AI attacker vs
+  keeper 61.1/23.7 (61.3/21.1); all-neural 52.8/25.2/18.3 (61.3/20.2/16.5);
+  attacker_vs_rules 76.3 (79.3); defender_vs_rules 7.4 (8.7).
+  Hypothesis (untested): 763's decisions transferred but not its kick aim
+  (phase-1 fresh kick_dir KL ~1.1 = ~8 deg per kick at kappa ~900) -> many
+  more misses; mean KL hides it (kicks ~10% of rows). Holding: no PPO,
+  waiting for the user before a kick-weighted refit / quantile probe.
