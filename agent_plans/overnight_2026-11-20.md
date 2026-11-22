@@ -1372,3 +1372,13 @@ don't need the lower LR").
   rollout_steps 650k -> 600k (user: some swapping). label_smoothing is 1e-5
   (Bernoulli targets), bc_label_smoothing 0.01 (unused, role_bc off).
   run80 from run79 cycle 3; pinned config verified.
+- 2026-11-22 23:27: run80 (cf 0.3, 600k) cycles 1-3 held-out before fit p1
+  real 0.98 1.00 1.03, p2 0.39 0.34 0.37, cf p1 1.66 1.57 1.59, cf p2 1.60
+  1.76 1.54 (noisy, no clear trend yet). ppo.n_epochs 10 -> 6 for the next
+  PPO launch (user; PPO val sets judged a poor measure, use evals).
+  New (user's idea): frozen reference model (distill_pretrain
+  holdout_reference, 9089573) scored every cycle on the SAME rows as the
+  live student -- whole fresh rollout before the fit (all rows) + held-out
+  after the last epoch -- with current-minus-reference lines. Reference =
+  run79 cycle 3 (run80's start). run81 from run80 cycle 3; pinned config
+  verified.
