@@ -85,6 +85,43 @@ def test_copies_real_and_counterfactual(trainer):
     assert len(off["returns"]) == N and not bool(off["is_cf"].any())
 
 
+def _mark_goalkeepers(b, rows):
+    import dataclasses
+    from footballcoach.ai.obs.schema import PlayerFeatures
+    col = [f.name for f in dataclasses.fields(PlayerFeatures)].index("is_goalkeeper")
+    b["self_feat"][:, col] = 0.0
+    b["self_feat"][rows, col] = 1.0
+    return b
+
+
+def test_counterfactual_rows_skip_the_goalkeeper(trainer):
+    """counterfactual_skip_goalkeeper: keeper rows keep their real copy (and its
+    value target) but get no task-id-swapped copy; every other row gets one."""
+    b = _mark_goalkeepers(_obs(trainer), [4, 5])      # two phase-2 rows are keepers
+    assert dp.goalkeeper_rows(b).tolist() == [False] * 4 + [True] * 2
+    ret = torch.arange(N, dtype=torch.float32)
+    data = dp.build_copies(b, ret, (1, 2), True, 0.2, counterfactual_rows=~dp.goalkeeper_rows(b))
+    real, cf = ~data["is_cf"], data["is_cf"]
+    assert int(real.sum()) == N and int(cf.sum()) == N - 2
+    assert data["returns"][real].tolist() == ret.tolist()            # real rows first, in order
+    assert data["returns"][cf].tolist() == ret[:4].tolist()
+    assert not bool(dp.goalkeeper_rows(data["obs"])[cf].any())       # no keeper counterfactual
+    assert data["value_w"][cf].tolist() == [0.0] * (N - 2)
+    assert data["kl_w"][cf].tolist() == pytest.approx([0.2] * (N - 2))
+    assert len(data["bc_w"]) == len(data["returns"]) == len(data["bc_labels"])
+
+
+def test_attach_role_bc_sizes_to_all_rows_with_counterfactuals(trainer):
+    """With counterfactual copies the BC tensors cover every row (labels on the
+    real rows only); previously they were sized to the real rows alone."""
+    b = _obs(trainer)
+    data = dp.build_copies(b, torch.zeros(N), (1, 2), True, 0.5)
+    batch = {"bc_labels": torch.ones(N, dp._bc_label_dim())}
+    dp.attach_role_bc(data, batch, {})
+    assert data["bc_labels"].shape[0] == data["bc_w"].shape[0] == 2 * N
+    assert bool((data["bc_labels"][N:] == 0).all())
+
+
 def test_rows_without_either_task_id_are_refused(trainer):
     b = _obs(trainer)
     b["global_feat"][0, distill.task_id_column(1)] = 0.0

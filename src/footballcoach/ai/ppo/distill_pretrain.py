@@ -142,11 +142,24 @@ def _bc_label_dim() -> int:
     return BC_LABEL_DIM
 
 
+def goalkeeper_rows(obs: dict) -> torch.Tensor:
+    """(N,) bool: rows whose OWN player is a goalkeeper (PlayerFeatures.is_goalkeeper)."""
+    import dataclasses
+    from footballcoach.ai.obs.schema import PlayerFeatures
+    col = [f.name for f in dataclasses.fields(PlayerFeatures)].index("is_goalkeeper")
+    return obs["self_feat"][:, col] > 0.5
+
+
 def build_copies(obs: dict, returns: torch.Tensor, phases: tuple[int, int], counterfactual: bool,
-                 counterfactual_weight: float) -> dict:
+                 counterfactual_weight: float, counterfactual_rows: Optional[torch.Tensor] = None) -> dict:
     """The rows to fit: the real copy (own phase, value target) and, if on,
     the task-id-swapped copy. Returns {"obs", "returns", "target_phase",
-    "value_w", "kl_w", "is_cf"}; every row must carry one of ``phases``' task ids."""
+    "value_w", "kl_w", "is_cf"}; every row must carry one of ``phases``' task ids.
+
+    ``counterfactual_rows``: optional (N,) bool, which rows get a counterfactual
+    copy (None = all). Real copies come first, then the counterfactual ones,
+    so the first ``(~is_cf).sum()`` rows are always the real rollout rows in
+    order. Counterfactual copies never carry a value target (value_w = 0)."""
     from footballcoach.ai.ppo.distill import phase_row_mask
     pa, pb = phases
     in_a, in_b = phase_row_mask(obs["global_feat"], pa), phase_row_mask(obs["global_feat"], pb)
@@ -155,22 +168,28 @@ def build_copies(obs: dict, returns: torch.Tensor, phases: tuple[int, int], coun
     real_phase = torch.where(in_a, torch.full_like(in_a, pa, dtype=torch.long), torch.full_like(in_a, pb, dtype=torch.long))
     n = len(returns)
     parts = [(obs, real_phase, torch.ones(n), torch.ones(n), torch.zeros(n, dtype=torch.bool))]
+    cf_idx = None
     if counterfactual:
-        cf_obs = dict(obs)
-        cf_obs["global_feat"] = swap_task_ids(obs["global_feat"], pa, pb)
-        other = torch.where(real_phase == pa, torch.full_like(real_phase, pb), torch.full_like(real_phase, pa))
-        parts.append((cf_obs, other, torch.zeros(n), torch.full((n,), float(counterfactual_weight)),
-                      torch.ones(n, dtype=torch.bool)))
+        cf_idx = (torch.arange(n) if counterfactual_rows is None
+                  else torch.nonzero(counterfactual_rows.bool()).squeeze(-1))
+        m = len(cf_idx)
+        cf_obs = {k: v[cf_idx] for k, v in obs.items()}
+        cf_obs["global_feat"] = swap_task_ids(cf_obs["global_feat"], pa, pb)
+        own = real_phase[cf_idx]
+        other = torch.where(own == pa, torch.full_like(own, pb), torch.full_like(own, pa))
+        parts.append((cf_obs, other, torch.zeros(m), torch.full((m,), float(counterfactual_weight)),
+                      torch.ones(m, dtype=torch.bool)))
+    total = sum(len(p[1]) for p in parts)
     return {
         "obs": {k: torch.cat([p[0][k] for p in parts]) for k in obs},
-        "returns": torch.cat([returns] * len(parts)),
+        "returns": torch.cat([returns] + ([returns[cf_idx]] if cf_idx is not None else [])),
         "target_phase": torch.cat([p[1] for p in parts]),
         "value_w": torch.cat([p[2] for p in parts]),
         "kl_w": torch.cat([p[3] for p in parts]),
         "is_cf": torch.cat([p[4] for p in parts]),
         # Role BC (attach_role_bc): none by default.
-        "bc_w": torch.zeros(n * len(parts)),
-        "bc_labels": torch.zeros(n * len(parts), _bc_label_dim()),
+        "bc_w": torch.zeros(total),
+        "bc_labels": torch.zeros(total, _bc_label_dim()),
     }
 
 
@@ -357,14 +376,18 @@ def attach_role_bc(data: dict, batch: dict, role_bc: dict) -> None:
     from footballcoach.ai.obs.canonical import canonicalize_bc_labels, x_sign_of
     from footballcoach.ai.ppo.bc import BC_LABEL_DIM
     from footballcoach.ai.ppo.bc_sources import source_id
-    n = len(data["returns"])
+    total = len(data["returns"])
+    is_cf = data.get("is_cf")
+    n = total if is_cf is None else int((~is_cf).sum())     # the real rows come first (build_copies)
     labels = batch.get("bc_labels")
-    data["bc_labels"] = (canonicalize_bc_labels(labels.float(), x_sign_of(data["obs"]["self_feat"][:n]))
-                         if labels is not None and len(labels) == n
-                         else torch.zeros(n, BC_LABEL_DIM))
-    data["bc_w"] = torch.zeros(n)
+    data["bc_labels"] = torch.zeros(total, BC_LABEL_DIM)
+    if labels is not None and len(labels) == n:
+        data["bc_labels"][:n] = canonicalize_bc_labels(labels.float(), x_sign_of(data["obs"]["self_feat"][:n]))
+    data["bc_w"] = torch.zeros(total)
     if not role_bc:
         return
+    if total != n:
+        raise ValueError("distill_pretrain role_bc: needs counterfactual off")
     src = batch.get("bc_sources")
     if src is None or len(src) != n:
         raise ValueError("distill_pretrain role_bc: the rollout carries no per-row BC sources")
@@ -467,6 +490,7 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
              f"role-BC loss overrides {overrides}), "
              f"label_smoothing={cfg['label_smoothing']}, "
              f"counterfactual_kick_only_phases={list(cfg['counterfactual_kick_only_phases'])}, "
+             f"counterfactual_skip_goalkeeper={bool(cfg.get('counterfactual_skip_goalkeeper'))}, "
              f"aggregate_cycles={cfg['aggregate_cycles']}, counterfactual={cfg['counterfactual']} "
              f"(weight {cfg['counterfactual_weight']}), kl_coef={cfg['kl_coef']}, value_coef={cfg['value_coef']}, "
              f"{cfg['num_rollouts']} cycle(s) x {cfg['rollout_steps']} steps x {cfg['epochs']} epoch(s), lr={cfg['lr']} "
@@ -485,7 +509,9 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
             log.info("  [distill pretrain] rollout: " + composition(obs, batch.get("track_ids"), phases, _stats))
             returns = batch["returns"].float()
             ret_std = float(returns.std().clamp(min=1.0))
-            data = build_copies(obs, returns, phases, bool(cfg["counterfactual"]), float(cfg["counterfactual_weight"]))
+            cf_rows = ~goalkeeper_rows(obs) if cfg.get("counterfactual_skip_goalkeeper") else None
+            data = build_copies(obs, returns, phases, bool(cfg["counterfactual"]), float(cfg["counterfactual_weight"]),
+                                counterfactual_rows=cf_rows)
             attach_role_bc(data, batch, role_bc)
             del batch, obs
             data["anchor"] = smooth_bernoulli_targets(
