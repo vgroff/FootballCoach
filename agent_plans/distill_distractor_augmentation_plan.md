@@ -1,7 +1,13 @@
 # Distill refit: distractor-player augmentation (invariance teaching)
 
 Status: idea from the user, 2026-11-22. Not implemented. To be tried if the
-distill refit really hits a wall before the user decides on PPO.
+distill refit really hits a wall before the user decides on PPO; tell the user
+when starting it.
+
+Scope (user, 2026-11-22): a phase-2 attacking-phase tool only, used where
+the extra players are certainly irrelevant. It is NOT for 5v5 or any
+cooperative phase: there far players matter (passing, support), and
+cooperation will be taught there instead.
 
 ## Idea
 
