@@ -1159,3 +1159,11 @@ don't need the lower LR").
   pinned config verified. New fast probe scratchpad/evals_batched.py
   (trainer's batched factories, eval_n_parallel_workers 16,
   eval_envs_per_process 30); not run next to the refit (WinError 1450 risk).
+
+- 2026-11-22 18:20: run70 counterfactual KL (fresh -> fitted) sits ~2.0-2.4
+  (move_dir ~1.2-1.4, kick_dir ~0.4-0.7), only ~0.1-0.2 off per fit vs ~0.45
+  for real phase-1 rows. Not yet known how much of the teacher-vs-teacher gap
+  that represents (probe: KL(763 || run66) on the cf states + student shift on
+  task-id swap; run after the refit, not next to it). User decision: keep
+  counterfactual_weight 0.2 for now as a regulariser, raise it later as the
+  main (real-row) fit improves.
