@@ -1171,3 +1171,22 @@ don't need the lower LR").
   counterfactual KL < 0.6 (measured on the FRESH rollout, i.e. the cycle's
   "before" numbers, the honest generalisation metric). Status at cycle 3
   fresh: phase 1 real 1.93, phase 2 real 0.65, cf 2.30 / 2.39.
+- 2026-11-22 18:50: run70 phase-1 FRESH real KL stalled: 1.90, 1.89, 1.93,
+  1.71, 1.83 over cycles 1-5 (fitted 1.45-1.51 -> 1.41). Metric audit:
+  * Refuted: "KL has an untrainable spread-mismatch floor". The report and
+    the loss both score teacher means at the STUDENT's spreads
+    (anchor_globals = student globals_, distill_pretrain.py:293/344), so
+    the KL is means-only.
+  * Found: shared global spreads differ a lot between teachers. Student (and
+    run66) move kappa 265, kick kappa 1630; 763 move kappa 1000, kick kappa
+    110. So phase-1 kick_dir KL ~0.7 at kappa 1630 is RMS aim error ~1.7 deg
+    (approximation KL ~ kappa*d^2/2), against 763's own ~5.5 deg sampling
+    spread; scored at 763's kappa it would be ~0.05. Move_dir 0.77 at kappa
+    265 is RMS ~4.4 deg; at 763's kappa it would be ~2.9. So phase-1 move_dir
+    is the substantive gap; kick_dir looks inflated by the student's
+    phase-2-driven kick kappa.
+  * Weakens (does not disprove) the earlier untested hypothesis that the
+    phase-1 misses come from kick aim: RMS 1.7 deg is small vs 763's spread,
+    but a systematic bias on rare edge-of-pitch kicks would not show in RMS.
+  * RAM: refit process 16.5 GB, 4.3 GB free of 31 GB, so raising
+    aggregate_cycles (more data per fit) would risk OOM; not an option.
