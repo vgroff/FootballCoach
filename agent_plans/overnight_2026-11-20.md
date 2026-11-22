@@ -891,3 +891,22 @@ don't need the lower LR").
   first < 50% of run65+66); attacker_vs_rules 85.0 / 84.3 / 82.3;
   defender_vs_rules ~7.7%; phase-1 59.1% 0.940 / 59.3% 0.920 / 58.5%
   0.886 (a lower block; 141-142 back at 59.5% 0.942). No change.
+- 05:33 watchdog (run66): healthy, 152 checkpoints, global step 4,054.4M
+  (run66 ~76M), no errors, 0 early stops, max last hour move_dir KL
+  0.016, kick_dir 0.054; kappa log 5.573 (~263, steadily loosening from
+  350 at run65 start). Training (20-update blocks 121-140 / 141-152):
+  value 0.396 / 0.388, kl 0.018 / 0.015, |adv| 1.221 / 1.205.
+  FLAG -- phase 1 falling faster: per-eval reward last 12: 0.918 0.965
+  0.876 0.910 0.906 0.877 0.927 0.805 0.882 0.792 0.798 0.700 (win 59 ->
+  55%); blocks 111-120 0.940, 121-130 0.920, 131-140 0.886, 141-150 0.886,
+  151-152 0.749 -- now BELOW the run66 start (58% / 0.835). Self-snapshots
+  43-45%. Same window: attacker_vs_rules 84.3 / 82.3 / 81.1 / 80.0
+  (attacker easing too), AI attacker vs neural keeper scored up (55.6 ->
+  60.2) only because keeper saves fell (29.9 -> 24.5); keeper vs rules
+  attacker at its best (15.2/35.2). So the ball-carrying side (phase 1 +
+  attacker vs rules keeper) is slipping while the keeper improves.
+  Untested hypotheses: (a) cross-phase interference as before; (b) move
+  kappa loosening (350 -> 263, wider move-direction noise) hurting
+  precise ball carrying. Not acting unilaterally (user explicitly accepted
+  phase-1 easing; parked option = phase-1 teacher KL); flagged to the
+  user. No change.
