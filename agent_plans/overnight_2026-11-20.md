@@ -1329,3 +1329,12 @@ don't need the lower LR").
   sharper, ~0.85/row in phase 1, dominated by saturated-tail differences).
   Evaluate refit checkpoints with a 0.10 copy. run77 = run76 config from
   run76 cycle 2.
+- 2026-11-22 22:27: user: the refit SAMPLES its rollouts with the student's
+  spreads, so the play-time sigma should be used there too (DAgger trains on
+  the deployed policy's states). Compromise chosen by the user: power sigma
+  0.2 everywhere (rollouts, loss, evals). Expect the power KL ~4.5x
+  (0.425/0.2)^2, i.e. a MECHANICAL rise of ~+0.16 / row (p1) and ~+0.1 (p2)
+  in every KL number from run78 on. ent_kick_power_only_weight 12 -> 4
+  (PPO-only, 2517a17). run77 cycle 1 (held-out p1 real 1.020 -> 0.993 /
+  0.998 / 1.012, p2 0.421 -> 0.326 / 0.331 / 0.338) -> copy with power
+  sigma 0.2 -> run78; pinned config verified.
