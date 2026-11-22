@@ -1055,3 +1055,24 @@ don't need the lower LR").
   (keeper saves falling there too); attacker_vs_rules 79.0 / 79.7 / 81.2
   (rising again); defender_vs_rules 8.4 / 8.2 / 9.0%. Self-play race
   continuing per the user; no change.
+- 13:36 watchdog (run66): healthy, 240 checkpoints, global step 4,098.5M
+  (run66 ~120M), no errors, 0 early stops, max last hour move_dir KL
+  0.017, kick_dir 0.081; kappa log 5.578 (~264). Training (20-update
+  blocks 201-220 / 221-240): value 0.349 / 0.349, kl 0.016 / 0.017, |adv|
+  1.122 / 1.121 (steady). Evals (blocks 221-230 / 231-239): phase-1 59.0%
+  0.925 / 59.1% 0.923; keeper vs rules attacker 14.3/37.3 / 13.9/37.9 (ckpt
+  233 13.5/38.5 = best save rate); AI attacker vs neural keeper 65.7/18.7 /
+  65.0/20.0; all_neural raw 56.1/18.3 / 55.4/21.6; attacker_vs_rules 81.1 /
+  79.8; defender_vs_rules 9.0 / 8.0%. No change to run66.
+  13:1x-13:3x (user): plan a distill refit with per-phase teachers to test
+  whether the net can hold both behaviours (capacity) and restore phase 1
+  while keeping phase 2: teachers {1: best phase-1 net, 2: run66 latest},
+  counterfactuals on (task id as the discriminator) but NOT for keeper rows
+  (phase 1 has no keeper) -- added opt-in distill_pretrain
+  counterfactual_skip_goalkeeper (e5b0f66; also fixed attach_role_bc
+  sizing its BC tensors to real rows only, which broke with counterfactual
+  copies). Counterfactual copies never train the value head. Teacher
+  candidates (user: just migrated 763 vs the others), fully seeded phase-1
+  eval vs rules, single process: 763 = 53.7% / reward 0.62 (920 eps) --
+  weaker than run66's ~59% / 0.93; run60 checkpoint_start and run66 latest
+  in progress; then a seeded head-to-head between them.
