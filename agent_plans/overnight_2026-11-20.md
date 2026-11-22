@@ -1338,3 +1338,22 @@ don't need the lower LR").
   (PPO-only, 2517a17). run77 cycle 1 (held-out p1 real 1.020 -> 0.993 /
   0.998 / 1.012, p2 0.421 -> 0.326 / 0.331 / 0.338) -> copy with power
   sigma 0.2 -> run78; pinned config verified.
+- 2026-11-22 23:05: run78 (power sigma 0.2, 3 epochs, lr 7e-5) held-out
+  before-fit over 5 cycles: p1 real 0.947 1.116 0.987 1.035 1.014; p2 real
+  0.384 0.420 0.440 0.474 0.362; cf p1 1.69 1.75 1.80 1.65 1.52, cf p2 1.55
+  1.80 1.66 1.56 1.53 (real rows plateau; cf drifting down). Within a
+  cycle epochs moved held-out < 0.04, no consistent direction. (Monitor bug:
+  sed without -u buffered all events -- fixed with sed -u.)
+  User: 2 epochs, lr 5e-5 -> run79 from run78 cycle 5; pinned config
+  verified.
+  TAIL PROBE (scratchpad/tail_probe.py, run78 c5, ~3.4k fresh states per
+  phase, single CPU process): move_dir KL is heavy-tailed -- top 1 / 5 / 10%
+  rows carry 47 / 68 / 78% (p1) and 48 / 69 / 78% (p2) of the mean (0.70 /
+  0.45). Worst 5%: student err 12.2 / 10.3 deg; other 95%: 1.9 / 1.5 deg
+  (KL ~0.15 at kappa 265, already under 0.3). Worst rows sit where the
+  teacher's own direction changes fast step to step (p1 16.4 vs 4.9 deg mean;
+  spearman(err, teacher change) +0.30 p1, +0.14 p2). => the mean-KL gate is
+  mostly a target on a ~5% tail of near-discontinuous teacher states (turns
+  / switches, possibly teacher chatter). Suggested: judge by behaviour + log
+  a tail-robust KL (median / 95%-trimmed) next to the mean; user to decide
+  the gate. Untested: whether the tail matters for play.
