@@ -1304,3 +1304,8 @@ don't need the lower LR").
   of cycle 1 kept); epochs 10 -> 3; run75 from run74 cycle 1; pinned config
   verified. Note: checkpoints since the rescale carry no optimizer state
   (rescale script drops it); the refit uses its own Adam anyway.
+- 2026-11-22 22:10: user: also cut lr a little. run75 stopped mid-rollout
+  (no checkpoint; its dir has only config + log). lr 1e-4 -> 7e-5. run76 =
+  epochs 3, lr 7e-5, holdout 0.1, from run74 cycle 1; pinned config
+  verified. Two changes at once (epochs + lr), so per-change attribution is
+  lost; the held-out curve per epoch is the readout.
