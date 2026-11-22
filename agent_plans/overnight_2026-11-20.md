@@ -1101,3 +1101,16 @@ don't need the lower LR").
   phase-2 KL stays small?
 - User (busy today): proceed through the agreed plan without waiting for
   okays if everything looks right.
+- 16:08 refit run67 stopped after cycle 5 (user: KLs too high, push the
+  real ones below ~0.3). run67 per cycle (after): phase 1 real 4.79, 3.43,
+  2.52, 2.09, 2.04 (move_dir err 4.9 -> 3.4 deg); phase 2 real 1.10, 0.84,
+  0.78, 0.85, 0.54 (2.6 -> 2.3 deg); phase 1 cf 9.97 -> 3.69; phase 2 cf
+  2.70 -> 2.31. Real-row KL by head (cycle 4 after): phase 1 move_dir 0.92,
+  kick_dir 0.75; phase 2 kick_dir 0.47, move_dir 0.28. Within each cycle
+  the training KL fell every epoch to the end (1.67 -> 1.44 over cycle 4)
+  -> optimisation-limited, not capacity (no trade-off either: both phases
+  improved together). Copied checkpoint_pretrained.pt to
+  checkpoint_pretrained_cycle5.pt, taskkill /T PID 10272 (verified).
+- Relaunched as refit run68 from that checkpoint: lr 1e-4 -> 2e-4 (not
+  3e-4: 1e-4 showed a ~0.21 noise floor in run21/22), epochs 12 -> 20,
+  6 cycles (72c4ea7); pinned config verified.
