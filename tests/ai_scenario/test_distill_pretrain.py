@@ -289,3 +289,25 @@ def test_holdout_episode_mask_holds_whole_episodes():
     assert int(mask.sum()) == sum(len(e) for e in held)
     assert not bool(mask[-3:].any())
     assert not bool(dp.holdout_episode_mask(tracks, dones, 0.0, torch.Generator().manual_seed(0)).any())
+
+
+def test_group_report_reference_nets_identical_copy_gives_zero_delta(trainer, tmp_path):
+    """Scoring a frozen copy of the student (holdout_reference 'start') gives the same report,
+    so the current-minus-reference line is zero; a perturbed copy differs."""
+    import copy
+    b = _obs(trainer)
+    other = _teacher(trainer, tmp_path, "other.pt", perturb=0.05)
+    data = dp.build_copies(b, torch.zeros(N), (1, 2), True, 1.0)
+    data["anchor"] = dp.teacher_anchor(trainer, data["obs"], data["target_phase"], {1: other, 2: other}, 64)
+    data["actions"] = dp.soft_actions(data["anchor"], len(data["returns"]))
+    cur = dp.group_report(trainer, data, 64)
+    ref = copy.deepcopy((trainer.decision_net, trainer.execution_net))
+    same = dp.group_report(trainer, data, 64, nets=ref)
+    assert sorted(cur) == sorted(same)
+    for k in cur:
+        assert same[k]["kl"] == pytest.approx(cur[k]["kl"], abs=1e-6)
+    import re
+    deltas = [float(x) for x in re.findall(r"[+-]\d+\.\d+", dp.reference_delta_line(cur, same))]
+    assert deltas and all(abs(x) < 1e-3 for x in deltas)
+    moved = dp.group_report(trainer, data, 64, nets=other)
+    assert any(abs(moved[k]["kl"] - cur[k]["kl"]) > 1e-4 for k in cur)

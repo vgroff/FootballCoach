@@ -51,7 +51,7 @@ _SPREAD_KEYS = ("move_dir_log_kappa", "kick_dir_log_kappa", "kick_dir_z_log_std"
 DEFAULTS = {"counterfactual": True, "counterfactual_weight": 1.0, "kl_coef": 5.0, "value_coef": 1.0,
             "label_smoothing": 0.0, "epochs": 6, "lr": 1e-4, "lr_warmup_steps": 0, "batch_size": 8000,
             "rollout_steps": 540000, "num_rollouts": 4, "aggregate_cycles": 1,
-            "counterfactual_kick_only_phases": (), "holdout_episode_fraction": 0.0}
+            "counterfactual_kick_only_phases": (), "holdout_episode_fraction": 0.0, "holdout_reference": None}
 
 
 def holdout_episode_mask(track_ids, dones, fraction: float, generator: torch.Generator) -> torch.Tensor:
@@ -258,15 +258,18 @@ def soft_actions(anchor: dict, n: int) -> dict:
             "pass_": z, "tackle": z, "mark": z}
 
 
-def _student_forward(trainer, mb_obs: dict):
+def _student_forward(trainer, mb_obs: dict, nets: Optional[tuple] = None):
+    """The student's heads on ``mb_obs``; ``nets`` = (decision_net, execution_net)
+    to run instead (e.g. a frozen reference copy, see holdout_reference)."""
     from footballcoach.ai.ppo.trainer_common import _ai_types
+    d_net, e_net = nets if nets is not None else (trainer.decision_net, trainer.execution_net)
     sat, oat = _ai_types(mb_obs)
-    d = trainer.decision_net(
+    d = d_net(
         mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"], mb_obs["ball_feat"], mb_obs["global_feat"],
         sat, oat, ball_physics_full=mb_obs.get("ball_physics_full"),
         self_physics_full=mb_obs.get("self_physics_full"), other_physics_full=mb_obs.get("other_physics_full"),
     )
-    e = trainer.execution_net(
+    e = e_net(
         mb_obs["self_feat"], mb_obs["other_feat"], mb_obs["exists_mask"], mb_obs["ball_feat"], mb_obs["global_feat"],
         d, sat, oat,
     )
@@ -338,9 +341,10 @@ def _slice(data: dict, idx: torch.Tensor, device) -> dict:
     }
 
 
-def group_report(trainer, data: dict, batch_size: int, max_rows: int = 40000) -> dict:
+def group_report(trainer, data: dict, batch_size: int, max_rows: int = 40000, nets: Optional[tuple] = None) -> dict:
     """{(phase of the row, "real"/"cf"): {"kl", "agree": {...}}} on up to
-    ``max_rows`` rows per group, no grad."""
+    ``max_rows`` rows per group, no grad. ``nets``: score that (decision,
+    execution) pair instead of the live student, at the live student's spreads."""
     from footballcoach.ai.ppo.distill import phase_row_mask
     from footballcoach.ai.ppo.ppo_update import _DISTILL_AGREE_KEYS, _distill_agreement
     out = {}
@@ -357,7 +361,7 @@ def group_report(trainer, data: dict, batch_size: int, max_rows: int = 40000) ->
                 for s in range(0, len(rows), batch_size):
                     idx = rows[s:s + batch_size]
                     mb = _slice(data, idx, trainer.device)
-                    d, e = _student_forward(trainer, mb["obs"])
+                    d, e = _student_forward(trainer, mb["obs"], nets)
                     globals_ = {k: getattr(trainer.execution_net, k).detach() for k in _SPREAD_KEYS}
                     kl, per_head = trainer._ppg_kl_penalty(d, e, mb["anchor"], globals_, mb["actions"], mb["obs"]["exists_mask"],
                                                            detach_spread=True, soft_action_weights=True, forward_kl=True)
@@ -469,6 +473,16 @@ def holdout_line(report: dict) -> str:
     return "  ".join(f"p{pid} {copy} {one(r)}" for (pid, copy), r in sorted(report.items()))
 
 
+def reference_delta_line(report: dict, ref: dict) -> str:
+    """Current minus reference KL per (phase, real/cf), with move / kick direction split
+    (negative = the current student is closer to the teachers than the reference)."""
+    def d(r, q):
+        h, hq = r.get("by_head", {}), q.get("by_head", {})
+        return (f"{r['kl'] - q['kl']:+.4f} (move_dir {h.get('move_dir', 0.0) - hq.get('move_dir', 0.0):+.3f} "
+                f"kick_dir {h.get('kick_dir', 0.0) - hq.get('kick_dir', 0.0):+.3f})")
+    return "  ".join(f"p{pid} {copy} {d(r, ref[(pid, copy)])}" for (pid, copy), r in sorted(report.items()) if (pid, copy) in ref)
+
+
 def composition(obs: dict, track_ids, phases: tuple[int, int], stats: dict) -> str:
     """One line: rows per phase split by track (trainee / secondary, i.e. the
     phase-1 opponent's or a phase-2 secondary neural player's rows) and the
@@ -511,6 +525,21 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
         raise ValueError("distill_pretrain: holdout_episode_fraction is not supported with role_bc "
                          "(the BC labels are aligned to the full rollout)")
     hold_gen = torch.Generator().manual_seed(int(cfg.get("holdout_seed", 0)))
+    # holdout_reference: a FROZEN model scored on the same held-out episodes
+    # every cycle ("start" = the student as it was before cycle 1, or a
+    # checkpoint path), so current-minus-reference on identical rows washes
+    # out the rollout-to-rollout noise of the absolute numbers.
+    ref_nets, ref_name = None, cfg.get("holdout_reference")
+    if ref_name:
+        if ref_name == "start":
+            import copy
+            ref_nets = copy.deepcopy((trainer.decision_net, trainer.execution_net))   # one call keeps shared modules shared
+            for m in ref_nets:
+                m.eval()
+                for p in m.parameters():
+                    p.requires_grad_(False)
+        else:
+            ref_nets = teacher_nets(ref_name, trainer.separate_value_net, trainer.device)
     teachers = {pid: teacher_nets(path, trainer.separate_value_net, trainer.device) for pid, path in cfg["teachers"].items()}
     phases = tuple(sorted(teachers))
     bs = int(cfg["batch_size"])
@@ -522,7 +551,8 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
              f"label_smoothing={cfg['label_smoothing']}, "
              f"counterfactual_kick_only_phases={list(cfg['counterfactual_kick_only_phases'])}, "
              f"counterfactual_skip_goalkeeper={bool(cfg.get('counterfactual_skip_goalkeeper'))}, "
-             f"aggregate_cycles={cfg['aggregate_cycles']}, holdout_episode_fraction={hold_frac}, "
+             f"aggregate_cycles={cfg['aggregate_cycles']}, holdout_episode_fraction={hold_frac} "
+             f"(reference {ref_name if ref_nets is not None else None}), "
              f"counterfactual={cfg['counterfactual']} "
              f"(weight {cfg['counterfactual_weight']}), kl_coef={cfg['kl_coef']}, value_coef={cfg['value_coef']}, "
              f"{cfg['num_rollouts']} cycle(s) x {cfg['rollout_steps']} steps x {cfg['epochs']} epoch(s), lr={cfg['lr']} "
@@ -577,9 +607,25 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
             log.info(f"  [distill pretrain] {n_new} rows ({int((~data['is_cf']).sum())} real, {int(data['is_cf'].sum())} counterfactual)"
                      f"  returns std={ret_std:.2f}")
             log_report(f"cycle {cycle + 1} before", group_report(trainer, data, bs))
+            if ref_nets is not None:
+                # The whole fresh rollout (every row, not the first 40k per group),
+                # scored for the live student and the frozen reference on the same rows.
+                cur_all = group_report(trainer, data, bs, max_rows=1 << 62)
+                ref_all = group_report(trainer, data, bs, max_rows=1 << 62, nets=ref_nets)
+                log.info(f"  [distill pretrain reference] cycle {cycle + 1} before fit, whole rollout, current: "
+                         + holdout_line(cur_all))
+                log.info(f"  [distill pretrain reference] cycle {cycle + 1} before fit, whole rollout, reference ({ref_name}): "
+                         + holdout_line(ref_all))
+                log.info(f"  [distill pretrain reference] cycle {cycle + 1} before fit, whole rollout, current - reference: "
+                         + reference_delta_line(cur_all, ref_all))
+            ref_report = hold_report = None
             if hold is not None:
                 log.info(f"  [distill pretrain holdout] cycle {cycle + 1} before fit: "
                          + holdout_line(group_report(trainer, hold, bs)))
+                if ref_nets is not None:
+                    ref_report = group_report(trainer, hold, bs, nets=ref_nets)
+                    log.info(f"  [distill pretrain holdout] cycle {cycle + 1} reference ({ref_name}): "
+                             + holdout_line(ref_report))
             if role_bc:
                 log.info(f"  [distill pretrain] role BC rows: {int((data['bc_w'] > 0).sum())}  "
                          f"bc loss before={bc_report_line(trainer, data, bs, smoothing)}")
@@ -610,8 +656,12 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
                 log.info(f"  [distill pretrain] epoch {epoch + 1}/{cfg['epochs']}: kl={np.mean(kls):.4f}  bc(weighted)={np.mean(bcs):.4f}  "
                          f"value_mse/var={np.mean(vals):.4f} (rmse {ret_std * math.sqrt(max(np.mean(vals), 0.0)):.2f})")
                 if hold is not None:
+                    hold_report = group_report(trainer, hold, bs)
                     log.info(f"  [distill pretrain holdout] cycle {cycle + 1} epoch {epoch + 1}/{cfg['epochs']}: "
-                             + holdout_line(group_report(trainer, hold, bs)))
+                             + holdout_line(hold_report))
+            if ref_report is not None and hold_report is not None:
+                log.info(f"  [distill pretrain holdout] cycle {cycle + 1} vs reference ({ref_name}), same held-out rows: "
+                         + reference_delta_line(hold_report, ref_report))
             report = group_report(trainer, data, bs)
             log_report(f"cycle {cycle + 1} after", report)
             if role_bc:
