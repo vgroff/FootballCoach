@@ -934,3 +934,18 @@ don't need the lower LR").
   attacker's shot choice changed (e.g. earlier/longer shots the rules
   keeper handles and the neural keeper does not). Still flagged to the
   user (05:33 push); no change.
+- 07:33 watchdog (run66): healthy, 174 checkpoints, global step 4,065.4M
+  (run66 ~87M), no errors, 0 early stops, max last hour move_dir KL
+  0.016, kick_dir 0.063; kappa log 5.566 (~261, loosening has slowed).
+  Training (20-update blocks 141-160 / 161-174): value 0.388 / 0.385, kl
+  0.015 / 0.017, |adv| 1.205 / 1.194. Value RMSE saved 2.304 (773k), goal
+  1.496, defence 2.070, box 0.610.
+  Evals (blocks 141-150 / 151-160 / 161-170): phase-1 58.5% 0.886 / 57.4%
+  0.831 / 57.4% 0.836 (171-174 57.0% 0.821) -- the decline has flattened
+  at about the run66 start level; attacker_vs_rules 81.1 / 79.2 / 78.4
+  (171-174 79.1) -- also flattening; keeper vs rules attacker 15.2/35.2 /
+  15.7/34.4 / 15.7/34.7 (best ckpt 167 14.6/36.1); AI attacker vs neural
+  keeper 58.3/26.9 / 59.9/23.7 / 59.7/24.7; all_neural raw 53.7/22.8 /
+  52.5/24.4 / 50.5/27.9 (ckpts 163-171 share ~29-30% saves, best sustained
+  level); defender_vs_rules ~8.2%. No change; the ball-carrying question
+  stays with the user.
