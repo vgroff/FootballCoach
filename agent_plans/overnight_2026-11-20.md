@@ -1114,3 +1114,14 @@ don't need the lower LR").
 - Relaunched as refit run68 from that checkpoint: lr 1e-4 -> 2e-4 (not
   3e-4: 1e-4 showed a ~0.21 noise floor in run21/22), epochs 12 -> 20,
   6 cycles (72c4ea7); pinned config verified.
+- 16:21 refit run68 (lr 2e-4, 20 ep) stopped after cycle 2. Result: phase 1
+  real after 1.83 -> 1.67, but the FRESH-rollout ('before') real KL stayed
+  ~2.8-3.0 (phase 1) since run67 c4 whatever the LR, and phase 2 fresh rose
+  0.67 -> 1.14; per-epoch training KL bounced (1.44 -> 1.63 -> 1.31).
+  CORRECTION of 16:0x: not optimisation-limited on held-out states -- a
+  ~1.0 generalisation gap between fitted and fresh rows. Kept
+  checkpoint_pretrained_cycle2.pt; taskkill /T PID 31872 (verified).
+- User: batch is GPU-maxed; rollout_steps up to 600-700k OK (careful of
+  OOM); try different LRs. Relaunched as refit run69 from run68 cycle 2:
+  lr 1e-4, epochs 10, rollout_steps 650k, aggregate_cycles 2 (keep RAM near
+  the old ~1.9M rows), 6 cycles (fa53687); pinned config verified.
