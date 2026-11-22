@@ -1167,3 +1167,7 @@ don't need the lower LR").
   task-id swap; run after the refit, not next to it). User decision: keep
   counterfactual_weight 0.2 for now as a regulariser, raise it later as the
   main (real-row) fit improves.
+- 2026-11-22 18:25: refit targets set by user: real-row KL < 0.3 and
+  counterfactual KL < 0.6 (measured on the FRESH rollout, i.e. the cycle's
+  "before" numbers, the honest generalisation metric). Status at cycle 3
+  fresh: phase 1 real 1.93, phase 2 real 0.65, cf 2.30 / 2.39.
