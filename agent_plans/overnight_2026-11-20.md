@@ -1382,3 +1382,17 @@ don't need the lower LR").
   after the last epoch -- with current-minus-reference lines. Reference =
   run79 cycle 3 (run80's start). run81 from run80 cycle 3; pinned config
   verified.
+- 2026-11-22 23:40 (hourly): run81 (reference = run79 c3), no errors.
+  Paired current-minus-reference (negative = closer to the teachers):
+  whole fresh rollout before fit, c1 / c2 / c3: cf p1 -0.043 -0.082 -0.076,
+  cf p2 -0.045 -0.054 -0.074, real p1 +0.001 -0.021 +0.003, real p2 -0.007
+  -0.038 +0.003; held-out after fit c1 / c2 / c3: cf p1 -0.098 -0.066 -0.107,
+  cf p2 -0.071 -0.056 -0.058, real p1 -0.015 -0.010 -0.013, real p2 -0.045
+  +0.009 -0.014. => steady cf gain (~-0.07 to -0.1, mostly move_dir) at no
+  lasting cost to the real rows, which oscillate around 0 (tail floor).
+  The absolute numbers had hidden this. Raw direction norms (norm_check):
+  move median 1.42 / 0.83, kick 1.17 / 1.12 (p1 / p2) vs 1.31 / 0.75 right
+  after the 21:13 rescale -- slight creep (~8%), reg 0.1 is holding.
+  Plan (user): no more restarts; run81 runs its 12 cycles, then full
+  behaviour evals at power sigma 0.10, then continue (run82, same config).
+  Restarts reset the refit's Adam + its 500-step warmup (~1 cycle each).
