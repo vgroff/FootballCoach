@@ -1288,3 +1288,19 @@ don't need the lower LR").
   direction-group gradient clip rate (was 100% clipped in run65/66; shorter
   vectors give larger direction gradients), move_dir per-head KL. Lower the
   coefficient (0.03 / 0.01) if learning looks hurt.
+- 2026-11-22 22:05: run74 (holdout_episode_fraction 0.1, from run73 cycle 3;
+  run73 c1-3 fresh p1 0.96 0.98 0.93, p2 0.42 0.36 0.47, fitted c3 0.77 /
+  0.34; raw norms after c1 ~1.3 / 0.75, held by reg 0.1). First held-out
+  curve (cycle 1), p1 real: before 1.137, epoch 1 1.115 (best), then 1.118
+  1.122 1.136 1.136 1.125 1.136 1.132 1.140 1.155 while the fit rows went
+  0.98 -> 0.79 (train loss 0.75 -> 0.68); p2 real 0.385 -> 0.368 then
+  0.39-0.43; cf flat / slightly up. => epochs 2-10 memorise the rollout's
+  episodes. Cycle 2 held-out before-fit 1.060 (cross-cycle progress real).
+  Side finding (untested): before any fit, fit rows read 0.98 vs held-out
+  1.14 on the same net + rollout -- the 'before' report scores the FIRST 40k
+  rows per group (rollout order), possibly a biased subset, so the day's
+  'fresh' numbers may be optimistic; the held-out set is the representative
+  one. User: cut epochs to 3, restart now. Stopped run74 in cycle 2 (copy
+  of cycle 1 kept); epochs 10 -> 3; run75 from run74 cycle 1; pinned config
+  verified. Note: checkpoints since the rescale carry no optimizer state
+  (rescale script drops it); the refit uses its own Adam anyway.
