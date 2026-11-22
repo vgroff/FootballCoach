@@ -1255,3 +1255,29 @@ don't need the lower LR").
   checkpoints/phase2_run71/checkpoint_pretrained_cycle6_kick300.pt; pinned
   config verified; per-cycle checkpoint copies on. Note: kick_dir KL now
   falls ~5.4x mechanically -- report aim error in degrees alongside.
+- 2026-11-22 21:15: run72 (kick kappa 300) cycles 1-3 fresh real KL p1 1.08
+  1.09 0.99, p2 0.42 0.48 0.44; cf 1.61/1.67 -> 1.50/1.46; fitted cycle 3
+  p1 0.81 p2 0.39.
+  Task-id probe (scratchpad/taskid_probe.py, single CPU process, 3000 steps
+  per phase, run72 cycle 1, keepers dropped): swapping the task id already
+  reproduces most of the teacher difference -- move dir slope 0.71 (phase-1
+  states) / 0.85 (phase-2), corr ~0.9; kick dir shift 37 of 43 deg / 71 of
+  73 deg; P(kick) slope 0.61 / 0.70. Swapped-id errors (move 3.7-4.0 deg,
+  kick 11-14 deg) vs own-id (2.0-2.5 / 4.4-4.6). So the task id is used;
+  input scaling is the wrong lever (user agrees); cf weight stays 0.2.
+  Direction heads (user question): keep the normalised raw-vector head
+  (seam-free; a scalar angle via cos/sin has a smooth output map but forces
+  a 2*pi cliff in the state->angle function wherever the target winds).
+  Raw norm had drifted again despite reg 0.001: student median move 4.5 /
+  2.5, kick 3.7 / 3.3 (phase 1 / 2); run66 ckpt241 ~1.2; 763 ~48. Row-level
+  "long vectors on hard rows" REFUTED: spearman(norm, move err) -0.30 / -0.20
+  (shortest quartile has the largest error). The level effect (angular lr ~
+  1/||raw|| for the whole head) is untested -> run73 tests it.
+  User: stop at next checkpoint, rescale, raise the reg. Done: stopped run72
+  after cycle 3 (copy checkpoint_pretrained_cycle3.pt), rescaled
+  (scripts/rescale_direction_heads.py -> ..._cycle3_rescaled.pt; medians
+  3.73 / 3.17 -> 1.00, 0 action/log-prob mismatches over 300 rows x 2),
+  bc.direction_mag_reg_coef 0.001 -> 0.1 (global, also PPO). run73 = same
+  refit config, 50/50, from the rescaled checkpoint; pinned config verified
+  (reg 0.1). Watch: raw norms per cycle (scratchpad/norm_check.py) and
+  whether phase-1 move_dir fresh KL falls faster than run72's.
