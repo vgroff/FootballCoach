@@ -1011,3 +1011,17 @@ don't need the lower LR").
   Refines the 08:33 note: not exploitation of the CURRENT keeper only --
   of neural keepers generally. Plumbing check: logged vs probe within ~1
   point on both self-pairs. No change.
+- 10:33 watchdog (run66): healthy, 207 checkpoints, global step 4,081.9M
+  (run66 ~103M), no errors, 0 early stops, max last hour move_dir KL
+  0.015, kick_dir 0.062; kappa log 5.565 (~261, flat). Training
+  (20-update blocks 161-180 / 181-200 / 201-207): value 0.382 / 0.360 /
+  0.350 (falling steadily), kl 0.017 / 0.017 / 0.016, |adv| 1.189 / 1.150
+  / 1.130. Value RMSE saved 2.378 (646k), goal 1.417, defence 2.142, box
+  0.615.
+  Evals (blocks 181-190 / 191-200 / 201-207): phase-1 58.3% 0.886 / 58.3%
+  0.887 / 58.6% 0.902 (recovering slowly); keeper vs rules attacker
+  14.7/36.2 / 13.9/37.5 / 14.0/37.3 (best level); AI attacker vs neural
+  keeper 62.2/21.1 / 63.5/19.4 / 64.5/19.6; all_neural raw 53.6/24.3 /
+  54.1/21.3 / 53.6/22.2; attacker_vs_rules 78.5 / 78.6 / 79.3;
+  defender_vs_rules 8.2 / 7.9 / 8.2% conceded (rules keeper saves rising
+  39 -> 44%, defender possession 47 -> 42%). No change.
