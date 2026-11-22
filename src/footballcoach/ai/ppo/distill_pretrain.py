@@ -51,7 +51,24 @@ _SPREAD_KEYS = ("move_dir_log_kappa", "kick_dir_log_kappa", "kick_dir_z_log_std"
 DEFAULTS = {"counterfactual": True, "counterfactual_weight": 1.0, "kl_coef": 5.0, "value_coef": 1.0,
             "label_smoothing": 0.0, "epochs": 6, "lr": 1e-4, "lr_warmup_steps": 0, "batch_size": 8000,
             "rollout_steps": 540000, "num_rollouts": 4, "aggregate_cycles": 1,
-            "counterfactual_kick_only_phases": ()}
+            "counterfactual_kick_only_phases": (), "holdout_episode_fraction": 0.0}
+
+
+def holdout_episode_mask(track_ids, dones, fraction: float, generator: torch.Generator) -> torch.Tensor:
+    """(N,) bool over the rollout's rows: ``fraction`` of its COMPLETE episodes
+    (per track, trainer_common.complete_episode_rows -- the same segmentation
+    as PPO's held-out validation episodes), every row of a chosen episode.
+    Rows of no complete episode stay in the fit. 0 episodes held out when the
+    fraction rounds to 0 or there are fewer than 2 complete episodes."""
+    from footballcoach.ai.ppo.trainer_common import complete_episode_rows
+    episodes = complete_episode_rows(track_ids, dones)
+    mask = torch.zeros(len(dones), dtype=torch.bool)
+    n_hold = round(fraction * len(episodes)) if len(episodes) >= 2 else 0
+    if n_hold <= 0:
+        return mask
+    for k in torch.randperm(len(episodes), generator=generator)[:n_hold].tolist():
+        mask[episodes[k]] = True
+    return mask
 
 # The anchor fields of the kick sub-heads (gate, power, direction, spin).
 KICK_KEYS = ("kick_logit", "kick_power", "kick_direction", "kick_spin")
@@ -443,6 +460,15 @@ def log_report(tag: str, report: dict) -> None:
                      + "  ".join(f"{h}={v:.4f}" for h, v in top))
 
 
+def holdout_line(report: dict) -> str:
+    """One compact line of a group_report: KL per (phase, real/cf) with move / kick direction split."""
+    def one(r):
+        h = r.get("by_head", {})
+        return (f"{r['kl']:.4f} (move_dir {h.get('move_dir', 0.0):.3f} kick_dir {h.get('kick_dir', 0.0):.3f}, "
+                f"n={r['n']})")
+    return "  ".join(f"p{pid} {copy} {one(r)}" for (pid, copy), r in sorted(report.items()))
+
+
 def composition(obs: dict, track_ids, phases: tuple[int, int], stats: dict) -> str:
     """One line: rows per phase split by track (trainee / secondary, i.e. the
     phase-1 opponent's or a phase-2 secondary neural player's rows) and the
@@ -480,6 +506,11 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
     if role_bc and cfg["counterfactual"]:
         raise ValueError("distill_pretrain: role_bc needs counterfactual off (a task-id-swapped copy of a "
                          "rules-taught row would have no teacher)")
+    hold_frac = float(cfg.get("holdout_episode_fraction") or 0.0)
+    if role_bc and hold_frac > 0:
+        raise ValueError("distill_pretrain: holdout_episode_fraction is not supported with role_bc "
+                         "(the BC labels are aligned to the full rollout)")
+    hold_gen = torch.Generator().manual_seed(int(cfg.get("holdout_seed", 0)))
     teachers = {pid: teacher_nets(path, trainer.separate_value_net, trainer.device) for pid, path in cfg["teachers"].items()}
     phases = tuple(sorted(teachers))
     bs = int(cfg["batch_size"])
@@ -491,7 +522,8 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
              f"label_smoothing={cfg['label_smoothing']}, "
              f"counterfactual_kick_only_phases={list(cfg['counterfactual_kick_only_phases'])}, "
              f"counterfactual_skip_goalkeeper={bool(cfg.get('counterfactual_skip_goalkeeper'))}, "
-             f"aggregate_cycles={cfg['aggregate_cycles']}, counterfactual={cfg['counterfactual']} "
+             f"aggregate_cycles={cfg['aggregate_cycles']}, holdout_episode_fraction={hold_frac}, "
+             f"counterfactual={cfg['counterfactual']} "
              f"(weight {cfg['counterfactual_weight']}), kl_coef={cfg['kl_coef']}, value_coef={cfg['value_coef']}, "
              f"{cfg['num_rollouts']} cycle(s) x {cfg['rollout_steps']} steps x {cfg['epochs']} epoch(s), lr={cfg['lr']} "
              f"(linear warmup over {cfg['lr_warmup_steps']} steps)")
@@ -509,22 +541,45 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
             log.info("  [distill pretrain] rollout: " + composition(obs, batch.get("track_ids"), phases, _stats))
             returns = batch["returns"].float()
             ret_std = float(returns.std().clamp(min=1.0))
-            cf_rows = ~goalkeeper_rows(obs) if cfg.get("counterfactual_skip_goalkeeper") else None
-            data = build_copies(obs, returns, phases, bool(cfg["counterfactual"]), float(cfg["counterfactual_weight"]),
-                                counterfactual_rows=cf_rows)
-            attach_role_bc(data, batch, role_bc)
+
+            def prepare(o: dict, r: torch.Tensor, b: dict) -> dict:
+                """Rows to fit / report on: copies, teacher anchors, soft actions, physics features."""
+                cf_rows = ~goalkeeper_rows(o) if cfg.get("counterfactual_skip_goalkeeper") else None
+                d = build_copies(o, r, phases, bool(cfg["counterfactual"]), float(cfg["counterfactual_weight"]),
+                                 counterfactual_rows=cf_rows)
+                attach_role_bc(d, b, role_bc)
+                d["anchor"] = smooth_bernoulli_targets(
+                    kick_only_counterfactuals(trainer, d, teacher_anchor(trainer, d["obs"], d["target_phase"], teachers, bs),
+                                              teachers, cfg["counterfactual_kick_only_phases"], bs),
+                    float(cfg["label_smoothing"]))
+                d["actions"] = soft_actions(d["anchor"], len(d["returns"]))
+                phys = trainer._precompute_physics_full({f"obs/{k}": v for k, v in d["obs"].items()}, bs)
+                d["obs"].update({k[len("obs/"):]: v for k, v in phys.items()})
+                return d
+
+            # Held-out episodes (holdout_episode_fraction > 0): whole episodes of
+            # this rollout kept out of the fit (and of later cycles' aggregation),
+            # reported after every epoch, so the fit's overfitting is visible
+            # separately from the next rollout's distribution shift.
+            hold = None
+            hold_rows = (holdout_episode_mask(batch.get("track_ids") or None, batch["dones"], hold_frac, hold_gen)
+                         if hold_frac > 0 else None)
+            if hold_rows is not None and bool(hold_rows.any()):
+                fit_rows = ~hold_rows
+                hold = prepare({k: v[hold_rows] for k, v in obs.items()}, returns[hold_rows], {})
+                data = prepare({k: v[fit_rows] for k, v in obs.items()}, returns[fit_rows], {})
+                log.info(f"  [distill pretrain] held out {int(hold_rows.sum())} of {len(hold_rows)} rollout rows "
+                         f"(whole episodes, fraction {hold_frac}): not fitted, reported per epoch")
+            else:
+                data = prepare(obs, returns, batch)
             del batch, obs
-            data["anchor"] = smooth_bernoulli_targets(
-                kick_only_counterfactuals(trainer, data, teacher_anchor(trainer, data["obs"], data["target_phase"], teachers, bs),
-                                          teachers, cfg["counterfactual_kick_only_phases"], bs),
-                float(cfg["label_smoothing"]))
-            data["actions"] = soft_actions(data["anchor"], len(data["returns"]))
-            phys = trainer._precompute_physics_full({f"obs/{k}": v for k, v in data["obs"].items()}, bs)
-            data["obs"].update({k[len("obs/"):]: v for k, v in phys.items()})
             n_new = len(data["returns"])
             log.info(f"  [distill pretrain] {n_new} rows ({int((~data['is_cf']).sum())} real, {int(data['is_cf'].sum())} counterfactual)"
                      f"  returns std={ret_std:.2f}")
             log_report(f"cycle {cycle + 1} before", group_report(trainer, data, bs))
+            if hold is not None:
+                log.info(f"  [distill pretrain holdout] cycle {cycle + 1} before fit: "
+                         + holdout_line(group_report(trainer, hold, bs)))
             if role_bc:
                 log.info(f"  [distill pretrain] role BC rows: {int((data['bc_w'] > 0).sum())}  "
                          f"bc loss before={bc_report_line(trainer, data, bs, smoothing)}")
@@ -554,6 +609,9 @@ def distill_pretrain(trainer, phase_id: int, cfg: Optional[dict] = None, checkpo
                     bcs.append(float(bcl.detach()))
                 log.info(f"  [distill pretrain] epoch {epoch + 1}/{cfg['epochs']}: kl={np.mean(kls):.4f}  bc(weighted)={np.mean(bcs):.4f}  "
                          f"value_mse/var={np.mean(vals):.4f} (rmse {ret_std * math.sqrt(max(np.mean(vals), 0.0)):.2f})")
+                if hold is not None:
+                    log.info(f"  [distill pretrain holdout] cycle {cycle + 1} epoch {epoch + 1}/{cfg['epochs']}: "
+                             + holdout_line(group_report(trainer, hold, bs)))
             report = group_report(trainer, data, bs)
             log_report(f"cycle {cycle + 1} after", report)
             if role_bc:

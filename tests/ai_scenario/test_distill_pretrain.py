@@ -259,3 +259,33 @@ def test_the_loss_trains_the_student_towards_two_different_teachers(trainer, tmp
     for name in dp._SPREAD_KEYS:                                   # means only: spreads untouched
         assert getattr(trainer.execution_net, name).grad is None or \
             float(getattr(trainer.execution_net, name).grad.abs().sum()) == 0.0
+
+
+def test_complete_episode_rows_segments_per_track():
+    """Interleaved tracks are cut at their OWN done rows; a trailing partial episode is dropped."""
+    from footballcoach.ai.ppo.trainer_common import complete_episode_rows
+    tracks = ["trainee", "p7", "trainee", "p7", "trainee", "p7", "trainee"]
+    dones = [0, 0, 1, 1, 0, 0, 1]
+    assert complete_episode_rows(tracks, dones) == [[0, 2], [4, 6], [1, 3]]
+    assert complete_episode_rows(None, [0, 1, 0, 1, 0]) == [[0, 1], [2, 3]]
+
+
+def test_holdout_episode_mask_holds_whole_episodes():
+    """Every held-out row belongs to a held-out episode and every row of it is held out;
+    the count follows the fraction; the partial tail is never held out."""
+    from footballcoach.ai.ppo.trainer_common import complete_episode_rows
+    tracks, dones = [], []
+    for ep in range(20):                       # 20 trainee episodes, interleaved with a secondary track
+        for s in range(5):
+            tracks += ["trainee", f"sec{ep % 2}"]
+            dones += [int(s == 4), int(s == 4)]
+    tracks += ["trainee"] * 3                  # partial tail
+    dones += [0, 0, 0]
+    mask = dp.holdout_episode_mask(tracks, dones, 0.1, torch.Generator().manual_seed(0))
+    episodes = complete_episode_rows(tracks, dones)
+    held = [e for e in episodes if bool(mask[e].all())]
+    assert len(held) == round(0.1 * len(episodes)) == 4
+    assert all(not bool(mask[e].any()) for e in episodes if e not in held)
+    assert int(mask.sum()) == sum(len(e) for e in held)
+    assert not bool(mask[-3:].any())
+    assert not bool(dp.holdout_episode_mask(tracks, dones, 0.0, torch.Generator().manual_seed(0)).any())

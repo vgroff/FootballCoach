@@ -502,23 +502,12 @@ class PPOUpdateMixin(PPOUpdateDiagnosticsMixin):
         split skipped, everything trains, matching every other
         opt-in-with-a-minimum-episode-count split in this file).
         """
-        track_ids = batch.get("track_ids") or ["trainee"] * len(batch["dones"])
-        dones_np = batch["dones"].numpy()
-        n_total = len(dones_np)
+        from footballcoach.ai.ppo.trainer_common import complete_episode_rows
 
-        groups: dict[str, list[int]] = {}
-        for i, t in enumerate(track_ids):
-            groups.setdefault(t, []).append(i)
-
-        episodes: list[list[int]] = []  # each entry: that episode's own flat indices
-        for _track, idxs in groups.items():
-            ep_start_pos = 0
-            for pos, flat_i in enumerate(idxs):
-                if dones_np[flat_i] > 0.5:
-                    episodes.append(idxs[ep_start_pos:pos + 1])
-                    ep_start_pos = pos + 1
-            # Trailing partial episode (no terminal done yet) dropped --
-            # same convention as every other episode-boundary scan here.
+        n_total = len(batch["dones"])
+        # each entry: that episode's own flat indices; a trailing partial
+        # episode (no terminal done yet) is dropped.
+        episodes = complete_episode_rows(batch.get("track_ids") or None, batch["dones"])
 
         n_complete = len(episodes)
         n_val_eps = max(1, round(self.val_episode_fraction * n_complete)) if n_complete >= 2 else 0

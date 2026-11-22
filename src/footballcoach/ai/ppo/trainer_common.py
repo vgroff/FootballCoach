@@ -294,6 +294,35 @@ def _ai_types(obs_dict: dict) -> tuple:
         sat = torch.cat([sat, side.to(device=sat.device, dtype=sat.dtype)], dim=-1)
     return sat, oat
 
+
+def complete_episode_rows(track_ids: Optional[list], dones) -> list[list[int]]:
+    """Each COMPLETE episode's own flat row indices, segmented per track.
+
+    A flat ``dones > 0.5`` scan over a concatenated rollout would misread
+    episode boundaries wherever a secondary neural player's rows are
+    interleaved with the trainee's (see ``track_ids`` in rollout_buffer.py),
+    so rows are grouped by track first and each track is cut at its own
+    ``done`` rows. An episode's rows are therefore not necessarily a
+    contiguous flat range. A trailing partial episode (no terminal done) is
+    dropped. ``track_ids`` None = one track. Shared by PPO's held-out
+    validation episodes (``_split_train_val_episodes``) and the distill
+    refit's held-out episodes (distill_pretrain.holdout_episode_mask)."""
+    dones_np = np.asarray(dones.numpy() if isinstance(dones, torch.Tensor) else dones)
+    if track_ids is None:
+        track_ids = ["trainee"] * len(dones_np)
+    groups: dict = {}
+    for i, t in enumerate(track_ids):
+        groups.setdefault(t, []).append(i)
+    episodes: list[list[int]] = []
+    for idxs in groups.values():
+        start = 0
+        for pos, flat_i in enumerate(idxs):
+            if dones_np[flat_i] > 0.5:
+                episodes.append(idxs[start:pos + 1])
+                start = pos + 1
+    return episodes
+
+
 def _episode_abs_adv_means(
     track_ids: list, dones, advantages,
 ) -> list[float]:
