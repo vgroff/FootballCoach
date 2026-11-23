@@ -46,3 +46,22 @@ ent_kick_power_only_weight 4; direction reg 0.1; no distill anchor.
   - Kick kappa 323 -> 334 (~+1.1 / update), power sigma 0.199, move kappa 264.
   - KL 0.010-0.014; direction group still 100% clipped (pre-clip mean 33-38).
   - Ratio spikes up to 571 (checkpoint 25, positive advantage).
+- 04:35, checkpoints 31-48 (~24M steps): no errors. (Missed re-arming the
+  watch for ~30 min, so this was reviewed in one go.)
+  - KEEPER vs rules attacker, a real mild regression: goals 13.5-14.3
+    (checkpoints 1-9) -> 14.6-15.2 (29-34) -> 15.4-15.7 (35-38) -> 15.9-16.5
+    (39-47), back to 15.4 at 48; saves ~37-38 -> 35.0-35.9.
+  - Same seeds, ~10 checkpoints shifted ~+2 pts (per-eval SE ~1.6) -> real.
+  - Likely specialisation to self-play: only ~10% of neural-keeper episodes
+    face the rules attacker; saves vs its own attacker are flat / up
+    (attacker_vs_ai_keeper 22-26, self-play rollouts 23-27); attacker vs
+    rules up 76 -> 80-82.
+  - Decision: HOLD, user to decide in the morning (the remedy, more keeper
+    episodes vs the rules attacker, changes the training distribution and
+    needs a restart). Act alone only if the keeper passes ~17.5 conceded or
+    saves drop below 34.
+  - Phase 1 vs rules 5-checkpoint means: 1.169 (29-33) -> 1.139 (39-43)
+    -> 1.129 (44-48); slight drift, above the 1.10 act threshold (new rule:
+    5-checkpoint mean < 1.10 or a single reading < 1.05).
+  - Kick kappa 334 -> 357 (~+1.2 / update); power sigma 0.200; move kappa
+    263; KL 0.011-0.012.
