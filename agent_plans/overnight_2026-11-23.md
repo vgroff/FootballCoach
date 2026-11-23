@@ -35,3 +35,14 @@ ent_kick_power_only_weight 4; direction reg 0.1; no distill anchor.
   - Direction group still 100% clipped (pre-clip mean 35-38).
   - Largest ratio spike 1489 (checkpoint 14, negative advantage, bounded
     by dual-clip; KL normal).
+- 03:40, checkpoints 21-30 (~15M steps): stable, no errors, no action.
+  - Phase 1 vs rules 1.11-1.24 (new best 1.244 / 65% at checkpoint 30);
+    the 1.113 at checkpoint 21 was a single low.
+  - Attacker vs rules 78.5-82.0%.
+  - Keeper vs rules 14.6-15.4 goals / 36-37 saves (the drift stopped and
+    eased back).
+  - Defender 6.3-7.4; attacker vs ai keeper 58-63; all-neural goals
+    47.8-56.5 (self-play balance swinging, no trend).
+  - Kick kappa 323 -> 334 (~+1.1 / update), power sigma 0.199, move kappa 264.
+  - KL 0.010-0.014; direction group still 100% clipped (pre-clip mean 33-38).
+  - Ratio spikes up to 571 (checkpoint 25, positive advantage).
