@@ -19,3 +19,19 @@ ent_kick_power_only_weight 4; direction reg 0.1; no distill anchor.
   - Ratio spikes 37-311 on single rows, both signs, bounded by clip 0.3 /
     dual-clip 10.
   - No action taken.
+- 02:35, checkpoints 10-20 (~10M steps): stable, no errors, no action.
+  - Phase 1 vs rules mean reward 1.13-1.23 (best 1.234 / 65% at
+    checkpoint 17); no slide.
+  - Attacker vs rules 78-83% (best 82.8 at checkpoint 19).
+  - Keeper vs rules: a slight drift, goals 13.5-14.3 over checkpoints 1-9
+    -> 14.3-15.7 over checkpoints 10-20 (latest 15.2 / 36.3 saved). About +1
+    pt, within the per-eval SE (~1.6) but persistent on the same seeds. It
+    stopped growing; watch (attacker outpacing the keeper, as in earlier
+    cross-play). Act if it reaches ~16.5 or rises 3 checkpoints in a row.
+  - Defender 6.3-7.6; attacker vs ai keeper 58-63; all-neural ~50 / 25 / 19.
+  - Spreads: kick kappa 300 -> 322 (slow, ~+1 per update), power sigma
+    0.200 -> 0.199, move kappa 263-264, z sigma flat.
+  - KL 0.010-0.013.
+  - Direction group still 100% clipped (pre-clip mean 35-38).
+  - Largest ratio spike 1489 (checkpoint 14, negative advantage, bounded
+    by dual-clip; KL normal).
