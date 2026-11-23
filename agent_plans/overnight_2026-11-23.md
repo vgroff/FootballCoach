@@ -65,3 +65,22 @@ ent_kick_power_only_weight 4; direction reg 0.1; no distill anchor.
     5-checkpoint mean < 1.10 or a single reading < 1.05).
   - Kick kappa 334 -> 357 (~+1.2 / update); power sigma 0.200; move kappa
     263; KL 0.011-0.012.
+- 05:05, checkpoints 49-54 (~27M steps): no errors. Two slow drifts, both
+  inside the act-alone thresholds, so held for the user's morning call.
+  - Phase 1 vs rules: 1.153 1.139 1.140 1.120 1.107 1.121 (5-checkpoint
+    mean ~1.13 vs 1.17 early in the night; threshold mean < 1.10).
+  - Keeper vs rules attacker: 15.4 15.4 16.1 16.3 15.9 15.9 goals / ~36
+    saves (start 14.3 / 37.2; thresholds > 17.5 or saves < 34).
+  - All-neural saves 25.7 -> 19.8-20.9 over the last 5. That RETRACTS the
+    pure "keeper specialises to the self-play attacker" explanation: it is
+    slipping vs its own attacker too, i.e. the attacker is outpacing it.
+  - Attacker vs rules 80-82%.
+  - Kick kappa 365, power sigma 0.200, KL 0.011-0.013.
+  OPTIONS FOR THE USER (each a restart in a fresh dir from a recent
+  checkpoint):
+  - A) phase mix 35/65 -> 50/50 (fixed phase 1 in the refit);
+  - B) more keeper episodes vs the rules attacker: curriculum.phase2
+    controllers attacker rules:neural is 1:9 (user's 2026-11-20 call for
+    more neural training) -> e.g. 1:4;
+  - C) both.
+  If a threshold trips before then: phase 1 -> A, keeper -> B.
