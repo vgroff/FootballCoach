@@ -84,3 +84,28 @@ ent_kick_power_only_weight 4; direction reg 0.1; no distill anchor.
     more neural training) -> e.g. 1:4;
   - C) both.
   If a threshold trips before then: phase 1 -> A, keeper -> B.
+
+## 2026-11-24 20:55: catch-up review (monitoring gap)
+
+- MONITORING GAP: after the 05:05 (11-23) check nothing was processed; the
+  hourly check-ins queued. The run trained on from checkpoint 54 to 296
+  (~148M steps) until 03:25 on 11-24, then the laptop slept until 20:52
+  (training paused). No errors in the whole log.
+- Evals, checkpoint 1 -> 61 -> 296:
+  - phase 1 vs rules 1.185 / 64% -> 1.100 / 62% -> 1.225 / 65% (held
+    1.10-1.23 all run: NO run66-style slide under 35/65);
+  - keeper vs rules 14.3 / 37.2 -> 16.3 / 35.7 -> 14.1 / 39.6 (12.2-14.1
+    / 39-41.5 over checkpoints 200-296: the overnight drift REVERSED on its
+    own, now better than the start and run66's 13.5 / 38.5);
+  - attacker vs rules 76.1 -> 81 -> 84.3; defender ~7-8;
+  - attacker vs ai keeper 59 -> 61-69 (goals up);
+  - all-neural saves 22 -> 24-30.
+- FLAG, kick kappa sharpening and accelerating: 300 (1), 372 (60), 438
+  (120), 512 (180), 610 (240), 724 (296); +1.2 -> ~+2 per update, heading
+  back toward run66's 1630.
+  - Power sigma 0.200 -> 0.188 (-6%); move kappa flat 265.
+  - KL 0.017 -> 0.009; direction clip still 100% (pre-clip mean 39 -> 32).
+  - Not hurting play (attacker goals rose with it, consistent with the
+    kappa sweep: precision is rewarded).
+  - User's call: (a) ent_kick_dir_azimuth_only_weight 5 -> ~10, (b) a
+    kick-kappa cap ~1000, (c) leave it.
